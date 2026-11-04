@@ -83,7 +83,7 @@ All part bytes flow exclusively through sidecar signed URLs (ADR-0004); there is
 - **ADR**: [ADR-0002](../ADR/0002-cpt-cf-file-storage-adr-content-hash-selection.md) -- Content hash selection; its `hash_policy` vision is superseded by ADR-0006
 - **ADR**: [ADR-0006](../ADR/0006-cpt-cf-file-storage-adr-content-hash-modes.md) -- Content-hash modes (whole-object + multipart offset-manifest composite, SHA-256-only)
 - **ADR**: [ADR-0003](../ADR/0003-cpt-cf-file-storage-adr-sidecar-data-plane.md) -- Sidecar data plane (no bytes through control plane)
-- **ADR**: [ADR-0004](../ADR/0004-cpt-cf-file-storage-adr-signed-url-transport.md) -- Signed-URL transport, implemented as a codec-equivalent bespoke Ed25519 token, not literal PASETO v4.public -- no `kid` -- see that ADR's "Implementation note"
+- **ADR**: [ADR-0004](../ADR/0004-cpt-cf-file-storage-adr-signed-url-transport.md) -- Signed-URL transport, implemented as a codec-equivalent bespoke ECDSA P-256/SHA-256 token, not literal PASETO v4.public -- no `kid` -- see that ADR's "Implementation note"
 - **Dependencies**: Signed-URL transport (ADR-0004), sidecar data plane (ADR-0003)
 
 ## 2. Actor Flows (CDSL)
@@ -123,7 +123,7 @@ User-facing interactions that start with an actor (human or external system) and
 6. [x] - `p1` - DB: INSERT pending version row into file_versions (version_id, file_id, status=pending) - `inst-init-db-version`
 7. [x] - `p1` - Backend: initiate_multipart(backend_path) -- obtain the backend's multipart upload handle - `inst-init-backend-initiate`
 8. [x] - `p1` - DB: INSERT into multipart_uploads (upload_id, file_id, version_id, backend_upload_handle, declared_size, part_size, state=in_progress, expires_at); on failure, best-effort compensate (abort the backend upload and the pending version) - `inst-init-db-session`
-9. [x] - `p1` - FOR EACH part in the plan: mint a signed URL (Ed25519, codec-equivalent to PASETO v4.public -- ADR-0004's Implementation note) with claims {upload_id, file_id, version_id, part_number, offset, size, op="multipart_part", exp} - `inst-init-sign-urls`
+9. [x] - `p1` - FOR EACH part in the plan: mint a signed URL (ECDSA P-256/SHA-256, private compact codec -- ADR-0004's Implementation note) with claims {upload_id, file_id, version_id, part_number, offset, size, op="multipart_part", exp} - `inst-init-sign-urls`
 10. [x] - `p1` - RETURN 200 {upload_id, version_id, part_hash_algorithm, part_size, parts: [{part_number, offset, size, upload_url}], expires_at} - `inst-init-return`
 
 ### Upload a Part
@@ -156,7 +156,7 @@ User-facing interactions that start with an actor (human or external system) and
 
 **Steps**:
 1. [x] - `p1` - Client: PUT <signed_part_url> with raw body of exactly `size` bytes - `inst-part-request`
-2. [x] - `p1` - Sidecar: verify the signed token (asymmetric Ed25519; sidecar cannot mint tokens -- ADR-0004; **not
+2. [x] - `p1` - Sidecar: verify the signed token (asymmetric ECDSA P-256/SHA-256; sidecar cannot mint tokens -- ADR-0004; **not
    literal PASETO -- see that ADR's Implementation note**) - `inst-part-verify-token`
 3. [x] - `p1` - **IF** token invalid or expired **RETURN** 403 Forbidden - `inst-part-token-reject`
 4. [x] - `p1` - Algorithm: enforce per-part size claim using `cpt-cf-file-storage-algo-enforce-part-size` -- RETURN 413/PAYLOAD_TOO_LARGE before/after writing if mismatch - `inst-part-size-enforce`
@@ -228,11 +228,18 @@ returned.
 - Policy size limit exceeded by the assembled total -- policy-size-exceeded error
 - Session `aborted` or expired, or `upload_id` foreign to this `file_id` -- `404`-shaped "not found"
 - `If-Match` supplied and it does not match the file's current content ETag -- `400` (`FailedPrecondition`)
+- The abandoned-session/expiry sweep aborts the session **after** this call already passed the step-4 non-terminal
+  check and won the lease, but **before** its finalize transaction (step 14) runs -- a race window the sweep's own
+  TTL reclaim can land in while this call's backend assembly (step 12) is still in flight. The finalize transaction's
+  first statement re-checks session state and rejects with `409 Conflict` instead of finalizing a version for a
+  session no longer there to own it. Because the backend assembly already succeeded by this point, this call
+  best-effort deletes the object it just assembled (it's an orphan no DB row will ever point at again -- the sweep
+  that aborted the session already removed its part rows) before returning the `409`
 
 **Steps**:
 1. [x] - `p1` - Client: POST /api/file-storage/v1/files/{id}/multipart/{upload_id}/complete (no request body; optional `If-Match` header). Control plane: authorize `write` - `inst-complete-request`
 2. [x] - `p1` - Control plane: load the session by `upload_id`; verify it belongs to `file_id` - `inst-complete-load-session`
-3. [x] - `p1` - **IF** the session is already `completed`: RETURN **200** by replaying the persisted `complete_result` -- or, only for a session that predates the `complete_result`/`auto_bind` migration (`m20260924_000001_upload_flow_redesign`) and so has no such JSON to replay, rebuilding the response from the finalized version row instead -- idempotent convergence, no re-assembly, no DB write; this check runs **before** the `If-Match` precondition below - `inst-complete-replay`
+3. [x] - `p1` - **IF** the session is already `completed`: RETURN **200** by replaying the persisted `complete_result` -- or, only for a session that predates the `complete_result`/`auto_bind` migration (`m20261014_000001_upload_flow`) and so has no such JSON to replay, rebuilding the response from the finalized version row instead -- idempotent convergence, no re-assembly, no DB write; this check runs **before** the `If-Match` precondition below - `inst-complete-replay`
 4. [x] - `p1` - **ELSE IF** the session is `aborted`, or its `expires_at` has passed: RETURN `404`-shaped "not found" - `inst-complete-terminal-reject`
 5. [x] - `p1` - **ELSE**: if `If-Match` is present and not `*`, compare it against the file's current content ETag and reject on mismatch (`400`) - `inst-complete-ifmatch`
 6. [x] - `p1` - DB: attempt to win the completion lease via one conditional UPDATE -- `state='completing', lease_until=now+multipart_complete_lease_secs, lease_owner=:me WHERE state='in_progress' OR (state='completing' AND lease_until < now)` (the second arm is a takeover of a dead lease owner, the same operation as a fresh acquire); the read-only checks above (session lookup, terminal-state check, `If-Match`) run **before** this CAS so a deterministic rejection never occupies the lease - `inst-complete-lease-acquire`
@@ -244,7 +251,7 @@ returned.
 12. [x] - `p1` - Detached backend task (the client's HTTP request is open but expendable -- a dropped connection does not cancel it): `CompleteMultipartUpload`, building the ADR-0006 offset-manifest and its root hash from the already-persisted per-part digests+offsets -- **no re-read** of the assembled object - `inst-complete-assemble`
 13. [x] - `p1` - Post-assembly, pre-finalize: sniff the assembled object's leading bytes and validate against `session.declared_mime` (`cpt-cf-file-storage-fr-content-type-validation`); re-check the policy size ceiling against the resolved MIME; on mismatch release the lease CAS (`completing -> in_progress`, so the next `complete` retries immediately) and fail **before** any DB finalize (the assembled blob becomes an orphan reclaimed by the orphan-reconciliation sweep) - `inst-complete-mime-validate`
 14. [x] - `p1` - **One DB transaction**: finalize the version row (`status: pending -> available`, real assembled `size`/composite `content_hash`/`hash_mode`/`part_count`/`manifest`) -- for a **manual** session (`auto_bind = false`) this leaves `content_id` untouched; for an **auto-bind** session (`auto_bind = true`) the same transaction also attempts the `content_id IS NULL` CAS bind, touching `content_id` only if it wins -- **plus**, in the same transaction, the session CAS `completing -> completed` and the persisted `complete_result` JSON -- **on this fast (first-attempt) path** the audit row is written in this same transaction too; on a takeover or converge path (see below) the audit row is instead written via a separate step - `inst-complete-finalize-version`
-15. [x] - `p1` - RETURN **200** `{version_id, size, hash_algorithm, content_hash, hash_mode, part_count, manifest, bind_state, etag?, current_etag?}` - `inst-complete-return`
+15. [x] - `p1` - RETURN **200** `{version_id, size, hash_algorithm, content_hash, hash_mode, part_count, manifest?, bind_state, etag?, current_etag?}` - `inst-complete-return`
 16. [ ] - `p2` - For a **manual** session (`bind_state: "manual"`) or a lost auto-bind CAS (`bind_state: "conflict"`), the client separately calls `POST /files/{id}/bind {version_id}` under `If-Match` to swap `content_id` and make the content live; a won auto-bind CAS (`bind_state: "bound"`) needs no follow-up call - `inst-complete-bind-followup`
 
 A completer that **dies** mid-`completing` (control-plane crash after winning the lease, before the finalize
@@ -415,7 +422,7 @@ regardless of lease state.
 
 - [x] `p1` - **ID**: `cpt-cf-file-storage-dod-multipart-initiate`
 
-The system **MUST** implement `POST /api/file-storage/v1/files/{id}/multipart` on the control plane. The endpoint validates declared_mime, declared_size, and storage quota; calls `cpt-cf-file-storage-algo-compute-parts-plan`; pre-registers a pending version; persists the multipart session with declared_size and part_size; mints one signed URL per part (Ed25519, codec-equivalent to PASETO v4.public -- ADR-0004) (claims: upload_id, file_id, version_id, part_number, offset, size, op, exp); and returns the full parts plan. The parts plan enforces a hard ceiling of 10,000 parts (`MAX_PART_COUNT`), widening the part size (up to `MAX_PART_SIZE`, 5 GiB) before rejecting a `declared_size` that cannot fit even at the maximum part size.
+The system **MUST** implement `POST /api/file-storage/v1/files/{id}/multipart` on the control plane. The endpoint validates declared_mime, declared_size, and storage quota; calls `cpt-cf-file-storage-algo-compute-parts-plan`; pre-registers a pending version; persists the multipart session with declared_size and part_size; mints one signed URL per part (ECDSA P-256/SHA-256, private compact codec -- ADR-0004) (claims: upload_id, file_id, version_id, part_number, offset, size, op, exp); and returns the full parts plan. The parts plan enforces a hard ceiling of 10,000 parts (`MAX_PART_COUNT`), widening the part size (up to `MAX_PART_SIZE`, 5 GiB) before rejecting a `declared_size` that cannot fit even at the maximum part size.
 
 **Implements**:
 - `cpt-cf-file-storage-flow-multipart-initiate`
@@ -430,7 +437,7 @@ The system **MUST** implement `POST /api/file-storage/v1/files/{id}/multipart` o
 
 - [x] `p1` - **ID**: `cpt-cf-file-storage-dod-multipart-sidecar-enforcement`
 
-The sidecar part-upload handler verifies the signed token (Ed25519, codec-equivalent to but not literal
+The sidecar part-upload handler verifies the signed token (ECDSA P-256/SHA-256, private codec rather than
 PASETO -- ADR-0004's Implementation note); calls `cpt-cf-file-storage-algo-enforce-part-size` to reject with HTTP 413
 if the body length does not match the size claim — neither write path buffers a whole part: on `multipart_native`
 paths a sidecar-side streaming counter (`part_size_guard`) enforces the ceiling ahead of the backend write, and the
@@ -468,11 +475,16 @@ session `completing -> completed`, and persists the `complete_result` JSON -- pl
 path, the audit row too (a takeover or converge path instead writes the audit row via a separate step). A crash
 between winning the lease and this transaction committing leaves the session at `completing` for the next `complete`
 call to take over (§4's state machine), never a half-finalized version. A failed assembly/verification instead
-releases the lease (`completing -> in_progress`) so the next `complete` retries immediately. Returns **`200`** with
-`{version_id, size, hash_algorithm, content_hash, hash_mode, part_count, manifest, bind_state, etag?,
+releases the lease (`completing -> in_progress`) so the next `complete` retries immediately. If instead the
+abandoned-session/expiry sweep aborts the session out from under this call between its lease win and this
+transaction (a race the sweep's own TTL reclaim can land in while assembly is still running), the transaction's own
+first statement detects the session is no longer there to own and rejects with `409` instead of finalizing a version
+for it -- this call then best-effort deletes the object it already assembled on the backend, since the aborted
+session leaves no DB row left to ever reference it. Returns **`200`** with
+`{version_id, size, hash_algorithm, content_hash, hash_mode, part_count, manifest?, bind_state, etag?,
 current_etag?}`. A retry against an already-`completed` session **converges**: it replays the persisted
 `complete_result` verbatim -- or, only for a session that predates the `complete_result`/`auto_bind` migration
-(`m20260924_000001_upload_flow_redesign`) and so never got one, rebuilds it from the finalized version row instead --
+(`m20261014_000001_upload_flow`) and so never got one, rebuilds it from the finalized version row instead --
 without re-running assembly or any CAS, and it never returns `409` (the audit row for this converge case is written
 via a separate step, not as part of a repeated finalize transaction). It accepts an **optional**
 `If-Match` header (a concrete value is checked against the file's current content ETag, `*`/absent is unconditional).

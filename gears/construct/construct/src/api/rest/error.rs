@@ -112,9 +112,9 @@ pub fn too_long(field: &str, limit: usize) -> CanonicalError {
         .create()
 }
 
-/// The REST answer for a domain error on the manage-facts route. A subject the caller may not act for answers as a
-/// subject that does not exist, so the answer reveals nothing about it. The gear's own failures are mapped as
-/// everywhere else.
+/// The REST answer for a domain error on the manage-facts route. A subject the caller may not act for, or whose
+/// settings the caller's policy scope leaves out, answers as a subject that does not exist, so the answer reveals
+/// nothing about it. The gear's own failures are mapped as everywhere else.
 ///
 /// @cpt-dod:cpt-cf-construct-dod-planner-manage-route:p1
 #[must_use]
@@ -122,6 +122,12 @@ pub fn for_facts(e: DomainError, subject_id: Uuid) -> CanonicalError {
     match e {
         DomainError::Forbidden(msg) => {
             tracing::warn!(msg = %msg, "construct subject facts access refused");
+            SubjectFactsError::not_found("no such subject")
+                .with_resource(subject_id.to_string())
+                .create()
+        }
+        DomainError::OutOfScope(refused) => {
+            log_out_of_scope(&refused);
             SubjectFactsError::not_found("no such subject")
                 .with_resource(subject_id.to_string())
                 .create()

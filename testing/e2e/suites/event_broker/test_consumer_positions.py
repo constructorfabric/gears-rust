@@ -5,13 +5,15 @@ All SEEK requests use the topic-keyed wire format:
 
 The SEEK response mirrors that shape:
 ``{"positions": {"<topic>": [{"partition": int, "value": int}]}}``
-where ``value`` is the resolved cursor (RF-1 for "earliest", HWM for "latest").
+where ``value`` is the resolved cursor (RF-1 for "earliest", the head - the
+last stored event's sequence - for "latest").
 
 Every test that asserts a concrete cursor value or a quoted valid range runs
 against TOPIC_PREFILLED, which is seeded with PREFILLED_COUNT events into a
-fresh database at session bootstrap. That fixes RF-1 at 0 and HWM at
-PREFILLED_COUNT, so both bounds are known constants rather than whatever a
-shared topic happens to hold.
+fresh medium at session bootstrap. That fixes RF-1 at 0, and the
+`prefilled_topic` fixture records the sequence every seeded event got, so the
+head is known too rather than whatever a shared topic happens to hold.
+Sequences rise but may have gaps, so no position is computed from the count.
 """
 
 from __future__ import annotations
@@ -28,7 +30,6 @@ from .conftest import (
     EVENT_TYPE_STREAM,
     EVENT_TYPE_PREFILLED,
     TOPIC_4P,
-    PREFILLED_COUNT,
     PREFILLED_TENANT_ID,
     SUBJECT_TYPE,
     TOPIC_STREAM,
@@ -38,6 +39,7 @@ from .conftest import (
 )
 
 
+@pytest.mark.backend_sensitive
 async def test_seek_earliest_returns_resolved_cursor(api, prefilled_topic):
     """scenario: consumer/positions/1.01-positive-seek-earliest.md
 
@@ -82,12 +84,12 @@ async def test_seek_earliest_returns_resolved_cursor(api, prefilled_topic):
     assert body["positions"][TOPIC_PREFILLED] == [{"partition": 0, "value": 0}]
 
 
+@pytest.mark.backend_sensitive
 async def test_seek_latest_returns_hwm_cursor(api, prefilled_topic):
     """scenario: consumer/positions/1.02-positive-seek-latest.md
 
-    "latest" resolves to the current HWM.  TOPIC_PREFILLED is seeded with
-    exactly PREFILLED_COUNT events at session bootstrap into a fresh database,
-    so sequences start at 1 and the HWM is exactly PREFILLED_COUNT.
+    "latest" resolves to the head, the last stored event's sequence, which
+    the `prefilled_topic` fixture recorded when it read the seeded events back.
     """
     async with api() as client:
         group_resp = await client.post("/consumer-groups")
@@ -121,9 +123,10 @@ async def test_seek_latest_returns_hwm_cursor(api, prefilled_topic):
     body = resp.json()
     assert isinstance(body, dict)
     assert list(body["positions"]) == [TOPIC_PREFILLED]
-    assert body["positions"][TOPIC_PREFILLED] == [{"partition": 0, "value": PREFILLED_COUNT}]
+    assert body["positions"][TOPIC_PREFILLED] == [{"partition": 0, "value": prefilled_topic.head}]
 
 
+@pytest.mark.backend_sensitive
 async def test_seek_exact_offset_accepted(api, prefilled_topic):
     """scenario: consumer/positions/1.03-positive-seek-exact-offset.md
 
@@ -179,8 +182,8 @@ async def test_mixed_sentinels_and_integers_accepted(api, prefilled_topic):
     A SEEK may send an integer alongside a sentinel in the same request.  With
     TOPIC_PREFILLED (1 partition) a true mix of two partitions is not possible,
     so the test demonstrates that an integer equivalent to a sentinel resolves
-    to the same concrete value: seeking 0 (= "earliest") and seeking
-    PREFILLED_COUNT (= "latest") both return the expected integers.
+    to the same concrete value: seeking 0 (= "earliest") and seeking the head
+    (= "latest") both return the expected integers.
     """
     async with api() as client:
         group_resp = await client.post("/consumer-groups")
@@ -218,19 +221,20 @@ async def test_mixed_sentinels_and_integers_accepted(api, prefilled_topic):
         resp_high = await client.post(
             f"/subscriptions/{sub_id}:seek",
             json={
-                "topology_version": 1, "positions": {TOPIC_PREFILLED: [{"partition": 0, "value": PREFILLED_COUNT}]}
+                "topology_version": 1, "positions": {TOPIC_PREFILLED: [{"partition": 0, "value": prefilled_topic.head}]}
             },
         )
     assert resp_high.status_code == 200
-    assert resp_high.json()["positions"][TOPIC_PREFILLED] == [{"partition": 0, "value": PREFILLED_COUNT}]
+    assert resp_high.json()["positions"][TOPIC_PREFILLED] == [{"partition": 0, "value": prefilled_topic.head}]
 
 
+@pytest.mark.backend_sensitive
 async def test_out_of_range_below_rf_rejected_400(api, prefilled_topic):
     """scenario: consumer/positions/1.05-negative-out-of-range-offset.md
 
     An integer SEEK value below RF-1 is rejected.  TOPIC_PREFILLED fixes the
-    valid range - RF-1 = 0 and HWM = PREFILLED_COUNT - so the range the error
-    quotes is a known constant and can be asserted literally.  Seeking to -1
+    valid range - RF-1 = 0 and the head the fixture recorded - so the range the
+    error quotes is known and can be asserted literally.  Seeking to -1
     is below the floor.  The error names the offending entry by its index in
     ``partition_positions`` and carries no part of the submitted value.
     """
@@ -275,7 +279,7 @@ async def test_out_of_range_below_rf_rejected_400(api, prefilled_topic):
             "field_violations": [
                 {
                     "field": "positions",
-                    "description": f"topic {TOPIC_PREFILLED} partition 0: the seek position is below the valid range [0, {PREFILLED_COUNT}]",
+                    "description": f"topic {TOPIC_PREFILLED} partition 0: the seek position is below the valid range [0, {prefilled_topic.head}]",
                     "reason": "below_retention_floor",
                 }
             ],
@@ -284,13 +288,14 @@ async def test_out_of_range_below_rf_rejected_400(api, prefilled_topic):
     }
 
 
+@pytest.mark.backend_sensitive
 async def test_offset_above_hwm_rejected_400(api, prefilled_topic):
     """scenario: consumer/positions/1.06-negative-offset-above-hwm.md
 
-    A SEEK value above HWM is rejected - it would claim to have processed
-    events that do not exist yet.  TOPIC_PREFILLED puts HWM at exactly
-    PREFILLED_COUNT, so seeking one past it is the tightest possible breach
-    and the quoted range is a known constant.
+    A SEEK value above the head is rejected - it would claim to have processed
+    events that do not exist yet.  The fixture recorded TOPIC_PREFILLED's head,
+    so seeking one past it is the tightest possible breach and the quoted range
+    is known.
     """
     async with api() as client:
         group_resp = await client.post("/consumer-groups")
@@ -317,7 +322,7 @@ async def test_offset_above_hwm_rejected_400(api, prefilled_topic):
         resp = await client.post(
             f"/subscriptions/{sub_id}:seek",
             json={
-                "topology_version": 1, "positions": {TOPIC_PREFILLED: [{"partition": 0, "value": PREFILLED_COUNT + 1}]}
+                "topology_version": 1, "positions": {TOPIC_PREFILLED: [{"partition": 0, "value": prefilled_topic.head + 1}]}
             },
         )
     assert resp.status_code == 400
@@ -333,7 +338,7 @@ async def test_offset_above_hwm_rejected_400(api, prefilled_topic):
             "field_violations": [
                 {
                     "field": "positions",
-                    "description": f"topic {TOPIC_PREFILLED} partition 0: the seek position is above the valid range [0, {PREFILLED_COUNT}]",
+                    "description": f"topic {TOPIC_PREFILLED} partition 0: the seek position is above the valid range [0, {prefilled_topic.head}]",
                     "reason": "above_high_water_mark",
                 }
             ],
@@ -559,12 +564,13 @@ async def test_seek_stale_topology_version_rejected_412(api):
     assert "assigned" not in body["context"]
 
 
+@pytest.mark.backend_sensitive
 async def test_seek_any_value_in_retention_range_accepted(api, prefilled_topic):
     """scenario: consumer/positions/1.10-positive-seek-any-value-in-range.md
 
-    Any integer in [RF-1, HWM] is accepted.  TOPIC_PREFILLED has RF-1=0 and
-    HWM=PREFILLED_COUNT so both boundaries are known; a midpoint (PREFILLED_COUNT//2)
-    confirms an interior value is also accepted.
+    Any integer in [RF-1, head] is accepted.  TOPIC_PREFILLED has RF-1=0 and
+    the head the fixture recorded, so both boundaries are known; the sequence
+    of the middle seeded event confirms an interior value is also accepted.
     """
     async with api() as client:
         group_resp = await client.post("/consumer-groups")
@@ -588,7 +594,8 @@ async def test_seek_any_value_in_retention_range_accepted(api, prefilled_topic):
         assert sub_resp.status_code == 201
         sub_id = str(sub_resp.json()["id"])
 
-        for value in (0, PREFILLED_COUNT // 2, PREFILLED_COUNT):
+        middle = prefilled_topic.events[len(prefilled_topic.events) // 2]["sequence"]
+        for value in (0, middle, prefilled_topic.head):
             resp = await client.post(
                 f"/subscriptions/{sub_id}:seek",
                 json={
@@ -599,13 +606,13 @@ async def test_seek_any_value_in_retention_range_accepted(api, prefilled_topic):
             assert resp.json()["positions"][TOPIC_PREFILLED] == [{"partition": 0, "value": value}]
 
 
+@pytest.mark.backend_sensitive
 async def test_seek_at_timestamp_returns_resolved_integer(api, prefilled_topic):
     """scenario: consumer/positions/1.11-positive-seek-at-timestamp.md
 
     "at:<ISO-8601>" resolves to the first event at or after that timestamp.
-    A far-future timestamp clamps to HWM.  TOPIC_PREFILLED is seeded with
-    PREFILLED_COUNT events so the HWM is exactly PREFILLED_COUNT and the
-    assertion is concrete.
+    A far-future timestamp clamps to the head, which the fixture recorded, so
+    the assertion is concrete.
     """
     async with api() as client:
         group_resp = await client.post("/consumer-groups")
@@ -639,14 +646,15 @@ async def test_seek_at_timestamp_returns_resolved_integer(api, prefilled_topic):
     body = resp.json()
     assert isinstance(body, dict)
     assert list(body["positions"]) == [TOPIC_PREFILLED]
-    assert body["positions"][TOPIC_PREFILLED] == [{"partition": 0, "value": PREFILLED_COUNT}]
+    assert body["positions"][TOPIC_PREFILLED] == [{"partition": 0, "value": prefilled_topic.head}]
 
 
+@pytest.mark.backend_sensitive
 async def test_seek_timestamp_before_retention_clamps_to_rf(api, prefilled_topic):
     """scenario: consumer/positions/1.12-positive-seek-at-timestamp-before-retention.md
 
     A timestamp before the retention floor clamps to RF-1.  TOPIC_PREFILLED
-    has PREFILLED_COUNT events but RF=1 (no eviction in this session), so
+    has its seeded events but RF=1 (no eviction in this session), so
     RF-1=0 and a pre-epoch timestamp resolves to exactly 0.
     """
     async with api() as client:
@@ -684,12 +692,13 @@ async def test_seek_timestamp_before_retention_clamps_to_rf(api, prefilled_topic
     assert body["positions"][TOPIC_PREFILLED] == [{"partition": 0, "value": 0}]
 
 
+@pytest.mark.backend_sensitive
 async def test_seek_timestamp_beyond_hwm_clamps_to_hwm(api, prefilled_topic):
     """scenario: consumer/positions/1.13-positive-seek-at-timestamp-beyond-hwm.md
 
-    A timestamp beyond the HWM clamps to the current HWM (same as "latest").
-    TOPIC_PREFILLED's HWM is exactly PREFILLED_COUNT so the assertion is
-    concrete; no need to first resolve "latest" and compare indirectly.
+    A timestamp beyond the head clamps to the head (same as "latest"). The
+    fixture recorded TOPIC_PREFILLED's head, so the assertion is concrete; no
+    need to first resolve "latest" and compare indirectly.
     """
     async with api() as client:
         group_resp = await client.post("/consumer-groups")
@@ -723,22 +732,25 @@ async def test_seek_timestamp_beyond_hwm_clamps_to_hwm(api, prefilled_topic):
     body = resp.json()
     assert isinstance(body, dict)
     assert list(body["positions"]) == [TOPIC_PREFILLED]
-    assert body["positions"][TOPIC_PREFILLED] == [{"partition": 0, "value": PREFILLED_COUNT}]
+    assert body["positions"][TOPIC_PREFILLED] == [{"partition": 0, "value": prefilled_topic.head}]
 
 
-RESUME_AT = 40
+# The index of the seeded event the consumer stops after.
+RESUME_AFTER = 39
 
 
+@pytest.mark.backend_sensitive
 @pytest.mark.timeout(30, func_only=True)
 async def test_seek_resume_from_cursor(api, test_env, prefilled_topic):
     """scenario: consumer/positions/1.14-positive-seek-resume-from-cursor.md
 
-    Consumer reads from earliest to sequence RESUME_AT, then reconnects in the
-    same group by seeking to the integer RESUME_AT. The first event on the
-    resumed stream must be sequence RESUME_AT + 1 - no event reprocessed, none
-    skipped.
+    Consumer reads from earliest up to the seeded event at RESUME_AFTER, then
+    reconnects in the same group by seeking to that event's sequence. The first
+    event on the resumed stream must be the next seeded event - no event
+    reprocessed, none skipped, whatever gap lies between their sequences.
     """
-    # ── Phase 1: join, seek earliest, stream until sequence RESUME_AT ──────
+    resume_at = prefilled_topic.events[RESUME_AFTER]["sequence"]
+    # ── Phase 1: join, seek earliest, stream until sequence resume_at ──────
     async with api() as client:
         group_resp = await client.post("/consumer-groups")
         assert group_resp.status_code == 201
@@ -784,10 +796,10 @@ async def test_seek_resume_from_cursor(api, test_env, prefilled_topic):
             assert topology_kind == "topology"
             while True:
                 kind, data = await reader.next_frame(timeout=10)
-                if kind == "event" and data["payload"]["sequence"] == RESUME_AT:
+                if kind == "event" and data["payload"]["sequence"] == resume_at:
                     break
 
-    # ── Phase 2: delete sub1, create sub2, seek to RESUME_AT, resume ───────
+    # ── Phase 2: delete sub1, create sub2, seek to resume_at, resume ───────
     async with api() as client:
         del_resp = await client.delete(f"/subscriptions/{sub1_id}")
         assert del_resp.status_code == 204
@@ -812,12 +824,12 @@ async def test_seek_resume_from_cursor(api, test_env, prefilled_topic):
         seek2_resp = await client.post(
             f"/subscriptions/{sub2_id}:seek",
             json={
-                "topology_version": 1, "positions": {TOPIC_PREFILLED: [{"partition": 0, "value": RESUME_AT}]}
+                "topology_version": 1, "positions": {TOPIC_PREFILLED: [{"partition": 0, "value": resume_at}]}
             },
         )
         assert seek2_resp.status_code == 200
         assert seek2_resp.json() == {
-            "positions": {TOPIC_PREFILLED: [{"partition": 0, "value": RESUME_AT}]}
+            "positions": {TOPIC_PREFILLED: [{"partition": 0, "value": resume_at}]}
         }
 
     async with httpx.AsyncClient(
@@ -833,21 +845,21 @@ async def test_seek_resume_from_cursor(api, test_env, prefilled_topic):
             event_kind, event_data = await reader.next_frame(timeout=5)
 
     assert event_kind == "event"
-    payload = event_data["payload"]
-    assert payload == {
-        "id": payload["id"],
+    nxt = prefilled_topic.events[RESUME_AFTER + 1]
+    assert event_data["payload"] == {
+        "id": nxt["id"],
         "type": EVENT_TYPE_PREFILLED,
         "topic": TOPIC_PREFILLED,
         "tenant_id": PREFILLED_TENANT_ID,
         "source": "e2e-prefill",
         "subject": "prefill-subject",
         "subject_type": SUBJECT_TYPE,
-        "occurred_at": payload["occurred_at"],
+        "occurred_at": nxt["occurred_at"],
         "trace_parent": None,
         "data": None,
         "partition": 0,
-        "sequence": RESUME_AT + 1,
-        "sequence_time": payload["sequence_time"],
+        "sequence": nxt["sequence"],
+        "sequence_time": nxt["sequence_time"],
     }
 
 

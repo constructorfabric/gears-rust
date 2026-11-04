@@ -88,7 +88,10 @@ async fn the_census_covers_every_route_the_routers_register() {
     assert_eq!(registered, census());
     assert_eq!(census::source_routes(), registered);
     assert_eq!(census::readers("require_authenticated("), registered);
-    assert_eq!(census::readers("authz::access_scope("), registered);
+    // Every door asks the PDP but the currency table (D-537), which authenticates only.
+    let mut asks_the_pdp = registered.clone();
+    assert!(asks_the_pdp.remove(&("GET".to_owned(), "/bss-pricing/v1/currencies".to_owned())));
+    assert_eq!(census::readers("authz::access_scope("), asks_the_pdp);
     assert_eq!(registered.len(), 61);
     assert_eq!(bss_pricing::authz::labels::ALL.len(), 7);
     let permissions: Vec<_> = toolkit_gts::inventory::iter::<toolkit_gts::InventoryInstance>
@@ -103,7 +106,7 @@ async fn the_census_covers_every_route_the_routers_register() {
 /// id `PRICING_SYSTEM_ACTOR`; a token's claims can carry both) is refused at every door the real
 /// `register_rest` serves, 403 `SYSTEM_ACTOR_RESERVED`, before the PDP is asked. Another system
 /// subject (Rating's, which calls resolve) passes the edge and meets the PDP, here one that cannot
-/// answer (503).
+/// answer (503), except at the currency table, which asks no PDP (D-537) and answers 200.
 #[tokio::test]
 async fn no_rest_door_serves_pricings_system_actor() {
     use axum::{body::Body, http::Request};
@@ -166,6 +169,8 @@ async fn no_rest_door_serves_pricings_system_actor() {
                     body["context"]["reason"], "SYSTEM_ACTOR_RESERVED",
                     "{method} {path} as {who:?}: {body}"
                 );
+            } else if path == "/bss-pricing/v1/currencies" {
+                assert_eq!(status, 200, "{method} {path} as {who:?}: {body}");
             } else {
                 assert_eq!(status, 503, "{method} {path} as {who:?}: {body}");
             }
@@ -185,9 +190,14 @@ fn the_authentication_and_authz_parsers_have_positive_controls() {
     // as the list and the counts doors do, once, in one helper (D-490); its card and votes call
     // the doors. The source's page also authenticates once more before it asks its read grant and
     // the two flag grants at once (one PDP round trip), so a 401 still comes first.
-    for (needle, more) in [("require_authenticated(", 3), ("authz::access_scope(", 5)] {
+    // The currency table (D-537) authenticates and asks no permission: 61 routes authenticate,
+    // 60 ask the PDP.
+    for (needle, routes, more) in [
+        ("require_authenticated(", 61, 3),
+        ("authz::access_scope(", 60, 5),
+    ] {
         assert_eq!(census::count_in_functions(census::CONTROL, needle), 2);
-        assert_eq!(census::production_count(needle), 61 + more, "{needle}");
+        assert_eq!(census::production_count(needle), routes + more, "{needle}");
     }
     let routes = census::registrations(census::CONTROL);
     assert_eq!(
@@ -238,7 +248,7 @@ fn every_mounted_router_is_merged_into_both_censuses() {
 // GET /price-books/{id}/export price_book:read false false
 // GET /settings config:read false false
 // PUT /settings config:settings true false
-// GET /currencies config:read false false (D-537)
+// GET /currencies authenticated false false (D-537: no permission, no PDP call)
 // GET /dimension-keys config:read false false
 // PUT /dimension-keys config:settings true false
 

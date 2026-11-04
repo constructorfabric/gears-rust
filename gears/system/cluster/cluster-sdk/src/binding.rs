@@ -317,6 +317,7 @@ pub struct UnboundCacheBackend {
 /// A free function rather than a `new`, because what a caller wants here is the
 /// erased `Arc<dyn _Backend>` a facade takes - the concrete type is not nameable
 /// outside this crate anyway.
+#[must_use]
 pub fn unbound_cache(profile: &'static str) -> Arc<dyn ClusterCacheBackend> {
     Arc::new(UnboundCacheBackend { profile })
 }
@@ -424,6 +425,7 @@ pub struct UnboundLockBackend {
 /// A free function rather than a `new`, because what a caller wants here is the
 /// erased `Arc<dyn _Backend>` a facade takes - the concrete type is not nameable
 /// outside this crate anyway.
+#[must_use]
 pub fn unbound_lock(profile: &'static str) -> Arc<dyn DistributedLockBackend> {
     Arc::new(UnboundLockBackend { profile })
 }
@@ -490,6 +492,7 @@ pub struct UnboundLeaderElectionBackend {
 /// A free function rather than a `new`, because what a caller wants here is the
 /// erased `Arc<dyn _Backend>` a facade takes - the concrete type is not nameable
 /// outside this crate anyway.
+#[must_use]
 pub fn unbound_leader_election(profile: &'static str) -> Arc<dyn LeaderElectionBackend> {
     Arc::new(UnboundLeaderElectionBackend { profile })
 }

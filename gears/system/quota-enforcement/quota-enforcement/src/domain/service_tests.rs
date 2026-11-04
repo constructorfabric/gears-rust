@@ -34,6 +34,9 @@ fn service() -> Service {
             cache_entries: 16,
             cache_ttl: std::time::Duration::from_secs(5),
             preparation_max_attempts: std::num::NonZeroU32::new(3).expect("attempts"),
+            leases: crate::domain::operations::LeaseLimits::default(),
+            batch: crate::domain::operations::BatchLimits::default(),
+            snapshot: crate::domain::operations::SnapshotLimits::default(),
         },
     )
 }

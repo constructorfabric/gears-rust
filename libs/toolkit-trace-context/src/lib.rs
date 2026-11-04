@@ -21,6 +21,7 @@
 #![cfg_attr(coverage_nightly, feature(coverage_attribute))]
 
 use http::HeaderMap;
+use std::future::Future;
 
 /// The `(trace_id, span_id)` of the currently active `OTel` span, if valid.
 ///
@@ -245,6 +246,65 @@ mod imp {
 
 pub use imp::{inject_current_span, set_parent_from_headers};
 
+/// `x-request-id` header name — the edge-minted, chain-scoped correlation id
+/// the gateway echoes on responses and gears record on their request spans.
+///
+/// Unlike `trace_id` (a new span per hop), the request id is static for the
+/// whole request chain. Inbound middleware installs it via [`with_request_id`];
+/// `toolkit-http` forwards it on outbound requests via [`inject_request_id`].
+pub const X_REQUEST_ID: &str = "x-request-id";
+
+tokio::task_local! {
+    /// Chain-scoped `x-request-id` for the in-flight request this task serves.
+    static REQUEST_ID: Option<String>
+}
+
+/// Extract the inbound `x-request-id` header value, if present.
+#[must_use]
+pub fn extract_request_id(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get(X_REQUEST_ID)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned)
+}
+
+/// The `x-request-id` installed by [`with_request_id`], if any.
+///
+/// Returns `None` outside the task that `with_request_id` wraps — see its
+/// docs for the `tokio::spawn` / `spawn_blocking` / streamed-body limitation.
+#[must_use]
+pub fn current_request_id() -> Option<String> {
+    REQUEST_ID.try_with(Clone::clone).ok().flatten()
+}
+
+/// Run `f` with `id` installed as [`current_request_id`], so `toolkit-http`
+/// requests made while serving this request carry the same `x-request-id`
+/// downstream. `None` installs an empty scope: nothing propagates.
+///
+/// `id` is a tokio task-local, so it is not inherited across `tokio::spawn` /
+/// `spawn_blocking` or into a streamed body polled after `f` resolves — such
+/// work is uncorrelated unless it captures `current_request_id` and re-installs
+/// it via `with_request_id` (as `tracing::Span` needs `.in_current_span()`).
+pub async fn with_request_id<F: Future>(id: Option<String>, f: F) -> F::Output {
+    REQUEST_ID.scope(id, f).await
+}
+
+/// Copy [`current_request_id`] into `headers` unless the caller already set
+/// `x-request-id`. A no-op outside a request scope — nothing is minted.
+///
+/// Must run in the caller's task, not in a `Buffer`-ed layer: the buffer's
+/// worker task sees no task-locals (it forwards only `tracing::Span`).
+pub fn inject_request_id(headers: &mut HeaderMap) {
+    if headers.contains_key(X_REQUEST_ID) {
+        return;
+    }
+    if let Some(id) = current_request_id()
+        && let Ok(value) = id.parse()
+    {
+        headers.insert(X_REQUEST_ID, value);
+    }
+}
+
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
@@ -328,6 +388,54 @@ mod tests {
             parse_trace_id(&format!("00-{TID}-00f067aa0ba902b7-zz")).is_none(),
             "non-hex flags must be rejected"
         );
+    }
+
+    /// The request-id carrier is visible only inside `with_request_id`'s scope
+    /// and never leaks to the surrounding task.
+    #[tokio::test]
+    async fn request_id_is_visible_only_inside_the_scope() {
+        assert!(current_request_id().is_none());
+        let id = with_request_id(Some("req-1".to_owned()), async { current_request_id() }).await;
+        assert_eq!(id.as_deref(), Some("req-1"));
+        assert!(current_request_id().is_none());
+    }
+
+    /// `inject_request_id` stamps the scoped id, leaves a caller-set header
+    /// alone, and does nothing outside a request scope.
+    #[tokio::test]
+    async fn inject_request_id_scoped_explicit_and_absent() {
+        let mut headers = HeaderMap::new();
+        inject_request_id(&mut headers);
+        assert!(
+            headers.is_empty(),
+            "outside a request scope no id is minted"
+        );
+
+        with_request_id(Some("req-9".to_owned()), async {
+            let mut scoped = HeaderMap::new();
+            inject_request_id(&mut scoped);
+            assert_eq!(scoped.get(X_REQUEST_ID).unwrap(), "req-9");
+
+            let mut explicit = HeaderMap::new();
+            explicit.insert(X_REQUEST_ID, "explicit".parse().expect("header"));
+            inject_request_id(&mut explicit);
+            assert_eq!(
+                explicit.get(X_REQUEST_ID).unwrap(),
+                "explicit",
+                "a caller-set header is never overwritten"
+            );
+        })
+        .await;
+    }
+
+    /// `extract_request_id` lifts the raw header value and treats a missing or
+    /// non-UTF8 value as absent.
+    #[test]
+    fn extract_request_id_reads_the_header() {
+        let mut headers = HeaderMap::new();
+        assert!(extract_request_id(&headers).is_none());
+        headers.insert(X_REQUEST_ID, "req-7".parse().expect("header"));
+        assert_eq!(extract_request_id(&headers).as_deref(), Some("req-7"));
     }
 
     /// `set_parent_from_headers` must not panic in either feature mode, and it

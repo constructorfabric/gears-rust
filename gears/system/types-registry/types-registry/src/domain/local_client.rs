@@ -1,7 +1,8 @@
 //! In-process platform and tenant APIs over `RegistryService` (SPEC §10.1, D15, D17).
 //! Shares REST cursors/errors and domain validator tokens. Mutations read back accepted
 //! operations; read failures return Aborted with `operation_id` for same-key replay (D19).
-//! Contexts are unvalidated and record no principal (C2); publisher forwarding is Phase 9.
+//! In-process contexts are trusted by contract, not validated, and record no principal (C2);
+//! publisher forwarding is Phase 9.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -51,10 +52,14 @@ impl LocalClient {
     /// The operation an accepted submit created, read back (D19).
     async fn read_back(
         &self,
-        caller: CallerContext<'_>,
+        ctx: &PlatformSecurityContext,
         operation_id: Uuid,
     ) -> Result<OperationRecord, CanonicalError> {
-        match self.service.operation(caller, operation_id).await {
+        match self
+            .service
+            .operation(CallerContext::Platform(ctx), operation_id)
+            .await
+        {
             Ok(Some(record)) => Ok(record),
             Ok(None) => Err(read_back_failed(operation_id, "it could not be found")),
             Err(e) => {
@@ -236,11 +241,8 @@ impl PlatformTypesRegistryApi for LocalClient {
             .await
             .map_err(CanonicalError::from)?;
         let operation_id = accepted.operation_id;
-        match operation_from(
-            self.read_back(CallerContext::Platform(ctx), operation_id)
-                .await?,
-        )
-        .map_err(|e| unrepresentable(operation_id, &e))?
+        match operation_from(self.read_back(ctx, operation_id).await?)
+            .map_err(|e| unrepresentable(operation_id, &e))?
         {
             sdk::Operation::Registration(operation) => Ok(operation),
             sdk::Operation::Deletion(_) => Err(wrong_kind(operation_id)),
@@ -282,11 +284,8 @@ impl PlatformTypesRegistryApi for LocalClient {
             .await
             .map_err(CanonicalError::from)?;
         let operation_id = accepted.operation_id;
-        match operation_from(
-            self.read_back(CallerContext::Platform(ctx), operation_id)
-                .await?,
-        )
-        .map_err(|e| unrepresentable(operation_id, &e))?
+        match operation_from(self.read_back(ctx, operation_id).await?)
+            .map_err(|e| unrepresentable(operation_id, &e))?
         {
             sdk::Operation::Deletion(operation) => Ok(operation),
             sdk::Operation::Registration(_) => Err(wrong_kind(operation_id)),

@@ -30,6 +30,7 @@ async fn plugin_over(store: FakeQuotaStore) -> (StoragePlugin, Arc<FakeQuotaStor
         store.clone(),
         Arc::new(crate::test_support::FakePolicyStore::default()),
         Arc::new(crate::test_support::FakeConsumptionStore),
+        Arc::new(crate::test_support::FakeLeaseStore) as Arc<dyn crate::domain::ports::LeaseStore>,
     );
     (plugin, store)
 }

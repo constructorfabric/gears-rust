@@ -346,6 +346,7 @@ async fn a_retired_declaration_keeps_its_restrictions_readable_but_takes_no_new_
             .list(&conn, &root, &key)
             .await
             .expect("lists")
+            .rows
             .len(),
         1
     );
@@ -517,6 +518,7 @@ async fn the_list_covers_the_callers_subtree_without_standalone_branches() {
         .list(&conn, &root, &h.key("strict"))
         .await
         .expect("lists")
+        .rows
         .into_iter()
         .map(|r| r.tenant_id)
         .collect();
@@ -529,6 +531,7 @@ async fn the_list_covers_the_callers_subtree_without_standalone_branches() {
         .list(&conn, &actor(t.a), &h.key("strict"))
         .await
         .expect("lists")
+        .rows
         .into_iter()
         .map(|r| r.tenant_id)
         .collect();

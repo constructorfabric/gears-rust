@@ -25,17 +25,17 @@ updates:
     open-pull-requests-limit: 5
     commit-message:
       prefix: "chore(deps)"
-    ignore:
-      # tokio 1.54 panics on a zero-capacity BufStream (tokio-rs/tokio#8494), and every
-      # released pingora-core (<= 0.9.0) creates one per connection, so oagw and
-      # event-broker fail every proxied request (#5421). Cargo.toml caps tokio <1.54
-      # for the same reason; remove both once pingora ships cloudflare/pingora#1060.
-      - dependency-name: "tokio"
-        versions: [">=1.54.0"]
     groups:
+      # apalis crates are pinned with `=` and must move in lockstep: #5543 bumped
+      # apalis-core/apalis-postgres to 1.0.0 via cargo-patch but left apalis on
+      # rc.10, which does not compile. Groups match in order, so this one must
+      # stay above cargo-patch.
+      apalis:
+        patterns:
+          - "apalis*"
       # RustCrypto crates share trait versions (digest/signature): bumping one
       # alone does not compile (#5350: sha2 0.11 against rsa's digest 0.10).
-      # Listed first so these never fall into the patch group below.
+      # Listed above cargo-patch so these never fall into the patch group.
       # pkcs8/sec1 are direct deps locked to rsa's generation (rustls-corecrypto-provider).
       rustcrypto:
         patterns:

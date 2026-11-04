@@ -17,7 +17,7 @@ use super::{
     AccessRepository, EffectiveAccess, Restriction, RestrictionDraft, TenantAccess,
     evict_access_change, may_restrict, restriction_tag, strictest,
 };
-use crate::audit::{AuditOperation, AuditRecord, AuditSink, AuditValue, ImageClass};
+use crate::audit::{ActorTenant, AuditOperation, AuditRecord, AuditSink, AuditValue, ImageClass};
 use crate::domain::category::{DomainVisibility, is_visible};
 use crate::domain::declaration::{Declaration, DeclarationRepository};
 use crate::domain::error::DomainError;
@@ -54,6 +54,27 @@ pub struct AccessReadout {
     pub effective: EffectiveAccess,
     /// The tag a mutation of the pair must present.
     pub etag: ETag,
+    /// The tenant's chain, root first: what a reader's path down to the
+    /// target is cut from.
+    pub chain: Vec<Uuid>,
+    /// The root tenant, which a platform administrator's own tenant is.
+    pub root: Uuid,
+}
+
+/// The stored restrictions of a caller's subtree, with the walk they were
+/// found by.
+#[domain_model]
+#[derive(Debug, Clone)]
+pub struct AccessListing {
+    /// The rows, ordered by tenant.
+    pub rows: Vec<Restriction>,
+    /// The subtree walk, whose parent links are the path from the caller down
+    /// to each row's tenant.
+    pub walk: crate::domain::resolution::Subtree,
+    /// The caller's own tenant: the reader tenant.
+    pub caller: Uuid,
+    /// The root tenant.
+    pub root: Uuid,
 }
 
 /// The service.
@@ -157,6 +178,31 @@ where
         Ok(declaration)
     }
 
+    /// The root tenant and one tenant's chain from it, root first.
+    async fn root_and_chain(&self, tenant: Uuid) -> Result<(Uuid, Vec<Uuid>), DomainError> {
+        let root = self.platform.root_tenant().await?;
+        let chain = if tenant == root {
+            vec![root]
+        } else {
+            self.hierarchy.chain(tenant).await?
+        };
+        Ok((root, chain))
+    }
+
+    /// Effective access over a chain already obtained.
+    async fn effective_over<C: DBRunner>(
+        &self,
+        conn: &C,
+        declaration_id: Uuid,
+        chain: &[Uuid],
+    ) -> Result<EffectiveAccess, DomainError> {
+        let rows = self
+            .access
+            .find_in_tenants(conn, &AccessScope::allow_all(), declaration_id, chain)
+            .await?;
+        Ok(strictest(&rows))
+    }
+
     /// Effective access of one tenant for one declaration.
     async fn effective_for<C: DBRunner>(
         &self,
@@ -164,17 +210,8 @@ where
         declaration_id: Uuid,
         tenant: Uuid,
     ) -> Result<EffectiveAccess, DomainError> {
-        let root = self.platform.root_tenant().await?;
-        let chain = if tenant == root {
-            vec![root]
-        } else {
-            self.hierarchy.chain(tenant).await?
-        };
-        let rows = self
-            .access
-            .find_in_tenants(conn, &AccessScope::allow_all(), declaration_id, &chain)
-            .await?;
-        Ok(strictest(&rows))
+        let (_, chain) = self.root_and_chain(tenant).await?;
+        self.effective_over(conn, declaration_id, &chain).await
     }
 
     /// The target of a read: the caller's own tenant or a descendant that is
@@ -199,7 +236,10 @@ where
             .access
             .find_one(conn, &AccessScope::allow_all(), declaration.id, tenant_id)
             .await?;
-        let effective = self.effective_for(conn, declaration.id, tenant_id).await?;
+        // The target's chain is what the upward disclosure boundary reads the
+        // path from the reader tenant down to the target off.
+        let (root, chain) = self.root_and_chain(tenant_id).await?;
+        let effective = self.effective_over(conn, declaration.id, &chain).await?;
         let etag = restriction_tag(stored.as_ref());
         Ok(AccessReadout {
             declaration,
@@ -207,6 +247,8 @@ where
             stored,
             effective,
             etag,
+            chain,
+            root,
         })
     }
 
@@ -309,6 +351,7 @@ where
                     tenant_id: target,
                     access,
                     set_by: actor.ctx.subject_id().to_string(),
+                    set_by_tenant: Some(actor.ctx.subject_tenant_id()),
                 },
                 current.as_ref().map(|row| row.updated_at),
             )
@@ -325,6 +368,7 @@ where
             key.as_str(),
             Some(target),
             actor.ctx.subject_id().to_string(),
+            ActorTenant::of(actor.ctx.subject_tenant_id()),
             operation,
             actor.request_id.clone(),
         )
@@ -394,6 +438,7 @@ where
                 key.as_str(),
                 Some(target),
                 actor.ctx.subject_id().to_string(),
+                ActorTenant::of(actor.ctx.subject_tenant_id()),
                 AuditOperation::Remove,
                 actor.request_id.clone(),
             )
@@ -432,7 +477,7 @@ where
         conn: &C,
         actor: &AccessActor,
         key: &SettingKey,
-    ) -> Result<Vec<Restriction>, DomainError> {
+    ) -> Result<AccessListing, DomainError> {
         let caller = actor.ctx.subject_tenant_id();
         // @cpt-begin:cpt-cf-settings-service-flow-tenant-access-list:p1:inst-ta-list-3
         let declaration = self.visible_declaration(conn, actor, key).await?;
@@ -440,11 +485,14 @@ where
         // @cpt-begin:cpt-cf-settings-service-flow-tenant-access-list:p1:inst-ta-list-4
         // Under the subtree budget: a listing the budget would cut is refused
         // with the bound named, never answered partially.
-        let (mut tenants, truncated) = self
+        // The walk is kept whole: its parent links are the path from the caller
+        // down to each row's tenant.
+        let walk = self
             .hierarchy
-            .descendants_bfs(caller, crate::domain::resolution::SUBTREE_BUDGET)
+            .subtree(caller, crate::domain::resolution::SUBTREE_BUDGET)
             .await?;
-        if truncated {
+        let mut tenants = walk.order.clone();
+        if walk.truncated {
             return Err(crate::domain::resolution::subtree_too_large(
                 "tenant", "caller's",
             ));
@@ -456,7 +504,12 @@ where
             .await?;
         rows.sort_by_key(|row| row.tenant_id);
         // @cpt-end:cpt-cf-settings-service-flow-tenant-access-list:p1:inst-ta-list-4
-        Ok(rows)
+        Ok(AccessListing {
+            rows,
+            walk,
+            caller,
+            root: self.platform.root_tenant().await?,
+        })
     }
 }
 

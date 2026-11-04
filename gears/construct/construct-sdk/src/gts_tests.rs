@@ -5,6 +5,7 @@ use super::{
     CHAT_MESSAGE_TYPE, ChatMessageV1, ChatRole, ENRICHMENT_FACT_CANDIDATE_TYPE, FactCandidateV1,
     FactField, MASTERY_COURSE_CATALOG_TYPE, RECORD_BASE_TYPE, RECORD_TYPES, RecordV1,
     SUBJECT_REQUIRED_TRAIT, TypeRule, TypeRuleViolation, check_type_rules, record_base_schema,
+    record_type_schema,
 };
 
 /// The schema of `type_id` as the link-time inventory submits it.
@@ -25,6 +26,18 @@ fn store() -> GtsStore {
             .unwrap_or_else(|err| panic!("{type_id} registers: {err}"));
     }
     store
+}
+
+#[test]
+fn each_record_type_schema_is_the_one_it_registers() {
+    for type_id in RECORD_TYPES {
+        assert_eq!(
+            record_type_schema(type_id),
+            Some(registered(type_id)),
+            "{type_id}"
+        );
+    }
+    assert_eq!(record_type_schema("gts.cf.construct.unknown.v1~"), None);
 }
 
 #[test]

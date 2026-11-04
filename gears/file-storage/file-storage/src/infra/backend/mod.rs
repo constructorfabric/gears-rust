@@ -23,6 +23,27 @@ pub use in_memory::InMemoryBackend;
 pub use local_fs::LocalFsBackend;
 pub use s3::S3Backend;
 
+/// Classifies an I/O error of backend `backend_id`: timeouts, interruptions, resets and aborted
+/// or truncated transfers are transient (`BackendUnavailable`); the rest is permanent (`Backend`).
+#[must_use]
+pub fn classify_io_error(backend_id: &str, e: &std::io::Error) -> DomainError {
+    use std::io::ErrorKind;
+    if matches!(
+        e.kind(),
+        ErrorKind::TimedOut
+            | ErrorKind::Interrupted
+            | ErrorKind::WouldBlock
+            | ErrorKind::ConnectionReset
+            | ErrorKind::ConnectionAborted
+            | ErrorKind::BrokenPipe
+            | ErrorKind::UnexpectedEof
+    ) {
+        DomainError::backend_unavailable(backend_id, e.to_string())
+    } else {
+        DomainError::backend(backend_id, e.to_string())
+    }
+}
+
 use crate::infra::content::hash_mode::ManifestEntry;
 
 /// One part of a multipart completion: `(part_number, offset, part_hash, backend_etag)`.
@@ -47,6 +68,18 @@ pub(crate) fn build_manifest_and_root(
     let manifest = Manifest::new(entries)?;
     let root = manifest.root();
     Ok((manifest, root))
+}
+
+/// Result of [`StorageBackend::publish_exclusive`]: measured size/digest of the streamed bytes
+/// plus whether the write landed.
+///
+/// `created: false` means `path` already held a blob, left untouched. `bytes_written` and
+/// `digest` always describe this attempt's bytes, not the stored blob's.
+#[derive(Debug, Clone, Copy)]
+pub struct PublishOutcome {
+    pub bytes_written: u64,
+    pub digest: [u8; 32],
+    pub created: bool,
 }
 
 /// Optional features a backend may declare. Versioning is not here: it is implemented at
@@ -113,6 +146,23 @@ pub trait StorageBackend: Send + Sync {
         self.put(path, Bytes::from(buf)).await?;
         Ok((bytes_written, digest))
     }
+
+    /// Publish a blob at `path` **only if nothing is stored there yet**, unlike [`Self::put_stream`].
+    /// Used only by the sidecar's single-shot upload.
+    ///
+    /// A `PUT` token's signature never covers the body and stays valid until `exp`; overwriting
+    /// would let a token holder replace already-served content under the recorded size/hash/`ETag`
+    /// (an immutability break). Later attempts observe `created: false`.
+    ///
+    /// An `exists`-then-write default would be non-atomic (TOCTOU), so there is none. `LocalFsBackend`
+    /// uses `hard_link`, `InMemoryBackend` one mutex, `S3Backend` `If-None-Match: *` (needs
+    /// conditional-write support; ADR-0003 "Known gap", ADR-0005).
+    async fn publish_exclusive(
+        &self,
+        path: &str,
+        stream: futures::stream::BoxStream<'_, std::io::Result<Bytes>>,
+        max_size: Option<u64>,
+    ) -> Result<PublishOutcome, DomainError>;
 
     /// Read the whole blob at `path`.
     async fn get(&self, path: &str) -> Result<Bytes, DomainError>;

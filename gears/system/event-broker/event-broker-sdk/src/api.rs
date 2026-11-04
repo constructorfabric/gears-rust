@@ -6,12 +6,12 @@ use gts::{GtsIdPattern, GtsInstanceId, GtsTypeId};
 use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
-use crate::error::{EventBrokerError, StorageBackendError};
+use crate::error::EventBrokerError;
 use crate::ids::{ConsumerGroupId, ProducerId, SubscriptionId};
 use crate::models::Event;
 use crate::models::{
-    ConsumerGroup, ConsumerGroupQuery, CreateConsumerGroupRequest, EventType, Page,
-    PartitionLeader, PartitionRange, ResetScope, Subscription, Topic, TopicSegment,
+    ConsumerGroup, ConsumerGroupQuery, CreateConsumerGroupRequest, EventType, Page, PartitionRange,
+    ResetScope, Subscription, Topic, TopicSegment,
 };
 use crate::sequence::Sequence;
 
@@ -40,24 +40,18 @@ pub enum IngestOutcome {
     Duplicate,
 }
 
-/// Broker `last_sequence` for one partition of a topic.
-#[derive(Debug, Clone)]
-pub struct PartitionCursor {
-    pub partition: u32,
-    pub last_sequence: i64,
-}
-
-/// Broker cursors for one topic - the `last_sequence` of each of its partitions.
+/// Broker `last_sequence` of a producer's chain on one topic. The chain is
+/// kept per `(producer_id, topic)`: no partition is part of it (ADR-0004
+/// "Chain Scope").
 #[derive(Debug, Clone)]
 pub struct TopicCursors {
     pub topic: GtsInstanceId,
-    pub partitions: Vec<PartitionCursor>,
+    pub last_sequence: i64,
 }
 
-/// Producer cursor snapshot: the broker's known `last_sequence` per
-/// `(topic, partition)`, grouped by topic, plus the echoed producer identity.
-/// Object-shaped (not a bare array) so producer-level fields can be carried and
-/// the response stays extensible.
+/// Producer cursor snapshot: the broker's known `last_sequence` per topic, plus
+/// the echoed producer identity. Object-shaped (not a bare array) so
+/// producer-level fields can be carried and the response stays extensible.
 #[derive(Debug, Clone)]
 pub struct ProducerCursors {
     pub producer_id: ProducerId,
@@ -66,18 +60,17 @@ pub struct ProducerCursors {
 }
 
 impl ProducerCursors {
-    /// True when the producer has no recorded cursor on any topic/partition.
+    /// True when the producer has no recorded cursor on any topic.
     pub fn is_empty(&self) -> bool {
-        self.topics.iter().all(|topic| topic.partitions.is_empty())
+        self.topics.is_empty()
     }
 
-    /// The broker's known `last_sequence` for a `(topic, partition)`, if any.
-    pub fn last_sequence(&self, topic: &GtsInstanceId, partition: u32) -> Option<i64> {
+    /// The broker's known `last_sequence` for `topic`, if any.
+    pub fn last_sequence(&self, topic: &GtsInstanceId) -> Option<i64> {
         self.topics
             .iter()
             .find(|t| &t.topic == topic)
-            .and_then(|t| t.partitions.iter().find(|p| p.partition == partition))
-            .map(|p| p.last_sequence)
+            .map(|t| t.last_sequence)
     }
 }
 
@@ -93,8 +86,9 @@ pub enum Position {
     Earliest,
     /// Broker-resolved: emit only events admitted after this SEEK.
     Latest,
-    /// Broker-resolved: seek so delivery begins at the first event whose
-    /// `occurred_at` is at or after this instant. Parsed at the API boundary,
+    /// Broker-resolved: seek so delivery begins at the first event the broker
+    /// stored (`sequence_time`) at or after this instant - never by the
+    /// producer's `occurred_at`, which is untrusted. Parsed at the API boundary,
     /// so no backend re-parses a string or has to invent behaviour for one it
     /// cannot read.
     At(chrono::DateTime<chrono::Utc>),
@@ -570,250 +564,4 @@ pub trait EventBrokerApi: Send + Sync {
         ctx: &SecurityContext,
         id: &str,
     ) -> Result<EventType, EventBrokerError>;
-}
-
-// --- EventBrokerBackend - storage plugin seam --------------------------------
-
-/// Plugin trait for swappable storage backends.
-///
-/// Implemented by the built-in memory and postgres backends; third-party backends
-/// register via GTS type extension without modifying broker core.
-///
-/// **Note:** This trait exposes the public [`Event`](crate::models::Event) envelope.
-/// Backend authors need the full shape to persist and assign offsets correctly.
-#[async_trait]
-pub trait EventBrokerBackend: Send + Sync {
-    async fn persist(
-        &self,
-        ctx: &SecurityContext,
-        topic: &str,
-        partition: u32,
-        events: &[Event],
-    ) -> Result<(), StorageBackendError>;
-
-    /// Stored events strictly after `after`, in sequence order, at most
-    /// `max_count` of them.
-    ///
-    /// **Every read of the log is exclusive of the position it names.** Fetching
-    /// with sequence 43 returns sequences greater than 43 - never 43 itself, and
-    /// not necessarily 44, because the next populated sequence is unknowable in a
-    /// space retention and filtering leave sparse. A caller therefore never
-    /// computes the position it wants next; it names the one it has consumed.
-    /// `Sequence::NONE` reads from the start of the space.
-    async fn read(
-        &self,
-        ctx: &SecurityContext,
-        topic: &str,
-        partition: u32,
-        after: Sequence,
-        max_count: usize,
-    ) -> Result<Vec<Event>, StorageBackendError>;
-
-    /// Resolves a requested position to the cursor to read after.
-    ///
-    /// The backend owns this because it is the only thing that knows what it
-    /// holds: where retention has reached, what it has assigned, and when each
-    /// event occurred.
-    ///
-    /// - `Exact(n)` returns `n`, or [`StorageBackendError::OffsetOutOfRange`]
-    ///   when `n` is not a position a cursor may hold here.
-    /// - `Earliest` returns the position just below the oldest event still
-    ///   stored, so delivery begins at that event.
-    /// - `Latest` returns the highest sequence ever assigned - the highest
-    ///   *assigned* rather than the highest still stored, so erasing the newest
-    ///   event never moves it backwards.
-    /// - `At(t)` returns the position just below the first event whose
-    ///   `occurred_at` is at or after `t`, falling back to `Latest` when no
-    ///   stored event is that recent.
-    ///
-    /// A returned position is one a cursor may hold. It is not a claim that an
-    /// event occupies it, and frequently none does - the position below the
-    /// retention floor is precisely the event retention removed.
-    async fn resolve(
-        &self,
-        ctx: &SecurityContext,
-        topic: &str,
-        partition: u32,
-        position: Position,
-    ) -> Result<Sequence, StorageBackendError>;
-
-    async fn query(
-        &self,
-        ctx: &SecurityContext,
-        topic: &str,
-        partition: u32,
-        range: PartitionRange,
-    ) -> Result<Vec<TopicSegment>, StorageBackendError>;
-
-    async fn list_partition_leaders(
-        &self,
-        ctx: &SecurityContext,
-        topic: &str,
-    ) -> Result<Vec<PartitionLeader>, StorageBackendError>;
-
-    /// Performs one retention pass over a single partition and reports what it
-    /// removed.
-    ///
-    /// The backend that owns the rows owns keeping them bounded, so this is a
-    /// trait method rather than anything the broker does to a backend from
-    /// outside - a second backend brings its own enforcement instead of
-    /// inheriting the first one's.
-    ///
-    /// Driven, never self-scheduling: the caller decides the cadence and this
-    /// performs exactly one pass. A backend owns no timer and spawns no task,
-    /// which is the difference between a test that forces three passes
-    /// deterministically and one that sleeps hoping a background thread ran.
-    /// It is also why retention still fires for a topic that has stopped
-    /// receiving events, which enforcement on the append path would not.
-    ///
-    /// # Errors
-    /// [`StorageBackendError::RetentionFailed`] if the pass could not be
-    /// applied. A failed pass removes nothing: whatever it would have removed
-    /// is still there for the next one.
-    async fn maintain(
-        &self,
-        ctx: &SecurityContext,
-        request: &RetentionRequest,
-    ) -> Result<RetentionReport, StorageBackendError>;
-}
-
-/// One partition's retention pass: which partition, and the bounds it must end
-/// within.
-///
-/// The duration bound arrives as an absolute instant rather than a duration
-/// because the caller owns the clock - it is the thing already ticking. A
-/// backend with no clock of its own cannot drift from the broker's, and a test
-/// moves the cutoff instead of having to age the events.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RetentionRequest {
-    topic: GtsInstanceId,
-    partition: u32,
-    oldest_permitted: chrono::DateTime<chrono::Utc>,
-    max_stored_bytes: Option<u64>,
-}
-
-impl RetentionRequest {
-    /// Three arguments of mutually distinguishable types, so none can be passed
-    /// in another's place; the optional byte bound is chained.
-    #[must_use]
-    pub fn for_partition(
-        topic: GtsInstanceId,
-        partition: u32,
-        oldest_permitted: chrono::DateTime<chrono::Utc>,
-    ) -> RetentionRequestBuilder {
-        RetentionRequestBuilder {
-            request: RetentionRequest {
-                topic,
-                partition,
-                oldest_permitted,
-                max_stored_bytes: None,
-            },
-        }
-    }
-
-    #[must_use]
-    pub fn topic(&self) -> &GtsInstanceId {
-        &self.topic
-    }
-
-    #[must_use]
-    pub fn partition(&self) -> u32 {
-        self.partition
-    }
-
-    /// Events stamped before this instant are past the duration bound.
-    #[must_use]
-    pub fn oldest_permitted(&self) -> chrono::DateTime<chrono::Utc> {
-        self.oldest_permitted
-    }
-
-    /// Bytes the partition may hold. `None` leaves it bounded by
-    /// [`oldest_permitted`](Self::oldest_permitted) alone, free to grow past
-    /// any byte figure.
-    #[must_use]
-    pub fn max_stored_bytes(&self) -> Option<u64> {
-        self.max_stored_bytes
-    }
-}
-
-pub struct RetentionRequestBuilder {
-    request: RetentionRequest,
-}
-
-impl RetentionRequestBuilder {
-    /// Bounds the partition by stored bytes as well as by age. Whichever bound
-    /// is reached first triggers removal.
-    #[must_use]
-    pub fn max_stored_bytes(mut self, bytes: u64) -> Self {
-        self.request.max_stored_bytes = Some(bytes);
-        self
-    }
-
-    #[must_use]
-    pub fn build(self) -> RetentionRequest {
-        self.request
-    }
-}
-
-/// What one retention pass did, and where the partition stands after it.
-///
-/// Every figure is counted rather than derived: `removed_events` is the rows
-/// the pass actually removed and `remaining_events` the rows still stored.
-/// Neither is the distance between two sequence numbers - sequences are
-/// ordinals, and after a prefix removal that distance is not a count of
-/// anything.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct RetentionReport {
-    /// Events this pass removed.
-    pub removed_events: u64,
-    /// Stored bytes this pass removed, summed over the rows it removed.
-    pub removed_bytes: u64,
-    /// Events still stored in the partition.
-    pub remaining_events: u64,
-    /// Stored bytes those events occupy.
-    pub remaining_bytes: u64,
-    /// The partition's new floor: the lowest sequence still stored, or `None`
-    /// when the pass left the partition empty.
-    ///
-    /// A reader positioned below this has been overtaken by retention. It is
-    /// owed the oldest surviving event and no explanation, so nothing here is
-    /// ever reported to a consumer.
-    pub oldest_surviving_sequence: Option<Sequence>,
-}
-
-/// Builds one backend from an operator's `backend` block.
-///
-/// The wiring-side counterpart to [`EventBrokerBackend`]: a plugin implements
-/// this so the gear can bind a topic to the backend its settings name, without
-/// the gear knowing how that backend stores a row. Not a `RunnableCapability`
-/// and not a `Gear` - a host builds the provider and injects it, the way the
-/// cluster gear injects its cache providers.
-#[async_trait]
-pub trait EventBrokerBackendProvider: Send + Sync {
-    /// The GTS backend type this provider serves, as a topic's `backend.type`
-    /// names it - a type derived from `gts.cf.core.events.backend.v1~`.
-    ///
-    /// A type identifier rather than a short alias because a backend *is* a GTS
-    /// type: the plugin registers it, and a running deployment of it is an
-    /// instance of that type (`docs/DESIGN.md`, "Backend Type vs. Backend
-    /// Instance"). The plugin owns the identifier, so adding a backend adds no
-    /// name to the gear.
-    fn backend_type(&self) -> &'static str;
-
-    /// Builds the backend from the settings written beside `type` in that
-    /// topic's `backend` block.
-    ///
-    /// The gear passes them through without inspecting them: each backend
-    /// publishes its own schema, so the type that can reject an unknown key is
-    /// this plugin's, not the gear's. Anything the backend needs that is not
-    /// operator configuration - a database handle the host already owns, say -
-    /// is captured when the provider itself is constructed, not passed here.
-    ///
-    /// # Errors
-    /// [`StorageBackendError::InvalidConfig`] if `settings` are not the ones
-    /// this backend understands.
-    async fn build_backend(
-        &self,
-        settings: &serde_json::Map<String, serde_json::Value>,
-    ) -> Result<std::sync::Arc<dyn EventBrokerBackend>, StorageBackendError>;
 }

@@ -1,7 +1,7 @@
 [package]
 name = "cf-gears-usage-collector-sdk"
 description = "SDK for the usage-collector gear: contract surfaces (consumer SDK trait, storage Plugin SPI), domain models, GTS plugin spec, and error definitions"
-version = "0.3.14"
+version = "0.3.17"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
@@ -27,6 +27,7 @@ schemars = { workspace = true }
 time = { workspace = true }
 rust_decimal = { workspace = true, features = ["serde-with-str"] }
 bigdecimal = { workspace = true }
+strum = { workspace = true }
 
 # GTS types
 gts = { workspace = true }
@@ -37,3 +38,7 @@ toolkit = { workspace = true }
 toolkit-security = { workspace = true }
 toolkit-odata = { workspace = true }
 toolkit-odata-macros = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+proptest = { workspace = true }

@@ -10,7 +10,7 @@ use toolkit_gts::GtsInstanceId;
 use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
-use crate::domain::authz::{EVENT_TYPE_RESOURCE, tenant_authorized};
+use crate::domain::authz::{event_type_resource, tenant_authorized};
 use crate::domain::backend::BackendResolver;
 use crate::domain::error::{DomainError, ErrorCode};
 use event_broker_sdk::models::EventType;
@@ -25,8 +25,8 @@ use crate::domain::model::{Event, Meta};
 /// determines its partition is that type's `partition_key` pointer, so an event
 /// can never disagree with its type about either and there is nothing for the
 /// broker to cross-check. [`IngestService::publish_event`] resolves both and
-/// returns the [`Event`] the request became, with the topic and the selected
-/// partition stamped on it.
+/// returns the [`Event`] the request became, with the topic stamped on it; the
+/// partition is the backend's to assign.
 #[domain_model]
 #[derive(Debug, Clone)]
 pub struct PublishRequest {
@@ -113,20 +113,13 @@ pub struct ProducerRecord {
     pub mode: ProducerMode,
 }
 
-/// One partition's `last_sequence` cursor.
-#[domain_model]
-#[derive(Debug, Clone, Copy)]
-pub struct ProducerPartitionCursor {
-    pub partition: i32,
-    pub last_sequence: i64,
-}
-
-/// Cursors for one topic - the partitions a producer has published to.
+/// A producer's chain on one topic: its `last_sequence`. The chain is kept per
+/// `(producer_id, topic)`; no partition is part of it (ADR-0004 "Chain Scope").
 #[domain_model]
 #[derive(Debug, Clone)]
 pub struct ProducerTopicCursors {
     pub topic: GtsInstanceId,
-    pub partitions: Vec<ProducerPartitionCursor>,
+    pub last_sequence: i64,
 }
 
 /// Result of `IngestService::get_producer_cursors` (`docs/openapi.yaml`'s
@@ -141,51 +134,29 @@ pub struct ProducerCursors {
     pub topics: Vec<ProducerTopicCursors>,
 }
 
-/// Which `evbk_producer_state` rows `IngestService::reset_producer` clears.
-/// Not `Option<(String, i32)>` on the method signature itself - an enum
-/// keeps the "clear everything" vs "clear one (topic, partition)" choice
-/// explicit at call sites.
+/// Which `evbk_producer_state` rows `IngestService::reset_producer` clears:
+/// the producer's chain on every topic, or on one.
 #[domain_model]
 #[derive(Debug, Clone)]
 pub enum ProducerResetScope {
     All,
-    TopicPartition { topic: String, partition: i32 },
+    Topic { topic: String },
 }
 
-/// The two optional selectors a `:reset` request carries, before the domain
-/// decides which [`ProducerResetScope`] they mean. Its own type (rather than a
-/// two-argument function) so the decision reads as a real conversion and the
-/// REST layer can hand it over without making the decision itself: the choice -
-/// and the rejection of an ambiguous shape - lives here in the domain, not in
-/// the request DTO.
+/// The optional selector a `:reset` request carries, before the domain decides
+/// which [`ProducerResetScope`] it means. Its own type so the REST layer hands
+/// it over without making the decision itself.
 #[domain_model]
 #[derive(Debug)]
 pub struct ProducerResetSelector {
     pub topic: Option<String>,
-    pub partition: Option<i32>,
 }
 
-impl TryFrom<ProducerResetSelector> for ProducerResetScope {
-    type Error = DomainError;
-
-    /// A topic without a partition (or a partition without a topic) is
-    /// ambiguous - a topic spans partitions - and is refused rather than
-    /// silently widened to "reset everything". Both absent means all
-    /// producers; both present, one `(topic, partition)`.
-    fn try_from(selector: ProducerResetSelector) -> Result<Self, DomainError> {
-        match (selector.topic, selector.partition) {
-            (Some(topic), Some(partition)) => Ok(Self::TopicPartition { topic, partition }),
-            (None, None) => Ok(Self::All),
-            (Some(_), None) => Err(DomainError::Validation {
-                code: ErrorCode::InvalidBody,
-                message: "a producer reset scoped to a topic must also name its partition"
-                    .to_owned(),
-            }),
-            (None, Some(_)) => Err(DomainError::Validation {
-                code: ErrorCode::InvalidBody,
-                message: "a producer reset scoped to a partition must also name its topic"
-                    .to_owned(),
-            }),
+impl From<ProducerResetSelector> for ProducerResetScope {
+    fn from(selector: ProducerResetSelector) -> Self {
+        match selector.topic {
+            Some(topic) => Self::Topic { topic },
+            None => Self::All,
         }
     }
 }
@@ -218,7 +189,7 @@ pub trait IngestService: Send + Sync {
         input: ProducerRegistrationInput,
     ) -> Result<ProducerRegistration, DomainError>;
 
-    /// Read per-`(topic, partition)` `last_sequence` cursors for a producer.
+    /// Read a producer's per-topic `last_sequence` cursors.
     /// Principal-bound - only the registering principal may call this
     /// (`docs/openapi.yaml`'s `GET /v1/producers/{id}/cursors`).
     async fn get_producer_cursors(
@@ -248,8 +219,7 @@ pub trait IngestService: Send + Sync {
         ctx: &SecurityContext,
     ) -> Result<Vec<crate::domain::model::Topic>, DomainError>;
 
-    /// `GET /v1/topics/segments`. `ctx` is threaded to the storage backend's
-    /// `query`, which is itself security-context-first.
+    /// `GET /v1/topics/segments`.
     async fn list_topic_segments(
         &self,
         ctx: &SecurityContext,
@@ -262,14 +232,13 @@ pub trait IngestService: Send + Sync {
     async fn list_event_types(&self, ctx: &SecurityContext) -> Result<Vec<EventType>, DomainError>;
 }
 
-/// Producer identity/ownership bookkeeping - separate from `EventRepo`'s
-/// per-`(producer_id, topic, partition)` sequence state (`IdempotencyGuard`
-/// owns that) because registration/ownership/client-agent are keyed purely
-/// by `producer_id`, with no topic/partition dimension.
+/// Producer identity/ownership bookkeeping - separate from the
+/// per-`(producer_id, topic)` sequence state (`IdempotencyGuard` owns that)
+/// because registration/ownership/client-agent are keyed purely by
+/// `producer_id`, with no topic dimension.
 #[async_trait]
 pub trait ProducerRegistry: Send + Sync {
-    /// `tenant_id` (eb-single-process-implementation decision log entry 28)
-    /// is captured from `ctx.subject_tenant_id()` at the call site, never
+    /// `tenant_id` is captured from `ctx.subject_tenant_id()` at the call site, never
     /// overridable - matches `ConsumerGroup.tenant_id`'s own "non-overridable,
     /// captured from `SecurityContext`" convention.
     async fn register(
@@ -300,11 +269,9 @@ pub trait ProducerRegistry: Send + Sync {
 }
 
 /// Real `IngestService`: topic/event-type resolution via
-/// `SpecificationManager` (eb-single-process-implementation D1), partition
-/// resolution (`partition_key` else `tenant_id`,
-/// `event-broker-producer-api`'s partition contract), idempotency via
-/// `IdempotencyGuard`, and durable append via the backend resolved through
-/// `BackendResolver` (D3). Generic over one repo type implementing the traits
+/// `SpecificationManager`, partition-key resolution, and idempotency plus
+/// durable enqueue via `IdempotencyGuard`; the backend append happens when the
+/// ingest outbox drains. Generic over one repo type implementing the traits
 /// it needs (idempotency, producer registry - neither topics nor events have
 /// a repo contract).
 #[domain_model]
@@ -314,6 +281,10 @@ pub struct IngestServiceImpl<R> {
     spec_manager: std::sync::Arc<dyn crate::domain::specification::SpecificationManager>,
     backend_resolver: std::sync::Arc<dyn BackendResolver>,
     batch: crate::config::BatchConfig,
+    /// The `default` outbox group's partitions: what an event's ingest
+    /// partition is taken modulo, so it has to be the count the group's queue
+    /// was registered with.
+    outbox_partitions: crate::domain::outbox::OutboxPartitions,
 }
 
 impl<R> IngestServiceImpl<R> {
@@ -343,6 +314,7 @@ impl<R> IngestServiceImpl<R> {
         spec_manager: std::sync::Arc<dyn crate::domain::specification::SpecificationManager>,
         backend_resolver: std::sync::Arc<dyn BackendResolver>,
         batch: crate::config::BatchConfig,
+        outbox_partitions: crate::domain::outbox::OutboxPartitions,
     ) -> Self {
         Self {
             repo,
@@ -350,6 +322,7 @@ impl<R> IngestServiceImpl<R> {
             spec_manager,
             backend_resolver,
             batch,
+            outbox_partitions,
         }
     }
 }
@@ -366,13 +339,13 @@ where
     ) -> Result<PublishAck, DomainError> {
         use crate::domain::idempotency::ProducerIdempotencyOutcome;
 
-        // Authz/tenant-scope enforcement (`gears-rust#4516`,
-        // `eb-authz-enforcement`) - before topic/schema validation, per
-        // `DESIGN.md`'s Validation Pipeline step 1 ordering.
+        // Reject non-event types, then authorize before topic/schema validation
+        // (`docs/DESIGN.md`, Validation Pipeline step 1 and §3.3).
+        let event_type_resource = event_type_resource(&request.r#type)?;
         self.policy_enforcer
             .access_scope_with(
                 ctx,
-                &EVENT_TYPE_RESOURCE,
+                &event_type_resource,
                 "produce",
                 None,
                 &AccessRequest::new()
@@ -412,6 +385,21 @@ where
             })?;
 
         subject_type_allowed(&event_type, request.subject_type.as_ref())?;
+
+        // A topic its backend does not hold yet cannot take events: answered
+        // `503`, retryable, until provisioning completes (feature 0006 §4.2).
+        if !matches!(
+            self.spec_manager.topic_state(&topic.id).await?,
+            Some(crate::domain::specification::TopicState::Provisioned { .. })
+        ) {
+            return Err(DomainError::StorageUnavailable {
+                reason: format!(
+                    "topic '{}' is not provisioned on its storage backend yet",
+                    topic.id
+                ),
+                source: None,
+            });
+        }
 
         // A chained/monotonic publish names a registered producer. Resolve it
         // before running the chain check so an unknown `producer_id` - never
@@ -458,27 +446,15 @@ where
 
         // The routing contract is the event type's, not this publisher's: the
         // type names a member of the event with a JSON Pointer, and the value
-        // at it is what decides the partition. Every producer of the type
-        // therefore routes identically, which is the property consumers of it
-        // depend on.
-        let partition_input =
-            crate::domain::backend::partition_input(&request, &event_type.partition_key)?;
-        let partition = partition_for(
-            &partition_input,
-            (*topic.settings.partitions().value())
-                .max(1)
-                .cast_unsigned(),
-        );
+        // at it is what the backend partitions the event by. Ingest assigns no
+        // topic partition: it only places the event in the ingest outbox
+        // partition of its key, so events of one key drain in publish order.
+        let key = crate::domain::backend::partition_input(&request, &event_type.partition_key)?;
+        let ingest_partition =
+            crate::domain::outbox::outbox_partition_for(&topic.id, &key, self.outbox_partitions);
 
-        // Broker-logical `sequence` is genuinely unknowable here: persist
-        // is now asynchronous (design.md D5's ingest-side outbox), matching
-        // DESIGN.md's "the producer gets 202 in milliseconds... backend
-        // persist completes asynchronously" - `sequence`/`sequence_time`
-        // stay `None` on the returned `Event` rather than a wasteful
-        // read-after-write for a value this design doesn't have yet.
-        // The resolved topic and the selected `partition` are stamped here so
-        // the outbox payload (this exact `Event`, JSON-encoded - no separate
-        // envelope type) carries both through to the leased handler.
+        // Partition, sequence and sequence time are the backend's, assigned
+        // when the outbox drains the event; none is known here.
         let event = Event {
             id: request.id,
             r#type: request.r#type,
@@ -491,15 +467,19 @@ where
             trace_parent: request.trace_parent,
             data: request.data,
             meta: request.meta,
-            partition: Some(partition),
+            partition: None,
             sequence: None,
             sequence_time: None,
         };
-        let payload = serde_json::to_vec(&event)
-            .map_err(|e| DomainError::Internal(format!("serialize ingest outbox payload: {e}")))?;
+        let payload = serde_json::to_vec(&crate::domain::outbox::IngestPayload {
+            topic: topic.id.clone(),
+            key,
+            event: event.clone(),
+        })
+        .map_err(|e| DomainError::Internal(format!("serialize ingest outbox payload: {e}")))?;
 
         let mut request = crate::domain::idempotency::PublishEnqueue::builder(
-            partition,
+            ingest_partition,
             payload,
             crate::domain::outbox::INGEST_PAYLOAD_TYPE,
         );
@@ -507,19 +487,17 @@ where
             request = request.chain(crate::domain::idempotency::ProducerChainCheck {
                 producer_id: meta.producer_id,
                 topic: topic.id.clone(),
-                partition,
                 previous: meta.previous.unwrap_or(0),
                 sequence: meta.sequence,
                 // `producer_mode` is set for every non-nil producer resolved
-                // above; a nil producer_id keeps the historical chained rule.
+                // above; a nil producer_id is checked as chained.
                 mode: producer_mode.unwrap_or(ProducerMode::Chained),
             });
         }
 
         // `check_and_enqueue` is the one DB transaction spanning the
-        // producer-chain check and the outbox insert (design.md D5;
-        // `domain/idempotency.rs`'s trait doc) - the actual backend persist
-        // happens later, out-of-transaction, when the outbox processor
+        // producer-chain check and the outbox insert - the backend append
+        // happens later, out of transaction, when the outbox processor
         // drains the row.
         match self.repo.check_and_enqueue(request.build()).await? {
             ProducerIdempotencyOutcome::Accept => {}
@@ -529,7 +507,6 @@ where
             ProducerIdempotencyOutcome::SequenceViolation { last_sequence } => {
                 return Err(DomainError::SequenceViolation {
                     topic: topic.id.to_string(),
-                    partition,
                     last_sequence,
                 });
             }
@@ -623,6 +600,11 @@ where
         ctx: &SecurityContext,
         input: ProducerRegistrationInput,
     ) -> Result<ProducerRegistration, DomainError> {
+        // Validated before the registration is written, on every path in (REST
+        // and the in-process broker): this `client_agent` is the one that
+        // persists, into a column documented as printable ASCII within 256
+        // bytes.
+        event_broker_sdk::validate::client_agent(&input.client_agent)?;
         self.repo
             .register(
                 ctx.subject_id(),
@@ -704,7 +686,7 @@ where
 
     async fn list_topic_segments(
         &self,
-        ctx: &SecurityContext,
+        _ctx: &SecurityContext,
         topic_id: &GtsInstanceId,
         partition: i32,
     ) -> Result<crate::domain::model::TopicSegmentManifest, DomainError> {
@@ -717,19 +699,36 @@ where
                     message: format!("topic '{topic_id}' is not registered"),
                     resource: topic_id.to_string(),
                 })?;
+        // Checked here rather than left to the backend: a backend reports an
+        // unknown partition as not found, while a partition the topic does not
+        // have is a malformed request.
+        let partitions = *topic.settings.partitions().value();
+        if !(0..partitions).contains(&partition) {
+            return Err(DomainError::Validation {
+                code: ErrorCode::InvalidPartition,
+                message: format!("partition must be in [0, {partitions}) for this topic"),
+            });
+        }
         let backend = self.backend_resolver.resolve(&topic);
-        let segments = backend
+        let at = event_broker_sdk::backend::TopicPartition::new(
+            topic.id.clone(),
+            event_broker_sdk::backend::Partition::new(partition.cast_unsigned()),
+        );
+        let segments = match backend
             .query(
-                ctx,
-                topic.id.as_ref(),
-                partition.cast_unsigned(),
+                &at,
                 event_broker_sdk::models::PartitionRange {
                     start_offset: None,
                     end_offset: None,
                     limit: u32::MAX,
                 },
             )
-            .await?;
+            .await
+        {
+            // Nothing provisioned yet: the partition holds nothing.
+            Err(event_broker_sdk::backend::BackendError::NotProvisioned { .. }) => Vec::new(),
+            segments => segments?,
+        };
         let Some(segment) = segments.into_iter().next() else {
             return Ok(crate::domain::model::TopicSegmentManifest {
                 topic: topic.id,
@@ -764,19 +763,6 @@ where
         // read from the ctx-less Tier-1 specification manager.
         Ok(self.spec_manager.list_event_types().await)
     }
-}
-
-/// The partition a resolved key belongs to.
-///
-/// Murmur3 (32-bit, x86 variant) with a zero seed, masked to strip the sign bit
-/// so the modulo operates on a non-negative value, then reduced by the topic's
-/// partition count. The mask is what keeps a signed remainder out of the
-/// answer. Hashed the same way the SDK does
-/// (`event-broker-sdk/src/mock/partitioning.rs`), so a producer computing a
-/// local hint and the broker deciding authoritatively cannot disagree.
-fn partition_for(key: &str, partition_count: u32) -> i32 {
-    let count = partition_count.max(1);
-    ((toolkit_stable_hash::murmur3_x86_32(key.as_bytes(), 0) & 0x7FFF_FFFF) % count).cast_signed()
 }
 
 /// `event_type.allowed_subject_types` pattern grammar (`DESIGN.md` §3.1) via

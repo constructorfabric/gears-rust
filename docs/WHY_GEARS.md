@@ -1,618 +1,554 @@
-# Why Should I Use Constructor Fabric Gears (Rust)?
+# Why Gears
 
-<!-- toc -->
+> **Audience:** technical decision-makers evaluating Gears as a foundation — CTOs and chief architects, engineering/platform leads, and ISVs building products on top. It assumes familiarity with multi-tenant SaaS concerns (tenancy, auth, deployment) and marks implementation status inline where a capability is still being built.
 
-- [Executive Summary](#executive-summary)
-  - [At a glance: Go vs C# vs Rust vs Rust + Gears](#at-a-glance-go-vs-c-vs-rust-vs-rust--gears)
-- [Part A — Where Rust has advantages over Go and C# (for platform code)](#part-a--where-rust-has-advantages-over-go-and-c-for-platform-code)
-  - [A.1 Errors are part of the type system](#a1-errors-are-part-of-the-type-system)
-  - [A.2 Memory data races are a compile error, not a `-race` flag](#a2-memory-data-races-are-a-compile-error-not-a--race-flag)
-  - [A.3 No `nil` interfaces, no exceptions-from-anywhere](#a3-no-nil-interfaces-no-exceptions-from-anywhere)
-  - [A.4 Sum types make illegal states unrepresentable](#a4-sum-types-make-illegal-states-unrepresentable)
-  - [A.5 Exhaustive `match` makes state evolution safer](#a5-exhaustive-match-makes-state-evolution-safer)
-  - [A.6 Zero-cost abstractions and predictable performance](#a6-zero-cost-abstractions-and-predictable-performance)
-  - [A.7 Tooling and static analysis as a first-class citizen](#a7-tooling-and-static-analysis-as-a-first-class-citizen)
-  - [A.8 Newtypes make identity mix-ups a compile error](#a8-newtypes-make-identity-mix-ups-a-compile-error)
-  - [A.9 RAII, lifetimes, and scoped resources](#a9-raii-lifetimes-and-scoped-resources)
-  - [A.10 Traits and generics: zero-cost polymorphism](#a10-traits-and-generics-zero-cost-polymorphism)
-  - [A.11 Macros move framework rules into compile time](#a11-macros-move-framework-rules-into-compile-time)
-- [Part B — Why "just Rust" is not enough: what Gears adds](#part-b--why-just-rust-is-not-enough-what-gears-adds)
-  - [B.1 A pre-integrated configurable XaaS backbone](#b1-a-pre-integrated-configurable-xaas-backbone)
-  - [B.2 Spec-driven development with Studio](#b2-spec-driven-development-with-studio)
-  - [B.3 Tenant isolation by default](#b3-tenant-isolation-by-default)
-  - [B.4 Authentication & authorization, built in (NIST SP 800-162 PDP/PEP)](#b4-authentication--authorization-built-in-nist-sp-800-162-pdppep)
-  - [B.5 Prewritten architecture lints (`cargo gears lint`)](#b5-prewritten-architecture-lints-cargo-gears-lint)
-  - [B.6 Runtime Gears capabilities](#b6-runtime-gears-capabilities)
-  - [B.7 One consistent API dialect: `OperationBuilder` + OpenAPI + OData](#b7-one-consistent-api-dialect-operationbuilder--openapi--odata)
-  - [B.8 Composable gears: one codebase, many deployment shapes](#b8-composable-gears-one-codebase-many-deployment-shapes)
-  - [B.9 Extensible domain model via the Global Type System (GTS)](#b9-extensible-domain-model-via-the-global-type-system-gts)
-  - [B.10 Canonical errors](#b10-canonical-errors)
-  - [B.11 Observability and operational defaults](#b11-observability-and-operational-defaults)
-  - [B.12 FIPS 140-3 support](#b12-fips-140-3-support)
-  - [B.13 Supply-chain policy as code](#b13-supply-chain-policy-as-code)
-  - [B.14 Preconfigured build-gated safety](#b14-preconfigured-build-gated-safety)
-  - [B.15 Local-first, shift-left development](#b15-local-first-shift-left-development)
-- [When Gears is (and isn't) the right choice](#when-gears-is-and-isnt-the-right-choice)
-- [Get started](#get-started)
+> **Status:** evolving — captures the target architecture and direction rather than the full current implementation. For the present Gears scope and implementation status, see [GEARS.md](GEARS.md).
 
-<!-- /toc -->
+## What Gears actually is
 
-> A guide for **Go developers** (and C# developers) evaluating [Constructor Fabric Gears](https://github.com/constructorfabric/gears-rust) — a secure, modular **XaaS development framework & middleware** written in Rust.
+Gears turns the recurring, high-risk parts of XaaS engineering into a well-architected, secure foundation of composable libraries — reusable OSS and BSS capabilities, extensible and customizable API contracts, automatic safeguards, runtime extensions, integrations automation, and efficient operation from a single server to global scale.
 
-**Public links**
+In practice, Gears is a versatile, well-architected set of efficient Rust libraries and a runtime for building multi-tenant backends and frontends for XaaS (SaaS, IaaS, PaaS) platforms and services — a proper architecture for business scale rather than a starter kit for early prototypes. You do not deploy "Gears" as is; instead you pick the libraries (called **gears**) you need — API gateway, account and user management, subscriptions and licenses, events and audit logging, gen ai, serverless runtime, etc — configure and compose them into your own set of foundational microservices, and finally add your own business logic on top to shape the final product.
 
-- **Gears (Rust) monorepo** — <https://github.com/constructorfabric/gears-rust>
-- **Architecture Manifest** — [`docs/ARCHITECTURE_MANIFEST.md`](./ARCHITECTURE_MANIFEST.md)
-- **Overview slides** — [`docs/slides/1_OVERVIEW.md`](./slides/1_OVERVIEW.md)
-- **Gears inventory** — [`docs/GEARS.md`](./GEARS.md)
-- **Toolkit guide** — [`docs/toolkit_unified_system/README.md`](./toolkit_unified_system/README.md)
-- **Global Type System (GTS)** — <https://github.com/globaltypesystem/gts-spec>
-- **Constructor Fabric Foundation** — <https://www.constructorfabric.org>
+Each gear:
+
+- owns its REST/gRPC API and its database schema;
+- talks to other gears through a stable public Rust SDK interface;
+- can run in the same process as its callers or in a separate process or microservice without changing its code.
+
+That last point is the design center of the whole system - many benefits below follow from it.
+
+Two things Gears is **not**: it is not a ready-made SaaS you run as is, and it is not a replacement for AWS/GCP/K8s. It's a middleware that sits between the infrastructure and your product.
+
+For a CTO and their engineering org, Gears + Studio means shipping products faster, at higher quality and scope, and cheaper to develop and run — because teams reuse proven gears (specifications, designs, APIs and code) instead of rebuilding each product or service from scratch and because Studio is optimized for Gears lifecycle automation.
+
+### The Gears catalog
+
+The target catalog is 200+ gears covering the generic, reusable patterns an XaaS product keeps re-implementing, grouped into APIs and contracts, Gen AI, Serverless, Core Functionality, OSS (operations), and BSS (monetization). What Gears deliberately does **not** contain is the logic that makes your product yours. That stays outside the foundation: in your own open-source or proprietary gears built on the same SDK, contracts, and controls; in serverless functions and workflows configured per deployment, tenant, or user (planned; see §3); or in external code written in any language and connected to Gears through REST/gRPC APIs.
+
+So the foundation gives you the common platform, and you spend your effort on differentiating product logic rather than rebuilding the platform underneath it.
+
+## Reasons to build on Gears
+
+These points are **not steps in a sequence** — they depend on each other. Where a capability is still being built out, the section that discusses it says so.
+
+| # | Factor | What it gives you |
+|---|---|---|
+| 1 | XaaS DNA in every Gear | 200+ reusable OSS and BSS gears that package common patterns, built-in XaaS concerns, and a shared product-portfolio foundation |
+| 2 | Composable capabilities | Single-process AI-friendly development, configurable deployment topology from one codebase, and infrastructure-agnostic deployment |
+| 3 | Multi-level logic customization | Product-level composition, third-party applications and integrations, and safe tenant/user customization |
+| 4 | Security & isolation | Compile-time-validated request processing, safe extension coexistence, and policy-driven access control |
+| 5 | Gears lifecycle automation | Specification and code quality control, AI tuned for Gears, and lessons converted into enforceable standards |
 
 ---
 
-## Executive Summary
+## 1. XaaS DNA in every Gear: proven patterns packaged for reuse
 
-If you build **multi-tenant XaaS / SaaS backends**, you are repeatedly solving the same problems in every service: tenant isolation, authentication/authorization, licensing & quota, usage metering, consistent REST APIs, pagination/filtering, observability, and safe DB access. Popular programming languages like Go and C# can solve these problems well, often with excellent libraries, analyzers, and mature team conventions.
+> 200+ reusable OSS and BSS gears that allow you to build and run your product portfolio faster. Common XaaS patterns are delivered as specifications, decision guides, stable contracts, and reference implementations; tenancy, identity, security, policy, licensing, usage, billing, audit, and observability follow one coherent architecture.
 
-Gears combines many of these best practices into one structured Rust middleware: shared platform contracts, reusable libraries ("gears"), consistent API patterns, and build-gated checks that make the preferred path explicit. Those checks help both human developers and AI-generated code follow established patterns, backed by compile-time guarantees and validation.
+### Overview
 
-Gears takes a different position, in two layers:
+This factor includes:
 
-1. **Rust as the language** moves some important classes of bugs — memory data races, use-after-free, null dereferences, many unhandled errors — from *runtime incidents* to *compile errors* or explicit types.
+1. **Incorporate typical patterns as Gears libraries:** common XaaS patterns are represented end to end, from requirements and design decisions through stable contracts and reusable implementations.
+2. **Build XaaS concerns in:** the foundational capabilities every product needs follow one architecture instead of being reimplemented and integrated differently by each team.
+3. **Provide a common foundation for the product portfolio:** products reuse interoperable open-source OSS and BSS capabilities while keeping their differentiating business logic private.
 
-2. **Gears as the middleware** provides the platform layer around Rust: tenant-scoped data access, authentication/authorization contracts, consistent API construction, composable business capabilities, local-first testing, deployment options, supply-chain policy, and additional build-gated safety checks.
+### Typical problem
 
-The result is a solid technology stack for long-living, comprehensive XaaS systems: product teams get a common foundation for security, tenancy, APIs, observability, lifecycle, and deployment instead of assembling those pieces differently in every service. This structure is especially useful for AI-driven development: coding agents work better when correctness rules are not only written in prose, but also expressed as types, generated schemas, lints, tests, and CI checks that provide deterministic feedback.
+Almost every XaaS service splits into two parts. One is the **unique, competitive business logic** that differentiates the product and drives revenue. The other is the **foundational logic** every service needs no matter what it does — tenancy, users, products, licensing, subscriptions, provisioning, policies, secrets, authentication, notifications, AI capabilities, usage, and billing.
 
-### At a glance: Go vs C# vs Rust vs Rust + Gears
+The foundational layer must always be secure, reliable, versatile, and performant. Its complexity grows with the service's scope and scale—what is adequate for an initial release rarely meets the requirements of a mature, large-scale product.
 
-For a long-living XaaS platform, Gears can provide advantages that are less visible in small standalone services: shared runtime capabilities, stronger static guarantees, consistent APIs, and platform rules enforced by the build.
+Many useful foundational open-source components work well as standalone services but cannot be dropped into a large-scale XaaS product unchanged because their foundational models are incomplete or incompatible with common XaaS requirements for:
 
-A similar middleware could exist or be built for Go or C#, and mature teams often build parts of it successfully. However, this investment would still not close every Rust-specific advantage: ownership-based memory safety without a GC, `Send`/`Sync` data-race checks, exhaustive enums, zero-cost newtypes, and macro-generated code that remains type-checked by the compiler.
+- tenant hierarchies, resource ownership, and isolation;
+- user roles, delegated administration, and approval workflows;
+- authentication, authorization, access policies, and impersonation;
+- usage metering, quotas, licensing, and admission control;
+- audit trails, distributed tracing, and incident investigation;
+- secrets management and controlled outbound egress;
+- data retention, deletion, and operator-defined policies;
+- runtime extensibility through custom data types, APIs, callbacks, and hooks.
 
-| # | Concern | Go (typical) | C# / .NET | Rust (plain) | **Rust + Gears** |
-|---:|---|---|---|---|---|
-| 1 | **Runtime footprint** | small binary, GC pauses | larger runtime, GC | small, no GC | small, no GC |
-| 2 | **Deployment shapes** | per-service choices | per-service | per-service | **One code → edge / bare-metal / K8s** |
-| 3 | **Memory & data-race safety** | GC; memory races possible, detected only at runtime (`-race`) | GC; memory races possible | Compile-time ownership & `Send`/`Sync` | Compile-time, same as Rust |
-| 4 | **Error handling** | `if err != nil`, lint-gated in mature shops | exceptions / analyzer policy | `Result<T, E>`, `?` — must handle | `Result` + **canonical error taxonomy** (RFC-9457) |
-| 5 | **Null safety** | `nil` panics | NRT helps, policy-dependent | `Option<T>` — no null | `Option<T>` everywhere |
-| 6 | **Panics / unsafe shortcuts** | runtime panics possible | runtime exceptions possible | possible, but lintable | `unwrap`, `panic`, unsafe patterns [**prohibited at build time**](#b14-preconfigured-build-gated-safety) |
-| 7 | **State evolution** | `switch` may miss new constants | `switch` often needs analyzer support | exhaustive `match` over enums | exhaustive `match` + architecture lints |
-| 8 | **ID / domain mix-ups** | named types catch swaps, but literals/conversions remain easy; opaque structs add boilerplate | record structs / value objects work, but require conventions and serializers | zero-cost newtypes; no implicit conversion; private fields by default | tenant/user/resource IDs can be distinct validated types |
-| 9 | **Scoped resource cleanup** | `defer` discipline | `using` / `IDisposable` discipline | `Drop` + lifetimes | scoped transactions, guards, spans, connections |
-| 10 | **Polymorphism** | interfaces + newer generics; less expressive type relationships | rich generics + interfaces; runtime framework costs vary | traits, associated types, monomorphization | typed SDKs and `ClientHub` across transports |
-| 11 | **Compile-time code generation** | generators / reflection / tags | source generators / attributes / reflection | procedural and declarative macros expand into type-checked Rust | derives and builders generate schemas, scopes, APIs, route metadata, and validation glue |
-| 12 | **Tenant isolation** | manual `WHERE tenant_id = ?` | manual / EF global filters | manual | **Standardized** via `SecureConn` + `AccessScope` |
-| 13 | **AuthN / AuthZ** | per-service middleware, bespoke | ASP.NET policies | bespoke | **Built-in** PDP/PEP (NIST SP 800-162) |
-| 14 | **API consistency** | per-team router conventions | attributes + filters | bespoke | **`OperationBuilder`** → uniform REST + OpenAPI |
-| 15 | **Pagination / filtering** | hand-rolled | OData libs | hand-rolled | **Built-in OData** `$filter`/`$select`/`$orderby` |
-| 16 | **Architecture policy** | `go vet` / `golangci-lint` / custom checks | Roslyn analyzers / custom checks | Clippy / custom lints | Prewritten Clippy + architecture lints (via `cargo gears lint`) for Gears conventions |
-| 17 | **Multi-tenancy / licensing / quota / usage** | build it yourself | build it yourself | build it yourself | **Pre-integrated, replaceable gears** |
-| 18 | **Extensible API domain data types** | manual | manual | manual | **GTS** — versioned, schema-validated, autogenerated JSON schemas from Rust code |
+The result is integration code around every component that also needs to be maintained, tested, and secured. Each team pays the foundational tax again and solves the same problems differently. That requires additional effort, creates security gaps, and raises maintenance, performance, and troubleshooting costs as system scale grows.
 
-Those benefits are not free. Rust and framework-heavy stacks have real adoption costs; Gears tries to make them visible, document where they matter, and reduce them with structure, tooling, templates, and automation rather than hiding them.
+### Example: a real LLM gateway is not just a proxy
 
-| # | Concern | Go (typical) | C# / .NET | Rust (plain) | **Rust + Gears** |
-|---:|---|---|---|---|---|
-| 1 | **Learning curve** | low; deliberately small language | moderate; familiar OO + large docs | high; ownership, lifetimes, async, traits | high plus framework concepts (*) |
-| 2 | **Code readability for newcomers** | usually straightforward | usually familiar to enterprise teams | can be dense; types/macros/async add load | can be denser because framework types encode policy (**) |
-| 3 | **Compile speed / iteration** | usually fast | usually good; tooling mature | often slower, especially large workspaces | slower again when full lint/test gates run |
-| 4 | **Ecosystem breadth** | very strong for cloud/network services | very strong enterprise ecosystem | strong systems/backend ecosystem, thinner in some areas but evolving | inherits Rust tooling |
+A toy LLM gateway receives a prompt, sends it to a provider, and returns the response.
 
-(*) Gears middleware consists of three large layers:
-- **Toolkit** — reusable Rust libraries for API construction, data access, auth integration, observability, transport, testing, and other cross-cutting platform concerns.
-- **System Gears** — platform-level capabilities such as events, tenant and authentication resolvers, type registries, serverless/runtime support, and other shared XaaS services.
-- **Domain Gears** — product/business capabilities such as chat, credential storage, file parsing, approval flows, and other feature-level libraries.
+A production multi-tenant LLM gateway must also, on every request:
 
-Gears Toolkit internals can be complex because they encode reusable XaaS infrastructure. Individual Gear libraries are usually simpler: they model a concrete business capability inside established platform boundaries, with tenancy, API wiring, validation, and safety checks already provided by the stack.
+1. ensure the model is enabled, approved, and not deprecated for this tenant;
+2. ensure the tenant has an active license for the model and requested features;
+3. authenticate the caller and verify its user, application, and impersonation context;
+4. authorize the requested model, operation, tools, and data sources;
+5. enforce token, spend, rate, and concurrent-request limits for both the tenant and user;
+6. validate request shape, size, modalities, tool definitions, and structured-output schemas;
+7. route to a compatible provider and region according to capability, residency, cost, and latency policy;
+8. store and resolve tenant- or user-scoped provider credentials securely;
+9. restrict outbound traffic to approved providers, endpoints, and redirect targets;
+10. apply data-classification, retention, and content-safety policies before data leaves or enters the platform;
+11. enforce deadlines, cancellation, retry, fallback, and circuit-breaking rules without duplicating side effects or charges;
+12. handle streaming backpressure and client disconnects without leaking resources or continuing unwanted work;
+13. record usage and cost idempotently, then reconcile reserved quota with the actual result;
+14. audit authorization, routing, policy, and administrative decisions without storing sensitive content unnecessarily;
+15. keep metrics, traces, and logs useful for troubleshooting while redacting prompts, credentials, and sensitive user data;
+16. return stable, sanitized errors without leaking provider internals or making callers depend on one backend.
 
-(**) AI-assisted development changes the readability trade-off. Lints, generators, templates, examples, and deterministic validation help agents produce new Gear code faster and with fewer convention mistakes. Human reviewers still need to understand the code, but the generated result is usually ordinary business logic inside a familiar structure rather than a new service architecture invented from scratch.
+That is the difference between a working proxy prototype and a production service that can survive a security review and operate in a paid SaaS product.
 
-> **TL;DR for Go devs:** You keep some operational properties Go teams often value —
-> single binaries, fast startup, low runtime footprint, and explicit control flow.
-> You do **not** keep Go's simplicity or ecosystem breadth. Gears is a trade:
-> more language and framework complexity in exchange for stronger static checks
-> and a pre-integrated XaaS backbone.
+### Why it matters
+
+The same tenancy, policy, licensing, usage, security, and audit questions exist in most business services: account management, provisioning, eventing, notifications, search, audit, chat, workflows, billing, integrations, and admin APIs. Rebuilding the same rules in every service without proper control and consistency leads to fragmented and insecure systems.
+
+### How Gears addresses it
+
+#### 1. Incorporate typical patterns as Gears libraries
+
+Every capability starts as a traceable spec (PRD → DESIGN → ADR → FEATURE with linked IDs), so intent is explicit and reviewable before code exists. Those specifications, designs, decision guides, and API contracts ship *with* the gears. A team can reuse them as-is or take ideas from them, so the whole SDLC—requirements → design → API → implementation → tests—starts from a proven baseline instead of a blank page.
+
+The accepted design becomes one engineering DNA shared by every gear: SDK-first crates and DDD-light layers, route declarations and generated OpenAPI, canonical RFC 9457 errors, tracing/metrics/health/lifecycle conventions, and a uniform testing and CI approach. Each gear owns its contract and implementation behind a stable public SDK interface.
+
+Each gear is designed to be useful independently: it can be selected and consumed through its published API and SDK, with required dependencies declared explicitly rather than hidden in another gear's internals. It ships with its specifications, design and usage documentation, can be configured or extended through declared capabilities and plugins instead of a private fork, and inherits the platform's zero-trust defaults.
+
+#### 2. Build XaaS concerns in
+
+API ingress/egress, authn/authz, tenancy, credentials, type registry, events, usage, licensing, and the other parts of the OSS and BSS layer are gears behind SDK and plugin contracts. An ISV picks the auth provider, policy engine, storage backend, and commercial controls its product needs instead of inheriting one hard-wired choice or rebuilding the surrounding integration layer.
+
+These concerns are governed consistently across gears. Compile-time-validated contracts and runtime controls govern API and database operations by tenant, user, license, and policy, with integrated observability, auditing, and notifications. The secure request path and isolation mechanisms that enforce these controls are explained in §4.
+
+#### 3. Provide a common foundation for the product portfolio
+
+The target catalog is 200+ gears covering the generic, reusable patterns an XaaS product keeps reimplementing. Gears fits the current technology stack in two ways: run it as a **standalone platform you build on**, or **integrate it into an existing platform through plugins and adapters** that wire its contracts to services already in operation.
+
+What Gears deliberately does **not** contain is the logic that makes your product yours. That stays outside the foundation, in one of three places:
+
+- **your own open-source or proprietary gears** built on the same SDK, contracts, and controls;
+- **serverless logic** — functions and workflows configured per deployment, tenant, or user (planned; see §3);
+- **external code in any language** that uses Gears through its REST/gRPC APIs.
+
+The foundation therefore supplies common platform capabilities across a product portfolio while each product keeps its differentiating logic private. Teams spend their effort on that logic rather than rebuilding the platform underneath it.
+
+### Benefits
+
+- **Executive:** wider product portfolio and faster delivery — launch more products on a common governed Gears foundation instead of funding the same platform work repeatedly.
+- **CTO:** capital and operational efficiency from reusing shared security and commercial controls without giving up quality, scalability, reliability, or performance.
+- **Developer:** focus on key product logic on top of a tenant-scoped, secure, and performant platform instead of reinventing foundational capabilities for each service.
+
+References: [Architecture Manifest — secure data path](ARCHITECTURE_MANIFEST.md#31-secure-xaas-framework-with-defense-in-depth), [Gears inventory](GEARS.md), [AuthN/AuthZ and Secure ORM](toolkit_unified_system/06_authn_authz_secure_orm.md).
 
 ---
 
-## Part A — Where Rust has advantages over Go and C# (for platform code)
+## 2. Composable capabilities: one codebase, any topology
 
-This section is about the **language**. Gears is built on Rust specifically because it targets *long-lived platform code* where correctness and maintainability matter more than raw time-to-first-prototype.
+> Separate business logic from service packaging — choose, configure, and package only what you need with DSL. Write the logic once; develop the complete product in a single process, then repackage the same code for a small on-premises deployment or a large production cloud.
 
-### A.1 Errors are part of the type system
+### Overview
 
-In Go, error handling is explicit and simple; serious teams usually add `errcheck` / `golangci-lint` to prevent accidentally discarded errors. Rust makes that stricter by putting fallibility in the type signature and making propagation (`?`) explicit in ordinary language flow.
+This factor includes:
 
-```go
-// Go — compiles unless your lint gate rejects the ignored error.
-func loadUser(id string) *User {
-    u, _ := db.FindUser(id) // ignored error; u may be nil
-    return u
-}
+1. **AI-friendly single-process product development:** write, build, run, and test the complete product locally, giving engineers and AI agents the shortest change → feedback loop.
+2. **Scale down or up from one codebase:** repackage, replicate, and shard selected gears for large-scale production without rewriting business logic.
+3. **Remain infrastructure agnostic:** target public cloud, private cloud, on-premises, or edge deployments without coupling product logic to one provider.
 
-caller := loadUser("42")
-fmt.Println(caller.Name) // nil pointer dereference at runtime
+### Typical problem
+
+Teams usually choose deployment boundaries at the same time as business boundaries. A component becomes either:
+
+- a monolith module that is hard to scale or isolate later; or
+- a microservice with a separate build, deployment, network contract, logs, and test environment from day one.
+
+Real product scenarios cross those boundaries. Troubleshooting requires correlating metrics and logs from several services. Integration tests need containers or a cluster. Later merging two chatty services, or extracting a hot path from a monolith, becomes a refactoring project rather than an operational decision.
+
+The problem compounds with many teams and with AI-assisted development. When several teams share one platform, a change one team needs usually becomes a pull request into a shared component — scoped, reviewed, merged, and released centrally before the requesting team can move; teams wait on a queue they don't control, or fork the shared code and inherit a permanent merge cost. And an AI agent can propose code quickly, but it cannot accelerate a change it must wait minutes or hours to verify through image builds, deployment, remote logs, and cluster E2E tests.
+
+### Example: evolve an AI product from laptop to production
+
+Suppose a Chat product needs API Gateway, authz, tenants, users, licensing, LLM gateway, a chat gear and usage collection for billing.
+
+For development, compile them into one process. A developer or coding agent runs the real cross-gear scenario locally:
+
+```text
+edit → build + lints → run in-process test → inspect failure → fix
 ```
 
-In Rust, the error is part of the type. You must deal with it, and there is no `nil`.
-
-```rust
-// Rust — you cannot accidentally ignore the error or deref a null.
-fn load_user(id: &str) -> Result<User, RepoError> {
-    let user = db.find_user(id)?; // `?` propagates the error explicitly
-    Ok(user)
-}
-
-match load_user("42") {
-    Ok(user) => println!("{}", user.name),
-    Err(e)   => tracing::warn!(error = %e, "user not found"),
-}
-```
-
-`Option<T>` replaces `nil`, and `Result<T, E>` makes "this can fail" visible in the signature. Whole categories of `nil` panics and swallowed errors become compile-time or lint-gated failures instead of review conventions.
-
-### A.2 Memory data races are a compile error, not a `-race` flag
-
-Go's race detector is excellent — but it only finds races on code paths you actually execute under instrumentation. Races ship to production all the time.
+There are no per-component builds and deployments, no shared staging cluster, and no digging through logs from separate services just to find an integration mismatch.
 
-```go
-// Go — compiles, runs, and corrupts the map under load. No compile error.
-counts := map[string]int{}
-for _, ev := range events {
-    go func(e Event) {
-        counts[e.Key]++ // concurrent map write -> runtime panic / corruption
-    }(ev)
-}
-```
+In production, move the tenants, users, LLM gateway and usage collection to dedicated replicas because they have distinct latency and scaling needs. Callers keep the same SDK interface. The business gear code does not need a rewrite because the runtime swaps local dispatch for a remote client.
 
-Rust's ownership model and the `Send`/`Sync` traits make unsynchronized shared mutable memory across threads a **compile error**. You're forced to use a proper synchronization primitive.
+### Why it matters
 
-```rust
-// Rust — won't compile unless the shared state is actually thread-safe.
-use std::sync::{Arc, Mutex};
+Deployment topology should follow requirements — scalability, latency, fault isolation, tenancy, data residency, cost, and capacity — rather than the boundaries teams happened to define when they first created the repositories. The same is true of team boundaries: independent teams should ship on their own cadence, not serialize through one shared release.
 
-let counts = Arc::new(Mutex::new(HashMap::<String, i64>::new()));
-let mut handles = vec![];
-for ev in events {
-    let counts = Arc::clone(&counts);
-    handles.push(std::thread::spawn(move || {
-        *counts.lock().unwrap().entry(ev.key).or_insert(0) += 1;
-    }));
-}
-```
+This range of composition and deployment scenarios is not flexibility for its own sake. Exercising the same gears across binary, on-premises, and cluster shapes — and across many teams and editions — surfaces and hardens them, improving overall **system quality** and yielding a **proper architecture for business scale**. Composition and configuration also let each product take on only the capabilities it needs, so **customization controls complexity** instead of adding to it.
 
-"If it compiles, it's free of memory data races" is not a slogan — it's enforced by the borrow checker. This does not eliminate logical races such as TOCTOU bugs, lost updates, deadlocks, or bad transaction boundaries; those still need design, tests, and database constraints. For a platform handling concurrent multi-tenant traffic, Rust shifts an important class of concurrency defects from runtime testing into compilation.
+### How Gears addresses it
 
-### A.3 No `nil` interfaces, no exceptions-from-anywhere
+Gears interfaces are **versioned contracts** and no gear may depend on another's internals or schema, independent teams and software vendors can build different services on the same foundation without a central bottleneck:
 
-C# gives you a rich runtime, but exceptions are invisible in signatures — any call can throw, and `NullReferenceException` remains the most common production failure. Go's `nil` interface trap (`err != nil` being true for a typed-nil) catches even experienced developers.
+- **Compose gears into executable services:** group compatible gears behind the service boundaries that fit your product, just as you compose other libraries into an application.
+- **Pin and upgrade on your own cadence:** a consumer pins a gear version and upgrades when it chooses, so a producer's release never forces a consumer to move.
+- **Refactor freely:** internals change behind a stable contract without breaking anyone.
+- **Extend without touching the core:** a change another team needs is usually a plugin behind an existing SDK trait, a runtime extension (§3), or an additive contract version — not an edit to a shared gear.
 
-Rust has neither. Fallibility (`Result`) and absence (`Option`) are explicit in every signature, and exhaustive `match` means adding a new variant forces you to handle it everywhere.
+#### 1. Enable AI-friendly single-process product development
 
-**Gears** goes further than plain Rust style advice: nil-like failure paths and unsafe shortcuts are blocked by the build. Project policy treats `unwrap`, avoidable `panic`, unchecked assumptions, and unsafe patterns as architecture violations, not personal taste. In Go or C#, teams can enforce similar rules with analyzers, linters, and review policy; in Gears, Clippy plus project-specific lints make these checks part of the standard build gate.
+Business logic is separated from how it is packaged into a service. A gear exposes a stable SDK interface, and consumers depend on that interface, not the implementation:
 
-### A.4 Sum types make illegal states unrepresentable
+- **same process:** direct Rust-native call, with no serialization or network;
+- **separate process or pod:** generated REST/gRPC client implementing the same interface.
 
-Modeling a state machine in Go usually means a struct with a bunch of optional fields and a comment explaining which combinations are "valid."
+For local development, compatible gears compile into a single process and execute realistic cross-gear flows without per-component deployment. Engineers and AI agents get fast compiler and functional logic test feedback against the complete product rather than waiting for a remote environment to build, run the tests and collect logs for troubleshooting.
 
-```go
-// Go — nothing stops you from setting ErrorMsg while Status == "running".
-type Job struct {
-    Status   string // "pending" | "running" | "done" | "failed"  (by convention)
-    Result   *Output
-    ErrorMsg string
-}
-```
+#### 2. Different deployments from one codebase
 
-Rust enums carry data per-variant, so invalid combinations can't be constructed:
+Gears allow to have both different products and different deployments from one codebase by gears composition and defining needed deployment profiles: Embedded, Host + Workers, and Kubernetes Native. Embedded is the current default for local development. The distributed model has active foundations and documented gaps; full equivalence is still being completed.
 
-```rust
-// Rust — the compiler guarantees a failed job has an error and no result.
-enum Job {
-    Pending,
-    Running { started_at: Instant },
-    Done { result: Output },
-    Failed { error: String },
-}
-```
+Gears DSL called GDL (Gears Definition Language) makes composition explicit and validated. It declares:
 
-### A.5 Exhaustive `match` makes state evolution safer
+- gears, versions, dependencies, and capabilities;
+- how gears will be packaged into executable processes;
+- plugin/provider bindings;
+- OS-native or Kubernetes-based deployment;
+- target infrastructure environment — public clouds, private clouds, on-premises;
+- scalability configuration — limits, replicas, sharding;
+- custom data types and roles;
+- latency, availability, resource, and residency constraints;
+- required database, cache, lock, and discovery guarantees.
 
-In Go or C#, if you add a new status, old `switch` statements may keep compiling unless analyzers or strict review rules require every call site to be revisited:
+The GDL compiler should reject an impossible composition before deployment — for example, a missing capability, insufficient hardware resources, incompatible SDK versions, a backend that cannot meet a consistency requirement, or a placement that violates residency constraints.
 
-```go
-// Go — adding StatusCanceled later does not force every switch to be updated.
-switch job.Status {
-case StatusPending:
-    queue(job)
-case StatusRunning:
-    observe(job)
-case StatusDone:
-    archive(job)
-}
-```
+- **Scale down:** co-locate compatible gears into one binary and use local calls.
+- **Scale up:** split, replicate, or shard selected gears and bind remote clients.
 
-In Rust, matching an enum is exhaustive by default. If you later add `Cancelled`, every `match` that forgot it fails to compile until you decide what the new state means:
+#### 3. Remain infrastructure agnostic
 
-```rust
-// Rust — adding Job::Cancelled forces this match to be updated.
-match job {
-    Job::Pending => queue(job),
-    Job::Running { started_at } => observe(started_at),
-    Job::Done { result } => archive(result),
-    Job::Failed { error } => report(error),
-}
-```
+Infrastructure agnosticism comes primarily from the Gears ToolKit, which abstracts OS interfaces, database access, gear discovery, distributed-execution primitives, and other infrastructure services behind stable contracts. In every deployment shape, gear business logic uses the same interfaces while the composition selects implementations appropriate for OS-native, Kubernetes, public-cloud, private-cloud, on-premises, or edge environments.
 
-The same pattern appears everywhere: `Option` forces you to handle absence, `Result` forces you to handle failure, and enums force you to handle new states. This is exactly the kind of language support you want when platform APIs and workflows evolve over years.
+This is analogous to operating-system drivers: applications use stable OS interfaces without knowing the details of each hardware device, while drivers adapt those interfaces to a particular implementation. Similarly, a gear requests capabilities such as persistence, discovery, messaging, locking, or remote execution without embedding the details of a specific cloud or infrastructure product; ToolKit bindings and adapters provide the environment-specific implementation.
 
-### A.6 Zero-cost abstractions and predictable performance
+For choices that are specific to a gear rather than common infrastructure, the gear can expose its own plugin contract. For example, a gear may define a persistence interface and provide plugins for storing its data in a relational database or a document-oriented database. The gear's domain logic remains unchanged while the product selects the implementation that fits its consistency, query, scale, and operational requirements.
 
-No garbage collector means no GC pauses and a small, predictable memory footprint — which is exactly what you want for edge/on-prem appliances and for running the *full* platform locally during development. You get C-like performance with high-level ergonomics, and the abstractions compile away.
+Together, ToolKit abstractions and gear-specific plugins keep the product portable across environments. Teams can choose infrastructure based on cost, performance, reliability, or data-residency requirements instead of hard-wiring the system to a single vendor.
 
-### A.7 Tooling and static analysis as a first-class citizen
+### Benefits
 
-`cargo`, `rustfmt`, `clippy`, and `cargo-deny` give a consistent toolchain. Crucially, Rust's lint infrastructure is extensible — which is the hook Gears uses to enforce **architecture** at compile time (see Part B).
+- **Executive:** wider product portfolio and faster delivery — one efficient codebase supports public cloud, private cloud, on-premises, and edge deployment with no single-vendor lock-in, while more teams and ISVs deliver in parallel on one foundation.
+- **CTO:** change process boundaries, replication, sharding, and infrastructure targets without rewriting business logic; avoid shared-component merge queues and forks, with opt-in upgrades per team.
+- **Developer / AI / ISV:** run realistic multi-gear flows locally with fast compiler/test feedback instead of waiting for cluster deployment; consume a pinned gear version for stable, reproducible builds.
 
-### A.8 Newtypes make identity mix-ups a compile error
-
-Most backends have IDs like `UserId`, `TenantId`, `OrderId`. Even when they're all strings or UUIDs underneath, they should not be interchangeable — passing a `UserId` where a `TenantId` is expected is a bug the compiler should catch.
-
-**Go — named types help, but are not a full validation boundary**
-
-```go
-type TenantID string
-type UserID   string
-
-func LoadTenant(id TenantID) {}
-
-var u UserID = "user_123"
-LoadTenant(u)              // compile error — good
-LoadTenant("tenant_123")   // ALLOWED — untyped string literal converts implicitly
-id := TenantID("anything") // ALLOWED — explicit conversion from any string
-```
-
-Even in this case two escape hatches remain: literals convert implicitly, and any caller can construct `TenantID(x)` from any string with no validation. To close them you have to fall back to a struct with an unexported field:
-
-```go
-type TenantID struct{ value string }
-
-func NewTenantID(v string) (TenantID, error) {
-    if v == "" { return TenantID{}, errors.New("empty tenant id") }
-    return TenantID{value: v}, nil
-}
-```
-
-This works, but there is a cost:
-
-- **JSON / DB marshaling** must be hand-written (`MarshalJSON`, `Scan`, `Value`) per type, because the field is unexported.
-- **Zero value is silently invalid** — `var t TenantID` produces `TenantID{""}` that bypassed the constructor.
-- **Same-package code** can still write `TenantID{value: x}` directly, bypassing validation.
-- The type is no longer interchangeable with `string` in generics, reflection, or struct tags.
-
-**C# — similar story, with strong value-object options**
-
-Plain primitives have the same swap problem as Go. A common fix is a `readonly record struct` or another value-object pattern:
-
-```csharp
-public readonly record struct TenantId(Guid Value);
-public readonly record struct UserId(Guid Value);
-
-void LoadTenant(TenantId id) { }
-
-LoadTenant(new TenantId(userId.Value)); // explicit, distinct type
-```
-
-**Rust — the validated boundary is the default**
-
-```rust
-pub struct TenantId(String);
-pub struct UserId(String);
-
-fn load_tenant(id: TenantId) {}
-
-load_tenant(user_id);              // compile error — distinct types
-load_tenant(String::from("x"));    // compile error — no implicit conversion
-load_tenant("tenant_123");         // compile error — &str is not TenantId
-```
-
-The inner field is **private by module** unless marked `pub`, so `TenantId(x)` is only constructible inside the defining module — no extra ceremony required. Validation lives in one place:
-
-```rust
-impl TenantId {
-    pub fn new(v: String) -> Result<Self, IdError> {
-        if v.is_empty() { return Err(IdError::Empty); }
-        Ok(Self(v))
-    }
-}
-```
-
-Serialization, hashing, equality, ordering, and many schema/DB integrations can usually be derived or implemented once through standard traits instead of hand-written ad hoc codecs per call site. Newtypes compile to the same machine code as the inner type, so the type separation is free at runtime.
-
-### A.9 RAII, lifetimes, and scoped resources
-
-Rust also uses types to model resource lifetime. Values are dropped deterministically when they leave scope, so transactions, mutex guards, file handles, tracing spans, and pooled connections can release themselves through `Drop` even when a function returns early with `?`.
-
-```rust
-async fn update_document(repo: &Repo, id: DocumentId) -> Result<(), RepoError> {
-    let tx = repo.begin().await?;
-    let _span = tracing::info_span!("update_document", %id).entered();
-
-    repo.lock_document(&tx, id).await?;
-    repo.write_document(&tx, id).await?;
-
-    tx.commit().await?;
-    Ok(())
-} // span exits; uncommitted guards/resources are dropped on every return path
-```
-
-Go's `defer` and C#'s `using` / `IDisposable` are good mechanisms, and experienced teams use them successfully. Rust's advantage is that scoped ownership is the default shape of the language. You can still design a bad transaction boundary or hold a lock too long, but it is harder to forget cleanup code in ordinary control flow.
-
-### A.10 Traits and generics: zero-cost polymorphism
-
-Rust traits are not just "interfaces". They support associated types, trait bounds, blanket implementations, static dispatch through monomorphized generics, and dynamic dispatch when you explicitly choose it. That combination is useful for framework code: APIs can be generic and strongly typed without requiring a runtime reflection model.
-
-```rust
-trait DocumentClient {
-    type Error;
-
-    async fn list_documents(
-        &self,
-        tenant: TenantId,
-        owner: UserId,
-    ) -> Result<Vec<Document>, Self::Error>;
-}
-
-async fn render_dashboard<C>(client: &C, tenant: TenantId, owner: UserId) -> Result<(), C::Error>
-where
-    C: DocumentClient,
-{
-    let docs = client.list_documents(tenant, owner).await?;
-    /* ... */
-    Ok(())
-}
-```
-
-Go now has generics and remains excellent for simple interfaces. C# has a powerful generic system and mature runtime tooling. Rust's particular advantage for Gears is that SDK crates, in-process clients, and future out-of-process transports can share type-safe contracts while still compiling many abstractions down to direct calls. This is one reason the `ClientHub` model in B.7 can stay ergonomic without giving up type safety.
-
-### A.11 Macros move framework rules into compile time
-
-Rust macros are not only text substitution. Derive and procedural macros inspect Rust syntax at compile time and generate checked Rust code. That lets framework authors put repetitive correctness rules close to the type definition instead of relying only on runtime reflection, handwritten glue, or external code generation.
-
-```rust
-#[derive(Scopable, Deserialize, Serialize)]
-#[secure(tenant_col = "tenant_id", owner_col = "owner_id")]
-struct Document {
-    tenant_id: TenantId,
-    owner_id: UserId,
-    title: String,
-}
-```
-
-This is the bridge between plain Rust and Gears. `#[derive(Scopable)]` can generate scoping metadata from the entity type; `serde` derives serialization without handwritten mapping code; schema tools can derive OpenAPI or JSON Schema from Rust types; SQL tooling such as `sqlx::query!` can even check queries against a database schema at compile time when configured for that workflow.
-
-Go and C# have strong alternatives: Go has explicit code generation and struct tags; C# has attributes, reflection, and source generators. Rust's advantage is the combination of type-checked generated code, no required runtime reflection, and close integration with the compiler pipeline. That is why B.5 and B.9 are not "magic": Gears leans on Rust's macro and lint ecosystem to turn framework conventions into code the compiler can verify.
+References: [Deployment profiles ADR](arch/toolkit-oop/ADR/0001-cpt-cf-adr-deployment-profiles.md), [Distributed Gears PRD](arch/toolkit-oop/PRD.md), [SDK/OoP pattern](toolkit_unified_system/09_oop_grpc_sdk_pattern.md), [Gears inventory and dependency rules](GEARS.md).
 
 ---
 
-## Part B — Why "just Rust" is not enough: what Gears adds
+## 3. Multi-level logic customization: products, vendors, tenants, and users
 
-Rust gives you a safe language. It does **not** give you multi-tenancy, an authz model, a consistent API dialect, licensing, or a deployment story. In Go, C#, or Rust, teams still need to choose or build those platform conventions.
+> Define the initial product shape, then let third-party vendors, AI agents, customers, and integrations extend the product at runtime. ISVs shape the compiled core by composing gears and plugins; vendors add integrations and applications through stable contracts; tenants and users customize data, UI, workflows, and automation without rebuilding the product.
 
-Gears is the **middleware and framework** that provides shared implementations and makes secure-by-default patterns the standard path.
+### Overview
 
-### B.1 A pre-integrated configurable XaaS backbone
+This factor includes:
 
-Multi-tenancy, permissions & roles, licensing & quota, usage collection, and an event system are all built in — and each is a **regular, replaceable gear** with its own SDK. You can swap Gears' `authn-resolver` / `tenant-resolver` for your existing vendor systems, or integrate an existing product catalog / license engine via plugins, **without modifying core gears**.
+1. **Select and configure what each product needs:** compose gears, plugins, policies, and deployment profiles into product editions using DSL.
+2. **Let third-party vendors extend the product:** expose stable application and integration contracts so external ISVs and system integrators can build on the product without access to or changes in its core.
+3. **Let tenants and users customize safely:** tailor data, UI, workflows, and automation at runtime, with independent lifecycle and scope.
 
-### B.2 Spec-driven development with Studio
+### Typical problem
 
-Gears is designed to keep product and technical documentation close to the code and tests instead of treating it as a separate wiki that slowly diverges. The integrated Studio and spec-driven development workflow store architecture, requirements, decomposition, design, and feature documents alongside the implementation in markdown files.
+Large-scale XaaS products require extensibility across three different dimensions:
 
-Traceable IDs such as `cpt-*` connect specifications, generated code and tests. Deterministic checks validate document structure, templates, tables of contents, references, and traceability, so documentation defects can be found by tools rather than only by human review. AI workflows can then use those same IDs and validated artifacts for semantic spec-to-code transformation, gap analysis, and integrity checks after code changes.
+- **ISV-level customization:** an ISV wants a platform or ready-to-use building blocks for its service, and usually wants to ship more than one product from the same base — different deployments, free and commercial editions, hosted (SaaS) and on-prem/installable versions, and separate products for different segments. Every one of those still has to apply the same core constraints — a tenancy model, enabled capabilities, access policy, licensing, metering, admission control, audit. Off-the-shelf open-source components rarely have all of those controls in place, so integrating them safely into each edition is the hard part.
 
-For long-living XaaS systems, this matters as much as the runtime framework: requirements, APIs, tenancy rules, and operational decisions remain navigable and auditable as the system grows.
+- **Third-party vendor-level extension:** an external ISV or system integrator needs to build an application or integration on top of the product without access to its source code. The extension needs its *own* data types, events, jobs, UI, connectivity settings, API mappings, and lifecycle, while remaining compatible with the product and isolated from other vendors' extensions.
 
-### B.3 Tenant isolation by default
+- **Tenant-level customization:** a customer wants to run its own AI agent or automation workflow, asks for a custom field, widget, setting, an approval rule, or a specific per-user workflow — small changes that should not be a part of the core product.
 
-One of the highest-risk bugs in a SaaS backend is a missing tenant filter — one missing `WHERE tenant_id = ?` can expose data across tenants.
+### Example: the same order product, extended at three levels
 
-In many Go or C# services, this is handled through query helpers, ORM conventions, middleware, or code review. Those approaches can work well, but they still depend on every code path using the right abstraction:
+An ISV ships an "orders" edition by **composing** the order, approval, pricing, and notification gears and selecting its policies and deployment profile. A third-party vendor adds an **adapter application** for a specific ERP through published extension contracts.
 
-```go
-// Go — one missing clause = cross-tenant data leak. The compiler is silent.
-rows, _ := db.Query("SELECT * FROM documents WHERE owner = ?", userID)
-// forgot AND tenant_id = ?  -> leaks every tenant's documents
-```
+On top of that running product, tenant A adds a new orders type with a `cost_center` property and an approval **workflow** for given orders over a threshold; tenant B adds different properties and a transformation function. Neither tenant forks the order gear, and both stay inside the same governed API, tenancy, and audit boundary.
 
-In Gears, entities derive `Scopable`, and the recommended repository path uses `SecureConn` to apply the caller's `AccessScope` (tenant, resource, owner, type) as automatic `WHERE` clauses:
+### Why it matters
 
-```rust
-// Rust + Gears — scoping is applied by the framework from the SecurityContext.
-#[derive(Scopable)]
-#[secure(tenant_col = "tenant_id", owner_col = "owner_id")]
-struct Document { /* ... */ }
+First-class customization capabilities keep the compiled core small and stable while custom product editions, integrations, vendor applications, and per-customer behavior evolve independently. Small changes in the core do not require new gears — they can be delivered as extensions instead. This way, new functionality ships faster without touching or rebuilding the main system core.
 
-// The AccessScope (derived from the authenticated caller) is applied automatically.
-let docs = secure_conn
-    .scoped::<Document>(&access_scope)
-    .filter(documents::Column::Status.eq("active"))
-    .all()
-    .await?; // emitted SQL always includes the tenant/owner predicates
-```
+### How Gears addresses it
 
-> The architecture makes the **scoped path the normal path**. Direct ORM or SQL access is
-> reserved for infrastructure/migration code and guarded by review plus architecture lints.
+Gears supports customization beyond the logic written in gears and fixed at compile time. It uses the [Global Type System](https://www.globaltypesystem.org) (GTS) to define and version API and data contracts, custom object types, properties, events, roles, and permissions. Serverless functions and workflows add custom server-side behavior, while cloud-side sandboxes isolate that code and enforce its application identity, tenant scope, permissions, resource limits, secrets, and network access. Together, these mechanisms support three extension levels: product composition at build time, partner applications at runtime, and tenant- or user-scoped customization.
 
-### B.4 Authentication & authorization, built in (NIST SP 800-162 PDP/PEP)
+#### 1. Select and configure what each product needs
 
-Gears ships a real authorization architecture, not a middleware stub:
+An ISV builds its service on pre-defined gears that already carry the core controls, and shapes them to the product without modifying the gears it reuses:
 
-- **API Gateway** validates the token and injects a `SecurityContext`.
-- The **PDP** (Policy Decision Point — an AuthZ Resolver plugin) evaluates policies
-  (RBAC/ABAC/ReBAC — vendor's choice) and returns a decision **plus row-level
-  constraints**.
-- The **PEP** (Policy Enforcement Point — your domain gear) compiles those
-  constraints into SQL `WHERE` clauses via `AccessScope`.
-- Returns **predicates, not resource IDs** → one PDP decision per request, with the
-  database applying row-level predicates for correct pagination and counts.
-- **Fail-closed**: denied / unreachable PDP / missing constraints → `403`.
+- **Compose** the set of gears the product needs into its binary or cluster.
+- **Configure** — with the planned DSL — the tenancy model, access-control policies, licensing, metering, and audit that the product must enforce, instead of hand-wiring those controls into each component.
+- **Write plugins** behind a host gear's SDK trait — e.g. a new auth provider, a storage backend, a search engine — discovered at runtime via the type registry and resolved through `ClientHub`.
+- **Write adapters** to integrate external systems behind the same contracts.
 
-In Go or C#, a mature platform team can centralize this with shared middleware, repositories, analyzers, and code review. Gears' value is that this repo already provides a standard contract and implementation path for its services.
+The primary way an ISV does this is Constructor Studio with a dedicated UI, AI assistant chat and GDL. **AI helps with scope** (what gears exist, what capabilities they provide, and which fit the product), and **GDL validates the result** (versions, capabilities, and options are compatible and satisfy the declared requirements and constraints). The model proposes, the compiler proves.
 
-### B.5 Prewritten architecture lints (`cargo gears lint`)
+The result is a product that reconfigures original gears for a specific product edition's needs, so the ISV owns its deployable profile without forking the core. The same foundation can then be recomposed into other editions (free/commercial, small-scale/large-scale, hosted/on-prem, per-segment) by changing the DSL declaration rather than editing or duplicating gears.
 
-This is where Gears uses Rust's linting model as a platform feature. This is not fundamentally different in kind from Go projects using `golangci-lint` / `go vet`, or .NET projects using Roslyn analyzers. The practical benefit is that Gears already ships a suite of custom architecture lints (run via `cargo gears lint`, provided by the `cargo-gears` CLI), and CI can fail the build on violations:
+#### 2. Let third-party partners and vendors extend the product at runtime
 
-- **Domain-layer isolation** — no infra imports (`sqlx`, `sea_orm`, `axum`, `reqwest`) inside `domain/`.
-- **Direct-SQL restriction** — raw SQL only in migration infrastructure.
-- **Versioned REST paths** — endpoints must be `/<gear>/v1/...`.
-- **Mandatory `OperationBuilder` metadata** — auth posture, error responses, and schemas must be declared.
-- **GTS identifier correctness** — valid IDs; no `schema_for!` on GTS structs.
-- **No unsafe shortcuts** — `unwrap`, avoidable `panic`, unsafe code paths, and unchecked invariants are treated as build-time failures where they would undermine platform guarantees.
+The Gears-based product vendor publishes governed extension contracts that external ISVs and system integrators use to build applications and integrations without access to or changes in the product source code. The extension surface can include UI extension points, versioned APIs and events, data types and custom properties, durable objects, roles and permissions, lifecycle hooks, and serverless functions and workflows.
 
-Why this matters for Gears: the framework is not just a set of helper libraries; it is a **runtime contract** for secure XaaS systems. `cargo gears lint` lets the repository encode rules that ordinary Rust tooling cannot know: which layer may import which crate, which API paths must be versioned, which API metadata is mandatory, where SQL is allowed, and which GTS identifiers are valid. That turns some design-document rules into CI-enforced checks.
+An **application** is a packaged extension with its own vendor identity, manifest, version, compatibility range, permissions, data, UI, and behavior. An **integration** is an application that connects the product to an external system and can add connectivity settings, API mappings, transformations, synchronization jobs, and integration-owned events.
 
-Compared with Go/C# alternatives, this is not about one ecosystem being incapable and another being capable. Go has `go vet`, `staticcheck`, and custom analyzers; C# has Roslyn analyzers; both are mature and useful. The difference is that Gears already includes project-specific checks for layer boundaries, route metadata, SQL placement, GTS identifiers, and unsafe shortcuts, wired into the same quality gate as formatting, Clippy, tests, and security checks.
+The main extension mechanisms are:
 
-> Documentation in markdown decays. `cargo gears lint` makes selected architecture rules executable in CI; that is not a substitute for design review, but it catches violations that reviewers would otherwise have to remember manually.
+- **GTS for APIs and data:** versioned, schema-validated product and vendor-owned types, properties, events, jobs, and settings. The Types Registry rejects incompatible schemas at registration.
+- **Serverless for behavior and durable state:** functions, workflows, and durable objects for mappings, transformations, synchronization, automation, and AI-agent skills. They run within the identity, permissions, and scope granted to the application.
 
-### B.6 Runtime Gears capabilities
+Applications have a lifecycle independent of the core product: they can be released, installed, enabled, disabled, upgraded, or downgraded separately. Installation makes an application available; a product operator or tenant administrator activates it for selected tenants or users. Declared compatibility is checked before activation, and application data, APIs, routes, secrets, usage, and behavior are isolated by default (§4).
 
-Gears offer a set of useful capabilities for building modern XaaS systems:
+#### 3. Let tenants and users customize safely
 
-- **Gear-owned migrations** — gears own their database migrations and run them as part of the runtime lifecycle, so schema ownership follows capability ownership.
-- **Cluster primitives** — the cluster system gear provides common cross-instance coordination primitives: distributed cache, leader election, distributed locks, and service discovery. Operators can bind each primitive to the right backend for the deployment (in-process, Postgres, Redis, Kubernetes, NATS, etcd), while consumers keep the same facade-style API and get startup validation when a backend cannot satisfy required guarantees.
-- **Transactional outbox** — reliable async message production with per-partition ordering, transactional or leased processing modes, retry/reject semantics, and graceful cancellation.
-- **HTTP client** — `toolkit-http` provides a standard outbound HTTP client with rustls TLS, pooling, timeouts, retries with exponential backoff, User-Agent injection, fail-fast concurrency limiting, response size limits, transparent gzip/brotli/deflate decompression, and secure redirect handling with SSRF and credential-leakage protections.
-- **SSE streaming** — toolkit support for typed server-sent events gives gears a standard way to expose streaming APIs without inventing one-off protocols.
+Product and operations teams can introduce a new user role, tighten an access policy, or launch a new pricing or licensing model globally or for a category of tenants or users. Tenants can add their own UI customizations, data fields, settings, AI agents, workflows, and automation. Per-tenant, per-group, or per-user customization uses the same extension model at a narrower scope.
 
-### B.7 One consistent API dialect: `OperationBuilder` + OpenAPI + OData
+A customer, partner, or product team can customize the product without access to or changes in the product source code, either in AI chat or manually using the guidelines:
 
-In Go and C#, teams usually choose routers/frameworks and standardize conventions for auth, errors, pagination, and OpenAPI generation. Gears makes one such standard choice for this platform: a single authoritative route-registration mechanism where one declaration produces the route, the auth posture, the license posture, the schemas, the registered error responses, and the OpenAPI entry:
+- Basic customization can be done in a declarative way.
+- Advanced customization can be developed as redistributable code.
+- Custom code can extend an existing product function or replace its implementation through defined extension points.
+- Customization code is stored separately from the mainstream product code.
+- Customization code has its own lifecycle: a customization can be released and redistributed without releasing a new product version.
+- Customizations are update-safe. A product upgrade must preserve a customization when its declared extension contracts remain compatible; incompatibility must be detected before activation rather than breaking the running product.
 
-```rust
-// Rust + Gears — one place declares everything; OpenAPI is generated from it.
-OperationBuilder::get("/documents/v1/documents")
-    .operation_id("documents.list")
-    .summary("List documents")
-    .authenticated()                       // auth posture is part of the route
-    .require_license_features::<License>([])
-    .handler(handlers::list_documents)
-    .json_response_with_schema::<dto::DocumentPage>(openapi, StatusCode::OK, "OK")
-    .error_401(openapi)
-    .error_500(openapi)
-    .register(router, openapi);
-```
+Customizations can be scoped, layered, disabled, and moved:
 
-This gives gears one uniform place for pagination/filtering (**OData** `$filter`, `$select`, `$orderby`), auth, rate-limiting, timeouts, observability, and OpenAPI generation. It reduces drift, but still depends on routes using the standard builder and on CI/review catching bypasses.
+- A customization can apply to the whole system, a tenant, a group of users, or one user.
+- A customization can be disabled from the UI. Once disabled, the affected scope uses mainstream product behavior.
+- Multiple customizations from different vendors or teams can apply to the same product module or screen and must coexist under deterministic composition and conflict rules.
+- Customizations are layered. System-wide, tenant, group, and user layers combine at runtime to determine behavior for the current user, with explicit and inspectable precedence rules.
+- Customizations can be exported and imported.
 
-### B.8 Composable gears: one codebase, many deployment shapes
+### Benefits
 
-A **Gear** is a self-contained unit that owns its API (an SDK crate), owns its data (behind `SecureConn`), is discovered at link time via `inventory`, and composes through a typed `ClientHub` in-process — or the *same* SDK over gRPC out-of-process.
+- **Executive:** ecosystem growth and customer retention — enable third-party vendors to extend product capabilities independently, increasing the product's value and integration reach without consuming the core product team's capacity.
+- **CTO:** keep a small, governed compiled core while product management, operations, ISVs and tenants configure, customize and extend it at runtime.
+- **Developer / AI / ISV:** keep core gears clean and stable — implement product-specific requirements and small customizations as separate extensions instead of accumulating customer-specific branches, feature flags, and logic in the core codebase.
 
-The logical model is identical regardless of the physical boundary. Switching between in-process and out-of-process is a **YAML field** (`runtime.type`), not a code change:
-
-- **Single-node** — all gears in one process → edge, on-prem appliances, dev/test.
-- **Multi-node** — gears across processes/machines over gRPC, no orchestrator.
-- **Kubernetes** — containerized, full orchestration, cloud-native ops.
-
-> Develop locally single-node → deploy bare-metal → scale to K8s — **no rewrites**.
-
-### B.9 Extensible domain model via the Global Type System (GTS)
-
-Gears exposes extensible domain objects through [GTS](https://github.com/globaltypesystem/gts-spec): globally unique, human-readable, **versioned** identifiers (e.g. `gts.cf.core.events.event.v1~`) with JSON Schemas generated directly from Rust types and registered in a Types Registry. You can add new event types, settings, model attributes, permissions, or license types **without touching existing gears**. CRUD handlers are customizable via hooks/callbacks implemented as serverless functions or workflows.
-
-### B.10 Canonical errors
-
-Gears uses a canonical error taxonomy aligned with the 16 [gRPC error status codes](https://grpc.io/docs/guides/status-codes/) (`NotFound`, `AlreadyExists`, `PermissionDenied`, `InvalidArgument`, `Unauthenticated`, and others). Over HTTP, errors are rendered as **RFC-9457 `Problem`** documents, so REST handlers, SDK boundaries, and future gRPC transports share the same vocabulary. Handlers return typed domain errors; middleware maps them into stable wire responses with trace context.
-
-### B.11 Observability and operational defaults
-
-Gears standardizes operational concerns that are often re-created per service: OpenTelemetry tracing, request IDs, structured logs, health endpoints (`/health`, `/healthz`), timeouts, body limits, CORS/MIME controls, rate limiting, and inflight protection. This gives platform teams a common operational surface across all gears instead of a different observability story per service.
-
-### B.12 FIPS 140-3 support
-
-For regulated deployments, Gears can be built with `--features fips` to route TLS crypto through OS/provider-specific FIPS-capable modules such as Apple `corecrypto` on supported macOS configurations, AWS-LC FIPS on Linux, and Windows CNG on Windows. Validation status is provider-, platform-, and version-specific; see the security/FIPS docs for the supported matrix. This does not claim that Gears itself is a CMVP-listed module; it means Gears consumes validated cryptographic modules through a controlled TLS provider strategy.
-
-### B.13 Supply-chain policy as code
-
-Gears treats the dependency graph as part of the security boundary. The useful part is not the slogan; it is that dependency decisions live in files that reviewers can diff.
-
-- **Same inputs for everyone** — `Cargo.lock` is committed, and `rust-toolchain.toml` pins the Rust version and components. A developer, CI job, and release build start from the same dependency closure and compiler baseline for a given commit.
-- **License and advisory checks** — `deny.toml` defines the SPDX allowlist, RustSec advisory handling, allowed registries, and pinned per-crate exceptions. Exceptions include the crate, version, and rationale in the file, so a license or vulnerability exception is a code-review item, not a private spreadsheet.
-- **FIPS graph checks** — `deny-fips.toml` is a stricter `cargo-deny` profile for `--features fips`. It blocks non-approved crypto crates and TLS backends outside the validated provider chain at build time. Phase A bans crates that should not enter the FIPS graph; Phase B records transitive cleanup before stricter bans such as `ring`, non-FIPS `aws-lc-rs`, pure-Rust AES/HMAC/HKDF/SHA paths, and other non-approved primitives can be enabled.
-- **CI coverage** — CI runs `make deny`; OpenSSF Scorecard runs on a schedule; CodeQL Advanced scans Rust, Python, and GitHub Actions; ClusterFuzzLite runs PR-scoped Rust fuzz targets on PRs that touch code; and repository-controlled GitHub Actions are pinned by commit SHA rather than mutable tags.
-- **Known gaps are explicit** — SBOM generation (CycloneDX), `cargo-vet` attestations, and SLSA provenance for release artifacts are useful next steps, but they should be treated as roadmap items until wired into CI.
-
-This is not unique to Rust — Go, C#, and other ecosystems can and should enforce dependency policy too. Rust's advantage for Gears is that the build graph, lockfile, feature flags, advisory database, and `cargo-deny` checks compose naturally with the same automation model used for formatting, lints, tests, architecture rules, and FIPS-mode builds.
-
-### B.14 Preconfigured build-gated safety
-
-Gears also defines a workspace lint floor in `Cargo.toml` and `clippy.toml`. This answers the practical question "what does prohibited mean?" with concrete build rules, not style guidance.
-
-- **Unsafe and debug leakage** — `unsafe_code = "forbid"` applies workspace-wide. `unwrap_used`, `expect_used`, `dbg_macro`, `use_debug`, and `unnecessary_debug_formatting` are denied; tests are the explicit exception for `unwrap`/`expect` through `clippy.toml`.
-- **Async correctness** — `await_holding_lock`, `await_holding_refcell_ref`, `async_yields_async`, and `unused_async` are denied. These catch common Tokio mistakes: holding a lock across `.await`, carrying `RefCell` borrows across suspension points, and adding unnecessary async boundaries.
-- **Numeric safety** — `cast_possible_truncation`, `cast_possible_wrap`, `cast_precision_loss`, `cast_sign_loss`, `integer_division`, `float_cmp`, and `lossy_float_literal` are denied. For quotas, usage metering, billing, and limits, silent narrowing or precision loss must be explicit and reviewed.
-- **Complexity budget** — `cognitive_complexity`, `type_complexity`, `too_many_lines`, and `struct_excessive_bools` are denied with project thresholds: cognitive complexity `20`, type complexity `190`, function length `200`, and at most `2` bool fields in a struct. The bool limit nudges state modeling toward enums instead of ambiguous flag bags.
-- **AI-generated code guardrails** — the config includes stricter thresholds for LLM-generated code: `single-char-binding-names-threshold = 4`, `large-error-threshold = 128`, plus denials for redundant clones, needless collects, verbose patterns, large stack arrays, `Rc<Mutex<_>>`, and `LinkedList`. This catches the kind of plausible-but-bloated code that agents and humans both produce under time pressure.
-- **Tenant-safe ORM use** — `clippy.toml` configures `disallowed-methods` for direct SeaORM `all`, `one`, `count`, update, and delete execution methods, with reasons pointing developers to secure scoped wrappers.
-
-Go and C# teams can enforce many of these rules with `golangci-lint`, `go vet`, Roslyn analyzers, and custom build policy. The practical difference in Gears is that the Rust compiler, Clippy, custom architecture lints (via `cargo gears lint`), and Cargo feature checks are already wired into one standard workspace safety pipeline (`make clippy`, `make lint`, `make safety`).
-
-### B.15 Local-first, shift-left development
-
-Because gears are composable libraries, the **full business logic — including scenarios that span multiple gears** — can be run and tested locally on a developer machine, without Jenkins, Ansible, or K8s. A single process can host many gears and exercise cross-gear flows end-to-end entirely in memory.
-
-Gears comes with integrated unit, integration, end-to-end, and fuzzing tests, plus coverage and diff-coverage to show exactly which changes are exercised. The same test suites can then be repeated by CI against a distributed deployment, where real networking, orchestration, and database backends are also exercised. This **local-first, fully testable runtime** lets developers and Agentic IDEs/LLMs catch logical and cross-gear issues early, *before* a pull request is opened, so most behavioral defects are found locally long before CI or a release stage.
+References: [GTS architecture](ARCHITECTURE_MANIFEST.md#35-extensible-domain-model-via-global-type-system), [Serverless roadmap](GEARS.md#serverless), [ClientHub and plugins](toolkit_unified_system/03_clienthub_and_plugins.md).
 
 ---
 
-## When Gears is (and isn't) the right choice
+## 4. Security & isolation: a shared platform with enforced boundaries
 
-**Choose Gears when you are:**
+> Many customers, partners, and integrations share one platform safely. Tenancy, authentication, authorization, database access, and logging follow one guarded request path; third-party extensions are isolated by default; and policy governs users, AI agents, integrations, and applications.
 
-- A **XaaS / SaaS vendor** building on a governed, multi-tenant backbone.
-- A **platform/product team** that wants security and tenancy handled by shared platform defaults instead of one-off service conventions.
-- A **GenAI builder** needing chat, RAG, model management, agents, tools.
-- An **on-prem / edge vendor** shipping single-binary appliances.
-- An **enterprise** embedding capabilities into an existing platform via plugins.
+### Overview
 
-**Gears is deliberately *not*:**
+This factor includes:
 
-- Optimized for minimalism / the absolute lowest barrier to entry — it prioritizes explicit structure, security, governance, and evolvability.
-- A ready-to-use catalog of end-user services — it's the *foundation* vendors build on.
-- A replacement for cloud infrastructure or PaaS — gears are libraries and building
-  blocks.
+1. **Secure, compile-time-validated request processing:** tenancy, authentication, authorization, database access, and logging follow one guarded request path.
+2. **Safe coexistence of third-party applications and extensions:** deny-by-default isolation prevents cross-tenant and cross-application access while retaining shared-infrastructure efficiency.
+3. **Policy-driven access control:** configurable RBAC/ABAC policies govern users, AI agents, integrations, and applications down to row and data-type scope.
 
----
+### Typical problem
 
-## Get started
+Once tenants, integrations, add-on services, and AI agents can define their own data and behavior (§3), a new risk appears: everything now lives in the same platform or product instance, often in the same tenant. Without a strict boundary:
 
-```bash
-git clone --recurse-submodules https://github.com/constructorfabric/gears-rust
-cd gears-rust
+- integration B could read events that integration A produced;
+- one integration could report usage against a usage type another integration owns;
+- a custom setting, notification type, or subscription attribute from one app or agent could leak into another;
+- a function from one service could operate on objects it does not own and must not see;
+- an unscoped database query could expose another tenant's rows;
+- an extension could call an undeclared internal API or external route, or leak a secret through logs.
 
-make build      # build libs + example server
-make example    # run the example server -> http://127.0.0.1:8087/cf/docs
+In most stacks this boundary is convention plus review, which does not hold once third parties are extending the system. Some platforms offer a dedicated per-tenant service or platform instance instead, but that approach carries higher operational and infrastructure cost and does not scale far.
 
-curl http://127.0.0.1:8087/cf/health    # detailed JSON (all component checks)
-curl http://127.0.0.1:8087/cf/readyz    # readiness: 200 ready / 503 not ready
-curl http://127.0.0.1:8087/cf/healthz   # liveness "ok"
+### Example: two integrations that cannot see each other
+
+Integration A declares an event type for a change in some external object. Integration B declares its own event type for a different system.
+
+Through GTS namespacing and ABAC checks in the event-broker gear, integrations A and B cannot subscribe to or emit each other’s events: B never receives A’s events, and A never receives B’s. The same isolation applies to settings, notifications, subscription attributes, and usage types: **integration B cannot report usage under a usage type defined by integration A**. Each integration behaves as if it had its own private slice of the platform, while still running inside the shared tenant and infrastructure.
+
+### Why it matters
+
+Isolation is not an add-on to extensibility — it is what makes extensibility safe. Without it, opening the platform to per-tenant, per-integration, and third-party logic would inevitably mix data and behavior that must stay separate. With it, many tenants, integrations, and applications can share services without leaking into one another, avoiding the infrastructure and operational cost of a separate stack for every customer.
+
+### How Gears addresses it
+
+#### 1. Secure, compile-time-validated request processing
+
+Gears ToolKit libraries provide a secure-by-default request path, while `cargo gears lint` verifies at build time that gears follow required architecture patterns:
+
+```text
+Client
+  → API Gateway authenticates the API client and establishes SecurityContext
+  → gear calls PolicyEnforcer as the policy enforcement point (PEP)
+  → policy decision point (PDP) evaluates access and returns row-level constraints
+  → PolicyEnforcer compiles those constraints into AccessScope
+  → Secure ORM applies AccessScope to database queries
+  → gear returns a typed response or a canonical RFC 9457 Problem
 ```
 
-**Next steps**
+These runtime checks execute **on every protected request** as platform capabilities each gear inherits rather than as per-service decisions. Architecture lints complement them by rejecting invalid declarations and prohibited implementation patterns before merge. Secure ORM applies row constraints before a query reaches the database, preserving correct filtering, counts, and pagination while preventing unscoped access.
 
-- Read the [Architecture Manifest](./ARCHITECTURE_MANIFEST.md) for the full rationale behind the Rust and monorepo choices.
-- Browse the [Gears inventory](./GEARS.md) to see what's already built.
-- Follow the [Toolkit guide](./toolkit_unified_system/README.md) to build your first
-  gear.
+At the language level, safe Rust prevents broad classes of memory-safety vulnerabilities—including use-after-free, out-of-bounds memory access, dangling references, and data races—before code runs. The workspace-wide `unsafe_code = "forbid"` policy prevents first-party gears from bypassing those guarantees. This removes an entire vulnerability category, while the guarded request path remains responsible for application-level security such as identity, authorization, tenancy, and data access.
+
+The same guarded path extends beyond tenant scoping: credentials use platform secret facilities, sensitive data must be kept out of logs and error details, and canonical API and error contracts avoid accidental leakage of provider or implementation internals.
+
+#### 2. Let third-party applications and extensions coexist safely
+
+Every GTS data type and function carries its **vendor package and namespace** in its identifier. That makes ownership machine-checkable, so the platform can scope data and logic to the integration, application, service, or user that owns them. Because ownership is part of the type or function identity rather than a runtime convention, the same boundary holds across storage, events, usage, and API access.
+
+Locally developed and third-party applications are isolated from one another by default. An application from vendor A cannot access vendor B's data or APIs unless the required permission is explicitly requested and granted:
+
+- Consent is explicit: the user or tenant administrator can see what data is requested, which vendor requests it, and why, then grant or reject access.
+- An application declares all required permissions in a manifest that is easy to review before deployment or consent.
+- Internet routes, internal APIs, and AI skills are declared explicitly; undeclared access is denied.
+- Application UI logic is untrusted, including UI supplied by trusted vendors, and is sandboxed so it cannot escape its assigned boundary or interfere with other applications.
+- Application secrets are stored through platform credential facilities, not in application code or user-visible configuration.
+- The platform enforces sensitive-data redaction or rejection and audits application API communication without exposing secrets or sensitive payloads.
+
+Containers, namespaces, and sandboxes complement contract- and policy-level controls where process or UI isolation is required. Many tenants and extensions can therefore share services safely instead of requiring an independent platform instance for each customer.
+
+#### 3. Apply policy-driven access control
+
+Gears applies **unified, data-type-based RBAC and ABAC** using namespaced GTS identifiers: a role or attribute grants access to specific types and methods, not to everything. Tenants define their own policies so different user roles, AI agents, integrations, and applications reach only the objects and operations they are allowed to use.
+
+On every request, API Gateway establishes `SecurityContext`; `PolicyEnforcer` asks the policy decision point for a decision and row-level constraints; and `AccessScope` turns those constraints into Secure ORM predicates. A tenant, user, or integration therefore reads and writes only the rows it owns. This is **zero trust by construction**: nothing is reachable unless policy explicitly grants it, with deny-all as the default.
+
+### Benefits
+
+- **Executive:** higher customer density and stronger retention — serve more tenants on shared infrastructure while safely hosting sandboxed third-party integrations that broaden the product offering and reduce churn.
+- **CTO:** lower security risk and review burden — platform-enforced isolation, compile-time checks, and ownership-based RBAC/ABAC limit the impact of developer mistakes instead of relying on every team to implement every boundary correctly.
+- **Developer / AI / ISV:** focus on business logic and deliver it faster — inherit tenancy, authentication, policy enforcement, data scoping, secrets handling, and safe logging instead of rebuilding security controls in every service and integration.
+
+References: [GTS architecture](ARCHITECTURE_MANIFEST.md#35-extensible-domain-model-via-global-type-system), [AuthN/AuthZ and Secure ORM](toolkit_unified_system/06_authn_authz_secure_orm.md), [ClientHub and plugins](toolkit_unified_system/03_clienthub_and_plugins.md).
 
 ---
 
-*Constructor Fabric Gears (Rust) · Apache-2.0 · by the
-[Constructor Fabric Foundation](https://www.constructorfabric.org).
-Secure · Modular · Composable · GenAI-ready.*
+## 5. Gears lifecycle automation: quality that improves and becomes enforceable
+
+> Constructor Studio brings UI, DSL, and AI operations for Gears and automates the whole delivery lifecycle. It controls specification and code quality, applies AI tuned for Gears, and turns lessons learned into reusable guidance and deterministic enforcement.
+
+### Overview
+
+This factor includes:
+
+1. **Specification and code quality control:** detect contradictions, gaps, traceability breaks, and violations of security, architecture, and reliability rules before release.
+2. **AI tuned for Gears:** improve quality and cost through optimized model routing, Gears-specific context, and tuned open models.
+3. **Re-enforceable learning:** turn lessons learned into reusable guidance, compiler constraints, static analysis, and deterministic CI checks.
+
+### Typical problem
+
+As a system grows, three problems appear together:
+
+- **Drift:** each service acquires its own specs format, auth/database pattern, API and error conventions, observability, testing, and review expectations. Knowledge from one service does not transfer to the next — for people or AI agents.
+- **Late detection:** a general compiler and generic linter allow many designs that compile but are wrong for this platform — an ORM query that skips tenant scoping, raw SQL in a domain layer, a route without an auth/error/schema contract, a remote call while a transaction is open, a secret reaching a log, or a dependency on a gear's internals. These surface as data leaks, lock contention, unstable APIs, and security findings, caught (if at all) by review and an ever-growing test suite. That does not scale, especially with AI-generated code.
+- **Manual assembly:** choosing which gears fit, wiring them together, and upgrading versions is manual and error-prone, so integration risk grows over the product's life.
+
+### Example: adding a tenant data-export endpoint with AI
+
+A team asks an AI coding agent to add `GET /v1/orders/export`. A generic implementation can compile and pass a single-tenant happy-path test while still querying the database directly, omitting row-level access scope, returning ad hoc errors, skipping audit and usage controls, or exporting sensitive fields that were never covered by the requirements.
+
+Gears lifecycle automation moves the change through progressively stronger controls:
+
+1. **Specification quality:** traceable PRD → DESIGN → ADR → FEATURE relationships make intent reviewable and allow tooling and AI to identify contradictions, gaps, and broken traceability before implementation.
+2. **Before coding, specification checks expose gaps:** who may export, which tenant and rows are in scope, which fields are sensitive, whether the capability requires a license or quota, and what must be audited.
+3. **Gears-tuned AI validates the generated code:** it analyzes the code change semantically and in its full context, checking semantics, contracts, error handling, data scoping, and use of platform patterns; it flags issues directly to frontier AI agents and human authors before the code is committed.
+4. **The build rejects architectural bypasses:** enforces multi-tenancy, authentication, authorization, licensing, and audit at compile and lint time so that code which skips required guards, scopes, or contracts cannot pass the build.
+5. **New lessons become shared enforcement:** if review or production reveals a reusable defect—for example, unbounded exports or spreadsheet-formula injection—the fix is captured in guidance, templates, static analysis, or contract tests so every future gear and AI-generated change inherits it.
+
+The result is not merely faster code generation. It is a controlled path from an incomplete request to a specified, on-pattern, machine-validated capability, with each discovered defect improving the next implementation.
+
+### Why it matters
+
+Specifications and standards do not keep implementations consistent by themselves. Without automated checks, the same architecture and security requirements must be verified repeatedly in code review, and violations will eventually be missed. Encoding recurring requirements and defects as shared lints, compiler constraints, and contract tests applies the same checks to every gear and every change.
+
+Early, deterministic validation reduces the number of defects that reach integration testing or production and makes failures easier to diagnose. A consistent project structure and machine-readable contracts also let engineers and AI agents work with less gear-specific context, while reviewers can focus on business behavior and genuinely new risks instead of checking the same platform conventions manually.
+
+### How Gears addresses it
+
+#### 1. Control specification and code quality
+
+Gears moves each recurring concern through a managed lifecycle and applies the strongest available validation at each stage:
+
+```text
+specification   →   standard   →   compile-time enforcement   →   tooling
+(PRD/DESIGN/ADR)    (one DNA)      (executable architecture)      (choose/compose/upgrade)
+```
+
+- **Specification quality:** traceable PRD → DESIGN → ADR → FEATURE relationships make intent reviewable and allow tooling and AI to identify contradictions, gaps, and broken traceability before implementation.
+- **Code quality:** Rust's type system and a workspace-wide `unsafe_code = "forbid"` policy; Clippy blocking raw SeaORM execution methods; Secure ORM typestate with deny-all empty access scopes; `OperationBuilder` typestate requiring route metadata; `cargo gears` / Dylint rules for layer isolation, SQL placement, versioned REST paths, and GTS conventions; schema generation and contract tests turn platform expectations into build-time checks.
+- **Lifecycle quality:** the same contracts make choosing, wiring, and upgrading gears validated rather than manual.
+
+Constructor Studio supports the lifecycle through a UI, requirements DSL, composition DSL, and AI workspace:
+
+- **Choose:** the catalog and AI assistant identify which gears and capabilities fit a product (§3).
+- **Compose and validate:** GDL declares gears, versions, bindings, deployment target, and constraints; its compiler rejects an impossible composition — missing capability, incompatible SDK/GTS versions, or an unmet consistency or residency constraint — before deployment (§2).
+- **Register and discover:** each gear carries a manifest and is discovered at runtime through the Types Registry, then resolved through `ClientHub`; plugins bind behind SDK traits without hard-wiring.
+- **Upgrade:** interfaces are versioned, upgrades are opt-in and checked at compose time, and the Types Registry rejects incompatible GTS changes at registration, so a bad upgrade fails early rather than in production.
+
+#### 2. Tune AI for Gears
+
+Studio's AI assistance is built specifically for Gears development and Gears-based product development. It combines an optimized model router, tuned open and custom models, training, and reinforcement grounded in Gears specifications, contracts, and conventions. Requirements and composition DSLs, together with continuously reinforced static analysis, give models precise Gears-specific context.
+
+Because the model works against a known, machine-checkable structure, it can produce more correct, on-pattern output at lower token, review, and rework cost than a general-purpose assistant. Routing selects the appropriate model for quality and cost, while tuning makes common Gears tasks require less repeated explanation.
+
+#### 3. Make learning re-enforceable
+
+The accepted design becomes one engineering DNA every gear shares: SDK-first crates and DDD-light layers, route declarations and generated OpenAPI, canonical RFC 9457 errors, tracing/metrics/health/lifecycle conventions, and a uniform testing and CI approach. There is one way to develop, build, operate, and reason about every gear.
+
+Where a mistake becomes known, the standard becomes a rule that fails the build rather than waiting for a test or production incident. Findings from reviews, AI analysis, or incidents are converted into specifications, decision guidance, compiler constraints, architecture lints, static analysis, contract tests, and deterministic CI checks.
+
+The target direction widens this net: a lint for remote calls while a transaction guard is held; sensitive-data annotations that keep a field out of logs, tracing, schema output, API responses, and error details; and AI-assisted discovery of repeated review or incident patterns that then become deterministic rules. AI can identify the pattern; the compiler enforces it on every future change.
+
+### Benefits
+
+Together, Gears and Studio let a team build and assemble products **faster** (a running baseline of specs, designs, APIs, and code instead of a blank page), with **better scope and quality** (proven capabilities and enforced conventions), and at **lower cost across both development and operations** (reuse instead of rebuild, and defects caught early rather than in production):
+
+- **Executive:** fewer late security, reliability, and compliance surprises, and lower cost to add or swap capabilities over the product's life.
+- **CTO:** architecture rules stay enforceable as the platform and team grow; fewer one-off conventions, simpler operations, and version upgrades or provider swaps validated by tooling rather than manual audit.
+- **Developer / AI:** a precise build failure with the preferred alternative beats a production incident; familiar structure and machine-checked contracts mean less context to load and a faster path from one reported problem to a repository-wide fix.
+
+References: [Specification templates](spec-templates/README.md), [ToolKit guide](toolkit_unified_system/README.md), [`Cargo.toml`](../Cargo.toml), [`clippy.toml`](../clippy.toml), [`Gears.toml`](../Gears.toml), [Defect class → control map](toolkit_unified_system/16_defect_class_to_control_map.md), [ClientHub and plugins](toolkit_unified_system/03_clienthub_and_plugins.md).
+
+---
+
+## What actually makes the difference
+
+No single one of these five factors above is unique — most can be built by a strong platform team. The value is that they hold together:
+
+```text
+XaaS DNA in every Gear (patterns + built-in concerns + portfolio foundation)
+  + composable capabilities (single process + configurable deployment topology + infrastructure agnostic)
+  + multi-level logic customization (product + third-party vendor + tenant/user)
+  + security & isolation (guarded requests + safe coexistence + policy)
+  + Gears lifecycle automation (quality control + tuned AI + re-enforceable learning)
+```
+
+Most frameworks hand you building blocks and leave assembly, deployment, extension, testing, and operations to you. Gears standardizes those too, so the parts compose instead of drifting apart as the product grows.
+
+The DSL, GTS, and serverless layers extend the same idea: describe the platform and its constraints, let the tooling validate a workable composition, and let teams or ISVs add behavior without making the compiled core or the deployment harder to reason about.
+
+So the claim is not "more features." It is: **Gears turns the recurring, high-risk parts of XaaS engineering into a well-architected, secure foundation of composable libraries** — reusable OSS and BSS capabilities, extensible and customizable API contracts, automatic safeguards, runtime extensions, integrations automation, and efficient operation from a single server to global scale.
+
+## What it's worth
+
+Gears creates value in five places: foundational capabilities are reused across a product portfolio; engineers and AI agents get a shorter local feedback loop; one codebase supports multiple product and deployment profiles; partners add applications without expanding the core product team; and secure shared infrastructure serves more customers and extensions per deployment. Lifecycle automation reduces the review and incident cost of keeping that system consistent as it grows.
+
+A current portfolio-level estimate is that the reusable security, core, billing, and operations capabilities cover functionality otherwise represented by roughly **3–5M lines of foundational code** and avoid **30–50 person-years of repeated platform work**. These are directional planning estimates, not universal benchmarks: the realized value depends on how much of the catalog a product uses, how much equivalent platform code already exists, and which target capabilities are implemented at adoption time.
+
+| Stakeholder | Direct value | What creates it |
+|---|---|---|
+| **Executive / product business** | More products and integrations per platform investment; higher customer density and retention; less infrastructure lock-in | Shared OSS/BSS foundation (§1), partner and tenant extension model (§3), secure shared services (§4) |
+| **CTO / chief architect** | Fewer parallel platform implementations; flexible service boundaries and infrastructure targets; lower security and review burden | Versioned contracts and deployment composition (§2), platform-enforced isolation (§4), validated upgrades and reusable architecture checks (§5) |
+| **Product management** | More flexible product positioning — create cloud, on-premises, free, commercial, and segment-specific editions with configurable capabilities and licensing instead of maintaining separate products | Product and deployment composition (§2), customizable product definitions (§3), and built-in licensing and commercial controls (§1) |
+| **Third-party vendor / system integrator** | Build and release applications or integrations without modifying the product core or waiting for its release cycle | Published APIs and events, GTS contracts, serverless behavior, application packaging, permissions, and sandboxing (§3–§4) |
+| **Tenant / customer** | Product-specific data, workflows, UI, and integrations without a private product fork or dedicated platform stack | Scoped and layered customization (§3), policy-driven access and application isolation (§4) |
+
+## Further reading
+
+- [Architecture Manifest](ARCHITECTURE_MANIFEST.md)
+- [Gears inventory and implementation status](GEARS.md)
+- [ToolKit Architecture & Developer Guide](toolkit_unified_system/README.md)
+- [Distributed Gears PRD](arch/toolkit-oop/PRD.md)
+- [Three Named Deployment Profiles ADR](arch/toolkit-oop/ADR/0001-cpt-cf-adr-deployment-profiles.md)
+- [Security Overview](security/SECURITY.md)
+- [WHY_RUST.md](WHY_RUST.md) — deep technical dive for developers

@@ -2,9 +2,13 @@
 
 use std::sync::Arc;
 
+use axum::extract::Request;
+use axum::middleware::{Next, from_fn};
+use axum::response::{IntoResponse, Response};
 use axum::{Extension, Router};
 use toolkit::api::OpenApiRegistry;
 use toolkit::api::canonical_prelude::StatusCode;
+use toolkit::api::operation_builder::state::{AuthNotSet, AuthSet, Missing};
 use toolkit::api::operation_builder::{
     CORE_GLOBAL_BASE_LICENSE_FEATURE, LicenseFeature, OperationBuilder, OperationBuilderODataExt,
     ParamSpec, ResponseHeaderSpec, ResponseHeaderType,
@@ -16,7 +20,11 @@ use super::dto::{
     RegisterEntitiesRequest, RegisterEntitiesResponse, SubmitEntitiesRequest,
 };
 use super::handlers;
-pub use super::paths::{V1, V2};
+pub use super::paths::{PLATFORM, V1, V2};
+use toolkit_canonical_errors::CanonicalError;
+use toolkit_security::{PlatformSecurityContext, SecurityContext};
+use types_registry_sdk::reason;
+
 use crate::config::Limits;
 use crate::domain::registry_service::RegistryService;
 use crate::domain::service::TypesRegistryService;
@@ -36,28 +44,57 @@ impl LicenseFeature for License {}
 /// Registers all REST routes for the Types Registry gear.
 #[allow(clippy::needless_pass_by_value)]
 pub fn register_routes(
-    mut router: Router,
+    host: Router,
     openapi: &dyn OpenApiRegistry,
     service: Arc<TypesRegistryService>,
     registry: Option<Arc<RegistryService>>,
 ) -> Router {
-    // C8 remains open: v2 accepts tenant bearers; exposed=false only controls proxy discovery.
-    // T34 moves routes, credentials, fixtures and e2e callers to platform auth atomically.
-    // Platform bypasses the tenant PDP (ADR-0006/0008). Routes remain in OpenAPI; T38 promotes
-    // the tenant reads to V1 and keeps mutations unexposed while C8 remains open.
+    // D17: platform operations use `.platform_authenticated()` under PLATFORM;
+    // tenant entity reads use `.authenticated()` under V2 (V1 after T38).
+    // C6: authentication only; any valid internal token may mutate.
+    // C8: no `.exposed()` routes, excluding OoP platform routes from gateway
+    // discovery. Embedded routes share the gateway listener and token validation.
 
-    router = register_v1(router, openapi);
-    router = register_submit(router, openapi);
-    router = register_reads(router, openapi);
-    router = register_batch_get(router, openapi);
+    let mut router = register_v1(Router::new(), openapi);
     let limits = registry
         .as_deref()
         .map_or_else(Limits::default, |registry| *registry.limits());
-    router = register_discovery(router, openapi, &limits);
+    router = register_submit(router, openapi);
+    router = register_operation(router, openapi);
     router = register_batch_delete(router, openapi);
     router = register_delete_entity(router, openapi);
+    for plane in [Plane::Platform, Plane::Tenant] {
+        router = register_exact_read(router, openapi, plane);
+        router = register_batch_get(router, openapi, plane);
+        router = register_discovery(router, openapi, &limits, plane);
+    }
 
-    router.layer(Extension(service)).layer(Extension(registry))
+    // Only the registry's own routes are gated; the host's are not ours to refuse.
+    host.merge(router.route_layer(from_fn(require_caller)))
+        .layer(Extension(service))
+        .layer(Extension(registry))
+}
+
+/// Return canonical 401 when a registry route has no caller context (SPEC §8.4).
+/// Standalone `oop_serve` installs no tenant plane without an authenticator;
+/// this prevents unauthenticated legacy reads and database extractor 500s.
+/// The listener's platform gate already handles platform routes.
+async fn require_caller(request: Request, next: Next) -> Response {
+    let extensions = request.extensions();
+    if extensions.get::<SecurityContext>().is_some()
+        || extensions.get::<PlatformSecurityContext>().is_some()
+    {
+        return next.run(request).await;
+    }
+    tracing::warn!(
+        path = %request.uri().path(),
+        "types_registry refused a request with no validated caller; no tenant authenticator \
+         is installed"
+    );
+    CanonicalError::unauthenticated()
+        .with_reason(reason::unauthenticated::TENANT_AUTHENTICATION_UNAVAILABLE)
+        .create()
+        .into_response()
 }
 
 /// Declare the required mutation header via `param`. `OperationBuilder` still
@@ -155,29 +192,86 @@ fn register_v1(mut router: Router, openapi: &dyn OpenApiRegistry) -> Router {
     router
 }
 
-// Database-backed v2 (T9); T38 promotes the tenant reads to v1. No .exposed(): gateway discovery
-// excludes it, including mutations after promotion (see C8 above).
+// The database API (T9): every operation on the platform plane, and the entity reads again
+// on the tenant plane. No `.exposed()`: see C8 above.
 
-/// `POST {V2}/entities` (D10).
-fn register_submit(mut router: Router, openapi: &dyn OpenApiRegistry) -> Router {
-    // POST /types-registry/v2/entities — submit a registration (D10)
-    //
+/// Which plane a route set serves (D17); a route serves exactly one.
+#[derive(Clone, Copy)]
+enum Plane {
+    /// `.platform_authenticated()` under [`PLATFORM`].
+    Platform,
+    /// `.authenticated()` under [`V2`], until T38 promotes it to [`V1`].
+    Tenant,
+}
+
+impl Plane {
+    const fn base(self) -> &'static str {
+        match self {
+            Self::Platform => PLATFORM,
+            Self::Tenant => V2,
+        }
+    }
+
+    /// Distinct per plane, since a read is declared on both.
+    fn operation_id(self, name: &str) -> String {
+        match self {
+            Self::Platform => format!("types_registry.platform.{name}"),
+            Self::Tenant => format!("types_registry.{name}"),
+        }
+    }
+
+    /// Applied before the handler, while the builder is still bare.
+    fn authenticate(
+        self,
+        builder: OperationBuilder<Missing, Missing, (), AuthNotSet>,
+    ) -> OperationBuilder<Missing, Missing, (), AuthSet> {
+        match self {
+            Self::Platform => builder.platform_authenticated(),
+            Self::Tenant => builder.authenticated(),
+        }
+    }
+}
+
+/// The receipt headers of a `202`, plus `Retry-After` when `accepted`.
+fn receipt_headers(accepted: bool) -> Vec<ResponseHeaderSpec> {
+    let mut headers = vec![ResponseHeaderSpec::new(
+        "Location",
+        "URI of the admission operation",
+        ResponseHeaderType::String,
+    )];
+    if accepted {
+        headers.push(ResponseHeaderSpec::new(
+            "Retry-After",
+            "Suggested delay in seconds before polling the operation",
+            ResponseHeaderType::Integer,
+        ));
+    }
+    headers.push(ResponseHeaderSpec::new(
+        "Idempotency-Replayed",
+        "Whether this submission replayed an existing operation",
+        ResponseHeaderType::Boolean,
+    ));
+    headers
+}
+
+/// `POST {PLATFORM}/entities` (D10).
+fn register_submit(router: Router, openapi: &dyn OpenApiRegistry) -> Router {
     // The async shape DESIGN specifies: the response is a receipt for an
     // operation and the outcome is polled. `200` is returned only for a replay of
     // an operation that is already terminal.
-    router = OperationBuilder::post(format!("{V2}/entities"))
-        .operation_id("types_registry.submit_entities")
+    let mut builder = OperationBuilder::post(format!("{PLATFORM}/entities"))
+        .operation_id(Plane::Platform.operation_id("submit_entities"))
         .summary("Submit GTS entities for registration")
-        .description(
+        .description(format!(
             "Submit one or more GTS entities for admission. Returns 202 with the operation's \
-             Location; poll GET /types-registry/v2/operations/{operation_id} for the \
+             Location; poll GET {PLATFORM}/operations/{{operation_id}} for the \
              per-candidate outcome. A replay of a terminal operation returns 200. An \
              Idempotency-Key header is required: a replay with the same body returns the same \
              operation, and a different body under the same key is a conflict.",
-        )
+        ))
         .param(idempotency_key_param())
         .tag(API_TAG)
-        .authenticated()
+        .platform_authenticated()
         .require_license_features::<License>([])
         .json_request::<SubmitEntitiesRequest>(openapi, "Entities to admit")
         .handler(handlers::submit_entities)
@@ -185,37 +279,19 @@ fn register_submit(mut router: Router, openapi: &dyn OpenApiRegistry) -> Router 
             openapi,
             StatusCode::ACCEPTED,
             "Accepted; poll the operation at the returned Location",
-        )
-        .response_header(ResponseHeaderSpec::new(
-            "Location",
-            "URI of the admission operation",
-            ResponseHeaderType::String,
-        ))
-        .response_header(ResponseHeaderSpec::new(
-            "Retry-After",
-            "Suggested delay in seconds before polling the operation",
-            ResponseHeaderType::Integer,
-        ))
-        .response_header(ResponseHeaderSpec::new(
-            "Idempotency-Replayed",
-            "Whether this submission replayed an existing operation",
-            ResponseHeaderType::Boolean,
-        ))
-        .json_response_with_schema::<OperationAcceptedDto>(
-            openapi,
-            StatusCode::OK,
-            "Replay of an operation that is already terminal",
-        )
-        .response_header(ResponseHeaderSpec::new(
-            "Location",
-            "URI of the admission operation",
-            ResponseHeaderType::String,
-        ))
-        .response_header(ResponseHeaderSpec::new(
-            "Idempotency-Replayed",
-            "Whether this submission replayed an existing operation",
-            ResponseHeaderType::Boolean,
-        ))
+        );
+    for header in receipt_headers(true) {
+        builder = builder.response_header(header);
+    }
+    builder = builder.json_response_with_schema::<OperationAcceptedDto>(
+        openapi,
+        StatusCode::OK,
+        "Replay of an operation that is already terminal",
+    );
+    for header in receipt_headers(false) {
+        builder = builder.response_header(header);
+    }
+    builder
         .problem_response(
             openapi,
             StatusCode::CONFLICT,
@@ -227,22 +303,20 @@ fn register_submit(mut router: Router, openapi: &dyn OpenApiRegistry) -> Router 
         .error_422(openapi)
         // An unbound database is a deployment state, so this 503 has no `Retry-After`.
         .error_503(openapi)
-        .register(router, openapi);
-    router
+        .register(router, openapi)
 }
 
-/// The two v2 reads: one operation, one entity.
-fn register_reads(mut router: Router, openapi: &dyn OpenApiRegistry) -> Router {
-    // GET /types-registry/v2/operations/{operation_id} — poll an operation
-    router = OperationBuilder::get(format!("{V2}/operations/{{operation_id}}"))
-        .operation_id("types_registry.get_operation")
+/// `GET {PLATFORM}/operations/{operation_id}`: platform only, like every mutation.
+fn register_operation(router: Router, openapi: &dyn OpenApiRegistry) -> Router {
+    OperationBuilder::get(format!("{PLATFORM}/operations/{{operation_id}}"))
+        .operation_id(Plane::Platform.operation_id("get_operation"))
         .summary("Get an admission operation")
         .description(
             "Return one operation and the durable per-candidate outcomes. `status` is progress \
              only: `completed` means every item is terminal, and the outcomes are on the items.",
         )
         .tag(API_TAG)
-        .authenticated()
+        .platform_authenticated()
         .require_license_features::<License>([])
         .path_param(
             "operation_id",
@@ -253,11 +327,14 @@ fn register_reads(mut router: Router, openapi: &dyn OpenApiRegistry) -> Router {
         .problem_response(openapi, StatusCode::NOT_FOUND, "No such operation")
         .standard_errors(openapi)
         .error_503(openapi)
-        .register(router, openapi);
+        .register(router, openapi)
+}
 
-    // GET /types-registry/v2/entities/{entity_key} — exact read from the database
-    router = OperationBuilder::get(format!("{V2}/entities/{{entity_key}}"))
-        .operation_id("types_registry.get_entity")
+/// `GET {base}/entities/{entity_key}` — the exact read, on either plane.
+fn register_exact_read(router: Router, openapi: &dyn OpenApiRegistry, plane: Plane) -> Router {
+    let base = plane.base();
+    let builder = OperationBuilder::get(format!("{base}/entities/{{entity_key}}"))
+        .operation_id(plane.operation_id("get_entity"))
         .summary("Get a GTS entity by identifier or Registry Reference")
         .description(
             "Return one entity, projected by `$select`. The key is either a canonical GTS \
@@ -274,8 +351,9 @@ fn register_reads(mut router: Router, openapi: &dyn OpenApiRegistry) -> Router {
              reports it. No other query parameter is accepted. The `ETag` is scoped to the \
              `$select`; `If-None-Match` with a current one returns a bodyless 304.",
         )
-        .tag(API_TAG)
-        .authenticated()
+        .tag(API_TAG);
+    let builder = plane
+        .authenticate(builder)
         .require_license_features::<License>([])
         .path_param(
             "entity_key",
@@ -287,8 +365,12 @@ fn register_reads(mut router: Router, openapi: &dyn OpenApiRegistry) -> Router {
                 .required(false)
                 .description("An earlier `ETag` of this key under the same `$select`, or `*`"),
         )
-        .with_odata_select()
-        .handler(handlers::get_entity_by_key)
+        .with_odata_select();
+    let builder = match plane {
+        Plane::Platform => builder.handler(handlers::platform_get_entity_by_key),
+        Plane::Tenant => builder.handler(handlers::get_entity_by_key),
+    };
+    builder
         .json_response_with_schema::<EntityDto>(openapi, StatusCode::OK, "The requested entity")
         .response_header(etag_header())
         .no_content_response(
@@ -299,23 +381,23 @@ fn register_reads(mut router: Router, openapi: &dyn OpenApiRegistry) -> Router {
         .problem_response(openapi, StatusCode::NOT_FOUND, "Entity not found")
         .standard_errors(openapi)
         .error_503(openapi)
-        .register(router, openapi);
-    router
+        .register(router, openapi)
 }
 
-/// `POST {V2}/entities:batchGet` (T22a).
-fn register_batch_get(mut router: Router, openapi: &dyn OpenApiRegistry) -> Router {
+/// `POST {base}/entities:batchGet` (T22a), on either plane.
+fn register_batch_get(router: Router, openapi: &dyn OpenApiRegistry, plane: Plane) -> Router {
+    let base = plane.base();
     // A read-only custom action, and a `POST` for two reasons that are about the
     // transport rather than the semantics: an identifier runs to 1024 characters,
     // which a query string cannot carry safely, and portable `GET` has no body
     // (DESIGN §3.3). It is still a read — no `Idempotency-Key`, nothing to replay.
-    router = OperationBuilder::post(format!("{V2}/entities:batchGet"))
-        .operation_id("types_registry.batch_get_entities")
+    let builder = OperationBuilder::post(format!("{base}/entities:batchGet"))
+        .operation_id(plane.operation_id("batch_get_entities"))
         .summary("Read a set of GTS entities by key")
-        .description(
+        .description(format!(
             "Read up to 100 entities in one round trip. Each item names one entity in `entity_key` \
              (a canonical GTS identifier or the Registry Reference UUID derived from it), \
-             resolved exactly as GET /types-registry/v2/entities/{entity_key} resolves it. \
+             resolved exactly as GET {base}/entities/{{entity_key}} resolves it. \
              A top-level `$select` string applies to every key and follows that route's \
              `$select` rules; absent, the document-free default. Tombstones are `found`. Returns 200 with one result \
              per distinct requested key, in no contractual order, echoing the key it was asked by, a Registry \
@@ -331,12 +413,17 @@ fn register_batch_get(mut router: Router, openapi: &dyn OpenApiRegistry) -> Rout
              two keys and get two results. An absent key is not a 404: one missing key must \
              not lose the answers for the others. The If-None-Match header is refused rather \
              than ignored: validators are per key and belong in each item's `if_none_match`.",
-        )
-        .tag(API_TAG)
-        .authenticated()
+        ))
+        .tag(API_TAG);
+    let builder = plane
+        .authenticate(builder)
         .require_license_features::<License>([])
-        .json_request::<BatchGetRequest>(openapi, "Keys to read")
-        .handler(handlers::batch_get_entities)
+        .json_request::<BatchGetRequest>(openapi, "Keys to read");
+    let builder = match plane {
+        Plane::Platform => builder.handler(handlers::platform_batch_get_entities),
+        Plane::Tenant => builder.handler(handlers::batch_get_entities),
+    };
+    builder
         .json_response_with_schema::<EntityLookupsDto>(
             openapi,
             StatusCode::OK,
@@ -347,26 +434,28 @@ fn register_batch_get(mut router: Router, openapi: &dyn OpenApiRegistry) -> Rout
         .error_415(openapi)
         .error_422(openapi)
         .error_503(openapi)
-        .register(router, openapi);
-    router
+        .register(router, openapi)
 }
 
-/// `GET {V2}/entities` — the bounded, projected discovery page (D12, T22a, T22b).
+/// `GET {base}/entities` — the bounded, projected discovery page (D12, T22a, T22b), on
+/// either plane.
 fn register_discovery(
-    mut router: Router,
+    router: Router,
     openapi: &dyn OpenApiRegistry,
     limits: &Limits,
+    plane: Plane,
 ) -> Router {
+    let base = plane.base();
     let (default, max) = (limits.page_size_default, limits.page_size_max);
-    router = OperationBuilder::get(format!("{V2}/entities"))
-        .operation_id("types_registry.list_entities")
+    let builder = OperationBuilder::get(format!("{base}/entities"))
+        .operation_id(plane.operation_id("list_entities"))
         .summary("Discover GTS entities")
         .description(format!(
             "Return one bounded page of entities, ordered by canonical identifier, with a \
              cursor only when another match remains; a page with a cursor is full. \
              `lifecycle_status` is `active` (default), `deleted` \
              (tombstones only) or `all`. Each item is projected by `$select` \
-             exactly as GET /types-registry/v2/entities/{{entity_key}} projects it; absent, the \
+             exactly as GET {base}/entities/{{entity_key}} projects it; absent, the \
              document-free default; `gts_id`, `gts_uuid`, `kind` and `lifecycle_status` are \
              always returned. A page never carries a validator. `depth` bounds the number of \
              identifier segments and `kind` narrows to Type Schemas or Instances; \
@@ -380,8 +469,9 @@ fn register_discovery(
              `$select` or `lifecycle_status` are interchangeable. Any other query parameter \
              is refused.",
         ))
-        .tag(API_TAG)
-        .authenticated()
+        .tag(API_TAG);
+    let builder = plane
+        .authenticate(builder)
         .require_license_features::<License>([])
         .query_param(
             "pattern",
@@ -437,8 +527,12 @@ fn register_discovery(
              lifecycle_status and $select. \
              Absent starts at the beginning. Alias: $skiptoken",
         )
-        .with_odata_select()
-        .handler(handlers::discover_entities)
+        .with_odata_select();
+    let builder = match plane {
+        Plane::Platform => builder.handler(handlers::platform_discover_entities),
+        Plane::Tenant => builder.handler(handlers::discover_entities),
+    };
+    builder
         .json_response_with_schema::<EntityPageDto>(
             openapi,
             StatusCode::OK,
@@ -446,30 +540,29 @@ fn register_discovery(
         )
         .standard_errors(openapi)
         .error_503(openapi)
-        .register(router, openapi);
-    router
+        .register(router, openapi)
 }
 
-/// `POST {V2}/entities:batchDelete` (T20a).
-fn register_batch_delete(mut router: Router, openapi: &dyn OpenApiRegistry) -> Router {
-    router = OperationBuilder::post(format!("{V2}/entities:batchDelete"))
-        .operation_id("types_registry.batch_delete_entities")
+/// `POST {PLATFORM}/entities:batchDelete` (T20a).
+fn register_batch_delete(router: Router, openapi: &dyn OpenApiRegistry) -> Router {
+    let mut builder = OperationBuilder::post(format!("{PLATFORM}/entities:batchDelete"))
+        .operation_id(Plane::Platform.operation_id("batch_delete_entities"))
         .summary("Submit GTS entities for deletion")
-        .description(
+        .description(format!(
             "Submit one or more entities for deletion. Each item names its target in `entity_key` \
              (a canonical GTS identifier or the Registry Reference UUID derived from it) and \
              carries a required positive `expected_resource_version`. Returns 202 with the \
-             operation's Location; poll GET /types-registry/v2/operations/{operation_id} for \
+             operation's Location; poll GET {PLATFORM}/operations/{{operation_id}} for \
              the per-item outcome. Outcomes are reported in request order and echo each key as \
              `entity_key`, a Registry Reference in canonical lowercase hyphenated form; a \
              Registry Reference naming no entity fails only its own item. A \
              stale version is not a 412: \
              it is reported as a terminal `precondition_failed` item on the operation, and \
              If-Match is refused rather than ignored.",
-        )
+        ))
         .param(idempotency_key_param())
         .tag(API_TAG)
-        .authenticated()
+        .platform_authenticated()
         .require_license_features::<License>([])
         .json_request::<DeleteEntitiesRequest>(openapi, "Entities to delete")
         .handler(handlers::batch_delete_entities)
@@ -477,37 +570,19 @@ fn register_batch_delete(mut router: Router, openapi: &dyn OpenApiRegistry) -> R
             openapi,
             StatusCode::ACCEPTED,
             "Accepted; poll the operation at the returned Location",
-        )
-        .response_header(ResponseHeaderSpec::new(
-            "Location",
-            "URI of the admission operation",
-            ResponseHeaderType::String,
-        ))
-        .response_header(ResponseHeaderSpec::new(
-            "Retry-After",
-            "Suggested delay in seconds before polling the operation",
-            ResponseHeaderType::Integer,
-        ))
-        .response_header(ResponseHeaderSpec::new(
-            "Idempotency-Replayed",
-            "Whether this submission replayed an existing operation",
-            ResponseHeaderType::Boolean,
-        ))
-        .json_response_with_schema::<OperationAcceptedDto>(
-            openapi,
-            StatusCode::OK,
-            "Replay of an operation that is already terminal",
-        )
-        .response_header(ResponseHeaderSpec::new(
-            "Location",
-            "URI of the admission operation",
-            ResponseHeaderType::String,
-        ))
-        .response_header(ResponseHeaderSpec::new(
-            "Idempotency-Replayed",
-            "Whether this submission replayed an existing operation",
-            ResponseHeaderType::Boolean,
-        ))
+        );
+    for header in receipt_headers(true) {
+        builder = builder.response_header(header);
+    }
+    builder = builder.json_response_with_schema::<OperationAcceptedDto>(
+        openapi,
+        StatusCode::OK,
+        "Replay of an operation that is already terminal",
+    );
+    for header in receipt_headers(false) {
+        builder = builder.response_header(header);
+    }
+    builder
         .problem_response(
             openapi,
             StatusCode::CONFLICT,
@@ -518,25 +593,24 @@ fn register_batch_delete(mut router: Router, openapi: &dyn OpenApiRegistry) -> R
         .error_415(openapi)
         .error_422(openapi)
         .error_503(openapi)
-        .register(router, openapi);
-    router
+        .register(router, openapi)
 }
 
-/// `DELETE {V2}/entities/{{entity_key}}` (T20a).
-fn register_delete_entity(mut router: Router, openapi: &dyn OpenApiRegistry) -> Router {
-    router = OperationBuilder::delete(format!("{V2}/entities/{{entity_key}}"))
-        .operation_id("types_registry.delete_entity")
+/// `DELETE {PLATFORM}/entities/{{entity_key}}` (T20a).
+fn register_delete_entity(router: Router, openapi: &dyn OpenApiRegistry) -> Router {
+    let mut builder = OperationBuilder::delete(format!("{PLATFORM}/entities/{{entity_key}}"))
+        .operation_id(Plane::Platform.operation_id("delete_entity"))
         .summary("Delete one GTS entity")
-        .description(
+        .description(format!(
             "Delete a single entity named by canonical GTS identifier or Registry Reference \
-             UUID, spelled as GET /types-registry/v2/entities/{entity_key} takes it and \
+             UUID, spelled as GET {PLATFORM}/entities/{{entity_key}} takes it and \
              resolved by the worker. One item's worth of :batchDelete. Returns 202 with the operation's Location; \
              a stale version is reported as a terminal `precondition_failed` item rather than \
              a 412, and If-Match is refused rather than ignored.",
-        )
+        ))
         .param(idempotency_key_param())
         .tag(API_TAG)
-        .authenticated()
+        .platform_authenticated()
         .require_license_features::<License>([])
         .path_param(
             "entity_key",
@@ -570,37 +644,19 @@ fn register_delete_entity(mut router: Router, openapi: &dyn OpenApiRegistry) -> 
             openapi,
             StatusCode::ACCEPTED,
             "Accepted; poll the operation at the returned Location",
-        )
-        .response_header(ResponseHeaderSpec::new(
-            "Location",
-            "URI of the admission operation",
-            ResponseHeaderType::String,
-        ))
-        .response_header(ResponseHeaderSpec::new(
-            "Retry-After",
-            "Suggested delay in seconds before polling the operation",
-            ResponseHeaderType::Integer,
-        ))
-        .response_header(ResponseHeaderSpec::new(
-            "Idempotency-Replayed",
-            "Whether this submission replayed an existing operation",
-            ResponseHeaderType::Boolean,
-        ))
-        .json_response_with_schema::<OperationAcceptedDto>(
-            openapi,
-            StatusCode::OK,
-            "Replay of an operation that is already terminal",
-        )
-        .response_header(ResponseHeaderSpec::new(
-            "Location",
-            "URI of the admission operation",
-            ResponseHeaderType::String,
-        ))
-        .response_header(ResponseHeaderSpec::new(
-            "Idempotency-Replayed",
-            "Whether this submission replayed an existing operation",
-            ResponseHeaderType::Boolean,
-        ))
+        );
+    for header in receipt_headers(true) {
+        builder = builder.response_header(header);
+    }
+    builder = builder.json_response_with_schema::<OperationAcceptedDto>(
+        openapi,
+        StatusCode::OK,
+        "Replay of an operation that is already terminal",
+    );
+    for header in receipt_headers(false) {
+        builder = builder.response_header(header);
+    }
+    builder
         .problem_response(
             openapi,
             StatusCode::CONFLICT,
@@ -608,6 +664,5 @@ fn register_delete_entity(mut router: Router, openapi: &dyn OpenApiRegistry) -> 
         )
         .standard_errors(openapi)
         .error_503(openapi)
-        .register(router, openapi);
-    router
+        .register(router, openapi)
 }

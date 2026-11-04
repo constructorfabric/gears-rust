@@ -18,7 +18,7 @@ use std::time::Duration;
 use serde_json::json;
 use uuid::Uuid;
 
-use common::{SseFrameReader, TestServer};
+use common::{EventLog, SseFrameReader, TestServer};
 
 #[tokio::test]
 async fn publish_then_consume_happy_path() {
@@ -162,20 +162,25 @@ async fn publish_then_consume_happy_path() {
     );
 }
 
+/// The event log is on the `SQLite` backend plugin, so the events survive the
+/// restart along with the gear's own database.
 #[tokio::test]
 async fn restart_preserves_events_and_consumer_groups_but_not_subscriptions() {
     let topic = "gts.cf.core.events.topic.v1~x.eb.t10r.topic.v1";
     let event_type = "gts.cf.core.events.event.v1~x.eb.t10r.foo.v1~";
     let subject_type = "gts.x.eb.t10r.subject.v1~";
-    let mut server = TestServer::start(vec![
-        json!({ "id": topic, "partitions": 1, }),
-        json!({
-            "id": event_type,
-            "topic_id": topic,
-            "allowed_subject_types": [subject_type],
-            "data_schema": {},
-        }),
-    ])
+    let mut server = TestServer::start_with_event_log(
+        vec![
+            json!({ "id": topic, "partitions": 1, }),
+            json!({
+                "id": event_type,
+                "topic_id": topic,
+                "allowed_subject_types": [subject_type],
+                "data_schema": {},
+            }),
+        ],
+        EventLog::Sqlite,
+    )
     .await;
     let client = reqwest::Client::new();
 
@@ -336,8 +341,8 @@ async fn restart_preserves_events_and_consumer_groups_but_not_subscriptions() {
     let (topology2_kind, _) = reader2.next_frame(Duration::from_secs(5)).await;
     assert_eq!(topology2_kind, "topology");
 
-    // The event itself - not just the cursor row - is still in the SQLite
-    // `EventBrokerBackend` table: a fresh subscription's in-memory replay
+    // The event itself - not just the cursor row - is still in the durable
+    // storage backend: a fresh subscription's in-memory replay
     // cursor starts from its own join-time `assigned.offset` (always `0`
     // for a new JOIN, `domain/delivery.rs::join`), so it re-reads from the
     // beginning and must see the same event again.

@@ -34,10 +34,13 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: full
-  # .github/actions/sccache sets RUSTC_WRAPPER in each job. sccache puts every
+  # .github/actions/ci-cache sets RUSTC_WRAPPER on the self-hosted runners. sccache puts every
   # CARGO_* variable in its cache keys, so changing one rebuilds everything.
   # Usually better determinism and smaller cache churn in CI.
   CARGO_INCREMENTAL: "0"
+  CI_PREINSTALLED_TOOLS: nextest
+  # The one cargo-gears pin for CI; gears.mk reads it from the environment too.
+  CARGO_GEARS_VERSION: 0.0.8
   # Pinned nightly toolchain used by the coverage job. Independent of the pin in
   # shear-nightly.yml — they happen to match today but need not.
   RUSTUP_TOOLCHAIN_NIGHTLY: nightly-2026-08-21
@@ -49,7 +52,7 @@ jobs:
   # On workflow_dispatch every filter defaults to true (run everything).
   changes:
     name: Detect changes
-    runs-on: ubuntu-latest
+    runs-on: ${{ (vars.GEARS_FORCE_GITHUB_HOSTED == 'true' || github.repository != 'constructorfabric/gears-rust' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && 'ubuntu-latest' || 'gears-small' }}
     permissions:
       contents: read
       pull-requests: read
@@ -81,6 +84,8 @@ jobs:
               - 'gears-rust.mk'
               - 'rust-toolchain.toml'
               - '.cargo/**'
+              - 'tools/scripts/check_crypto_facade.py'
+              - 'tools/scripts/tests/test_crypto_facade.py'
               # Input to `make check-release-config` in the repo-checks job: a config-only
               # edit must still get the release configuration validated.
               - 'release-plz.toml'
@@ -96,8 +101,11 @@ jobs:
               # silently never runs on exactly the diff it exists to catch.
               - 'testing/e2e/lib/sidecars.py'
             fips:
+              - 'libs/toolkit-security/**'
+              - 'libs/toolkit-auth/**'
               - 'libs/toolkit/**'
               - 'libs/toolkit-http/**'
+              - 'libs/toolkit-http-proxy/**'
               - 'libs/rustls-*/**'
             magika:
               - 'gears/file-parser/**'
@@ -137,17 +145,18 @@ jobs:
       || needs.changes.outputs.rust == 'true'
       || needs.changes.outputs.ci == 'true'
       || github.event_name == 'workflow_dispatch')
-    runs-on: ubuntu-latest
-    # sccache S3 keys: read-write on main, read-only elsewhere. See .github/actions/sccache.
-    # No environment until the S3_BUCKET variable is set, so the job runs without one.
-    # Reused below as `*sccache-env`.
-    environment: &sccache-env
-      name: ${{ vars.S3_BUCKET != '' && (github.ref == 'refs/heads/main' && 'ci-cache-write' || 'ci-cache-read') || '' }}
+    runs-on: ${{ (vars.GEARS_FORCE_GITHUB_HOSTED == 'true' || github.repository != 'constructorfabric/gears-rust' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && 'ubuntu-latest' || 'gears-large' }}
+    # Only a push to main enters the environment, whose read-write key for the
+    # shared build cache GitHub releases to main alone; every other run reads.
+    # Reused below as `*ci-cache-env`.
+    environment: &ci-cache-env
+      name: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') && 'ci-trusted' || '' }}
       deployment: false
     env:
       RUSTFLAGS: "-C debuginfo=0"
     steps:
       - name: Free disk space
+        if: runner.environment == 'github-hosted'
         uses: jlumbroso/free-disk-space@ceedf095f4ec1a097402bc6bd80831f2e1a6fde6 # v2.0.0
         with:
           tool-cache: false
@@ -161,7 +170,8 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install protoc
-        uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
+        if: runner.environment == 'github-hosted'
+        uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
         with:
           tool: protoc@3.34.1
 
@@ -177,27 +187,36 @@ jobs:
           rustup show
 
       - name: Install cargo-hack
-        uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
+        if: runner.environment == 'github-hosted'
+        uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
         with:
           tool: cargo-hack
 
+      - name: Set up the shared build cache
+        id: cache
+        uses: ./.github/actions/ci-cache
+        # Reused below as `*ci-cache-inputs`.
+        with: &ci-cache-inputs
+          rw-key-id: ${{ secrets.CI_CACHE_RW_KEY_ID }}
+          rw-secret: ${{ secrets.CI_CACHE_RW_SECRET }}
+          trusted: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+          rust: true
+          downloads: |
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          downloads-key: cargo-${{ hashFiles('**/Cargo.lock') }}
+          downloads-restore-keys: cargo-
+
+      # GitHub-hosted runs (fork pull requests, the kill switch) keep the
+      # registry cache; on the self-hosted runners ci-cache covers it.
       - name: Cache Cargo/target
+        if: ${{ steps.cache.outputs.mode == 'none' }}
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           cache-bin: false
           cache-targets: false
           shared-key: pr-clippy-${{ hashFiles('rust-toolchain.toml') }}
-
-      # Only main writes to the cache. See .github/actions/sccache.
-      - name: Set up sccache
-        uses: ./.github/actions/sccache
-        # Reused below as `*sccache-inputs`.
-        with: &sccache-inputs
-          s3-endpoint: ${{ vars.S3_ENDPOINT }}
-          s3-region: ${{ vars.S3_REGION }}
-          s3-bucket: ${{ vars.S3_BUCKET }}
-          s3-access-key-id: ${{ secrets.S3_ACCESS_KEY_ID }}
-          s3-secret-access-key: ${{ secrets.S3_SECRET_ACCESS_KEY }}
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
 
       # Database image tags are pinned in libs/test-containers (docs/TESTING.md
       # 4.4). A fixture that constructs a container any other way re-introduces
@@ -212,6 +231,11 @@ jobs:
       # step in this job.
       - name: No unpinned database container images
         run: cargo xtask check-test-container-pins
+
+      - name: Application crypto stays behind the facade
+        run: |
+          python3 tools/scripts/check_crypto_facade.py
+          python3 -m unittest discover -s tools/scripts/tests -p test_crypto_facade.py
 
       # The wrapper turns compiler/lint errors into annotations titled by
       # their code (E0308, DE0904, clippy::...) when the command fails.
@@ -229,7 +253,7 @@ jobs:
       || needs.changes.outputs.rust == 'true'
       || needs.changes.outputs.ci == 'true'
       || github.event_name == 'workflow_dispatch')
-    runs-on: ubuntu-latest
+    runs-on: ${{ (vars.GEARS_FORCE_GITHUB_HOSTED == 'true' || github.repository != 'constructorfabric/gears-rust' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && 'ubuntu-latest' || 'gears-small-vm' }}
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -265,10 +289,11 @@ jobs:
     # macOS and Windows run once a day in macos-windows-tests.yml.
     uses: ./.github/workflows/test-suite.yml
     with:
-      os: ubuntu-latest
-    secrets:
-      S3_ACCESS_KEY_ID: ${{ secrets.S3_ACCESS_KEY_ID }}
-      S3_SECRET_ACCESS_KEY: ${{ secrets.S3_SECRET_ACCESS_KEY }}
+      os: ${{ (vars.GEARS_FORCE_GITHUB_HOSTED == 'true' || github.repository != 'constructorfabric/gears-rust' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && 'ubuntu-latest' || 'gears-large' }}
+    # The nextest job enters `ci-trusted` itself on a push to main; its read-write
+    # cache key is an environment secret, which only `inherit` carries into a
+    # called workflow.
+    secrets: inherit
 
   integration:
     name: Integration tests
@@ -279,8 +304,8 @@ jobs:
       || needs.changes.outputs.rust == 'true'
       || needs.changes.outputs.ci == 'true'
       || github.event_name == 'workflow_dispatch')
-    runs-on: ubuntu-latest
-    environment: *sccache-env
+    runs-on: ${{ (vars.GEARS_FORCE_GITHUB_HOSTED == 'true' || github.repository != 'constructorfabric/gears-rust' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && 'ubuntu-latest' || 'gears-large' }}
+    environment: *ci-cache-env
     env:
       RUSTFLAGS: "-C debuginfo=0"
       # See the `test` job: per-suite JUnit reports land in JUNIT_DIR.
@@ -288,6 +313,7 @@ jobs:
       JUNIT_DIR: test-results
     steps:
       - name: Free disk space
+        if: runner.environment == 'github-hosted'
         uses: jlumbroso/free-disk-space@ceedf095f4ec1a097402bc6bd80831f2e1a6fde6 # v2.0.0
         with:
           tool-cache: false
@@ -301,7 +327,8 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install protoc
-        uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
+        if: runner.environment == 'github-hosted'
+        uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
         with:
           tool: protoc@3.34.1
 
@@ -317,56 +344,71 @@ jobs:
           rustup show
 
       - name: Install nextest
-        uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
+        if: runner.environment == 'github-hosted'
+        uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
         with:
           tool: nextest
 
+      - name: Set up the shared build cache
+        id: cache
+        uses: ./.github/actions/ci-cache
+        with: *ci-cache-inputs
+
+      # GitHub-hosted runs (fork pull requests, the kill switch) keep the
+      # registry cache; on the self-hosted runners ci-cache covers it.
       - name: Cache Cargo/target
+        if: ${{ steps.cache.outputs.mode == 'none' }}
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           cache-bin: false
           cache-targets: false
           shared-key: pr-${{ runner.os }}-integration-${{ hashFiles('rust-toolchain.toml') }}
-
-      # Only main writes to the cache. See .github/actions/sccache.
-      - name: Set up sccache
-        id: setup
-        uses: ./.github/actions/sccache
-        with: *sccache-inputs
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
 
       # Every test step below runs even when an earlier one failed
       # (`!cancelled()`), so one broken suite no longer hides the results of the
-      # rest; the job still fails if any of them did. Gated on `setup` so a
+      # rest; the job still fails if any of them did. Gated on `cache` so a
       # broken toolchain does not cascade into a wall of identical failures.
       - name: UI tests for toolkit macros libraries
-        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.cache.outcome == 'success' }}
         run: tools/scripts/with_rust_annotations.sh make test-macros
 
       - name: Test users_info with Postgres (integration)
-        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.cache.outcome == 'success' }}
         run: tools/scripts/with_rust_annotations.sh make test-integration LANE=users-info-pg
 
       - name: Test timescaledb usage-collector plugin (pg integration)
-        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.cache.outcome == 'success' }}
         run: tools/scripts/with_rust_annotations.sh make test-integration LANE=usage-collector-pg
 
       - name: Test clickhouse usage-collector plugin (ch integration)
-        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.cache.outcome == 'success' }}
         run: tools/scripts/with_rust_annotations.sh make test-integration LANE=usage-collector-ch
 
       - name: Test postgres-cluster-plugin (pg integration)
-        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.cache.outcome == 'success' }}
         run: tools/scripts/with_rust_annotations.sh make test-integration LANE=cluster-pg
 
+      - name: Test postgres-event-broker-plugin (pg integration)
+        if: ${{ !cancelled() && steps.cache.outcome == 'success' }}
+        run: tools/scripts/with_rust_annotations.sh make test-eb-pg
+
+      - name: Test event-broker gear database (SQLite, PostgreSQL, MySQL integration)
+        if: ${{ !cancelled() && steps.cache.outcome == 'success' }}
+        # The lane sets EB_TEST_REQUIRE_DOCKER=1 itself, so an unreachable
+        # Docker fails the step instead of skipping the suite green.
+        run: tools/scripts/with_rust_annotations.sh make test-integration LANE=eb-gear-db
+
       - name: Test k8s-cluster-plugin (k3s L2+L3 integration)
-        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.cache.outcome == 'success' }}
         # k3s runs in a **privileged** container (testcontainers-modules sets it);
-        # GitHub-hosted ubuntu runners permit that. The target uses `cargo test`, not
-        # nextest, so one k3s container is shared per test binary -- see gears-rust.mk.
+        # GitHub-hosted ubuntu runners and gears-large permit that. The target
+        # uses `cargo test`, not nextest, so one k3s container is shared per
+        # test binary -- see gears-rust.mk.
         run: tools/scripts/with_rust_annotations.sh make test-cluster-k8s
 
       - name: Test resource-group (pg smoke, integration)
-        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.cache.outcome == 'success' }}
         # Fail if Docker is unreachable instead of letting the suite skip itself
         # into a green step that asserted nothing.
         env:
@@ -374,7 +416,7 @@ jobs:
         run: tools/scripts/with_rust_annotations.sh make test-integration LANE=rg-pg
 
       - name: Test settings-service (pg migrations, integration)
-        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.cache.outcome == 'success' }}
         # Same shape as resource-group above: Docker is on this runner, so a
         # skip here would be a broken daemon passing green.
         env:
@@ -392,7 +434,7 @@ jobs:
       # owns lives in them. This job already has Docker. The lane passes
       # `--no-fail-fast`; see gears-rust.mk for what the default cost on 2026-08-18.
       - name: Test bss-pricing with Postgres (integration)
-        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.cache.outcome == 'success' }}
         run: tools/scripts/with_rust_annotations.sh make test-integration LANE=pricing-pg
 
       # coord's `m0001_…` writes two independent SQL literals and only the
@@ -400,7 +442,7 @@ jobs:
       # that stops the `bss-pricing`-beside-`bss-ledger` boot crash, and the
       # `in_schema("bss")` form both gears actually pass, ran in no job.
       - name: Test coord with Postgres (integration)
-        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.cache.outcome == 'success' }}
         run: tools/scripts/with_rust_annotations.sh make test-integration LANE=coord-pg
 
       # bss-products' Postgres tier, added 2026-08-30. It carries the gear's
@@ -411,46 +453,57 @@ jobs:
       # here and runs nowhere, which is the state the pricing comment above
       # records as having cost that gear nine hidden failures.
       - name: Test bss-products with Postgres (integration)
-        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.cache.outcome == 'success' }}
         run: tools/scripts/with_rust_annotations.sh make test-integration LANE=products-pg
 
       # bss-ledger's Postgres tier: every posting, chain, payment and REST-over-Postgres
       # proof the gear owns. Without this step the tier compiles here and runs nowhere.
       - name: Test bss-ledger with Postgres (integration)
-        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.cache.outcome == 'success' }}
         run: tools/scripts/with_rust_annotations.sh make test-integration LANE=ledger-pg
 
+      # bss-orders' Postgres tier: the engine, sealed audit, idempotency, claims, role-isolation
+      # and gear-boot proofs all run against a real PostgreSQL. Without this step the tier
+      # compiles here and runs nowhere.
+      - name: Test bss-orders with Postgres (integration)
+        if: ${{ !cancelled() && steps.cache.outcome == 'success' }}
+        run: tools/scripts/with_rust_annotations.sh make test-integration LANE=orders-pg
+
       - name: Test redis-cluster-plugin (redis integration)
-        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.cache.outcome == 'success' }}
         run: tools/scripts/with_rust_annotations.sh make test-integration LANE=cluster-redis
 
       - name: Test durable-execution (PostgreSQL and subprocess recovery)
-        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.cache.outcome == 'success' }}
         run: tools/scripts/with_rust_annotations.sh make test-durable-execution-pg
 
       - name: Test toolkit-db (sqlite integration)
-        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.cache.outcome == 'success' }}
         run: tools/scripts/with_rust_annotations.sh make test-integration LANE=toolkit-db-sqlite
 
       - name: Test toolkit-db (pg integration)
-        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.cache.outcome == 'success' }}
         run: tools/scripts/with_rust_annotations.sh make test-integration LANE=toolkit-db-pg
 
       - name: Test toolkit-db (pgq)
-        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.cache.outcome == 'success' }}
         run: tools/scripts/with_rust_annotations.sh make test-integration LANE=toolkit-db-pgq
 
       - name: Test toolkit-db (mysql integration)
-        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.cache.outcome == 'success' }}
         run: tools/scripts/with_rust_annotations.sh make test-integration LANE=toolkit-db-mysql
 
       - name: Test types-registry (db integration)
-        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.cache.outcome == 'success' }}
         run: tools/scripts/with_rust_annotations.sh make test-integration LANE=types-registry-db
 
       - name: Test oagw (pg/mysql conformance + migrations, integration)
-        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.cache.outcome == 'success' }}
         run: tools/scripts/with_rust_annotations.sh make test-integration LANE=oagw-db
+
+      - name: Test oagw (cluster feature)
+        if: ${{ !cancelled() && steps.cache.outcome == 'success' }}
+        run: tools/scripts/with_rust_annotations.sh make test-integration LANE=oagw-cluster
 
       # Published as GitHub Checks by test-report.yml (workflow_run), which has
       # the `checks: write` this job lacks on fork PRs. `!cancelled()` so a
@@ -475,8 +528,8 @@ jobs:
       || needs.changes.outputs.deps == 'true'
       || needs.changes.outputs.ci == 'true'
       || github.event_name == 'workflow_dispatch')
-    runs-on: ${{ matrix.os }}
-    environment: *sccache-env
+    runs-on: ${{ matrix.os == 'ubuntu-latest' && ((vars.GEARS_FORCE_GITHUB_HOSTED == 'true' || github.repository != 'constructorfabric/gears-rust' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && 'ubuntu-latest' || 'gears-large') || matrix.os }}
+    environment: *ci-cache-env
     strategy:
       fail-fast: false
       matrix:
@@ -485,7 +538,7 @@ jobs:
       RUSTFLAGS: "-C debuginfo=0"
     steps:
       - name: Free disk space
-        if: runner.os == 'Linux'
+        if: runner.os == 'Linux' && runner.environment == 'github-hosted'
         uses: jlumbroso/free-disk-space@ceedf095f4ec1a097402bc6bd80831f2e1a6fde6 # v2.0.0
         with:
           tool-cache: false
@@ -506,7 +559,8 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install protoc
-        uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
+        if: runner.environment == 'github-hosted'
+        uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
         with:
           tool: protoc@3.34.1
 
@@ -524,23 +578,30 @@ jobs:
           rustup show
 
       - name: Install nextest
-        uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
+        if: runner.environment == 'github-hosted'
+        uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
         with:
           tool: nextest
 
+      # Linux only: the macOS and Windows legs run on GitHub-hosted runners.
+      - name: Set up the shared build cache
+        if: runner.os == 'Linux'
+        id: cache
+        uses: ./.github/actions/ci-cache
+        with: *ci-cache-inputs
+
       # `-fips` only splits the registry cache. Sharing sccache is safe: its keys
       # include features and rustc args, and it never caches the FIPS C code.
+      # GitHub-hosted runs (fork pull requests, the kill switch) keep the
+      # registry cache; on the self-hosted runners ci-cache covers it.
       - name: Cache Cargo/target
+        if: ${{ runner.os != 'Linux' || steps.cache.outputs.mode == 'none' }}
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           cache-bin: false
           cache-targets: false
           shared-key: pr-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml') }}-fips
-
-      # Only main writes to the cache. See .github/actions/sccache.
-      - name: Set up sccache
-        uses: ./.github/actions/sccache
-        with: *sccache-inputs
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
 
       # Linux: aws-lc-fips path via the existing make target
       # (cf-gears-toolkit + cf-gears-toolkit-http, bootstrap + fips).
@@ -554,15 +615,33 @@ jobs:
         if: runner.os == 'macOS'
         shell: bash
         run: |
+          cargo test -p cf-gears-toolkit-security --features fips,jwt,internal-auth-cache --lib --test jwt_no_backend_fallback
+          cargo test -p cf-gears-toolkit-auth --features toolkit-security/fips --lib providers::jwks
           cargo test -p cf-gears-rustls-corecrypto-provider --features fips
           cargo test -p cf-gears-toolkit-http --features fips
+          cargo test -p cf-gears-toolkit-http-proxy --features fips --no-run
 
-      # Windows: build-verify the CNG provider path. Compile-only is sufficient —
-      # runtime FIPS execution depends on host FIPS-mode policy (see ADR 0003).
-      - name: FIPS build check (Windows / CNG)
+      # Windows: execute native CNG operations through internal test injection.
+      # This does not establish a FIPS witness on the hosted runner (ADR 0003).
+      - name: CNG operations and FIPS build check (Windows)
         if: runner.os == 'Windows'
         shell: bash
-        run: cargo check --target x86_64-pc-windows-msvc -p cf-gears-toolkit-http --features fips
+        run: |
+          cargo test --locked -p cf-gears-toolkit-security --features fips,jwt --lib crypto::windows_tests::native_cng_operations
+          cargo check --target x86_64-pc-windows-msvc -p cf-gears-toolkit-security --all-targets --features fips,jwt,internal-auth-cache
+          cargo check --target x86_64-pc-windows-msvc -p cf-gears-toolkit-http --features fips
+          cargo check --target x86_64-pc-windows-msvc -p cf-gears-toolkit-http-proxy --features fips
+
+      - name: Check FIPS sidecar configuration
+        shell: bash
+        run: cargo check --locked -p cf-gears-file-storage --bin sidecar --features toolkit/fips
+
+      - name: Test native FIPS consumers
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          cargo test --locked -p cf-gears-file-storage --features toolkit/fips --lib --bin sidecar
+          cargo test --locked -p cf-gears-credstore --features toolkit-security/fips --lib domain::secret::fence
 
   # The gear's whole suite against a real PostgreSQL with pgvector, and its
   # own coverage floor, in one pass.
@@ -585,7 +664,8 @@ jobs:
       || needs.changes.outputs.deps == 'true'
       || needs.changes.outputs.ci == 'true'
       || github.event_name == 'workflow_dispatch')
-    runs-on: ubuntu-latest
+    runs-on: ${{ (vars.GEARS_FORCE_GITHUB_HOSTED == 'true' || github.repository != 'constructorfabric/gears-rust' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && 'ubuntu-latest' || 'gears-large' }}
+    environment: *ci-cache-env
     # The Codecov upload below asks for OIDC off pull requests, and an OIDC
     # token needs `id-token: write` — the workflow default is `contents: read`
     # alone, so without this the token request is denied. That upload also sets
@@ -602,11 +682,13 @@ jobs:
           persist-credentials: false
 
       - name: Install protoc
+        if: runner.environment == 'github-hosted'
         uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Install Rust toolchain (with llvm-tools)
+        if: runner.environment == 'github-hosted'
         uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2 # nightly
         with:
           toolchain: ${{ env.RUSTUP_TOOLCHAIN_NIGHTLY }}
@@ -615,18 +697,28 @@ jobs:
       - name: Pin nightly for all cargo commands
         run: echo "RUSTUP_TOOLCHAIN=${{ env.RUSTUP_TOOLCHAIN_NIGHTLY }}" >> "$GITHUB_ENV"
 
+      - name: Set up the shared build cache
+        id: cache
+        uses: ./.github/actions/ci-cache
+        with: *ci-cache-inputs
+
+      # GitHub-hosted runs (fork pull requests, the kill switch) keep the
+      # registry cache; on the self-hosted runners ci-cache covers it.
       - name: Cache Cargo/target
+        if: ${{ steps.cache.outputs.mode == 'none' }}
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           cache-bin: false
           cache-targets: false
           shared-key: pr-${{ runner.os }}-nightly-${{ env.RUSTUP_TOOLCHAIN_NIGHTLY }}-llvm-cov
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
 
       # The same pin as the workspace coverage job: the v2.70.3 one installed
       # cargo-llvm-cov 0.8.5, which on nightly-2026-08-21 ran every test and
       # then found no object files to report on.
       - name: Install cargo-llvm-cov and nextest
-        uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
+        if: runner.environment == 'github-hosted'
+        uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
         with:
           tool: cargo-llvm-cov, nextest
 
@@ -702,7 +794,8 @@ jobs:
       || needs.changes.outputs.deps == 'true'
       || needs.changes.outputs.ci == 'true'
       || github.event_name == 'workflow_dispatch')
-    runs-on: ubuntu-latest
+    runs-on: ${{ (vars.GEARS_FORCE_GITHUB_HOSTED == 'true' || github.repository != 'constructorfabric/gears-rust' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && 'ubuntu-latest' || 'gears-large' }}
+    environment: *ci-cache-env
     permissions:
       contents: read
       id-token: write
@@ -713,11 +806,13 @@ jobs:
           persist-credentials: false
 
       - name: Install protoc
+        if: runner.environment == 'github-hosted'
         uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Install Rust toolchain (with llvm-tools)
+        if: runner.environment == 'github-hosted'
         uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2 # nightly
         with:
           toolchain: ${{ env.RUSTUP_TOOLCHAIN_NIGHTLY }}
@@ -726,15 +821,25 @@ jobs:
       - name: Pin nightly for all cargo commands
         run: echo "RUSTUP_TOOLCHAIN=${{ env.RUSTUP_TOOLCHAIN_NIGHTLY }}" >> "$GITHUB_ENV"
 
+      - name: Set up the shared build cache
+        id: cache
+        uses: ./.github/actions/ci-cache
+        with: *ci-cache-inputs
+
+      # GitHub-hosted runs (fork pull requests, the kill switch) keep the
+      # registry cache; on the self-hosted runners ci-cache covers it.
       - name: Cache Cargo/target
+        if: ${{ steps.cache.outputs.mode == 'none' }}
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           cache-bin: false
           cache-targets: false
           shared-key: pr-${{ runner.os }}-nightly-${{ env.RUSTUP_TOOLCHAIN_NIGHTLY }}-llvm-cov
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
 
       - name: Install cargo-llvm-cov and nextest
-        uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
+        if: runner.environment == 'github-hosted'
+        uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
         with:
           tool: cargo-llvm-cov, nextest
 
@@ -774,7 +879,8 @@ jobs:
       || needs.changes.outputs.deps == 'true'
       || needs.changes.outputs.ci == 'true'
       || github.event_name == 'workflow_dispatch')
-    runs-on: ubuntu-latest
+    runs-on: ${{ (vars.GEARS_FORCE_GITHUB_HOSTED == 'true' || github.repository != 'constructorfabric/gears-rust' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && 'ubuntu-latest' || 'gears-large' }}
+    environment: *ci-cache-env
     env:
       ONNXRUNTIME_VERSION: "1.29.0"
       ONNXRUNTIME_SHA256: "c3fddc4f139a045b0c4902c57410f0694f1c2fdf9b6939fbe38b1aeae7cd14ba"
@@ -791,6 +897,7 @@ jobs:
           persist-credentials: false
 
       - name: Install protoc
+        if: runner.environment == 'github-hosted'
         uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
@@ -800,12 +907,21 @@ jobs:
           rustup show active-toolchain || rustup toolchain install
           rustup show
 
+      - name: Set up the shared build cache
+        id: cache
+        uses: ./.github/actions/ci-cache
+        with: *ci-cache-inputs
+
+      # GitHub-hosted runs (fork pull requests, the kill switch) keep the
+      # registry cache; on the self-hosted runners ci-cache covers it.
       - name: Cache Cargo/target
+        if: ${{ steps.cache.outputs.mode == 'none' }}
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           cache-bin: false
           cache-targets: false
           shared-key: pr-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml') }}-onnx
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
 
       - name: Fetch ONNX Runtime shared library
         shell: bash
@@ -873,8 +989,8 @@ jobs:
       || needs.changes.outputs.deps == 'true'
       || needs.changes.outputs.ci == 'true'
       || github.event_name == 'workflow_dispatch')
-    runs-on: ubuntu-latest
-    environment: *sccache-env
+    runs-on: ${{ (vars.GEARS_FORCE_GITHUB_HOSTED == 'true' || github.repository != 'constructorfabric/gears-rust' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && 'ubuntu-latest' || 'gears-large' }}
+    environment: *ci-cache-env
     env:
       # api-24 (see workspace Cargo.toml `ort` entry) requires an ONNX
       # Runtime with minor version >= 24; older builds fail `ort`'s version
@@ -890,6 +1006,7 @@ jobs:
           persist-credentials: false
 
       - name: Install protoc
+        if: runner.environment == 'github-hosted'
         uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
@@ -899,17 +1016,21 @@ jobs:
           rustup show active-toolchain || rustup toolchain install
           rustup show
 
+      - name: Set up the shared build cache
+        id: cache
+        uses: ./.github/actions/ci-cache
+        with: *ci-cache-inputs
+
+      # GitHub-hosted runs (fork pull requests, the kill switch) keep the
+      # registry cache; on the self-hosted runners ci-cache covers it.
       - name: Cache Cargo/target
+        if: ${{ steps.cache.outputs.mode == 'none' }}
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           cache-bin: false
           cache-targets: false
           shared-key: pr-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml') }}-magika
-
-      # Only main writes to the cache. See .github/actions/sccache.
-      - name: Set up sccache
-        uses: ./.github/actions/sccache
-        with: *sccache-inputs
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
 
       - name: Fetch ONNX Runtime shared library
         shell: bash
@@ -939,7 +1060,7 @@ jobs:
       || needs.changes.outputs.deps == 'true'
       || needs.changes.outputs.ci == 'true'
       || github.event_name == 'workflow_dispatch')
-    runs-on: ubuntu-latest
+    runs-on: ${{ (vars.GEARS_FORCE_GITHUB_HOSTED == 'true' || github.repository != 'constructorfabric/gears-rust' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && 'ubuntu-latest' || 'gears-small-vm' }}
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -951,7 +1072,8 @@ jobs:
 
       # Install tools via prebuilt binaries for speed.
       - name: Install cargo-deny
-        uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
+        if: runner.environment == 'github-hosted'
+        uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
         with:
           tool: cargo-deny@0.20.2
 
@@ -968,12 +1090,14 @@ jobs:
       || needs.changes.outputs.rust == 'true'
       || needs.changes.outputs.ci == 'true'
       || github.event_name == 'workflow_dispatch')
-    runs-on: ubuntu-latest
+    runs-on: ${{ (vars.GEARS_FORCE_GITHUB_HOSTED == 'true' || github.repository != 'constructorfabric/gears-rust' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && 'ubuntu-latest' || 'gears-large' }}
+    environment: *ci-cache-env
     permissions:
       contents: read
       id-token: write
     steps:
       - name: Free disk space
+        if: runner.environment == 'github-hosted'
         uses: jlumbroso/free-disk-space@ceedf095f4ec1a097402bc6bd80831f2e1a6fde6 # v2.0.0
         with:
           tool-cache: false
@@ -987,11 +1111,13 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install protoc
-        uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
+        if: runner.environment == 'github-hosted'
+        uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
         with:
           tool: protoc@3.34.1
 
       - name: Install Rust toolchain (with llvm-tools)
+        if: runner.environment == 'github-hosted'
         uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2 # nightly
         with:
           toolchain: ${{ env.RUSTUP_TOOLCHAIN_NIGHTLY }}
@@ -1002,15 +1128,25 @@ jobs:
       - name: Pin nightly for all cargo commands
         run: echo "RUSTUP_TOOLCHAIN=${{ env.RUSTUP_TOOLCHAIN_NIGHTLY }}" >> "$GITHUB_ENV"
 
+      - name: Set up the shared build cache
+        id: cache
+        uses: ./.github/actions/ci-cache
+        with: *ci-cache-inputs
+
+      # GitHub-hosted runs (fork pull requests, the kill switch) keep the
+      # registry cache; on the self-hosted runners ci-cache covers it.
       - name: Cache Cargo/target
+        if: ${{ steps.cache.outputs.mode == 'none' }}
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           cache-bin: false
           cache-targets: false
           shared-key: pr-${{ runner.os }}-nightly-${{ env.RUSTUP_TOOLCHAIN_NIGHTLY }}-llvm-cov
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
 
       - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
+        if: runner.environment == 'github-hosted'
+        uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
         with:
           tool: cargo-llvm-cov, nextest
 
@@ -1031,6 +1167,9 @@ jobs:
       #   5. The toolkit-durable-execution PostgreSQL suites behind the integration
       #      feature, including subprocess recovery. A single test binary
       #      shares the workspace-pinned PostgreSQL container.
+      #   6. OAGW with its `cluster` feature, which pass 1 lacks: the proxy
+      #      cache's change log, publisher and watcher. Keep in sync with
+      #      the `oagw-cluster` lane of `make test-integration`.
       #
       # The per-binary k3s loop (one container per binary, cleaned between —
       # nextest's process-per-test would start ~70 of them) lives in the
@@ -1072,6 +1211,9 @@ jobs:
           # (cargo test: no JUnit).
           fresh_report
           "$W" make coverage-durable-execution-pg
+          # Pass 6: OAGW with the `cluster` feature.
+          fresh_report
+          "$W" cargo llvm-cov nextest --no-report -p cf-gears-oagw --features cluster
           # Merge into the single report that gets uploaded.
           cargo llvm-cov report --lcov --output-path lcov.info
 
@@ -1124,7 +1266,8 @@ jobs:
 
   lint:
     name: Architecture Lints (cargo gears lint)
-    runs-on: ubuntu-latest
+    runs-on: ${{ (vars.GEARS_FORCE_GITHUB_HOSTED == 'true' || github.repository != 'constructorfabric/gears-rust' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && 'ubuntu-latest' || 'gears-large' }}
+    environment: *ci-cache-env
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -1132,7 +1275,8 @@ jobs:
           persist-credentials: false
 
       - name: Install protoc
-        uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
+        if: runner.environment == 'github-hosted'
+        uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
         with:
           tool: protoc@3.34.1
 
@@ -1141,8 +1285,27 @@ jobs:
         with:
           toolchain: stable
 
+      - name: Set up the shared build cache
+        id: cache
+        uses: ./.github/actions/ci-cache
+        with: *ci-cache-inputs
+
       - name: Install cargo-gears
-        run: cargo install --locked cargo-gears@0.0.8
+        uses: ./.github/actions/cargo-gears
+        with:
+          version: ${{ env.CARGO_GEARS_VERSION }}
+
+      # rust-lang/rust-clippy renamed `master` to `main`, but dylint (up to 6.2.0) clones it and
+      # checks out `master`, so building the dylint driver fails. Serve that clone from a local
+      # mirror whose default branch `master` is `main`. Remove once dylint checks out `main`.
+      - name: Work around dylint's hard-coded rust-clippy `master`
+        shell: bash
+        run: |
+          mirror="$RUNNER_TEMP/rust-clippy.git"
+          git clone --bare --quiet https://github.com/rust-lang/rust-clippy "$mirror"
+          git -C "$mirror" branch -f master main
+          git -C "$mirror" symbolic-ref HEAD refs/heads/master
+          git config --global url."file://$mirror".insteadOf https://github.com/rust-lang/rust-clippy
 
       - name: Run architecture lints
-        run: tools/scripts/with_rust_annotations.sh cargo gears lint --dylint
+        run: tools/scripts/with_rust_annotations.sh make dylint

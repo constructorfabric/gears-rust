@@ -1,0 +1,297 @@
+{
+  "$id": "gts://gts.cf.core.tasks.task.v1~",
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "description": "Task type base. Abstract: concrete task types are derived at runtime by consuming gears (not shipped here) and determine the input/output payload contracts. The engine stores base task fields (state, priority, queue, owner, assignment, timestamps) in indexed relational columns and the GTS-typed extension data (input, context, output) as compressed binary blobs (ADR-0006) — new task types never require DDL changes (PRD cpt-cf-task-engine-fr-gts-task-type). A derived type MAY declare concurrency limits, a derived dedup identity with optional supersession, progress settings, and type defaults (default_queue, timeouts, retry_policy, retention_days) via traits (x-gts-traits-schema). Type defaults resolve as: task creation request, then this trait, then the queue's effective value (PRD cpt-cf-task-engine-fr-gts-task-type, Type defaults resolution). Trait keys use snake_case per platform GTS convention; the engine validates the dedup/supersede traits against the type's input schema when it first resolves the type (DESIGN cpt-cf-task-engine-design-gts-types).",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "input": {
+      "description": "Validated task input payload. Derived task types narrow this with their own JSON Schema; the engine validates a task's input against the resolved schema at creation when one is registered (PRD cpt-cf-task-engine-fr-structured-io).",
+      "type": "object",
+      "additionalProperties": true
+    },
+    "context": {
+      "description": "Optional mutable execution context (checkpoint data merged at the key level). Counted toward the aggregate payload size limit together with input and output.",
+      "type": [
+        "object",
+        "null"
+      ],
+      "additionalProperties": true,
+      "default": null
+    },
+    "output": {
+      "description": "Optional structured result payload set at completion. Derived task types narrow this with their own JSON Schema; validated at the completion boundary when a schema is registered",
+      "type": [
+        "object",
+        "null"
+      ],
+      "additionalProperties": true,
+      "default": null
+    }
+  },
+  "required": [
+    "input"
+  ],
+  "x-gts-traits-schema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "global_concurrency_limit": {
+        "description": "Maximum number of simultaneously executing (claimed + running) tasks of this type across all tenants. 0 or absent means unlimited. Overridable in config by GTS task-type pattern (PRD cpt-cf-task-engine-fr-type-concurrency, cpt-cf-task-engine-fr-concurrency-overrides).",
+        "type": "integer",
+        "minimum": 0
+      },
+      "per_tenant_concurrency_limit": {
+        "description": "Maximum number of simultaneously executing (claimed + running) tasks of this type per tenant. 0 or absent means unlimited.",
+        "type": "integer",
+        "minimum": 0
+      },
+      "dedup": {
+        "description": "Derived dedup identity: makes the engine compute a task's identity from the work itself rather than from a caller-supplied Idempotency-Key (PRD cpt-cf-task-engine-fr-derived-dedup). Validated against the type's input schema on first resolution; an invalid policy makes the type non-creatable (fail closed).",
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "key_fields": {
+            "description": "Ordered list of RFC 6901 JSON Pointers into the task input whose values form the identity. Each pointer MUST resolve to a field the input schema declares required; at most 16 pointers; each resolved value at most 4 KiB.",
+            "type": "array",
+            "items": {
+              "type": "string",
+              "format": "json-pointer"
+            },
+            "minItems": 1,
+            "maxItems": 16
+          },
+          "scope": {
+            "description": "Whose tasks may collide: 'subject' (default; the creating subject), 'authz_scope' (callers whose PDP-compiled access scope is identical; NOT AVAILABLE YET — the engine rejects a type that declares it until ToolKit confirms a stable serialized form of AccessScope, PRD §11 Assumptions), or 'tenant' (all callers of the owning tenant — must be declared explicitly, never a default). owner_tenant_id is always part of the identity, so identities never cross tenants.",
+            "type": "string",
+            "enum": [
+              "subject",
+              "authz_scope",
+              "tenant"
+            ],
+            "default": "subject"
+          },
+          "window": {
+            "description": "How long the identity stays occupied: 'active' (default; released on any terminal outcome) or 'active_or_succeeded' (additionally held after a completed task with result success/warning until retention).",
+            "type": "string",
+            "enum": [
+              "active",
+              "active_or_succeeded"
+            ],
+            "default": "active"
+          }
+        },
+        "required": [
+          "key_fields"
+        ]
+      },
+      "supersede": {
+        "description": "Optional supersession policy; only valid on a type that also declares dedup (PRD cpt-cf-task-engine-fr-task-supersede). Newer order wins, equal is a replay, older is stale. A supersede-enabled type MUST NOT accept tasks with cancellable=false.",
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "order_field": {
+            "description": "RFC 6901 JSON Pointer to a required, non-negative integer in the input (e.g. a graph revision). Excluded from key_fields; the engine appends its value to the dedup identity and uses the identity without it as the supersede group.",
+            "type": "string",
+            "format": "json-pointer"
+          },
+          "mode": {
+            "description": "How an obsolete in-flight task is stopped: 'graceful' (default; cancel_requested + grace period) or 'forced' (lease invalidated immediately).",
+            "type": "string",
+            "enum": [
+              "graceful",
+              "forced"
+            ],
+            "default": "graceful"
+          }
+        },
+        "required": [
+          "order_field"
+        ]
+      },
+      "authority": {
+        "description": "Creator authority (PRD cpt-cf-task-engine-fr-worker-principals, Creator authority; DESIGN cpt-cf-task-engine-design-creator-authority). Workers act as themselves, so this trait states whose rights bound what they do for a task. 'creator_verified' (default): at creation the engine asks the PDP, with the creator's own security context and the task's owner tenant, whether each check's action is allowed on each referenced resource; a denial, an unreachable PDP, or a result the engine cannot fully evaluate rejects the create. Checked resource references are stored and published as verified. 'worker': the work uses only the worker's authority; allowed only for platform-owned types (a tenant-owned type declaring it cannot be created). Absent means 'creator_verified' with no checks: nothing is verified and every resource reference is stored with verified = false.",
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "mode": {
+            "type": "string",
+            "enum": [
+              "creator_verified",
+              "worker"
+            ],
+            "default": "creator_verified"
+          },
+          "checks": {
+            "description": "Creator checks, only with mode 'creator_verified'. At most trust_limits.max_creator_checks (default 16) entries.",
+            "type": "array",
+            "maxItems": 16,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "source": {
+                  "description": "Where the checked resources are named: 'resource_refs' (every resource reference whose type matches resource_type), or an RFC 6901 JSON Pointer to a field the input schema declares required and of type string, whose value is a resource ID of resource_type.",
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 512
+                },
+                "resource_type": {
+                  "description": "GTS type identifier, or a GTS pattern with a trailing '*' when source is 'resource_refs', of the referenced resources. With a pointer source it MUST be a concrete type.",
+                  "type": "string",
+                  "maxLength": 512
+                },
+                "action": {
+                  "description": "Action the work performs on the resource, as known to the PDP for that resource type (for example 'read', 'update').",
+                  "type": "string",
+                  "pattern": "^[a-z][a-z0-9_]{0,63}$"
+                }
+              },
+              "required": [
+                "source",
+                "resource_type",
+                "action"
+              ]
+            },
+            "default": []
+          }
+        }
+      },
+      "progress_events": {
+        "description": "Progress event mode for tasks of this type (PRD cpt-cf-task-engine-fr-progress-events): 'none' (default), 'milestones' (event only when milestone/current_stage changed), or 'all' (event when any progress dimension changed). Overridable in config by task-type pattern; config override > queue override > this trait > queue registration > global default.",
+        "type": "string",
+        "enum": [
+          "none",
+          "milestones",
+          "all"
+        ]
+      },
+      "progress_flush_interval_secs": {
+        "description": "Flush interval (seconds) for batched progress persistence and derived progress events. Effective value is clamped to progress_min_flush_interval_secs.",
+        "type": "integer",
+        "minimum": 1
+      },
+      "default_queue": {
+        "description": "Queue for tasks of this type when the creation request names none. Absent means the 'default' queue. MUST reference a queue of kind 'dispatch' that accepts the type (accepted_types) and, if a task-domain type rule matches the type, is routed to that domain (otherwise creates without a queue are rejected TASK_DOMAIN_MISMATCH); a tenant-owned type MUST NOT name an 'operated_by: platform' queue (checked by the engine when it resolves the type, PRD cpt-cf-task-engine-fr-type-trust).",
+        "type": "string",
+        "x-gts-instance-ref": "gts.cf.core.tasks.queue.v1~"
+      },
+      "timeouts": {
+        "description": "Default timeouts for tasks of this type. Each field resolves on its own: task creation request, then this trait, then the queue's effective value. Copy of the queue base type's timeouts object (GTS $ref does not allow JSON Pointer fragments); keep the two in sync.",
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "queue_timeout_secs": {
+            "description": "Maximum time a task may wait in 'queued' before it is force-completed as timed out (terminal).",
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 1,
+            "default": null
+          },
+          "assignment_timeout_secs": {
+            "description": "Maximum time a claimed task may remain 'claimed' before it starts (assignment_deadline); on expiry it is a liveness failure and the task is requeued with backoff against max_liveness_requeues (not max_retries).",
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 1,
+            "default": null
+          },
+          "execution_timeout_secs": {
+            "description": "Maximum running time per attempt (execution_deadline, re-armed on each start so time spent waiting is never counted). Terminal, task-attributed, never retried. Every task has an execution timeout: null/absent here falls through to the next level (task request, then type trait, then queue) and finally to the engine default default_execution_timeout_secs; it never means 'no limit'. Values above the engine trust limit (trust_limits max_execution_timeout_secs, tighter for tenant-owned types) make the type non-creatable or the queue refuse new tasks (PRD cpt-cf-task-engine-fr-timeouts, cpt-cf-task-engine-fr-type-trust).",
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 1,
+            "default": null
+          },
+          "heartbeat_timeout_secs": {
+            "description": "Lease duration: the maximum interval between worker heartbeats before the lease expires; falls back to default_lease_duration_secs when null. Workers MUST heartbeat at the heartbeat_interval_secs returned on claim (one third of this value, rounded down, minimum 1) so a single delayed heartbeat does not expire the lease. An expired lease is a liveness failure: the task is requeued with backoff against max_liveness_requeues (not max_retries).",
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 1,
+            "default": null
+          },
+          "lifetime_timeout_secs": {
+            "description": "Absolute wall-clock budget from creation to terminal state, surviving requeues. On expiry the task is force-completed as timed out (overrides retry/lease handling).",
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 1,
+            "default": null
+          }
+        }
+      },
+      "retry_policy": {
+        "description": "Default retry policy for tasks of this type. Taken as a whole from the first level that declares one: task creation request, then this trait, then the queue's effective value. Copy of the queue base type's retry_policy object (GTS $ref does not allow JSON Pointer fragments); keep the two in sync.",
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "max_retries": {
+            "description": "Maximum number of retries after explicit retryable failures reported by a worker. Liveness requeues (lease expiry, assignment timeout) do not consume this budget; see max_liveness_requeues.",
+            "type": "integer",
+            "minimum": 0
+          },
+          "max_liveness_requeues": {
+            "description": "Maximum number of liveness requeues (lease expiry or assignment timeout) before the task is routed terminally with a timed_out result. Counted separately from max_retries so losing the worker never burns the failure-retry budget. Backoff uses this policy's strategy and intervals, applied to the liveness-requeue count. 0 means unlimited (bounded only by the lifetime timeout, if any).",
+            "type": "integer",
+            "minimum": 0,
+            "default": 20
+          },
+          "strategy": {
+            "description": "Backoff strategy used to compute run_after for a retry.",
+            "type": "string",
+            "enum": [
+              "fixed",
+              "linear",
+              "exponential"
+            ]
+          },
+          "base_interval_secs": {
+            "description": "Base backoff interval in seconds.",
+            "type": "integer",
+            "minimum": 0
+          },
+          "max_interval_secs": {
+            "description": "Maximum backoff interval in seconds (caps exponential/linear growth). MUST be greater than or equal to base_interval_secs; the engine rejects a queue whose policy breaks this rule when it resolves the queue (JSON Schema cannot compare two fields).",
+            "type": "integer",
+            "minimum": 0
+          },
+          "jitter_factor": {
+            "description": "Fractional jitter (0.0-1.0) to de-synchronize retries. Jitter only shortens a wait: each wait is drawn from [d * (1 - jitter_factor), d], where d is the capped backoff, so it never exceeds max_interval_secs. 1.0 gives full jitter (PRD cpt-cf-task-engine-fr-retry, Backoff).",
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1,
+            "default": 0
+          },
+          "non_retryable_codes": {
+            "description": "Error codes that are always terminal regardless of the worker's retryable flag.",
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "default": []
+          }
+        },
+        "required": [
+          "max_retries",
+          "strategy",
+          "base_interval_secs",
+          "max_interval_secs"
+        ]
+      },
+      "retention_days": {
+        "description": "Retention for terminal tasks of this type, measured from the terminal time (PRD cpt-cf-task-engine-fr-retention). Precedence: tenant policy > matching config type pattern > this trait > global default.",
+        "type": "integer",
+        "minimum": 1
+      }
+    }
+  },
+  "x-gts-abstract": true
+}

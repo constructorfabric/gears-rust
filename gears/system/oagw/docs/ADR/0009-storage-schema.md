@@ -384,16 +384,17 @@ The queries the database repositories run, as SQL. The secure ORM adds the `tena
 
 Frequency:
 
-- **per request**: every proxied request. Config is not cached; Q1–Q3 run on each one, independent of tenant depth. The proxy never reads tags and does not load them.
+- **per miss**: a proxied request whose lookup misses the proxy configuration cache ([ADR: Proxy Configuration Cache](./0020-proxy-config-cache.md), on by default with a database). Q1 runs on an alias-section miss, Q15 on a route-section miss; a hit runs no query. Loads per replica are bounded by the active keys per TTL plus reloads after writes.
+- **per request**: every proxied request with the cache off (`proxy_cache.enabled: false`): Q1–Q3, independent of tenant depth. With the cache on, Q2–Q3 run only for the SDK's `resolve_proxy_target` (per call). The proxy never reads tags and does not load them.
 - **per call**: Management API / SDK calls.
 - **per check**: the registry reconcile's gate, once per pod per re-check interval (`registry_provisioning.recheck_interval`, default 5 minutes).
 - **per run**: a registry reconcile, which runs only when the registry content (or OAGW's version) differs from the last clean run's, or no run since the last one that took the lease was clean.
 
 | # | Query | Frequency | Index |
 |---|---|---|---|
-| Q1 | Upstreams by alias in the tenant chain, with their plugins | per request | unique `(tenant_id, alias)`; child PK |
-| Q2 | Enabled HTTP route candidates that allow the request method: selection columns only | per request | `(tenant_id, upstream_id)`; child PKs |
-| Q3 | The winning route in full, with its path, methods and plugins; re-checked against the request, and Q2–Q3 run once more on a mismatch | per request | PK; child PKs |
+| Q1 | Upstreams by alias in the tenant chain, with their plugins | per miss; per request with the cache off; per call (SDK with tags) | unique `(tenant_id, alias)`; child PK |
+| Q2 | Enabled HTTP route candidates that allow the request method: selection columns only | per request with the cache off; per call (SDK with tags) | `(tenant_id, upstream_id)`; child PKs |
+| Q3 | The winning route in full, with its path, methods and plugins; re-checked against the request, and Q2–Q3 run once more on a mismatch | per request with the cache off; per call (SDK with tags) | PK; child PKs |
 | Q4 | Tags of the Q1 upstreams and the Q3 route (SDK `resolve_proxy_target` only) | per call | child PK |
 | Q5 | Get / update / delete by ID | per call | PK |
 | Q6 | List upstreams | per call | unique `(tenant_id, id)` |
@@ -405,6 +406,7 @@ Frequency:
 | Q12 | Registry state: generation and content hash | per check | PK |
 | Q13 | Registry state: claim the generation, take, renew or release the lease, record the hash; one conditional `UPDATE` each | per run | PK |
 | Q14 | Delete a dropped registry upstream if unused: lock the row, look for one route, delete; one transaction | per run | PK; `(tenant_id, upstream_id)` |
+| Q15 | Every enabled HTTP route of several upstreams, in full with its path, methods and plugins (`list_proxy_routes`, the cache's route load): one query for all the missing upstreams (chunked past the backend's bind-parameter limit, which a lookup never reaches) | per miss | `(tenant_id, upstream_id)`; child PKs |
 
 Joins match the composite foreign key `(tenant_id, parent_id)`, and the tenant scope applies to the parent: the join key's tenant keeps every child row in its scoped parent's tenant, so the children need no predicate of their own. Upstream delete is one `DELETE`; routes and child rows cascade through `(tenant_id, upstream_id)` and the child PKs.
 
@@ -431,6 +433,16 @@ JOIN oagw_route_method m      ON m.tenant_id  = r.tenant_id AND m.route_id  = r.
 LEFT JOIN oagw_route_plugin p ON p.tenant_id  = r.tenant_id AND p.route_id  = r.id
 WHERE r.id = $1 AND r.upstream_id IN (...) AND r.enabled AND r.match_type = 'http'
   AND r.tenant_id = $2;
+
+-- Q15: Q3 without the winner filter, one row per (route, method, plugin);
+-- grouped by (tenant_id, upstream_id) in the application.
+SELECT r.*, hm.path_prefix, m.method, p.*
+FROM oagw_route r
+JOIN oagw_route_http_match hm ON hm.tenant_id = r.tenant_id AND hm.route_id = r.id
+JOIN oagw_route_method m      ON m.tenant_id  = r.tenant_id AND m.route_id  = r.id
+LEFT JOIN oagw_route_plugin p ON p.tenant_id  = r.tenant_id AND p.route_id  = r.id
+WHERE r.upstream_id IN (...) AND r.enabled AND r.match_type = 'http'
+  AND r.tenant_id IN (...);
 
 -- Q4
 SELECT * FROM oagw_upstream_tag WHERE upstream_id IN (...) AND tenant_id IN (...);
@@ -582,7 +594,8 @@ Deferred / future work:
 - [ADR: Plugin System](./0003-plugin-system.md)
 - [ADR: Request Routing](./0002-request-routing.md)
 - [ADR: State Management](./0008-state-management.md)
-- [ADR: Control Plane Caching](./0007-data-plane-caching.md)
+- [ADR: Control Plane Caching](./0007-data-plane-caching.md) (superseded by ADR-0020)
+- [ADR: Proxy Configuration Cache](./0020-proxy-config-cache.md)
 - [ADR: Rate Limiting](./0004-rate-limiting.md)
 
 ## Traceability

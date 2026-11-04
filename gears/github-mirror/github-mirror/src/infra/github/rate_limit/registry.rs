@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use aws_lc_rs::digest::{self, SHA256};
+use toolkit_security::crypto::hash::Sha256;
 
 use super::controller::RateLimitController;
 
@@ -16,9 +16,7 @@ pub struct TokenFingerprint(String);
 impl TokenFingerprint {
     #[must_use]
     pub fn of(token: &str) -> Self {
-        Self(hex::encode(
-            digest::digest(&SHA256, token.as_bytes()).as_ref(),
-        ))
+        Self(hex::encode(Sha256::digest(token.as_bytes()).as_ref()))
     }
 }
 

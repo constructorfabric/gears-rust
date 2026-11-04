@@ -6,7 +6,7 @@
 //! `name` set at the create, and versions 1, 2, … each holding one immutable declaration. The rules
 //! of a declaration are the SDK's ([`derived::validate`]); this module turns its typed refusal into
 //! the door's 400 `DERIVED_DECLARATION_INVALID`, which names the rule. A version stores the SHA-256
-//! of the SDK's canonical bytes, taken here through `aws-lc-rs` (lint DE0708), and nothing ever
+//! of the SDK's canonical bytes, taken here through the toolkit-security facade, and nothing ever
 //! recomputes it: the stored digest is what pricing pins (P-D-229 decision 3).
 //!
 //! Every input names a raw GTS usage type, and each is resolved through the [`UsageTypeCatalog`]
@@ -24,12 +24,12 @@ use crate::domain::caps;
 use crate::domain::error::DomainError;
 use crate::domain::recognized::UsageTypeAnswer;
 use crate::domain::validation::ValidationReport;
-use aws_lc_rs::digest::{SHA256, digest as sha256};
 use bss_products_sdk::derived::{self, DeclarationError, DerivedUsageDeclaration, Expr, MeterId};
 use bss_products_sdk::usage_types::UsageTypeCatalog;
 use time::OffsetDateTime;
 use toolkit_macros::domain_model;
 use toolkit_security::SecurityContext;
+use toolkit_security::crypto::hash::Sha256;
 use uuid::Uuid;
 
 /// The audit `subject_kind` of a derived usage type's acts.
@@ -187,7 +187,7 @@ pub fn validate(declaration: &DerivedUsageDeclaration) -> Result<(), DomainError
 #[must_use]
 pub fn digest_hex(declaration: &DerivedUsageDeclaration) -> String {
     const DIGITS: &[u8; 16] = b"0123456789abcdef";
-    sha256(&SHA256, &derived::canonical_bytes(declaration))
+    Sha256::digest(derived::canonical_bytes(declaration))
         .as_ref()
         .iter()
         .fold(String::with_capacity(64), |mut hex, b| {

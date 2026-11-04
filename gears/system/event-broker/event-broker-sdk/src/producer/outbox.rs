@@ -9,13 +9,14 @@ use crate::error::EventBrokerError;
 use crate::ids::ProducerId;
 use crate::models::{Event, ProducerMeta};
 
-use super::db::{DbProducer, UnknownProducerAction};
+use super::db::DbProducer;
 
-pub const PRODUCER_OUTBOX_ENVELOPE_VERSION: u16 = 1;
+pub const PRODUCER_OUTBOX_ENVELOPE_VERSION: u16 = 2;
 pub const PRODUCER_OUTBOX_PAYLOAD_TYPE: &str =
-    "application/vnd.constructorfabric.event-broker.producer-outbox+json;version=1";
+    "application/vnd.constructorfabric.event-broker.producer-outbox+json;version=2";
 
-type ProducerOutboxCursorKey = (ProducerId, String, u32);
+/// A producer's chain is kept per `(producer_id, topic)` (ADR-0004 "Chain Scope").
+type ProducerOutboxCursorKey = (ProducerId, String);
 type ProducerOutboxCursorMap = HashMap<ProducerOutboxCursorKey, i64>;
 type SharedProducerOutboxCursor = Arc<Mutex<ProducerOutboxCursorMap>>;
 
@@ -35,18 +36,9 @@ pub struct ProducerOutboxEnvelope {
     trace_parent: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     data: Option<serde_json::Value>,
-    broker_partition: u32,
-    // `ProducerMode` is a transport-free SDK type (no serde derives), so the
-    // envelope - the outbox row's private wire form - maps it through a local
-    // serde mirror (`producer_mode_wire`) rather than serializing the SDK enum
-    // directly. The field stays the domain type; only the wire mapping lives in
-    // the adapter.
+    // Mapped through `producer_mode_wire`: SDK types carry no serde derives.
     #[serde(with = "producer_mode_wire")]
     producer_mode: ProducerMode,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    producer_id: Option<ProducerId>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    generation: Option<i64>,
     diagnostic_metadata: ProducerOutboxDiagnostics,
 }
 
@@ -113,10 +105,7 @@ impl ProducerOutboxEnvelope {
     pub(crate) fn from_event(
         event: Event,
         topic: String,
-        broker_partition: u32,
         producer_mode: ProducerMode,
-        producer_id: Option<ProducerId>,
-        generation: Option<i64>,
         sdk_client_agent: String,
     ) -> Self {
         Self {
@@ -131,43 +120,42 @@ impl ProducerOutboxEnvelope {
             occurred_at: event.occurred_at,
             trace_parent: event.trace_parent,
             data: event.data,
-            broker_partition,
             producer_mode,
-            producer_id,
-            generation,
             diagnostic_metadata: ProducerOutboxDiagnostics { sdk_client_agent },
         }
     }
 
-    fn to_event(&self, seq: i64, chained_previous: Option<i64>) -> Result<Event, EventBrokerError> {
+    /// The event this envelope publishes as message `seq` under
+    /// `producer_id`, the id of the outbox partition it drains from.
+    /// `chained_previous` is the chain's last accepted sequence, for a chained
+    /// producer only.
+    fn to_event(
+        &self,
+        seq: i64,
+        producer_id: Option<ProducerId>,
+        chained_previous: Option<i64>,
+    ) -> Result<Event, EventBrokerError> {
         if self.version != PRODUCER_OUTBOX_ENVELOPE_VERSION {
             return Err(EventBrokerError::Internal(format!(
                 "unsupported producer outbox envelope version {}",
                 self.version
             )));
         }
-        let meta = match self.producer_mode {
-            ProducerMode::Stateless => None,
-            ProducerMode::Monotonic => {
-                let producer_id = self.producer_id.ok_or_else(|| {
-                    EventBrokerError::Internal(
-                        "producer outbox envelope is missing producer_id".to_owned(),
-                    )
-                })?;
-                Some(ProducerMeta {
-                    version: 1,
-                    producer_id: Some(producer_id.0),
-                    previous: None,
-                    sequence: Some(seq),
-                    partition_hint: Some(self.broker_partition),
-                })
+        let meta = match (self.producer_mode, producer_id) {
+            (ProducerMode::Stateless, _) => None,
+            (_, None) => {
+                return Err(EventBrokerError::Internal(
+                    "producer outbox message of a deduplicating producer has no producer id"
+                        .to_owned(),
+                ));
             }
-            ProducerMode::Chained => {
-                let producer_id = self.producer_id.ok_or_else(|| {
-                    EventBrokerError::Internal(
-                        "producer outbox envelope is missing producer_id".to_owned(),
-                    )
-                })?;
+            (ProducerMode::Monotonic, Some(producer_id)) => Some(ProducerMeta {
+                version: 1,
+                producer_id: Some(producer_id.0),
+                previous: None,
+                sequence: Some(seq),
+            }),
+            (ProducerMode::Chained, Some(producer_id)) => {
                 let previous = chained_previous.ok_or_else(|| {
                     EventBrokerError::Internal(
                         "producer outbox chained publish is missing previous sequence".to_owned(),
@@ -178,7 +166,6 @@ impl ProducerOutboxEnvelope {
                     producer_id: Some(producer_id.0),
                     previous: Some(previous),
                     sequence: Some(seq),
-                    partition_hint: Some(self.broker_partition),
                 })
             }
         };
@@ -324,6 +311,7 @@ impl ProducerOutboxQueue {
             .queue(&self.queue, self.partitions)
             .leased(ProducerOutboxProcessor {
                 producer: self.producer.clone(),
+                queue: self.queue.clone(),
                 cursor_state: Arc::new(Mutex::new(HashMap::new())),
             })
     }
@@ -365,7 +353,35 @@ impl ProducerOutboxHandle {
     }
 }
 
+/// The queue name the `process_outbox_payload*_for_test` helpers drain as.
+#[doc(hidden)]
+pub const TEST_QUEUE: &str = "event-broker-producer-test";
+
 impl DbProducer {
+    /// The producer id messages of `partition` of `queue` publish under,
+    /// registering it now if the partition has none yet - as its first drain
+    /// would.
+    #[doc(hidden)]
+    pub async fn partition_producer_for_test(
+        &self,
+        queue: &str,
+        partition: i64,
+    ) -> Result<ProducerId, EventBrokerError> {
+        self.partition_producer(queue, partition).await
+    }
+
+    /// Every stored partition registration of this producer's key, as
+    /// `(queue, partition, producer id, generation)`, ordered by queue and
+    /// partition.
+    #[doc(hidden)]
+    pub async fn registrations_for_test(
+        &self,
+    ) -> Result<Vec<(String, i64, ProducerId, i64)>, EventBrokerError> {
+        self.stored_partition_registrations().await
+    }
+
+    /// Drains one message of partition id 0 of [`TEST_QUEUE`] through the
+    /// producer outbox handler.
     #[doc(hidden)]
     pub async fn process_outbox_payload_for_test(
         &self,
@@ -376,6 +392,9 @@ impl DbProducer {
             .await
     }
 
+    /// As [`process_outbox_payload_for_test`](Self::process_outbox_payload_for_test),
+    /// with the chained cursor of the envelope's topic seeded to
+    /// `initial_chained_previous` for partition 0's producer id.
     #[doc(hidden)]
     pub async fn process_outbox_payload_with_cursor_for_test(
         &self,
@@ -386,15 +405,16 @@ impl DbProducer {
         let cursor_state = Arc::new(Mutex::new(HashMap::new()));
         if let Some(previous) = initial_chained_previous
             && let Ok(envelope) = serde_json::from_slice::<ProducerOutboxEnvelope>(&payload)
-            && let Ok(key) = cursor_key(&envelope)
+            && let Ok(producer_id) = self.partition_producer(TEST_QUEUE, 0).await
         {
             cursor_state
                 .lock()
                 .expect("producer outbox cursor state lock poisoned")
-                .insert(key, previous);
+                .insert((producer_id, envelope.topic), previous);
         }
         let processor = ProducerOutboxProcessor {
             producer: self.clone(),
+            queue: TEST_QUEUE.to_owned(),
             cursor_state,
         };
         let msg = OutboxMessage {
@@ -411,26 +431,56 @@ impl DbProducer {
 
 struct ProducerOutboxProcessor {
     producer: DbProducer,
+    queue: String,
     cursor_state: SharedProducerOutboxCursor,
 }
 
+/// How a failed broker call is answered: a transient failure retries, anything
+/// else rejects the message.
+fn retry_or_reject(err: &EventBrokerError) -> MessageResult {
+    match err {
+        EventBrokerError::Transport(_)
+        | EventBrokerError::RateLimitExceeded { .. }
+        | EventBrokerError::RateLimited { .. } => MessageResult::Retry,
+        err => MessageResult::Reject(err.to_string()),
+    }
+}
+
 impl ProducerOutboxProcessor {
+    /// The producer id messages of `partition` publish under, or `None` for a
+    /// stateless producer.
+    async fn producer_for(
+        &self,
+        envelope: &ProducerOutboxEnvelope,
+        partition: i64,
+    ) -> Result<Option<ProducerId>, EventBrokerError> {
+        if envelope.producer_mode == ProducerMode::Stateless {
+            return Ok(None);
+        }
+        self.producer
+            .partition_producer(&self.queue, partition)
+            .await
+            .map(Some)
+    }
+
     async fn event_for_message(
         &self,
         envelope: &ProducerOutboxEnvelope,
+        producer_id: Option<ProducerId>,
         seq: i64,
     ) -> Result<Event, EventBrokerError> {
-        match envelope.producer_mode {
-            ProducerMode::Stateless | ProducerMode::Monotonic => envelope.to_event(seq, None),
-            ProducerMode::Chained => {
-                let previous = self.cursor_for(envelope).await?;
-                envelope.to_event(seq, Some(previous))
+        match (envelope.producer_mode, producer_id) {
+            (ProducerMode::Chained, Some(producer_id)) => {
+                let previous = self
+                    .cursor_for((producer_id, envelope.topic.clone()))
+                    .await?;
+                envelope.to_event(seq, Some(producer_id), Some(previous))
             }
+            _ => envelope.to_event(seq, producer_id, None),
         }
     }
 
-    async fn cursor_for(&self, envelope: &ProducerOutboxEnvelope) -> Result<i64, EventBrokerError> {
-        let key = cursor_key(envelope)?;
+    async fn cursor_for(&self, key: ProducerOutboxCursorKey) -> Result<i64, EventBrokerError> {
         if let Some(previous) = self
             .cursor_state
             .lock()
@@ -444,7 +494,7 @@ impl ProducerOutboxProcessor {
     }
 
     async fn refresh_cursor(&self, key: ProducerOutboxCursorKey) -> Result<i64, EventBrokerError> {
-        let (producer_id, topic, partition) = key.clone();
+        let (producer_id, topic) = key.clone();
         let cursors = self
             .producer
             .broker
@@ -454,8 +504,7 @@ impl ProducerOutboxProcessor {
             .topics
             .into_iter()
             .find(|t| t.topic == topic)
-            .and_then(|t| t.partitions.into_iter().find(|p| p.partition == partition))
-            .map_or(-1, |p| p.last_sequence);
+            .map_or(-1, |t| t.last_sequence);
         self.cursor_state
             .lock()
             .expect("producer outbox cursor state lock poisoned")
@@ -463,84 +512,84 @@ impl ProducerOutboxProcessor {
         Ok(last_sequence)
     }
 
+    /// The broker forgot `producer_id`: the partition gets a new one, and the
+    /// message is retried under it. The broker's chain state for the old id is
+    /// already gone, so nothing is kept by stalling.
+    async fn replace_unknown(&self, partition: i64, producer_id: ProducerId) -> MessageResult {
+        match self
+            .producer
+            .replace_unknown_producer(&self.queue, partition, producer_id)
+            .await
+        {
+            Ok(()) => MessageResult::Retry,
+            Err(err) => retry_or_reject(&err),
+        }
+    }
+
     async fn handle_sequence_violation(
         &self,
         envelope: &ProducerOutboxEnvelope,
+        producer_id: ProducerId,
+        partition: i64,
         seq: i64,
     ) -> MessageResult {
-        let key = match cursor_key(envelope) {
-            Ok(key) => key,
-            Err(err) => return MessageResult::Reject(err.to_string()),
-        };
-        let previous = match self.refresh_cursor(key).await {
+        let previous = match self
+            .refresh_cursor((producer_id, envelope.topic.clone()))
+            .await
+        {
             Ok(previous) => previous,
-            Err(EventBrokerError::Transport(_))
-            | Err(EventBrokerError::RateLimitExceeded { .. })
-            | Err(EventBrokerError::RateLimited { .. }) => return MessageResult::Retry,
-            Err(err) => return MessageResult::Reject(err.to_string()),
+            Err(EventBrokerError::UnknownProducer { producer_id, .. }) => {
+                return self.replace_unknown(partition, producer_id).await;
+            }
+            Err(err) => return retry_or_reject(&err),
         };
         if seq <= previous {
             return MessageResult::Ok;
         }
-        let event = match envelope.to_event(seq, Some(previous)) {
+        let event = match envelope.to_event(seq, Some(producer_id), Some(previous)) {
             Ok(event) => event,
             Err(err) => return MessageResult::Reject(err.to_string()),
         };
-        self.publish_event(&envelope.topic, event).await
-    }
-
-    async fn publish_event(&self, topic: &str, event: Event) -> MessageResult {
-        match self
-            .producer
-            .broker
-            .publish(&self.producer.ctx, &event)
-            .await
-        {
-            Ok(IngestOutcome::Accepted | IngestOutcome::Persisted) => {
-                if let Some(meta) = event.meta
-                    && let (Some(producer_id), Some(sequence), Some(partition)) =
-                        (meta.producer_id, meta.sequence, meta.partition_hint)
-                {
-                    self.cursor_state
-                        .lock()
-                        .expect("producer outbox cursor state lock poisoned")
-                        .insert(
-                            (ProducerId(producer_id), topic.to_owned(), partition),
-                            sequence,
-                        );
-                }
-                MessageResult::Ok
-            }
-            Ok(IngestOutcome::Duplicate) => MessageResult::Ok,
+        match self.publish(&envelope.topic, &event).await {
             Err(EventBrokerError::SequenceViolation { .. }) => MessageResult::Reject(
                 "producer outbox chained sequence divergence persisted after cursor refresh"
                     .to_owned(),
             ),
-            Err(EventBrokerError::UnknownProducer { producer_id, .. }) => {
-                self.handle_unknown_producer(producer_id).await
-            }
-            Err(EventBrokerError::Transport(_))
-            | Err(EventBrokerError::RateLimitExceeded { .. })
-            | Err(EventBrokerError::RateLimited { .. }) => MessageResult::Retry,
-            Err(err) => MessageResult::Reject(err.to_string()),
+            result => self.answer(result, partition).await,
         }
     }
 
-    async fn handle_unknown_producer(&self, producer_id: ProducerId) -> MessageResult {
-        match self.producer.handle_unknown_producer(producer_id).await {
-            Ok(UnknownProducerAction::Rotated) => MessageResult::Reject(format!(
-                "producer_id {producer_id:?} is unknown; registered replacement for future enqueues"
-            )),
-            Ok(UnknownProducerAction::AlreadyRotated) => MessageResult::Reject(format!(
-                "producer_id {producer_id:?} is unknown; local registration already rotated"
-            )),
-            Ok(UnknownProducerAction::Fail) => {
-                MessageResult::Reject(format!("producer_id {producer_id:?} is unknown"))
+    /// Publishes `event` and, once accepted, records its sequence as the
+    /// chain's last for `topic`.
+    async fn publish(&self, topic: &str, event: &Event) -> Result<IngestOutcome, EventBrokerError> {
+        let outcome = self
+            .producer
+            .broker
+            .publish(&self.producer.ctx, event)
+            .await?;
+        if matches!(outcome, IngestOutcome::Accepted | IngestOutcome::Persisted)
+            && let Some(meta) = &event.meta
+            && let (Some(producer_id), Some(sequence)) = (meta.producer_id, meta.sequence)
+        {
+            self.cursor_state
+                .lock()
+                .expect("producer outbox cursor state lock poisoned")
+                .insert((ProducerId(producer_id), topic.to_owned()), sequence);
+        }
+        Ok(outcome)
+    }
+
+    async fn answer(
+        &self,
+        result: Result<IngestOutcome, EventBrokerError>,
+        partition: i64,
+    ) -> MessageResult {
+        match result {
+            Ok(_) => MessageResult::Ok,
+            Err(EventBrokerError::UnknownProducer { producer_id, .. }) => {
+                self.replace_unknown(partition, producer_id).await
             }
-            Err(EventBrokerError::Transport(_))
-            | Err(EventBrokerError::RateLimitExceeded { .. })
-            | Err(EventBrokerError::RateLimited { .. }) => MessageResult::Retry,
-            Err(err) => MessageResult::Reject(err.to_string()),
+            Err(err) => retry_or_reject(&err),
         }
     }
 }
@@ -552,69 +601,34 @@ impl LeasedMessageHandler for ProducerOutboxProcessor {
             Ok(envelope) => envelope,
             Err(err) => return MessageResult::Reject(format!("decode producer envelope: {err}")),
         };
-        // Building the event can itself call the broker (a chained producer
-        // refreshes its cursor via `get_producer_cursors`), so the same
-        // recovery the publish arms below apply must apply here: a reaped
-        // registration surfaces as `UnknownProducer` at whichever broker call
-        // observes it first, and a transient failure is still a `Retry`. Only a
-        // genuinely unrecoverable error rejects the message.
-        let event = match self.event_for_message(&envelope, msg.seq).await {
-            Ok(event) => event,
-            Err(EventBrokerError::UnknownProducer { producer_id, .. }) => {
-                return self.handle_unknown_producer(producer_id).await;
-            }
-            Err(EventBrokerError::Transport(_))
-            | Err(EventBrokerError::RateLimitExceeded { .. })
-            | Err(EventBrokerError::RateLimited { .. }) => return MessageResult::Retry,
-            Err(err) => return MessageResult::Reject(err.to_string()),
+        let partition = msg.partition_id;
+        // Resolving the partition's id and building the event can both call
+        // the broker (registration, a chained cursor refresh), so they get the
+        // same recovery as the publish: a forgotten id surfaces as
+        // `UnknownProducer` at whichever call observes it first.
+        let producer_id = match self.producer_for(&envelope, partition).await {
+            Ok(producer_id) => producer_id,
+            Err(err) => return retry_or_reject(&err),
         };
-        match self
-            .producer
-            .broker
-            .publish(&self.producer.ctx, &event)
+        let event = match self
+            .event_for_message(&envelope, producer_id, msg.seq)
             .await
         {
-            Ok(IngestOutcome::Accepted | IngestOutcome::Persisted) => {
-                if let Some(meta) = event.meta
-                    && let (Some(producer_id), Some(sequence), Some(partition)) =
-                        (meta.producer_id, meta.sequence, meta.partition_hint)
-                {
-                    self.cursor_state
-                        .lock()
-                        .expect("producer outbox cursor state lock poisoned")
-                        .insert(
-                            (ProducerId(producer_id), envelope.topic.clone(), partition),
-                            sequence,
-                        );
-                }
-                MessageResult::Ok
+            Ok(event) => event,
+            Err(EventBrokerError::UnknownProducer { producer_id, .. }) => {
+                return self.replace_unknown(partition, producer_id).await;
             }
-            Ok(IngestOutcome::Duplicate) => MessageResult::Ok,
+            Err(err) => return retry_or_reject(&err),
+        };
+        match self.publish(&envelope.topic, &event).await {
             Err(EventBrokerError::SequenceViolation { .. })
                 if envelope.producer_mode == ProducerMode::Chained =>
             {
-                self.handle_sequence_violation(&envelope, msg.seq).await
+                let producer_id = producer_id.expect("a chained producer has a producer id");
+                self.handle_sequence_violation(&envelope, producer_id, partition, msg.seq)
+                    .await
             }
-            Err(EventBrokerError::UnknownProducer { producer_id, .. }) => {
-                self.handle_unknown_producer(producer_id).await
-            }
-            Err(EventBrokerError::Transport(_))
-            | Err(EventBrokerError::RateLimitExceeded { .. })
-            | Err(EventBrokerError::RateLimited { .. }) => MessageResult::Retry,
-            Err(err) => MessageResult::Reject(err.to_string()),
+            result => self.answer(result, partition).await,
         }
     }
-}
-
-fn cursor_key(
-    envelope: &ProducerOutboxEnvelope,
-) -> Result<ProducerOutboxCursorKey, EventBrokerError> {
-    let producer_id = envelope.producer_id.ok_or_else(|| {
-        EventBrokerError::Internal("producer outbox envelope is missing producer_id".to_owned())
-    })?;
-    Ok((
-        producer_id,
-        envelope.topic.clone(),
-        envelope.broker_partition,
-    ))
 }

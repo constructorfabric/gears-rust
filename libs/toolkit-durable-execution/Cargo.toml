@@ -1,6 +1,6 @@
 [package]
 name = "cf-gears-toolkit-durable-execution"
-version = "0.1.0"
+version = "0.1.2"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
@@ -22,6 +22,12 @@ test-util = ["tokio/rt"]
 # PostgreSQL and subprocess recovery tests (testcontainers).
 integration = []
 
+# The unit and integration suites live under `tests/` but are compiled into the
+# library's own test build through `#[cfg(test)] #[path = "../tests/..."]`
+# modules, which cargo-shear cannot follow, so it reports the files as unlinked.
+[package.metadata.cargo-shear]
+ignored-paths = ["tests/unit/*.rs", "tests/integration/*.rs"]
+
 [lints]
 workspace = true
 
@@ -31,7 +37,6 @@ async-trait.workspace = true
 chrono.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-aws-lc-rs.workspace = true
 hex.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["macros", "time", "rt", "sync"] }

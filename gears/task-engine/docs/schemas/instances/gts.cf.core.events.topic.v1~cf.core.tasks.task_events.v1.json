@@ -1,0 +1,5 @@
+{
+  "id": "gts.cf.core.events.topic.v1~cf.core.tasks.task_events.v1",
+  "description": "Outbound Task Engine lifecycle-events stream. All task lifecycle event types are published to this topic.",
+  "retention": "P30D"
+}

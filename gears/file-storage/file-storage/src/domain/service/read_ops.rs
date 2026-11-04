@@ -1,5 +1,7 @@
 //! Read-only queries and version-lifecycle operations (download URL, restore, delete).
 
+use std::collections::HashMap;
+
 use toolkit_security::{AccessScope, SecurityContext};
 use uuid::Uuid;
 
@@ -9,7 +11,9 @@ use crate::domain::audit::AuditOperation;
 use crate::domain::authz::actions;
 use crate::domain::error::DomainError;
 use crate::domain::etag;
+use crate::domain::pagination::{self, Direction};
 use crate::domain::service::{DownloadTicket, FileService};
+use crate::infra::content::hash_mode::HashMode;
 use crate::infra::external_clients::UsageDelta;
 
 impl FileService {
@@ -149,6 +153,139 @@ impl FileService {
             self.cfg.max_page_size,
         )?;
         self.store.list_versions_page(file_id, limit, cursor).await
+    }
+
+    /// Batched manifest lookup for a `list_versions` page (composite versions only).
+    ///
+    /// Performs **no authorization of its own**: ids must come from an authorized `list_versions`
+    /// call, hence `pub(crate)`.
+    pub(crate) async fn manifests_for_versions(
+        &self,
+        version_ids: &[Uuid],
+    ) -> Result<HashMap<Uuid, String>, DomainError> {
+        self.store.get_version_manifests(version_ids).await
+    }
+
+    /// `GET /files/{id}/versions` plus each composite version's ADR-0006 manifest, truncated to a
+    /// manifest-byte budget (see [`Self::fetch_manifests_within_budget`]).
+    ///
+    /// A truncated page keeps the rows adjacent to the request's cursor (at least one, so resuming
+    /// progresses) and rebuilds the cursor on the dropped side, so no gap and no duplicate.
+    pub async fn list_versions_with_manifests(
+        &self,
+        ctx: &SecurityContext,
+        file_id: Uuid,
+        limit: Option<u64>,
+        cursor: Option<toolkit_odata::CursorV1>,
+    ) -> Result<toolkit_odata::Page<(FileVersion, Option<String>)>, DomainError> {
+        let binding = pagination::versions_binding(file_id);
+        let mut page = self
+            .list_versions(ctx, file_id, limit, cursor.clone())
+            .await?;
+        // `list_versions` authorizes the caller and validates the cursor first; only then read its direction.
+        let direction = cursor
+            .map(|c| pagination::seek(c, pagination::VERSIONS_ID_FIELD, binding.as_deref()))
+            .transpose()?
+            .map_or(Direction::Forward, |seek| seek.direction);
+
+        let fetched_len = page.items.len();
+        if direction == Direction::Backward {
+            page.items.reverse();
+        }
+        let mut manifests = self
+            .fetch_manifests_within_budget(&mut page.items, LIST_VERSIONS_MANIFEST_BUDGET_BYTES)
+            .await?;
+        if direction == Direction::Backward {
+            page.items.reverse();
+        }
+        let budget_truncated = page.items.len() < fetched_len;
+
+        let mut next_cursor = page.page_info.next_cursor.clone();
+        let mut prev_cursor = page.page_info.prev_cursor.clone();
+        if budget_truncated {
+            let rebuild = |v: &FileVersion, direction| {
+                pagination::encode(
+                    v.created_at,
+                    v.version_id,
+                    pagination::VERSIONS_ID_FIELD,
+                    binding.clone(),
+                    direction,
+                )
+            };
+            match direction {
+                Direction::Forward => {
+                    next_cursor = page
+                        .items
+                        .last()
+                        .map(|v| rebuild(v, Direction::Forward))
+                        .transpose()?;
+                }
+                Direction::Backward => {
+                    prev_cursor = page
+                        .items
+                        .first()
+                        .map(|v| rebuild(v, Direction::Backward))
+                        .transpose()?;
+                }
+            }
+        }
+        let items = page
+            .items
+            .into_iter()
+            .map(|v| {
+                let manifest = manifests.remove(&v.version_id);
+                (v, manifest)
+            })
+            .collect();
+        Ok(toolkit_odata::Page::new(
+            items,
+            toolkit_odata::PageInfo {
+                next_cursor,
+                prev_cursor,
+                limit: page.page_info.limit,
+            },
+        ))
+    }
+
+    /// Fetch composite manifests for one page in batches, truncating `versions` via
+    /// [`manifest_budget_cutoff`] once the byte total would cross `budget_bytes`. The cutoff covers
+    /// only the prefix whose manifests are all fetched (an unfetched one would be admitted free).
+    async fn fetch_manifests_within_budget(
+        &self,
+        versions: &mut Vec<FileVersion>,
+        budget_bytes: u64,
+    ) -> Result<HashMap<Uuid, String>, DomainError> {
+        let mut composite_ids: Vec<Uuid> = Vec::new();
+        let mut composite_positions: Vec<usize> = Vec::new();
+        for (i, v) in versions.iter().enumerate() {
+            if v.hash_mode == HashMode::MULTIPART_COMPOSITE_SHA256 {
+                composite_ids.push(v.version_id);
+                composite_positions.push(i);
+            }
+        }
+
+        let mut manifests: HashMap<Uuid, String> = HashMap::new();
+        let mut fetched = 0usize;
+
+        for chunk in composite_ids.chunks(MANIFEST_FETCH_BATCH_SIZE) {
+            let batch = self.manifests_for_versions(chunk).await?;
+            manifests.extend(batch);
+            fetched += chunk.len();
+
+            let safe_upto = composite_positions
+                .get(fetched)
+                .copied()
+                .unwrap_or(versions.len());
+            let cutoff = manifest_budget_cutoff(&versions[..safe_upto], &manifests, budget_bytes);
+            if cutoff < safe_upto {
+                versions.truncate(cutoff);
+                return Ok(manifests);
+            }
+            if safe_upto == versions.len() {
+                return Ok(manifests);
+            }
+        }
+        Ok(manifests)
     }
 
     /// Restore a prior version as current (a rebind: pointer swap, no re-upload).
@@ -330,3 +467,36 @@ impl FileService {
         Ok(())
     }
 }
+
+/// Aggregate manifest-byte budget for one page, enforced while fetching rather than as a cap on `?limit`.
+const LIST_VERSIONS_MANIFEST_BUDGET_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Composite manifests fetched per DB round trip (bounds the fetch past an early cutoff).
+const MANIFEST_FETCH_BATCH_SIZE: usize = 8;
+
+/// How many of `versions` (ordered outwards from the cursor) fit in `budget_bytes` of manifests.
+///
+/// The first is always kept even if over budget (a manifest is bounded, ~1 MiB), so a client
+/// resuming after it makes progress. Any truncation forces the paging-direction cursor to be rebuilt.
+fn manifest_budget_cutoff(
+    versions: &[FileVersion],
+    manifests: &HashMap<Uuid, String>,
+    budget_bytes: u64,
+) -> usize {
+    let mut used_bytes: u64 = 0;
+    for (i, v) in versions.iter().enumerate() {
+        let Some(manifest) = manifests.get(&v.version_id) else {
+            continue; // whole-sha256 (or no manifest found): no budget consumed
+        };
+        let size = manifest.len() as u64;
+        if i > 0 && used_bytes.saturating_add(size) > budget_bytes {
+            return i;
+        }
+        used_bytes = used_bytes.saturating_add(size);
+    }
+    versions.len()
+}
+
+#[cfg(test)]
+#[path = "read_ops_tests.rs"]
+mod read_ops_tests;

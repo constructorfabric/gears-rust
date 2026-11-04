@@ -537,6 +537,6 @@ See the [Stripe price contract][stripe-prices].
 [rating-design]: ../../rating/docs/DESIGN.md
 [ledger-sdk]: ../../ledger/ledger-sdk/src/posting.rs
 [ledger-design]: ../../ledger/docs/DESIGN.md
-[orders-design]: ../../orders-lifecycle/docs/DESIGN.md
+[orders-design]: ../../orders/docs/DESIGN.md
 [database-adr]: ../../../../docs/arch/database/ADR/0001-cpt-cf-database-adr-object-namespacing.md
 [errors-adr]: ../../../../docs/arch/errors/ADR/0001-cpt-cf-adr-canonical-error-categories.md

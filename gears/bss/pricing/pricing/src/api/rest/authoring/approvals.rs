@@ -189,6 +189,7 @@ async fn name_books(
     tenant: Uuid,
     units: &mut [PricingApprovalUnitDto],
 ) -> Result<BTreeMap<Uuid, entity::price_book::Model>, DoorError> {
+    fill_price_specs(tx, tenant, units).await?;
     let mut ids = BTreeSet::new();
     for unit in units.iter() {
         collect_book_ids(&unit.snapshot, &mut ids);
@@ -221,6 +222,93 @@ async fn name_books(
         attach_book_identity(&mut unit.snapshot, &books);
     }
     Ok(found)
+}
+/// The `price_id` a snapshot price or its `before` names, when it is an id.
+fn snapshot_price_id(value: &serde_json::Value) -> Option<Uuid> {
+    value
+        .get("price_id")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|raw| Uuid::parse_str(raw).ok())
+}
+/// The price ids of a prices snapshot whose `before` or `after` lacks its currency spec: a unit
+/// stored before D-539. `after` is the item's price, `before` its predecessor's.
+fn prices_without_spec(snapshot: &serde_json::Value, out: &mut BTreeSet<Uuid>) {
+    let Some(prices) = snapshot.get("prices").and_then(serde_json::Value::as_array) else {
+        return;
+    };
+    let lacks =
+        |value: &serde_json::Value| value.is_object() && value.get("currency_scale").is_none();
+    for price in prices {
+        if price.get("after").is_some_and(lacks)
+            && let Some(id) = snapshot_price_id(price)
+        {
+            out.insert(id);
+        }
+        if let Some(before) = price.get("before")
+            && lacks(before)
+            && let Some(id) = snapshot_price_id(before)
+        {
+            out.insert(id);
+        }
+    }
+}
+/// Put `currency` and `currency_scale` on each snapshot price that lacks them (D-539): a unit
+/// stored before D-539 carries none, and the spec is read from the price's row, where it was
+/// stored with the money (D-531). A unit stored since carries both in its snapshot, and nothing is
+/// read. A row that is gone (a rejected draft deleted since) leaves the price as it is. The stored
+/// snapshot and its fingerprint are unchanged: this is what the review reads.
+/// # Errors
+/// Storage failures.
+async fn fill_price_specs(
+    tx: &impl DBRunner,
+    tenant: Uuid,
+    units: &mut [PricingApprovalUnitDto],
+) -> Result<(), DoorError> {
+    let mut ids = BTreeSet::new();
+    for unit in units.iter() {
+        prices_without_spec(&unit.snapshot, &mut ids);
+    }
+    if ids.is_empty() {
+        return Ok(());
+    }
+    let id_list: Vec<Uuid> = ids.iter().copied().collect();
+    let specs: BTreeMap<Uuid, (String, i16)> =
+        price_repo::find_many(tx, &AccessScope::for_tenant(tenant), tenant, &id_list)
+            .await?
+            .into_iter()
+            .map(|m| (m.id, (m.currency, m.currency_scale)))
+            .collect();
+    let attach = |value: &mut serde_json::Value, id: Uuid| {
+        if let serde_json::Value::Object(map) = value
+            && map.get("currency_scale").is_none()
+            && let Some((currency, scale)) = specs.get(&id)
+        {
+            map.insert("currency".into(), serde_json::json!(currency));
+            map.insert("currency_scale".into(), serde_json::json!(scale));
+        }
+    };
+    for unit in units {
+        let Some(prices) = unit
+            .snapshot
+            .get_mut("prices")
+            .and_then(serde_json::Value::as_array_mut)
+        else {
+            continue;
+        };
+        for price in prices {
+            if let Some(id) = snapshot_price_id(price)
+                && let Some(after) = price.get_mut("after")
+            {
+                attach(after, id);
+            }
+            if let Some(before) = price.get_mut("before")
+                && let Some(id) = snapshot_price_id(before)
+            {
+                attach(before, id);
+            }
+        }
+    }
+    Ok(())
 }
 /// One unit's item authors and decisions, one statement each: what its receipt's flag and, for a
 /// plan revision, its progress are built from.

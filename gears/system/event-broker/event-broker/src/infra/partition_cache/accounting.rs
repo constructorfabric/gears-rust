@@ -5,8 +5,9 @@
 //! extra call, which sequences in the range it covered are **permanently
 //! absent**: within the interval from the requested offset up to the highest
 //! sequence returned, the returned set is the complete set, and because
-//! sequences are assigned contiguously at persist time, a sequence missing
-//! from it has been deleted. Backends may delete at any time - retention
+//! nothing becomes readable below a sequence already readable, a sequence
+//! missing from it never appears: storage skipped it or deleted it. Backends
+//! may skip positions at assignment and delete at any time - retention
 //! trimming a prefix, lawful erasure of one tenant's events mid-stream, or
 //! compaction - so holes are expected rather than exceptional. See
 //! `docs/DESIGN.md`'s `DeliveryService` responsibilities (requirement R09,

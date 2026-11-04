@@ -84,6 +84,20 @@ pub fn record_base_schema() -> serde_json::Value {
     RecordV1::<()>::gts_schema_with_refs()
 }
 
+/// The schema of the record type `type_id` as this crate registers it, or
+/// `None` for a type it does not define.
+#[must_use]
+pub fn record_type_schema(type_id: &str) -> Option<serde_json::Value> {
+    Some(match type_id {
+        RECORD_BASE_TYPE => record_base_schema(),
+        CHAT_MESSAGE_TYPE => ChatMessageV1::gts_schema_with_refs(),
+        ENRICHMENT_FACT_CANDIDATE_TYPE => FactCandidateV1::gts_schema_with_refs(),
+        MASTERY_COURSE_CATALOG_TYPE => CourseCatalogV1::gts_schema_with_refs(),
+        MASTERY_STUDENT_MASTERY_TYPE => StudentMasteryV1::gts_schema_with_refs(),
+        _ => return None,
+    })
+}
+
 // The traits of a record type, emitted as the base's `x-gts-traits-schema`.
 // A plain comment: a doc comment would become the trait schema's
 // description.

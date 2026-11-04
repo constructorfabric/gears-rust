@@ -476,22 +476,21 @@ fn db_error(e: &RepoError) -> Option<&sea_orm::DbErr> {
         _ => None,
     }
 }
+/// Start both writers together. The barrier sits before the transaction: on `SQLite` a
+/// transaction that may write begins with `BEGIN IMMEDIATE` and holds the write lock, so the
+/// second writer waits in its `BEGIN` until the first commits, then sees the conflict. Inside
+/// the transaction the first writer would hold the lock at the barrier, waiting for a second
+/// writer that cannot begin.
 async fn writer(
     db: Db,
     scope: AccessScope,
     id: Uuid,
     barrier: Arc<tokio::sync::Barrier>,
 ) -> Result<(), RepoError> {
-    let mut attempt = 0;
+    barrier.wait().await;
     db.transaction_with_retry(TxConfig::serializable(), db_error, move |tx| {
-        attempt += 1;
-        let first = attempt == 1;
         let scope = scope.clone();
-        let barrier = Arc::clone(&barrier);
         Box::pin(async move {
-            if first {
-                barrier.wait().await;
-            }
             reference_op_repo::transition(
                 tx,
                 &scope,
@@ -516,7 +515,7 @@ async fn writer(
 async fn two_real_writers_one_sqlite_file_only_one_transition_wins() {
     let (db, scope, tenant, dsn) = test_db().await;
     let other = toolkit_db::connect_db(
-        &dsn,
+        &storage_support::toolkit_dsn(&dsn),
         ConnectOpts {
             max_conns: Some(1),
             min_conns: Some(1),

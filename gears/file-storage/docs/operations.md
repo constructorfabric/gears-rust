@@ -24,25 +24,21 @@ drift with every edit.
 
 All fields are `#[serde(default = "…")]`, so an operator's YAML only needs to override what it wants to change; a
 gear started with no `file-storage` config section at all gets every default below — **except that it still cannot
-actually boot**: `require_signing_key_seed` defaults to `true` with `signing_key_seed` unset, and
-`FileStorageConfig::validate()` fails gear init on exactly that combination (see `require_signing_key_seed` below).
-A genuinely zero-config deployment is dev/test-only (set `require_signing_key_seed: false` there).
+actually boot**: `require_signing_key` defaults to `true` with `signing_key_pkcs8` unset, and
+`FileStorageConfig::validate()` fails gear init on exactly that combination (see `require_signing_key` below).
+A genuinely zero-config deployment is dev/test-only (set `require_signing_key: false` there).
 `FileStorageConfig::validate()` (called at gear init, before anything is wired up) rejects invalid configurations —
 missing-secret/zero-value guards (`default_url_ttl_secs`, `multipart_session_ttl_secs`,
-`multipart_complete_lease_secs`, `migrate_timeout_secs` or `migrate_lease_margin_secs` equal to `0`, instead of
-silently using one second; `default_page_size` or `max_page_size` equal to `0`; `signing_key_seed` absent while
+`multipart_complete_lease_secs` equal to `0`, instead of
+silently using one second; `default_page_size` or `max_page_size` equal to `0`; `signing_key_pkcs8` absent while
 required; `finalize_internal_secret` absent or empty);
 absolute ceilings (`finalize_token_grace_secs` above `MAX_FINALIZE_TOKEN_GRACE_SECS`, 7 days; `max_page_size` above
 `MAX_PAGE_SIZE_CEILING`, 200; `max_url_ttl_secs` above `MAX_URL_TTL_CEILING`, 30 days; `multipart_session_ttl_secs`
 above `MAX_MULTIPART_SESSION_TTL_SECS`, 30 days; `multipart_complete_lease_secs` above
-`MAX_MULTIPART_COMPLETE_LEASE_SECS`, 1 day; `migrate_timeout_secs` above `MAX_MIGRATE_TIMEOUT_SECS`, 1 day;
-`migrate_lease_margin_secs` above `MAX_MIGRATE_LEASE_MARGIN_SECS`, 1 hour;
-`idempotency_ttl_secs` above `MAX_IDEMPOTENCY_TTL_SECS`, 30 days; `previous_signing_public_keys` having more than
-`infra::signed_url::MAX_PREVIOUS_SIGNING_PUBLIC_KEYS`, 8, entries — see those fields below); cross-field ordering
+`MAX_MULTIPART_COMPLETE_LEASE_SECS`, 1 day;
+`idempotency_ttl_secs` above `MAX_IDEMPOTENCY_TTL_SECS`, 30 days); cross-field ordering
 invariants (`default_url_ttl_secs` vs. `max_url_ttl_secs`; `default_page_size` vs. `max_page_size`;
-`multipart_session_ttl_secs` vs. `default_url_ttl_secs`); and one per-entry format check (each
-`previous_signing_public_keys` entry must be a validly-formed, 32-byte Ed25519 public key — see that field below) —
-noted inline below. Function names (rather than line numbers) are used as source pointers throughout this
+`multipart_session_ttl_secs` vs. `default_url_ttl_secs`), as noted inline below. Function names (rather than line numbers) are used as source pointers throughout this
 table since line numbers drift with every edit.
 
 **Removed keys.** `enable_background_sweep`, `sweep_interval_secs`, `sweep_time_budget_secs`, `orphan_grace_secs` and
@@ -59,20 +55,17 @@ there is no standalone TOML/JSON file of its own.
 | `finalize_token_grace_secs` | `3600` (1h) | `default_finalize_token_grace_secs()` |
 | `multipart_session_ttl_secs` | `86400` (24h) | `default_multipart_session_ttl_secs()` |
 | `multipart_complete_lease_secs` | `120` (2 min) | `default_multipart_complete_lease_secs()` |
-| `migrate_timeout_secs` | `3600` (1h) | `default_migrate_timeout_secs()` |
-| `migrate_lease_margin_secs` | `300` (5 min) | `default_migrate_lease_margin_secs()` |
 | `sidecar_base_url` | `"http://localhost:8087"` | `default_sidecar_base_url()` |
 | `default_page_size` | `25` | `default_page_size()` |
 | `max_page_size` | `200` | `default_max_page_size()` |
 | `storage_root` | `"./.file-storage-data"` | `default_storage_root()` |
-| `signing_key_seed` | `None` (no `#[serde(default = …)]`, just `Option::default()`) | struct field default |
-| `require_signing_key_seed` | `true` | `default_require_signing_key_seed()` |
+| `signing_key_pkcs8` | `None` (no `#[serde(default = …)]`, just `Option::default()`) | struct field default |
+| `require_signing_key` | `true` | `default_require_signing_key()` |
 | `idempotency_ttl_secs` | `86400` (24h) | `default_idempotency_ttl_secs()` |
 | `enable_in_memory_backend` | `false` (bare `#[serde(default)]`) | struct field default |
 | `s3_backends` | `[]` (empty, bare `#[serde(default)]`) | struct field default |
 | `default_backend_id` | `None` (bare `#[serde(default)]`) | struct field default |
 | `finalize_internal_secret` | **required** (`None` fails `validate()`) | struct field default |
-| `previous_signing_public_keys` | `[]` (empty, bare `#[serde(default)]`) | struct field default |
 
 ### `default_url_ttl_secs`
 Default TTL (seconds) baked into every signed URL the control plane mints (`900` = 15 minutes), unless the caller's
@@ -142,36 +135,6 @@ short → a slow-but-healthy assembly has its lease stolen and the work is redon
 session whose completer really did crash stays unavailable for takeover for the whole lease window. Capped at
 `MAX_MULTIPART_COMPLETE_LEASE_SECS` (`86400` s = 1 day); `validate()` fails gear init above it.
 
-### `migrate_timeout_secs` / `migrate_lease_margin_secs`
-Together these size the per-version **migration lease** `POST /files/{id}/migrate` acquires before it ever writes to
-a destination backend (upload-flow redesign): `lease = migrate_timeout_secs + migrate_lease_margin_secs`. A second
-migration attempt of the same version while the lease is live is rejected with `409 Conflict` immediately, before any
-backend I/O.
-
-`migrate_timeout_secs` (seconds, default `3600` = 1h) is the time budget for one migration attempt's transfer +
-verification + commit, enforced via `tokio::time::timeout`; exceeding it best-effort deletes only the destination
-object this call itself created and fails with a retryable `503 service_unavailable` + `Retry-After`. **Production
-recommendation**: size it to your largest realistic object divided by the slowest backend's sustained throughput this
-deployment expects to migrate, with headroom — e.g. a 50 GiB object over a backend sustaining 100 MiB/s needs at
-least ~500s; leave a comfortable multiple on top for backend hiccups rather than sizing to the exact expected
-duration. **Misconfiguration risk**: too short aborts legitimate large-object transfers before they can finish (each
-retry starts the transfer over, since the previous attempt's own destination write becomes the next attempt's
-reclaimable tail — see `docs/features/backend-migration.md`); too long lets a genuinely stuck attempt hold the lease,
-and therefore block every other migration attempt of that version, for the whole window. Capped at
-`MAX_MIGRATE_TIMEOUT_SECS` (`86400` s = 1 day).
-
-`migrate_lease_margin_secs` (seconds, default `300` = 5 min) is added on top of `migrate_timeout_secs` to cover two
-effects the timeout alone doesn't budget for: clock skew between the instance holding the lease and whichever clock
-ultimately evaluates its expiry (the lease itself is timed by the **database's own clock**, `now()` /
-`CURRENT_TIMESTAMP` — see `VersionRepo::acquire_migration_lease` — but the instance's own `tokio::time::timeout`
-still fires on its local clock, so the two can disagree by however far the instances have drifted); and the tail of a
-backend request already in flight when that local timeout fires, which does not itself observe the timeout and may
-keep running briefly afterward. **Production recommendation**: a few minutes is enough for typical clock-sync (NTP)
-drift and backend request tails; raise it if this deployment's instances are known to drift further than that.
-**Misconfiguration risk**: too small risks a second attempt taking over the lease while the first one's now-abandoned
-backend call is still writing; too large extends how long a stuck migration blocks every other attempt at the same
-version. Capped at `MAX_MIGRATE_LEASE_MARGIN_SECS` (`3600` s = 1 hour).
-
 ### `sidecar_base_url`
 The externally-reachable base URL of the data-plane sidecar that every signed URL points at (default assumes a
 sidecar on `localhost:8087`, i.e. **local dev only**). **Production recommendation**: must be set to the sidecar's
@@ -201,89 +164,36 @@ recommendation**: point at a durable, backed-up volume mount; never leave at the
 deployment. **Misconfiguration risk**: content written under an ephemeral/container-local path is lost on
 pod/container recreation — this is a **silent data-loss** risk since writes will appear to succeed.
 
-### `signing_key_seed`
-Base64url-encoded 32-byte Ed25519 seed for the URL-signing keypair. When set, the keypair (and the public key the
+`storage_root` must live on a filesystem that supports hard links (`link(2)`): the exclusive publish of a single-part
+upload hard-links the written temp file into place, and there is deliberately no `rename` fallback (it would
+overwrite). On a filesystem without them (FAT/exFAT, some FUSE and SMB mounts) every single-part upload fails. The
+sidecar's `/readyz` checks this with a probe file in the root (a success is cached for the process, a failure is retried on the next probe) and reports the backend as not ready.
+
+### `signing_key_pkcs8`
+Base64url-encoded PKCS#8 DER ECDSA P-256 private key for the URL-signing keypair. When set, the keypair (and the public key the
 sidecar verifies against) is **stable across restarts**; when absent, `gear.rs::init` generates an ephemeral key
 every boot (logged at `info` level with an explicit warning). **Production recommendation**: always set this in any
 real deployment, and treat it as a secret (same handling tier as any other private key material) — never log or
 serialize it (`FileStorageConfig`'s manual `Debug` impl redacts it deliberately). **Multi-replica warning**: every
-replica must be configured with the **same** seed. If replicas each generate their own ephemeral key (i.e. the seed
+replica must be configured with the **same** key. If replicas each generate their own ephemeral key (i.e. the key
 is unset in a multi-replica deployment), signed URLs minted by one replica fail verification at the sidecar (which
 is configured with only one public key via `FS_SIDECAR_PUBLIC_KEY`) — this looks like intermittent, replica-dependent
-upload/download failures. `require_signing_key_seed` (below) exists specifically to fail fast on this misconfiguration
+upload/download failures. `require_signing_key` (below) exists specifically to fail fast on this misconfiguration
 instead of degrading silently into that failure mode.
 
-**Rotation is zero-outage** if BOTH of the platform's independent acceptance points are given the old key during the
-rotation window, not just one of them: the sidecar verifies a token against its own small ordered set of public
-keys (`FS_SIDECAR_PUBLIC_KEY` plus, optionally, `FS_SIDECAR_PREVIOUS_PUBLIC_KEYS`), and — separately — the control
-plane verifies the sidecar's finalize/report-part callbacks against its OWN small ordered set (the current seed's
-key plus, optionally, `previous_signing_public_keys` below). The sidecar's set does nothing for the control plane's
-own callback verification; each side needs the old key configured on its own terms. Procedure:
+**Rotation:** only one active key is implemented. Key replacement requires draining
+outstanding URLs/uploads and coordinating control-plane and sidecar configuration.
+Follow [the migration procedure](#ed25519-to-p-256-migration), also for later P-256
+key rotations. On compromise, deliberately invalidate outstanding URLs and issue new
+ones after replacing both components' keys.
 
-1. Generate the new seed and get its public key **before** touching anything else. The reliable way to do this
-   without a dedicated derivation utility: start (or restart, in staging) one control-plane replica with the new
-   seed and read its own startup log — `gear.rs::init` always logs
-   `sidecar_public_key = <base64url>` (`"file-storage URL-signing public key (configure FS_SIDECAR_PUBLIC_KEY with
-   this)"`) derived from whichever seed it booted with, precisely so this key never has to be computed by hand.
-2. Roll out the sidecar fleet with the NEW key added to its set — either as the new `FS_SIDECAR_PUBLIC_KEY` with the
-   old key moved into `FS_SIDECAR_PREVIOUS_PUBLIC_KEYS`, or left as `FS_SIDECAR_PREVIOUS_PUBLIC_KEYS` alongside the
-   still-current primary. Order only changes verification cost (the primary is tried first), never correctness —
-   every sidecar now accepts tokens signed by either key. This must complete before step 3: the control plane must
-   never sign with a key no sidecar accepts yet.
-3. Restart the control plane on the new seed — **every replica at once** (see the multi-replica warning above: a
-   mixed-seed control-plane fleet is exactly the failure mode that warns about) — with the OLD seed's public key set
-   in `previous_signing_public_keys`. Tokens already issued under the old seed keep verifying at the sidecar,
-   because step 2 already taught the sidecars the old key too; their finalize/report-part callbacks keep verifying
-   at the control plane too, because this step's `previous_signing_public_keys` now teaches the control plane the
-   old key. Skipping `previous_signing_public_keys` here reproduces exactly the bug this field exists to close:
-   every upload started before the restart would fail its finalize/report-part callback the instant the control
-   plane comes back up, even though the sidecar fleet still honours its signed URL.
-4. Only once `max_url_ttl_secs + finalize_token_grace_secs` (default 7 days + 1h) has passed since step 3, remove
-   the old key from every sidecar's `FS_SIDECAR_PREVIOUS_PUBLIC_KEYS`/`FS_SIDECAR_PUBLIC_KEY` **and** from the
-   control plane's `previous_signing_public_keys`. This is longer than the sidecar-only bound an earlier version of
-   this procedure used (`max_url_ttl_secs` alone): a token minted under the OLD seed right up until this restart can
-   carry an `exp` up to `max_url_ttl_secs` after it, and the control plane's finalize/report-part routes then accept
-   that same token up to `finalize_token_grace_secs` *past* that `exp` (`Verifier::verify_with_grace` — the same
-   slack that lets an ordinary slow-but-live upload finalize after its token's nominal TTL). Removing the old key
-   any earlier can reject the finalize/report-part callback of a legitimate, still-in-flight upload that happened to
-   straddle both its own token's TTL and this rotation window.
+Previously documented overlap settings (`previous_signing_public_keys` and
+`FS_SIDECAR_PREVIOUS_PUBLIC_KEYS`) are **not implemented**. Do not configure them:
+the control plane rejects the unknown field and the sidecar ignores the environment
+variable. There is no zero-outage multi-key rotation in this implementation.
 
-**Compromise** follows the same four steps, except step 4 happens immediately, as a deliberate invalidation of every
-URL the old key could still authorize (including its finalize/report-part callback) rather than something to wait
-out: a holder of the private key can mint a token for *any* `file_id`/`op`/`backend_path`, so containing that risk
-outweighs preserving in-flight URLs — and their callbacks — signed under it. Concretely:
-- Outstanding **download** URLs simply get re-issued (a fresh `GET`/`HEAD` against the control plane mints a new one
-  under the new key).
-- An in-flight **single-part upload** resumes via a repeat `POST /files` with the same `idempotency_key` — the
-  replay re-signs the returned upload URL under the current (new) key rather than replaying the old one (see F1 in
-  [concurrency-and-failure-model.md](./concurrency-and-failure-model.md)).
-- An in-flight **multipart session** survives the rotation through its existing resume path: `GET
-  /files/{id}/multipart/{upload_id}` re-signs the remaining parts' URLs under the current key, still capped by the
-  session's own `expires_at` — no special-casing needed for a key rotation specifically.
-
-### `previous_signing_public_keys`
-Public keys of previously-active `signing_key_seed`s that the control plane's OWN finalize/report-part callback
-verification (`FileService::verifier`, `Verifier::verify_with_grace`) still accepts, on top of the current seed's
-key. Empty (`[]`) by default. Each entry is a base64url-encoded (`URL_SAFE_NO_PAD`) raw Ed25519 **public** key — the
-same wire format as one element of the sidecar's `FS_SIDECAR_PREVIOUS_PUBLIC_KEYS` list — never a seed or any other
-private key material; the control plane only ever needs to hold retired *public* keys, never the retired seed
-itself. This is a second, independent acceptance point from the sidecar's own `FS_SIDECAR_PUBLIC_KEY`/
-`FS_SIDECAR_PREVIOUS_PUBLIC_KEYS`: that set only widens what the *sidecar* accepts for PUT/GET/part-upload requests,
-and does nothing for the control plane's own verification of the sidecar's finalize/report-part callbacks — see
-`signing_key_seed`'s **Rotation** procedure above, which this field is a step of. **Production recommendation**:
-leave empty outside an active rotation window; populate it with exactly the retiring seed's public key per step 3
-of the **Rotation** procedure, and clear it again once step 4 completes. **Misconfiguration risk**: leaving it unset
-during a rotation reproduces the bug this field exists to close — every upload started before the control-plane
-restart fails its finalize/report-part callback the instant the restart happens, even though the sidecar fleet
-still honours the client's in-flight signed URL. `validate()` fails gear init on a malformed entry (bad base64, or
-the wrong decoded length), or on more than `infra::signed_url::MAX_PREVIOUS_SIGNING_PUBLIC_KEYS` (8) entries — the
-same ceiling, and for the same reason (an unbounded per-callback linear scan through `Verifier::verify`), as the
-sidecar's own `FS_SIDECAR_PREVIOUS_PUBLIC_KEYS` below; harmless duplicates (of the current key, or within this
-list) are silently deduped with a startup warning once the current key is actually known — see
-`FileService::with_previous_signing_public_keys` and `infra::signed_url::dedupe_public_keys`.
-
-### `require_signing_key_seed`
-When `true` (the default), `FileStorageConfig::validate()` makes gear init **fail fast** if `signing_key_seed` is
+### `require_signing_key`
+When `true` (the default), `FileStorageConfig::validate()` makes gear init **fail fast** if `signing_key_pkcs8` is
 absent, instead of silently minting an ephemeral per-boot key. **Production recommendation**: leave at `true`
 everywhere except local dev/test harnesses that construct a `FileStorageConfig` directly and intentionally want the
 ephemeral-key behaviour — set `false` explicitly there. **Misconfiguration risk**: setting `false` in a real
@@ -393,8 +303,8 @@ re-read the object at finalize (it checks the stored length via backend metadata
 prefix). This is a stop-gap until the platform's `toolkit-security::internal_auth` profiles are deployable in this
 gear (see [ADR-0003](./ADR/0003-cpt-cf-file-storage-adr-sidecar-data-plane.md)'s trust-model section). The control
 plane rejects with `403` every sidecar callback lacking a matching `x-fs-internal-token`, which the client sees as a
-`502` on every fresh single-part `PUT` (a replay of the same `PUT` is answered `409`, per the sidecar's `!created`
-decision table) and on every part of a multipart upload.
+`502` on every fresh single-part `PUT` (a replay of the same `PUT` is also answered `502`: only a `400` from finalize
+turns a replay into `409`, see the finalize outcomes below) and on every part of a multipart upload.
 
 **Rotating an already-configured secret is a brief upload outage, not a zero-downtime operation.**
 `FinalizeAuth` holds exactly one secret, built once at gear init and kept in a `OnceLock`, so changing it takes a
@@ -416,8 +326,7 @@ share `FileStorageConfig`. All of these are read once in `main()`.
 | Variable | Default | Notes |
 |---|---|---|
 | `FS_SIDECAR_ADDR` | `0.0.0.0:8087` | Bind address. |
-| `FS_SIDECAR_PUBLIC_KEY` | **required, no default** | Base64url Ed25519 **primary** public key; must match the control plane's `signing_key_seed`-derived keypair (see above). Startup fails (`anyhow::anyhow!`) if unset or malformed. |
-| `FS_SIDECAR_PREVIOUS_PUBLIC_KEYS` | unset (no previous keys) | Optional comma-separated list of additional base64url Ed25519 public keys, checked **after** the primary (same "try each, first match wins" verifier — no `kid`). Exists purely to give a `signing_key_seed` rotation a window where tokens signed by either the old or the new key still verify — see `signing_key_seed`'s **Rotation** paragraph below for the procedure. **Cost**: one extra Ed25519 verification per token that fails against the primary, times the list length — keep it short (one entry covering the immediately-prior seed is the normal case) and drop a key once `max_url_ttl_secs` has passed since the seed that produced it stopped being primary, so no still-valid token could possibly have been signed with it. Capped at `infra::signed_url::MAX_PREVIOUS_SIGNING_PUBLIC_KEYS` (8) entries; `build_config` fails sidecar startup above it, for the same unbounded-linear-scan reason as the control plane's own `previous_signing_public_keys` ceiling above. An entry that duplicates `FS_SIDECAR_PUBLIC_KEY` or repeats elsewhere within the list is dropped at startup with a `warn`-level log (`dropped_duplicates`) rather than rejected — a harmless no-op, not a startup error, since the list need not be scrubbed the instant a rotation finishes, but the warning is a signal that step 4 of the rotation procedure has not been completed yet. A malformed entry fails sidecar startup exactly like a malformed `FS_SIDECAR_PUBLIC_KEY`. |
+| `FS_SIDECAR_PUBLIC_KEY` | **required, no default** | Base64url ECDSA P-256/SHA-256 **primary** public key; must match the control plane's `signing_key_pkcs8`-derived keypair (see above). Startup fails (`anyhow::anyhow!`) if unset or malformed. |
 | `FS_SIDECAR_BACKEND_ROOT` | `./.file-storage-data` | Local-fs backend root — same durability caveat as the control plane's `storage_root`; the two should point at the **same** underlying storage for a single-backend deployment, or the sidecar will read/write blobs the control plane's metadata doesn't expect to find there. |
 | `FS_SIDECAR_CONTROL_URL` | `http://localhost:8080` | Base URL of the control plane, used for the finalize/report-part callbacks. Setting it to the **empty string** explicitly disables the callback (dev/test only) — uploaded versions then stay `pending` forever, since nothing ever calls finalize; production must always set this to a reachable control-plane URL. The scheme is **not** validated, and the callbacks carry `x-fs-token` plus the `x-fs-internal-token` shared secret — so keep this hop inside a trusted network boundary or point it at an HTTPS/mTLS endpoint; a plain-HTTP URL puts that secret on the wire in the clear. |
 | `FS_SIDECAR_MAX_BODY_BYTES` | `5368709120` (5 GiB) | Raises axum's blanket request-body floor (default 2 MiB). The limit is a `DefaultBodyLimit` layer on the **whole** sidecar router (`build_router`), so it applies to the request bodies of the single-part `PUT` and of multipart part uploads alike — not only to the single-part route. It does **not** bound download responses: the limit governs request-body extraction, and a download is a `GET`/`HEAD` whose response is streamed past it. This is a transport-layer ceiling only — the real per-request limit is the signed token's `max_size`/`exact_size` claim. **Misconfiguration risk**: setting it below the largest policy-permitted single-part upload causes legitimate uploads to be rejected at the transport layer before the token-level check even runs; because the planner may widen `part_size` up to `MAX_PART_SIZE` (5 GiB) for very large objects, lowering this variable can also reject every *part* of a multipart upload with `413`, which is easy to miss when tuning it with only single-part uploads in mind. |
@@ -441,23 +350,33 @@ descriptive error if the value is *set but does not parse* (`parse_optional`/`pa
 `FS_SIDECAR_MAX_BODY_BYTES=5GB`. Only a genuinely unset variable uses the default.
 
 A failed finalize/report-part callback (after the sidecar's retry budget, see `post_with_retry` /
-`CALLBACK_MAX_ATTEMPTS` in `src/bin/sidecar.rs`) returns `502 Bad Gateway` to the client. The backend write itself
+`CALLBACK_MAX_ATTEMPTS` in `src/bin/sidecar.rs`) returns `502 Bad Gateway` to the client, with these exceptions for
+the single-part finalize, decided by the control plane's status. A `400` (the control plane rejected the content: size
+against the policy, MIME, the stored-object check) on the `PUT` that created the object is relayed to the client as
+`400` with the control plane's message, and the sidecar deletes the object best-effort, so a corrected retry goes
+through as a fresh upload. A `404` (the version was deleted concurrently) on the creating `PUT` is answered `404` and
+the object is deleted the same way. A `400` on a replay (the object already existed) is `409 content already
+published`: the stored bytes were published and the control plane still rejects them. Every other `4xx` (`401`,
+`403`, `408`, `429`, ...) and `5xx` is `502` and the object is **kept** — another sidecar may already have finalized
+it, e.g. during a secret rotation — and a retry of the same `PUT` is allowed and is never turned into `409`. The backend write itself
 is **create-exclusive, not overwrite-safe**: `StorageBackend::publish_exclusive` writes only the *first* time a
 given backend path is empty — a retried `PUT` to the same signed URL never overwrites bytes already landed there,
-it reports `created: false` and leaves the stored blob untouched. The documented recovery is still to retry the
-`PUT`: if the earlier publish landed but finalize never ran, this retry's measured bytes match what's already
-stored and the handler answers `200` (a benign retry has converged) via a fresh finalize attempt. If the version
-was already finalized, the outcome converges **regardless of the token's bind mode**: a replay whose size and
-content hash match the stored version is answered `200` — for a token carrying the `bind_on_finalize` claim
-(auto-bind `POST /files` path) the `X-FS-Bound`/`ETag` headers are recomputed against the file's *current*
-`content_id`, so a concurrent bind in between can still flip `bound`↔`conflict` (F4 in the concurrency-and-failure
-model, and `write.rs`'s already-available replay branch); a manual-bind token converges the same way, simply with no
-bind-outcome headers to report, exactly as on the first call. A mismatched replay (different size or hash) is
-answered `400` (hash/size check) — never a silent overwrite. `409` ("version already finalized") is now reserved for
-a genuine **concurrent** double-finalize — two callbacks racing before either has observed the other's
-already-`available` status — not for an ordinary sequential retry, which converges as above. For the finalize case
-specifically, the version may already be correctly finalized server-side even though the client saw a transient
-`502` on a preceding attempt (re-verify via `GET /files/{id}/versions` before assuming failure).
+it reports `created: false` and leaves the stored blob untouched. The documented recovery is still to retry the `PUT`
+with the same bytes: the sidecar reads the stored object back and compares its hash with the retry's. If the earlier
+publish landed but finalize never ran, a matching retry finalizes and the handler answers `200` (a benign retry has
+converged); a retry whose bytes differ from the stored object is answered `409` and finalizes nothing. A replayed
+`PUT` therefore re-reads the whole stored object. If the version was already finalized, the outcome converges
+**regardless of the token's bind mode**: a replay whose size and content hash match the stored version is answered
+`200` — for a token carrying the `bind_on_finalize` claim
+(auto-bind `POST /files` path) a bind won at finalize replays as `bound` from the persisted `bound_on_finalize`
+flag (only a won bind is sticky), while a lost CAS follows the file's *current* `content_id` on every replay: `bound`
+while the file points at this version, `conflict` with the current ETag otherwise (F4 in the concurrency-and-failure
+model); a manual-bind token converges the same way, simply with no bind-outcome headers to report, exactly as on
+the first call. A mismatched replay (different size or hash) is answered
+`409` — never a silent overwrite. Two finalize callbacks racing for the same version converge the same way: the one
+that loses the `pending → available` CAS re-reads the version and applies the same size/hash comparison. For the
+finalize case specifically, the version may already be correctly finalized server-side even though the client saw a
+transient `502` on a preceding attempt (re-verify via `GET /files/{id}/versions` before assuming failure).
 
 ## Cleanup (not running yet)
 
@@ -478,10 +397,10 @@ a very low time budget still processes one batch per step every tick. `run_sweep
 every step was exhausted) and `elapsed_ms` (the tick's wall-clock duration), both logged alongside the existing
 tallies.
 
-Three of the four steps (abandoned-pending, versionless-files, expired-multipart) keep a keyset cursor for this
+Two of the four steps (abandoned-pending, expired-multipart) keep a keyset cursor for this
 purpose that is **local to one tick**: a candidate a batch could not actually reclaim this pass (a still-active
 multipart session, a transient per-row error) does not block the rest of that step's backlog for the remainder of
-the tick, and every new tick starts each of these three steps over from its oldest candidate again — so a
+the tick, and every new tick starts each of these two steps over from its oldest candidate again — so a
 candidate that was blocked in one tick is retried once whatever was blocking it has cleared, rather than being
 skipped forever. The retention-expiry step is the exception: its `file_id` cursor is **persisted on the
 `CleanupEngine`** and survives across ticks, because a full table scan can legitimately take longer than one
@@ -491,27 +410,16 @@ next call (later in the same tick, or the next tick) naturally sees the next-old
 
 The sweep runs **four** steps, in this order:
 
-1. **Abandoned-pending sweep** (`cpt-cf-file-storage-fr-orphan-reconciliation`) — runs in two phases, still just one
-   of the four sweep steps:
-   - **(a)** Deletes `file_versions` rows still `pending` (pre-registered but never finalized) older than
-     the orphan grace period, best-effort deletes their backend blobs, and additionally deletes the parent `files` row
-     too if reclaiming its last pending version leaves it a permanent zero-version orphan (no versions left **and**
-     `content_id IS NULL`, and no blocking in-progress/completing multipart session for that file).
-   - **(b)** Separately sweeps `files` rows that never had a version in the first place. The list query's predicate
-     is exactly three conditions — `content_id IS NULL`, no rows in `file_versions`, and `created_at` older than the
-     same `grace_cutoff` (the orphan grace period) — and runs batched; each candidate is then re-verified and deleted
-     through the same guarded `maybe_delete_orphaned_file` path that phase (a) uses for its own zero-version case,
-     writing an `OrphanReconcile` audit row and a `file.deleted` event. The absence of a blocking
-     `in_progress`/`completing` multipart session for the file is deliberately **not** part of that list query: it is
-     checked per candidate, at delete time, inside `maybe_delete_orphaned_file`. This is the reaper for a `POST /files`
-     multipart create whose control plane crashed between committing the bare file row and inserting the pending
-     version, or whose synchronous `compensate_failed_multipart_initiate` compensation (see
-     [concurrency-and-failure-model.md](./concurrency-and-failure-model.md) §2.2 M1) itself failed — before this
-     phase existed, that versionless row was never picked up by any sweep pass; the zero-version cleanup in phase
-     (a) only ever fired as a side effect of reclaiming a *pending* version, and step 2's expired-session sweep only
-     ever fired as a side effect of aborting a session, so a file that got neither had no reaper at all. There is no
-     race with a live `POST /files`: the gap between committing the file row and inserting its pending version is
-     milliseconds, while the orphan grace period is measured in hours.
+1. **Abandoned-pending sweep** (`cpt-cf-file-storage-fr-orphan-reconciliation`) — deletes `file_versions` rows still
+   `pending` (pre-registered but never finalized) older than the orphan grace period, best-effort deletes their
+   backend blobs, and additionally deletes the parent `files` row too if reclaiming its last pending version leaves it
+   a permanent zero-version orphan (no versions left **and** `content_id IS NULL`, and no blocking
+   in-progress/completing multipart session for that file). A separate phase for `files` rows that never had a version
+   is **not implemented**: it is planned together with the cleanup job (see
+   [retention-cleanup.md](./features/retention-cleanup.md), Sweep Versionless Files). A composite `POST /files` and a
+   multipart abort do not leave such rows: the file and its pending version are committed in one transaction, and a
+   failed initiate or an abort removes the version and then the file (see
+   [concurrency-and-failure-model.md](./concurrency-and-failure-model.md) §2.2 M1).
 2. **Expired-multipart sweep** — aborts `multipart_uploads` sessions whose `expires_at` has passed: those still
    `in_progress`, **and** those left `completing` by a completer that died, once their lease has expired too (a
    live lease is never reaped mid-assembly). It wins the session's own `→ aborted` CAS first (racing a concurrent
@@ -560,7 +468,8 @@ by checks that must all pass:
   original ticket for a request the caller never actually made.
 - **Bind-mode binding**: `bind` is deliberately excluded from `request_hash` (so a key minted before this flag
   existed still matches), but a replay that changes it is rejected with the same `409` as an outright body mismatch —
-  a caller can never silently flip whether the replayed upload auto-binds.
+  a caller can never silently flip whether the replayed upload auto-binds. A key stored before `bind` existed
+  matches under any `bind` value and is replayed in manual mode, exactly as its original create issued it.
 - **Owner binding**: a replay re-reads the file's *live* owner and requires it to still match the request's
   `(owner_kind, owner_id)` — closing the gap where `POST /files/{id}/transfer` changes the file's owner without
   touching an already-stored ticket. A stale-owner replay is `409`, not a still-valid ticket.
@@ -577,25 +486,41 @@ See the `idempotency_keys` table (`m20260701_000001_p2_initial`, extended by `m2
 
 ## Upgrading from v0.2.x and rolling back
 
-This release adds one additive migration, `m20260924_000001_upload_flow_redesign`: new `multipart_uploads` columns
+This release adds two additive migrations, applied in this order: `m20261008_000001_listing_indexes` (the
+`file_versions_file_created_idx` and `files_owner_listing_v2_idx` listing indexes, the latter superseding
+`files_owner_listing_idx`) and `m20261014_000001_upload_flow`. The second adds new `multipart_uploads` columns
 — `auto_bind`, `lease_until`, `lease_owner`, `complete_result`, `backend_id`, `backend_path` — and the `completing`
-state in its CHECK (on SQLite it rebuilds `multipart_uploads`, carrying rows and parts over), plus indexes only
-(`idempotency_keys_file_idx`, `multipart_uploads_sweep_idx`, `files_versionless_sweep_idx`,
-`file_versions_file_created_idx`, `files_owner_listing_v2_idx` superseding `files_owner_listing_idx`). Existing rows
-keep working: new columns are nullable or default to the old behaviour, and `backend_id`/`backend_path` are
-backfilled from the session's version. No released migration changes.
+state in its CHECK (on SQLite it rebuilds `multipart_uploads`, carrying rows and parts over), plus the
+`idempotency_keys_file_idx` index and the `file_versions.bound_on_finalize` column. For existing multipart sessions
+`backend_id`/`backend_path` are copied from the session's version row; a session an old instance starts after the
+migration has them NULL and is read through its version row and the storage layout. Existing rows keep working: new
+columns are nullable or default to the old behaviour. The sweep indexes for the cleanup job (`multipart_uploads_sweep_idx`,
+`files_versionless_sweep_idx`) come with a later migration, not this release. No released migration changes.
 
-**Mixed-version window.** Run the migration once, then roll the fleet. An older (v0.2.x) instance tolerates the new
+**Mixed-version window.** Run the migrations once, then roll the fleet. An older (v0.2.x) instance tolerates the new
 schema, with two exceptions to keep short: it rejects a multipart session in the new `completing` state as
-`invalid multipart upload state` (a `complete` in flight on a new instance), and it never auto-binds. Roll the
-control plane and the sidecars together — the sidecar forwards the new finalize headers and the control plane
-accepts the new token grace — and keep the window as short as a normal rolling restart.
+`invalid multipart upload state` (a `complete` in flight on a new instance), and it never auto-binds. An auto-bind
+upload whose finalize or `complete` lands on an old instance therefore ends unbound; a retry on a new instance answers
+`bind_state: "manual"`, and the client calls `POST /files/{id}/bind` itself. Roll the control plane and the sidecars
+together — the sidecar forwards the new finalize headers and the control plane accepts the new token grace — and keep
+the window as short as a normal rolling restart.
 
 **Rolling back the binary.** An older binary refuses to start against a database that has migrations it does not
 know (sea-orm reports `Migration file of version '…' is missing`), so the order is: with the **new** binary, run
-`m20260924_000001_upload_flow_redesign` down, then deploy the old binary. Its `down()` drops the new columns, so
-sessions in `completing` and stored completion snapshots are lost; finish or abort in-flight multipart uploads
-before rolling back. Files and versions themselves are untouched by either direction.
+`m20261014_000001_upload_flow` down, then `m20261008_000001_listing_indexes` down (reverse of the apply order), then
+deploy the old binary. The down step of `m20261014_000001_upload_flow` folds any session in `completing` into
+`aborted` (the narrow pre-upgrade CHECK cannot hold it), narrows the CHECK again, and drops the new columns and the
+index, so stored completion snapshots, leases and the `bound_on_finalize` flag are lost; finish or abort in-flight
+multipart uploads before rolling back. Files and versions themselves are untouched by either direction.
+
+Three consequences of rolling back deserve to be planned for. First, once `m20261014_000001_upload_flow` is down the
+new binary cannot work against `file_versions` and `multipart_uploads` (its entities read the dropped columns), so
+stop the new fleet before running `down`; between `down` and the start of the old binary the service is unavailable.
+Second, the old binary ignores the auto-bind claim: single-part uploads from `POST /files` with `bind: auto` that are
+finalized after the rollback stay unbound (the client binds manually), and so does a replay of an idempotency key.
+Third, `down` moves `completing` to `aborted` in the database only — the multipart upload on the backend and the
+pending version stay and nobody cleans them up, which makes finishing or aborting in-flight multipart uploads a
+requirement of the rollback, not a recommendation.
 
 ## Storage quota (not enforced)
 
@@ -624,15 +549,52 @@ were added by migration `m20260707_000001_content_hash_modes`.
 
 ## The `SignatureProvider` / `SignatureVerifier` abstraction
 
-Signing and verification of the URL-signing token are behind an in-house trait pair
-(`infra::signed_url::SignatureProvider` / `SignatureVerifier`), not called directly against a hard-wired crypto
-library. The implementation is Ed25519 (`Issuer::from_seed`/`Issuer::generate`), codec-equivalent to
-PASETO `v4.public` (see `docs/api.md`'s "Signed URLs" section). The abstraction exists specifically for **FIPS
-posture**: a FIPS-validated deployment needs the sign/verify primitive to run inside a FIPS-validated module (the
-platform's `rustls-corecrypto-provider`); the trait boundary lets that primitive be swapped (e.g. for ECDSA P-256)
-without any change to the token's opaque wire format or any client-visible change. **The provider shipped today is
-not FIPS-validated**: `Ed25519Provider` is a generic Ed25519 implementation, and while Ed25519 itself is approved
-under FIPS 186-5, that approval requires the primitive to run inside a validated module. It therefore **MUST NOT**
-be deployed in a FIPS-constrained environment until the provider behind it is swapped — the abstraction makes that
-swap cheap, but it has not been made. See
-[ADR-0004](./ADR/0004-cpt-cf-file-storage-adr-signed-url-transport.md) "FIPS posture" for the full rationale.
+Signed URLs use ECDSA P-256/SHA-256 through `toolkit_security::crypto`. Private keys
+use PKCS#8 DER, public keys use 65-byte uncompressed SEC1 points, and signatures use
+ASN.1 DER. The private two-part token codec is not JWT or PASETO. Signing failures
+propagate as errors. Sidecar startup checks the public-key length, uncompressed
+encoding and backend availability before creating HTTP clients. The backend checks
+the curve point during signature verification. The sidecar explicitly installs
+the facade-selected TLS provider.
+
+### Ed25519 to P-256 migration
+
+This change requires new keys and coordinated control-plane/sidecar deployment.
+Old Ed25519 seeds, public keys and outstanding tokens are not accepted. File contents,
+content hashes and metadata do not change.
+
+1. Generate a new P-256 private key with an embedded public point, and export PKCS#8 DER:
+
+   ```sh
+   umask 077
+   openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out signing-key.pem
+   openssl pkcs8 -topk8 -nocrypt -in signing-key.pem -outform DER -out signing-key.pk8
+   ```
+
+   Provision the base64url encoding without padding as secret `signing_key_pkcs8`.
+   Use an approved provisioning process where the deployment's FIPS policy requires one.
+   Do not reuse the public fixture shipped in local/E2E configs.
+2. Stop issuing old signed URLs and drain outstanding uploads/downloads. Wait for the
+   maximum lifetime of old URLs and multipart sessions, including callback grace, or
+   schedule an outage that explicitly invalidates outstanding URLs and sessions.
+3. Configure all control-plane replicas with the same new key. Obtain its
+   `sidecar_public_key` startup log value and configure `FS_SIDECAR_PUBLIC_KEY` on all
+   sidecars. Roll both components together; mixed Ed25519/P-256 fleets do not interoperate.
+4. Resume traffic and obtain fresh URLs. For rollback, restore both old binaries and
+   their matching old key configuration; newly issued P-256 tokens will be invalid.
+
+The old `signing_key_seed` / `require_signing_key_seed` settings have been replaced by
+`signing_key_pkcs8` / `require_signing_key`. A seed is not a PKCS#8 key and must not be
+copied into the new setting. The new required-key flag remains true by default.
+
+### Building the sidecar with FIPS policy
+
+Use the existing toolkit feature; an ordinary build does not enable FIPS policy:
+
+```sh
+cargo build --locked -p cf-gears-file-storage --bin sidecar --features toolkit/fips
+```
+
+This enables toolkit-security's native backend policy and toolkit-http's FIPS
+configuration. On Windows the production process still requires system FIPS policy;
+on all targets the module's supported operating environment remains a deployment requirement.

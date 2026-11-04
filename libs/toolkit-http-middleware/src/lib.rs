@@ -25,9 +25,10 @@ pub mod auth;
 pub mod security;
 
 pub use auth::{
-    AnonymousRoute, MixedCredentials, PlatformRefusal, RouteAuth, RouteAuthPolicy, admit_platform,
-    internal_auth_middleware, layer_route_auth, platform_route_middleware, retain_route_plane,
-    route_auth_middleware, security_context_middleware,
+    AnonymousRoute, MixedCredentials, PlatformRefusal, RouteAuth, RouteAuthPolicy, TenantPlane,
+    admit_platform, internal_auth_middleware, layer_route_auth, layer_route_auth_with,
+    platform_route_middleware, retain_route_plane, route_auth_middleware,
+    security_context_middleware,
 };
 pub use security::{
     InternalTokenHttpError, SecurityContextHttpError, extract_bearer_http,

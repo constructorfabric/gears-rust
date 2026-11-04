@@ -253,3 +253,18 @@ fn an_out_of_scope_error_on_the_record_path_is_403_without_its_ids() {
     assert_access_denied_without(&rest(on_route), RECORD_RESOURCE_TYPE, &ids);
     assert_access_denied_without(&wire(in_process), RECORD_RESOURCE_TYPE, &other_ids);
 }
+
+#[test]
+fn an_out_of_scope_error_on_the_facts_route_answers_as_no_such_subject() {
+    use crate::api::rest::error::for_facts;
+
+    let (error, ids) = out_of_scope();
+    let subject_id = ids[3];
+    let problem = Problem::from(for_facts(error, subject_id));
+
+    assert_eq!(problem.status, Some(404));
+    let text = visible_text(&problem);
+    for id in &ids[..3] {
+        assert!(!text.contains(&id.to_string()), "{id} in {text}");
+    }
+}

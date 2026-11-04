@@ -13,7 +13,10 @@ use crate::domain::authz::actions;
 use crate::domain::error::DomainError;
 use crate::domain::etag;
 use crate::domain::policy::PolicyResolver;
-use crate::domain::service::{FileService, VersionRef};
+use crate::domain::ports::AutoBindOnFinalize;
+use crate::domain::service::{
+    FileService, FinalizeByTokenOutcome, VersionRef, best_effort_blob_delete,
+};
 use crate::infra::backend::StorageBackend;
 use crate::infra::content::mime::{
     MIME_SNIFF_PREFIX_BYTES, enforce_size_ceiling_for_validated_mime, validate_and_resolve_mime,
@@ -174,8 +177,11 @@ impl FileService {
                 None,
                 Some(validated_mime),
                 audit,
+                // No auto-bind on the user-facing finalize; binding stays an explicit `bind`.
+                None,
             )
-            .await?;
+            .await?
+            .updated;
         if !ok {
             // Already finalized (409) vs row gone (404), from the earlier `version` snapshot.
             return Err(
@@ -472,13 +478,19 @@ impl FileService {
     ///
     /// The caller has already verified `claims` (signature, expiry, `op == Put`, ids). The
     /// audit actor is `"sidecar"` with the nil UUID.
+    ///
+    /// Returns the bind outcome: `Bound` only when the token carried `bind_on_finalize` and the
+    /// `content_id IS NULL` CAS won (then `etag` is set); the sidecar echoes it as headers.
+    ///
+    /// Retries converge for both bind modes: a finalize for an already-`Available` version with
+    /// matching size/hash replays the original decision instead of a 409.
     #[tracing::instrument(skip_all)]
     pub async fn finalize_upload_by_token(
         &self,
         claims: &Claims,
         size: i64,
         hash_value: Vec<u8>,
-    ) -> Result<(), DomainError> {
+    ) -> Result<FinalizeByTokenOutcome, DomainError> {
         if size < 0 {
             return Err(DomainError::validation("size", "must be non-negative"));
         }
@@ -498,6 +510,20 @@ impl FileService {
             .get_version(file_id, version_id)
             .await?
             .ok_or_else(|| DomainError::version_not_found(file_id, version_id))?;
+
+        // PUT-retry convergence: a retried `PUT` is refused by `publish_exclusive`, then finalize
+        // arrives for an already-available version. Converge on success only when size and hash match;
+        // a mismatched replay is rejected.
+        if version.status == file_storage_sdk::VersionStatus::Available {
+            return Self::replay_available_finalize(
+                claims,
+                file.content_id,
+                &version,
+                size,
+                &hash_value,
+            );
+        }
+
         let version_mime = version.mime_type.clone();
         let backend_id = version.backend_id.clone();
         let policy = self
@@ -526,7 +552,7 @@ impl FileService {
         let mime_sniff_prefix =
             check_uploaded_object(backend.as_ref(), &version.backend_path, size).await?;
         let actual_size = size;
-        let actual_hash = hash_value;
+        let actual_hash = hash_value.clone();
 
         // The declared MIME is untrusted: the sniffed type wins when the bytes carry a
         // recognizable signature, a mismatch is rejected.
@@ -539,6 +565,7 @@ impl FileService {
             actual_size,
         )?;
 
+        // Actor is "sidecar" with the nil UUID (no user identity in the callback).
         let audit = AuditEntry::success(
             file.tenant_id,
             "sidecar",
@@ -548,8 +575,30 @@ impl FileService {
             serde_json::json!({ "version_id": version_id, "size": size }),
         );
 
+        // A `bind_on_finalize` token also binds under a strict `content_id IS NULL` CAS (minted only by
+        // `create_file` with `bind: "auto"`); it can never replace existing content.
+        let auto_bind = claims.bind_on_finalize.then(|| AutoBindOnFinalize {
+            expected_content_id: None,
+            audit: AuditEntry::success(
+                file.tenant_id,
+                "sidecar",
+                Uuid::nil(),
+                Some(file_id),
+                AuditOperation::PatchContent,
+                serde_json::json!({ "version_id": version_id, "auto_bind": true }),
+            ),
+            event: Some(Self::make_file_event(
+                file.tenant_id,
+                file.owner_id,
+                file_id,
+                "file.content_updated",
+                serde_json::json!({ "version_id": version_id, "auto_bind": true }),
+            )),
+        });
+        let bind_attempted = auto_bind.is_some();
+
         // `validated_mime` replaces the client's declaration.
-        let ok = self
+        let outcome = self
             .store
             .finalize_version(
                 file_id,
@@ -562,19 +611,33 @@ impl FileService {
                 None,
                 Some(validated_mime),
                 audit,
+                auto_bind,
             )
             .await?;
-        if !ok {
-            // Already finalized (409) vs row gone (404), from the earlier `version` snapshot.
-            return Err(
-                if version.status == file_storage_sdk::VersionStatus::Available {
-                    DomainError::conflict("version already finalized")
-                } else {
-                    DomainError::version_not_found(file_id, version_id)
-                },
+        if !outcome.updated {
+            // Lost the `pending -> available` CAS: a concurrent finalize won (converge) or the row is gone (404).
+            let current = self
+                .store
+                .get_version(file_id, version_id)
+                .await?
+                .ok_or_else(|| DomainError::version_not_found(file_id, version_id))?;
+            if current.status != file_storage_sdk::VersionStatus::Available {
+                return Err(DomainError::version_not_found(file_id, version_id));
+            }
+            let fresh = self
+                .store
+                .require_file(&AccessScope::allow_all(), file_id)
+                .await?;
+            return Self::replay_available_finalize(
+                claims,
+                fresh.content_id,
+                &current,
+                size,
+                &hash_value,
             );
         }
 
+        // Credit the bytes, as in `finalize_upload`.
         self.report_usage(UsageDelta {
             tenant_id: file.tenant_id,
             owner_id: file.owner_id,
@@ -584,18 +647,68 @@ impl FileService {
 
         self.metrics
             .record_operation("finalize_upload_by_token", "ok");
-        Ok(())
+        if !bind_attempted {
+            return Ok(FinalizeByTokenOutcome {
+                bind_state: None,
+                etag: None,
+                current_etag: None,
+            });
+        }
+        let decision = if outcome.bound {
+            crate::domain::multipart::BindDecision::Bound
+        } else {
+            // Lost the `content_id IS NULL` CAS; report the winning pointer for a manual bind.
+            let fresh = self
+                .store
+                .require_file(&AccessScope::allow_all(), file_id)
+                .await?;
+            crate::domain::multipart::BindDecision::Conflict {
+                current_etag: etag::etag_for(&fresh),
+            }
+        };
+        let (bind_state, bind_etag, current_etag) = decision.outcome(file_id, version_id);
+        Ok(FinalizeByTokenOutcome {
+            bind_state: Some(bind_state),
+            etag: bind_etag,
+            current_etag,
+        })
+    }
+
+    /// Outcome of a finalize for an already-`Available` version: equal size and hash replay the
+    /// original decision, anything else is rejected.
+    ///
+    /// The bind decision comes from the persisted `bound_on_finalize`; re-deriving it from the live
+    /// `content_id` would disagree after a legitimate rebind.
+    fn replay_available_finalize(
+        claims: &Claims,
+        content_id: Option<Uuid>,
+        version: &file_storage_sdk::FileVersion,
+        size: i64,
+        hash_value: &[u8],
+    ) -> Result<FinalizeByTokenOutcome, DomainError> {
+        if version.size != size || version.hash_value != hash_value {
+            return Err(DomainError::hash_mismatch(
+                hex::encode(hash_value),
+                hex::encode(&version.hash_value),
+            ));
+        }
+        let (bind_state, etag, current_etag) = crate::domain::multipart::replay_bind_state(
+            version.file_id,
+            content_id,
+            version.version_id,
+            version.bound_on_finalize,
+            claims.bind_on_finalize,
+        );
+        Ok(FinalizeByTokenOutcome {
+            bind_state: Some(bind_state),
+            etag,
+            current_etag,
+        })
     }
 
     /// Delete a backend blob, logging (not failing) on error; a failure leaves an orphan
     /// for the cleanup engine.
     pub(super) async fn best_effort_blob_delete(&self, backend_id: &str, path: &str) {
-        let Ok(backend) = self.backends.get(backend_id) else {
-            return;
-        };
-        if let Err(err) = backend.delete(path).await {
-            self.metrics.record_backend_error(backend_id, "delete");
-            tracing::warn!(?err, path, "best-effort backend delete failed");
-        }
+        best_effort_blob_delete(&self.backends, self.metrics.as_ref(), backend_id, path).await;
     }
 }

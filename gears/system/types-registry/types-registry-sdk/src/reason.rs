@@ -4,6 +4,14 @@
 //! Field-violation reasons live in [`crate::field`], precondition `type`s in
 //! [`crate::precondition`], and an item's admission reason in [`crate::item_failure`].
 
+/// Values for `CanonicalError::Unauthenticated.ctx.reason` that the registry itself sets;
+/// the listener's own refusals (`MISSING_BEARER`, `MIXED_CREDENTIALS`, …) are toolkit's.
+pub mod unauthenticated {
+    /// A tenant route reached a registry host that validates no bearer: it runs out of
+    /// process with no tenant authenticator linked, so no caller can be admitted.
+    pub const TENANT_AUTHENTICATION_UNAVAILABLE: &str = "TENANT_AUTHENTICATION_UNAVAILABLE";
+}
+
 /// Values for `CanonicalError::Aborted.ctx.reason`.
 pub mod aborted {
     use core::fmt;

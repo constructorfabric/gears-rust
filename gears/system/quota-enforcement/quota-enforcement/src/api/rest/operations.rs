@@ -17,7 +17,8 @@ use axum::response::IntoResponse;
 use axum::{Extension, Json, Router};
 use quota_enforcement_sdk::{
     CreditRequest, DebitRequest, Decision, DecisionPreview, DecisionResult, EvaluationAttribution,
-    PreviewRequest, QuotaId, ResourceProjection, RollbackRequest, SubjectClaim, TenantId,
+    PreviewRequest, QuotaId, ResourceProjection, RollbackRequest, RollbackableOperation,
+    SubjectClaim, TenantId,
 };
 use serde_json::{Map, Value};
 use toolkit::api::OpenApiRegistry;
@@ -122,12 +123,41 @@ pub struct CreditRequestDto {
     pub idempotency_key: String,
 }
 
+/// Which kind of operation a rollback reverses.
+///
+/// A direct debit and a lease commit are separate idempotency namespaces, so
+/// one caller can hold both under the same key; this says which is meant.
+#[derive(Debug, Clone, Copy, Default)]
+#[toolkit_macros::api_dto(request)]
+pub enum RollbackableOperationDto {
+    /// A direct debit. The default, so a request that predates leases keeps
+    /// its meaning.
+    #[default]
+    Debit,
+    /// A lease commit.
+    LeaseCommit,
+}
+
+impl From<RollbackableOperationDto> for RollbackableOperation {
+    fn from(value: RollbackableOperationDto) -> Self {
+        match value {
+            RollbackableOperationDto::Debit => Self::Debit,
+            RollbackableOperationDto::LeaseCommit => Self::LeaseCommit,
+        }
+    }
+}
+
 /// Reverse a committed debit.
 #[derive(Debug, Clone)]
 #[toolkit_macros::api_dto(request)]
 pub struct RollbackRequestDto {
     /// Attribution of the debit being reversed.
     pub attribution: EvaluationAttributionDto,
+    /// Which kind of operation the original key names: a direct `debit`, or a
+    /// `lease_commit`. They are separate idempotency namespaces, so the same
+    /// key may address one of each. Defaults to `debit`.
+    #[serde(default)]
+    pub original_operation: RollbackableOperationDto,
     /// Key the original debit was committed under.
     pub original_idempotency_key: String,
     /// Client-supplied key of this rollback.
@@ -287,6 +317,7 @@ async fn rollback(
             &ctx,
             RollbackRequest {
                 attribution: body.attribution.into(),
+                original_operation: body.original_operation.into(),
                 original_idempotency_key: body.original_idempotency_key,
                 idempotency_key: body.idempotency_key,
             },

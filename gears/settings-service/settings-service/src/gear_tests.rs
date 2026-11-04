@@ -74,6 +74,14 @@ fn an_uninitialized_gear_refuses_to_hand_out_the_enforcer() {
 }
 
 #[test]
+fn an_uninitialized_gear_refuses_to_hand_out_the_names() {
+    // The name resolver is built at init with the hub's optional directory;
+    // a default here would answer for a hub it never saw.
+    let gear = SettingsService::default();
+    assert!(gear.names().is_err());
+}
+
+#[test]
 fn an_uninitialized_gear_refuses_to_hand_out_the_validator() {
     // A default validator that accepted everything would be the vacuous pass
     // the fail-closed rule exists to prevent.
@@ -386,6 +394,7 @@ async fn init_fills_every_lock_and_binds_both_sdk_traits_into_the_hub() {
         gear.writes().is_ok(),
         gear.access().is_ok(),
         gear.hierarchy().is_ok(),
+        gear.names().is_ok(),
     ] {
         assert!(accessor, "init leaves no accessor empty");
     }
@@ -643,7 +652,7 @@ async fn a_retention_pass_prunes_what_is_past_its_horizon_and_nothing_younger() 
     // The pass the lifecycle runs once a day: records past the configured
     // default leave, a fresh record stays. `now` is passed in, so the test
     // moves the clock instead of waiting a year.
-    use crate::audit::{AuditOperation, AuditRecord, AuditSink as _};
+    use crate::audit::{ActorTenant, AuditOperation, AuditRecord, AuditSink as _};
     let db = crate::test_support::sqlite_provider().await;
     let tenant = uuid::Uuid::new_v4();
     {
@@ -652,7 +661,14 @@ async fn a_retention_pass_prunes_what_is_past_its_horizon_and_nothing_younger() 
             .append(
                 &conn,
                 &toolkit_security::AccessScope::allow_all(),
-                AuditRecord::new("k", Some(tenant), "admin", AuditOperation::Change, "req"),
+                AuditRecord::new(
+                    "k",
+                    Some(tenant),
+                    "admin",
+                    ActorTenant::machine(),
+                    AuditOperation::Change,
+                    "req",
+                ),
             )
             .await
             .expect("append");
@@ -688,7 +704,7 @@ async fn a_retention_pass_prunes_what_is_past_its_horizon_and_nothing_younger() 
 
 #[tokio::test]
 async fn a_retention_pass_works_in_batches_up_to_its_cap_and_stops_when_cancelled() {
-    use crate::audit::{AuditOperation, AuditRecord, AuditSink as _};
+    use crate::audit::{ActorTenant, AuditOperation, AuditRecord, AuditSink as _};
     let db = crate::test_support::sqlite_provider().await;
     {
         let conn = db.conn().expect("connection");
@@ -697,7 +713,14 @@ async fn a_retention_pass_works_in_batches_up_to_its_cap_and_stops_when_cancelle
                 .append(
                     &conn,
                     &toolkit_security::AccessScope::allow_all(),
-                    AuditRecord::new("k", None, "admin", AuditOperation::Change, format!("r{i}")),
+                    AuditRecord::new(
+                        "k",
+                        None,
+                        "admin",
+                        ActorTenant::machine(),
+                        AuditOperation::Change,
+                        format!("r{i}"),
+                    ),
                 )
                 .await
                 .expect("append");
@@ -733,7 +756,14 @@ async fn a_retention_pass_works_in_batches_up_to_its_cap_and_stops_when_cancelle
             .append(
                 &conn,
                 &toolkit_security::AccessScope::allow_all(),
-                AuditRecord::new("k", None, "admin", AuditOperation::Change, "late"),
+                AuditRecord::new(
+                    "k",
+                    None,
+                    "admin",
+                    ActorTenant::machine(),
+                    AuditOperation::Change,
+                    "late",
+                ),
             )
             .await
             .expect("append");

@@ -63,6 +63,14 @@ impl From<DomainError> for CanonicalError {
             DomainError::InvalidArgument { field, reason } => QuotaResource::invalid_argument()
                 .with_field_violation(field, format!("invalid argument {field}: {reason}"), reason)
                 .create(),
+            DomainError::InvalidBatchItem { .. }
+            | DomainError::BulkTooLarge { .. }
+            | DomainError::BatchTimeout => batch(err),
+            DomainError::InvalidSnapshot {
+                index,
+                field,
+                reason,
+            } => snapshot_violation(index, field, reason),
             DomainError::ProjectionNotRegistered { projection } => {
                 QuotaResource::invalid_argument()
                     .with_field_violation(
@@ -311,6 +319,61 @@ fn quota_lifecycle(err: DomainError) -> CanonicalError {
             "{}: {feature} is not yet implemented",
             reason::NOT_YET_IMPLEMENTED
         ))
+        .create(),
+        other => CanonicalError::from(other),
+    }
+}
+
+/// A refused snapshot request, naming the subject when one is at fault. A
+/// snapshot reads Quota records, so the violation is the Quota resource's.
+fn snapshot_violation(
+    index: Option<usize>,
+    field: &'static str,
+    reason: &'static str,
+) -> CanonicalError {
+    let at = index.map_or_else(
+        || field.to_owned(),
+        |index| format!("subjects[{index}].{field}"),
+    );
+    QuotaResource::invalid_argument()
+        .with_field_violation(
+            at.clone(),
+            format!("invalid argument {at}: {reason}"),
+            reason,
+        )
+        .create()
+}
+
+/// The batch debit's envelope rejections and its timeout.
+fn batch(err: DomainError) -> CanonicalError {
+    match err {
+        // --- 400 InvalidArgument ---
+        DomainError::InvalidBatchItem {
+            index,
+            field,
+            reason,
+        } => {
+            let at = format!("items[{index}].{field}");
+            OperationResource::invalid_argument()
+                .with_field_violation(
+                    at.clone(),
+                    format!("invalid argument {at}: {reason}"),
+                    reason,
+                )
+                .create()
+        }
+        DomainError::BulkTooLarge { items, max } => OperationResource::invalid_argument()
+            .with_field_violation(
+                "items",
+                format!("a batch of {items} items exceeds the maximum of {max}"),
+                "BULK_TOO_LARGE",
+            )
+            .create(),
+        // --- 504 DeadlineExceeded ---
+        // The builder has no reason slot; the token leads the detail.
+        DomainError::BatchTimeout => OperationResource::deadline_exceeded(
+            "BATCH_TIMEOUT: batch evaluation exceeded the batch timeout; nothing was written",
+        )
         .create(),
         other => CanonicalError::from(other),
     }

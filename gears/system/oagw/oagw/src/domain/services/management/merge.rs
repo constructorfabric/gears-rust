@@ -1,5 +1,8 @@
+use toolkit_macros::domain_model;
+use uuid::Uuid;
+
 use crate::domain::error::DomainError;
-use crate::domain::model::{Route, Upstream};
+use crate::domain::model::{Route, Server, Upstream};
 
 /// Check whether an upstream is visible to descendant tenants.
 ///
@@ -49,6 +52,17 @@ pub(crate) fn compute_effective_config(
     ancestor_chain: &[Upstream],
     route: Option<&Route>,
 ) -> Result<Upstream, DomainError> {
+    compute_effective_config_reporting(ancestor_chain, route, &mut |_| {})
+}
+
+/// [`compute_effective_config`] that reports to `withheld` every ancestor
+/// auth or header set it does not apply, and the enforced auth it refuses,
+/// because the descendant's server is not within the owner's (`inst-merge-3a0`).
+pub(crate) fn compute_effective_config_reporting(
+    ancestor_chain: &[Upstream],
+    route: Option<&Route>,
+    withheld: &mut dyn FnMut(Withheld),
+) -> Result<Upstream, DomainError> {
     use crate::domain::model::{BudgetMode, SharingMode};
 
     if ancestor_chain.is_empty() {
@@ -59,9 +73,45 @@ pub(crate) fn compute_effective_config(
 
     // Start with the root upstream as the base.
     let mut effective = ancestor_chain[0].clone();
+    // Per `inst-merge-3a0`: the upstreams whose auth and headers are in
+    // effect. They go only to endpoints their owner configured.
+    let mut auth_owner = &ancestor_chain[0];
+    let mut headers_owner = &ancestor_chain[0];
 
     // Walk root → descendant, merging each layer.
     for layer in &ancestor_chain[1..] {
+        let auth_enforced = effective
+            .auth
+            .as_ref()
+            .is_some_and(|a| a.sharing == SharingMode::Enforce);
+        if auth_enforced {
+            // An enforced auth must be applied, so it must be applicable.
+            if !server_within(&layer.server, &auth_owner.server) {
+                withheld(Withheld::of(auth_owner, layer, WithheldKind::EnforcedAuth));
+                return Err(DomainError::forbidden_with_reason(
+                    ENFORCED_AUTH_OTHER_SERVER,
+                    format!(
+                        "upstream '{}' serves alias '{}' on endpoints upstream '{}' did not \
+                         configure, and its enforced auth cannot be sent there",
+                        layer.id, layer.alias, auth_owner.id
+                    ),
+                ));
+            }
+        } else if layer.auth.is_some() {
+            auth_owner = layer;
+        } else if effective.auth.is_some() && !server_within(&layer.server, &auth_owner.server) {
+            effective.auth = None;
+            withheld(Withheld::of(auth_owner, layer, WithheldKind::Auth));
+        }
+        if layer.headers.is_some() {
+            headers_owner = layer;
+        } else if effective.headers.is_some()
+            && !server_within(&layer.server, &headers_owner.server)
+        {
+            effective.headers = None;
+            withheld(Withheld::of(headers_owner, layer, WithheldKind::Headers));
+        }
+
         // Auth merge
         merge_auth(&mut effective, layer);
 
@@ -190,6 +240,62 @@ pub(crate) fn compute_effective_config(
     }
 
     Ok(effective)
+}
+
+/// Whether every endpoint of `server` is one of `owner`'s, so a credential
+/// `owner` configured may be sent to it. Endpoints compare by normalized host
+/// (case-insensitive, no trailing dot or IPv6 brackets), port and scheme. One
+/// way only: an endpoint `owner` does not list makes it another server, and so
+/// does an empty `server`.
+pub(super) fn server_within(server: &Server, owner: &Server) -> bool {
+    if server.endpoints.is_empty() {
+        return false;
+    }
+    let key = |e: &crate::domain::model::Endpoint| (e.normalized_host(), e.port, e.scheme as u8);
+    let owner: std::collections::HashSet<_> = owner.endpoints.iter().map(key).collect();
+    server.endpoints.iter().all(|e| owner.contains(&key(e)))
+}
+
+/// `permission_denied` reason when an enforced auth would go to endpoints its
+/// owner did not configure.
+pub(crate) const ENFORCED_AUTH_OTHER_SERVER: &str =
+    oagw_sdk::reason::permission::ENFORCED_AUTH_OTHER_SERVER;
+
+/// An ancestor's auth or headers the merge did not apply to a descendant.
+#[domain_model]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Withheld {
+    /// The upstream that configured the withheld setting.
+    pub(crate) owner_id: Uuid,
+    /// The descendant upstream on other endpoints.
+    pub(crate) upstream_id: Uuid,
+    /// The shared alias.
+    pub(crate) alias: String,
+    /// What was withheld.
+    pub(crate) kind: WithheldKind,
+}
+
+/// The setting a [`Withheld`] is about.
+#[domain_model]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum WithheldKind {
+    /// The owner's `auth`.
+    Auth,
+    /// The owner's request `headers`.
+    Headers,
+    /// The owner's enforced `auth`: the request is refused.
+    EnforcedAuth,
+}
+
+impl Withheld {
+    fn of(owner: &Upstream, layer: &Upstream, kind: WithheldKind) -> Self {
+        Self {
+            owner_id: owner.id,
+            upstream_id: layer.id,
+            alias: layer.alias.clone(),
+            kind,
+        }
+    }
 }
 
 /// Merge auth config from a descendant layer onto the effective config.

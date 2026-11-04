@@ -1,7 +1,10 @@
 //! Version-level queries and mutating operations, including the bind and ownership-transfer
 //! transactions.
 
+use std::collections::HashMap;
+
 use time::OffsetDateTime;
+use toolkit_db::secure::{DBRunner, TxConfig};
 use toolkit_security::AccessScope;
 use uuid::Uuid;
 
@@ -9,7 +12,14 @@ use file_storage_sdk::{File, FileVersion, VersionStatus};
 
 use crate::domain::audit::{AuditEntry, FileEvent};
 use crate::domain::error::DomainError;
+use crate::domain::error_convert::db_err;
+use crate::domain::etag;
+use crate::domain::multipart::{BindDecision, MultipartUploadState, StoredCompleteResult};
+use crate::domain::ports::{
+    AutoBindOnFinalize, FinalizeMultipartOutcome, FinalizeVersionOutcome, MultipartFinishSnapshot,
+};
 use crate::infra::content::hash_mode::HashMode;
+use crate::infra::storage::repo::Repos;
 use crate::infra::storage::store::{Store, pending_version};
 
 /// "No limit" for callers that must see a file's complete version set (cascade delete,
@@ -131,12 +141,15 @@ impl Store {
     }
 
     /// Record a version's size + hash, mark it `available` and write an audit row in
-    /// one transaction. Returns `true` if the version row existed and was updated.
+    /// one transaction; `updated` reports whether the version row existed and was updated.
     ///
     /// `mime_type` is the sniffed content type to persist; `None` keeps the declared
     /// one (multipart complete does not validate MIME). `hash_mode`/`part_count` are
     /// set here; for `multipart-composite-sha256`, `manifest` is inserted in the same
     /// transaction.
+    ///
+    /// `auto_bind`: also binds the version as current content in this transaction (same CAS and
+    /// promotion as `bind_atomic_with_event`); a lost CAS is reported via `bound`, not an error.
     #[allow(clippy::too_many_arguments)]
     pub async fn finalize_version(
         &self,
@@ -149,14 +162,25 @@ impl Store {
         manifest: Option<String>,
         mime_type: Option<String>,
         audit: AuditEntry,
-    ) -> Result<bool, DomainError> {
+        auto_bind: Option<AutoBindOnFinalize>,
+    ) -> Result<FinalizeVersionOutcome, DomainError> {
+        let repos = self.repos.clone();
         let versions = self.repos.versions.clone();
         let audit_repo = self.repos.audit.clone();
         let hash_mode_str = hash_mode.as_str();
         let now = OffsetDateTime::now_utc();
+        // Retryable: auto-bind locks `file_versions` then `files`, a file delete the opposite; can deadlock.
         self.db
             .db()
-            .transaction_ref_mapped(move |tx| {
+            .transaction_with_retry(TxConfig::default(), db_err, move |tx| {
+                let repos = repos.clone();
+                let versions = versions.clone();
+                let audit_repo = audit_repo.clone();
+                let hash_value = hash_value.clone();
+                let mime_type = mime_type.clone();
+                let manifest = manifest.clone();
+                let audit = audit.clone();
+                let auto_bind = auto_bind.clone();
                 Box::pin(async move {
                     let scope = AccessScope::allow_all();
                     let updated = versions
@@ -172,7 +196,7 @@ impl Store {
                             mime_type,
                         )
                         .await?;
-                    if updated {
+                    let bound = if updated {
                         // Manifest and version row commit atomically.
                         if let Some(manifest) = manifest {
                             versions
@@ -180,8 +204,151 @@ impl Store {
                                 .await?;
                         }
                         audit_repo.insert(tx, &audit).await?;
+
+                        auto_bind_in_tx(&repos, tx, file_id, version_id, auto_bind, now).await?
+                    } else {
+                        false
+                    };
+                    Ok::<FinalizeVersionOutcome, DomainError>(FinalizeVersionOutcome {
+                        updated,
+                        bound,
+                    })
+                })
+            })
+            .await
+    }
+
+    /// Multipart counterpart of `finalize_version`: finalize + auto-bind CAS + session
+    /// `completing -> completed` + snapshot, all in ONE transaction.
+    ///
+    /// The session row is locked first and its `state` re-checked: the finalize CAS is fenced only
+    /// by `status = 'pending'`, so a stale completer whose session cleanup already aborted could
+    /// otherwise finalize and bind. A vanished row or `aborted` fails with `DomainError::conflict`;
+    /// `completed` and `in_progress` are tolerated (the version CAS reports `updated: false` / the
+    /// owner-`None` finish arm closes the session).
+    pub async fn finalize_multipart_version(
+        &self,
+        file_id: Uuid,
+        manifest: Option<String>,
+        mime_type: Option<String>,
+        finalize_audit: AuditEntry,
+        auto_bind: Option<AutoBindOnFinalize>,
+        finish: MultipartFinishSnapshot,
+    ) -> Result<FinalizeMultipartOutcome, DomainError> {
+        let repos = self.repos.clone();
+        let hash_mode_str = finish.hash_mode.as_str();
+        let auto_bind_requested = auto_bind.is_some();
+        let now = OffsetDateTime::now_utc();
+        // Retryable: lock order `multipart_uploads` -> `file_versions` -> `files`; only the latter half can deadlock.
+        self.db
+            .db()
+            .transaction_with_retry(TxConfig::default(), db_err, move |tx| {
+                let repos = repos.clone();
+                let manifest = manifest.clone();
+                let mime_type = mime_type.clone();
+                let finalize_audit = finalize_audit.clone();
+                let auto_bind = auto_bind.clone();
+                let finish = finish.clone();
+                Box::pin(async move {
+                    let scope = AccessScope::allow_all();
+                    let session_state = repos
+                        .multipart
+                        .lock_session_state(tx, finish.upload_id)
+                        .await?;
+                    let reclaimed_by_cleanup = match session_state.as_deref() {
+                        Some(state) => state == MultipartUploadState::Aborted.as_str(),
+                        None => true,
+                    };
+                    if reclaimed_by_cleanup {
+                        return Err(DomainError::conflict(
+                            crate::domain::error::MULTIPART_SESSION_RECLAIMED_BY_CLEANUP_MESSAGE,
+                        ));
                     }
-                    Ok::<bool, DomainError>(updated)
+                    let updated = repos
+                        .versions
+                        .finalize(
+                            tx,
+                            &scope,
+                            file_id,
+                            finish.version_id,
+                            finish.size,
+                            finish.content_hash.clone(),
+                            hash_mode_str,
+                            finish.part_count,
+                            mime_type,
+                        )
+                        .await?;
+                    if !updated {
+                        return Ok::<FinalizeMultipartOutcome, DomainError>(
+                            FinalizeMultipartOutcome {
+                                updated: false,
+                                bound: false,
+                                session_completed: false,
+                                current_etag: None,
+                            },
+                        );
+                    }
+
+                    if let Some(manifest) = manifest {
+                        repos
+                            .versions
+                            .insert_manifest(tx, &scope, finish.version_id, &manifest, now)
+                            .await?;
+                    }
+                    repos.audit.insert(tx, &finalize_audit).await?;
+
+                    let bound =
+                        auto_bind_in_tx(&repos, tx, file_id, finish.version_id, auto_bind, now)
+                            .await?;
+
+                    let decision = if bound {
+                        BindDecision::Bound
+                    } else if auto_bind_requested {
+                        let fresh =
+                            repos.files.get(tx, &scope, file_id).await?.ok_or_else(|| {
+                                DomainError::database(
+                                    "file row missing during multipart finalize's fresh-etag read",
+                                )
+                            })?;
+                        BindDecision::Conflict {
+                            current_etag: etag::etag_for(&fresh),
+                        }
+                    } else {
+                        BindDecision::Manual
+                    };
+                    let (bind_state, result_etag, current_etag) =
+                        decision.outcome(file_id, finish.version_id);
+
+                    let stored = StoredCompleteResult {
+                        version_id: finish.version_id,
+                        size: finish.size,
+                        content_hash: hex::encode(&finish.content_hash),
+                        hash_mode: hash_mode_str.to_owned(),
+                        part_count: finish.part_count.unwrap_or(1),
+                        bind_state: bind_state.as_str().to_owned(),
+                        etag: result_etag,
+                        current_etag: current_etag.clone(),
+                    };
+                    let result_json = serde_json::to_string(&stored).map_err(|_| {
+                        DomainError::database("failed to serialize complete result")
+                    })?;
+
+                    // Owner `None`: the won finalize CAS proves authorship, and an owner check would re-strand a
+                    // stale completer; `in_progress` is accepted too (see `MultipartRepo::finish_complete`).
+                    let session_completed = repos
+                        .multipart
+                        .finish_complete(tx, finish.upload_id, None, &result_json)
+                        .await?;
+                    if session_completed {
+                        repos.audit.insert(tx, &finish.session_audit).await?;
+                    }
+
+                    Ok(FinalizeMultipartOutcome {
+                        updated,
+                        bound,
+                        session_completed,
+                        current_etag,
+                    })
                 })
             })
             .await
@@ -196,6 +363,17 @@ impl Store {
         self.repos
             .versions
             .get_manifest(&conn, &AccessScope::allow_all(), version_id)
+            .await
+    }
+
+    pub async fn get_version_manifests(
+        &self,
+        version_ids: &[Uuid],
+    ) -> Result<HashMap<Uuid, String>, DomainError> {
+        let conn = self.db.conn().map_err(DomainError::from)?;
+        self.repos
+            .versions
+            .get_manifests(&conn, &AccessScope::allow_all(), version_ids)
             .await
     }
 
@@ -215,7 +393,10 @@ impl Store {
         let audit_repo = self.repos.audit.clone();
         self.db
             .db()
-            .transaction_ref_mapped(move |tx| {
+            .transaction_with_retry(TxConfig::default(), db_err, move |tx| {
+                let versions = versions.clone();
+                let audit_repo = audit_repo.clone();
+                let audit = audit.clone();
                 Box::pin(async move {
                     let scope = AccessScope::allow_all();
                     // Re-read in-transaction: `is_current` mirrors `files.content_id`
@@ -252,7 +433,10 @@ impl Store {
         let audit_repo = self.repos.audit.clone();
         self.db
             .db()
-            .transaction_ref_mapped(move |tx| {
+            .transaction_with_retry(TxConfig::default(), db_err, move |tx| {
+                let versions = versions.clone();
+                let audit_repo = audit_repo.clone();
+                let audit = audit.clone();
                 Box::pin(async move {
                     let removed = versions
                         .delete_if_status(
@@ -293,7 +477,12 @@ impl Store {
         let bind_scope = scope.clone();
         self.db
             .db()
-            .transaction_ref_mapped(move |tx| {
+            .transaction_with_retry(TxConfig::default(), db_err, move |tx| {
+                let files = files.clone();
+                let versions = versions.clone();
+                let audit_repo = audit_repo.clone();
+                let bind_scope = bind_scope.clone();
+                let audit = audit.clone();
                 Box::pin(async move {
                     let swapped = files
                         .bind_content_cas(
@@ -310,10 +499,7 @@ impl Store {
                     }
                     // Honours the unique-current index.
                     versions
-                        .clear_current(tx, &AccessScope::allow_all(), file_id)
-                        .await?;
-                    versions
-                        .set_current(tx, &AccessScope::allow_all(), file_id, version_id)
+                        .promote_current(tx, &AccessScope::allow_all(), file_id, version_id)
                         .await?;
                     audit_repo.insert(tx, &audit).await?;
                     Ok::<bool, DomainError>(true)
@@ -342,7 +528,14 @@ impl Store {
         let bind_scope = scope.clone();
         self.db
             .db()
-            .transaction_ref_mapped(move |tx| {
+            .transaction_with_retry(TxConfig::default(), db_err, move |tx| {
+                let files = files.clone();
+                let versions = versions.clone();
+                let audit_repo = audit_repo.clone();
+                let events_repo = events_repo.clone();
+                let bind_scope = bind_scope.clone();
+                let audit = audit.clone();
+                let event = event.clone();
                 Box::pin(async move {
                     let swapped = files
                         .bind_content_cas(
@@ -358,10 +551,7 @@ impl Store {
                         return Ok(false);
                     }
                     versions
-                        .clear_current(tx, &AccessScope::allow_all(), file_id)
-                        .await?;
-                    versions
-                        .set_current(tx, &AccessScope::allow_all(), file_id, version_id)
+                        .promote_current(tx, &AccessScope::allow_all(), file_id, version_id)
                         .await?;
                     audit_repo.insert(tx, &audit).await?;
                     if let Some(ev) = event {
@@ -395,7 +585,14 @@ impl Store {
         let new_backend_path = new_backend_path.to_owned();
         self.db
             .db()
-            .transaction_ref_mapped(move |tx| {
+            .transaction_with_retry(TxConfig::default(), db_err, move |tx| {
+                let versions = versions.clone();
+                let audit_repo = audit_repo.clone();
+                let expected_backend_id = expected_backend_id.clone();
+                let expected_backend_path = expected_backend_path.clone();
+                let new_backend_id = new_backend_id.clone();
+                let new_backend_path = new_backend_path.clone();
+                let audit = audit.clone();
                 Box::pin(async move {
                     let updated = versions
                         .rebind_backend(
@@ -438,7 +635,14 @@ impl Store {
         let new_owner_kind = new_owner_kind.to_owned();
         self.db
             .db()
-            .transaction_ref_mapped(move |tx| {
+            .transaction_with_retry(TxConfig::default(), db_err, move |tx| {
+                let files = files.clone();
+                let audit_repo = audit_repo.clone();
+                let events_repo = events_repo.clone();
+                let transfer_scope = transfer_scope.clone();
+                let new_owner_kind = new_owner_kind.clone();
+                let audit = audit.clone();
+                let event = event.clone();
                 Box::pin(async move {
                     let updated = files
                         .update_owner(
@@ -461,4 +665,39 @@ impl Store {
             })
             .await
     }
+}
+
+/// Auto-bind tail of a finalize transaction: the first-bind CAS and, if it wins, promotion, the
+/// `bound_on_finalize` marker, audit and event. `None` or a lost CAS yields `false` (not an error).
+async fn auto_bind_in_tx<C: DBRunner>(
+    repos: &Repos,
+    tx: &C,
+    file_id: Uuid,
+    version_id: Uuid,
+    auto_bind: Option<AutoBindOnFinalize>,
+    now: OffsetDateTime,
+) -> Result<bool, DomainError> {
+    let Some(ab) = auto_bind else {
+        return Ok(false);
+    };
+    let scope = AccessScope::allow_all();
+    let swapped = repos
+        .files
+        .bind_content_cas(tx, &scope, file_id, ab.expected_content_id, version_id, now)
+        .await?;
+    if swapped {
+        repos
+            .versions
+            .promote_current(tx, &scope, file_id, version_id)
+            .await?;
+        repos
+            .versions
+            .mark_bound_on_finalize(tx, &scope, file_id, version_id)
+            .await?;
+        repos.audit.insert(tx, &ab.audit).await?;
+        if let Some(ev) = ab.event {
+            repos.events_outbox.enqueue(tx, &ev).await?;
+        }
+    }
+    Ok(swapped)
 }

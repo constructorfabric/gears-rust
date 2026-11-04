@@ -2,7 +2,7 @@
 
 High-level Rust SDK for the `event-broker` gear.
 
-Wire concerns (JSON serialisation, partition selection, producer-chain bookkeeping,
+Wire concerns (JSON serialisation, producer-chain bookkeeping,
 subscription lifecycle recovery, canonical error handling) are handled inside the
 SDK. Callers work with their own typed event structs, a single `EventBrokerApi` trait,
 and structured `Producer` / `Consumer` builders.
@@ -10,8 +10,8 @@ and structured `Producer` / `Consumer` builders.
 ## Error model
 
 The SDK traits and wrappers use domain-readable local errors in-process:
-`EventBrokerApi` returns `EventBrokerError`, `EventBrokerBackend` returns
-`StorageBackendError`, and producer/consumer wrappers return `EventBrokerError`
+`EventBrokerApi` returns `EventBrokerError`, `backend::Backend` returns
+`BackendError` (feature 0007), and producer/consumer wrappers return `EventBrokerError`
 for local typed validation, retry, and dispatch. Those errors are canonical-error
 compatible: before errors cross an API or transport boundary they convert to the
 canonical categories and RFC 9457 `Problem` representation from
@@ -146,9 +146,10 @@ Outbox producers use toolkit-db `OutboxMessage.seq` as the durable local
 sequence and Event Broker cursors as the authoritative accepted sequence.
 
 One `ProducerOutboxQueue` can carry all topics configured on a `DbProducer`.
-The SDK maps `(topic, broker_partition)` to one producer outbox partition, so
-topic partition counts and outbox queue partition counts can differ without
-breaking ordering for a topic partition.
+The SDK maps each event to a producer outbox partition by its own rule; it
+derives no broker partition, which the backend assigns from the partition key.
+A partitioned producer registers one producer id per producer partition, each a
+sequence space of its own, shared by every topic that partition publishes to.
 
 The service owns toolkit-db outbox lifecycle: run toolkit-db outbox migrations,
 register queues, start workers, tune leases, and stop the `OutboxHandle`.

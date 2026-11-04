@@ -1234,6 +1234,43 @@ fn translate_completed_returns_terminal() {
 }
 
 #[test]
+fn translate_function_call_returns_tool_use_with_usage() {
+    let event = ProviderEvent::ResponseCompleted {
+        response: ResponseObject {
+            id: "resp-tool".into(),
+            output: vec![OutputItem {
+                r#type: "function_call".into(),
+                content: vec![],
+                call_id: Some("call_1".into()),
+                name: Some("search_knowledge".into()),
+                arguments: Some(r#"{"query":"q"}"#.into()),
+            }],
+            usage: RawUsage {
+                input_tokens: 300,
+                output_tokens: 40,
+                input_tokens_details: None,
+                output_tokens_details: None,
+            },
+            incomplete_details: None,
+        },
+    };
+    match translate_provider_event(&event, "") {
+        TranslatedEvent::Terminal(TerminalOutcome::ToolUse {
+            tool_use_id,
+            name,
+            usage,
+            ..
+        }) => {
+            assert_eq!(tool_use_id, "call_1");
+            assert_eq!(name, "search_knowledge");
+            assert_eq!(usage.input_tokens, 300);
+            assert_eq!(usage.output_tokens, 40);
+        }
+        _ => panic!("expected Terminal(ToolUse)"),
+    }
+}
+
+#[test]
 fn translate_completed_propagates_token_details() {
     let event = ProviderEvent::ResponseCompleted {
         response: ResponseObject {

@@ -13,8 +13,8 @@
 ///
 /// Inserted by `toolkit-gateway::Forwarder` on every response it relays
 /// from an upstream, and by `oagw`'s proxy data-plane on every response it
-/// relays from the underlying data-plane layer (upstream or pingora
-/// itself) - both are reverse-proxy passthroughs where the response was
+/// relays from an upstream - both are reverse-proxy passthroughs where the
+/// response was
 /// never constructed via this platform's canonical error system.
 #[derive(Debug, Clone, Copy)]
 pub struct ForeignPassthrough;

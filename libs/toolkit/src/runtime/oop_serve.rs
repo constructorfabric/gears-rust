@@ -21,6 +21,10 @@
 //!   matching the in-process (`api-gateway`) path. The drain guard also catches
 //!   panics so a panic can neither drop the client connection nor leak the
 //!   in-flight counter (which would otherwise stall graceful drain).
+//! - **Request/trace context** — the outermost `trace_context_middleware`
+//!   continues the inbound W3C `traceparent` and scopes the inbound
+//!   `x-request-id` (`toolkit_trace_context::with_request_id`), so the gear's
+//!   span carries the edge id and outbound `toolkit-http` calls forward it.
 //!
 //! The server is driven by [`OopHttpServer`], invoked from the `HostRuntime`
 //! `OoP` path: it binds and serves the probes **before** the gear's `start()`
@@ -49,7 +53,7 @@ use url::Url;
 
 use cf_system_sdks::directory::{DirectoryClient, RegisterInstanceInfo, ServiceEndpoint};
 use toolkit_canonical_errors::CanonicalError;
-use toolkit_http_middleware::{RouteAuthPolicy, layer_route_auth};
+use toolkit_http_middleware::{RouteAuthPolicy, TenantPlane, layer_route_auth_with};
 use toolkit_security::{DynBearerAuthenticator, DynInternalAuthenticator};
 
 use super::readiness::ReadinessState;
@@ -117,6 +121,10 @@ pub struct OopServeOptions {
     /// Platform-plane authenticator; when `Some`, `internal_auth_middleware` is
     /// installed on gear routes (runs before the tenant plane).
     pub internal_authenticator: Option<DynInternalAuthenticator>,
+    /// Development only (`oop_http.auth_disabled`): without a tenant authenticator,
+    /// non-platform routes run with the default tenant `SecurityContext` instead of
+    /// being refused. Platform routes still require a validated platform caller.
+    pub auth_disabled: bool,
     /// Stable addressing labels (k8s `matchLabels` style) advertised with this
     /// instance's directory registration for label-based selection.
     pub labels: BTreeMap<String, String>,
@@ -149,7 +157,26 @@ impl OopServeOptions {
             directory,
             bearer_authenticator: None,
             internal_authenticator: None,
+            auth_disabled: false,
             labels: BTreeMap::new(),
+        }
+    }
+
+    /// Development only: see [`Self::auth_disabled`].
+    #[must_use]
+    pub fn with_auth_disabled(mut self, auth_disabled: bool) -> Self {
+        self.auth_disabled = auth_disabled;
+        self
+    }
+
+    /// The listener's tenant plane: the bearer authenticator when one is installed, else
+    /// [`TenantPlane::Disabled`] under `auth_disabled`, else [`TenantPlane::Absent`].
+    #[must_use]
+    pub fn tenant_plane(&self) -> TenantPlane {
+        match (&self.bearer_authenticator, self.auth_disabled) {
+            (Some(bearer), _) => TenantPlane::Authenticator(bearer.clone()),
+            (None, true) => TenantPlane::Disabled,
+            (None, false) => TenantPlane::Absent,
         }
     }
 
@@ -488,15 +515,15 @@ fn layer_gear_router(
     drain_guard: DrainGuard,
     options: &OopServeOptions,
 ) -> Router {
-    // Policy, both auth planes (each only when injected) and the platform gate, in the
-    // order `cpt-cf-adr-two-plane-auth` requires. A missing internal authenticator fails
-    // closed for platform routes only; without a tenant authenticator, tenant routes are
-    // served without bearer validation (the bearer authenticator is optional, see
-    // `resolve_bearer_authenticator`).
-    let mut gear = layer_route_auth(
+    // Policy, both auth planes and the platform gate, in the order
+    // `cpt-cf-adr-two-plane-auth` requires. Both planes fail closed: platform routes
+    // without an internal authenticator, tenant and unlisted routes without a bearer
+    // authenticator (unless `auth_disabled`). `check_route_auth` refuses to start
+    // before that can happen for a declared tenant operation.
+    let mut gear = layer_route_auth_with(
         gear_router,
         route_auth,
-        options.bearer_authenticator.clone(),
+        options.tenant_plane(),
         options.internal_authenticator.clone(),
     );
 
@@ -529,23 +556,20 @@ async fn trace_context_middleware(req: Request, next: Next) -> Response {
     use tracing::Instrument as _;
     use tracing::field::Empty;
 
-    // Record the gateway-supplied `x-request-id` (forwarded to this gear, absent
-    // when the gear is reached without the gateway) and the wire `trace_id` /
+    // Record the inbound `x-request-id` — the edge-minted id, forwarded
+    // hop-to-hop by the gateway proxy and by `toolkit-http` clients, absent
+    // when the gear is reached without one — and the wire `trace_id` /
     // `parent.trace_id` on the span, so an OoP gear's log lines join to the
     // gateway access log and the wire trace even with the text console format,
-    // without OTel, or with the log-correlation splice off. The id is the
-    // gateway's; this gear does not mint one.
-    let request_id = req
-        .headers()
-        .get("x-request-id")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("n/a");
+    // without OTel, or with the log-correlation splice off. This gear does not
+    // mint one.
+    let request_id = toolkit_trace_context::extract_request_id(req.headers());
 
     let span = tracing::info_span!(
         "http_request",
         method = %req.method(),
         uri = %req.uri().path(),
-        request_id = %request_id,
+        request_id = %request_id.as_deref().unwrap_or("n/a"),
         trace_id = Empty,
         parent.trace_id = Empty,
     );
@@ -555,7 +579,9 @@ async fn trace_context_middleware(req: Request, next: Next) -> Response {
     // `toolkit_trace_context`; without `otel` it records the ids from the header.
     toolkit_trace_context::set_parent_from_headers(&span, req.headers());
 
-    next.run(req).instrument(span).await
+    // Install the edge request id as the task-local carrier so outbound
+    // `toolkit-http` calls (generated contract clients) forward it.
+    toolkit_trace_context::with_request_id(request_id, next.run(req).instrument(span)).await
 }
 
 // ---------------------------------------------------------------------------
@@ -765,25 +791,65 @@ impl OopHttpServer {
                 "tenant-plane authenticator installed (security_context_middleware enabled)"
             );
         } else {
-            tracing::warn!(
+            tracing::info!(
                 gear = %self.options.gear_name,
-                "no tenant-plane authenticator registered in ClientHub; tenant plane not installed"
+                "no tenant-plane authenticator registered in ClientHub"
             );
         }
     }
 
-    /// Atomically publish the composed gear routes (with auth policy) and their
-    /// `OpenAPI` document, then start background directory presence.
+    /// Refuse to serve tenant operations without a bearer authenticator (unless
+    /// `auth_disabled`): a startup error names the cause instead of a listener that
+    /// refuses every tenant request. Without one, a route the policy does not list is
+    /// refused too, which only a warning can flag: the router cannot list its routes.
+    /// Platform operations without an internal authenticator only warn (when layered):
+    /// the platform gate already refuses each request, and a linked gear's platform route
+    /// nobody calls must not stop the process.
+    ///
+    /// # Errors
+    /// When tenant operations are declared and no tenant authenticator is available.
+    pub(super) fn check_route_auth(&self, route_auth: &RouteAuthPolicy) -> anyhow::Result<()> {
+        if !matches!(self.options.tenant_plane(), TenantPlane::Absent) {
+            return Ok(());
+        }
+        let gear = &self.options.gear_name;
+        let tenant = route_auth.tenant_routes();
+        if !tenant.is_empty() {
+            anyhow::bail!(
+                "gear '{gear}' serves tenant operations but no tenant authenticator is \
+                 available (link authn-resolver, or set oop_http.auth_disabled for \
+                 development): {tenant:?}"
+            );
+        }
+        tracing::warn!(
+            gear = %gear,
+            reason = "TENANT_AUTH_NOT_CONFIGURED",
+            "no tenant authenticator on this listener: a route not declared through \
+             OperationBuilder is refused with 401 (link authn-resolver, or set \
+             oop_http.auth_disabled for development)"
+        );
+        Ok(())
+    }
+
+    /// Check the route policy ([`Self::check_route_auth`]), then atomically publish the
+    /// composed gear routes (with auth policy) and their `OpenAPI` document, then start
+    /// background directory presence.
     ///
     /// Presence (registration + heartbeat + self-heal) starts only once the gear
     /// can serve requests, so discovery never advertises a not-yet-serving instance.
     /// Dependency resolution runs in the proxy-wiring phase before serving.
+    ///
+    /// # Errors
+    /// When the route policy fails [`Self::check_route_auth`]; nothing is published.
     pub(super) fn attach(
         &mut self,
         gear_router: Router,
         openapi_json: String,
         route_auth: RouteAuthPolicy,
-    ) {
+    ) -> anyhow::Result<()> {
+        // A declared operation whose plane has no validator would refuse every request;
+        // stop here, before serving, and say why.
+        self.check_route_auth(&route_auth)?;
         let openapi_arc: Arc<str> = Arc::from(openapi_json);
         let layered = layer_gear_router(
             gear_router,
@@ -814,6 +880,7 @@ impl OopHttpServer {
             self.options.heartbeat_interval,
             self.cancel.clone(),
         )));
+        Ok(())
     }
 
     /// Wait for the server to drain on shutdown, then deregister from

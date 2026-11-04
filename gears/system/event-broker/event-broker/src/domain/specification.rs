@@ -7,8 +7,35 @@ use gts::GtsTypeId;
 use serde_json::Value as JsonValue;
 use toolkit_gts::GtsInstanceId;
 
+use event_broker_sdk::backend::LogId;
+use toolkit::domain_model;
+
+use crate::domain::backend::BackendResolver;
 use crate::domain::error::{DomainError, ErrorCode};
 use crate::domain::model::Topic;
+
+/// Where a registered topic stands on its storage backend (feature 0006 §5).
+/// A topic with no record yet has no state: registered, nothing attempted.
+#[domain_model]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TopicState {
+    /// An attempt under `log` is live or being retried; the backend does not
+    /// hold the topic's log yet.
+    Provisioning { log: LogId },
+    /// The backend holds the topic's log under `log`, with `partitions`
+    /// partitions - the count every role uses for the topic.
+    Provisioned { log: LogId, partitions: u32 },
+}
+
+/// The bounds one provisioning pass works within.
+#[domain_model]
+#[derive(Debug, Clone, Copy)]
+pub struct ProvisioningLimits {
+    /// The longest one `provision` call may take.
+    pub call_timeout: std::time::Duration,
+    /// An attempt nobody acted on for this long is replaced.
+    pub attempt_timeout: std::time::Duration,
+}
 
 /// Everything the rest of the gear asks about a topic or an event type.
 ///
@@ -54,6 +81,28 @@ pub trait SpecificationManager: Send + Sync {
     /// # Errors
     /// Returns `DomainError::NotFound` if `id` is not a known event type.
     async fn resolve_event_type_id(&self, id: &GtsTypeId) -> Result<i64, DomainError>;
+
+    /// Where `id` stands on its storage backend; `None` while no attempt has
+    /// been recorded for it.
+    ///
+    /// # Errors
+    /// Returns a `DomainError` if the record cannot be read.
+    async fn topic_state(&self, id: &GtsInstanceId) -> Result<Option<TopicState>, DomainError>;
+
+    /// One provisioning pass over every registered topic (feature 0006 §4.1):
+    /// starts an attempt for a topic with no record, continues a live one,
+    /// replaces one nobody acted on for `limits.attempt_timeout`, and hands a
+    /// provisioned topic its current settings again so its backend adopts
+    /// changed retention. The specification manager is the only writer of the
+    /// records. Failures are logged and left for the next pass.
+    ///
+    /// Returns how many registered topics are still not provisioned after the
+    /// pass, so the caller can retry soon rather than at its next refresh.
+    async fn provision_topics(
+        &self,
+        backends: &dyn BackendResolver,
+        limits: ProvisioningLimits,
+    ) -> usize;
 }
 
 /// Compiles `event_type.data_schema` into a reusable validator. Compilation is

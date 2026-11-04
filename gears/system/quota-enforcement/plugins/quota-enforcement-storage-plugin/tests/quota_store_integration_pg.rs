@@ -33,9 +33,12 @@ use uuid::Uuid;
 use quota_enforcement_storage_plugin::infra::storage::Migrator;
 use quota_enforcement_storage_plugin::infra::storage::entity::quota_allocation_counter;
 use quota_enforcement_storage_plugin::infra::storage::quota_mapping::QuotaUpdate;
-use quota_enforcement_storage_plugin::infra::storage::repo::{operation_log_repo, quota_repo};
+use quota_enforcement_storage_plugin::infra::storage::repo::{
+    RowWait, operation_log_repo, quota_repo,
+};
 use quota_enforcement_storage_plugin::{
-    Actor, NotificationEnqueuer, QeOutbox, QuotaStore, SqlQuotaStore, StoreError, start_outbox,
+    Actor, NotificationOutbox, QeOutbox, QuotaStore, SqlQuotaStore, StoreError,
+    start_undelivered_outbox,
 };
 
 const USER_PROJECTION: &str = "gts.cf.core.qe.subj.v1~cf.genai.llm_gateway.user.v1~";
@@ -119,12 +122,12 @@ impl PgHarness {
         run_migrations_for_testing(&db, Migrator::migrations())
             .await
             .expect("migrations");
-        let outbox = start_outbox(db.clone()).await.expect("outbox");
+        let outbox = start_undelivered_outbox(db.clone()).await.expect("outbox");
         let enqueuer = Arc::new(QeOutbox::new());
         enqueuer
             .bind(Arc::clone(outbox.outbox()))
             .expect("bind once");
-        let enqueuer: Arc<dyn NotificationEnqueuer> = enqueuer;
+        let enqueuer: Arc<dyn NotificationOutbox> = enqueuer;
         let store = SqlQuotaStore::new(db.clone(), enqueuer);
         Self {
             db,
@@ -197,10 +200,11 @@ impl PgHarness {
         let handle = tokio::spawn(async move {
             db.transaction_ref_mapped(move |tx| {
                 Box::pin(async move {
-                    let row = quota_repo::find_by_id(tx, &scope(), id.as_uuid(), true)
-                        .await
-                        .map_err(|e| DbError::Sea(sea_orm::DbErr::Custom(e.to_string())))?
-                        .expect("row exists");
+                    let row =
+                        quota_repo::find_by_id(tx, &scope(), id.as_uuid(), Some(RowWait::Wait))
+                            .await
+                            .map_err(|e| DbError::Sea(sea_orm::DbErr::Custom(e.to_string())))?
+                            .expect("row exists");
                     locked_tx.send(()).expect("test waits");
                     release_rx.await.expect("test releases");
                     body(tx, row).await?;

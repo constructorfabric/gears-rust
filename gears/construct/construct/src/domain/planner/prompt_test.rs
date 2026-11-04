@@ -74,7 +74,9 @@ fn each_record_type_reaches_the_model_with_its_payload_and_schema() {
         assert!(!input.starts_with("<record>\nType: A record."), "{input}");
         assert!(input.contains("Payload schema: {"), "{input}");
         assert!(input.contains("Payload: {"), "{input}");
-        for id_field in ["\"id\"", "_id\""] {
+        // No field is named `id` or `*_id`; a value such as the enum value
+        // `openalex_author_id` is the model's to see.
+        for id_field in ["\"id\":", "_id\":"] {
             assert!(!input.contains(id_field), "{input} shows {id_field}");
         }
         assert!(

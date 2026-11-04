@@ -1,7 +1,7 @@
 [package]
 name = "cf-gears-oagw"
 description = "OAGW module - discovers and routes to plugins"
-version = "0.5.5"
+version = "0.6.2"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
@@ -18,8 +18,9 @@ path = "src/lib.rs"
 
 [features]
 # FIPS-140-3: compile TLS deps with FIPS-approved cipher suites only
-fips = ["toolkit-http/fips"]
+fips = ["toolkit-http/fips", "toolkit-http-proxy/fips"]
 test-utils = [
+    "toolkit-http-proxy/test-utils",
     "axum/ws",
     "credstore-sdk/test-util",
     "toolkit/bootstrap",
@@ -33,10 +34,23 @@ test-utils = [
     "tokio/rt",
 ]
 mysql = ["toolkit-db/mysql"]
-integration = ["mysql"]
+# The database tier (`make test-oagw-db`), with the proxy cache's change log.
+integration = ["mysql", "cluster"]
+# The proxy configuration cache's change log on the platform cluster gear
+# (ADR-0020 *Cluster Setup*), which OAGW on a database requires. Off, OAGW
+# links no cluster SDK and runs in memory only: on a database `init` fails.
+# Not default, so an in-memory binary (mini-chat) does not link the SDK, whose
+# proxy wiring fails startup without a cluster gear once a workspace build
+# unifies its `grpc-client` feature in.
+cluster = ["dep:cluster-sdk"]
+# For an image that runs OAGW without a co-located cluster gear (cluster
+# DESIGN section 3.17.7): the SDK reaches the cluster pod over gRPC. The
+# embedded binary leaves it off; the `cluster` gear turns
+# `cluster-sdk/grpc-client` on itself.
+grpc-client = ["cluster", "cluster-sdk/grpc-client"]
 
 [dependencies]
-oagw-sdk = { path = "../oagw-sdk", package="cf-gears-oagw-sdk", version = "0.5.15", features = ["axum"] }
+oagw-sdk = { path = "../oagw-sdk", package="cf-gears-oagw-sdk", version = "0.5.16", features = ["axum"] }
 toolkit = { workspace = true }
 toolkit-auth = { workspace = true }
 toolkit-canonical-errors = { workspace = true, features = ["axum"] }
@@ -45,7 +59,6 @@ toolkit-http = { workspace = true }
 toolkit-security = { workspace = true }
 toolkit-macros = { workspace = true }
 toolkit-utils = { workspace = true, features = ["humantime-serde"] }
-aws-lc-rs = { workspace = true }
 inventory = { workspace = true }
 async-trait = { workspace = true }
 axum = { workspace = true }
@@ -67,6 +80,9 @@ tenant-resolver-sdk = { workspace = true }
 tenant-resolver = { workspace = true }
 credstore-sdk = { workspace = true }
 credstore = { workspace = true }
+# The proxy cache's change log (ADR-0020), with the `cluster` feature. The SDK
+# only: no `deps = [cluster]` edge and no cluster gear dependency.
+cluster-sdk = { workspace = true, optional = true }
 # Metrics / OpenTelemetry
 opentelemetry = { workspace = true }
 heck = { workspace = true }
@@ -83,19 +99,15 @@ sea-orm-migration = { workspace = true }
 time = { workspace = true }
 # DP deps
 form_urlencoded = "1"
-pingora-memory-cache = "0.8"
+lru = { workspace = true }
 futures-util = { workspace = true, features = ["sink"] }
 tokio = { workspace = true, features = ["time"] }
 tokio-util = { workspace = true }
-tokio-retry = { workspace = true }
 hyper = { workspace = true }
 hyper-util = { workspace = true }
-# Pingora proxy engine
-pingora-proxy = { version = "0.8", features = ["rustls"] }
-pingora-core = { version = "0.8", features = ["rustls"] }
-pingora-load-balancing = { version = "0.8", features = ["rustls"] }
-pingora-http = { version = "0.8.1" }
-httparse = "1"
+# Upstream proxy engine (ADR-0019)
+toolkit-http-proxy = { workspace = true }
+http-body-util = { workspace = true }
 # test-utils optional deps
 async-stream = { workspace = true, optional = true }
 tower = { workspace = true, features = ["util"], optional = true }
@@ -124,3 +136,15 @@ toolkit-db = { workspace = true, features = ["sqlite", "pg", "test-support"] }
 testcontainers = { workspace = true }
 test-containers = { workspace = true }
 tracing-test = { workspace = true }
+# Seeded random writes for the proxy cache's model test (ADR-0020).
+rand = { workspace = true }
+# Properties of the proxy cache's change-log decoder (ADR-0020).
+proptest = { workspace = true }
+# A real standalone cluster for the change-log and gear tests. Path only, no
+# version: a versioned internal dev-dep breaks release-plz publish ordering.
+cluster = { package = "cf-gears-cluster", path = "../../cluster/cluster" }
+standalone-cluster-plugin = { package = "cf-gears-standalone-cluster-plugin", path = "../../cluster/plugins/standalone-cluster-plugin" }
+
+[[bench]]
+name = "proxy_roundtrip"
+harness = false

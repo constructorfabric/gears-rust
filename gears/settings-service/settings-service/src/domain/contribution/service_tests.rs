@@ -234,6 +234,7 @@ impl Harness {
                     needs_review: false,
                     needs_review_detail: None,
                     set_by: "an-admin".to_owned(),
+                    set_by_tenant: None,
                 },
             )
             .await
@@ -1280,6 +1281,25 @@ impl DeclarationRepository for JournalingDeclarations {
             .visible_keys(conn, scope, visibility, hidden_for, keys)
             .await
     }
+    async fn list_candidates<C: toolkit_db::secure::DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        visibility: &crate::domain::category::visibility::DomainVisibility,
+        hidden_for: &[Uuid],
+        flagged_at: Option<Uuid>,
+        query: &toolkit_odata::ODataQuery,
+        narrowing: &crate::domain::declaration::BrowseNarrowing<'_>,
+    ) -> Result<
+        toolkit_odata::Page<crate::domain::declaration::BrowseCandidate>,
+        crate::domain::error::DomainError,
+    > {
+        DeclarationRepo
+            .list_candidates(
+                conn, scope, visibility, hidden_for, flagged_at, query, narrowing,
+            )
+            .await
+    }
     async fn find_by_key<C: toolkit_db::secure::DBRunner>(
         &self,
         conn: &C,
@@ -1350,6 +1370,15 @@ impl DeclarationRepository for JournalingDeclarations {
         id: Uuid,
     ) -> Result<(), crate::domain::error::DomainError> {
         DeclarationRepo.lock_for_update(conn, scope, id).await
+    }
+    async fn delete<C: toolkit_db::secure::DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        id: Uuid,
+        expected: time::OffsetDateTime,
+    ) -> Result<(), crate::domain::error::DomainError> {
+        DeclarationRepo.delete(conn, scope, id, expected).await
     }
     async fn set_default<C: toolkit_db::secure::DBRunner>(
         &self,

@@ -57,6 +57,17 @@ impl EvaluationBudget {
         })
     }
 
+    /// The budget of one batch item: whatever remains of the batch timer,
+    /// which supersedes the policy's own timeout. `None` once nothing
+    /// remains.
+    #[must_use]
+    pub fn within(remaining: Duration, cost_limit: NonZeroU64) -> Option<Self> {
+        (!remaining.is_zero()).then_some(Self {
+            timeout: remaining,
+            cost_limit,
+        })
+    }
+
     /// Maximum engine wall time for this invocation.
     #[must_use]
     pub const fn timeout(self) -> Duration {
@@ -169,7 +180,9 @@ mod tests {
     fn cost_cannot_underflow() -> Result<(), EngineError> {
         let limit =
             NonZeroU64::new(u64::MAX).ok_or_else(|| EngineError::Internal("fixture".into()))?;
-        let mut meter = EvaluationBudget::new(None, limit, limit)?.start();
+        // A minute of wall time, not the 5 ms default: the test is about cost,
+        // and a loaded runner must not reach the deadline before `charge`.
+        let mut meter = EvaluationBudget::new(Some(60_000), limit, limit)?.start();
         meter.charge(u64::MAX)?;
         assert_eq!(meter.charge(1), Err(EngineError::CostExceeded));
         Ok(())

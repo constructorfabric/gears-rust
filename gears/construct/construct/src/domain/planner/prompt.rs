@@ -1,4 +1,4 @@
-use construct_sdk::gts::RECORD_TYPES;
+use construct_sdk::gts::record_type_schema;
 use construct_sdk::person_types::Cardinality;
 use serde_json::Value;
 use toolkit_macros::domain_model;
@@ -74,12 +74,7 @@ pub fn record_input(
     record: &ReceivedRecord,
     numbered_profile: &str,
 ) -> Result<String, UnusableRecord> {
-    let record_type = RECORD_TYPES
-        .iter()
-        .find(|record_type| record_type.type_id == record.envelope.type_id)
-        .ok_or(UnusableRecord::UnknownType)?;
-    let schema: Value =
-        serde_json::from_str(record_type.schema).map_err(|_| UnusableRecord::NoPayloadSchema)?;
+    let schema = record_type_schema(&record.envelope.type_id).ok_or(UnusableRecord::UnknownType)?;
     let payload_schema = schema
         .pointer("/allOf/1/properties/payload")
         .ok_or(UnusableRecord::NoPayloadSchema)?;

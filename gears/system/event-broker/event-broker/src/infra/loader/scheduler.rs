@@ -5,14 +5,17 @@
 //! coalescing comes from: a thousand readers clustered at one partition's tail
 //! produce one demand, and therefore one fetch.
 //!
-//! Three rules, each earning its place. **Round-robin over partitions**, never
+//! Four rules, each earning its place. **Round-robin over partitions**, never
 //! priority by demand size - ranking partitions against each other by how much
 //! they want is precisely how a noisy partition starves the rest. **In-flight
 //! suppression per partition**, or every worker in the pool piles onto the same
 //! hungry partition and issues the same fetch, reintroducing the uncoalesced
-//! behaviour from the scheduler instead of from the readers. And **the tail
+//! behaviour from the scheduler instead of from the readers. **The tail
 //! poller's backoff gates tail demands only**, because a backfill covers
-//! sequences the backend certainly holds.
+//! sequences the backend certainly holds. And **a tail demand waits for a head
+//! above it**: once the head watch has reported a partition's head, a reader at
+//! that head costs no fetch until the head moves (feature 0007 §4.3), so an
+//! idle tail neither holds a permit nor outranks a replay with empty fetches.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -115,6 +118,7 @@ pub struct RoundReport {
     events_fetched: usize,
     empty_fetches: usize,
     deferred_by_backoff: usize,
+    awaiting_head: usize,
     suppressed_in_flight: usize,
     failures: usize,
 }
@@ -141,8 +145,9 @@ impl RoundReport {
         self.events_fetched
     }
 
-    /// Fetches that came back with nothing. Expected, not an error: a
-    /// notification can precede the sequence being assigned.
+    /// Fetches that came back with nothing. Expected, not an error: before the
+    /// head watch reports, a tail is polled blind, and a head can stand above
+    /// events retention has removed.
     #[must_use]
     pub fn empty_fetches(self) -> usize {
         self.empty_fetches
@@ -151,6 +156,12 @@ impl RoundReport {
     #[must_use]
     pub fn deferred_by_backoff(self) -> usize {
         self.deferred_by_backoff
+    }
+
+    /// Partitions whose only demands sit at or above the known head.
+    #[must_use]
+    pub fn awaiting_head(self) -> usize {
+        self.awaiting_head
     }
 
     #[must_use]
@@ -277,12 +288,26 @@ impl<S: EventSource + 'static> DemandScheduler<S> {
         }
 
         let ready = partition.poll().is_ready(now);
+        let mut awaiting_head = false;
         let mut eligible: Vec<Demand> = demands
             .into_iter()
-            .filter(|demand| ready || !demand.defers_to_backoff())
+            .filter(|demand| {
+                if !demand.defers_to_backoff() {
+                    return true;
+                }
+                if !partition.may_hold_above(demand.after()) {
+                    awaiting_head = true;
+                    return false;
+                }
+                ready
+            })
             .collect();
         if eligible.is_empty() {
-            report.deferred_by_backoff += 1;
+            if awaiting_head {
+                report.awaiting_head += 1;
+            } else {
+                report.deferred_by_backoff += 1;
+            }
             return None;
         }
 
@@ -322,8 +347,8 @@ impl<S: EventSource + 'static> DemandScheduler<S> {
 
         let result = match outcome {
             Ok(events) if events.is_empty() => {
-                // Not an error, and not proof of anything: the sequence may not
-                // have been assigned yet. Ask again, later.
+                // Not an error, and not proof of anything: no head may be known
+                // yet, or the head stands above removed events. Ask again, later.
                 partition
                     .poll()
                     .found_nothing(Instant::now(), policy.poll());
@@ -335,7 +360,15 @@ impl<S: EventSource + 'static> DemandScheduler<S> {
                 partition.poll().found_events(policy.poll());
                 Outcome::Fetched(count)
             }
-            Err(_) => Outcome::Failed,
+            Err(error) => {
+                tracing::debug!(
+                    topic = %partition.key().topic,
+                    partition = partition.key().partition,
+                    reason = ?error,
+                    "partition backend read failed"
+                );
+                Outcome::Failed
+            }
         };
 
         partition.release();

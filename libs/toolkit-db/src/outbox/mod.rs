@@ -236,6 +236,9 @@ mod workers;
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod integration_tests;
 
+#[cfg(all(test, feature = "integration", any(feature = "mysql", feature = "pg")))]
+mod registration_tests;
+
 pub use batch::Batch;
 pub use builder::{LeasedQueueBuilder, QueueBuilder};
 pub use core::Outbox;

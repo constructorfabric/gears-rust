@@ -1,6 +1,7 @@
 //! Per-mode service/route gating tests: which routes and services each
 //! `DeploymentMode` registers, and which it must not.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -12,15 +13,14 @@ use serde_json::json;
 use tokio_util::sync::CancellationToken;
 use toolkit::api::OpenApiRegistry;
 use toolkit::api::operation_builder::OperationSpec;
-use toolkit::config::ConfigProvider;
 use toolkit::{ClientHub, Gear, GearCtx, RestApiCapability};
-
-use crate::domain::specification::SpecificationManager;
 use tower::ServiceExt;
 use uuid::Uuid;
 
 use super::EventBrokerModule;
-use crate::config::DeploymentMode;
+use crate::config::{DeploymentMode, EventBrokerConfig};
+use crate::test_support::module_boot::StaticConfigProvider;
+use event_broker_sdk::backend::Role;
 
 struct NoopOpenApiRegistry;
 
@@ -43,21 +43,17 @@ impl OpenApiRegistry for NoopOpenApiRegistry {
     }
 }
 
-struct StaticConfigProvider {
-    root: serde_json::Value,
-}
-
-impl ConfigProvider for StaticConfigProvider {
-    fn get_gear_config(&self, gear: &str) -> Option<&serde_json::Value> {
-        self.root.get(gear)
-    }
-}
-
 /// A fresh temp-file `SQLite` DB with this crate's migrations applied -
 /// `init()` now resolves a real `DBProvider` (`ctx.db_required()`) and runs
 /// `SpecificationManager::bulk_load()` against it
 /// (eb-single-process-implementation D1), unlike before this change.
 async fn test_db_provider() -> toolkit_db::DBProvider<toolkit_db::DbError> {
+    test_db_provider_at().await.0
+}
+
+/// As [`test_db_provider`], with the DSN too, for a test that reads a table
+/// over a connection of its own.
+async fn test_db_provider_at() -> (toolkit_db::DBProvider<toolkit_db::DbError>, String) {
     let mut path = std::env::temp_dir();
     path.push(format!("cf-eb-module-test-{}.db", Uuid::now_v7().simple()));
     let mut file = path.to_string_lossy().replace('\\', "/");
@@ -79,107 +75,114 @@ async fn test_db_provider() -> toolkit_db::DBProvider<toolkit_db::DbError> {
     )
     .await
     .expect("migrations");
-    toolkit_db::DBProvider::new(db)
+    (toolkit_db::DBProvider::new(db), dsn)
 }
 
 async fn make_ctx(mode: &str) -> GearCtx {
     make_ctx_with_hub(mode, Arc::new(ClientHub::new())).await
 }
 
-/// Registers a default (empty) `MockTypesRegistryClient` on `hub` if the
-/// caller hasn't already put one there (`init()` now calls
-/// `SpecificationManager::bulk_load()`, which requires one), wires a
-/// `standalone` cache provider under the `event-broker` cluster profile if
-/// one isn't already bound (`init()` now resolves `EventBrokerCluster` to
-/// build `Storage` - eb-single-process-implementation D2 risk mitigation -
-/// callers that already wired their own via
-/// `test_support::standalone_event_broker_cluster()`, e.g. the
-/// service-discovery test below, keep that wiring untouched), and attaches
-/// a freshly-migrated test DB (`init()` now calls `ctx.db_required()`).
+/// A context for `mode` over `hub`, wired as
+/// [`module_ctx`](crate::test_support::module_boot::module_ctx) wires one, with
+/// a freshly-migrated temp-file `SQLite` gear database attached.
 async fn make_ctx_with_hub(mode: &str, hub: Arc<ClientHub>) -> GearCtx {
-    hub.register::<dyn types_registry_sdk::TypesRegistryClient>(Arc::new(
-        types_registry_sdk::testing::MockTypesRegistryClient::new(),
-    ));
-    if crate::domain::cluster::EventBrokerCluster::resolve(&hub)
-        .await
-        .is_err()
-    {
-        let config: cluster::ClusterConfig = serde_json::from_value(json!({
-            "profiles": { "event-broker": { "cache": { "provider": "standalone" } } }
-        }))
-        .expect("valid test cluster config");
-        let providers = cluster::ProviderRegistry::new()
-            .with_cache_provider(Arc::new(standalone_cluster_plugin::StandaloneCacheProvider));
-        let handle = cluster::ClusterWiring::from_config(Arc::clone(&hub), &config, &providers)
-            .await
-            .expect("standalone provider wires cleanly");
-        // Intentionally leaked - matches `standalone_event_broker_cluster()`'s
-        // own "no graceful shutdown needed in tests" precedent.
-        std::mem::forget(handle);
-    }
-    let cfg = json!({
-        "event-broker": {
-            "config": {
-                "mode": mode,
-                "default_storage_backend": "gts.cf.core.events.backend.v1~cf.core.backend.sqlite.v1~",
-                // Only load-bearing for cluster_ingest/cluster_delivery
-                // (registration `init`-time validation, `eb-dispatcher-routing`
-                // design.md D5); harmless for the other two modes.
-                "registration": { "advertise_addr": "127.0.0.1:8080" },
-            }
-        }
-    });
-    GearCtx::new(
-        EventBrokerModule::MODULE_NAME,
-        Uuid::new_v4(),
-        Arc::new(StaticConfigProvider { root: cfg }),
-        hub,
-        CancellationToken::new(),
-    )
-    .with_db(test_db_provider().await)
+    let (db, _dsn) = test_db_provider_at().await;
+    make_ctx_with_hub_and_config(mode, hub, &json!({}), db).await
 }
 
-async fn mode_after_init(mode: &str) -> DeploymentMode {
-    let module = EventBrokerModule::default();
-    let ctx = make_ctx(mode).await;
-    module.init(&ctx).await.expect("init must succeed");
-    module.mode()
+/// As [`make_ctx_with_hub`], with `extra` merged into the `event-broker`
+/// config and `db` attached.
+async fn make_ctx_with_hub_and_config(
+    mode: &str,
+    hub: Arc<ClientHub>,
+    extra: &serde_json::Value,
+    db: toolkit_db::DBProvider<toolkit_db::DbError>,
+) -> GearCtx {
+    crate::test_support::module_boot::module_ctx(mode, hub, extra, db).await
 }
 
-#[tokio::test]
-async fn standalone_activates_ingest_delivery_and_reaper_but_no_dispatcher() {
-    let mode = mode_after_init("standalone").await;
-    assert!(mode.ingest_active());
-    assert!(mode.delivery_active());
-    assert!(!mode.dispatcher_active());
-    assert!(mode.reaper_active());
+/// A component a mode turns on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Component {
+    Ingest,
+    Delivery,
+    Dispatcher,
+    Reaper,
 }
 
-#[tokio::test]
-async fn cluster_ingest_activates_only_ingest_and_reaper() {
-    let mode = mode_after_init("cluster_ingest").await;
-    assert!(mode.ingest_active());
-    assert!(!mode.delivery_active());
-    assert!(!mode.dispatcher_active());
-    assert!(mode.reaper_active());
+/// Everything `mode` turns on, as one value: its components and what it is
+/// to its storage backends.
+fn activation(mode: DeploymentMode) -> (BTreeSet<Component>, Option<Role>) {
+    let components = [
+        (Component::Ingest, mode.ingest_active()),
+        (Component::Delivery, mode.delivery_active()),
+        (Component::Dispatcher, mode.dispatcher_active()),
+        (Component::Reaper, mode.reaper_active()),
+    ]
+    .into_iter()
+    .filter_map(|(component, active)| active.then_some(component))
+    .collect();
+    (components, mode.backend_role())
 }
 
-#[tokio::test]
-async fn cluster_delivery_activates_only_delivery_and_reaper() {
-    let mode = mode_after_init("cluster_delivery").await;
-    assert!(!mode.ingest_active());
-    assert!(mode.delivery_active());
-    assert!(!mode.dispatcher_active());
-    assert!(mode.reaper_active());
+#[test]
+fn standalone_activates_ingest_delivery_and_reaper_but_no_dispatcher() {
+    assert_eq!(
+        activation(DeploymentMode::Standalone),
+        (
+            BTreeSet::from([Component::Ingest, Component::Delivery, Component::Reaper]),
+            Some(Role::Standalone)
+        )
+    );
 }
 
-#[tokio::test]
-async fn cluster_dispatcher_activates_only_the_dispatcher() {
-    let mode = mode_after_init("cluster_dispatcher").await;
-    assert!(!mode.ingest_active());
-    assert!(!mode.delivery_active());
-    assert!(mode.dispatcher_active());
-    assert!(!mode.reaper_active());
+#[test]
+fn cluster_ingest_activates_only_ingest_and_reaper() {
+    assert_eq!(
+        activation(DeploymentMode::ClusterIngest),
+        (
+            BTreeSet::from([Component::Ingest, Component::Reaper]),
+            Some(Role::Ingest)
+        )
+    );
+}
+
+#[test]
+fn cluster_delivery_activates_only_delivery_and_reaper() {
+    assert_eq!(
+        activation(DeploymentMode::ClusterDelivery),
+        (
+            BTreeSet::from([Component::Delivery, Component::Reaper]),
+            Some(Role::Delivery)
+        )
+    );
+}
+
+#[test]
+fn cluster_dispatcher_activates_only_the_dispatcher() {
+    assert_eq!(
+        activation(DeploymentMode::ClusterDispatcher),
+        (BTreeSet::from([Component::Dispatcher]), None)
+    );
+}
+
+/// The registry is built only where the checks prove a deployment and the
+/// mode has a backend role; a dispatcher has neither, so `init()` leaves its
+/// backends empty.
+#[test]
+fn cluster_dispatcher_builds_no_backend() {
+    let cfg: EventBrokerConfig = serde_json::from_value(json!({
+        "mode": "cluster_dispatcher",
+        "backends": { "main": { "type": "gts.cf.core.events.backend.v1~cf.core.backend.memory.v1~" } },
+        "backend_routing": { "gts.cf.core.events.topic.v1~": "main" },
+    }))
+    .expect("test configuration deserializes");
+    let deployment = crate::config::checks::check(&cfg, cfg.mode).expect("passes the checks");
+
+    assert_eq!(
+        super::registry_to_build(deployment, cfg.mode).map(|(_, role)| role),
+        None
+    );
 }
 
 #[tokio::test]
@@ -209,7 +212,8 @@ async fn init_fails_on_wildcard_bind_with_no_advertise_addr_in_cluster_mode() {
         "event-broker": {
             "config": {
                 "mode": "cluster_ingest",
-                "default_storage_backend": "gts.cf.core.events.backend.v1~cf.core.backend.sqlite.v1~",
+                "backends": { "main": { "type": "gts.cf.core.events.backend.v1~cf.core.backend.memory.v1~" } },
+                "backend_routing": { "gts.cf.core.events.topic.v1~": "main" },
                 // `registration` omitted entirely -> defaults to
                 // `listen_addr: "0.0.0.0:0"`, `advertise_addr: None`.
             }
@@ -235,115 +239,42 @@ async fn init_fails_on_wildcard_bind_with_no_advertise_addr_in_cluster_mode() {
     );
 }
 
-/// Spec "Ingest/delivery self-registration": booting in `cluster_ingest`
-/// mode registers with `DirectoryService` under `"event-broker-ingest"` at
-/// the resolved advertise address.
-/// Exactly one role maintains the specification cache. Both halves are
-/// asserted against the same seeded registry, because "the dispatcher wrote
-/// nothing" only means something next to "the ingest role wrote something".
+/// The readiness `/readyz` reports: `Starting` until `serve()` has wired the
+/// outbox and the cluster cache, then ready for as long as it serves, and
+/// `serve()` returns promptly on a stop.
 #[tokio::test]
-async fn only_the_ingest_role_maintains_the_specification_cache() {
-    const TOPIC_ID: &str = "gts.cf.core.events.topic.v1~x.eb.roles.topic.v1";
-
-    /// `patience` is how long to keep looking. Proving a cache was filled
-    /// needs a generous bound under a loaded runtime; proving one was never
-    /// filled only needs long enough for a load to have started, since the
-    /// initial load is awaited inside `serve()` before anything else is wired.
-    async fn topics_after_serve(mode: &str, patience: Duration) -> usize {
-        let hub = Arc::new(ClientHub::new());
-        let ctx = make_ctx_with_hub(mode, Arc::clone(&hub)).await;
-        // After `make_ctx_with_hub`, which registers an empty one of its own.
-        hub.register::<dyn types_registry_sdk::TypesRegistryClient>(Arc::new(
-            types_registry_sdk::testing::MockTypesRegistryClient::new().with_instances(vec![
-                types_registry_sdk::testing::make_test_instance(
-                    TOPIC_ID,
-                    json!({ "id": TOPIC_ID, "description": "a topic the roles test seeds" }),
-                ),
-            ]),
-        ));
-        let db = Arc::new(ctx.db_required().expect("the test ctx carries a database"));
-
-        let module = Arc::new(EventBrokerModule::default());
-        module.init(&ctx).await.expect("init must succeed");
-        let cancel = CancellationToken::new();
-        let serve_module = Arc::clone(&module);
-        let serve_cancel = cancel.clone();
-        let serve_task = tokio::spawn(async move { serve_module.serve(serve_cancel).await });
-
-        // The initial load is awaited inside `serve()` before anything else is
-        // wired, so a cache that is going to be filled is filled by the time
-        // the first poll finds the task still running.
-        let deadline = Instant::now() + patience;
-        let manager =
-            crate::infra::specification::TypesRegistrySpecificationManager::new(Arc::clone(&db));
-        let count = loop {
-            let found = manager.list_topics().await.len();
-            if found > 0 || Instant::now() >= deadline {
-                break found;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        };
-
-        cancel.cancel();
-        drop(serve_task.await);
-        count
-    }
-
-    assert_eq!(
-        topics_after_serve("cluster_ingest", Duration::from_secs(5)).await,
-        1,
-        "the ingest role loads and resolves what types-registry holds"
-    );
-    assert_eq!(
-        topics_after_serve("cluster_dispatcher", Duration::from_millis(250)).await,
-        0,
-        "a dispatcher forwards requests and holds no specification state"
-    );
-}
-
-#[tokio::test]
-async fn cluster_ingest_serve_registers_with_service_discovery() {
-    let (hub, _cluster) = crate::test_support::standalone_event_broker_cluster().await;
-    let directory = crate::test_support::test_directory_client(&hub);
-    let ctx = make_ctx_with_hub("cluster_ingest", Arc::clone(&hub)).await;
-
+async fn standalone_turns_ready_once_serve_has_wired_it() {
+    let ctx = make_ctx("standalone").await;
     let module = Arc::new(EventBrokerModule::default());
     module.init(&ctx).await.expect("init must succeed");
+    let check = module
+        .healthcheck(&ctx)
+        .expect("the gear always reports readiness");
+
+    let before = check.check().await;
+    assert_eq!(before.status, toolkit::HealthcheckStatus::Unhealthy);
+    assert_eq!(before.code.as_deref(), Some("starting"));
 
     let cancel = CancellationToken::new();
     let serve_module = Arc::clone(&module);
     let serve_cancel = cancel.clone();
     let serve_task = tokio::spawn(async move { serve_module.serve(serve_cancel).await });
 
-    // Poll rather than sleep a fixed span. `serve()` runs on another task, and
-    // how quickly it reaches `register_instance()` depends on how loaded the
-    // machine is - a fixed 20ms yield passed this test alone and failed most
-    // full-suite runs, because the rest of the suite competes for the runtime.
-    // The deadline is generous because it only bounds a failure; a healthy run
-    // leaves this loop on its first or second pass.
     let deadline = Instant::now() + Duration::from_secs(5);
-    let instances = loop {
-        let found = directory
-            .list_instances("event-broker-ingest")
-            .await
-            .expect("list_instances must not fail");
-        if !found.is_empty() || Instant::now() >= deadline {
-            break found;
+    let after = loop {
+        let result = check.check().await;
+        if result.status == toolkit::HealthcheckStatus::Healthy || Instant::now() >= deadline {
+            break result;
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     };
-    assert_eq!(instances.len(), 1, "instances: {instances:?}");
-    assert_eq!(
-        instances[0]
-            .rest_endpoint
-            .as_ref()
-            .map(|ep| ep.uri.as_str()),
-        Some("http://127.0.0.1:8080")
-    );
+    assert_eq!(after.status, toolkit::HealthcheckStatus::Healthy);
+    assert_eq!(after.message, None);
 
     cancel.cancel();
-    serve_task
+    tokio::time::timeout(Duration::from_secs(5), serve_task)
         .await
+        .expect("serve must return promptly on a stop")
         .expect("serve task must not panic")
         .expect("serve must return Ok on cancellation");
 }
@@ -402,43 +333,230 @@ async fn standalone_register_rest_builds_router_and_serves_a_route_with_no_auth_
     assert_eq!(json["items"], serde_json::json!([]));
 }
 
-#[test]
-fn for_mode_matches_design_md_deployment_modes_table_exhaustively() {
-    // Mirrors `DESIGN.md:2224`'s table row by row - if a fifth mode is ever
-    // added, this list forces an explicit decision here too.
-    let table = [
-        (DeploymentMode::Standalone, (true, true, false, true)),
-        (DeploymentMode::ClusterIngest, (true, false, false, true)),
-        (DeploymentMode::ClusterDelivery, (false, true, false, true)),
-        (
-            DeploymentMode::ClusterDispatcher,
-            (false, false, true, false),
-        ),
-    ];
+/// A context whose `event-broker` config is exactly `config`, with a migrated
+/// database attached, for `init` tests that stop at a startup check.
+async fn ctx_with_config(config: serde_json::Value) -> GearCtx {
+    GearCtx::new(
+        EventBrokerModule::MODULE_NAME,
+        Uuid::new_v4(),
+        Arc::new(StaticConfigProvider {
+            root: json!({ "event-broker": { "config": config } }),
+        }),
+        Arc::new(ClientHub::new()),
+        CancellationToken::new(),
+    )
+    .with_db(test_db_provider().await)
+}
 
-    for (mode, (ingest, delivery, dispatcher, reaper)) in table {
-        assert_eq!(mode.ingest_active(), ingest, "ingest mismatch for {mode:?}");
+/// The startup checks run before anything is wired, and a failing one stops
+/// `init` with its own message (feature 0005 section 2.4, C4).
+#[tokio::test]
+async fn init_fails_on_a_configuration_breaking_a_startup_check() {
+    let ctx = ctx_with_config(json!({
+        "mode": "standalone",
+        "backends": { "main": { "type": "gts.cf.core.events.backend.v1~cf.core.backend.memory.v1~" } },
+        "backend_routing": {},
+    }))
+    .await;
+
+    let err = EventBrokerModule::default()
+        .init(&ctx)
+        .await
+        .expect_err("C4 stops the start");
+
+    assert_eq!(
+        err.to_string(),
+        "backend_routing: there is no route for `gts.cf.core.events.topic.v1~`; it is required so that every topic resolves to a registry entry (feature 0005 section 2.4, C4)"
+    );
+}
+
+/// A registry entry no linked provider serves stops `init` (AC-1, C1).
+#[tokio::test]
+async fn init_fails_on_a_backend_type_no_linked_provider_serves() {
+    let ctx = ctx_with_config(json!({
+        "mode": "standalone",
+        "backends": { "main": { "type": "gts.cf.core.events.backend.v1~vendor.eb.unknown.backend.v1~" } },
+        "backend_routing": { "gts.cf.core.events.topic.v1~": "main" },
+    }))
+    .await;
+
+    let err = EventBrokerModule::default()
+        .init(&ctx)
+        .await
+        .expect_err("C1 stops the start");
+
+    assert_eq!(
+        err.to_string(),
+        "backends: entry 'main' names backend type 'gts.cf.core.events.backend.v1~vendor.eb.unknown.backend.v1~', which no provider linked into this build serves; it links [\"gts.cf.core.events.backend.v1~cf.core.backend.memory.v1~\", \"gts.cf.core.events.backend.v1~cf.core.backend.mysql.v1~\", \"gts.cf.core.events.backend.v1~cf.core.backend.postgres.v1~\", \"gts.cf.core.events.backend.v1~cf.core.backend.kafka.v1~\", \"gts.cf.core.events.backend.v1~cf.core.backend.sqlite.v1~\"]; every entry's type is served by a linked provider (feature 0005 section 2.4, C1)"
+    );
+}
+
+/// C10 on the gear's own database: every cluster mode refuses a `SQLite` one
+/// at `init`, and `standalone` runs on it (feature 0005 section 2.4).
+#[tokio::test]
+async fn init_refuses_a_sqlite_gear_database_outside_standalone() {
+    for mode in ["cluster_ingest", "cluster_delivery", "cluster_dispatcher"] {
+        let err = EventBrokerModule::default()
+            .init(&make_ctx(mode).await)
+            .await
+            .expect_err("C10 stops the start");
         assert_eq!(
-            mode.delivery_active(),
-            delivery,
-            "delivery mismatch for {mode:?}"
+            err.to_string(),
+            "database: the gear's database is SQLite; a SQLite database serves a single process, so only `standalone` mode runs on one (feature 0005 section 2.4, C10)",
+            "{mode}"
         );
-        assert_eq!(
-            mode.dispatcher_active(),
-            dispatcher,
-            "dispatcher mismatch for {mode:?}"
-        );
-        assert_eq!(mode.reaper_active(), reaper, "reaper mismatch for {mode:?}");
     }
 
-    // Dispatcher is exclusive to cluster_dispatcher; every other mode has
-    // no dispatcher constructed (`docs/ADR/0007-service-decomposition.md` D4).
-    for (mode, _) in table {
-        if mode != DeploymentMode::ClusterDispatcher {
-            assert!(
-                !mode.dispatcher_active(),
-                "{mode:?} must not activate a dispatcher"
-            );
+    EventBrokerModule::default()
+        .init(&make_ctx("standalone").await)
+        .await
+        .expect("standalone runs on a SQLite gear database");
+}
+
+/// `serve()` registers the `default` outbox group's queue with the count
+/// `outbox_groups.default.partitions` configures, the same count `init()`
+/// hands the ingest service.
+#[tokio::test]
+async fn serve_registers_the_default_outbox_group_with_its_configured_partitions() {
+    let (db, dsn) = test_db_provider_at().await;
+    let ctx = make_ctx_with_hub_and_config(
+        "standalone",
+        Arc::new(ClientHub::new()),
+        &json!({ "outbox_groups": { "default": { "partitions": 4 } } }),
+        db,
+    )
+    .await;
+    let module = Arc::new(EventBrokerModule::default());
+    module.init(&ctx).await.expect("init must succeed");
+
+    let cancel = CancellationToken::new();
+    let serve_module = Arc::clone(&module);
+    let serve_cancel = cancel.clone();
+    let serve_task = tokio::spawn(async move { serve_module.serve(serve_cancel).await });
+
+    // Polled: the queue is registered once `serve()` reaches the pipeline,
+    // which depends on how loaded the machine is. The deadline only bounds a
+    // failure.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let registered = loop {
+        let found = crate::test_support::outbox_queue_partitions(&dsn).await;
+        if found > 0 || Instant::now() >= deadline {
+            break found;
         }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    assert_eq!(registered, 4);
+
+    cancel.cancel();
+    serve_task
+        .await
+        .expect("serve task must not panic")
+        .expect("serve must return Ok on cancellation");
+}
+
+/// AC-11: a backend unreachable at start does not stop the process. The
+/// module initializes and serves, the reachable entry's topics are unaffected,
+/// and the unreachable entry's topics answer `Unavailable`.
+#[tokio::test]
+async fn an_unreachable_backend_does_not_stop_the_start_and_its_topics_are_unavailable() {
+    use event_broker_sdk::backend::{BackendError, Partition, TopicPartition};
+    use event_broker_sdk::models::PartitionRange;
+
+    const AUDIT_TOPIC: &str = "gts.cf.core.events.topic.v1~x.eb.audit.topic.v1";
+    const ORDERS_TOPIC: &str = "gts.cf.core.events.topic.v1~x.eb.orders.topic.v1";
+    let sections = json!({
+        "backends": {
+            "main": { "type": "gts.cf.core.events.backend.v1~cf.core.backend.memory.v1~" },
+            // Port 1 on loopback: nothing listens there.
+            "audit": {
+                "type": "gts.cf.core.events.backend.v1~cf.core.backend.postgres.v1~",
+                "url": "postgres://eb@127.0.0.1:1/eb",
+                "schema": "evbk",
+            },
+        },
+        "backend_routing": {
+            "gts.cf.core.events.topic.v1~": "main",
+            AUDIT_TOPIC: "audit",
+        },
+    });
+    let (db, _dsn) = test_db_provider_at().await;
+    let ctx =
+        make_ctx_with_hub_and_config("standalone", Arc::new(ClientHub::new()), &sections, db).await;
+    let module = Arc::new(EventBrokerModule::default());
+    module
+        .init(&ctx)
+        .await
+        .expect("an unreachable backend does not fail init");
+
+    let cancel = CancellationToken::new();
+    let serve_module = Arc::clone(&module);
+    let serve_cancel = cancel.clone();
+    let serve_task = tokio::spawn(async move { serve_module.serve(serve_cancel).await });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        !serve_task.is_finished(),
+        "serve keeps running with one backend unreachable"
+    );
+
+    let mut cfg = json!({ "mode": "standalone" });
+    for (key, value) in sections.as_object().expect("an object literal") {
+        cfg[key] = value.clone();
     }
+    let cfg: EventBrokerConfig =
+        serde_json::from_value(cfg).expect("test configuration deserializes");
+    let routing = crate::config::checks::routing(&cfg).expect("routes every topic");
+    let resolver = module
+        .backend_resolver
+        .get()
+        .expect("init built the registry");
+    let query = |id: &'static str| {
+        let id = toolkit_gts::GtsInstanceId::try_new(id).expect("a valid topic id");
+        let settings = crate::domain::resolution::resolve(
+            &cfg,
+            &routing,
+            &id,
+            &crate::domain::resolution::Declaration::default(),
+        )
+        .expect("resolves");
+        let topic = crate::domain::model::Topic {
+            id: id.clone(),
+            description: "a topic".to_owned(),
+            retention: None,
+            settings,
+        };
+        let backend = resolver.resolve(&topic);
+        async move {
+            backend
+                .query(
+                    &TopicPartition::new(id, Partition::new(0)),
+                    PartitionRange {
+                        start_offset: None,
+                        end_offset: None,
+                        limit: 10,
+                    },
+                )
+                .await
+        }
+    };
+
+    assert!(
+        matches!(
+            query(AUDIT_TOPIC).await,
+            Err(BackendError::Unavailable { .. })
+        ),
+        "the unreachable entry's topic answers Unavailable"
+    );
+    assert!(
+        !matches!(
+            query(ORDERS_TOPIC).await,
+            Err(BackendError::Unavailable { .. })
+        ),
+        "the reachable entry's topic is unaffected"
+    );
+
+    cancel.cancel();
+    serve_task
+        .await
+        .expect("serve task must not panic")
+        .expect("serve must return Ok on cancellation");
 }

@@ -6,7 +6,6 @@ use crate::error::EventBrokerError;
 use crate::models::{Event, ProducerMeta};
 use crate::typed_event::TypedEvent;
 
-use super::partitioning::broker_partition;
 use super::schema_cache::ProducerSchemaCache;
 use super::types::ProducerIdentity;
 
@@ -14,7 +13,11 @@ pub(crate) struct PreparedEvent {
     pub(crate) event: Event,
     /// Resolved from the event type, which owns the topic binding.
     pub(crate) topic: String,
-    pub(crate) broker_partition: u32,
+    /// The value at the event type's partition-key pointer. Places the event in
+    /// a producer outbox partition; the broker's backend assigns the topic
+    /// partition from the same value, and the producer never computes one.
+    #[cfg_attr(not(feature = "outbox"), allow(dead_code))]
+    pub(crate) key: String,
 }
 
 pub(crate) async fn prepare_event<E: TypedEvent>(
@@ -22,7 +25,7 @@ pub(crate) async fn prepare_event<E: TypedEvent>(
     identity: &ProducerIdentity,
     ctx: &toolkit_security::SecurityContext,
     event: E,
-    meta_for_partition: impl FnOnce(&str, u32) -> Option<ProducerMeta>,
+    meta_for_topic: impl FnOnce(&str) -> Option<ProducerMeta>,
 ) -> Result<PreparedEvent, EventBrokerError> {
     let type_id = E::TYPE_ID;
     let subject = event.subject();
@@ -52,13 +55,13 @@ pub(crate) async fn prepare_event<E: TypedEvent>(
         meta: None,
     };
 
-    let partition_count = cache.partition_count(&topic).await?;
-    let partition = broker_partition(&prepared.partition_input(&pointer)?, partition_count);
-    prepared.meta = meta_for_partition(&topic, partition);
+    cache.ensure_topic(&topic).await?;
+    let key = prepared.partition_input(&pointer)?;
+    prepared.meta = meta_for_topic(&topic);
 
     Ok(PreparedEvent {
-        broker_partition: partition,
         topic,
+        key,
         event: prepared,
     })
 }
