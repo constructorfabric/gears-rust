@@ -19,9 +19,10 @@ use llm_gateway_sdk::models::core::{
 };
 use llm_gateway_sdk::models::streaming::{ErrorEvent, OutputTextEvent, ResponseSnapshotEvent};
 use llm_gateway_sdk::{
-    CreateResponseBody, EmbeddingRequest, EmbeddingResponse, LlmGatewayError,
-    LlmGatewayProviderPluginClientV1, MediaInputMode, ProviderCallCtx, ProviderPluginCapabilities,
-    ResponseEventStream, ResponseInput, ResponseResource, StreamingEvent, Usage,
+    CreateResponseBody, EmbeddingData, EmbeddingRequest, EmbeddingResponse, EmbeddingVector,
+    LlmGatewayError, LlmGatewayProviderPluginClientV1, MediaInputMode, ProviderCallCtx,
+    ProviderPluginCapabilities, ResponseEventStream, ResponseInput, ResponseResource,
+    StreamingEvent, Usage,
 };
 use model_registry_sdk::{ModelInfoV1, ModelV1};
 use secrecy::SecretString;
@@ -188,6 +189,20 @@ pub fn sample_response_with_text(id: &str, model: &str, text: &str) -> ResponseR
     }]))
     .expect("output message deserializes");
     resource
+}
+
+/// Embedding response `id` for `model` with one two-component vector.
+#[must_use]
+pub fn sample_embedding_response(id: &str, model: &str) -> EmbeddingResponse {
+    EmbeddingResponse::new(
+        id,
+        model,
+        vec![EmbeddingData {
+            index: 0,
+            embedding: EmbeddingVector::Floats(vec![0.5, 0.25]),
+        }],
+        Usage::unknown(),
+    )
 }
 
 // ── Streaming event builders ────────────────────────────────────────────────
@@ -440,6 +455,9 @@ impl ModelResolver for FakeModels {
 
 // ── Provider plugin fake ────────────────────────────────────────────────────
 
+type EmbeddingOutcome =
+    Box<dyn Fn(&ProviderCallCtx) -> Result<EmbeddingResponse, LlmGatewayError> + Send + Sync>;
+
 type PluginOutcome =
     Box<dyn Fn(&ProviderCallCtx) -> Result<ResponseResource, LlmGatewayError> + Send + Sync>;
 
@@ -450,6 +468,10 @@ pub struct FakePlugin {
     calls: AtomicUsize,
     contexts: Mutex<Vec<ProviderCallCtx>>,
     bodies: Mutex<Vec<CreateResponseBody>>,
+    embedding_outcome: Mutex<EmbeddingOutcome>,
+    embedding_calls: AtomicUsize,
+    embedding_requests: Mutex<Vec<EmbeddingRequest>>,
+    embedding_contexts: Mutex<Vec<ProviderCallCtx>>,
     web_search: AtomicBool,
     log: Arc<CallLog>,
     /// Notified when a call has entered the plugin (only when `gated`).
@@ -525,6 +547,12 @@ impl FakePlugin {
             calls: AtomicUsize::new(0),
             contexts: Mutex::new(Vec::new()),
             bodies: Mutex::new(Vec::new()),
+            embedding_outcome: Mutex::new(Box::new(|c| {
+                Ok(sample_embedding_response(&c.request_id, "text-embedding"))
+            })),
+            embedding_calls: AtomicUsize::new(0),
+            embedding_requests: Mutex::new(Vec::new()),
+            embedding_contexts: Mutex::new(Vec::new()),
             web_search: AtomicBool::new(false),
             log,
             entered: Notify::new(),
@@ -542,6 +570,42 @@ impl FakePlugin {
     #[must_use]
     pub fn calls(&self) -> usize {
         self.calls.load(Ordering::SeqCst)
+    }
+
+    /// Script the `create_embedding` outcome (default: one vector echoing
+    /// `ctx.request_id` as the response `id`).
+    pub fn set_embedding(
+        &self,
+        outcome: impl Fn(&ProviderCallCtx) -> Result<EmbeddingResponse, LlmGatewayError>
+        + Send
+        + Sync
+        + 'static,
+    ) {
+        *self.embedding_outcome.lock().expect("embedding outcome") = Box::new(outcome);
+    }
+
+    /// Number of `create_embedding` calls.
+    #[must_use]
+    pub fn embedding_calls(&self) -> usize {
+        self.embedding_calls.load(Ordering::SeqCst)
+    }
+
+    /// Embedding requests received so far (the effective requests).
+    #[must_use]
+    pub fn embedding_requests(&self) -> Vec<EmbeddingRequest> {
+        self.embedding_requests
+            .lock()
+            .expect("embedding requests")
+            .clone()
+    }
+
+    /// Provider call contexts of the embedding calls received so far.
+    #[must_use]
+    pub fn embedding_contexts(&self) -> Vec<ProviderCallCtx> {
+        self.embedding_contexts
+            .lock()
+            .expect("embedding contexts")
+            .clone()
     }
 
     /// Report (or stop reporting) `streaming_transport`.
@@ -659,10 +723,24 @@ impl LlmGatewayProviderPluginClientV1 for FakePlugin {
     async fn create_embedding(
         &self,
         _ctx: &SecurityContext,
-        _call: &ProviderCallCtx,
-        _req: EmbeddingRequest,
+        call: &ProviderCallCtx,
+        req: EmbeddingRequest,
     ) -> Result<EmbeddingResponse, LlmGatewayError> {
-        Err(LlmGatewayError::internal("test fake: no embeddings"))
+        self.embedding_calls.fetch_add(1, Ordering::SeqCst);
+        self.log.push("plugin");
+        self.embedding_requests
+            .lock()
+            .expect("embedding requests")
+            .push(req);
+        self.embedding_contexts
+            .lock()
+            .expect("embedding contexts")
+            .push(call.clone());
+        if self.gated {
+            self.entered.notify_one();
+            self.release.notified().await;
+        }
+        (self.embedding_outcome.lock().expect("embedding outcome"))(call)
     }
 }
 
@@ -876,6 +954,8 @@ pub struct FakeRules {
     pub unsupported_hints: BTreeSet<&'static str>,
     /// Construct reported for every schema, when set.
     pub unsupported_construct: Option<&'static str>,
+    /// Reject every `dimensions` value.
+    pub reject_all_dimensions: bool,
 }
 
 impl ProviderRules for FakeRules {
@@ -885,6 +965,10 @@ impl ProviderRules for FakeRules {
 
     fn supports_cache_control(&self, _model: &ModelInfoV1, hint: &str) -> bool {
         !self.unsupported_hints.contains(hint)
+    }
+
+    fn supports_dimensions(&self, _model: &ModelInfoV1, _dimensions: u32) -> bool {
+        !self.reject_all_dimensions
     }
 
     fn unsupported_schema_construct(
@@ -967,6 +1051,23 @@ impl Harness {
             self.log.clone(),
         );
         self.plugin.set_streaming_transport(true);
+    }
+
+    /// Serve an embedding model (`supported_api = ["embedding"]`), so
+    /// `create_embedding` passes the capability gate.
+    pub fn enable_embeddings(&mut self) {
+        self.enable_embeddings_with(|_| {});
+    }
+
+    /// [`Self::enable_embeddings`] with an extra patch on the model's wire JSON.
+    pub fn enable_embeddings_with(&mut self, patch: impl FnOnce(&mut serde_json::Value)) {
+        self.models = FakeModels::found(
+            sample_model_info_patched(OPENAI_TYPE, |v| {
+                v["supported_api"] = serde_json::json!(["embedding"]);
+                patch(v);
+            }),
+            self.log.clone(),
+        );
     }
 
     /// Build the service over the current fakes.

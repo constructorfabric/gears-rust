@@ -29,6 +29,12 @@ pub const GENERIC_PARAMETERS: &[&str] = &[
 /// Cache-control hint carried by the SDK request.
 pub const PROMPT_CACHE_KEY: &str = "prompt_cache_key";
 
+/// Wire name of the embeddings `input_type` parameter; rules are asked about
+/// it through [`ProviderRules::supports_parameter`]. `dimensions` is not a
+/// droppable parameter and has its own hook
+/// ([`ProviderRules::supports_dimensions`]).
+pub const INPUT_TYPE: &str = "input_type";
+
 /// Provider rules for one provider type.
 pub trait ProviderRules: Send + Sync {
     /// Whether `model` supports the generic parameter `parameter` (one of
@@ -38,6 +44,11 @@ pub trait ProviderRules: Send + Sync {
     /// Whether the provider has an equivalent of the cache-control hint
     /// `hint` (e.g. [`PROMPT_CACHE_KEY`]).
     fn supports_cache_control(&self, model: &ModelInfoV1, hint: &str) -> bool;
+
+    /// Whether `model` can produce embedding vectors of exactly `dimensions`
+    /// components. `false` rejects the request with `unsupported_parameter`
+    /// (`dimensions` is never dropped, DESIGN §3.2).
+    fn supports_dimensions(&self, model: &ModelInfoV1, dimensions: u32) -> bool;
 
     /// The name of the first construct of `schema` that the provider's JSON
     /// Schema subset cannot express, or `None` when the schema is expressible.
@@ -60,6 +71,10 @@ impl ProviderRules for PermissiveRules {
     }
 
     fn supports_cache_control(&self, _model: &ModelInfoV1, _hint: &str) -> bool {
+        true
+    }
+
+    fn supports_dimensions(&self, _model: &ModelInfoV1, _dimensions: u32) -> bool {
         true
     }
 

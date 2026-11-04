@@ -47,14 +47,31 @@
 //! `text`), measured in serialized bytes.
 //!
 //! `ignored_parameters` is sorted ascending and deduplicated.
+//!
+//! # Embeddings contract ([`CapabilityChecker::check_embedding`])
+//!
+//! - `supported_api` lacks `Embedding` -> `capability_not_supported`
+//!   (`embeddings`).
+//! - empty input (`""`, `[]`) -> `validation_error` (param `input`); more
+//!   than `max_embedding_inputs` texts; a batch holding an empty text is
+//!   empty input too (whitespace-only texts are allowed) -> `validation_error` (param `input`).
+//! - `dimensions` the rules do not support -> `unsupported_parameter`
+//!   (`dimensions`), even with `drop_unsupported_params` (never dropped).
+//! - `input_type` the rules do not support (`supports_parameter`): error, or
+//!   dropped and listed with `drop_unsupported_params`.
+//! - `encoding_format` is never checked: the plugin always honors it.
+//! - `extra_fields` keys must be in `allow_extra_params`, else error (or
+//!   dropped and listed), as for responses.
+//! - the model's `default_parameters` are generation defaults and are not
+//!   applied to embeddings; no override policy applies.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use llm_gateway_sdk::models::items::InputContent;
 use llm_gateway_sdk::{
-    CreateResponseBody, InputContentPart, InputItem, LlmGatewayError, NamedToolChoice,
-    ResponseInput, TextFormatKind, Tool, ToolChoice,
+    CreateResponseBody, EmbeddingInput, EmbeddingRequest, InputContentPart, InputItem,
+    LlmGatewayError, NamedToolChoice, ResponseInput, TextFormatKind, Tool, ToolChoice,
 };
 use model_registry_sdk::{ModelInfoV1, SupportedApi};
 use serde::Serialize;
@@ -62,7 +79,7 @@ use serde::de::DeserializeOwned;
 use toolkit_macros::domain_model;
 
 use super::ports::ResolvedPlugin;
-use super::provider_rules::{PROMPT_CACHE_KEY, ProviderRules, ProviderRulesRegistry};
+use super::provider_rules::{INPUT_TYPE, PROMPT_CACHE_KEY, ProviderRules, ProviderRulesRegistry};
 use crate::config::LimitsConfig;
 
 /// Outcome of the checks: the request to dispatch and the parameters that
@@ -74,6 +91,17 @@ pub struct EffectiveRequest {
     /// parameters removed).
     pub body: CreateResponseBody,
     /// Dropped and overridden parameters, sorted ascending, no duplicates.
+    pub ignored_parameters: Vec<String>,
+}
+
+/// Outcome of the embedding checks: the request to dispatch and the
+/// parameters that were dropped.
+#[domain_model]
+#[derive(Debug, Clone, PartialEq)]
+pub struct EffectiveEmbedding {
+    /// The request to hand to the plugin (dropped parameters removed).
+    pub request: EmbeddingRequest,
+    /// Dropped parameters, sorted ascending, no duplicates.
     pub ignored_parameters: Vec<String>,
 }
 
@@ -130,6 +158,76 @@ impl CapabilityChecker {
             body,
             ignored_parameters,
         })
+    }
+
+    /// Run the embedding checks on `request` for `model`; see the module
+    /// docs ("Embeddings") for the contract.
+    ///
+    /// # Errors
+    ///
+    /// `capability_not_supported`, `unsupported_parameter` or
+    /// `validation_error`.
+    pub fn check_embedding(
+        &self,
+        model: &ModelInfoV1,
+        request: EmbeddingRequest,
+    ) -> Result<EffectiveEmbedding, LlmGatewayError> {
+        require(
+            model.supported_api.contains(&SupportedApi::Embedding),
+            "embeddings",
+        )?;
+        self.check_embedding_input(&request.input)?;
+
+        let rules = self.rules.rules_for(model.gts_type.as_ref());
+        if let Some(dimensions) = request.dimensions {
+            // Never dropped, whatever `drop_unsupported_params` says.
+            let exceeds_model = model
+                .context_window
+                .output_vector_size
+                .is_some_and(|size| dimensions > size);
+            // Zero dimensions can never be honored exactly.
+            if dimensions == 0 || exceeds_model || !rules.supports_dimensions(model, dimensions) {
+                return Err(LlmGatewayError::unsupported_parameter("dimensions"));
+            }
+        }
+
+        let mut request = request;
+        let mut policy = ParameterPolicy {
+            rules: rules.as_ref(),
+            model,
+            drop_unsupported: request.drop_unsupported_params.unwrap_or(false),
+            ignored: Vec::new(),
+        };
+        policy.parameter(INPUT_TYPE, &mut request.input_type, None)?;
+        policy.extra_fields(&mut request.extra_fields)?;
+
+        let mut ignored_parameters = policy.ignored;
+        ignored_parameters.sort();
+        ignored_parameters.dedup();
+        Ok(EffectiveEmbedding {
+            request,
+            ignored_parameters,
+        })
+    }
+
+    fn check_embedding_input(&self, input: &EmbeddingInput) -> Result<(), LlmGatewayError> {
+        let texts: &[String] = match input {
+            EmbeddingInput::Single(text) => std::slice::from_ref(text),
+            EmbeddingInput::Many(texts) => texts,
+        };
+        if texts.is_empty() || texts.iter().any(String::is_empty) {
+            return Err(LlmGatewayError::validation_param(
+                "input must not be empty",
+                "input",
+            ));
+        }
+        if texts.len() > self.limits.max_embedding_inputs {
+            return Err(LlmGatewayError::validation_param(
+                "too many embedding inputs",
+                "input",
+            ));
+        }
+        Ok(())
     }
 
     fn check_limits(&self, body: &CreateResponseBody) -> Result<(), LlmGatewayError> {
@@ -413,7 +511,7 @@ impl ParameterPolicy<'_> {
             self.ignored.push(PROMPT_CACHE_KEY.to_owned());
         }
 
-        self.extra_fields(body)
+        self.extra_fields(&mut body.extra_fields)
     }
 
     fn parameter<T: PartialEq>(
@@ -448,8 +546,11 @@ impl ParameterPolicy<'_> {
         Ok(())
     }
 
-    fn extra_fields(&mut self, body: &mut CreateResponseBody) -> Result<(), LlmGatewayError> {
-        let Some(extras) = body.extra_fields.as_mut() else {
+    fn extra_fields(
+        &mut self,
+        fields: &mut Option<HashMap<String, serde_json::Value>>,
+    ) -> Result<(), LlmGatewayError> {
+        let Some(extras) = fields.as_mut() else {
             return Ok(());
         };
         let mut unlisted: Vec<String> = extras
@@ -468,7 +569,7 @@ impl ParameterPolicy<'_> {
             self.ignored.push(key);
         }
         if extras.is_empty() {
-            body.extra_fields = None;
+            *fields = None;
         }
         Ok(())
     }
@@ -478,3 +579,8 @@ impl ParameterPolicy<'_> {
 #[cfg_attr(coverage_nightly, coverage(off))]
 #[path = "capability_checker_tests.rs"]
 mod capability_checker_tests;
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+#[path = "capability_checker_embedding_tests.rs"]
+mod capability_checker_embedding_tests;

@@ -6,8 +6,8 @@ use std::time::Duration;
 
 use authz_resolver_sdk::PolicyEnforcer;
 use llm_gateway_sdk::{
-    EmbeddingInput, EmbeddingRequest, InputItem, ItemReference, LlmGatewayClientV1,
-    LlmGatewayError, ProviderErrorCategory, ProviderFailure, ResponseInput,
+    InputItem, ItemReference, LlmGatewayClientV1, LlmGatewayError, ProviderErrorCategory,
+    ProviderFailure, ResponseInput,
 };
 use model_registry_sdk::ModelInfoV1;
 use secrecy::{ExposeSecret, SecretString};
@@ -521,22 +521,6 @@ async fn local_client_streaming_without_model_support_is_capability_not_supporte
         1,
         "streaming requests are authorized first (F-006)"
     );
-}
-
-#[tokio::test]
-async fn local_client_embeddings_is_capability_not_supported() {
-    let h = Harness::new();
-    let client = LlmGatewayLocalClient::new(h.service());
-    let err = client
-        .create_embedding(
-            &ctx(),
-            EmbeddingRequest::new("m", EmbeddingInput::Single("hi".to_owned())),
-        )
-        .await
-        .expect_err("embeddings are not served yet");
-
-    assert_eq!(err.code(), "capability_not_supported");
-    assert_eq!(h.pdp.calls(), 0);
 }
 
 // ── cancellation ────────────────────────────────────────────────────────────

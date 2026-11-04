@@ -11,7 +11,9 @@ use llm_gateway_sdk::{ResponseEventStream, StreamingEvent};
 use toolkit::api::canonical_prelude::Json;
 use toolkit_security::SecurityContext;
 
-use super::dto::{CreateResponseRequest, ResponseResourceDto};
+use super::dto::{
+    CreateEmbeddingRequest, CreateResponseRequest, EmbeddingResponseDto, ResponseResourceDto,
+};
 use super::error::error_to_problem;
 use crate::domain::Service;
 
@@ -38,6 +40,19 @@ pub async fn handle_create_response(
         Err(failure) => {
             error_to_problem(&failure.error, Some(&failure.response_id)).into_response()
         }
+    }
+}
+
+/// `POST /llm-gateway/v1/embeddings`: `200` JSON `EmbeddingResponse`, or an
+/// `application/problem+json` Problem carrying the allocated request id.
+pub async fn handle_create_embedding(
+    Extension(ctx): Extension<SecurityContext>,
+    Extension(service): Extension<Arc<Service>>,
+    Json(req): Json<CreateEmbeddingRequest>,
+) -> Response {
+    match service.create_embedding_traced(&ctx, req.request).await {
+        Ok(response) => Json(EmbeddingResponseDto { response }).into_response(),
+        Err(failure) => error_to_problem(&failure.error, Some(&failure.request_id)).into_response(),
     }
 }
 

@@ -15,4 +15,4 @@ pub mod tool_resolver;
 
 pub use credential_broker::KeylessCredentialBroker;
 pub use local_client::LlmGatewayLocalClient;
-pub use service::{CreateResponseFailure, Service};
+pub use service::{CreateEmbeddingFailure, CreateResponseFailure, Service};

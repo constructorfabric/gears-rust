@@ -18,6 +18,7 @@ pub fn register_routes(
     openapi: &dyn OpenApiRegistry,
     service: Arc<Service>,
 ) -> Router {
+    let router = register_embeddings(router, openapi);
     OperationBuilder::post("/llm-gateway/v1/responses")
         .operation_id("llm_gateway.responses.create")
         .summary("Create a response")
@@ -50,7 +51,39 @@ pub fn register_routes(
         .layer(axum::Extension(service))
 }
 
+fn register_embeddings(router: Router, openapi: &dyn OpenApiRegistry) -> Router {
+    OperationBuilder::post("/llm-gateway/v1/embeddings")
+        .operation_id("llm_gateway.embeddings.create")
+        .summary("Create embeddings")
+        .description(
+            "Gateway embeddings: vectors (floats or base64) and usage for the input texts.",
+        )
+        .tag(RESPONSES_TAG)
+        .authenticated()
+        .no_license_required()
+        .json_request::<dto::CreateEmbeddingRequest>(openapi, "Embedding request body")
+        .handler(handlers::handle_create_embedding)
+        .json_response_with_schema::<dto::EmbeddingResponseDto>(
+            openapi,
+            StatusCode::OK,
+            "The embedding vectors and usage",
+        )
+        .standard_errors(openapi)
+        .problem_response(
+            openapi,
+            StatusCode::NOT_IMPLEMENTED,
+            "Provider not supported",
+        )
+        .error_503(openapi)
+        .register(router, openapi)
+}
+
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 #[path = "routes_tests.rs"]
 mod routes_tests;
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+#[path = "routes_embedding_tests.rs"]
+mod routes_embedding_tests;

@@ -55,6 +55,10 @@ pub struct LimitsConfig {
     /// function tool schema or the structured output schema). Over the limit:
     /// `validation_error`.
     pub max_schema_bytes: usize,
+    /// Maximum number of input texts in one embeddings request. Over the
+    /// limit: `validation_error` (param `input`) before quota admission and
+    /// credential retrieval.
+    pub max_embedding_inputs: usize,
 }
 
 impl Default for LimitsConfig {
@@ -65,6 +69,7 @@ impl Default for LimitsConfig {
             max_input_items: 1_000,
             max_tools: 128,
             max_schema_bytes: 262_144,
+            max_embedding_inputs: 2_048,
         }
     }
 }

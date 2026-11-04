@@ -7,9 +7,11 @@ use std::sync::Arc;
 
 use authz_resolver_sdk::PolicyEnforcer;
 use llm_gateway_sdk::{
-    CreateResponseBody, InputItem, LlmGatewayError, ProviderCallCtx, ProviderErrorCategory,
-    ResponseEventStream, ResponseInput, ResponseResource, TextFormatKind,
+    CreateResponseBody, EmbeddingRequest, EmbeddingResponse, InputItem, LlmGatewayError,
+    ProviderCallCtx, ProviderErrorCategory, ResponseEventStream, ResponseInput, ResponseResource,
+    TextFormatKind,
 };
+use model_registry_sdk::ModelInfoV1;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
 use toolkit_macros::domain_model;
@@ -18,7 +20,7 @@ use tracing::Instrument as _;
 use uuid::Uuid;
 
 use super::authz::{actions, authorize};
-use super::capability_checker::{CapabilityChecker, EffectiveRequest};
+use super::capability_checker::{CapabilityChecker, EffectiveEmbedding, EffectiveRequest};
 use super::output_validator::OutputValidator;
 use super::ports::{
     CredentialBroker, ModelResolver, PluginDirectory, ResolvedPlugin, ToolSchemaSource,
@@ -35,6 +37,18 @@ use crate::config::{LimitsConfig, StreamConfig};
 pub struct CreateResponseFailure {
     /// The response `id` allocated at the start of the pipeline.
     pub response_id: String,
+    /// The failure.
+    pub error: LlmGatewayError,
+}
+
+/// A failed create-embedding call together with the request `id` that was
+/// allocated for it, so REST Problems can carry the id.
+#[domain_model]
+#[derive(Debug)]
+pub struct CreateEmbeddingFailure {
+    /// The embedding request `id` (`emb_<uuid v7>`) allocated at the start of
+    /// the pipeline.
+    pub request_id: String,
     /// The failure.
     pub error: LlmGatewayError,
 }
@@ -104,15 +118,15 @@ fn log_failure(response_id: &str, err: &LlmGatewayError) {
 }
 
 fn log_error(response_id: &str, code: &str, chain: &str) {
-    tracing::error!(response_id, code, error = %chain, "create_response failed");
+    tracing::error!(response_id, code, error = %chain, "gateway request failed");
 }
 
 fn log_warn(response_id: &str, code: &str, chain: &str) {
-    tracing::warn!(response_id, code, error = %chain, "create_response failed");
+    tracing::warn!(response_id, code, error = %chain, "gateway request failed");
 }
 
 fn log_info(response_id: &str, code: &str, chain: &str) {
-    tracing::info!(response_id, code, error = %chain, "create_response failed");
+    tracing::info!(response_id, code, error = %chain, "gateway request failed");
 }
 
 fn has_item_reference(body: &CreateResponseBody) -> bool {
@@ -272,20 +286,9 @@ impl Service {
         let model = body.model.clone();
         let span = |stage: &'static str| tracing::info_span!("llm_gateway.stage", stage, response_id = %response_id, model = %model);
 
-        authorize(&self.enforcer, ctx, actions::CREATE_RESPONSE)
-            .instrument(span("authorize"))
+        let slot = self
+            .admit(ctx, actions::CREATE_RESPONSE, response_id, &model, mode)
             .await?;
-
-        let slot = {
-            let _enter = span("acquire_slot").entered();
-            let pool = match mode {
-                Mode::Sync => &self.inflight_sync,
-                Mode::Stream => &self.inflight_streams,
-            };
-            Arc::clone(pool)
-                .try_acquire_owned()
-                .map_err(|_| LlmGatewayError::GatewayUnavailable)?
-        };
 
         {
             let _enter = span("capability_gate").entered();
@@ -294,17 +297,7 @@ impl Service {
             }
         }
 
-        let model_info = self
-            .models
-            .resolve(ctx, &model)
-            .instrument(span("resolve_model"))
-            .await?;
-
-        let plugin = self
-            .plugins
-            .resolve(model_info.gts_type.as_ref())
-            .instrument(span("select_plugin"))
-            .await?;
+        let (model_info, plugin) = self.resolve_target(ctx, response_id, &model).await?;
 
         let mut body = body;
         if let Some(tools) = body.tools.take() {
@@ -345,16 +338,9 @@ impl Service {
             _ => None,
         };
 
-        let api_key = self
-            .credentials
-            .resolve(ctx, &model_info)
-            .instrument(span("resolve_credentials"))
+        let call = self
+            .provider_call(ctx, model_info, response_id, &model, cancel)
             .await?;
-
-        let mut call = ProviderCallCtx::new(model_info, response_id, cancel);
-        if let Some(key) = api_key {
-            call = call.with_api_key(key);
-        }
         Ok(Prepared {
             plugin,
             call,
@@ -363,6 +349,78 @@ impl Service {
             output_schema,
             slot,
         })
+    }
+
+    /// Shared first steps: authorize `action`, then take an in-flight slot of
+    /// the `mode`'s pool.
+    async fn admit(
+        &self,
+        ctx: &SecurityContext,
+        action: &str,
+        request_id: &str,
+        model: &str,
+        mode: Mode,
+    ) -> Result<OwnedSemaphorePermit, LlmGatewayError> {
+        let span = |stage: &'static str| tracing::info_span!("llm_gateway.stage", stage, response_id = %request_id, model = %model);
+        authorize(&self.enforcer, ctx, action)
+            .instrument(span("authorize"))
+            .await?;
+
+        let _enter = span("acquire_slot").entered();
+        let pool = match mode {
+            Mode::Sync => &self.inflight_sync,
+            Mode::Stream => &self.inflight_streams,
+        };
+        Arc::clone(pool)
+            .try_acquire_owned()
+            .map_err(|_| LlmGatewayError::GatewayUnavailable)
+    }
+
+    /// Shared model resolution and plugin selection.
+    async fn resolve_target(
+        &self,
+        ctx: &SecurityContext,
+        request_id: &str,
+        model: &str,
+    ) -> Result<(ModelInfoV1, ResolvedPlugin), LlmGatewayError> {
+        let span = |stage: &'static str| tracing::info_span!("llm_gateway.stage", stage, response_id = %request_id, model = %model);
+        let model_info = self
+            .models
+            .resolve(ctx, model)
+            .instrument(span("resolve_model"))
+            .await?;
+        let plugin = self
+            .plugins
+            .resolve(model_info.gts_type.as_ref())
+            .instrument(span("select_plugin"))
+            .await?;
+        Ok((model_info, plugin))
+    }
+
+    /// Shared credential resolution and provider call context.
+    async fn provider_call(
+        &self,
+        ctx: &SecurityContext,
+        model_info: ModelInfoV1,
+        request_id: &str,
+        model: &str,
+        cancel: CancellationToken,
+    ) -> Result<ProviderCallCtx, LlmGatewayError> {
+        let api_key = self
+            .credentials
+            .resolve(ctx, &model_info)
+            .instrument(tracing::info_span!(
+                "llm_gateway.stage",
+                stage = "resolve_credentials",
+                response_id = %request_id,
+                model = %model
+            ))
+            .await?;
+        let mut call = ProviderCallCtx::new(model_info, request_id, cancel);
+        if let Some(key) = api_key {
+            call = call.with_api_key(key);
+        }
+        Ok(call)
     }
 
     /// Create a response (sync); SDK-shaped wrapper over
@@ -475,6 +533,99 @@ impl Service {
     }
 }
 
+impl Service {
+    /// Create embeddings and return them, or the failure with the allocated
+    /// request `id`.
+    ///
+    /// # Errors
+    ///
+    /// Any [`LlmGatewayError`] of the embeddings pipeline (DESIGN §4.1).
+    pub async fn create_embedding_traced(
+        &self,
+        ctx: &SecurityContext,
+        req: EmbeddingRequest,
+    ) -> Result<EmbeddingResponse, Box<CreateEmbeddingFailure>> {
+        let request_id = format!("emb_{}", Uuid::now_v7().simple());
+        match self.run_embedding(ctx, req, &request_id).await {
+            Ok(response) => Ok(response),
+            Err(error) => {
+                log_failure(&request_id, &error);
+                Err(Box::new(CreateEmbeddingFailure { request_id, error }))
+            }
+        }
+    }
+
+    async fn run_embedding(
+        &self,
+        ctx: &SecurityContext,
+        req: EmbeddingRequest,
+        request_id: &str,
+    ) -> Result<EmbeddingResponse, LlmGatewayError> {
+        // Cancelled on every exit path, including a dropped future.
+        let cancel = CancellationToken::new();
+        let _cancel_on_drop = cancel.clone().drop_guard();
+
+        let model = req.model.clone();
+        let _slot = self
+            .admit(
+                ctx,
+                actions::CREATE_EMBEDDING,
+                request_id,
+                &model,
+                Mode::Sync,
+            )
+            .await?;
+        let (model_info, plugin) = self.resolve_target(ctx, request_id, &model).await?;
+
+        let EffectiveEmbedding {
+            request,
+            ignored_parameters,
+        } = {
+            let _enter = tracing::info_span!("llm_gateway.stage", stage = "capability_check", response_id = %request_id, model = %model).entered();
+            self.checker.check_embedding(&model_info, req)?
+        };
+
+        let call = self
+            .provider_call(ctx, model_info, request_id, &model, cancel)
+            .await?;
+
+        // One call, never retried: calls are not idempotent.
+        let mut response = plugin
+            .client
+            .create_embedding(ctx, &call, request)
+            .instrument(tracing::info_span!(
+                "llm_gateway.stage",
+                stage = "dispatch",
+                response_id = %request_id,
+                model = %model
+            ))
+            .await?;
+
+        let mut ignored = std::mem::take(&mut response.ignored_parameters);
+        ignored.extend(ignored_parameters);
+        ignored.sort();
+        ignored.dedup();
+        response.ignored_parameters = ignored;
+        request_id.clone_into(&mut response.id);
+        Ok(response)
+    }
+
+    /// SDK-shaped wrapper over [`Self::create_embedding_traced`].
+    ///
+    /// # Errors
+    ///
+    /// Any [`LlmGatewayError`] of the embeddings pipeline (DESIGN §4.1).
+    pub async fn create_embedding(
+        &self,
+        ctx: &SecurityContext,
+        req: EmbeddingRequest,
+    ) -> Result<EmbeddingResponse, LlmGatewayError> {
+        self.create_embedding_traced(ctx, req)
+            .await
+            .map_err(|failure| failure.error)
+    }
+}
+
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 #[path = "service_tests.rs"]
@@ -489,3 +640,8 @@ mod service_checks_tests;
 #[cfg_attr(coverage_nightly, coverage(off))]
 #[path = "service_stream_tests.rs"]
 mod service_stream_tests;
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+#[path = "service_embedding_tests.rs"]
+mod service_embedding_tests;

@@ -46,9 +46,9 @@ impl LlmGatewayClientV1 for LlmGatewayLocalClient {
 
     async fn create_embedding(
         &self,
-        _ctx: &SecurityContext,
-        _req: EmbeddingRequest,
+        ctx: &SecurityContext,
+        req: EmbeddingRequest,
     ) -> Result<EmbeddingResponse, LlmGatewayError> {
-        Err(LlmGatewayError::capability_not_supported("embeddings"))
+        self.svc.create_embedding(ctx, req).await
     }
 }

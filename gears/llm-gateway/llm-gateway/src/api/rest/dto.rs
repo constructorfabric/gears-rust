@@ -1,7 +1,9 @@
 //! Wire DTOs. The SDK models stay free of `utoipa::ToSchema`, so the REST
 //! layer wraps them in thin DTOs.
 
-use llm_gateway_sdk::{CreateResponseBody, ResponseResource, StreamingEvent};
+use llm_gateway_sdk::{
+    CreateResponseBody, EmbeddingRequest, EmbeddingResponse, ResponseResource, StreamingEvent,
+};
 
 /// `POST /responses` request: the Open Responses body plus the REST-only
 /// `stream` flag.
@@ -36,4 +38,24 @@ pub struct StreamingEventDto {
     #[serde(flatten)]
     #[schema(value_type = Object)]
     pub event: StreamingEvent,
+}
+
+/// `POST /embeddings` request body (the SDK `EmbeddingRequest`).
+#[derive(Debug, Clone)]
+#[toolkit_macros::api_dto(request)]
+pub struct CreateEmbeddingRequest {
+    /// The embedding request.
+    #[serde(flatten)]
+    #[schema(value_type = Object)]
+    pub request: EmbeddingRequest,
+}
+
+/// `POST /embeddings` response body (the SDK `EmbeddingResponse`).
+#[derive(Debug, Clone)]
+#[toolkit_macros::api_dto(response)]
+pub struct EmbeddingResponseDto {
+    /// The embedding response.
+    #[serde(flatten)]
+    #[schema(value_type = Object)]
+    pub response: EmbeddingResponse,
 }

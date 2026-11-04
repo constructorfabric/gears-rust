@@ -72,3 +72,39 @@ fn unknown_provider_type_gets_the_permissive_default() {
     assert!(fallback.supports_parameter(&model, "temperature"));
     assert_eq!(fallback.unsupported_schema_construct(&model, &schema), None);
 }
+
+#[test]
+fn permissive_rules_support_every_dimensions_value() {
+    let model = sample_model_info(OPENAI_TYPE);
+    assert!(PermissiveRules.supports_dimensions(&model, 1));
+    assert!(PermissiveRules.supports_dimensions(&model, 3_072));
+}
+
+#[test]
+fn permissive_rules_support_the_input_type_parameter() {
+    let model = sample_model_info(OPENAI_TYPE);
+    assert!(PermissiveRules.supports_parameter(&model, super::INPUT_TYPE));
+    assert_eq!(super::INPUT_TYPE, "input_type");
+}
+
+#[test]
+fn registry_serves_provider_specific_dimensions_rules() {
+    let registry = ProviderRulesRegistry::permissive().with_rules(
+        OPENAI_TYPE,
+        Arc::new(FakeRules {
+            reject_all_dimensions: true,
+            ..FakeRules::default()
+        }),
+    );
+    let model = sample_model_info(OPENAI_TYPE);
+    assert!(
+        !registry
+            .rules_for(OPENAI_TYPE)
+            .supports_dimensions(&model, 8)
+    );
+    assert!(
+        registry
+            .rules_for(OTHER_TYPE)
+            .supports_dimensions(&model, 8)
+    );
+}
