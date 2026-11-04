@@ -28,7 +28,7 @@ use toolkit_security::AccessScope;
 use uuid::Uuid;
 
 use crate::domain::ports::{Actor, QuotaStore, StoreError};
-use crate::infra::outbox::{EnqueueError, NotificationEnqueuer};
+use crate::infra::outbox::{AttemptWakes, EnqueueError, NotificationOutbox, settling};
 use crate::infra::storage::consumption_store::{TxError as CounterTxError, credit_counter};
 use crate::infra::storage::cursor::{self, MAX_FILTER_IDS};
 use crate::infra::storage::entity::quota;
@@ -49,7 +49,7 @@ const LOG_TARGET: &str = "qe.storage";
 #[derive(Clone)]
 pub struct SqlQuotaStore {
     db: Db,
-    enqueuer: Arc<dyn NotificationEnqueuer>,
+    enqueuer: Arc<dyn NotificationOutbox>,
     clock: crate::infra::storage::consumption_store::Clock,
 }
 
@@ -154,7 +154,7 @@ fn with_quota_id(events: &[NotificationEvent], id: QuotaId) -> Vec<NotificationE
 impl SqlQuotaStore {
     /// Bind the store to the plugin's database and its notification outbox.
     #[must_use]
-    pub fn new(db: Db, enqueuer: Arc<dyn NotificationEnqueuer>) -> Self {
+    pub fn new(db: Db, enqueuer: Arc<dyn NotificationOutbox>) -> Self {
         Self {
             db,
             enqueuer,
@@ -168,7 +168,7 @@ impl SqlQuotaStore {
     #[must_use]
     pub fn with_clock(
         db: Db,
-        enqueuer: Arc<dyn NotificationEnqueuer>,
+        enqueuer: Arc<dyn NotificationOutbox>,
         clock: crate::infra::storage::consumption_store::Clock,
     ) -> Self {
         Self {
@@ -297,9 +297,11 @@ impl QuotaStore for SqlQuotaStore {
         let with_counter = draft.quota_type == QuotaType::Allocation;
         let scope = scope.clone();
         let actor = actor.clone();
-        let enqueuer = Arc::clone(&self.enqueuer);
-        self.db
-            .transaction_ref_mapped(move |tx| {
+        let wakes = AttemptWakes::begin(&self.enqueuer);
+        let enqueuer = wakes.enqueuer();
+        settling(
+            wakes,
+            self.db.transaction_ref_mapped(move |tx| {
                 Box::pin(async move {
                     quota_repo::insert(tx, &scope, row).await?;
                     // The pair's capacity row exists before its first lease, so
@@ -333,9 +335,10 @@ impl QuotaStore for SqlQuotaStore {
                     enqueuer.enqueue_all(tx, &events).await?;
                     Ok::<QuotaId, TxError>(id)
                 })
-            })
-            .await
-            .map_err(|e| lift(OPERATION, e))
+            }),
+        )
+        .await
+        .map_err(|e| lift(OPERATION, e))
     }
 
     async fn update_quota(
@@ -352,10 +355,12 @@ impl QuotaStore for SqlQuotaStore {
         let scope = scope.clone();
         let actor = actor.clone();
         let events = events.to_vec();
-        let enqueuer = Arc::clone(&self.enqueuer);
+        let wakes = AttemptWakes::begin(&self.enqueuer);
+        let enqueuer = wakes.enqueuer();
         let clock = Arc::clone(&self.clock);
-        self.db
-            .transaction_ref_mapped(move |tx| {
+        settling(
+            wakes,
+            self.db.transaction_ref_mapped(move |tx| {
                 Box::pin(async move {
                     let row = Self::lock_active_row(tx, &scope, quota_id).await?;
                     // Read under the lock, never before it. An update that
@@ -406,9 +411,10 @@ impl QuotaStore for SqlQuotaStore {
                     enqueuer.enqueue_all(tx, &events).await?;
                     Ok::<Quota, TxError>(quota_mapping::row_to_quota(committed)?)
                 })
-            })
-            .await
-            .map_err(|e| lift(OPERATION, e))
+            }),
+        )
+        .await
+        .map_err(|e| lift(OPERATION, e))
     }
 
     async fn deactivate_quota(
@@ -423,9 +429,11 @@ impl QuotaStore for SqlQuotaStore {
         let scope = scope.clone();
         let actor = actor.clone();
         let events = events.to_vec();
-        let enqueuer = Arc::clone(&self.enqueuer);
-        self.db
-            .transaction_ref_mapped(move |tx| {
+        let wakes = AttemptWakes::begin(&self.enqueuer);
+        let enqueuer = wakes.enqueuer();
+        settling(
+            wakes,
+            self.db.transaction_ref_mapped(move |tx| {
                 Box::pin(async move {
                     // @cpt-begin:cpt-cf-quota-enforcement-flow-quota-deactivate:p1:inst-qde-cascade
                     let row = Self::lock_active_row(tx, &scope, quota_id).await?;
@@ -579,9 +587,10 @@ impl QuotaStore for SqlQuotaStore {
                     Ok::<DeactivateOutcome, TxError>(outcome)
                     // @cpt-end:cpt-cf-quota-enforcement-flow-quota-deactivate:p1:inst-qde-atomic
                 })
-            })
-            .await
-            .map_err(|e| lift(OPERATION, e))
+            }),
+        )
+        .await
+        .map_err(|e| lift(OPERATION, e))
     }
 
     async fn read_quotas(

@@ -91,6 +91,14 @@ fn every_variant_family_maps_to_its_documented_status() {
             400,
         ),
         (DomainError::BulkTooLarge { items: 2, max: 1 }, 400),
+        (
+            DomainError::InvalidSnapshot {
+                index: Some(0),
+                field: "id",
+                reason: "SNAPSHOT_TENANT_MISMATCH",
+            },
+            400,
+        ),
         (DomainError::BatchTimeout, 504),
         (
             DomainError::NotReady {
@@ -285,6 +293,33 @@ fn batch_rejections_name_the_item_and_lead_with_their_tokens() {
         timeout.detail.starts_with("BATCH_TIMEOUT:"),
         "the token leads the detail: {}",
         timeout.detail
+    );
+}
+
+#[test]
+fn snapshot_rejections_name_the_subject_or_the_request_field() {
+    let subject = serde_json::to_string(&Problem::from(CanonicalError::from(
+        DomainError::InvalidSnapshot {
+            index: Some(2),
+            field: "kind",
+            reason: "SUBJECT_KIND_INVALID",
+        },
+    )))
+    .expect("json");
+    assert!(subject.contains("subjects[2].kind"), "{subject}");
+    assert!(subject.contains("SUBJECT_KIND_INVALID"), "{subject}");
+    let request = serde_json::to_string(&Problem::from(CanonicalError::from(
+        DomainError::InvalidSnapshot {
+            index: None,
+            field: "limit",
+            reason: "SNAPSHOT_LIMIT_OUT_OF_RANGE",
+        },
+    )))
+    .expect("json");
+    assert!(request.contains("\"limit\""), "{request}");
+    assert!(
+        request.contains(QUOTA_RESOURCE),
+        "a snapshot reads Quotas: {request}"
     );
 }
 

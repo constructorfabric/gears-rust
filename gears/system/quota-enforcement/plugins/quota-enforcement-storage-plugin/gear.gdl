@@ -8,7 +8,7 @@ gdl_version = "1.0"
 # `implements`; this plugin's vendor and priority are read from source.
 
 gear(
-    deps = [],
+    deps = ["types-registry"],
     source = git(url = "https://github.com/constructorfabric/gears-rust", path = "gears/system/quota-enforcement/plugins/quota-enforcement-storage-plugin"),
     maturity = "experimental",
     name = "Quota Enforcement Storage Plugin",

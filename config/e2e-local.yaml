@@ -262,6 +262,16 @@ gears:
     config:
       listen_addr: "uds:///tmp/cf-gears-grpc-e2e"
 
+  # Linked by --features oagw-embedded. OAGW on a database keeps its proxy
+  # cache's change log in the `oagw` profile (ADR-0020); standalone suffices
+  # for one process.
+  cluster:
+    config:
+      profiles:
+        oagw:
+          cache:
+            provider: standalone
+
   users-info:
     # Gear-specific database configuration
     database:
@@ -513,6 +523,10 @@ gears:
     database:
       server: "sqlite_users"
       file: "bss_products.db"
+      params:
+        # Writers wait for the write lock (BEGIN IMMEDIATE) instead of failing
+        # at once beside the outbox worker; see docs/toolkit_unified_system/11_database_patterns.md.
+        transaction_mode: "immediate"
 
   bss-pricing:
     # The PriceBook skeleton reserves /bss-pricing/v1 with no operations.
@@ -521,6 +535,10 @@ gears:
     database:
       server: "sqlite_users"
       file: "bss_pricing.db"
+      params:
+        # Writers wait for the write lock (BEGIN IMMEDIATE) instead of failing
+        # at once beside the outbox worker; see docs/toolkit_unified_system/11_database_patterns.md.
+        transaction_mode: "immediate"
 
   bss-approvals:
     # The approvals inbox: one list, count, card and vote over the approval units
@@ -555,14 +573,14 @@ gears:
       file: "file_storage.db"
     config:
       # Default TTL and sidecar URL — overridden per-suite by the lifecycle
-      # conftest via config_patch (storage_root, sidecar_base_url, signing_key_seed).
+      # conftest via config_patch (storage_root, sidecar_base_url, signing_key_pkcs8).
       sidecar_base_url: "http://localhost:8099"
       storage_root: "./.file-storage-data"
-      # Use a fixed Ed25519 seed so signed-URL tokens survive a server restart
+      # Use a public test-only ECDSA P-256 PKCS#8 key so signed-URL tokens survive a server restart
       # and the sidecar can be pre-configured with the matching public key.
-      # Value is a 32-byte base64url-encoded seed (43 chars without padding).
+      # Value is a base64url-encoded PKCS#8 DER key (never use this public fixture in production).
       # SHARED with the sidecar via FS_SIDECAR_PUBLIC_KEY (lifecycle conftest).
-      signing_key_seed: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+      signing_key_pkcs8: "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgvyXv0q8GjreoBuf_PpNaMtOTjopTQiDanrRzE0yTGY2hRANCAAQZ2L6QZ1TYiDoNOYAetCY5SuDm9FiW2tOcy3DSKnbz8Wy9bwdzDx6plcpgtLoifYSjTnIR3X14G1M5Rrg1sj5D"
       # dev only
       finalize_internal_secret: "dev-file-storage-internal-secret"
 

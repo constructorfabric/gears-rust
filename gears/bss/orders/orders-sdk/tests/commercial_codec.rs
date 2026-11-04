@@ -9,7 +9,8 @@ use bss_orders_sdk::{
     authoring::AuthoredTerm,
     commercial::{
         AcceptedVersionRef, AssessmentRef, CodecError, MAX_BINDINGS, MAX_VERSION_BYTES,
-        MalformedKind, OrderPin, SelectionEvidence, term::TermIntent,
+        MalformedKind, OrderPin, SelectionEvidence, decode_acceptance_receipt,
+        decode_new_sale_query, encode_acceptance_receipt, encode_new_sale_query, term::TermIntent,
     },
     models::OrderVersion,
 };
@@ -710,4 +711,35 @@ proptest! {
         prop_assert_eq!(&decoded, &pin);
         prop_assert_eq!(decoded.encode().unwrap(), encoded);
     }
+}
+
+/// M2-6: the frozen request and the recorded receipt round-trip through the schema-2 spelling
+/// without loss, and are exactly the pin document's `receipt` member and its `query`.
+#[test]
+fn the_frozen_query_and_the_recorded_receipt_round_trip_in_the_pin_spelling() {
+    let pin = golden();
+    let receipt = pin.receipt().clone();
+    let recorded = encode_acceptance_receipt(&receipt).unwrap();
+    assert_eq!(decode_acceptance_receipt(&recorded).unwrap(), receipt);
+    let document: Value = serde_json::from_str(GOLDEN).unwrap();
+    assert_eq!(recorded, document["receipt"]);
+    let query = encode_new_sale_query(&receipt.query).unwrap();
+    assert_eq!(query, document["receipt"]["query"]);
+    assert_eq!(decode_new_sale_query(&query).unwrap(), receipt.query);
+    // A recorded receipt rebuilds the identical pin.
+    let rebuilt = OrderPin::decode(&serde_json::to_vec(&document).unwrap()).unwrap();
+    assert_eq!(
+        rebuilt.receipt(),
+        &decode_acceptance_receipt(&recorded).unwrap()
+    );
+    // Unknown and missing members are refused, never defaulted.
+    let mut extra = query;
+    extra
+        .as_object_mut()
+        .unwrap()
+        .insert("extra".into(), json!(1));
+    assert_eq!(decode_new_sale_query(&extra), Err(DATA));
+    let mut missing = recorded;
+    missing.as_object_mut().unwrap().remove("hold_until");
+    assert_eq!(decode_acceptance_receipt(&missing), Err(DATA));
 }

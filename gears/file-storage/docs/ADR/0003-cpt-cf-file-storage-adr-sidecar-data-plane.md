@@ -127,7 +127,7 @@ the client-issued `bind` into the same finalize transaction the sidecar's callba
 a brand-new file's first content the client itself only issues the create (presign) request and the `PUT`;
 the staged flow above still describes manual bind and a version bound after the fact.
 
-Signed URLs are **Ed25519, stateless** (S3-presigned-style): the control plane signs with a private
+Signed URLs are **ECDSA P-256/SHA-256, stateless** (S3-presigned-style): the control plane signs with a private
 key and is the **sole minter**; the sidecar verifies with the public key and can never forge a URL.
 Constraints are AND-combined into the signed payload — `exp` (required, capped at a configured
 `max_url_ttl`, recommended 7 days, enforced by the control plane at signing), optional
@@ -136,13 +136,9 @@ upload URLs — an optional size bound (`max_size` or `exact_size`, mutually exc
 `expected_hash`. `ip`/CIDR, token-claim predicates, and bandwidth (`max_rate`)/connection (`max_conns`)
 caps are declared here as part of the constraint model's design but are **not implemented**: the token
 carries none of these fields, and the sidecar enforces none of them — a documented extension point, not
-a shipped capability. The control plane signs with one active keypair at a time (private in control config, public in
-sidecar config); the sidecar verifies against a small ordered **set** of public keys — the active one
-plus, during a rotation window, previously-active ones (`FS_SIDECAR_PREVIOUS_PUBLIC_KEYS`) — which is
-what lets `signing_key_seed` be rotated without an outage or invalidating already-issued signed URLs
-(see [ADR-0004](./0004-cpt-cf-file-storage-adr-signed-url-transport.md)'s Implementation note and
-`docs/operations.md`'s `signing_key_seed` → Rotation section); there is no per-URL revocation —
-emergency revocation is the platform auth module's token revocation, not the URL layer.
+a shipped capability. Control and sidecar use one active P-256 keypair. Previous-key
+overlap is not implemented; rotate through the drain-and-replace procedure in
+operations.md. Outstanding URLs are rejected after key replacement.
 
 ### Consequences
 
@@ -234,7 +230,7 @@ Implementation verified via:
   body containing file content (only metadata + signed URLs).
 * Code review confirming the sidecar is the only component that opens backend clients for content
   I/O, and that no signed URL or SDK return value exposes a backend-addressable URL to a client.
-* Code review confirming the control plane is the sole signer (holds the Ed25519 private key) and
+* Code review confirming the control plane is the sole signer (holds the ECDSA P-256/SHA-256 private key) and
   the sidecar only verifies (holds the public key).
 * Integration tests covering presign → transfer for upload and download, the bind/rebind CAS path
   (including the failed-precondition retry that does not re-upload bytes), and signed-URL constraint enforcement
@@ -298,7 +294,7 @@ happens on the streaming path, now in the sidecar.
 This decision directly addresses the following requirements or design elements:
 
 * `cpt-cf-file-storage-fr-rest-api` — control REST carries metadata + signed URLs only; content lives on the sidecar
-* `cpt-cf-file-storage-fr-signed-urls` — new: the Ed25519 stateless signed-URL contract and constraint model
+* `cpt-cf-file-storage-fr-signed-urls` — new: the ECDSA P-256/SHA-256 stateless signed-URL contract and constraint model
 * `cpt-cf-file-storage-fr-upload-file` / `cpt-cf-file-storage-fr-download-file` — presign + transfer (download: two requests; upload: presign → `PUT` → finalize → `bind`); immutable-blob + pointer model
 * `cpt-cf-file-storage-fr-range-requests` — served by the sidecar; one signed URL, many ranges
 * `cpt-cf-file-storage-fr-usage-reporting`, `cpt-cf-file-storage-fr-content-type-validation`, `cpt-cf-file-storage-fr-read-audit` — reallocated to the sidecar, still 100% coverage

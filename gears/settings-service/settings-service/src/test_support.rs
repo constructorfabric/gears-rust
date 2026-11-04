@@ -22,6 +22,7 @@ use crate::audit::{AuditRecord, AuditSink};
 use crate::domain::contribution::SettingTypeRegistrar;
 use crate::domain::error::DomainError;
 use crate::domain::platform_scope::PlatformScope;
+use crate::domain::ports::StepUpOperation;
 use crate::domain::resolution::{Subtree, TenantHierarchy};
 use crate::infra::type_validator::SchemaSource;
 
@@ -193,7 +194,8 @@ impl PlatformScope for FixedScope {
 }
 
 /// A setting-type registrar that records the keys it was asked to register,
-/// and can be told to fail.
+/// can be told to fail, and — like the real registry — remembers the value
+/// type registered for each key and refuses a different one for it.
 #[derive(Default)]
 pub struct RecordingRegistrar {
     pub registered: Mutex<Vec<(String, String)>>,
@@ -212,10 +214,22 @@ impl SettingTypeRegistrar for RecordingRegistrar {
                 detail: "types registry down".to_owned(),
             });
         }
-        self.registered
-            .lock()
-            .expect("registrar lock")
-            .push((key.to_string(), value_type_id.to_owned()));
+        let mut registered = self.registered.lock().expect("registrar lock");
+        let key = key.to_string();
+        // The real registrar answers an already-registered key by comparing
+        // the type it holds with the one asked for (`confirm_same_type`).
+        if let Some((_, held)) = registered.iter().find(|(k, _)| *k == key)
+            && held != value_type_id
+        {
+            return Err(DomainError::Conflict {
+                detail: format!(
+                    "the type registered for `{key}` narrows its payload to `gts://{held}`, not \
+                     to `gts://{value_type_id}`; the declaration's value type and its \
+                     registered type would disagree"
+                ),
+            });
+        }
+        registered.push((key, value_type_id.to_owned()));
         Ok(())
     }
 }
@@ -991,6 +1005,74 @@ impl ResolutionHarness {
         .await;
     }
 
+    /// The declaration row, as the domain reads it.
+    pub async fn load_declaration(&self, id: Uuid) -> crate::domain::declaration::Declaration {
+        let conn = self.db.conn().expect("connection");
+        let scope = AccessScope::allow_all();
+        DeclarationRepo
+            .find(
+                &conn,
+                &scope,
+                &crate::domain::category::visibility::domain_visibility(&scope),
+                id,
+            )
+            .await
+            .expect("lookup")
+            .expect("row")
+    }
+
+    /// A secret row carrying a subject, inserted through the entity: the write
+    /// API is subject-less, so this is the only way such a row exists here.
+    pub async fn set_subject_secret(&self, declaration_id: Uuid, tenant: Uuid, secret_ref: &str) {
+        use sea_orm::ActiveValue::Set;
+        let conn = self.db.conn().expect("connection");
+        let at = time::OffsetDateTime::now_utc();
+        let active = crate::infra::storage::entity::setting_value::ActiveModel {
+            id: Set(Uuid::new_v4()),
+            declaration_id: Set(declaration_id),
+            tenant_id: Set(tenant),
+            subject_type: Set(Some(crate::domain::stepup::USER_SUBJECT_TYPE.to_owned())),
+            subject_id: Set(Some("subject-1".to_owned())),
+            value: Set(None),
+            secret_ref: Set(Some(secret_ref.to_owned())),
+            data_classification: Set("secret".to_owned()),
+            needs_review: Set(false),
+            needs_review_detail: Set(None),
+            last_change_at: Set(at),
+            created_at: Set(at),
+            updated_at: Set(at),
+            set_by: Set("subject-1".to_owned()),
+            set_by_tenant: Set(None),
+        };
+        toolkit_db::secure::secure_insert::<crate::infra::storage::entity::setting_value::Entity>(
+            active,
+            &AccessScope::allow_all(),
+            &conn,
+        )
+        .await
+        .expect("subject row");
+    }
+
+    /// A staged secret for a tenant, as a stage leaves it.
+    pub async fn stage_secret(&self, declaration_id: Uuid, tenant: Uuid, secret_ref: &str) {
+        use crate::domain::secrets::pending::{PendingSecretDraft, PendingSecretRepository};
+        let conn = self.db.conn().expect("connection");
+        crate::infra::storage::pending_secret_repo::PendingSecretRepo
+            .insert(
+                &conn,
+                &AccessScope::allow_all(),
+                PendingSecretDraft {
+                    declaration_id,
+                    tenant_id: tenant,
+                    subject_id: "subject-1".to_owned(),
+                    secret_ref: secret_ref.to_owned(),
+                    expires_at: time::OffsetDateTime::now_utc() + time::Duration::minutes(10),
+                },
+            )
+            .await
+            .expect("staged");
+    }
+
     /// The row as the writer leaves it, `classification` denormalized from
     /// the declaration onto it — the column the corpus and the masking rules
     /// read.
@@ -1081,6 +1163,44 @@ impl crate::domain::ports::ChangePublisher for RecordingPublisher {
     }
 }
 
+/// A metrics port that keeps every count it was given.
+#[derive(Default)]
+pub struct RecordingMetrics {
+    /// `(operation, result)` of every step-up count, in order.
+    pub step_ups: Mutex<Vec<(StepUpOperation, &'static str)>>,
+    /// The `result` of every purge release count, in order.
+    pub purge_releases: Mutex<Vec<&'static str>>,
+}
+
+impl RecordingMetrics {
+    /// The step-up counts of one operation, in order.
+    pub fn step_ups_of(&self, operation: StepUpOperation) -> Vec<&'static str> {
+        self.step_ups
+            .lock()
+            .expect("lock")
+            .iter()
+            .filter(|(op, _)| *op == operation)
+            .map(|(_, result)| *result)
+            .collect()
+    }
+}
+
+impl crate::domain::ports::WriteMetrics for RecordingMetrics {
+    fn value_write(&self, _result: &'static str) {}
+    fn step_up(&self, operation: StepUpOperation, result: &'static str) {
+        self.step_ups
+            .lock()
+            .expect("lock")
+            .push((operation, result));
+    }
+    fn purge_released(&self) {
+        self.purge_releases.lock().expect("lock").push("ok");
+    }
+    fn purge_release_failed(&self) {
+        self.purge_releases.lock().expect("lock").push("failed");
+    }
+}
+
 /// A step-up verifier whose verdict the test fixes.
 pub struct FixedStepUp {
     pub verdict: Result<(), crate::domain::stepup::StepUpRefusal>,
@@ -1122,6 +1242,9 @@ impl crate::domain::stepup::StepUpVerifier for FixedStepUp {
     }
 }
 
+/// The database and the declaration a [`RecordingSecrets`] probe looks for.
+pub type RowProbe = (Arc<DBProvider<DbError>>, Uuid);
+
 /// A Secret Manager that keeps plaintext in memory under deterministic
 /// references and remembers what it was asked to release.
 #[derive(Default)]
@@ -1133,6 +1256,11 @@ pub struct RecordingSecrets {
     /// The next store lands in the store and answers with a failure: the
     /// ambiguous outcome of a network that dropped the response.
     pub lose_next_answer: std::sync::atomic::AtomicBool,
+    /// A database and a declaration id: every `delete_secret` then records
+    /// whether the declaration row was still there when the release ran.
+    pub row_probe: Mutex<Option<RowProbe>>,
+    /// What the probe saw at each release, in order.
+    pub row_present_at_release: Mutex<Vec<bool>>,
 }
 
 impl RecordingSecrets {
@@ -1237,6 +1365,24 @@ impl crate::domain::ports::SecretManager for RecordingSecrets {
         secret_ref: &str,
     ) -> Result<(), DomainError> {
         self.check()?;
+        let probe = self.row_probe.lock().expect("secrets lock").clone();
+        if let Some((db, id)) = probe {
+            let conn = db.conn().expect("connection");
+            let scope = AccessScope::allow_all();
+            let row = DeclarationRepo
+                .find(
+                    &conn,
+                    &scope,
+                    &crate::domain::category::visibility::domain_visibility(&scope),
+                    id,
+                )
+                .await
+                .expect("lookup");
+            self.row_present_at_release
+                .lock()
+                .expect("secrets lock")
+                .push(row.is_some());
+        }
         self.entries
             .lock()
             .expect("secrets lock")
@@ -1421,6 +1567,58 @@ pub struct Answer {
     pub headers: HashMap<String, String>,
 }
 
+/// A directory that lists nobody: every history name reads `null`.
+struct NobodyDirectory;
+
+#[async_trait]
+impl crate::infra::actor_names::ActorDirectory for NobodyDirectory {
+    async fn list_users(
+        &self,
+        _ctx: &SecurityContext,
+        _tenant_id: Uuid,
+        _query: account_management_sdk::ListUsersQuery,
+    ) -> Result<
+        toolkit_odata::Page<account_management_sdk::IdpUser>,
+        toolkit::api::canonical_prelude::CanonicalError,
+    > {
+        Ok(toolkit_odata::Page::new(
+            Vec::new(),
+            toolkit_odata::PageInfo {
+                next_cursor: None,
+                prev_cursor: None,
+                limit: 200,
+            },
+        ))
+    }
+}
+
+/// A hub without Account Management: no directory is there to ask, and a lookup
+/// that reached it would be a defect.
+pub struct UnavailableDirectory;
+
+#[async_trait]
+impl crate::infra::actor_names::ActorDirectory for UnavailableDirectory {
+    fn is_available(&self) -> bool {
+        false
+    }
+
+    async fn list_users(
+        &self,
+        _ctx: &SecurityContext,
+        _tenant_id: Uuid,
+        _query: account_management_sdk::ListUsersQuery,
+    ) -> Result<
+        toolkit_odata::Page<account_management_sdk::IdpUser>,
+        toolkit::api::canonical_prelude::CanonicalError,
+    > {
+        panic!("an unavailable directory is never asked");
+    }
+}
+
+fn nobody() -> Arc<dyn crate::infra::actor_names::ActorDirectory> {
+    Arc::new(NobodyDirectory)
+}
+
 /// The gear's read surface, registered exactly as the gear registers it and
 /// answering real requests.
 ///
@@ -1452,7 +1650,25 @@ impl RestHarness {
     /// Build the surface over a fresh database, with every authorization
     /// decision allowed and a step-up assertion that passes.
     pub async fn new() -> Self {
-        Self::build(Arc::new(AllowAll), Arc::new(FixedStepUp::verified())).await
+        Self::build(
+            Arc::new(AllowAll),
+            Arc::new(FixedStepUp::verified()),
+            nobody(),
+        )
+        .await
+    }
+
+    /// The same surface with a directory the test scripts, for the history
+    /// tests that read actor names.
+    pub async fn with_directory(
+        directory: Arc<dyn crate::infra::actor_names::ActorDirectory>,
+    ) -> Self {
+        Self::build(
+            Arc::new(AllowAll),
+            Arc::new(FixedStepUp::verified()),
+            directory,
+        )
+        .await
     }
 
     /// The same surface whose declaration admin cannot reach the type
@@ -1473,7 +1689,12 @@ impl RestHarness {
     /// The same surface with every authorization decision denied, for the
     /// tests that assert the gate rather than what is behind it.
     pub async fn denying() -> Self {
-        Self::build(Arc::new(DenyAll), Arc::new(FixedStepUp::verified())).await
+        Self::build(
+            Arc::new(DenyAll),
+            Arc::new(FixedStepUp::verified()),
+            nobody(),
+        )
+        .await
     }
 
     /// The same surface with one action denied and every other allowed.
@@ -1481,6 +1702,7 @@ impl RestHarness {
         Self::build(
             Arc::new(DenyAction(action)),
             Arc::new(FixedStepUp::verified()),
+            nobody(),
         )
         .await
     }
@@ -1488,13 +1710,35 @@ impl RestHarness {
     /// The same surface for a caller that may read but may not see `pii`
     /// values unmasked.
     pub async fn without_pii_entitlement() -> Self {
-        Self::build(Arc::new(AllowButMasked), Arc::new(FixedStepUp::verified())).await
+        Self::build(
+            Arc::new(AllowButMasked),
+            Arc::new(FixedStepUp::verified()),
+            nobody(),
+        )
+        .await
+    }
+
+    /// The masked-caller surface over a scripted directory.
+    pub async fn without_pii_entitlement_with_directory(
+        directory: Arc<dyn crate::infra::actor_names::ActorDirectory>,
+    ) -> Self {
+        Self::build(
+            Arc::new(AllowButMasked),
+            Arc::new(FixedStepUp::verified()),
+            directory,
+        )
+        .await
     }
 
     /// The same surface for a caller that may read categories and
     /// declarations but not values.
     pub async fn without_value_read() -> Self {
-        Self::build(Arc::new(AllowButValues), Arc::new(FixedStepUp::verified())).await
+        Self::build(
+            Arc::new(AllowButValues),
+            Arc::new(FixedStepUp::verified()),
+            nobody(),
+        )
+        .await
     }
 
     /// The same surface where the caller's last re-authentication is too old,
@@ -1505,6 +1749,7 @@ impl RestHarness {
             Arc::new(FixedStepUp::refusing(
                 crate::domain::stepup::StepUpRefusal::Stale,
             )),
+            nobody(),
         )
         .await
     }
@@ -1512,6 +1757,7 @@ impl RestHarness {
     async fn build(
         pdp: Arc<dyn authz_resolver_sdk::AuthZResolverApi>,
         step_up: Arc<dyn crate::domain::stepup::StepUpVerifier>,
+        directory: Arc<dyn crate::infra::actor_names::ActorDirectory>,
     ) -> Self {
         Self::build_over(
             ResolutionHarness::new().await,
@@ -1519,6 +1765,7 @@ impl RestHarness {
             pdp,
             step_up,
             resolution_catalogue(),
+            directory,
         )
     }
 
@@ -1533,6 +1780,7 @@ impl RestHarness {
             pdp,
             step_up,
             admin_catalogue,
+            nobody(),
         )
     }
 
@@ -1547,6 +1795,7 @@ impl RestHarness {
             Arc::new(AllowAll),
             Arc::new(FixedStepUp::verified()),
             resolution_catalogue(),
+            nobody(),
         )
     }
 
@@ -1584,6 +1833,7 @@ impl RestHarness {
         pdp: Arc<dyn authz_resolver_sdk::AuthZResolverApi>,
         step_up: Arc<dyn crate::domain::stepup::StepUpVerifier>,
         admin_catalogue: FakeSource,
+        directory: Arc<dyn crate::infra::actor_names::ActorDirectory>,
     ) -> Self {
         let enforcer = Arc::new(authz_resolver_sdk::PolicyEnforcer::new(pdp));
         let openapi = toolkit::api::OpenApiRegistryImpl::new();
@@ -1602,12 +1852,19 @@ impl RestHarness {
             Arc::clone(&inner.db),
             Arc::clone(&enforcer),
         );
+        let names = Arc::new(
+            crate::infra::actor_names::ActorNameResolver::with_directory(
+                directory,
+                Arc::new(crate::domain::ports::NoActorNameMetrics),
+            ),
+        );
         let router = crate::api::rest::setting_routes::register_routes(
             router,
             &openapi,
             Arc::clone(&inner.resolver),
             Arc::clone(&inner.db),
             Arc::clone(&enforcer),
+            names,
         );
         let router = crate::api::rest::search_routes::register_routes(
             router,
@@ -1643,6 +1900,8 @@ impl RestHarness {
         ));
         let step_up_for_writes = Arc::clone(&step_up);
         let registrar = Arc::new(RecordingRegistrar::default());
+        // The admin releases through the very store the harness exposes.
+        let secrets = Arc::new(RecordingSecrets::default());
         let admin = Arc::new(crate::domain::declaration::DeclarationAdmin::new(
             crate::infra::storage::declaration_repo::DeclarationRepo,
             crate::infra::storage::category_repo::CategoryRepo,
@@ -1654,6 +1913,9 @@ impl RestHarness {
             step_up,
             crate::infra::storage::audit_store::AuditStore,
             Arc::clone(&inner.cache),
+            crate::infra::storage::pending_secret_repo::PendingSecretRepo,
+            Arc::clone(&secrets) as Arc<dyn crate::domain::ports::SecretManager>,
+            Arc::new(crate::domain::ports::NoMetrics),
         ));
         let router = crate::api::rest::declaration_routes::register_routes(
             router,
@@ -1667,7 +1929,6 @@ impl RestHarness {
         // The write surface. Every port behind it is doubled except the
         // repositories and the audit store, which run for real against the
         // same database the reads use.
-        let secrets = Arc::new(RecordingSecrets::default());
         let published = Arc::new(RecordingPublisher::default());
         let coordinator = write_coordinator(
             &inner,
@@ -1730,6 +1991,29 @@ impl RestHarness {
             if_match,
             caller,
             Some("application/json"),
+            None,
+        )
+        .await
+    }
+
+    /// The same as `send`, carrying the given `x-request-id`: what an audit
+    /// record and a log line must echo.
+    pub async fn send_with_request_id(
+        &self,
+        method: &str,
+        uri: &str,
+        if_match: Option<&str>,
+        caller: Uuid,
+        request_id: &str,
+    ) -> Answer {
+        self.dispatch(
+            method,
+            uri,
+            None,
+            if_match,
+            context_for(caller),
+            None,
+            Some(request_id),
         )
         .await
     }
@@ -1752,6 +2036,7 @@ impl RestHarness {
             if_match,
             context_for(caller),
             Some("application/json"),
+            None,
         )
         .await
     }
@@ -1773,10 +2058,14 @@ impl RestHarness {
             None,
             context_for(caller),
             content_type,
+            None,
         )
         .await
     }
 
+    /// One request through the router; the framing headers (`Content-Type`, `x-request-id`)
+    /// are each optional, whence the argument count.
+    #[allow(clippy::too_many_arguments)]
     async fn dispatch(
         &self,
         method: &str,
@@ -1785,6 +2074,7 @@ impl RestHarness {
         if_match: Option<&str>,
         caller: SecurityContext,
         content_type: Option<&str>,
+        request_id: Option<&str>,
     ) -> Answer {
         use tower::ServiceExt as _;
         let mut builder = axum::http::Request::builder().method(method).uri(uri);
@@ -1795,6 +2085,9 @@ impl RestHarness {
         }
         if let Some(tag) = if_match {
             builder = builder.header("if-match", tag);
+        }
+        if let Some(request_id) = request_id {
+            builder = builder.header("x-request-id", request_id);
         }
         let payload = body.map_or_else(axum::body::Body::empty, axum::body::Body::from);
         let mut request = builder.body(payload).expect("a well-formed request");

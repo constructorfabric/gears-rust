@@ -2287,7 +2287,7 @@ async fn a_rollback_replay_returns_the_stored_outcome() {
 }
 
 #[tokio::test]
-async fn a_snapshot_read_materializes_the_current_row_and_settles_nothing() {
+async fn a_snapshot_read_writes_nothing_and_the_next_mutation_opens_the_period() {
     let (storage, id) = consumption_storage(Some(100), Vec::new()).await;
     storage
         .apply_debit_plan_for(10, &idem(OperationType::Debit, "k1", 1))
@@ -2301,29 +2301,24 @@ async fn a_snapshot_read_materializes_the_current_row_and_settles_nothing() {
         .await
         .expect("read");
 
-    assert_eq!(snapshots[0].consumed, 0, "the new period starts empty");
+    assert_eq!(snapshots[0].consumed, 0, "the new period reads as empty");
     let rows = storage.period_rows(id);
-    assert_eq!(rows.len(), 2, "the successor row was materialized");
-    assert!(!rows[0].settled, "a read settles nothing");
+    assert_eq!(rows.len(), 1, "the read created no row (I3)");
+    assert!(!rows[0].settled, "and settled nothing");
     assert_eq!(
         storage.events().len(),
         events_before,
         "a read enqueues nothing, so a preview never writes an outbox row"
     );
 
-    // Repeating the read writes nothing further.
-    storage
-        .read_quota_snapshot(&ctx(), &scope(), &applicable())
-        .await
-        .expect("read again");
-    assert_eq!(storage.period_rows(id).len(), 2);
-
-    // The next mutation is what settles and emits.
+    // The next mutation opens the new period, settles the old one and emits.
     storage
         .apply_debit_plan_for(1, &idem(OperationType::Debit, "k2", 2))
         .await
         .expect("debit");
-    assert!(storage.period_rows(id)[0].settled);
+    let rows = storage.period_rows(id);
+    assert_eq!(rows.len(), 2);
+    assert!(rows[0].settled);
     assert!(kinds(&storage).contains(&NotificationEventKind::PeriodRollover));
 }
 
@@ -2794,5 +2789,545 @@ async fn an_engine_running_out_of_time_on_the_last_item_times_the_batch_out() {
         storage.consumed(id),
         0,
         "the first item's plan was discarded"
+    );
+}
+
+// --- bulk snapshot reads -----------------------------------------------------
+
+fn pair(subjects: &[&str]) -> ApplicableQuotas {
+    ApplicableQuotas {
+        subjects: subjects.iter().map(|id| test_subject(id)).collect(),
+        ..applicable()
+    }
+}
+
+async fn quotas_for(storage: &InMemoryStorage, subjects: &[&str]) -> Vec<QuotaId> {
+    let mut ids = Vec::new();
+    for subject in subjects {
+        ids.push(
+            storage
+                .create_quota(
+                    &ctx(),
+                    &scope(),
+                    quota_draft(test_subject(subject), Some(10)),
+                    &[],
+                )
+                .await
+                .expect("create quota"),
+        );
+    }
+    ids
+}
+
+#[tokio::test]
+async fn a_bulk_read_returns_the_union_once_each_in_id_order_across_pages() {
+    let storage = storage_with_policy().await;
+    let mut ids = quotas_for(&storage, &["u1", "u2", "u3"]).await;
+    ids.sort();
+    // u2 is selected by both pairs; it must still come back once.
+    let pairs = [pair(&["u1", "u2"]), pair(&["u2", "u3"])];
+
+    let first = storage
+        .bulk_read_quota_snapshot(&ctx(), &scope(), &pairs, PageRequest::first(2))
+        .await
+        .expect("first page");
+    let cursor = first.next_cursor.clone().expect("a second page");
+    let second = storage
+        .bulk_read_quota_snapshot(
+            &ctx(),
+            &scope(),
+            &pairs,
+            PageRequest {
+                limit: 2,
+                cursor: Some(cursor.clone()),
+            },
+        )
+        .await
+        .expect("second page");
+
+    let walked: Vec<QuotaId> = first
+        .items
+        .iter()
+        .chain(&second.items)
+        .map(|snapshot| snapshot.quota_id)
+        .collect();
+    assert_eq!(walked, ids, "each row once, in quota_id order");
+    assert_eq!(second.next_cursor, None, "the last page carries no cursor");
+    assert_eq!(
+        cursor,
+        first.items[1].quota_id.as_uuid().to_string(),
+        "the cursor holds only the last quota_id returned"
+    );
+}
+
+#[tokio::test]
+async fn a_bulk_read_refuses_a_cursor_it_did_not_issue() {
+    let storage = storage_with_policy().await;
+    let err = storage
+        .bulk_read_quota_snapshot(
+            &ctx(),
+            &scope(),
+            &[applicable()],
+            PageRequest {
+                limit: 10,
+                cursor: Some("7".to_owned()),
+            },
+        )
+        .await
+        .expect_err("an offset is not a cursor");
+    assert_eq!(err, StorageError::InvalidCursor);
+}
+
+/// A tenant-subtree grant: only `SecureConn` can evaluate it.
+fn subtree_scope() -> AccessScope {
+    AccessScope::single(toolkit_security::ScopeConstraint::new(vec![
+        toolkit_security::ScopeFilter::in_tenant_subtree(
+            toolkit_security::pep_properties::OWNER_TENANT_ID,
+            test_tenant().as_uuid(),
+            true,
+            Vec::new(),
+        ),
+    ]))
+}
+
+#[tokio::test]
+async fn snapshot_reads_apply_the_scope_subset_and_refuse_what_they_cannot_evaluate() {
+    let storage = storage_with_policy().await;
+    let ids = quotas_for(&storage, &["u1", "u2"]).await;
+    let pairs = [pair(&["u1", "u2"])];
+    let read = |scope: AccessScope| {
+        let storage = &storage;
+        let pairs = &pairs;
+        async move {
+            storage
+                .bulk_read_quota_snapshot(&ctx(), &scope, pairs, PageRequest::first(10))
+                .await
+        }
+    };
+
+    assert_eq!(read(scope()).await.expect("tenant scope").items.len(), 2);
+    let one = read(AccessScope::for_resource(ids[0].as_uuid()))
+        .await
+        .expect("resource scope");
+    assert_eq!(one.items.len(), 1);
+    assert_eq!(one.items[0].quota_id, ids[0]);
+    assert!(
+        read(AccessScope::for_tenant(Uuid::from_u128(0xbad)))
+            .await
+            .expect("another tenant")
+            .items
+            .is_empty()
+    );
+    assert!(
+        read(AccessScope::deny_all())
+            .await
+            .expect("deny all")
+            .items
+            .is_empty()
+    );
+    let subtree = subtree_scope();
+    assert!(
+        matches!(read(subtree.clone()).await, Err(StorageError::Internal(_))),
+        "a hierarchical scope is refused, never ignored"
+    );
+    assert!(matches!(
+        storage
+            .read_quota_snapshot(&ctx(), &subtree, &applicable())
+            .await,
+        Err(StorageError::Internal(_))
+    ));
+}
+
+#[tokio::test]
+async fn an_unsupported_scope_is_refused_even_when_no_row_would_be_read() {
+    let storage = storage_with_policy().await;
+    let unknown_property = AccessScope::single(toolkit_security::ScopeConstraint::new(vec![
+        toolkit_security::ScopeFilter::eq("region", "eu-west-1"),
+    ]));
+    let unsupported =
+        |error: Result<_, StorageError>| matches!(error, Err(StorageError::Internal(_)));
+
+    // An empty store: nothing matches, so a per-row check never runs.
+    for scope in [subtree_scope(), unknown_property] {
+        assert!(unsupported(
+            storage
+                .read_quota_snapshot(&ctx(), &scope, &applicable())
+                .await
+                .map(|_| ())
+        ));
+        assert!(unsupported(
+            storage
+                .bulk_read_quota_snapshot(&ctx(), &scope, &[applicable()], PageRequest::first(10))
+                .await
+                .map(|_| ())
+        ));
+    }
+
+    // A page past the last match reads no row either.
+    let id = seeded_quota(&storage, Some(10)).await;
+    let past = PageRequest {
+        limit: 10,
+        cursor: Some(id.as_uuid().to_string()),
+    };
+    assert!(unsupported(
+        storage
+            .bulk_read_quota_snapshot(&ctx(), &subtree_scope(), &[applicable()], past)
+            .await
+            .map(|_| ())
+    ));
+}
+
+#[tokio::test]
+async fn a_read_creates_no_row_and_still_returns_a_quota_outside_its_window() {
+    let (storage, valid) = consumption_storage(Some(100), Vec::new()).await;
+    let lapsed = storage
+        .create_quota(
+            &ctx(),
+            &scope(),
+            crate::models::QuotaDraft {
+                validity_window: Some(crate::models::ValidityWindow {
+                    start: None,
+                    end: Some(at("2026-03-18T00:00:00Z")),
+                }),
+                ..super::consumption_quota_draft(
+                    test_subject("u2"),
+                    Some(100),
+                    PeriodType::Day,
+                    Vec::new(),
+                )
+            },
+            &[],
+        )
+        .await
+        .expect("create lapsed quota");
+    let events_before = storage.events().len();
+    let (valid_rows, lapsed_rows) = (
+        storage.period_rows(valid).len(),
+        storage.period_rows(lapsed).len(),
+    );
+
+    storage.set_now(Some(at("2026-03-19T00:00:00Z")));
+    let page = storage
+        .bulk_read_quota_snapshot(
+            &ctx(),
+            &scope(),
+            &[pair(&["u1", "u2"])],
+            PageRequest::first(10),
+        )
+        .await
+        .expect("bulk read");
+
+    assert_eq!(
+        page.items.len(),
+        2,
+        "an out-of-window quota is still returned"
+    );
+    let lapsed_snapshot = page
+        .items
+        .iter()
+        .find(|snapshot| snapshot.quota_id == lapsed)
+        .expect("lapsed quota");
+    assert!(!lapsed_snapshot.currently_within_window);
+    assert_eq!(
+        lapsed_snapshot.consumed, 0,
+        "its current window reads as zero"
+    );
+    assert!(
+        lapsed_snapshot.period.is_some(),
+        "its period is the current window, computed"
+    );
+    assert_eq!(
+        storage.period_rows(valid).len(),
+        valid_rows,
+        "the read created no row (I3)"
+    );
+    assert_eq!(storage.period_rows(lapsed).len(), lapsed_rows);
+    assert!(
+        storage.period_rows(valid).iter().all(|row| !row.settled),
+        "a read settles nothing"
+    );
+    assert_eq!(storage.events().len(), events_before, "and emits nothing");
+
+    storage
+        .read_quota_snapshot(
+            &ctx(),
+            &scope(),
+            &ApplicableQuotas {
+                subjects: vec![test_subject("u2")],
+                ..applicable()
+            },
+        )
+        .await
+        .expect("single read");
+    assert_eq!(
+        (
+            storage.period_rows(valid).len(),
+            storage.period_rows(lapsed).len()
+        ),
+        (valid_rows, lapsed_rows),
+        "the single read follows the same rule"
+    );
+}
+
+// --- the notification pipeline -------------------------------------------------
+
+/// A delivery callback answering from a script (then `Delivered`), recording
+/// each event id with the attempts it was handed.
+#[derive(Default)]
+struct ScriptedDelivery {
+    script: parking_lot::Mutex<std::collections::VecDeque<crate::DeliveryOutcome>>,
+    seen: parking_lot::Mutex<Vec<(EventId, u16)>>,
+}
+
+#[async_trait::async_trait]
+impl crate::NotificationDeliveryV1 for ScriptedDelivery {
+    async fn deliver(
+        &self,
+        event: NotificationEvent,
+        attempts: u16,
+        _budget: Duration,
+    ) -> crate::DeliveryOutcome {
+        self.seen.lock().push((event.event_id, attempts));
+        self.script
+            .lock()
+            .pop_front()
+            .unwrap_or(crate::DeliveryOutcome::Delivered)
+    }
+
+    fn undeliverable(&self, _payload_type: &str, _reason: &str) {}
+}
+
+fn changed() -> NotificationEvent {
+    NotificationEvent {
+        event_id: EventId::generate(),
+        kind: NotificationEventKind::QuotaChanged,
+        scope: crate::models::NotificationScope::Tenant {
+            tenant_id: test_tenant(),
+        },
+        quota_id: None,
+        policy_id: None,
+        subject: None,
+        payload: serde_json::json!({ "change_kind": "created" }),
+        emitted_at: OffsetDateTime::UNIX_EPOCH,
+    }
+}
+
+async fn with_events(storage: &InMemoryStorage, count: usize) -> Vec<EventId> {
+    let mut ids = Vec::new();
+    for index in 0..count {
+        let event = changed();
+        ids.push(event.event_id);
+        storage
+            .create_quota(
+                &ctx(),
+                &scope(),
+                quota_draft(test_subject(&format!("u{index}")), Some(10)),
+                &[event],
+            )
+            .await
+            .expect("create quota");
+    }
+    ids
+}
+
+#[tokio::test]
+async fn the_pipeline_delivers_in_order_retries_the_head_and_dead_letters_rejections() {
+    let storage = storage_with_policy().await;
+    let ids = with_events(&storage, 3).await;
+    let delivery = Arc::new(ScriptedDelivery::default());
+    *delivery.script.lock() = vec![
+        crate::DeliveryOutcome::Delivered,
+        crate::DeliveryOutcome::Retry,
+        crate::DeliveryOutcome::Reject("sink refused".to_owned()),
+    ]
+    .into();
+    let handle = storage
+        .start_notification_delivery(Arc::clone(&delivery) as _)
+        .await
+        .expect("start");
+
+    let first = storage.drain_notifications().await;
+    assert_eq!(first.delivered, 1);
+    assert!(first.retry_pending, "the second event asked to be retried");
+    let second = storage.drain_notifications().await;
+    assert_eq!(second.rejected, 1, "its retry was rejected");
+    assert_eq!(second.delivered, 1, "and the third went through");
+
+    assert_eq!(
+        *delivery.seen.lock(),
+        vec![(ids[0], 0), (ids[1], 0), (ids[1], 1), (ids[2], 0)],
+        "the retried event is handed back with one failed attempt"
+    );
+    let dead = storage.dead_letters();
+    assert_eq!(dead.len(), 1);
+    assert_eq!(dead[0].0.event_id, ids[1]);
+    assert_eq!(dead[0].1, "sink refused");
+    handle.stop().await;
+}
+
+#[tokio::test]
+async fn one_pipeline_per_storage_and_nothing_after_stop() {
+    let storage = storage_with_policy().await;
+    let delivery = Arc::new(ScriptedDelivery::default());
+    let handle = storage
+        .start_notification_delivery(Arc::clone(&delivery) as _)
+        .await
+        .expect("start");
+    let second = storage
+        .start_notification_delivery(Arc::clone(&delivery) as _)
+        .await;
+    assert!(
+        matches!(second, Err(StorageError::Internal(_))),
+        "never a second pipeline"
+    );
+
+    handle.stop().await;
+    with_events(&storage, 1).await;
+    assert_eq!(
+        storage.drain_notifications().await,
+        crate::testing::DrainReport::default()
+    );
+    assert!(delivery.seen.lock().is_empty());
+}
+
+#[tokio::test]
+async fn a_restarted_storage_starts_a_pipeline_of_its_own_where_delivery_left_off() {
+    let storage = storage_with_policy().await;
+    let delivered = with_events(&storage, 1).await;
+    let delivery = Arc::new(ScriptedDelivery::default());
+    let handle = storage
+        .start_notification_delivery(Arc::clone(&delivery) as _)
+        .await
+        .expect("start");
+    assert_eq!(storage.drain_notifications().await.delivered, 1);
+    let pending = with_events(&storage, 1).await;
+    handle.stop().await;
+
+    let restarted = storage.restarted();
+    let after = Arc::new(ScriptedDelivery::default());
+    let handle = restarted
+        .start_notification_delivery(Arc::clone(&after) as _)
+        .await
+        .expect("a new instance starts its own pipeline");
+    assert_eq!(restarted.drain_notifications().await.delivered, 1);
+    assert_eq!(*delivery.seen.lock(), vec![(delivered[0], 0)]);
+    assert_eq!(
+        *after.seen.lock(),
+        vec![(pending[0], 0)],
+        "only what the first instance left undelivered"
+    );
+    handle.stop().await;
+}
+
+/// A delivery callback that announces each call, then waits to be released.
+/// `entered` counts calls, so no announcement is lost.
+struct GatedDelivery {
+    entered: tokio::sync::Semaphore,
+    release: tokio::sync::Notify,
+    seen: parking_lot::Mutex<Vec<EventId>>,
+}
+
+impl GatedDelivery {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            entered: tokio::sync::Semaphore::new(0),
+            release: tokio::sync::Notify::new(),
+            seen: parking_lot::Mutex::new(Vec::new()),
+        })
+    }
+
+    async fn wait_entered(&self) {
+        self.entered.acquire().await.expect("open").forget();
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::NotificationDeliveryV1 for GatedDelivery {
+    async fn deliver(
+        &self,
+        event: NotificationEvent,
+        _attempts: u16,
+        _budget: Duration,
+    ) -> crate::DeliveryOutcome {
+        self.seen.lock().push(event.event_id);
+        self.entered.add_permits(1);
+        self.release.notified().await;
+        crate::DeliveryOutcome::Delivered
+    }
+
+    fn undeliverable(&self, _payload_type: &str, _reason: &str) {}
+}
+
+#[tokio::test]
+async fn concurrent_drains_deliver_each_event_once_in_order() {
+    let storage = storage_with_policy().await;
+    let ids = with_events(&storage, 2).await;
+    let delivery = GatedDelivery::new();
+    let handle = storage
+        .start_notification_delivery(Arc::clone(&delivery) as _)
+        .await
+        .expect("start");
+
+    // Release every call, one at a time, after letting the other drain reach
+    // the pipeline while it is held.
+    let release = async {
+        loop {
+            delivery.wait_entered().await;
+            tokio::task::yield_now().await;
+            delivery.release.notify_one();
+        }
+    };
+    let (first, second) = tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::select! {
+            reports = async {
+                tokio::join!(storage.drain_notifications(), storage.drain_notifications())
+            } => reports,
+            () = release => unreachable!("the release loop never ends"),
+        }
+    })
+    .await
+    .expect("both drains finish");
+
+    assert_eq!(*delivery.seen.lock(), ids, "each event once, in order");
+    assert_eq!(first.delivered + second.delivered, 2);
+    handle.stop().await;
+}
+
+#[tokio::test]
+async fn stop_waits_for_the_delivery_in_flight() {
+    let storage = storage_with_policy().await;
+    let ids = with_events(&storage, 2).await;
+    let delivery = GatedDelivery::new();
+    let handle = storage
+        .start_notification_delivery(Arc::clone(&delivery) as _)
+        .await
+        .expect("start");
+
+    let stopping = async {
+        delivery.wait_entered().await;
+        let mut stop = std::pin::pin!(handle.stop());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut stop)
+                .await
+                .is_err(),
+            "stop returned while a delivery was running"
+        );
+        delivery.release.notify_one();
+        stop.await;
+    };
+    let (report, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::join!(storage.drain_notifications(), stopping)
+    })
+    .await
+    .expect("the drain and the stop finish");
+
+    assert_eq!(
+        report.delivered, 1,
+        "the delivery in flight finished and counted"
+    );
+    assert_eq!(
+        *delivery.seen.lock(),
+        vec![ids[0]],
+        "nothing started after stop"
     );
 }

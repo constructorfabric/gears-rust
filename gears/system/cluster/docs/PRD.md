@@ -131,8 +131,8 @@ A unified cluster gear gives every Gear the same three coordination primitives �
 **ID**: `cpt-cf-clst-actor-oagw`
 
 <!-- cpt-cf-id-content -->
-**Role**: Uses distributed locks for cross-instance rate limiting and uses cache CAS for shared counters (per-tenant request budgets). Holds locks for sub-second windows to atomically read-and-update counters; never holds locks across remote calls.
-**Needs**: High-throughput cache operations (10k+ counter updates per second). Bounded lock holding so a crashed OAGW instance never permanently blocks others. No fencing tokens — the rate-limiting flow is local-only inside the lock, so the classic fencing scenarios don't apply.
+**Role**: With a database, keeps a short configuration change log in one cache key of its `oagw` profile, appended with CAS and watched by exact key, so its replicas evict stale proxy configuration (OAGW ADR-0020). Planned, not built (OAGW's rate-limit counters are per replica; OAGW ADR-0004): distributed locks for cross-instance rate limiting and cache CAS for shared counters (per-tenant request budgets), holding locks for sub-second windows to atomically read-and-update counters and never across remote calls (UC-002).
+**Needs**: Exact-key watch and CAS on its `oagw` profile's cache (not `Linearizable`). For the planned rate limiting: high-throughput cache operations (10k+ counter updates per second). Bounded lock holding so a crashed OAGW instance never permanently blocks others. No fencing tokens — the rate-limiting flow is local-only inside the lock, so the classic fencing scenarios don't apply.
 <!-- cpt-cf-id-content -->
 
 #### Platform Gear (consumer)

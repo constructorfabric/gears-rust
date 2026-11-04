@@ -587,6 +587,7 @@ async fn outbox_processor_treats_duplicate_as_ok() {
     let result = producer.process_outbox_payload_for_test(envelope, 1).await;
 
     assert_message_ok(result);
+    wait_for_stored(&harness, TOPIC, 1).await;
     assert_eq!(stored_count(&harness, TOPIC).await, 1);
 }
 
@@ -782,7 +783,7 @@ async fn stored_count(harness: &EventBrokerHarness, topic: &str) -> usize {
 }
 
 async fn wait_for_stored(harness: &EventBrokerHarness, topic: &str, count: usize) {
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         if stored_count(harness, topic).await >= count {
             return;

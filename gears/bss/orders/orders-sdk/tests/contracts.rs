@@ -8,10 +8,12 @@ use bss_orders_sdk::{
     OrdersError,
     catalog::{EventKind, OPERATIONS, OrderState, Reason, Trigger},
     errors::RefusalDiagnostics,
+    gate_report::{CatalogSelection, GateFailure, GateOutcome, GateReport},
     models::{DraftRevision, IdempotencyKey, OrderVersion, SpawnSignalResult},
 };
 use serde_json::{Value, json};
 use toolkit_canonical_errors::{CanonicalError, Problem};
+use uuid::Uuid;
 
 fn catalog() -> Value {
     serde_json::from_str(include_str!("../contracts/catalog.json")).unwrap()
@@ -208,4 +210,185 @@ fn refusal_diagnostics_pin_their_wire_members() {
     );
     assert!(serde_json::from_value::<RefusalDiagnostics>(json!({"current_version": 0})).is_err());
     assert!(serde_json::from_value::<RefusalDiagnostics>(json!({"state": "invented"})).is_err());
+}
+
+/// D-233: the all-failures gate report is the optional `assessment` member. It round-trips under
+/// its wire names (an absent optional field stays absent), a payload from an Orders that predates
+/// the member decodes with `None`, and a reason token outside the registry fails to decode (D-233
+/// item 3: the closed `Reason`).
+#[test]
+fn refusal_diagnostics_carry_the_optional_gate_report() {
+    let line = "6f1c1f5e-1d1a-4c43-9d8e-2b7d2e7f0a11";
+    let wire = json!({
+        "assessment": {
+            "assessment_id": "0b5d2f0e-3c8e-4f7a-a6f4-8f2f6a3c9d10",
+            "mapping_version": "orders-gate-mapping/1",
+            "outcomes": [
+                {
+                    "predicate": "orders.axis-validity",
+                    "has_catalog_selection": false,
+                    "verdict": "failed",
+                    "reason": "payer-relationship-unconfirmed",
+                    "applicability": "required"
+                },
+                {
+                    "predicate": "catalog.revision-available",
+                    "line_id": line,
+                    "has_catalog_selection": true,
+                    "catalog_scope_key": "eu",
+                    "verdict": "passed",
+                    "applicability": "required"
+                }
+            ],
+            "failures": [
+                {"reason": "payer-relationship-unconfirmed", "predicate": "orders.axis-validity"}
+            ]
+        }
+    });
+    let diagnostics: RefusalDiagnostics = serde_json::from_value(wire.clone()).unwrap();
+    // The report the wire must decode to, built from literals (no value taken from the decode).
+    let expected = GateReport::new(
+        Uuid::parse_str("0b5d2f0e-3c8e-4f7a-a6f4-8f2f6a3c9d10").unwrap(),
+        "orders-gate-mapping/1",
+        vec![
+            GateOutcome::new("orders.axis-validity", "failed", "required")
+                .with_reason(Some(Reason::PayerRelationshipUnconfirmed)),
+            GateOutcome::new("catalog.revision-available", "passed", "required")
+                .with_line(Uuid::parse_str(line).unwrap())
+                .with_selection(CatalogSelection::Selected("eu".into())),
+        ],
+        vec![GateFailure::new(
+            None,
+            Reason::PayerRelationshipUnconfirmed,
+            "orders.axis-validity",
+        )],
+    );
+    assert_eq!(diagnostics.assessment.as_deref(), Some(&expected));
+    assert_eq!(
+        serde_json::to_value(&expected).unwrap(),
+        wire["assessment"],
+        "the literal report encodes to the wire member"
+    );
+    assert_eq!(serde_json::to_value(&diagnostics).unwrap(), wire);
+    // An Orders that predates D-233 sends no `assessment`.
+    let older: RefusalDiagnostics =
+        serde_json::from_value(json!({"request_audit_id": "0b5d2f0e-3c8e-4f7a-a6f4-8f2f6a3c9d10"}))
+            .unwrap();
+    assert_eq!(older.assessment, None);
+    // `reason` is the closed registry: an unknown token fails the whole member.
+    let mut unknown = wire.clone();
+    unknown["assessment"]["failures"][0]["reason"] = json!("invented-reason");
+    assert!(serde_json::from_value::<RefusalDiagnostics>(unknown).is_err());
+    let mut unknown_outcome = wire;
+    unknown_outcome["assessment"]["outcomes"][0]["reason"] = json!("invented-reason");
+    assert!(serde_json::from_value::<RefusalDiagnostics>(unknown_outcome).is_err());
+}
+
+/// C11: the catalog selection travels as today's two members. `NotSelected` is
+/// `has_catalog_selection: false` with no key, a selected NULL is `true` with the key absent
+/// (an explicit `null`, as the boundary fixture spells it, decodes the same) and a selected value
+/// is `true` with the key. `false` with a key names no selection and refuses.
+#[test]
+fn catalog_selection_wire_is_the_two_member_shape() {
+    let outcome = |members: Value| {
+        let mut wire = json!({
+            "predicate": "catalog.dimension-market",
+            "line_id": "6f1c1f5e-1d1a-4c43-9d8e-2b7d2e7f0a11",
+            "item_id": "0b5d2f0e-3c8e-4f7a-a6f4-8f2f6a3c9d10",
+            "verdict": "passed",
+            "applicability": "required"
+        });
+        wire.as_object_mut()
+            .unwrap()
+            .extend(members.as_object().unwrap().clone());
+        wire
+    };
+    for (members, has, key) in [
+        (json!({"has_catalog_selection": false}), false, None),
+        (json!({"has_catalog_selection": true}), true, None),
+        (
+            json!({"has_catalog_selection": true, "catalog_scope_key": "k"}),
+            true,
+            Some("k"),
+        ),
+    ] {
+        let wire = outcome(members);
+        let decoded: GateOutcome = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(decoded.has_catalog_selection(), has);
+        assert_eq!(decoded.catalog_scope_key(), key);
+        assert_eq!(
+            decoded.selection,
+            CatalogSelection::from_parts(has, key.map(str::to_owned)).unwrap()
+        );
+        assert_eq!(serde_json::to_value(&decoded).unwrap(), wire, "{wire}");
+    }
+    assert_eq!(
+        CatalogSelection::from_parts(false, None).unwrap(),
+        CatalogSelection::NotSelected
+    );
+    assert_eq!(
+        CatalogSelection::from_parts(true, None).unwrap(),
+        CatalogSelection::SelectedNull
+    );
+    assert_eq!(
+        CatalogSelection::from_parts(true, Some("k".into())).unwrap(),
+        CatalogSelection::Selected("k".into())
+    );
+    // The boundary fixture's selection members (explicit `null`) decode to the three variants.
+    let fixtures: Value =
+        serde_json::from_str(include_str!("fixtures/boundary-fixtures.json")).unwrap();
+    let selection = fixtures["golden_envelopes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|v| v["id"] == "selected-null-is-not-default")
+        .unwrap()["value"]
+        .as_array()
+        .unwrap()
+        .clone();
+    let decoded: Vec<CatalogSelection> = selection
+        .into_iter()
+        .map(|m| {
+            serde_json::from_value::<GateOutcome>(outcome(m))
+                .unwrap()
+                .selection
+        })
+        .collect();
+    assert_eq!(
+        decoded,
+        [
+            CatalogSelection::NotSelected,
+            CatalogSelection::SelectedNull,
+            CatalogSelection::Selected("default".into()),
+        ]
+    );
+    // `false` with a key refuses, on the wire and in the constructor.
+    assert!(
+        serde_json::from_value::<GateOutcome>(outcome(
+            json!({"has_catalog_selection": false, "catalog_scope_key": "k"})
+        ))
+        .is_err()
+    );
+    assert!(CatalogSelection::from_parts(false, Some("k".into())).is_err());
+}
+
+/// C5 (n31): the named setters fill the scope one member at a time; the selection setter is
+/// the only way to select, so `false` plus a key is not buildable.
+#[test]
+fn gate_outcome_setters_fill_named_scope() {
+    let line = Uuid::from_u128(1);
+    let item = Uuid::from_u128(2);
+    let o = GateOutcome::new("catalog.slot-coverage", "failed", "required")
+        .with_line(line)
+        .with_item(item)
+        .with_selection(CatalogSelection::Selected("eu".into()))
+        .with_reason(Some(Reason::NoLines));
+    assert_eq!(o.line_id, Some(line));
+    assert_eq!(o.item_id, Some(item));
+    assert!(o.has_catalog_selection());
+    assert_eq!(o.catalog_scope_key(), Some("eu"));
+    let bare = GateOutcome::new("order.has-lines", "passed", "required");
+    assert_eq!((bare.line_id, bare.item_id), (None, None));
+    assert!(!bare.has_catalog_selection());
+    assert_eq!(bare.catalog_scope_key(), None);
 }

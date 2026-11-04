@@ -144,9 +144,9 @@ range. A zero-length period is selected when its instant falls in the range.
 
 - Good, because a range shows every entry that measured any part of it, whatever
   the emission grain.
-- Bad, because two cases must be implemented on every path, and the point case is
-  the one an author omits. Overlap alone silently drops every point event sitting
-  on a lower bound, which is the month-close boundary.
+- Bad, because both interval and point logic must be implemented on every path,
+  and the point case is the one an author omits. Overlap alone silently drops
+  every point event sitting on a lower bound, which is the month-close boundary.
 - Bad, because adjacent sums double count. An entry that spans a seam is counted
   in both ranges.
 - Bad, because no exact rollup is possible. An entry can span many buckets, so a

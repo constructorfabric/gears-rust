@@ -1075,6 +1075,18 @@ impl std::fmt::Display for TestDsn {
         f.write_str(&self.dsn)
     }
 }
+/// `dsn` as the gear's pool opens it: a `SQLite` one with `transaction_mode=immediate`, as the
+/// gear's database config sets it, so its writers wait for the write lock instead of failing at
+/// once. Raw connections keep the plain DSN, since sqlx refuses toolkit-db's option.
+#[must_use]
+pub fn toolkit_dsn(dsn: &str) -> String {
+    if dsn.starts_with("sqlite:") {
+        let separator = if dsn.contains('?') { '&' } else { '?' };
+        format!("{dsn}{separator}transaction_mode=immediate")
+    } else {
+        dsn.to_owned()
+    }
+}
 /// `Database::connect(&dsn)` takes anything that is `Into<String>`.
 impl From<&TestDsn> for String {
     fn from(dsn: &TestDsn) -> Self {
@@ -1112,7 +1124,7 @@ pub async fn test_db_with(
     use sea_orm_migration::MigratorTrait;
     let dsn = TestDsn::new("products-repos-");
     let db = toolkit_db::connect_db(
-        &dsn,
+        &toolkit_dsn(&dsn),
         toolkit_db::ConnectOpts {
             max_conns: Some(max_conns),
             min_conns: Some(1),
@@ -1291,7 +1303,7 @@ pub async fn repo_connection(
     toolkit_db::secure::AccessScope,
 ) {
     let db = toolkit_db::connect_db(
-        dsn,
+        &toolkit_dsn(dsn),
         toolkit_db::ConnectOpts {
             max_conns: Some(1),
             min_conns: Some(1),

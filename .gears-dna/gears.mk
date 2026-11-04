@@ -724,7 +724,7 @@ endif
 # Run architecture lints via cargo-gears (see Gears.toml for configuration).
 dylint:
 	$(call print_target_banner)
-	$(call check_tool,cargo-gears)
+	$(call check_tool_version,cargo-gears,>=$(CARGO_GEARS_VERSION))
 	cargo gears lint --dylint
 
 # Check for unused dependencies with cargo-shear.

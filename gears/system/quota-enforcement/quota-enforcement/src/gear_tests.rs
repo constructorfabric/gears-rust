@@ -1,15 +1,23 @@
 #![allow(clippy::expect_used)]
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
+use async_trait::async_trait;
 use authz_resolver_sdk::AuthZResolverApi;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use axum::{Extension, Router};
-use quota_enforcement_sdk::testing::InMemoryStorage;
-use quota_enforcement_sdk::{PageRequest, QuotaFilter, QuotaManagerClientV1};
+use quota_enforcement_sdk::testing::{DrainReport, InMemoryStorage, RecordingSink, quota_draft};
+use quota_enforcement_sdk::{
+    NotificationDeliveryHandle, PageRequest, QuotaEnforcementStoragePluginV1, QuotaFilter,
+    QuotaManagerClientV1, SubjectRef,
+};
+use quota_enforcement_storage_plugin::StoragePluginGear;
 use serde_json::json;
 use tokio::sync::oneshot;
+use tokio::task::AbortHandle;
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use toolkit::api::openapi_registry::OpenApiRegistryImpl;
 use toolkit::config::ConfigProvider;
@@ -21,12 +29,14 @@ use uuid::Uuid;
 
 use super::QuotaEnforcementGear;
 use crate::api::rest::routes::PATH_PREFIX;
-use crate::domain::{Dependency, ReadinessState};
+use crate::domain::notifications::DeliveryLifecycle;
+use crate::domain::{Dependency, DomainError, ReadinessState};
 use crate::test_support::{
     ClusterFixture, FailingPdp, LLM_MODEL_RESOURCE, LLM_TENANT_PROJECTION, LLM_USER_PROJECTION,
     OtherProfile, PermitTenantsPdp, ctx as security_ctx, hub_with_registry, in_process_registry,
     llm_gateway_documents, metric_base_documents, plugin_instance_document, register_pdp,
-    register_storage, storage_instance, tenant, wire_cluster, wire_cluster_with,
+    register_sink, register_storage, sink_instance, storage_instance, tenant, wire_cluster,
+    wire_cluster_with,
 };
 
 struct StaticConfigProvider {
@@ -250,6 +260,11 @@ async fn init_then_serve_bootstraps_signals_ready_and_stops_on_cancel() {
         .expect("read through the in-process client");
     assert!(page.items.is_empty());
 
+    // Delivery started before the ready signal: a committed event is
+    // dispatched (acknowledged, with no sink registered).
+    commit_one_event(storage.as_ref()).await;
+    assert_eq!(storage.drain_notifications().await.delivered, 1);
+
     let check = gear.healthcheck(&ctx).expect("health check after init");
     let result = check.check().await;
     assert_eq!(
@@ -264,6 +279,129 @@ async fn init_then_serve_bootstraps_signals_ready_and_stops_on_cancel() {
         .expect("serve task joins")
         .expect("serve returns Ok on shutdown");
     assert!(cell.load().is_none(), "shutdown withdraws the gauge sample");
+    commit_one_event(storage.as_ref()).await;
+    assert_eq!(
+        storage.drain_notifications().await,
+        DrainReport::default(),
+        "shutdown stopped delivery"
+    );
+    fixture.stop().await;
+}
+
+/// Commit one Quota and its `quota-changed` event through `storage`.
+async fn commit_one_event(
+    storage: &dyn QuotaEnforcementStoragePluginV1,
+) -> quota_enforcement_sdk::NotificationEvent {
+    let event = crate::domain::quotas::events::quota_changed(
+        tenant(),
+        None,
+        None,
+        crate::domain::quotas::events::ChangeKind::Created,
+        time::OffsetDateTime::now_utc(),
+    );
+    storage
+        .create_quota(
+            &security_ctx(),
+            &toolkit_security::AccessScope::allow_all(),
+            quota_draft(
+                SubjectRef {
+                    projection_type: gts::GtsTypeId::new(LLM_USER_PROJECTION),
+                    subject_id: format!("u-{}", Uuid::new_v4()),
+                },
+                Some(10),
+            ),
+            std::slice::from_ref(&event),
+        )
+        .await
+        .expect("committed");
+    event
+}
+
+/// The published SQL storage plugin's context: its config and an in-memory
+/// `SQLite` database with its migrations applied.
+async fn sql_plugin_ctx(hub: Arc<ClientHub>) -> GearCtx {
+    use quota_enforcement_storage_plugin::infra::storage::Migrator;
+    use sea_orm_migration::MigratorTrait as _;
+
+    let cfg = json!({ "quota-enforcement-storage-plugin": { "config": { "vendor": "acme" } } });
+    let ctx = GearCtx::new(
+        StoragePluginGear::MODULE_NAME,
+        Uuid::from_u128(2),
+        Arc::new(StaticConfigProvider { root: cfg }),
+        hub,
+        CancellationToken::new(),
+    );
+    let opts = toolkit_db::ConnectOpts {
+        max_conns: Some(1),
+        min_conns: Some(1),
+        ..toolkit_db::ConnectOpts::default()
+    };
+    let db = toolkit_db::connect_db("sqlite::memory:", opts)
+        .await
+        .expect("in-memory sqlite");
+    toolkit_db::migration_runner::run_migrations_for_testing(&db, Migrator::migrations())
+        .await
+        .expect("migrations");
+    ctx.with_db(toolkit_db::DBProvider::new(db))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn serve_delivers_what_the_published_sql_plugin_commits_to_a_registered_sink() {
+    let sink_fixture = sink_instance("cf.core._.qe_sink_audit.v1", "acme");
+    let mut documents = llm_gateway_documents();
+    documents.extend(metric_base_documents());
+    documents.push(plugin_instance_document(&sink_fixture));
+    let hub = hub_with_registry(in_process_registry(documents));
+    register_pdp(
+        &hub,
+        Arc::new(PermitTenantsPdp::new(vec![tenant().as_uuid()])),
+    );
+    let sink = Arc::new(RecordingSink::new("audit"));
+    register_sink(&hub, &sink_fixture, sink.clone());
+    let fixture = wire_cluster(&hub);
+
+    // The SQL plugin publishes its instance and client into the same hub; the
+    // gear's binding selects it by vendor like any other storage plugin.
+    let plugin = StoragePluginGear::default();
+    plugin
+        .init(&sql_plugin_ctx(hub.clone()).await)
+        .await
+        .expect("plugin init");
+    let gear = Arc::new(QuotaEnforcementGear::default());
+    gear.init(&make_ctx(hub)).await.expect("init");
+    let (tx, rx) = oneshot::channel();
+    let cancel = CancellationToken::new();
+    let handle = tokio::spawn(
+        gear.clone()
+            .serve(cancel.clone(), ReadySignal::from_sender(tx)),
+    );
+    rx.await.expect("ready");
+
+    let storage = gear
+        .service()
+        .expect("service")
+        .storage()
+        .expect("storage bound");
+    let event = commit_one_event(storage.as_ref()).await;
+    // Well within the reconciler's idle minute: the commit's wake did it.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    while sink.received().is_empty() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the event never reached the sink"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    let received = sink.received();
+    assert_eq!(received.len(), 1);
+    assert_eq!(received[0].1.event_id, event.event_id);
+    assert!(!received[0].0.is_anonymous());
+
+    cancel.cancel();
+    handle
+        .await
+        .expect("serve task joins")
+        .expect("serve returns Ok on shutdown");
     fixture.stop().await;
 }
 
@@ -428,6 +566,50 @@ async fn serve_stops_cleanly_when_cancelled_during_bootstrap() {
     assert!(format!("{err:#}").contains("shutdown"), "{err:#}");
     assert!(rx.await.is_err());
     fixture.stop().await;
+}
+
+/// A pipeline handle that records when its stop began.
+struct StopInstant(Arc<Mutex<Option<Instant>>>);
+
+#[async_trait]
+impl NotificationDeliveryHandle for StopInstant {
+    async fn stop(self: Box<Self>) {
+        *self.0.lock().expect("stop instant") = Some(Instant::now());
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn shutdown_stops_delivery_at_once_and_aborts_leader_tasks_after_one_budget() {
+    let budget = Duration::from_secs(10);
+    let stuck = || tokio::spawn(std::future::pending::<Result<(), DomainError>>());
+    let tasks = [
+        ("gauge", stuck()),
+        ("retention", stuck()),
+        ("lease", stuck()),
+    ];
+    let aborts: Vec<_> = tasks.iter().map(|(_, task)| task.abort_handle()).collect();
+    let delivery = DeliveryLifecycle::default();
+    let stopped_at = Arc::new(Mutex::new(None));
+    assert!(
+        delivery
+            .hold(Box::new(StopInstant(Arc::clone(&stopped_at))))
+            .is_none()
+    );
+
+    let start = Instant::now();
+    super::stop_background(tasks, &delivery, budget).await;
+
+    assert_eq!(
+        *stopped_at.lock().expect("stop instant"),
+        Some(start),
+        "delivery stops without waiting for the leader tasks"
+    );
+    assert!(start.elapsed() <= budget, "took {:?}", start.elapsed());
+    tokio::task::yield_now().await;
+    assert!(
+        aborts.iter().all(AbortHandle::is_finished),
+        "a leader task that overruns its budget is aborted, not detached"
+    );
 }
 
 #[tokio::test]

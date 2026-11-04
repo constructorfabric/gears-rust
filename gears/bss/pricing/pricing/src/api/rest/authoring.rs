@@ -32,7 +32,9 @@ use dto::{
     PricingSettingsDto, PricingSettingsPut,
 };
 use std::sync::Arc;
-use support::{authz_failure, etag, header, require_authenticated, response, transaction};
+use support::{
+    authz_failure, etag, header, require_authenticated, response, transaction, transaction_read,
+};
 
 /// The approve and submit grants behind `caller_can_approve` (D-471). The two PDP questions are
 /// independent, so they are asked together: a unit list or card waits for one PDP round trip,
@@ -1394,7 +1396,7 @@ async fn list_publish_changes(
     .await
     .map_err(authz_failure)?;
     let tenant = ctx.subject_tenant_id();
-    let body = transaction(&state.db.db(), move |tx| {
+    let body = transaction_read(&state.db.db(), move |tx| {
         let scope = scope.clone();
         Box::pin(async move { approvals::publish_list(tx, &scope, tenant, id).await })
     })
@@ -1492,7 +1494,7 @@ async fn list_approval_units(
         submit_scope,
     };
     let caller = ctx.clone();
-    let body = transaction(&state.db.db(), move |tx| {
+    let body = transaction_read(&state.db.db(), move |tx| {
         let (scope, ctx, request) = (scope.clone(), caller.clone(), request.clone());
         Box::pin(async move { approvals::read_unit_page(tx, &scope, &ctx, &request).await })
     })
@@ -1695,7 +1697,7 @@ async fn get_approval_unit(
         approval_flag_scopes(&enforcer, &ctx),
     )?;
     let caller = ctx.clone();
-    let body = transaction(&state.db.db(), move |tx| {
+    let body = transaction_read(&state.db.db(), move |tx| {
         let (scope, ctx) = (scope.clone(), caller.clone());
         let (approve_scope, submit_scope) = (approve_scope.clone(), submit_scope.clone());
         Box::pin(async move {
@@ -1857,7 +1859,7 @@ async fn get_effective_policy(
         .await
         .map_err(authz_failure)?;
     let tenant = ctx.subject_tenant_id();
-    transaction(&state.db.db(), move |tx| {
+    transaction_read(&state.db.db(), move |tx| {
         Box::pin(async move { approvals::effective_quorum(tx, tenant, kind).await })
     })
     .await
@@ -1878,7 +1880,7 @@ async fn get_approval_policy(
     )
     .await
     .map_err(authz_failure)?;
-    transaction(&state.db.db(), move |tx| {
+    transaction_read(&state.db.db(), move |tx| {
         let (scope, ctx) = (scope.clone(), ctx.clone());
         Box::pin(async move { approvals::get_policy(tx, &scope, ctx.subject_tenant_id()).await })
     })
@@ -2071,6 +2073,7 @@ async fn create_price(
         digest,
         input,
         state.currency_scales.clone(),
+        state.clock.clone(),
     )
     .await
 }
@@ -2107,6 +2110,7 @@ async fn patch_price(
         version,
         input,
         state.currency_scales.clone(),
+        state.clock.clone(),
     )
     .await
 }
@@ -2193,7 +2197,7 @@ async fn get_book(
     let backend = state.db.db().backend();
     let today = time::OffsetDateTime::now_utc().date();
     let tx_ctx = ctx.clone();
-    let read = transaction(&state.db.db(), move |tx| {
+    let read = transaction_read(&state.db.db(), move |tx| {
         let (scope, ctx) = (scope.clone(), tx_ctx.clone());
         Box::pin(async move {
             let tenant = ctx.subject_tenant_id();
@@ -2479,7 +2483,7 @@ async fn unarchive_book(
     let tenant = ctx.subject_tenant_id();
     // The unarchive has committed: a failed read of the entries still released does not make it an
     // error. The answer says it does not know them (null) rather than invent a list.
-    let released_entries = match transaction(&state.db.db(), move |tx| {
+    let released_entries = match transaction_read(&state.db.db(), move |tx| {
         Box::pin(async move { books::released_entries(tx, tenant, id).await })
     })
     .await
@@ -2520,7 +2524,7 @@ async fn export_book(
     .await
     .map_err(authz_failure)?;
     let tenant = ctx.subject_tenant_id();
-    let body = transaction(&state.db.db(), move |tx| {
+    let body = transaction_read(&state.db.db(), move |tx| {
         let scope = scope.clone();
         Box::pin(async move { books::export(tx, &scope, tenant, id).await })
     })
@@ -2545,7 +2549,7 @@ async fn get_settings(
     .await
     .map_err(authz_failure)?;
     let tenant = ctx.subject_tenant_id();
-    let (body, version) = transaction(&state.db.db(), move |tx| {
+    let (body, version) = transaction_read(&state.db.db(), move |tx| {
         let scope = scope.clone();
         Box::pin(async move {
             let body = configuration::settings(tx, &scope, tenant).await?;
@@ -2624,7 +2628,7 @@ async fn get_dimensions(
     )
     .await
     .map_err(authz_failure)?;
-    transaction(&state.db.db(), move |tx| {
+    transaction_read(&state.db.db(), move |tx| {
         let (scope, ctx) = (scope.clone(), ctx.clone());
         Box::pin(async move {
             let tenant = ctx.subject_tenant_id();
@@ -2720,7 +2724,7 @@ async fn list_sku_entries(
     let books = money_scope(&enforcer, &ctx).await?;
     let today = time::OffsetDateTime::now_utc().date();
     let tenant = ctx.subject_tenant_id();
-    let body = transaction(&state.db.db(), move |tx| {
+    let body = transaction_read(&state.db.db(), move |tx| {
         let (scope, books, query) = (scope.clone(), books.clone(), query.clone());
         Box::pin(async move {
             match &query {
@@ -2796,7 +2800,7 @@ async fn get_entry(
     let books = money_scope(&enforcer, &ctx).await?;
     let today = time::OffsetDateTime::now_utc().date();
     let tenant = ctx.subject_tenant_id();
-    let (body, version) = transaction(&state.db.db(), move |tx| {
+    let (body, version) = transaction_read(&state.db.db(), move |tx| {
         let (scope, books) = (scope.clone(), books.clone());
         Box::pin(async move {
             let m = price_book_entries::find(tx, &scope, tenant, id).await?;
@@ -2888,7 +2892,7 @@ async fn list_entry_prices(
     let wanted = wanted_statuses(&uri)?;
     let today = time::OffsetDateTime::now_utc().date();
     let tenant = ctx.subject_tenant_id();
-    let body = transaction(&state.db.db(), move |tx| {
+    let body = transaction_read(&state.db.db(), move |tx| {
         let (scope, books, wanted) = (scope.clone(), books.clone(), wanted.clone());
         Box::pin(async move {
             price_book_entries::prices(
@@ -2992,7 +2996,7 @@ async fn list_reference_ops(
     if !(1..=1000).contains(&limit) {
         return Err(support::invalid("limit", "LIMIT_INVALID"));
     }
-    transaction(&state.db.db(), move |tx| {
+    transaction_read(&state.db.db(), move |tx| {
         let (scope, ctx) = (scope.clone(), ctx.clone());
         Box::pin(async move {
             let mut items = crate::infra::storage::repo::reference_op_repo::page(

@@ -6,6 +6,7 @@
     reason = "a test's fixtures and reads fail the test where they fail"
 )]
 mod plan_support;
+use bss_pricing::infra::reference_work::Clock;
 use bss_pricing::infra::storage::{entity::plan_item, repo::plan_item_repo};
 use bss_products_sdk::{PRICING_SYSTEM_ACTOR, models::SkuType};
 use bss_rest::actor_names::{ActorDirectory, IdpUser, ListUsersQuery, queried_ids};
@@ -68,6 +69,13 @@ impl People {
     }
 }
 
+struct FixedClock(time::OffsetDateTime);
+impl Clock for FixedClock {
+    fn now(&self) -> time::OffsetDateTime {
+        self.0
+    }
+}
+
 /// Everything the reads show, written by the author `f.ctx` (Ann) and voted on by Rob.
 struct World {
     f: Fixture,
@@ -85,7 +93,13 @@ struct World {
 async fn world() -> World {
     let catalog = Arc::new(Catalog::default());
     let people = Arc::new(People::default());
-    let fixture = Fixture::with_directory(catalog.clone(), people.clone()).await;
+    // The doors judge a price's window against their clock's date. Pinned at the start, a run that
+    // crosses midnight UTC drafts and applies the price on one day, as it reads it.
+    let now = time::OffsetDateTime::now_utc();
+    let today = now.date();
+    let fixture =
+        Fixture::with_directory_at(catalog.clone(), people.clone(), Arc::new(FixedClock(now)))
+            .await;
     let rob = fixture.user();
     people.know(fixture.ctx.subject_id(), "Ann Author");
     people.know(rob.subject_id(), "Rob Reviewer");
@@ -96,7 +110,7 @@ async fn world() -> World {
     let priced = entry(&fixture, eur, sku, "usage", None).await;
     let ann_item = item(&fixture, revision, sku, Some(priced), "paid").await;
     system_item(&fixture, &catalog, eur, &ann_item).await;
-    let unit = approved_price(&fixture, &rob, priced).await;
+    let unit = approved_price(&fixture, &rob, priced, today).await;
     World {
         f: fixture,
         people,
@@ -142,9 +156,14 @@ async fn system_item(fixture: &Fixture, catalog: &Catalog, book: Uuid, like: &pl
         .unwrap();
 }
 
-/// A price on `priced` drafted and submitted by Ann and approved by Rob, then a second draft by
-/// Ann: the unit's id.
-async fn approved_price(fixture: &Fixture, rob: &SecurityContext, priced: Uuid) -> String {
+/// A price on `priced` from `today` drafted and submitted by Ann and approved by Rob, then a
+/// second draft by Ann: the unit's id.
+async fn approved_price(
+    fixture: &Fixture,
+    rob: &SecurityContext,
+    priced: Uuid,
+    today: time::Date,
+) -> String {
     let (_, _, tag) = fixture
         .call("GET", "/approval-policy", json!({}), None, None)
         .await;
@@ -158,7 +177,6 @@ async fn approved_price(fixture: &Fixture, rob: &SecurityContext, priced: Uuid) 
         )
         .await;
     assert_eq!(status, 200, "{policy}");
-    let today = time::OffsetDateTime::now_utc().date();
     let drafted = draft(fixture, priced, today, "price").await;
     // A write answer carries no name: no write answer names anyone (D-519).
     named(&drafted["items"][0], "created_by", None);

@@ -10,8 +10,10 @@
 //! - **I2 Idempotency.** Replay returns the original outcome; a different
 //!   payload under the same scope returns
 //!   [`StorageError::IdempotencyPayloadMismatch`].
-//! - **I3 Read-only.** Reads do not mutate state, except snapshot reads may
-//!   materialize their current period row without settlement or events.
+//! - **I3 Read-only.** Reads do not mutate state, and snapshot reads take no
+//!   row lock. A consumption Quota with no row for its current window reads
+//!   as zero there; the next mutating operation creates the row and closes
+//!   the elapsed period.
 //! - **I4-I5 Lease periods.** Expired leases are treated as released; lease
 //!   settlement and rollback target the acquisition period.
 //! - **I6-I8 Bounds.** Cap updates, active-lease limits, and contention
@@ -695,8 +697,11 @@ pub trait QuotaEnforcementStoragePluginV1: Send + Sync + 'static {
 
     // --- snapshot reads ---
 
-    /// Per-Quota state for one applicable set. May materialize the current
-    /// period row (the I3 exception).
+    /// Per-Quota state for one applicable set: every active Quota whose
+    /// subject is in the set, in `quota_id` order.
+    ///
+    /// Writes nothing and takes no row lock (I3): a consumption Quota whose
+    /// current window has no row yet reads as zero over that window.
     async fn read_quota_snapshot(
         &self,
         ctx: &SecurityContext,
@@ -705,6 +710,22 @@ pub trait QuotaEnforcementStoragePluginV1: Send + Sync + 'static {
     ) -> Result<Vec<QuotaSnapshot>, StorageError>;
 
     /// Paginated per-Quota state for many applicable sets.
+    ///
+    /// Selects every active Quota under `scope` whose tenant and metric match
+    /// a pair and whose subject is in that pair's subjects. The union is
+    /// ordered by `quota_id` ascending and returns each Quota once, however
+    /// many pairs select it; Quotas outside their validity window are
+    /// included. At most `page.limit` rows are returned (a zero limit means
+    /// the default). `next_cursor` is opaque and holds only the last
+    /// `quota_id` returned, so the next page resumes after it and a walk to
+    /// exhaustion yields each row once; it is `None` on the last page. The
+    /// page is read in one transaction and, like
+    /// [`Self::read_quota_snapshot`], writes nothing.
+    ///
+    /// # Errors
+    ///
+    /// [`StorageError::InvalidCursor`] for a cursor this plugin did not issue;
+    /// [`StorageError::Unavailable`] when the backend cannot serve the page.
     async fn bulk_read_quota_snapshot(
         &self,
         ctx: &SecurityContext,
@@ -818,6 +839,24 @@ pub trait QuotaEnforcementStoragePluginV1: Send + Sync + 'static {
         &self,
         scope: &IdempotencyScope,
     ) -> Result<Option<IdempotencyRecord>, StorageError>;
+
+    // --- notification delivery ---
+
+    /// Start the one notification outbox pipeline of this plugin instance,
+    /// handing every claimed event to `delivery`, and bind it for enqueueing.
+    ///
+    /// Until this returns, events enqueued by a mutation stay queued; an empty
+    /// enqueue never needs it. The pipeline is fenced by the outbox lease, so
+    /// every replica may run one. Keep the handle and stop it on shutdown.
+    ///
+    /// # Errors
+    ///
+    /// [`StorageError::Internal`] when this instance already started one;
+    /// [`StorageError::Unavailable`] when the backend cannot start it.
+    async fn start_notification_delivery(
+        &self,
+        delivery: std::sync::Arc<dyn crate::notifications::NotificationDeliveryV1>,
+    ) -> Result<Box<dyn crate::notifications::NotificationDeliveryHandle>, StorageError>;
 
     // --- sweeper and reclamation ---
 

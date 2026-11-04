@@ -25,12 +25,15 @@ use super::tokens;
 pub enum PluginKind {
     /// `QuotaEnforcementStoragePluginV1`.
     Storage,
+    /// `QuotaNotificationSinkV1`.
+    NotificationSink,
 }
 
 impl fmt::Display for PluginKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             Self::Storage => "storage",
+            Self::NotificationSink => "notification sink",
         })
     }
 }
@@ -51,6 +54,8 @@ pub enum Dependency {
     Catalog,
     /// The statically registered resolution engines and their artifacts.
     Engine,
+    /// The registered notification sinks.
+    NotificationSinks,
 }
 
 impl Dependency {
@@ -64,6 +69,7 @@ impl Dependency {
             Self::TypesRegistry => "types_registry",
             Self::Catalog => "catalog",
             Self::Engine => "engine",
+            Self::NotificationSinks => "notification_sinks",
         }
     }
 }
@@ -264,6 +270,19 @@ pub enum DomainError {
         /// The item's position in the request.
         index: usize,
         /// The item field.
+        field: &'static str,
+        /// Closed `UPPER_SNAKE` reason token.
+        reason: &'static str,
+    },
+    // --- snapshot reads ---
+    /// A snapshot request is refused: its shape before the PDP, or a subject
+    /// the catalogue does not map after it. `index` names the subject when the
+    /// refusal is about one.
+    #[error("invalid snapshot {field}: {reason}")]
+    InvalidSnapshot {
+        /// The subject's position in the request, when one is at fault.
+        index: Option<usize>,
+        /// The request or subject field.
         field: &'static str,
         /// Closed `UPPER_SNAKE` reason token.
         reason: &'static str,

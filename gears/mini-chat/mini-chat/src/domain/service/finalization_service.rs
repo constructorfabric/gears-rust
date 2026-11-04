@@ -160,7 +160,13 @@ impl<TR: TurnRepository + 'static, MR: MessageRepository + 'static> Finalization
                 }
                 if let Some(billing) = outcome.billing_outcome {
                     let ms = start.elapsed().as_secs_f64() * 1000.0;
-                    Self::emit_post_commit_side_effects(&input, billing, ms, &*self.metrics);
+                    Self::emit_post_commit_side_effects(
+                        &input,
+                        billing,
+                        outcome.settlement_outcome.as_ref(),
+                        ms,
+                        &*self.metrics,
+                    );
                 }
                 Ok(outcome)
             }
@@ -194,6 +200,7 @@ impl<TR: TurnRepository + 'static, MR: MessageRepository + 'static> Finalization
                         Self::emit_post_commit_side_effects(
                             &retry_input,
                             billing,
+                            retry_outcome.settlement_outcome.as_ref(),
                             ms,
                             &*self.metrics,
                         );
@@ -230,6 +237,7 @@ impl<TR: TurnRepository + 'static, MR: MessageRepository + 'static> Finalization
                         Self::emit_post_commit_side_effects(
                             &retry_input,
                             billing,
+                            retry_outcome.settlement_outcome.as_ref(),
                             ms,
                             &*self.metrics,
                         );
@@ -527,17 +535,40 @@ impl<TR: TurnRepository + 'static, MR: MessageRepository + 'static> Finalization
     fn emit_post_commit_side_effects(
         input: &FinalizationInput,
         billing: BillingDerivation,
+        settlement: Option<&SettlementOutcome>,
         finalization_ms: f64,
         metrics: &dyn MiniChatMetricsPort,
     ) {
         metrics.record_finalization_latency_ms(finalization_ms);
-        Self::emit_quota_metrics(input, billing, metrics);
+        Self::emit_quota_metrics(input, billing, settlement, metrics);
         Self::emit_billing_side_effects(input, billing, metrics);
+        Self::emit_usage_missing(input, billing, metrics);
+    }
+
+    /// A completed turn without provider usage settles estimated instead of
+    /// free; make each one visible.
+    fn emit_usage_missing(
+        input: &FinalizationInput,
+        billing: BillingDerivation,
+        metrics: &dyn MiniChatMetricsPort,
+    ) {
+        if billing.outcome == BillingOutcome::Completed
+            && billing.settlement_method == SettlementMethod::Estimated
+        {
+            warn!(
+                turn_id = %input.turn_id,
+                effective_model = %input.effective_model,
+                usage = ?input.usage,
+                "completed turn without provider usage, settled with the estimated formula"
+            );
+            metrics.record_quota_usage_missing(&input.effective_model);
+        }
     }
 
     fn emit_quota_metrics(
         input: &FinalizationInput,
         billing: BillingDerivation,
+        settlement: Option<&SettlementOutcome>,
         metrics: &dyn MiniChatMetricsPort,
     ) {
         match billing.settlement_method {
@@ -556,6 +587,11 @@ impl<TR: TurnRepository + 'static, MR: MessageRepository + 'static> Finalization
                     if actual > reserved {
                         metrics.record_quota_overshoot(period::DAILY);
                         metrics.record_quota_overshoot(period::MONTHLY);
+                        // Beyond the tolerance the charge is capped at the
+                        // reserve (DESIGN §5.8.1), so the rest goes unbilled.
+                        if settlement.is_some_and(|s| s.overshoot_capped) {
+                            metrics.record_quota_overshoot_uncharged_tokens(actual - reserved);
+                        }
                     }
                 }
 
@@ -1708,6 +1744,232 @@ mod tests {
             1,
             "should record quota_actual_tokens"
         );
+    }
+
+    #[tokio::test]
+    async fn completed_without_usage_settles_estimated_and_records_metric() {
+        use crate::domain::model::quota::SettlementPath;
+        use crate::domain::service::test_helpers::TestMetrics;
+
+        /// Records the settlement path it was asked to settle.
+        #[domain_model]
+        struct RecordingQuotaSettler {
+            paths: std::sync::Mutex<Vec<SettlementPath>>,
+        }
+
+        #[async_trait::async_trait]
+        impl QuotaSettler for RecordingQuotaSettler {
+            async fn settle_in_tx(
+                &self,
+                _tx: &toolkit_db::secure::DbTx<'_>,
+                _scope: &AccessScope,
+                input: crate::domain::model::quota::SettlementInput,
+            ) -> Result<SettlementOutcome, DomainError> {
+                self.paths.lock().unwrap().push(input.settlement_path);
+                Ok(SettlementOutcome {
+                    settlement_method: SettlementMethod::Estimated,
+                    actual_credits_micro: 60,
+                    charged_tokens: 60,
+                    overshoot_capped: false,
+                })
+            }
+        }
+
+        let zero = Usage {
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read_input_tokens: 0,
+            cache_write_input_tokens: 0,
+            reasoning_tokens: 0,
+        };
+        for usage in [None, Some(zero)] {
+            let db = mock_db_provider(inmem_db().await);
+            let settler = Arc::new(RecordingQuotaSettler {
+                paths: std::sync::Mutex::new(Vec::new()),
+            });
+            let metrics = Arc::new(TestMetrics::new());
+            let svc = FinalizationService::new(
+                Arc::clone(&db),
+                Arc::new(TurnRepo),
+                Arc::new(MsgRepo::new(toolkit_db::odata::LimitCfg {
+                    default: 20,
+                    max: 100,
+                })),
+                Arc::clone(&settler) as Arc<dyn QuotaSettler>,
+                Arc::new(RecordingOutboxEnqueuer::new()),
+                Arc::clone(&metrics) as Arc<dyn MiniChatMetricsPort>,
+                crate::config::background::ThreadSummaryWorkerConfig::default(),
+            );
+
+            let tenant_id = Uuid::new_v4();
+            let chat_id = Uuid::new_v4();
+            let turn_id = Uuid::new_v4();
+            let request_id = Uuid::new_v4();
+            let user_id = Uuid::new_v4();
+            insert_test_chat(&db, tenant_id, chat_id, user_id).await;
+            insert_running_turn(&db, tenant_id, chat_id, turn_id, request_id).await;
+
+            let mut input = make_input(
+                tenant_id,
+                chat_id,
+                turn_id,
+                request_id,
+                user_id,
+                TurnState::Completed,
+            );
+            input.usage = usage;
+            let outcome = svc
+                .finalize_turn_cas(input)
+                .await
+                .expect("finalization should succeed");
+
+            assert!(outcome.won_cas);
+            let billing = outcome.billing_outcome.unwrap();
+            assert_eq!(billing.outcome, BillingOutcome::Completed, "{usage:?}");
+            assert_eq!(
+                billing.settlement_method,
+                SettlementMethod::Estimated,
+                "{usage:?}"
+            );
+            assert!(
+                matches!(
+                    settler.paths.lock().unwrap().as_slice(),
+                    [SettlementPath::Estimated]
+                ),
+                "{usage:?}"
+            );
+            assert_eq!(
+                *metrics.quota_usage_missing.lock().unwrap(),
+                vec!["gpt-5.2".to_owned()],
+                "{usage:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn capped_overshoot_records_uncharged_tokens() {
+        use crate::domain::service::test_helpers::TestMetrics;
+
+        /// Settles actual and reports the configured cap flag.
+        #[domain_model]
+        struct OvershootSettler {
+            capped: bool,
+        }
+
+        #[async_trait::async_trait]
+        impl QuotaSettler for OvershootSettler {
+            async fn settle_in_tx(
+                &self,
+                _tx: &toolkit_db::secure::DbTx<'_>,
+                _scope: &AccessScope,
+                input: crate::domain::model::quota::SettlementInput,
+            ) -> Result<SettlementOutcome, DomainError> {
+                Ok(SettlementOutcome {
+                    settlement_method: SettlementMethod::Actual,
+                    actual_credits_micro: input.reserved_credits_micro,
+                    charged_tokens: 100,
+                    overshoot_capped: self.capped,
+                })
+            }
+        }
+
+        for (capped, expected) in [(true, vec![50.0]), (false, vec![])] {
+            let db = mock_db_provider(inmem_db().await);
+            let metrics = Arc::new(TestMetrics::new());
+            let svc = FinalizationService::new(
+                Arc::clone(&db),
+                Arc::new(TurnRepo),
+                Arc::new(MsgRepo::new(toolkit_db::odata::LimitCfg {
+                    default: 20,
+                    max: 100,
+                })),
+                Arc::new(OvershootSettler { capped }),
+                Arc::new(RecordingOutboxEnqueuer::new()),
+                Arc::clone(&metrics) as Arc<dyn MiniChatMetricsPort>,
+                crate::config::background::ThreadSummaryWorkerConfig::default(),
+            );
+
+            let tenant_id = Uuid::new_v4();
+            let chat_id = Uuid::new_v4();
+            let turn_id = Uuid::new_v4();
+            let request_id = Uuid::new_v4();
+            let user_id = Uuid::new_v4();
+            insert_test_chat(&db, tenant_id, chat_id, user_id).await;
+            insert_running_turn(&db, tenant_id, chat_id, turn_id, request_id).await;
+
+            // reserve_tokens = 100, actual = 150.
+            let mut input = make_input(
+                tenant_id,
+                chat_id,
+                turn_id,
+                request_id,
+                user_id,
+                TurnState::Completed,
+            );
+            input.usage = Some(Usage {
+                input_tokens: 120,
+                output_tokens: 30,
+                cache_read_input_tokens: 0,
+                cache_write_input_tokens: 0,
+                reasoning_tokens: 0,
+            });
+            let outcome = svc
+                .finalize_turn_cas(input)
+                .await
+                .expect("finalization should succeed");
+
+            assert!(outcome.won_cas);
+            assert_eq!(
+                *metrics.quota_overshoot_uncharged_tokens.lock().unwrap(),
+                expected,
+                "capped = {capped}"
+            );
+            assert_eq!(
+                metrics
+                    .quota_overshoot
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                2,
+                "every overshoot is counted for daily and monthly"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn completed_with_usage_does_not_record_usage_missing() {
+        use crate::domain::service::test_helpers::TestMetrics;
+
+        let db = mock_db_provider(inmem_db().await);
+        let metrics = Arc::new(TestMetrics::new());
+        let (svc, _outbox) =
+            build_finalization_service_with_metrics(Arc::clone(&db), Arc::clone(&metrics) as _);
+
+        let tenant_id = Uuid::new_v4();
+        let chat_id = Uuid::new_v4();
+        let turn_id = Uuid::new_v4();
+        let request_id = Uuid::new_v4();
+        let user_id = Uuid::new_v4();
+        insert_test_chat(&db, tenant_id, chat_id, user_id).await;
+        insert_running_turn(&db, tenant_id, chat_id, turn_id, request_id).await;
+
+        let input = make_input(
+            tenant_id,
+            chat_id,
+            turn_id,
+            request_id,
+            user_id,
+            TurnState::Completed,
+        );
+        let outcome = svc
+            .finalize_turn_cas(input)
+            .await
+            .expect("finalization should succeed");
+
+        assert!(outcome.won_cas);
+        assert_eq!(
+            outcome.billing_outcome.unwrap().settlement_method,
+            SettlementMethod::Actual
+        );
+        assert!(metrics.quota_usage_missing.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

@@ -27,6 +27,18 @@ pub mod plugin_api;
 pub mod reason;
 pub mod serde_helpers;
 
+/// Generation 2 of the contract — the reworked metering surface. See
+/// [`v2`]'s own module documentation. The items re-exported at this crate's
+/// root remain generation 1, unchanged, for existing consumers.
+pub mod v2;
+
+/// The `bigdecimal` this crate's contract surfaces are typed against,
+/// re-exported so a plugin filling [`v2::QuantitySummary::Accrued`] need not
+/// declare the dependency and keep its version in step by hand. A version
+/// that drifts does not fail to resolve — it compiles two distinct
+/// `BigDecimal` types and fails at the call site.
+pub use bigdecimal;
+
 pub use api::UsageCollectorClientV1;
 pub use error::{UsageCollectorError, UsageCollectorPluginError};
 pub use gts::{USAGE_RECORD_RESOURCE, USAGE_TYPE_RESOURCE, UsageCollectorPluginSpecV1};

@@ -38,7 +38,7 @@ tables=[]
 for f in files:
  for m in re.finditer(r'CREATE TABLE (bss_orders__\w+) \(\n(.*?)\n\);',f.read_text(),re.S):
   full,body=m.groups();name=full.removeprefix('bss_orders__');mutation,scope,source=metadata[name]
-  t=dict(name=name,physical=full,content_owner=owners[name],source_ids=['cpt-cf-bss-orders-dbtable-'+source],migration=f.name,mutation=mutation,scope=scope,columns=[],pk=[],constraints={},indexes={},triggers=[],grants=[])
+  t={'name':name,'physical':full,'content_owner':owners[name],'source_ids':['cpt-cf-bss-orders-dbtable-'+source],'migration':f.name,'mutation':mutation,'scope':scope,'columns':[],'pk':[],'constraints':{},'indexes':{},'triggers':[],'grants':[]}
   for line in body.splitlines():
    line=line.strip().rstrip(',')
    if line.startswith('CONSTRAINT '):
@@ -47,9 +47,12 @@ for f in files:
    else:
     c=re.fullmatch(r'(\w+) (char\(3\)|\w+)( NOT NULL)?(.*)',line)
     assert c,line
-    n,ty,required,extra=c.groups();t['columns'].append(dict(name=n,type=ty,nullable=not bool(required),extra=extra.strip()))
-  for a in re.finditer(r'ALTER TABLE '+full+r' (ADD CONSTRAINT (\w+) (.*?));',sql,re.S):t['constraints'][a[2]]=' '.join(a[3].split())
-  for a in re.finditer(r'ALTER TABLE '+full+r' DROP CONSTRAINT (\w+);',sql):t['constraints'].pop(a[1],None)
+    n,ty,required,extra=c.groups();t['columns'].append({'name':n,'type':ty,'nullable':not bool(required),'extra':extra.strip()})
+  # One pass in source order, so a constraint dropped and re-added under its name survives.
+  for a in re.finditer(r'ALTER TABLE '+full+r' (?:ADD COLUMN (\w+) (\w+)( NOT NULL)?|ADD CONSTRAINT (\w+) (.*?)|DROP CONSTRAINT (\w+));',sql,re.S):
+   if a[1]:t['columns'].append({'name':a[1],'type':a[2],'nullable':not bool(a[3]),'extra':''})
+   elif a[4]:t['constraints'][a[4]]=' '.join(a[5].split())
+   else:t['constraints'].pop(a[6],None)
   for i in re.finditer(r'CREATE (UNIQUE )?INDEX (\w+) ON '+full+r' (.*?);',sql):t['indexes'][i[2]]=(i[1] or '')+i[3]
   for tr in re.finditer(r'CREATE (?:CONSTRAINT )?TRIGGER (\w+) ([^;]*?) ON '+full+r'\s+(.*?);',sql,re.S):
    # Match a trigger statement only, not across prior SQL statements.

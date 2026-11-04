@@ -73,6 +73,7 @@ fn unbound_service_with(pdp: Arc<dyn authz_resolver_sdk::AuthZResolverApi>) -> A
             preparation_max_attempts: std::num::NonZeroU32::new(3).expect("attempts"),
             leases: crate::domain::operations::LeaseLimits::default(),
             batch: crate::domain::operations::BatchLimits::default(),
+            snapshot: crate::domain::operations::SnapshotLimits::default(),
         },
     ))
 }

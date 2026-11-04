@@ -24,7 +24,7 @@ use bss_orders_sdk::catalog::{OrderState, Trigger};
 use event_broker::test_support::{
     DeliveredOutcome, DeliveredPublish, EventBrokerHarness, FaultInjectingBroker, TransientFault,
 };
-use event_broker_sdk::backend::{Backend, Partition, TopicPartition, Wait};
+use event_broker_sdk::backend::{Partition, TopicPartition, Wait};
 use event_broker_sdk::{EventBrokerApi, GtsInstanceId, Sequence};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -42,10 +42,14 @@ fn settings() -> ProducerSettings {
         tenant_id: u(1_101),
     }
 }
+/// Fast retries, plus a short idle poll: after a restart nothing signals a message that is
+/// already queued, so an idle processor must re-poll rather than wait out the profile's
+/// ten-minute idle interval.
 fn fast_retry() -> toolkit_db::outbox::WorkerTuning {
     toolkit_db::outbox::WorkerTuning::processor_high_throughput()
         .retry_base(Duration::from_millis(20))
         .retry_max(Duration::from_millis(100))
+        .idle_interval(Duration::from_millis(200))
 }
 
 /// Explicit grants at the broker's PEP: only the Orders producer may produce the Orders event
@@ -776,7 +780,9 @@ async fn lost_acknowledgement_retries_after_restart_with_cursor_recovery() -> an
     env.faulty.reconnect();
     let bound = env.bind().await;
     assert_eq!(env.registrations().await, registered);
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    // Longer than the default 30 s partition lease: if the stopped processor's release did
+    // not commit, the restarted one re-polls until that lease expires.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(45);
     while count(&env.pg, UNACKNOWLEDGED).await > 0 {
         assert!(
             tokio::time::Instant::now() < deadline,

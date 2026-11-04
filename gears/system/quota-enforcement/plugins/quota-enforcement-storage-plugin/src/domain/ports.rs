@@ -132,6 +132,22 @@ pub struct Actor {
 }
 
 /// Schema metadata and the platform-default configuration rows.
+/// The plugin's one notification outbox pipeline.
+#[async_trait]
+pub trait NotificationPipeline: Send + Sync {
+    /// Start the pipeline, handing every claimed event to `delivery`, and bind
+    /// it for enqueueing.
+    ///
+    /// # Errors
+    ///
+    /// `Internal` when it was already started; `Unavailable` when the backend
+    /// cannot start it.
+    async fn start(
+        &self,
+        delivery: std::sync::Arc<dyn quota_enforcement_sdk::NotificationDeliveryV1>,
+    ) -> Result<Box<dyn quota_enforcement_sdk::NotificationDeliveryHandle>, StorageError>;
+}
+
 #[async_trait]
 pub trait FoundationStore: Send + Sync {
     /// The installed contract major, if the schema was ever bootstrapped.
@@ -263,8 +279,8 @@ pub trait ConsumptionStore: Send + Sync {
         events: &[NotificationEvent],
     ) -> Result<TransitionOutcome<AppliedMutation>, StorageError>;
 
-    /// Per-Quota state of one applicable set, materializing a missing current
-    /// period row and nothing else (the I3 exception).
+    /// Per-Quota state of one applicable set. Writes nothing and takes no row
+    /// lock (I3).
     ///
     /// # Errors
     ///
@@ -275,6 +291,21 @@ pub trait ConsumptionStore: Send + Sync {
         scope: &AccessScope,
         applicable: &ApplicableQuotas,
     ) -> Result<Vec<QuotaSnapshot>, StorageError>;
+
+    /// One page of the per-Quota state of many applicable sets, each Quota
+    /// once, in `quota_id` order, writing nothing (I3).
+    ///
+    /// # Errors
+    ///
+    /// `InvalidCursor` for a cursor this plugin did not issue; `Unavailable`
+    /// when the backend cannot answer.
+    async fn bulk_read_quota_snapshot(
+        &self,
+        ctx: &SecurityContext,
+        scope: &AccessScope,
+        pairs: &[ApplicableQuotas],
+        page: PageRequest,
+    ) -> Result<PageResult<QuotaSnapshot>, StorageError>;
 
     /// The unexpired record under `scope_of`, if one exists.
     ///

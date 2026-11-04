@@ -235,6 +235,47 @@ pub async fn find_allocation_for_update(
         .await
 }
 
+/// The current period rows of `quota_ids` at `now`, unlocked, for a snapshot
+/// read: at most one per Quota, since its windows never overlap.
+///
+/// # Errors
+///
+/// The scope or database error of the read.
+pub async fn find_current_of(
+    runner: &impl DBRunner,
+    scope: &AccessScope,
+    quota_ids: &[Uuid],
+    now: OffsetDateTime,
+) -> Result<Vec<quota_consumption_counter::Model>, ScopeError> {
+    Entity::find()
+        .filter(Column::QuotaId.is_in(quota_ids.iter().copied()))
+        .filter(Column::PeriodStart.lte(now))
+        .filter(Column::PeriodEnd.gt(now))
+        .secure()
+        .scope_with(scope)
+        .all(runner)
+        .await
+}
+
+/// The allocation counter rows of `quota_ids`, unlocked, for a snapshot read.
+///
+/// # Errors
+///
+/// The scope or database error of the read.
+pub async fn find_allocations_of(
+    runner: &impl DBRunner,
+    scope: &AccessScope,
+    quota_ids: &[Uuid],
+) -> Result<Vec<crate::infra::storage::entity::quota_allocation_counter::Model>, ScopeError> {
+    use crate::infra::storage::entity::quota_allocation_counter as alloc;
+    alloc::Entity::find()
+        .filter(alloc::Column::QuotaId.is_in(quota_ids.iter().copied()))
+        .secure()
+        .scope_with(scope)
+        .all(runner)
+        .await
+}
+
 /// The allocation counter row, unlocked, for a snapshot read.
 ///
 /// # Errors

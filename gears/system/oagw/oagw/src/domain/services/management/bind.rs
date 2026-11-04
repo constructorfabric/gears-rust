@@ -24,6 +24,7 @@ pub(in crate::domain::services) mod bind_actions {
 /// the same validation logic.
 #[allow(unknown_lints, de0309_must_have_domain_model)] // short-lived param container, not a domain entity
 pub(in crate::domain::services) struct BindOverrides<'a> {
+    pub server: &'a crate::domain::model::Server,
     pub auth: Option<&'a crate::domain::model::AuthConfig>,
     pub rate_limit: Option<&'a crate::domain::model::RateLimitConfig>,
     pub plugins: Option<&'a crate::domain::model::PluginsConfig>,
@@ -47,6 +48,7 @@ pub(in crate::domain::services) async fn validate_bind_constraints(
     ctx: &SecurityContext,
     enforcer: &PolicyEnforcer,
     ancestor: &Upstream,
+    enforced_server: Option<&crate::domain::model::Server>,
     overrides: &BindOverrides<'_>,
 ) -> Result<(), DomainError> {
     use crate::domain::model::SharingMode;
@@ -65,7 +67,19 @@ pub(in crate::domain::services) async fn validate_bind_constraints(
         )
         .await?;
 
-    // 2. Check per-field override permissions and sharing mode constraints.
+    // 2. An enforced credential is applied on every request, and it may go
+    //    only to endpoints its owner configured.
+    if let Some(server) = enforced_server
+        && !super::merge::server_within(overrides.server, server)
+    {
+        return Err(DomainError::validation(format!(
+            "cannot bind alias '{}' to endpoints the ancestor upstream does not list: its \
+             auth has sharing mode 'enforce'",
+            ancestor.alias
+        )));
+    }
+
+    // 3. Check per-field override permissions and sharing mode constraints.
 
     // Auth override.
     if overrides.auth.is_some() {
@@ -216,18 +230,44 @@ pub(in crate::domain::services) fn parse_secret_ref(
 }
 
 /// Validate bind constraints against the **closest** ancestor with a matching
-/// alias ([`super::ancestor::closest_ancestor_upstream`]).
+/// alias (the first of [`super::ancestor::ancestor_upstreams`]).
 /// Delegates to [`validate_bind_constraints`] for the actual checks.
 ///
 /// No-op if no ancestor has the alias (fresh upstream, no bind needed).
+///
+/// `enforced_server` is the server of the ancestor whose enforced auth is in
+/// effect ([`enforced_auth_server`]): an enforced auth is sticky down the
+/// chain, so every binding under it must stay within those endpoints, whatever
+/// the ancestors in between set.
 pub(in crate::domain::services) async fn validate_ancestor_bind(
     ctx: &SecurityContext,
     enforcer: &PolicyEnforcer,
     ancestor: Option<&Upstream>,
+    enforced_server: Option<&crate::domain::model::Server>,
     overrides: &BindOverrides<'_>,
 ) -> Result<(), DomainError> {
     match ancestor {
-        Some(ancestor) => validate_bind_constraints(ctx, enforcer, ancestor, overrides).await,
+        Some(ancestor) => {
+            validate_bind_constraints(ctx, enforcer, ancestor, enforced_server, overrides).await
+        }
         None => Ok(()),
     }
+}
+
+/// The server of the ancestor whose enforced auth is in effect: the farthest
+/// enabled one of `ancestors` (closest first) that enforces its auth. The
+/// proxy merges only enabled ancestors and keeps the first enforced auth it
+/// meets from the root down.
+pub(in crate::domain::services) fn enforced_auth_server(
+    ancestors: &[Upstream],
+) -> Option<&crate::domain::model::Server> {
+    ancestors
+        .iter()
+        .rfind(|u| {
+            u.enabled
+                && u.auth
+                    .as_ref()
+                    .is_some_and(|a| a.sharing == crate::domain::model::SharingMode::Enforce)
+        })
+        .map(|u| &u.server)
 }

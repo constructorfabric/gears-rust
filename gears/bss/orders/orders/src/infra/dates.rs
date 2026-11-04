@@ -479,6 +479,8 @@ pub fn admitted_line(
             .ok_or(AdmittedLineError::BillingCycle)?,
         order_pin: None,
         overlap_scope_key: None,
+        overlap_item_keys: None,
+        catalog_subscription_product_key: None,
         date_policy_switch_state: basis.policy.switch_state(),
     })
 }

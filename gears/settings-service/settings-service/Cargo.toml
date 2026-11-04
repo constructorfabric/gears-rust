@@ -1,7 +1,7 @@
 # Created: 2026-08-12 by Virtuozzo International GmbH
 [package]
 name = "cf-gears-settings-service"
-version = "0.1.8"
+version = "0.1.10"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
@@ -70,7 +70,7 @@ tokio = { workspace = true, features = ["time", "macros", "rt"] }
 tokio-util = { workspace = true }
 # Step-up: the presented token is validated by the platform's AuthN resolver,
 # fetched from the hub at first use; the freshness claims are read from it.
-authn-resolver-sdk = { package = "cf-gears-authn-resolver-sdk", version = "0.3.39", path = "../../system/authn-resolver/authn-resolver-sdk" }
+authn-resolver-sdk = { package = "cf-gears-authn-resolver-sdk", version = "0.3.40", path = "../../system/authn-resolver/authn-resolver-sdk" }
 # Write-path counters.
 opentelemetry = { workspace = true }
 # Reading the session token's `sub` (unverified, for subject binding only).
@@ -79,10 +79,21 @@ secrecy = { workspace = true }
 toolkit-security = { workspace = true }
 toolkit-macros = { workspace = true }
 toolkit-gts = { workspace = true }
+# Actor names on the history read: AM's public user read, found in the hub when
+# it is registered (a soft dependency), and bounded concurrent lookups.
+account-management-sdk = { workspace = true }
+# The purge's Credential Store release: a bounded number of deletes at once.
+futures-util = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }
-tokio = { workspace = true, features = ["macros", "rt"] }
+tokio = { workspace = true, features = ["macros", "rt", "test-util"] }
+# `logs_contain`: the degraded-chunk warn line carries no id and no profile text.
+# `logs_assert`: the purge's release lines name the key and the tenant, never
+# the secret or its reference.
+tracing-test = { workspace = true, features = ["no-env-filter"] }
+# The metadata type id in AM's client trait, for the recording AM double.
+gts = { workspace = true }
 # The SQL query recorder: the impact walk pins its round trips as a count of
 # statements, which no timing assertion could do without flaking.
 toolkit-db = { workspace = true, features = ["test-support"] }

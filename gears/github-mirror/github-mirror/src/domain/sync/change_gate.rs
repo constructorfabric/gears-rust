@@ -1,10 +1,10 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use aws_lc_rs::digest::{self, SHA256};
 use chrono::{DateTime, Duration, Utc};
 use toolkit_macros::domain_model;
 use toolkit_security::AccessScope;
+use toolkit_security::crypto::hash::Sha256;
 use uuid::Uuid;
 
 use super::task::Entity;
@@ -79,7 +79,7 @@ pub fn child_counts_hash(counts: &[(&str, Option<i64>)]) -> Option<String> {
 }
 
 fn hash(canonical: &str) -> String {
-    hex::encode(digest::digest(&SHA256, canonical.as_bytes()).as_ref())
+    hex::encode(Sha256::digest(canonical.as_bytes()).as_ref())
 }
 
 #[must_use]

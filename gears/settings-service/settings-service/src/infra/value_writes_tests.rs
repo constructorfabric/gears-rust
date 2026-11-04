@@ -22,9 +22,9 @@ use super::{BATCH_LIMIT, BatchChange, WriteCoordinator};
 use crate::api::rest::value_dto::rejection_code;
 use crate::audit::{AuditOperation, AuditValue, StoredAuditRecord};
 use crate::domain::category::DomainVisibility;
-use crate::domain::declaration::DeclarationRepository;
+use crate::domain::declaration::{DeclarationRepository, DeclarationStatus};
 use crate::domain::error::DomainError;
-use crate::domain::ports::NoMetrics;
+use crate::domain::ports::{NoMetrics, StepUpOperation};
 use crate::domain::resolution::{ScopeTarget, scope_class};
 use crate::domain::secrets::pending::{
     PENDING_SECRET_TTL, PendingSecret, PendingSecretDraft, PendingSecretRepository,
@@ -59,16 +59,29 @@ impl Harness {
     }
 
     async fn with_step_up(step_up: Arc<dyn StepUpVerifier>) -> Self {
+        Self::with_store(step_up, |_, secrets| secrets).await
+    }
+
+    /// A harness whose Secret Manager is the one `wrap` builds around the
+    /// recording store; the recording store stays the one the assertions read.
+    async fn with_store(
+        step_up: Arc<dyn StepUpVerifier>,
+        wrap: impl FnOnce(
+            &ResolutionHarness,
+            Arc<RecordingSecrets>,
+        ) -> Arc<dyn crate::domain::ports::SecretManager>,
+    ) -> Self {
         let base = ResolutionHarness::new().await;
         let published = Arc::new(RecordingPublisher::default());
         let secrets = Arc::new(RecordingSecrets::default());
+        let manager = wrap(&base, Arc::clone(&secrets));
         let writer = Arc::new(ValueWriter::new(
             ValueRepo,
             Arc::clone(&base.resolver),
             Arc::new(GtsTypeValidator::new(resolution_catalogue())),
             crate::infra::storage::audit_store::AuditStore,
             step_up,
-            Arc::clone(&secrets) as Arc<dyn crate::domain::ports::SecretManager>,
+            manager,
             PendingSecretRepo,
             Arc::clone(&published) as Arc<dyn crate::domain::ports::ChangePublisher>,
             Arc::new(NoMetrics),
@@ -241,7 +254,7 @@ impl Harness {
                 tenant,
                 Change::Set(value),
                 if_match,
-                "set",
+                StepUpOperation::Set,
             )
             .await
     }
@@ -1890,4 +1903,161 @@ async fn a_secret_write_with_a_stale_or_missing_tag_never_reaches_the_store() {
     .await
     .expect("current tag");
     assert_eq!(h.stores(), stores_after_first + 1);
+}
+
+/// A Secret Manager whose store call, once the entry is in the store and
+/// before it answers, retires and purges a declaration: the purge that wins
+/// the race against a secret write in flight.
+struct PurgesWhileStoring {
+    inner: Arc<RecordingSecrets>,
+    db: Arc<toolkit_db::DBProvider<toolkit_db::DbError>>,
+    declaration: Arc<std::sync::OnceLock<Uuid>>,
+}
+
+#[async_trait::async_trait]
+impl crate::domain::ports::SecretManager for PurgesWhileStoring {
+    fn mint_reference(&self, key: &str, tenant: Uuid) -> String {
+        self.inner.mint_reference(key, tenant)
+    }
+
+    async fn store_secret(
+        &self,
+        key: &str,
+        tenant: Uuid,
+        secret_ref: &str,
+        plaintext: &serde_json::Value,
+    ) -> Result<(), DomainError> {
+        self.inner
+            .store_secret(key, tenant, secret_ref, plaintext)
+            .await?;
+        let declaration = *self.declaration.get().expect("the declaration is declared");
+        let conn = self.db.conn().expect("connection");
+        let scope = AccessScope::allow_all();
+        DeclarationRepo
+            .set_status(&conn, &scope, declaration, DeclarationStatus::Retired, None)
+            .await
+            .expect("retired");
+        let current = DeclarationRepo
+            .find(
+                &conn,
+                &scope,
+                &crate::domain::category::visibility::domain_visibility(&scope),
+                declaration,
+            )
+            .await
+            .expect("lookup")
+            .expect("row");
+        DeclarationRepo
+            .delete(&conn, &scope, declaration, current.updated_at)
+            .await
+            .expect("purged");
+        Ok(())
+    }
+
+    async fn resolve_plaintext(
+        &self,
+        key: &str,
+        tenant: Uuid,
+        secret_ref: &str,
+    ) -> Result<SecretString, DomainError> {
+        self.inner.resolve_plaintext(key, tenant, secret_ref).await
+    }
+
+    async fn delete_secret(
+        &self,
+        key: &str,
+        tenant: Uuid,
+        secret_ref: &str,
+    ) -> Result<(), DomainError> {
+        self.inner.delete_secret(key, tenant, secret_ref).await
+    }
+}
+
+/// A harness whose store purges `name`'s declaration while it stores, and the
+/// declaration's id.
+async fn racing_harness(name: &str) -> (Harness, Uuid) {
+    // The declaration is declared after the harness exists, so the store learns
+    // its id through a cell it reads when it is first called.
+    let cell = Arc::new(std::sync::OnceLock::<Uuid>::new());
+    let for_store = Arc::clone(&cell);
+    let h = Harness::with_store(Arc::new(FixedStepUp::verified()), move |base, inner| {
+        Arc::new(PurgesWhileStoring {
+            inner,
+            db: Arc::clone(&base.db),
+            declaration: for_store,
+        })
+    })
+    .await;
+    let id = h.declare_secret(name).await;
+    cell.set(id).expect("set once");
+    (h, id)
+}
+
+#[tokio::test]
+async fn a_stage_that_a_purge_raced_releases_its_entry_and_answers_not_found() {
+    let (h, id) = racing_harness("api_token").await;
+    let admin = actor(h.base.tree.root);
+
+    let err = h
+        .stage(&admin, "api_token", None, json!("hunter2"))
+        .await
+        .expect_err("the declaration was purged while the entry was being stored");
+
+    assert!(
+        matches!(
+            err,
+            DomainError::NotFound {
+                resource: "declaration"
+            }
+        ),
+        "{err:?}"
+    );
+    assert!(
+        h.secrets.held().is_empty(),
+        "the entry stored before the purge is released: {:?}",
+        h.secrets.held()
+    );
+    assert_eq!(h.deleted().len(), 1, "released exactly once");
+    assert!(h.all_pending().await.is_empty());
+    let conn = h.base.db.conn().expect("connection");
+    assert!(
+        DeclarationRepo
+            .find(
+                &conn,
+                &AccessScope::allow_all(),
+                &crate::domain::category::visibility::domain_visibility(&AccessScope::allow_all()),
+                id,
+            )
+            .await
+            .expect("lookup")
+            .is_none(),
+        "the purge stands"
+    );
+}
+
+#[tokio::test]
+async fn a_purge_racing_a_value_write_that_stores_a_secret_leaves_no_entry_unreleased() {
+    let (h, id) = racing_harness("api_token").await;
+    let admin = actor(h.base.tree.root);
+
+    // The write is in flight — its entry is in the store — when the purge
+    // lands; the commit then finds no declaration.
+    let err = h
+        .set(&admin, "api_token", None, json!("hunter2"), Some("absent"))
+        .await
+        .expect_err("the write is refused");
+
+    assert!(
+        matches!(err, DomainError::NotFound { .. }),
+        "refused as the setting being gone: {err:?}"
+    );
+    assert_eq!(h.stores(), 1, "the entry did reach the store");
+    assert!(
+        h.secrets.held().is_empty(),
+        "and every entry the write stored was released: {:?}",
+        h.secrets.held()
+    );
+    assert_eq!(h.deleted().len(), 1);
+    assert!(h.all_pending().await.is_empty(), "no intent row is left");
+    assert!(h.rows(id).await.is_empty(), "no value row was committed");
 }
