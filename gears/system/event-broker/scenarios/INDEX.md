@@ -11,6 +11,16 @@ Organized in two parts:
 
 ## 1. How To
 
+### Three partition counts
+
+"Partition" means one of three counts. They are independent: for the same topic they differ, and none constrains the others. For example, the producer has 4 partitions, ingest has 8 and the backend has 6.
+
+- **Producer partitions** - the producer's own outbox partitions (the SDK's outbox producer). The producer chooses how to number its events: one chain across the whole topic, or one producer id per producer partition, which is what the SDK outbox registers. The broker never sees producer partitions.
+- **Ingest partitions** - the partitions of the broker's ingest outbox group (`outbox_groups.default.partitions`, a power of 2 from 1 to 64). An event goes to the ingest partition that `{topic}:{key}` hashes to, so events of one key keep their order inside the broker.
+- **Backend partitions** - the partitions of the topic's log in the storage backend. The backend assigns each event the backend partition its partition-key value hashes to. Consumers read these: assignment, SEEK, cursors, segments, `RF` and `HWM` are per backend partition, and so is the `partition` field on a read event. Once the topic is provisioned, the backend's count is the one in force.
+
+The producer chain (`last_sequence`, dedup) is kept per `(producer_id, topic)`; no partition of any kind is part of it. Consumer scenarios that say "partition" mean a backend partition.
+
 ### Integration Journey
 
 To publish and consume events through the broker, follow these steps. Each step links to the scenario(s) with full coverage.
@@ -24,10 +34,10 @@ Anonymous groups are broker-minted via REST. Named groups are registered via `ty
 
 #### Step 2 — Publish events
 
-Producers submit typed events to a topic. Publish is async (`202`); opt into synchronous persistence with the standard `Prefer: wait` header (RFC 7240).
+Producers submit typed events to a topic. Publish is async (`202`); opt into synchronous persistence with the standard `Prefer: wait` header (RFC 7240). Not yet served: `Prefer: wait` answers `501`; tracked in #5655.
 
 - [Publish a single event (async)](producer/single/1.01-positive-publish-single-async.md) — `POST /v1/events` → `202 Accepted`.
-- [Publish sync (Prefer: wait)](producer/single/1.02-positive-publish-sync-wait-persisted.md) — `POST /v1/events` with `Prefer: wait` → `201 Created`.
+- [Publish sync (Prefer: wait)](producer/single/1.02-positive-publish-sync-wait-persisted.md) - `POST /v1/events` with `Prefer: wait` → `201 Created`. Not yet served: `Prefer: wait` answers `501`; tracked in #5655.
 
 #### Step 3 — JOIN a subscription
 
@@ -83,18 +93,19 @@ Multiple consumer instances share a group by JOINing with the same `consumer_gro
 
 #### producer/single/ — `POST /v1/events` (stateless)
 - [positive-1.1 — Publish single (async)](producer/single/1.01-positive-publish-single-async.md) — `POST /v1/events` → `202 Accepted`; event enqueued in outbox.
-- [positive-1.2 — Publish sync (Prefer: wait)](producer/single/1.02-positive-publish-sync-wait-persisted.md) — `POST /v1/events` with `Prefer: wait` → `201 Created` after backend persist.
-- [negative-1.5 — Read-only partition rejected](producer/single/1.05-negative-readonly-partition-rejected.md) — producer-supplied `partition` on publish → `400 Bad Request`; broker derives partition itself.
+- [positive-1.2 - Publish sync (Prefer: wait)](producer/single/1.02-positive-publish-sync-wait-persisted.md) - `POST /v1/events` with `Prefer: wait` → `201 Created` after backend persist. Not yet served: `Prefer: wait` answers `501`; tracked in #5655.
+- [negative-1.5 — Read-only partition rejected](producer/single/1.05-negative-readonly-partition-rejected.md) — producer-supplied `partition` on publish → `400 Bad Request`; the backend assigns the backend partition itself.
 
 #### producer/batch/ — `POST /v1/events:batch`
-- [positive-1.1 — Publish batch](producer/batch/1.01-positive-publish-batch.md) — `POST /v1/events:batch` → `202 Accepted`; all-or-nothing per topic+partition.
+- [positive-1.1 — Publish batch](producer/batch/1.01-positive-publish-batch.md) — `POST /v1/events:batch` → `202 Accepted`; one topic per batch, all-or-nothing.
+- [positive-1.9 - Batch of only duplicates](producer/batch/1.09-positive-batch-all-duplicates.md) - lost-ack resend of a whole chained run → `200 OK`, no body; the cursor stays and each event is stored once.
 
 #### producer/flows/ — `POST /v1/producers`, `GET /cursors`, `POST :reset`
 - [positive-1.1 — Register chained producer](producer/flows/1.01-positive-register-chained-producer.md) — `POST /v1/producers { mode: chained }` → `201` with `producer_id`.
 - [positive-1.2 — Register monotonic producer](producer/flows/1.02-positive-register-monotonic-producer.md) — `POST /v1/producers { mode: monotonic }` → `201`.
 - [positive-1.3 — Chained-mode sequence](producer/flows/1.03-positive-chained-mode-sequence.md) — `POST /v1/events` with `meta.producer_id` + `meta.previous/sequence`; broker deduplicates.
 - [positive-1.4 — Chain-head retry dedup](producer/flows/1.04-positive-chain-head-retry-dedup.md) — an exact retry of the current chain head returns `200` with an empty body; no second write. Dedup is chain-based (`previous`/`sequence`).
-- [positive-1.6 — Cursor recovery](producer/flows/1.06-positive-cursor-recovery.md) — `GET /v1/producers/{id}/cursors` → `{producer_id, client_agent, topics:[{topic, partitions:[{partition, last_sequence}]}]}`; feeds next SEEK after desync.
+- [positive-1.6 — Cursor recovery](producer/flows/1.06-positive-cursor-recovery.md) — `GET /v1/producers/{id}/cursors` → `{producer_id, client_agent, topics:[{topic, last_sequence}]}`; re-seeds the producer's chain per topic after desync.
 - [positive-1.7 — Chain reset](producer/flows/1.07-positive-chain-reset.md) — `POST /v1/producers/{id}:reset` → `200`; chain state cleared, audited.
 - [flow-1.9 — Desync recovery](producer/flows/1.09-flow-chained-producer-desync-recovery.md) — producer loses sequence state; first publish fails `412`; reads `/cursors`; reconciles counter; republishes successfully.
 
@@ -154,6 +165,7 @@ Multiple consumer instances share a group by JOINing with the same `consumer_gro
 
 - [positive-1.1 — List topics](topics/1.01-positive-list-topics.md) — `GET /v1/topics` → paged list of topic DTOs carrying `id`, `description`, `retention`.
 - [positive-1.2 — List topic segments](topics/1.02-positive-list-topic-segments.md) — `GET /v1/topics/segments?topic=...&partition=...` → segment manifest with RF/HWM per segment.
+- [positive-1.5 - Segments of an empty partition](topics/1.05-positive-segments-empty-partition.md) - `GET /v1/topics/segments?topic=...&partition=...` for a partition with no stored events → `200 OK` with `start_sequence: 0`, `end_sequence: 0`, null times and empty `segments[]`.
 - [positive-1.4 — List event types](topics/1.04-positive-list-event-types.md) — `GET /v1/event-types?topic=...` → paged list of event type registrations.
 
 ---
@@ -179,9 +191,13 @@ Multiple consumer instances share a group by JOINing with the same `consumer_gro
 
 - [negative-1.3 — Schema validation failure](producer/single/1.03-negative-schema-validation-failure.md) — `event.data` fails JSON Schema → `422 Invalid Argument`.
 - [negative-1.5 — Read-only partition rejected](producer/single/1.05-negative-readonly-partition-rejected.md) — producer-supplied `partition` on publish → `400 Bad Request`; `partition` is consumer-facing/read-side only.
-- [negative-1.2 — Mixed-partition batch](producer/batch/1.02-negative-mixed-partition-batch.md) — batch events span different partitions → `400 Invalid Argument`.
-- [negative-1.3 — Batch too large](producer/batch/1.03-negative-batch-too-large.md) — over 100 events or 1 MiB → `400 Invalid Argument`.
+- [negative-1.2 — Mixed-topic batch](producer/batch/1.02-negative-mixed-topic-batch.md) — batch events span different topics → `400 Invalid Argument`.
+- [negative-1.3 - Batch too large](producer/batch/1.03-negative-batch-too-large.md) - over 100 events or 1 MiB → `413 Content Too Large`.
 - [negative-1.4 — Batch late validation failure](producer/batch/1.04-negative-batch-late-validation-failure.md) — later invalid event rejects whole batch → `422 Invalid Argument`.
+- [negative-1.5 - Empty batch](producer/batch/1.05-negative-batch-empty.md) - `"events": []` → `400 Invalid Argument` (`empty_batch`).
+- [negative-1.6 - Duplicate event id in batch](producer/batch/1.06-negative-batch-duplicate-event-id.md) - an `id` repeated within the batch → `400 Invalid Argument` (`duplicate_event_id`, `events[1].id`); nothing stored.
+- [negative-1.7 - Malformed run in batch](producer/batch/1.07-negative-batch-malformed-run.md) - chained run `[0->1, 2->3]` → `400 Invalid Argument` (`malformed_run`, `events[1].meta`); nothing stored, no head row.
+- [negative-1.8 - Batch sequence violation](producer/batch/1.08-negative-batch-sequence-violation.md) - a run behind the committed head → `412 Failed Precondition` naming `index`, `producer_id`, `topic`, `last_sequence`; nothing stored.
 - [negative-1.7 — Too many interests](consumer/subscriptions/1.07-negative-join-too-many-interests.md) — more than 64 interests in one JOIN → `400 Invalid Argument`.
 - [negative-1.6 — Invalid client_agent](consumer/groups/1.06-negative-invalid-client-agent.md) — non-ASCII or oversized `client_agent` → `400 Invalid Argument`.
 - [guardrail-1.7 — Stream requires multipart Accept](consumer/stream/1.07-guardrail-stream-accept-json-rejected.md) — `Accept: application/json` on `:stream` endpoint → `406 Invalid Argument`.
@@ -326,8 +342,8 @@ So a scenario must not invent a `context` key. Anything a caller needs that has 
 | Shorthand | Meaning |
 |---|---|
 | `PD` | RFC-9457 Problem Details (`application/problem+json`). Implied by any `4xx` / `5xx`. |
-| `RF` | Partition retention floor — smallest offset still readable. |
-| `HWM` | Partition high-water mark — offset of the next event to be admitted. |
+| `RF` | Backend partition retention floor — smallest offset still readable. |
+| `HWM` | Backend partition high-water mark — offset of the next event to be admitted. |
 | `MP` | Multipart frame on `:stream`. |
 | `SSE` | Server-Sent Event frame on `:sse`. |
-| `Cursor` | Runtime/session cursor value for a `(group, topic, partition)` assignment — last-processed offset; broker emits from `Cursor + 1`. |
+| `Cursor` | Runtime/session cursor value for a `(group, topic, partition)` backend-partition assignment — last-processed offset; broker emits from `Cursor + 1`. |

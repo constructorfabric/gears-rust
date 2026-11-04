@@ -165,7 +165,7 @@ CREATE TABLE evbk__3f2a9c1e0b7d4e21a8c65f0d9e14b7a3_p3_s0000000000000001
 - `occurred_at` is not a column: it is the producer's claim, untrusted and unordered within a partition, so it never decides a position or an age. It travels in `body` as event data.
 - `body` is the plugin's own versioned encoding, JSON bytes: `{"v":1, "id", "type_id", "tenant_id", "source", "subject", "subject_type", "occurred_at", "trace_parent", "data"}`. `meta` is not stored (publisher-only, stripped on read); `partition`, `sequence` and `sequence_time` are columns. A reader refuses a `v` it does not know with `Internal`.
 - Sizes are what the tables take on disk, all overhead included: `pg_total_relation_size` of each segment table, heap, TOAST, the primary key and the `brin` index. No event carries a size and no counter adds them up. A segment is measured once, when it is sealed full (§4.9): its table is insert-only, so the figure is final, but for the visibility map and free space map a vacuum may add later. `max_bytes` bounds this size per partition: the sealed segments as measured, and every open segment as it is now, the empty ones made ahead of the head included (a few tens of KB each). The contract leaves the unit to the backend (feature 0007 §2).
-- `sequence_time` rises with `sequence` (§4.2), the order a block-range index summarizes best: the `brin` index costs a few bytes per range of blocks and lets `resolve(At)` skip whole ranges (§4.6). PostgreSQL gives every segment its own copy of the parent's indexes.
+- `sequence_time` rises with `sequence` (barring a clock step back; §4.2), the order a block-range index summarizes best: the `brin` index costs a few bytes per range of blocks and lets `resolve(At)` skip whole ranges (§4.6). PostgreSQL gives every segment its own copy of the parent's indexes.
 - A segment's range is fixed when it is created (§4.9); sizes may differ from segment to segment, and the suffix keeps every name exact.
 
 ### 2.3 NOTIFY Payload
@@ -184,7 +184,7 @@ SELECT pg_notify('evbk__head', payload) FROM UNNEST($payloads::text[]) AS payloa
 A transaction that notifies holds a lock shared by the whole cluster from its commit until the commit is flushed, so notifying commits run one at a time. `head_notify` (§5) decides who pays for that:
 
 - `in_transaction` (default): the append sends it before its `COMMIT`, and PostgreSQL delivers it on commit, in commit order. Every append waits its turn at commit.
-- `after_commit`: after the commit, the append leaves its heads, latest per partition, to the instance's notifier worker, which sends what has gathered in one transaction with `synchronous_commit = off` (a lost notification is lost before the flush or after it alike). Appends commit in parallel again; notifications arrive one hop later and in no particular order across instances, which a listener tolerates since a head at or below a known one is dropped. A failed send keeps its heads for the next pass. A crash between a commit and its send loses that notification (§7).
+- `after_commit`: after the commit, the append leaves its heads, latest per partition, to the instance's notifier worker, which sends what has gathered in one transaction with `synchronous_commit = off` (a lost notification is lost before the flush or after it alike). Appends commit in parallel again; notifications arrive one hop later and in no particular order across instances, which a listener tolerates since a head at or below a known one is dropped. A failed send keeps its heads for the next pass, which runs after a backoff: 1 s after the first failure, doubled per failure in a row up to 30 s, back to 1 s after a send that succeeds - the backoff of the `LISTEN` reconnect and the startup retry. A head offered meanwhile wakes the notifier early. A crash between a commit and its send loses that notification (§7).
 
 ## 3. Component Model
 
@@ -255,12 +255,14 @@ None of these waits: each is a try-lock, `SKIP LOCKED` or `NOWAIT`, so the two t
 
 ```sql
 BEGIN;
+-- skipped for replacing = Held, which never creates
 INSERT INTO evbk__log (topic_uuid, topic_id, log_id, partitions, max_age, max_bytes, provisioned_at)
 VALUES ($t, $topic_id, $new, $partitions, $max_age, $max_bytes, now())
 ON CONFLICT (topic_uuid) DO NOTHING;
 SELECT log_id, partitions FROM evbk__log WHERE topic_uuid = $t FOR UPDATE;
 --   log_id = $new                         -> this attempt (fresh, or continued); UPDATE max_age, max_bytes (re-provision with new settings)
 --   log_id = replacing (Log(id))          -> UPDATE evbk__log SET log_id = $new WHERE topic_uuid = $t
+--   no row (replacing = Held)             -> ROLLBACK; NotProvisioned
 --   anything else                         -> ROLLBACK; LogConflict
 SELECT partition, table_name FROM evbk__partition WHERE topic_uuid = $t;   -- names already stored
 -- per partition p in 0..partitions; parent = the stored name, else evbk__{t}_p{p} (§2.2):
@@ -281,6 +283,7 @@ COMMIT;
 After the commit, the new partitions' layouts go into the maintenance registry (§4.9).
 
 - DDL is transactional in PostgreSQL: a failed provisioning leaves nothing behind.
+- A `Held` claim never inserts the `evbk__log` row: over a topic this database holds nothing for, it answers `NotProvisioned` and creates no row and no table.
 - `partitions > 9999` is refused with `InvalidConfig` (naming, §2.2).
 - `evbk__log.partitions` is the count reported; a different count requested later is the gear's concern (feature 0006 §4.1).
 - A table that exists keeps its segments; a re-provision changes the bounds only.
@@ -306,7 +309,7 @@ WHERE evbk__fence.last_seq < EXCLUDED.last_seq;
 UPDATE evbk__partition SET hwm = hwm + $n WHERE topic_uuid = $t AND partition = 3
 RETURNING hwm, table_name, clock_timestamp();   -- the batch's last; events take the $n before it
 
--- (4) the events, sequence_time = that clock_timestamp() (taken after the row lock, so it rises with sequence);
+-- (4) the events, sequence_time = that clock_timestamp() (taken after the row lock, so it rises with sequence, barring a clock step back);
 --     into the stored table_name; PostgreSQL routes each row to its segment
 INSERT INTO table_name (sequence, sequence_time, tenant_id, body)
 VALUES (...);
@@ -320,6 +323,8 @@ COMMIT;
 ```
 
 Several partitions in one append repeat steps (3) and (4) per partition, in ascending order; step (5) is one statement for all of them.
+
+Step (5) and the `COMMIT`, and what follows the commit - the heads offered to the notifier under `after_commit`, the registry check below, and the heads published to this instance's watches - run in a task of their own, started at once and awaited by the call. A caller that goes away once the commit is issued, such as an outbox handler cut off by its deadline, leaves that task running: a commit that lands always has its heads notified and published. Else, under `after_commit`, other instances would not see a quiet partition's head until its next append, and in either mode this instance's watches would miss it.
 
 After the commit, each new head is checked against the maintenance registry in memory: one lookup and two compares, no query, no lock. A head past its partition's room alarm offers the partition to the extender; past its seal alarm, to the sealer (§4.9); one the registry does not know yet, to both. `append` never writes `evbk__segment` and does no byte arithmetic: sizes are the jobs' to measure.
 
@@ -391,7 +396,19 @@ HeadWatch.watch(partitions):
 
 ### 4.8 query
 
-Segment introspection (feature 0003) reads the segment list from the catalog and the figures from the tables:
+Segment introspection (feature 0003) reads the figures from the partition's table and the segment list from the catalog. `start_sequence`/`start_time` are the sequence and `sequence_time` of the first matched event above the floor, `end_sequence`/`end_time` those of the last of the first `limit` matched events; an empty match is an empty list. The figures are two probes on the primary key in one statement, never a scan of the range, so a `query` costs the same over a million stored events as over ten:
+
+```sql
+SELECT f.sequence, f.sequence_time, l.sequence, l.sequence_time FROM
+  (SELECT sequence, sequence_time FROM table_name WHERE sequence <= $end
+     AND sequence >= GREATEST($start, (SELECT floor + 1 FROM evbk__retention WHERE topic_uuid = $t AND partition = $p))
+     ORDER BY sequence ASC LIMIT 1) AS f
+  CROSS JOIN LATERAL
+  (SELECT sequence, sequence_time FROM table_name WHERE sequence >= f.sequence
+     AND sequence <= LEAST($end, f.sequence + $limit - 1) ORDER BY sequence DESC LIMIT 1) AS l;
+```
+
+`first + limit - 1` is the `limit`-th matched event because stored sequences have no gaps: append assigns them from the head up (§4.2) and retention removes whole segments from the floor up (§4.9). Events deleted by hand break this (§4.10). `sequence_time` is not clamped, so after a clock step back `start_time` and `end_time` are still the first and last matched events' times, not the range's MIN and MAX. The segment list:
 
 ```sql
 SELECT c.relname, pg_get_expr(c.relpartbound, c.oid)
@@ -565,7 +582,7 @@ Retention reads `55P03` on its `NOWAIT` lock as busy before any of this.
 | A provisioned topic routed here by a routing change | no `evbk__log` row | `NotProvisioned` |
 | The database holds a different log id for the topic | `provision` finds a foreign `evbk__log.log_id` | `LogConflict` |
 | The database restored from an older backup | `evbk__fence.last_seq` and `hwm` regress together with the data | events after the backup are lost; new appends continue from the restored head (ADR-0008 O5) |
-| Events deleted from a segment by hand | a gap in `(floor, hwm]`; `hwm` and the fence rows unchanged | lost data. `read` returns the events after the gap with no error, and `resolve(Exact)` accepts a sequence inside it. Appends go on; the segment still seals when full, with its table's size and its last remaining event's time (`NULL` with none left, which counts as past any age), and still expires. The storage invariants report it (L2, and L5 for a segment sealed before); the plugin does not |
+| Events deleted from a segment by hand | a gap in `(floor, hwm]`; `hwm` and the fence rows unchanged | lost data. `read` returns the events after the gap with no error, `resolve(Exact)` accepts a sequence inside it, and `query` with a `limit` short of the range ends at `first + limit - 1` or below, so it reports fewer than `limit` events. Appends go on; the segment still seals when full, with its table's size and its last remaining event's time (`NULL` with none left, which counts as past any age), and still expires. The storage invariants report it (L2, and L5 for a segment sealed before); the plugin does not |
 
 ## 5. Configuration
 

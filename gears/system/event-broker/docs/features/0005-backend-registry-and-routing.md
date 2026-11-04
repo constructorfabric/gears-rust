@@ -148,6 +148,7 @@ config:
 - The instance-less key `gts.cf.core.events.topic.v1~` is mandatory, so every topic resolves to a registry entry.
 - Values are registry names, never addresses or types.
 - A fully qualified key that names no registered topic is warned about on every specification refresh, naming the key: a mistyped key would otherwise leave its topic on the instance-less route for good.
+- A topic whose record names an entry this registry lacks resolves by the routing (its own key's entry, else the instance-less entry), and is warned about once per topic and recorded entry, naming the topic, the recorded entry and the chosen entry.
 - Routing says where a topic's log is expected to be. Whether it is really there is ADR-0008's to decide.
 
 ### 2.3 Affinity
@@ -209,7 +210,7 @@ A configuration naming any other group is refused at startup. Named groups (`aud
 CREATE TABLE event_broker__outbox_identity (
     name        VARCHAR(63) NOT NULL PRIMARY KEY,   -- group name
     outbox_id   VARCHAR(16) NOT NULL,               -- random 64-bit, 16 lowercase hex
-    created_at  VARCHAR(32) NOT NULL                -- RFC 3339 UTC
+    created_at  TIMESTAMP   NOT NULL                -- UTC, when the identity was minted; timestamptz on PostgreSQL, datetime(6) on MySQL
 );
 ```
 
@@ -310,7 +311,7 @@ def rank(pattern, topic):
 | Request | Topics taken from | Role | Choice |
 |---|---|---|---|
 | `POST /events` | the event's `type`, resolved to its topic (§4.5) | ingest | `pick(ingest, {topic})` |
-| `POST /events:batch` | the first event's `type` | ingest | `pick(ingest, {topic})`; a batch may carry several topics, and the rest ride with the first |
+| `POST /events:batch` | the first event's `type` | ingest | `pick(ingest, {topic})`; a batch targets one topic, so the first event's topic is the batch's |
 | `POST /producers/{id}:reset` with a `topic` | the body | ingest | `pick(ingest, {topic})` |
 | `GET /topics/segments` | the `topic` parameter | ingest | `pick(ingest, {topic})` |
 | `POST /producers`, `GET /producers/{id}/cursors`, `:reset` without a topic, `GET /topics`, `GET /event-types` | none | ingest | any live instance |

@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use event_broker_sdk::backend::support::topic_uuid;
 use event_broker_sdk::backend::{
-    BackendError, LogClaim, LogId, Partition, Provisioning, TopicSpec,
+    BackendError, LogClaim, LogId, Partition, Provisioning, Stored, TopicSpec,
 };
 use sqlx::MySqlPool;
 use uuid::Uuid;
@@ -28,8 +28,10 @@ const LOCK_WAIT: u64 = 5;
 /// `now - max_age` inside `DATETIME`'s range.
 const MAX_AGE_CAP: Duration = Duration::from_hours(100 * 365 * 24);
 
-/// Claims the topic's log for `claim` and creates its tables; `LogConflict`
-/// when the stored log id is not one the claim accepts.
+/// Claims the topic's log for `claim` and creates its tables; refused per
+/// [`LogClaim::check`] with nothing written. A `Held` claim never inserts the
+/// row, so over a topic this database holds nothing for it answers
+/// `NotProvisioned` and creates no table.
 pub async fn provision(
     shared: &Shared,
     spec: &TopicSpec,
@@ -52,13 +54,10 @@ pub async fn provision(
         .map(|b| i64::try_from(b).unwrap_or(i64::MAX));
     let map = |e| error::map(OP, &e);
 
-    let Some((partitions, tables)) =
+    let (partitions, tables) =
         error::retried(|| claim_log(pool, spec, claim, topic, (max_age_ms, max_bytes)))
             .await
-            .map_err(map)?
-    else {
-        return Err(BackendError::log_conflict(OP.name()));
-    };
+            .map_err(map)??;
 
     // The tables. A partition whose table exists is left to the maintenance:
     // a re-provision of a written topic takes no lock and waits for nothing.
@@ -97,38 +96,53 @@ pub async fn provision(
 }
 
 /// The compare-and-set on the log id and the topic's catalog rows, in one
-/// transaction: the partition count held and each partition's table, or
-/// `None` when the stored log id refuses the claim.
+/// transaction: the partition count held and each partition's table, or the
+/// error [`LogClaim::check`] refuses the claim with, nothing written.
 async fn claim_log(
     pool: &MySqlPool,
     spec: &TopicSpec,
     claim: &LogClaim,
     topic: Uuid,
     (max_age_ms, max_bytes): (Option<i64>, Option<i64>),
-) -> Result<Option<(u32, Vec<String>)>, sqlx::Error> {
+) -> Result<Result<(u32, Vec<String>), BackendError>, sqlx::Error> {
     let mut tx = pool.begin().await?;
-    sqlx::query(
-        "INSERT IGNORE INTO evbk__log \
-         (topic_uuid, topic_id, log_id, partitions, max_age_ms, max_bytes, provisioned_at) \
-         VALUES (?, ?, ?, ?, ?, ?, UTC_TIMESTAMP(6))",
-    )
-    .bind(topic)
-    .bind(spec.topic.as_ref())
-    .bind(claim.new.uuid())
-    .bind(i32::try_from(spec.partitions).unwrap_or(i32::MAX))
-    .bind(max_age_ms)
-    .bind(max_bytes)
-    .execute(&mut *tx)
-    .await?;
-    let (stored, partitions): (Uuid, i32) =
+    if claim.allows_creation() {
+        sqlx::query(
+            "INSERT IGNORE INTO evbk__log \
+             (topic_uuid, topic_id, log_id, partitions, max_age_ms, max_bytes, provisioned_at) \
+             VALUES (?, ?, ?, ?, ?, ?, UTC_TIMESTAMP(6))",
+        )
+        .bind(topic)
+        .bind(spec.topic.as_ref())
+        .bind(claim.new.uuid())
+        .bind(i32::try_from(spec.partitions).unwrap_or(i32::MAX))
+        .bind(max_age_ms)
+        .bind(max_bytes)
+        .execute(&mut *tx)
+        .await?;
+    }
+    let stored: Option<(Uuid, i32)> =
         sqlx::query_as("SELECT log_id, partitions FROM evbk__log WHERE topic_uuid = ? FOR UPDATE")
             .bind(topic)
-            .fetch_one(&mut *tx)
+            .fetch_optional(&mut *tx)
             .await?;
-    if !claim.accepts(Some(LogId::from_uuid(stored))) {
+    if let Err(refused) = claim.check(
+        OP.name(),
+        stored.map_or(Stored::Nothing, |(log, _)| {
+            Stored::Log(LogId::from_uuid(log))
+        }),
+    ) {
         tx.rollback().await?;
-        return Ok(None);
+        return Ok(Err(refused));
     }
+    let Some((_, partitions)) = stored else {
+        // `check` refuses a missing row unless the claim allows creation, and
+        // then the insert above wrote it.
+        tx.rollback().await?;
+        return Ok(Err(BackendError::Internal(format!(
+            "{OP}: evbk__log holds no row after the insert"
+        ))));
+    };
     // Fresh, resumed or replacing - either way the row takes the claim's id and
     // the spec's current retention.
     sqlx::query(
@@ -175,5 +189,5 @@ async fn claim_log(
         tables.push(table);
     }
     tx.commit().await?;
-    Ok(Some((partitions, tables)))
+    Ok(Ok((partitions, tables)))
 }

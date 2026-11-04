@@ -18,8 +18,9 @@ macro_rules! scenarios {
     };
 }
 
-pub const SCENARIOS: [(&str, Scenario); 27] = scenarios!(
+pub const SCENARIOS: [(&str, Scenario); 29] = scenarios!(
     provision_compare_and_set,
+    provision_with_a_held_claim_never_creates,
     provision_reports_the_held_partition_count,
     not_provisioned_everywhere,
     append_reports_heads,
@@ -36,6 +37,7 @@ pub const SCENARIOS: [(&str, Scenario); 27] = scenarios!(
     read_wait_returns_on_append,
     read_wait_times_out_empty,
     resolve_positions,
+    query_envelope_is_the_first_and_last_event_in_range,
     watch_starts_with_the_current_head,
     watch_yields_named_partitions_only,
     retention_keeps_events_within_bounds,

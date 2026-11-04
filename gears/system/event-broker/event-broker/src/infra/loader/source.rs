@@ -13,9 +13,9 @@ use crate::domain::streaming::source::PartitionKey;
 /// Why a fetch could not be served.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SourceError {
-    /// The backend is reachable again later. The demand survives.
+    /// The source could not be read; the same call may succeed later.
     Unavailable,
-    /// The read itself failed.
+    /// The read failed for any other reason, such as an unregistered topic.
     Failed(String),
 }
 

@@ -24,6 +24,11 @@ const PERMISSION_DENIED_DETAIL: &str = "You do not have permission to perform th
 /// The default `failed_precondition` detail the `resource_error` macro stamps.
 /// Replicated for the same reason as [`PERMISSION_DENIED_DETAIL`].
 const FAILED_PRECONDITION_DETAIL: &str = "Operation precondition not met";
+/// The field-violation reasons of the batch-shape rules (feature 0001 §5.2),
+/// spelled as the docs spell the codes.
+const EMPTY_BATCH: &str = "empty_batch";
+const DUPLICATE_EVENT_ID: &str = "duplicate_event_id";
+const MALFORMED_RUN: &str = "malformed_run";
 
 // These per-entity resource-error types name one fixed resource; they remain
 // for the `From` arms below that always concern the same resource
@@ -132,19 +137,11 @@ fn conflict(code: ErrorCode, message: String, resource: String) -> CanonicalErro
 impl From<DomainError> for CanonicalError {
     fn from(err: DomainError) -> Self {
         match err {
-            // Payload-schema validation is the one `Validation` that is `422
-            // PayloadValidationFailed` (`DESIGN.md:586`), not `400`: the body
-            // parsed fine but its `data` does not satisfy the event type's
-            // schema. Category stays `InvalidArgument`; a `TransportOverride`
-            // surfaces the literal `422` (same mechanism as `SequenceViolation`
-            // -> 412). Every other `Validation` (envelope, subject-type, mixed
-            // topics, unknown producer, ...) is a `400`.
-            // The payload failed its type's `data_schema`. The `(payload)`/
-            // `schema_validation` violation says what is wrong without
-            // reproducing anything the caller sent (`no user input in error
-            // bodies`), and the targeted stream is named in
-            // `context.resource_name` - the common resource of every publish
-            // error.
+            // The body parsed, but its `data` fails the event type's `data_schema`:
+            // `docs/openapi.yaml` documents a literal `422`, which a `TransportOverride`
+            // surfaces over the `InvalidArgument` category's `400`. The `(payload)`
+            // violation reproduces nothing the caller sent (no user input in error
+            // bodies); the topic rides in `context.resource_name`.
             DomainError::SchemaViolation { topic } => TopicResourceError::invalid_argument()
                 .with_field_violation(
                     "(payload)",
@@ -156,10 +153,8 @@ impl From<DomainError> for CanonicalError {
                 .create(),
 
             DomainError::Validation { code, message } => {
-                // `invalid_argument()` takes no detail argument - `.with_format`
-                // is what actually sets `Problem.detail` here. Also carries
-                // `InvalidSubjectType`/`SubjectTypeNotAllowed`/
-                // `InvalidSubjectTypePattern` (`eb-event-type-enforcement`).
+                // `invalid_argument()` takes no detail argument; `.with_format`
+                // is what sets `Problem.detail`.
                 EventBrokerResourceError::invalid_argument()
                     .with_format(format!("{code}: {message}"))
                     .create()
@@ -215,28 +210,50 @@ impl From<DomainError> for CanonicalError {
             } => conflict(code, message, resource),
 
             DomainError::SequenceViolation {
+                index,
+                producer_id,
                 topic,
                 last_sequence,
             } => {
-                // `failed_precondition()` takes no detail argument and its
-                // only context option is `.with_precondition_violation` (no
-                // `.with_format`-equivalent for this context type) - the
-                // descriptive text lives in the violation's `description`
-                // only, matching `DESIGN.md`'s documented shape exactly
-                // (`violations: [{type: "sequence_mismatch", subject:
-                // "(producer)", description: "expected_previous=<n>"}]`).
-                // `docs/openapi.yaml` documents this as a literal `412`; the
-                // override only changes the wire `status`, not the category.
+                // A precondition violation is a fixed `{type, subject,
+                // description}` shape, so the run's `index`, `producer_id`,
+                // `topic` and committed `last_sequence` (feature 0001 §5.2)
+                // ride in `description` as text, `last_sequence` last: the
+                // SDK reads the resync point as the description's last number.
+                // `docs/openapi.yaml` documents a literal `412`; the override
+                // only changes the wire `status`, not the category.
                 TopicResourceError::failed_precondition()
                     .with_precondition_violation(
                         "(producer)",
-                        format!("topic={topic} expected_previous={last_sequence}"),
+                        format!(
+                            "index={index} producer_id={producer_id} topic={topic} \
+                             last_sequence={last_sequence}"
+                        ),
                         reasons::SEQUENCE_MISMATCH,
                     )
                     .with_resource(topic)
                     .with_override(Http::status_code(412))
                     .create()
             }
+
+            // The batch-shape rules R1, R13 and R3 of feature 0001 §5.2.
+            DomainError::EmptyBatch => EventBrokerResourceError::invalid_argument()
+                .with_field_violation("events", "a batch carries at least one event", EMPTY_BATCH)
+                .create(),
+            DomainError::DuplicateEventId { index } => EventBrokerResourceError::invalid_argument()
+                .with_field_violation(
+                    format!("events[{index}].id"),
+                    "repeats the id of an earlier event of the batch",
+                    DUPLICATE_EVENT_ID,
+                )
+                .create(),
+            DomainError::MalformedRun { index } => EventBrokerResourceError::invalid_argument()
+                .with_field_violation(
+                    format!("events[{index}].meta"),
+                    "does not follow the same producer's event before it in the batch",
+                    MALFORMED_RUN,
+                )
+                .create(),
 
             DomainError::BatchTooLarge { count, max } => {
                 let message = format!("batch too large: {count} events (max {max})");

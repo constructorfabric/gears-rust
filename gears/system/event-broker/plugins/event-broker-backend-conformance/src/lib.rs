@@ -26,6 +26,7 @@ mod fixture;
 mod harness;
 mod lifecycle;
 mod provision;
+mod query;
 mod read;
 mod resolve;
 mod retention;
@@ -48,8 +49,9 @@ pub use lifecycle::{
 };
 pub use provision::{
     not_provisioned_everywhere, provision_compare_and_set,
-    provision_reports_the_held_partition_count,
+    provision_reports_the_held_partition_count, provision_with_a_held_claim_never_creates,
 };
+pub use query::query_envelope_is_the_first_and_last_event_in_range;
 pub use read::{
     read_is_exclusive_and_bounded, read_wait_returns_on_append, read_wait_times_out_empty,
 };

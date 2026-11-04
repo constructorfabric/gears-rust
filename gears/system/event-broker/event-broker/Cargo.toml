@@ -167,6 +167,13 @@ harness = false
 # The crate itself with `test-utils`, as oagw does: every `tests/` binary gets
 # `test_support` (the in-process harness) with no `required-features`.
 cf-gears-event-broker = { path = ".", features = ["test-utils"] }
+# `tests/migrations_backends_test.rs`: the SDK's producer registration
+# migration (`producer_registration_migrations`, behind its `db` feature) on
+# every engine the gear database may be.
+event-broker-sdk = { workspace = true, features = ["db"] }
+# `MockDatabase`: `migrations_tests.rs` records the DDL the migrations emit
+# on PostgreSQL to compare it with `docs/migration.sql`.
+sea-orm = { workspace = true, features = ["mock"] }
 # `tests/support/containers.rs`: the PostgreSQL and MySQL servers of the
 # engine-matrix tests, on `libs/test-containers`' pinned tags.
 test-containers = { workspace = true }

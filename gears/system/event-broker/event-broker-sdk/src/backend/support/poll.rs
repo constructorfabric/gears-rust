@@ -15,9 +15,13 @@ use crate::sequence::Sequence;
 /// Items buffered between the polling task and a slow consumer of the stream.
 const BUFFER: usize = 256;
 
+/// The shortest interval polled at; `tokio::time::interval` rejects zero.
+const MIN_INTERVAL: Duration = Duration::from_millis(1);
+
 /// Heads of `partitions`, found by asking `resolve(Latest)` every `interval`:
 /// first the current head of each partition, then one head per partition
-/// whose `Latest` rose since the previous tick.
+/// whose `Latest` rose since the previous tick. An interval under 1 ms polls
+/// every 1 ms.
 ///
 /// Polling runs in a task of its own, started at once. Errors arrive as
 /// stream items and do not end the stream; dropping the stream stops the task.
@@ -29,7 +33,7 @@ pub fn poll_heads(
     let (tx, rx) = mpsc::channel(BUFFER);
     let partitions = partitions.to_vec();
     tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(interval);
+        let mut ticker = tokio::time::interval(interval.max(MIN_INTERVAL));
         ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
         let mut last: Vec<Option<Sequence>> = vec![None; partitions.len()];
         loop {

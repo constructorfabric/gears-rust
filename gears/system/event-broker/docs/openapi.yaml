@@ -85,10 +85,12 @@ paths:
                 $ref: "#/components/schemas/Problem"
         "412":
           description: >-
-            SequenceViolation - the producer chain does not advance by exactly one
-            from the broker's stored `last_sequence`. `context.resource_name` names
-            the resolved topic; the violation carries `expected_previous=<n>` so the
-            producer can resync (re-read `GET /v1/producers/{id}/cursors`).
+            SequenceViolation - the event neither advances nor duplicates the
+            producer chain's committed `last_sequence`. `context.resource_name`
+            names the resolved topic; the `sequence_mismatch` violation's
+            `description` reads `index=0 producer_id=<id> topic=<topic>
+            last_sequence=<n>`, the committed head last, so the producer can resync
+            (re-read `GET /v1/producers/{id}/cursors`).
           content:
             application/problem+json:
               schema:
@@ -110,6 +112,16 @@ paths:
             application/problem+json:
               schema:
                 $ref: "#/components/schemas/Problem"
+        "503":
+          description: >-
+            ServiceUnavailable, retryable - the topic is not yet provisioned, the
+            broker's database or ingest pipeline is unavailable (including a
+            producer-chain write that exhausted its contention retries), or no ingest
+            instance is reachable.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
 
   /v1/events:batch:
     post:
@@ -119,6 +131,15 @@ paths:
         Atomic per-topic batch of up to 100 events. All-or-nothing per topic.
         Each event's owning topic is resolved from the `topic` trait on its `type`;
         a batch whose event types resolve to more than one topic is rejected.
+
+        Events may carry several producer ids, and stateless events. The chained
+        and monotonic events are split into runs, one per `(producer_id, topic)`,
+        each keeping request order, and each run is checked against its chain's
+        committed `last_sequence`: a chained run advances when its first event
+        links to the head, is a duplicate prefix through the event whose
+        `sequence` equals the head, and is otherwise a `412`; a monotonic run
+        skips its leading events with `sequence <= last_sequence`. Duplicates are
+        not enqueued; the rest of the batch is. Every answer is status only.
       requestBody:
         required: true
         content:
@@ -135,9 +156,25 @@ paths:
                   maxItems: 100
       responses:
         "202":
-          description: Accepted (async; the whole batch durably enqueued)
+          description: >-
+            Accepted (async; every event that is not a duplicate durably
+            enqueued). A batch carrying any stateless event is never a duplicate.
+        "200":
+          description: >-
+            Every event of the batch is a duplicate - a lost-ack resend. Nothing
+            is written and the response carries no body.
         "400":
-          description: Validation error
+          description: >-
+            Validation error, or a batch run rule broken - each a
+            `field_violations` entry naming the event by its position:
+            `empty_batch` (no events; field `events`), `duplicate_event_id` (an
+            `id` repeated within the batch; field `events[<index>].id`, the
+            repeat), `malformed_run` (a chained run's events do not link - every
+            event has `sequence > previous` and each after the first has
+            `previous` equal to the prior event's `sequence` - or a monotonic
+            run's sequences do not strictly increase; field
+            `events[<index>].meta`, the first offending event). The run rules are
+            checked before any chain state is read.
           content:
             application/problem+json:
               schema:
@@ -155,7 +192,13 @@ paths:
               schema:
                 $ref: "#/components/schemas/Problem"
         "412":
-          description: SequenceViolation - atomic batch rejection when any event in the batch fails the chain check
+          description: >-
+            SequenceViolation - atomic batch rejection: a run neither advances nor
+            duplicates its chain's committed `last_sequence`. Nothing is enqueued.
+            `context.resource_name` names the topic; the `sequence_mismatch`
+            violation's `description` reads `index=<n> producer_id=<id>
+            topic=<topic> last_sequence=<n>` - the position of the run's first
+            event, its producer and topic, and the committed head, last.
           content:
             application/problem+json:
               schema:
@@ -175,6 +218,16 @@ paths:
         "501":
           description: >-
             Synchronous publish (`Prefer: wait`) is not implemented yet.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "503":
+          description: >-
+            ServiceUnavailable, retryable - the batch's topic is not yet provisioned,
+            the broker's database or ingest pipeline is unavailable (including a
+            producer-chain write that exhausted its contention retries), or no ingest
+            instance is reachable. Nothing is enqueued.
           content:
             application/problem+json:
               schema:
@@ -452,7 +505,7 @@ paths:
       tags: [producers]
       summary: Reset the ingest-side chain state for a producer
       description: |
-        Operator-driven chain reset. Clears `evbk_producer_state` rows and emits an audit
+        Operator-driven chain reset. Clears `event_broker_producer_sequence` rows and emits an audit
         record. When the request body is absent or empty, the producer's chain on every
         topic is cleared. When `topic` is present, only that topic's chain is cleared.
         Principal-bound — only the registering principal may call this.
@@ -566,8 +619,12 @@ paths:
                   partition: { type: integer }
                   start_sequence: { type: integer, format: int64 }
                   end_sequence: { type: integer, format: int64 }
-                  start_time: { type: string, format: date-time }
-                  end_time: { type: string, format: date-time }
+                  start_time:
+                    type: ["string", "null"]
+                    format: date-time
+                  end_time:
+                    type: ["string", "null"]
+                    format: date-time
                   segments:
                     type: array
                     items: { type: object, additionalProperties: true }
@@ -626,6 +683,14 @@ paths:
                     $ref: "#/components/schemas/PageInfo"
         "400":
           description: Invalid $filter expression or cursor mismatch
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "503":
+          description: >-
+            ServiceUnavailable, retryable - the specification store is unavailable, or
+            no ingest instance is reachable.
           content:
             application/problem+json:
               schema:
@@ -852,7 +917,7 @@ paths:
           description: |
             `ConsumerGroupNotFound` (anonymous: must POST /v1/consumer-groups first; named:
             must register via types_registry),
-            `TopicNotFound` (an `interest.topic` is not registered in `evbk_topic`).
+            `TopicNotFound` (an `interest.topic` is not a registered topic).
           content:
             application/problem+json:
               schema:
@@ -1195,11 +1260,15 @@ components:
             Per-category structured context. Common fields include
             `retry_after_seconds` (ServiceUnavailable) and, for a `NotFound` or any
             resource-scoped error, `resource_type` / `resource_name` naming the
-            addressed resource. Every publish-path error names the targeted stream
-            (`resource_type: "gts.cf.core.events.topic.v1~"`, `resource_name`: the
-            resolved topic id); the specific fault lives in the `field_violations`
-            or `violations` entry (e.g. SequenceViolation's violation carries
-            `expected_previous=<n>`). Error bodies never echo submitted values.
+            addressed resource. A publish-path error about the stream names the
+            targeted stream (`resource_type: "gts.cf.core.events.topic.v1~"`,
+            `resource_name`: the resolved topic id); a request-level `400` names
+            the request (`resource_type: "gts.cf.core.events.request.v1~"`). The
+            specific fault lives in the `field_violations` or `violations` entry
+            (e.g. SequenceViolation's violation carries `last_sequence=<n>`).
+            Error bodies never echo submitted content - payloads or field values;
+            identifiers the broker issued (a `producer_id`, a resolved topic id)
+            and request positions (an event `index`) may appear.
 
   responses:
     Problem:
