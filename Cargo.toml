@@ -554,12 +554,12 @@ tracing-subscriber = { version = "0.3", features = [
     "local-time",
 ] }
 tracing-log = "0.2"
-tracing-opentelemetry = "0.33"
+tracing-opentelemetry = "0.34"
 tracing-appender = "0.2"
 tracing-test = "0.2"
-opentelemetry = { version = "0.32", features = ["trace", "metrics"] }
-opentelemetry_sdk = { version = "0.32", features = ["trace", "rt-tokio", "metrics"] }
-opentelemetry-otlp = { version = "0.32", features = [
+opentelemetry = { version = "0.33", features = ["trace", "metrics"] }
+opentelemetry_sdk = { version = "0.33", features = ["trace", "rt-tokio", "metrics"] }
+opentelemetry-otlp = { version = "0.33", features = [
     "grpc-tonic",
     "http-proto",
 ] }
