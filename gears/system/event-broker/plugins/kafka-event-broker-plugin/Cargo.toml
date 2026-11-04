@@ -1,0 +1,76 @@
+[package]
+name = "cf-gears-kafka-event-broker-plugin"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Apache Kafka storage backend plugin for the event-broker gear: one Kafka topic per event-broker topic and fenced deduplication over transactional producers"
+keywords = ["constructorfabric", "cf-gears", "event-broker", "kafka"]
+categories = ["database"]
+metadata.docs.rs.all-features = true
+
+[lib]
+name = "kafka_event_broker_plugin"
+
+# `testcontainers`/`testcontainers-modules` are optional `[dependencies]`, not
+# `[dev-dependencies]`: Cargo does not allow optional dev-dependencies, and the
+# `integration` feature names them with `dep:`. Every reference to them lives in
+# `tests/`.
+[package.metadata.cargo-shear]
+# `rdkafka-sys` is named only to hold its pin (root `Cargo.toml`); no code
+# uses it directly.
+ignored = ["rdkafka-sys", "testcontainers", "testcontainers-modules"]
+
+[lints]
+workspace = true
+
+[features]
+# Gates the tests that need a Docker daemon, so a default `cargo test` never
+# does.
+integration = ["dep:testcontainers", "dep:testcontainers-modules"]
+
+[dependencies]
+# The `backend::Backend` contract this crate implements. This crate depends on
+# the SDK only, never on the gear.
+event-broker-sdk = { workspace = true }
+
+async-trait = { workspace = true }
+chrono = { workspace = true, features = ["clock", "serde"] }
+rdkafka = { workspace = true }
+rdkafka-sys = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["rt", "sync", "time", "macros"] }
+tokio-util = { workspace = true }
+toolkit-gts = { workspace = true }
+toolkit-utils = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true, features = ["v4", "serde"] }
+testcontainers = { workspace = true, optional = true }
+testcontainers-modules = { workspace = true, optional = true }
+
+[dev-dependencies]
+# Path only, no version: the suite is not published.
+event-broker-backend-conformance = { package = "cf-gears-event-broker-backend-conformance", path = "../event-broker-backend-conformance" }
+event-broker-backend-bench = { package = "cf-gears-event-broker-backend-bench", path = "../event-broker-backend-bench" }
+futures-util = { workspace = true }
+test-containers = { workspace = true }
+temp-env = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "test-util"] }
+
+[[test]]
+name = "conformance"
+required-features = ["integration"]
+
+[[test]]
+name = "kafka"
+required-features = ["integration"]
+
+# Needs a Kafka cluster: a container (Docker) unless EB_BENCH_KAFKA_BOOTSTRAP
+# names one, so it is gated like the tests that do.
+[[bench]]
+name = "backend"
+harness = false
+required-features = ["integration"]

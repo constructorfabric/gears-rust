@@ -11,6 +11,5 @@
 //! thing.
 
 pub mod entity;
-pub mod graph;
 pub mod migrations;
 pub mod odata_mapper;

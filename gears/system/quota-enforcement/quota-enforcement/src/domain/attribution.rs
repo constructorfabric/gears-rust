@@ -13,7 +13,8 @@
 use authz_resolver_sdk::pep::ResourceType;
 use gts::GtsTypeId;
 use quota_enforcement_sdk::{
-    EvaluationAttribution, MetricId, ResourceProjection, SubjectRef, SubjectScope, TenantId,
+    AttributionDigest, EvaluationAttribution, MetricId, ResourceProjection, SubjectRef,
+    SubjectScope, TenantId,
 };
 use serde_json::{Map, Value, json};
 use toolkit_macros::domain_model;
@@ -63,6 +64,12 @@ pub struct AdmittedEvaluation {
     pub metric: MetricId,
     /// The Policy-visible input.
     pub input: PolicyInput,
+    /// Digest of exactly what the PDP authorized: metric, mapped subjects, and
+    /// the resource document. A debit records it so that a later rollback can
+    /// prove it reverses an operation it was itself admitted for; the
+    /// idempotency scope covers tenant and subjects, but neither the metric nor
+    /// the resource.
+    pub authorized: AttributionDigest,
 }
 
 /// The ingress step over the PEP boundary and the published catalogue.
@@ -139,6 +146,7 @@ impl<'a> Attribution<'a> {
 
         // @cpt-begin:cpt-cf-quota-enforcement-flow-ingress-validation:p1:inst-ing-authz
         // @cpt-begin:cpt-cf-quota-enforcement-algo-subject-resolution:p1:inst-res-authz
+        let pdp_properties = shaped.pdp_properties();
         let admitted = self
             .admission
             .admit_with_properties(
@@ -146,7 +154,7 @@ impl<'a> Attribution<'a> {
                 resource_type,
                 action,
                 AdmissionTarget::tenant(shaped.tenant_id),
-                shaped.pdp_properties(),
+                pdp_properties.clone(),
             )
             .await?;
         // @cpt-end:cpt-cf-quota-enforcement-algo-subject-resolution:p1:inst-res-authz
@@ -193,8 +201,7 @@ impl<'a> Attribution<'a> {
             .catalog
             .request_contract(&shaped.metric)
             .ok_or_else(|| {
-                // Unreachable once the tenant scope mapped: the catalogue holds a
-                // request contract for every admitted metric by construction.
+                // Every admitted metric has a request contract.
                 self.metrics
                     .record_admitted_metric_violation(ValidationSurface::RequestSubject);
                 DomainError::InvalidArgument {
@@ -223,8 +230,10 @@ impl<'a> Attribution<'a> {
         // @cpt-begin:cpt-cf-quota-enforcement-flow-ingress-validation:p1:inst-ing-forward
         // @cpt-begin:cpt-cf-quota-enforcement-algo-subject-resolution:p1:inst-res-return
         // @cpt-begin:cpt-cf-quota-enforcement-flow-owner-projection-publication:p1:inst-pub-return
-        // Any authorized caller reached the owner's projections through the
-        // catalogue; none of them chose a projection.
+        // Bind rollback authorization to the catalogue-mapped document seen by
+        // the PDP, including resource metadata.
+        let authorized = AttributionDigest::of_canonical(&pdp_properties)
+            .map_err(|error| DomainError::Internal(error.to_string()))?;
         Ok(AdmittedEvaluation {
             attribution: MappedAttribution {
                 tenant_id: shaped.tenant_id,
@@ -236,6 +245,7 @@ impl<'a> Attribution<'a> {
                 request: shaped.metadata,
                 resource,
             },
+            authorized,
         })
         // @cpt-end:cpt-cf-quota-enforcement-flow-owner-projection-publication:p1:inst-pub-return
         // @cpt-end:cpt-cf-quota-enforcement-algo-subject-resolution:p1:inst-res-return
@@ -395,9 +405,7 @@ impl<'a> Attribution<'a> {
                 reason: tokens::RESOURCE_TYPE_UNKNOWN,
             });
         };
-        // The complete `{type, id?, metadata}` document, `id` present only when
-        // the caller sent one: the resource base allows an omitted id and
-        // requires a string when present.
+        // Preserve an omitted resource id instead of serializing it as `null`.
         let mut document = Map::new();
         document.insert(
             "type".to_owned(),

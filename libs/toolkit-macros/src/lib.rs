@@ -184,16 +184,18 @@ fn validate_kebab_case(name: &str) -> Result<(), String> {
 
 #[derive(Debug, Clone)]
 struct LcGearCfg {
-    entry: String,        // entry method name (e.g., "serve")
-    stop_timeout: String, // human duration (e.g., "30s")
-    await_ready: bool,    // require ReadySignal gating
+    entry: String,                // entry method name (e.g., "serve")
+    stop_timeout: Option<String>, // human duration (e.g., "30s")
+    stop_timeout_fn: Option<Ident>,
+    await_ready: bool, // require ReadySignal gating
 }
 
 impl Default for LcGearCfg {
     fn default() -> Self {
         Self {
             entry: "serve".to_owned(),
-            stop_timeout: "30s".to_owned(),
+            stop_timeout: None,
+            stop_timeout_fn: None,
             await_ready: false,
         }
     }
@@ -215,6 +217,7 @@ impl Parse for GearConfig {
         let mut seen_ctor = false;
         let mut seen_client = false;
         let mut seen_lifecycle = false;
+        let mut seen_one_per_installation = false;
 
         let punctuated: Punctuated<Meta, Token![,]> =
             input.parse_terminated(Meta::parse, Token![,])?;
@@ -293,6 +296,40 @@ impl Parse for GearConfig {
                                 "client must be a trait path, e.g. client = crate::api::MyClient",
                             ));
                         }
+                    }
+                }
+                // `one_per_installation = <bool>`: this gear may exist only once in
+                // a running installation.
+                //
+                // Validated here and deliberately not stored. There is nothing
+                // for the runtime to do with it: a process can refuse a second
+                // `rest_host` because it can see its own gears, and no process
+                // can see another, so an installation-wide claim has no runtime
+                // vantage point. What acts on it is composition tooling, which
+                // reads this attribute's source rather than this macro's output.
+                //
+                // So the macro's job here is to make a typo a compile error
+                // instead of a silently ignored argument -- which is what the
+                // fallthrough below would otherwise make it.
+                Meta::NameValue(nv) if nv.path.is_ident("one_per_installation") => {
+                    if seen_one_per_installation {
+                        return Err(syn::Error::new_spanned(
+                            nv.path,
+                            "duplicate `one_per_installation` parameter",
+                        ));
+                    }
+                    seen_one_per_installation = true;
+                    if !matches!(
+                        nv.value,
+                        Expr::Lit(syn::ExprLit {
+                            lit: Lit::Bool(_),
+                            ..
+                        })
+                    ) {
+                        return Err(syn::Error::new_spanned(
+                            nv.value,
+                            "one_per_installation must be a bool, e.g. one_per_installation = true",
+                        ));
                     }
                 }
                 Meta::NameValue(nv) if nv.path.is_ident("deps") => {
@@ -444,11 +481,26 @@ fn parse_lifecycle_list(list: &MetaList) -> syn::Result<LcGearCfg> {
                     lit: Lit::Str(s), ..
                 }) = value
                 {
-                    cfg.stop_timeout = s.value();
+                    cfg.stop_timeout = Some(s.value());
                 } else {
                     return Err(syn::Error::new_spanned(
                         value,
                         "stop_timeout must be a string literal like \"45s\"",
+                    ));
+                }
+            }
+            Meta::NameValue(MetaNameValue { path, value, .. })
+                if path.is_ident("stop_timeout_fn") =>
+            {
+                if let Expr::Lit(syn::ExprLit {
+                    lit: Lit::Str(s), ..
+                }) = value
+                {
+                    cfg.stop_timeout_fn = Some(s.parse()?);
+                } else {
+                    return Err(syn::Error::new_spanned(
+                        value,
+                        "stop_timeout_fn must name a method in a string literal",
                     ));
                 }
             }
@@ -472,12 +524,13 @@ fn parse_lifecycle_list(list: &MetaList) -> syn::Result<LcGearCfg> {
             other => {
                 return Err(syn::Error::new_spanned(
                     other,
-                    "expected lifecycle args: entry=\"...\", stop_timeout=\"...\", await_ready[=true|false]",
+                    "expected lifecycle args: entry=\"...\", stop_timeout=\"...\" or stop_timeout_fn=\"...\", await_ready[=true|false]",
                 ));
             }
         }
     }
 
+    lifecycle_timeout_tokens(cfg.stop_timeout.as_deref(), cfg.stop_timeout_fn.as_ref())?;
     Ok(cfg)
 }
 
@@ -631,8 +684,9 @@ pub fn gear(attr: TokenStream, item: TokenStream) -> TokenStream {
     if let Some(lc) = &lifecycle_cfg_opt {
         // If the type declares lifecycle(...), we generate Runnable at top-level.
         let entry_ident = format_ident!("{}", lc.entry);
-        let timeout_ts =
-            parse_duration_tokens(&lc.stop_timeout).unwrap_or_else(|e| e.to_compile_error());
+        let timeout_config =
+            lifecycle_timeout_tokens(lc.stop_timeout.as_deref(), lc.stop_timeout_fn.as_ref())
+                .unwrap_or_else(|e| e.to_compile_error());
         let await_ready_bool = lc.await_ready;
 
         if await_ready_bool {
@@ -667,7 +721,7 @@ pub fn gear(attr: TokenStream, item: TokenStream) -> TokenStream {
                     /// Wrap this instance into a stateful gear with lifecycle configuration.
                     pub fn into_gear(self) -> ::toolkit::lifecycle::WithLifecycle<Self> {
                         ::toolkit::lifecycle::WithLifecycle::new_with_name(self, #name_lit)
-                            .with_stop_timeout(#timeout_ts)
+                            #timeout_config
                             .with_ready_mode(true, true, Some(#ready_shim_ident))
                     }
                 }
@@ -686,7 +740,7 @@ pub fn gear(attr: TokenStream, item: TokenStream) -> TokenStream {
                     /// Wrap this instance into a stateful gear with lifecycle configuration.
                     pub fn into_gear(self) -> ::toolkit::lifecycle::WithLifecycle<Self> {
                         ::toolkit::lifecycle::WithLifecycle::new_with_name(self, #name_lit)
-                            .with_stop_timeout(#timeout_ts)
+                            #timeout_config
                             .with_ready_mode(false, false, None)
                     }
                 }
@@ -711,7 +765,7 @@ pub fn gear(attr: TokenStream, item: TokenStream) -> TokenStream {
             },
             Capability::Stateful => {
                 if let Some(lc) = &lifecycle_cfg_opt {
-                    let timeout_ts = parse_duration_tokens(&lc.stop_timeout)
+                    let timeout_config = lifecycle_timeout_tokens(lc.stop_timeout.as_deref(), lc.stop_timeout_fn.as_ref())
                         .unwrap_or_else(|e| e.to_compile_error());
                     let await_ready_bool = lc.await_ready;
                     let ready_shim_ident =
@@ -723,7 +777,7 @@ pub fn gear(attr: TokenStream, item: TokenStream) -> TokenStream {
                                     gear.clone(),
                                     #name_lit,
                                 )
-                                .with_stop_timeout(#timeout_ts)
+                                #timeout_config
                                 .with_ready_mode(true, true, Some(#ready_shim_ident));
 
                             b.register_stateful_with_meta(
@@ -737,7 +791,7 @@ pub fn gear(attr: TokenStream, item: TokenStream) -> TokenStream {
                                     gear.clone(),
                                     #name_lit,
                                 )
-                                .with_stop_timeout(#timeout_ts)
+                                #timeout_config
                                 .with_ready_mode(false, false, None);
 
                             b.register_stateful_with_meta(
@@ -856,7 +910,8 @@ pub fn gear(attr: TokenStream, item: TokenStream) -> TokenStream {
 #[derive(Debug)]
 struct LcCfg {
     method: String,
-    stop_timeout: String,
+    stop_timeout: Option<String>,
+    stop_timeout_fn: Option<Ident>,
     await_ready: bool,
 }
 
@@ -944,11 +999,12 @@ pub fn lifecycle(attr: TokenStream, item: TokenStream) -> TokenStream {
         .into();
     }
 
-    // Duration literal token
-    let timeout_ts = match parse_duration_tokens(&cfg.stop_timeout) {
-        Ok(ts) => ts,
-        Err(e) => return e.to_compile_error().into(),
-    };
+    // Fixed timeout or a provider evaluated at stop
+    let timeout_config =
+        match lifecycle_timeout_tokens(cfg.stop_timeout.as_deref(), cfg.stop_timeout_fn.as_ref()) {
+            Ok(ts) => ts,
+            Err(e) => return e.to_compile_error().into(),
+        };
 
     // Generated additions (outside of impl-block)
     let ty_ident = match ty.segments.last() {
@@ -992,7 +1048,7 @@ pub fn lifecycle(attr: TokenStream, item: TokenStream) -> TokenStream {
                 /// Converts this value into a stateful gear wrapper with configured stop-timeout.
                 pub fn into_gear(self) -> ::toolkit::lifecycle::WithLifecycle<Self> {
                     ::toolkit::lifecycle::WithLifecycle::new(self)
-                        .with_stop_timeout(#timeout_ts)
+                        #timeout_config
                         .with_ready_mode(#await_ready_bool, true, Some(#ready_shim_ident))
                 }
             }
@@ -1010,7 +1066,7 @@ pub fn lifecycle(attr: TokenStream, item: TokenStream) -> TokenStream {
                 /// Converts this value into a stateful gear wrapper with configured stop-timeout.
                 pub fn into_gear(self) -> ::toolkit::lifecycle::WithLifecycle<Self> {
                     ::toolkit::lifecycle::WithLifecycle::new(self)
-                        .with_stop_timeout(#timeout_ts)
+                        #timeout_config
                         .with_ready_mode(#await_ready_bool, false, None)
                 }
             }
@@ -1026,7 +1082,8 @@ pub fn lifecycle(attr: TokenStream, item: TokenStream) -> TokenStream {
 
 fn parse_lifecycle_args(args: Punctuated<Meta, Token![,]>) -> syn::Result<LcCfg> {
     let mut method: Option<String> = None;
-    let mut stop_timeout = "30s".to_owned();
+    let mut stop_timeout = None;
+    let mut stop_timeout_fn = None;
     let mut await_ready = false;
 
     for m in args {
@@ -1051,7 +1108,7 @@ fn parse_lifecycle_args(args: Punctuated<Meta, Token![,]>) -> syn::Result<LcCfg>
             Meta::NameValue(nv) if nv.path.is_ident("stop_timeout") => {
                 if let Expr::Lit(el) = nv.value {
                     if let Lit::Str(s) = el.lit {
-                        stop_timeout = s.value();
+                        stop_timeout = Some(s.value());
                     } else {
                         return Err(syn::Error::new_spanned(
                             el,
@@ -1062,6 +1119,19 @@ fn parse_lifecycle_args(args: Punctuated<Meta, Token![,]>) -> syn::Result<LcCfg>
                     return Err(syn::Error::new_spanned(
                         nv,
                         "stop_timeout must be a string literal like \"45s\"",
+                    ));
+                }
+            }
+            Meta::NameValue(nv) if nv.path.is_ident("stop_timeout_fn") => {
+                if let Expr::Lit(syn::ExprLit {
+                    lit: Lit::Str(s), ..
+                }) = nv.value
+                {
+                    stop_timeout_fn = Some(s.parse()?);
+                } else {
+                    return Err(syn::Error::new_spanned(
+                        nv,
+                        "stop_timeout_fn must name a method in a string literal",
                     ));
                 }
             }
@@ -1088,7 +1158,7 @@ fn parse_lifecycle_args(args: Punctuated<Meta, Token![,]>) -> syn::Result<LcCfg>
             other => {
                 return Err(syn::Error::new_spanned(
                     other,
-                    "expected named args: method=\"...\", stop_timeout=\"...\", await_ready=true|false",
+                    "expected named args: method=\"...\", stop_timeout=\"...\" or stop_timeout_fn=\"...\", await_ready=true|false",
                 ));
             }
         }
@@ -1100,11 +1170,30 @@ fn parse_lifecycle_args(args: Punctuated<Meta, Token![,]>) -> syn::Result<LcCfg>
             "missing required arg: method=\"runner_name\"",
         )
     })?;
+    lifecycle_timeout_tokens(stop_timeout.as_deref(), stop_timeout_fn.as_ref())?;
     Ok(LcCfg {
         method,
         stop_timeout,
+        stop_timeout_fn,
         await_ready,
     })
+}
+
+fn lifecycle_timeout_tokens(
+    fixed: Option<&str>,
+    provider: Option<&Ident>,
+) -> syn::Result<proc_macro2::TokenStream> {
+    match (fixed, provider) {
+        (Some(_), Some(_)) => Err(syn::Error::new(
+            Span::call_site(),
+            "stop_timeout and stop_timeout_fn are mutually exclusive",
+        )),
+        (None, Some(method)) => Ok(quote! { .with_stop_timeout_fn(|gear| gear.#method()) }),
+        (fixed, None) => {
+            let duration = parse_duration_tokens(fixed.unwrap_or("30s"))?;
+            Ok(quote! { .with_stop_timeout(#duration) })
+        }
+    }
 }
 
 fn parse_duration_tokens(s: &str) -> syn::Result<proc_macro2::TokenStream> {
@@ -1333,4 +1422,35 @@ pub fn temporary(attr: TokenStream, item: TokenStream) -> TokenStream {
 pub fn derive_expand_vars(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
     TokenStream::from(expand_vars::derive(&input))
+}
+
+#[cfg(test)]
+mod lifecycle_timeout_tests {
+    use super::*;
+    use syn::parse::Parser;
+
+    #[test]
+    fn rejects_fixed_and_computed_timeouts_in_both_macros() {
+        let list: MetaList = syn::parse_quote!(lifecycle(
+            stop_timeout = "30s",
+            stop_timeout_fn = "shutdown_timeout"
+        ));
+        assert!(
+            parse_lifecycle_list(&list)
+                .unwrap_err()
+                .to_string()
+                .contains("mutually exclusive")
+        );
+        let args = Punctuated::<Meta, Token![,]>::parse_terminated.parse2(quote!(
+            method = "serve",
+            stop_timeout_fn = "shutdown_timeout",
+            stop_timeout = "30s"
+        ));
+        assert!(
+            parse_lifecycle_args(args.unwrap())
+                .unwrap_err()
+                .to_string()
+                .contains("mutually exclusive")
+        );
+    }
 }

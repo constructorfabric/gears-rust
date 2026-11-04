@@ -1,9 +1,10 @@
 //! The ordinal vocabulary of the event log.
 //!
-//! A sequence is a *position*, not a measure. The space is assigned contiguously
-//! by storage but populated sparsely, because retention removes prefixes and one
-//! partition carries many tenants' events while a single subscription sees a
-//! subset. Two consequences follow, and this module exists to make both of them
+//! A sequence is a *position*, not a measure. Storage assigns the space in
+//! strictly increasing order, possibly with gaps, and it is populated sparsely:
+//! a medium may spend positions on records of its own, retention removes
+//! prefixes, and one partition carries many tenants' events while a single
+//! subscription sees a subset. A partition's head is the last event's sequence. Two consequences follow, and this module exists to make both of them
 //! the compiler's business rather than review's:
 //!
 //! - The distance between two sequences is not a count of anything. A quantity

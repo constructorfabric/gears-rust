@@ -5,10 +5,13 @@
 //! shape (contract type + optional instance id + metadata object), so a
 //! `gts-macros` schema regression fails loudly.
 
-use gts::GtsSchema;
+use gts::schema_traits::X_GTS_TRAITS_SCHEMA;
+use gts::{GtsSchema, SELF_ID_REF, X_GTS_TYPE_REF};
 use serde_json::{Value, json};
 
-use super::{LicenseResolverPluginSpecV1, LicenseResourceV1, LicenseSubjectV1};
+use super::{
+    LicenseResolverPluginSpecV1, LicenseResourceV1, LicenseSubjectV1, LicenseTenantSubjectV1,
+};
 
 // Derived contract types, as a consuming Gear registers them.
 
@@ -136,12 +139,13 @@ fn base_types_are_abstract() {
 #[test]
 fn resource_base_emits_admitted_subjects_trait_referencing_subject_contract() {
     let schema = resource_schema();
-    let x_gts_ref =
-        schema.pointer("/x-gts-traits-schema/properties/admitted_subjects/items/x-gts-ref");
+    let type_ref = schema.pointer(&format!(
+        "/{X_GTS_TRAITS_SCHEMA}/properties/admitted_subjects/items/{X_GTS_TYPE_REF}"
+    ));
     assert_eq!(
-        x_gts_ref.and_then(Value::as_str),
+        type_ref.and_then(Value::as_str),
         Some(toolkit_gts::gts_id!("cf.core.lic.subj.v1~")),
-        "admitted_subjects items must x-gts-ref the Subject licensing base:\n{schema:#}"
+        "admitted_subjects items must x-gts-type-ref the Subject licensing base:\n{schema:#}"
     );
 }
 
@@ -185,12 +189,13 @@ fn base_resource_requires_type_and_allows_optional_id() {
         Some(&json!("object"))
     );
 
-    // `type` is narrowed to this base — `GtsTypeId`'s own schema would leave it
-    // open (`gts.*`), admitting a Subject contract id in the resource slot.
+    // `type` is narrowed to the contract being validated — `GtsTypeId`'s own
+    // schema would leave it open (`gts.*`), admitting a Subject contract id in the
+    // resource slot.
     assert_eq!(
-        schema.pointer("/properties/type/x-gts-ref"),
-        Some(&json!(toolkit_gts::gts_id!("cf.core.lic.res.v1~"))),
-        "resource `type` must ref the Resource base:\n{schema:#}"
+        schema.pointer(&format!("/properties/type/{X_GTS_TYPE_REF}")),
+        Some(&json!(SELF_ID_REF)),
+        "resource `type` must ref the contract being validated:\n{schema:#}"
     );
 }
 
@@ -224,9 +229,9 @@ fn base_subject_requires_type_and_allows_optional_id() {
         Some(&json!("object"))
     );
     assert_eq!(
-        schema.pointer("/properties/type/x-gts-ref"),
-        Some(&json!(toolkit_gts::gts_id!("cf.core.lic.subj.v1~"))),
-        "subject `type` must ref the Subject base:\n{schema:#}"
+        schema.pointer(&format!("/properties/type/{X_GTS_TYPE_REF}")),
+        Some(&json!(SELF_ID_REF)),
+        "subject `type` must ref the contract being validated:\n{schema:#}"
     );
 }
 
@@ -275,5 +280,20 @@ fn derived_contract_does_not_add_top_level_licensing_properties() {
         keys,
         ["metadata"],
         "derived contract must refine only `metadata`:\n{schema:#}"
+    );
+}
+
+#[test]
+fn tenant_subject_derives_from_subject_base() {
+    let schema: Value =
+        serde_json::from_str(&LicenseTenantSubjectV1::gts_schema_with_refs_as_string()).unwrap();
+    assert_eq!(
+        schema.pointer("/allOf/0/$ref"),
+        Some(&json!(format!("gts://{}", LicenseSubjectV1::<()>::TYPE_ID))),
+        "{schema:#}"
+    );
+    assert_eq!(
+        LicenseTenantSubjectV1::TYPE_ID,
+        toolkit_gts::gts_id!("cf.core.lic.subj.v1~cf.core.lic.tenant.v1~")
     );
 }

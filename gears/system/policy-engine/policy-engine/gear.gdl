@@ -1,0 +1,40 @@
+gdl_version = "1.0"
+
+# Every GDL field: https://github.com/constructorfabric/gearbox/blob/main/docs/gdl.md
+#
+# Gearbox product metadata for the policy-engine gear.
+#
+# Projected from #[toolkit::gear] in src/gear.rs: id, runtime_caps (system, db,
+# rest) and lifecycle; deps below is an exact checked mirror (GBX0214).
+
+gear(
+    deps = ["authz-resolver", "tenant-resolver", "types-registry"],
+    source = git(url = "https://github.com/constructorfabric/gears-rust", path = "gears/system/policy-engine/policy-engine"),
+    maturity = "experimental",
+    implementation = "in-progress",
+    name = "Policy Engine",
+    description = "Built-in platform policies and tenant-scoped policy documents, evaluated on the shared evaluation facility as the default admission-control engine.",
+    category = "core-functionality",
+    visibility = "internal",
+
+    package = cargo(
+        crate_name = "cf-gears-policy-engine",
+        lib = "policy_engine",
+        path = ".",
+    ),
+
+    sdk = cargo(
+        crate_name = "cf-gears-policy-engine-sdk",
+        lib = "policy_engine_sdk",
+        path = "../policy-engine-sdk",
+    ),
+
+    # The default engine of admission-control: it registers
+    # `AdmissionEnginePluginClientV1` (src/domain/engine_plugin.rs).
+    implements = "cf.core.admission_control.engine.v1~",
+
+    config_schema = config(exposes = ["engine_plugin", "builtin_policies"]),
+
+    # The crate has no [features] section.
+    cargo_features = [],
+)

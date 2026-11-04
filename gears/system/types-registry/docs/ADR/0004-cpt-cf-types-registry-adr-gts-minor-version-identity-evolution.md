@@ -120,7 +120,7 @@ This is what a minor means, and it is the only thing it means.
 
 A `$ref` or derivation base names an entity by its exact identifier, including its minor. Under ADR-0003, a reference to a mutable entity floats to its current revision.
 
-`x-gts-ref` is not a pinning boundary. It validates an instance value against an identifier pattern without resolving an entity, so it may accept identifiers from any minor or major while creating no dependency on them. GTS §9.6 also permits `gts.*`, which accepts any valid identifier, and relative JSON pointers that name a location in the holder's document.
+An entity reference (`x-gts-type-ref` / `x-gts-instance-ref`) is not a pinning boundary. It validates an instance value against an identifier pattern without resolving an entity, so it may accept identifiers from any minor or major while creating no dependency on them. GTS §9.6.1 also permits `gts.*`, which accepts any valid identifier of the keyword's kind, and the `/$id` pointer, which names the holder's own leaf Type Schema.
 
 **A minor-bearing entity is not mutable.** It is admitted once with one revision, and its authored content never changes. Publishing the next minor creates a different identifier and Registry Reference; existing dependents do not move. Adoption requires the dependent's owner to re-author its reference.
 

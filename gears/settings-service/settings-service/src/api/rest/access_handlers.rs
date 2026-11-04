@@ -1,4 +1,3 @@
-// Created: 2026-09-07 by Virtuozzo International GmbH
 //! Handlers of the tenant access restriction surface.
 
 use std::sync::Arc;
@@ -13,9 +12,10 @@ use uuid::Uuid;
 
 use crate::api::authz::{self, resource};
 use crate::api::rest::access_dto::{
-    AccessReadDto, RestrictionDto, SetRestrictionRequest, render_readout, render_restriction,
+    AccessReadDto, RestrictionDto, SetRestrictionRequest, render_listing, render_readout,
 };
 use crate::api::rest::if_match;
+use crate::api::rest::setting_dto::Reader;
 use crate::api::rest::setting_handlers::{TenantParam, may_read_pii};
 use crate::domain::access::{AccessActor, AccessReadout, TenantAccess};
 use crate::domain::category::domain_visibility;
@@ -84,7 +84,10 @@ async fn with_etag(
     ctx: &SecurityContext,
 ) -> ([(header::HeaderName, String); 1], Json<AccessReadDto>) {
     let pii = readout.stored.is_some() && may_read_pii(enforcer, ctx).await;
-    let dto = render_readout(readout, pii);
+    // The reader is the caller's own tenant: the root for a platform
+    // administrator.
+    let reader = Reader::new(ctx.subject_tenant_id(), readout.root);
+    let dto = render_readout(readout, pii, reader);
     ([(header::ETAG, super::etag_header(&dto.etag))], Json(dto))
 }
 
@@ -153,6 +156,12 @@ pub async fn set_access(
     // @cpt-end:cpt-cf-settings-service-flow-tenant-access-set:p1:inst-ta-set-3
     // @cpt-end:cpt-cf-settings-service-flow-tenant-access-set:p1:inst-ta-set-2
     let actor = actor(&ctx, &headers, &scope);
+    // The target check and the hierarchy lookups ask the tenant resolver,
+    // which opens its own connection and so cannot run inside the
+    // transaction below.
+    // @cpt-begin:cpt-cf-settings-service-flow-tenant-access-set:p1:inst-ta-set-4
+    let chains = service.authorized_hierarchy_chains(&actor, target).await?;
+    // @cpt-end:cpt-cf-settings-service-flow-tenant-access-set:p1:inst-ta-set-4
     let if_match = if_match(&headers).map(str::to_owned);
     let readout = {
         let service = Arc::clone(&service);
@@ -162,7 +171,15 @@ pub async fn set_access(
             .transaction_ref_mapped::<_, AccessReadout, DomainError>(move |tx| {
                 Box::pin(async move {
                     service
-                        .set(tx, &actor, &key, target, access, if_match.as_deref())
+                        .set(
+                            tx,
+                            &actor,
+                            &chains,
+                            &key,
+                            target,
+                            access,
+                            if_match.as_deref(),
+                        )
                         .await
                 })
             })
@@ -195,6 +212,10 @@ pub async fn clear_access(
     let scope = authz::access_scope(&enforcer, &ctx, &resource::VALUE, DELEGATE, None).await?;
     // @cpt-end:cpt-cf-settings-service-flow-tenant-access-clear:p1:inst-ta-clear-2
     let actor = actor(&ctx, &headers, &scope);
+    // Outside the transaction for the same reason as in `set_access`.
+    // @cpt-begin:cpt-cf-settings-service-flow-tenant-access-clear:p1:inst-ta-clear-3
+    let chains = service.authorized_hierarchy_chains(&actor, target).await?;
+    // @cpt-end:cpt-cf-settings-service-flow-tenant-access-clear:p1:inst-ta-clear-3
     let if_match = if_match(&headers).map(str::to_owned);
     let readout = {
         let service = Arc::clone(&service);
@@ -204,7 +225,7 @@ pub async fn clear_access(
             .transaction_ref_mapped::<_, AccessReadout, DomainError>(move |tx| {
                 Box::pin(async move {
                     service
-                        .clear(tx, &actor, &key, target, if_match.as_deref())
+                        .clear(tx, &actor, &chains, &key, target, if_match.as_deref())
                         .await
                 })
             })
@@ -236,16 +257,13 @@ pub async fn list_access(
     let scope = authz::access_scope(&enforcer, &ctx, &resource::VALUE, READ, None).await?;
     // @cpt-end:cpt-cf-settings-service-flow-tenant-access-list:p1:inst-ta-list-2
     let conn = db.conn().map_err(|e| conn_error(&e))?;
-    let rows = service
+    let listing = service
         .list(&conn, &actor(&ctx, &headers, &scope), &key)
         .await?;
     // @cpt-begin:cpt-cf-settings-service-flow-tenant-access-list:p1:inst-ta-list-5
     // Every row names who recorded it; asked once for the page.
-    let pii = !rows.is_empty() && may_read_pii(&enforcer, &ctx).await;
-    let items: Vec<RestrictionDto> = rows
-        .iter()
-        .map(|row| render_restriction(row, pii))
-        .collect();
+    let pii = !listing.rows.is_empty() && may_read_pii(&enforcer, &ctx).await;
+    let items: Vec<RestrictionDto> = render_listing(&listing, pii);
     // The whole list in one page, by design: at most one row per descendant
     // tenant, the subtree walked under the shared budget and refused past it,
     // so there is nothing to continue from. The page envelope is the

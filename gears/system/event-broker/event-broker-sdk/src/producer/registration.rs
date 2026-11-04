@@ -1,10 +1,14 @@
 //! Durable managed producer registrations with UTC bindings on every SQL backend.
 
 use chrono::Utc;
+#[cfg(feature = "outbox")]
+use sea_orm::ActiveValue;
 use sea_orm::entity::prelude::*;
-use sea_orm::{ActiveValue, ColumnTrait, EntityTrait, QueryFilter};
+use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+#[cfg(feature = "outbox")]
+use toolkit_db::secure::secure_insert;
 use toolkit_db::secure::{
-    AccessScope, ScopableEntity, ScopeError, SecureEntityExt, SecureUpdateExt, secure_insert,
+    AccessScope, ScopableEntity, ScopeError, SecureEntityExt, SecureUpdateExt,
 };
 
 use crate::api::ProducerMode;
@@ -13,11 +17,21 @@ use crate::ids::ProducerId;
 
 use super::types::ManagedDeduplication;
 
+/// Longest registration key and queue name a row holds (`VARCHAR(255)`).
+pub(crate) const MAX_NAME_LEN: usize = 255;
+
+/// One producer id per `(registration key, queue, outbox partition)`: each id
+/// carries exactly one sequence space, that partition's `OutboxMessage.seq`
+/// (ADR-0004 "Producer Partitions").
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel)]
 #[sea_orm(table_name = "event_broker_producer_registrations")]
 pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]
     pub registration_key: String,
+    #[sea_orm(primary_key, auto_increment = false)]
+    pub queue: String,
+    #[sea_orm(primary_key, auto_increment = false)]
+    pub outbox_partition: i64,
     pub producer_id: uuid::Uuid,
     pub mode: String,
     pub client_agent: String,
@@ -58,13 +72,42 @@ impl ScopableEntity for Entity {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ProducerRegistration {
-    pub(crate) key: String,
+    pub(crate) slot: RegistrationSlot,
     pub(crate) producer_id: ProducerId,
     pub(crate) mode: ProducerMode,
     pub(crate) client_agent: String,
     pub(crate) generation: i64,
+}
+
+/// Which outbox partition of which queue of which registration key a producer
+/// id serves.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct RegistrationSlot {
+    pub(crate) key: String,
+    pub(crate) queue: String,
+    /// The outbox partition as toolkit-db delivers it (`OutboxMessage.partition_id`):
+    /// the partition row's id, stable and unique per partition.
+    pub(crate) partition: i64,
+}
+
+impl RegistrationSlot {
+    fn filter(&self) -> sea_orm::Condition {
+        sea_orm::Condition::all()
+            .add(Column::RegistrationKey.eq(self.key.as_str()))
+            .add(Column::Queue.eq(self.queue.as_str()))
+            .add(Column::OutboxPartition.eq(self.partition))
+    }
+}
+
+/// A new registration's identity, before it is stored.
+#[cfg(feature = "outbox")]
+pub(crate) struct NewRegistration<'a> {
+    pub(crate) slot: &'a RegistrationSlot,
+    pub(crate) producer_id: ProducerId,
+    pub(crate) mode: ProducerMode,
+    pub(crate) client_agent: &'a str,
 }
 
 #[derive(Clone)]
@@ -79,11 +122,11 @@ impl ProducerRegistrationStore {
 
     pub(crate) async fn load(
         &self,
-        key: &str,
+        slot: &RegistrationSlot,
     ) -> Result<Option<ProducerRegistration>, EventBrokerError> {
         let conn = self.db.conn().map_err(map_db_err)?;
         let row = Entity::find()
-            .filter(Column::RegistrationKey.eq(key))
+            .filter(slot.filter())
             .secure()
             .scope_with(&AccessScope::allow_all())
             .one(&conn)
@@ -92,22 +135,41 @@ impl ProducerRegistrationStore {
         row.map(ProducerRegistration::try_from).transpose()
     }
 
+    /// Every partition's registration stored under `key`, across queues.
+    pub(crate) async fn load_all(
+        &self,
+        key: &str,
+    ) -> Result<Vec<ProducerRegistration>, EventBrokerError> {
+        let conn = self.db.conn().map_err(map_db_err)?;
+        Entity::find()
+            .filter(Column::RegistrationKey.eq(key))
+            .secure()
+            .scope_with(&AccessScope::allow_all())
+            .all(&conn)
+            .await
+            .map_err(map_scope_err)?
+            .into_iter()
+            .map(ProducerRegistration::try_from)
+            .collect()
+    }
+
+    #[cfg(feature = "outbox")]
     pub(crate) async fn insert_new(
         &self,
-        managed: &ManagedDeduplication,
-        producer_id: ProducerId,
-        client_agent: &str,
+        new: NewRegistration<'_>,
     ) -> Result<ProducerRegistration, EventBrokerError> {
         let now = Utc::now();
         let registration = ProducerRegistration {
-            key: managed.key.clone(),
-            producer_id,
-            mode: managed.mode,
-            client_agent: client_agent.to_owned(),
+            slot: new.slot.clone(),
+            producer_id: new.producer_id,
+            mode: new.mode,
+            client_agent: new.client_agent.to_owned(),
             generation: 1,
         };
         let am = ActiveModel {
-            registration_key: ActiveValue::Set(registration.key.clone()),
+            registration_key: ActiveValue::Set(registration.slot.key.clone()),
+            queue: ActiveValue::Set(registration.slot.queue.clone()),
+            outbox_partition: ActiveValue::Set(registration.slot.partition),
             producer_id: ActiveValue::Set(registration.producer_id.0),
             mode: ActiveValue::Set(mode_to_str(registration.mode).to_owned()),
             client_agent: ActiveValue::Set(registration.client_agent.clone()),
@@ -122,11 +184,15 @@ impl ProducerRegistrationStore {
         Ok(registration)
     }
 
+    /// Moves the slot of `current` to `producer_id` under the next
+    /// generation, provided the slot still holds the generation of `current`.
+    /// A slot that moved on in the meantime is left as it is: the update
+    /// matches no row and the outcome is [`Replaced::Lost`].
     pub(crate) async fn replace_with_new_generation(
         &self,
         current: &ProducerRegistration,
         producer_id: ProducerId,
-    ) -> Result<ProducerRegistration, EventBrokerError> {
+    ) -> Result<Replaced, EventBrokerError> {
         let generation = current.generation + 1;
         let now = Utc::now();
         let conn = self.db.conn().map_err(map_db_err)?;
@@ -140,26 +206,42 @@ impl ProducerRegistrationStore {
                 sea_orm::sea_query::Expr::value(generation),
             )
             .col_expr(Column::UpdatedAt, sea_orm::sea_query::Expr::value(now))
-            .filter(Column::RegistrationKey.eq(current.key.as_str()))
+            .filter(
+                current
+                    .slot
+                    .filter()
+                    .add(Column::Generation.eq(current.generation)),
+            )
             .secure()
             .scope_with(&AccessScope::allow_all())
             .exec(&conn)
             .await
             .map_err(map_scope_err)?;
-        if result.rows_affected != 1 {
-            return Err(EventBrokerError::Internal(format!(
-                "producer registration '{}' was not updated",
-                current.key
-            )));
+        match result.rows_affected {
+            0 => Ok(Replaced::Lost),
+            1 => Ok(Replaced::Done(ProducerRegistration {
+                slot: current.slot.clone(),
+                producer_id,
+                mode: current.mode,
+                client_agent: current.client_agent.clone(),
+                generation,
+            })),
+            n => Err(EventBrokerError::Internal(format!(
+                "producer registration '{}' queue '{}' partition {} updated {n} rows",
+                current.slot.key, current.slot.queue, current.slot.partition
+            ))),
         }
-        Ok(ProducerRegistration {
-            key: current.key.clone(),
-            producer_id,
-            mode: current.mode,
-            client_agent: current.client_agent.clone(),
-            generation,
-        })
     }
+}
+
+/// How a generation replace ended.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Replaced {
+    /// The slot moved to the new id; this is its stored registration.
+    Done(ProducerRegistration),
+    /// The slot left the expected generation before the update, so the new id
+    /// is not stored.
+    Lost,
 }
 
 impl ProducerRegistration {
@@ -172,7 +254,7 @@ impl ProducerRegistration {
             return Err(EventBrokerError::InvalidProducerOptions {
                 detail: format!(
                     "managed producer registration '{}' has mode {}, expected {}",
-                    self.key,
+                    self.slot.key,
                     mode_to_str(self.mode),
                     mode_to_str(managed.mode)
                 ),
@@ -182,7 +264,7 @@ impl ProducerRegistration {
             return Err(EventBrokerError::InvalidProducerOptions {
                 detail: format!(
                     "managed producer registration '{}' has client_agent '{}', expected '{}'",
-                    self.key, self.client_agent, client_agent
+                    self.slot.key, self.client_agent, client_agent
                 ),
             });
         }
@@ -194,8 +276,13 @@ impl TryFrom<Model> for ProducerRegistration {
     type Error = EventBrokerError;
 
     fn try_from(model: Model) -> Result<Self, Self::Error> {
+        let partition = model.outbox_partition;
         Ok(Self {
-            key: model.registration_key,
+            slot: RegistrationSlot {
+                key: model.registration_key,
+                queue: model.queue,
+                partition,
+            },
             producer_id: ProducerId(model.producer_id),
             mode: mode_from_str(&model.mode)?,
             client_agent: model.client_agent,

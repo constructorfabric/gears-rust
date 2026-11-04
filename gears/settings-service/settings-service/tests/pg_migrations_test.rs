@@ -1,5 +1,4 @@
 #![cfg(feature = "integration")]
-// Created: 2026-10-02 by Virtuozzo International GmbH
 // The fixture, the seed and the reader are plain helpers, which
 // `allow-expect-in-tests` does not reach; a failed expectation there is the
 // test failing, as in the sibling PostgreSQL suites.
@@ -24,14 +23,13 @@
 use std::collections::BTreeMap;
 
 use cf_gears_settings_service::infra::storage::migrations::Migrator;
-use sea_orm::{ConnectionTrait, Database, DatabaseConnection, Statement};
+use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
 use sea_orm_migration::{MigrationTrait, MigratorTrait};
-use testcontainers::runners::AsyncRunner;
-use testcontainers::{ContainerAsync, ImageExt};
-use testcontainers_modules::postgres::Postgres;
 use toolkit_db::migration_runner::run_migrations_for_testing;
-use toolkit_db::{ConnectOpts, Db, connect_db};
 use uuid::Uuid;
+
+mod common;
+use common::pg_fixture;
 
 /// The migration that repoints value types from the toolkit namespace at the
 /// gears one.
@@ -41,74 +39,6 @@ const MOVE: &str = "m20260917_000001_value_type_namespace";
 type Chain = Vec<Box<dyn MigrationTrait>>;
 const OLD_BOOL: &str = "gts.cf.toolkit.settings.type_bool_flag.v1~";
 const NEW_BOOL: &str = "gts.cf.core.settings.type_bool_flag.v1~";
-
-/// A `PostgreSQL` container, the toolkit handle the runner takes, and a plain
-/// connection for the rows the test writes and reads around the chain. Owned
-/// by the test, so the container goes when the test does.
-struct PgFixture {
-    _container: ContainerAsync<Postgres>,
-    db: Db,
-    conn: DatabaseConnection,
-}
-
-/// Whether a missing or broken Docker must fail the run rather than skip it.
-/// CI sets `SETTINGS_SERVICE_PG_REQUIRE_DOCKER=1`; locally it is unset.
-fn require_docker() -> bool {
-    std::env::var_os("SETTINGS_SERVICE_PG_REQUIRE_DOCKER")
-        .is_some_and(|v| v != "0" && !v.is_empty())
-}
-
-/// Docker is not there: skip locally, fail where a skip would pass vacuously.
-fn skip<T>(why: &str) -> Option<T> {
-    assert!(!require_docker(), "PostgreSQL migration suite: {why}");
-    eprintln!("skipping -- PostgreSQL migration suite: {why}");
-    None
-}
-
-/// Bring up a `testcontainers` `PostgreSQL` and connect to it twice: once as
-/// the toolkit does, for the runner, and once plainly, for the rows.
-async fn pg_fixture() -> Option<PgFixture> {
-    let request = test_containers::postgres()
-        .with_env_var("POSTGRES_PASSWORD", "pass")
-        .with_env_var("POSTGRES_USER", "user")
-        .with_env_var("POSTGRES_DB", "settings");
-    let container = match request.start().await {
-        Ok(container) => container,
-        Err(e) => {
-            return skip(&format!(
-                "could not start a PostgreSQL container via testcontainers ({e}); install or \
-                 start Docker to run this for real"
-            ));
-        }
-    };
-    let port = match container.get_host_port_ipv4(5432).await {
-        Ok(port) => port,
-        Err(e) => {
-            return skip(&format!(
-                "the container started but its port could not be resolved ({e}); is Docker \
-                 healthy?"
-            ));
-        }
-    };
-
-    let url = format!("postgres://user:pass@127.0.0.1:{port}/settings");
-    let opts = ConnectOpts {
-        max_conns: Some(5),
-        min_conns: Some(1),
-        ..Default::default()
-    };
-    let db = connect_db(&url, opts)
-        .await
-        .expect("the toolkit connects to the container");
-    let conn = Database::connect(&url)
-        .await
-        .expect("a plain connection to the container");
-    Some(PgFixture {
-        _container: container,
-        db,
-        conn,
-    })
-}
 
 /// The chain split where the move sits: everything before it, and the move
 /// with everything after it.
@@ -193,7 +123,7 @@ async fn value_types(conn: &DatabaseConnection) -> BTreeMap<String, String> {
 /// after it, and a restart finds nothing outstanding.
 #[tokio::test]
 async fn the_chain_applies_on_an_empty_database_and_moves_the_rows_written_before_it() {
-    let Some(fixture) = pg_fixture().await else {
+    let Some(fixture) = pg_fixture("migration").await else {
         return;
     };
     let (before_the_move, from_the_move) = split_at_the_move();
@@ -230,7 +160,7 @@ async fn the_chain_applies_on_an_empty_database_and_moves_the_rows_written_befor
 /// search `LIKE` leans on exists.
 #[tokio::test]
 async fn the_display_name_column_and_its_trigram_index_exist_after_the_chain() {
-    let Some(fixture) = pg_fixture().await else {
+    let Some(fixture) = pg_fixture("migration").await else {
         return;
     };
     run_migrations_for_testing(&fixture.db, Migrator::migrations())
@@ -275,4 +205,46 @@ async fn the_display_name_column_and_its_trigram_index_exist_after_the_chain() {
         .await
         .expect("readable");
     assert_eq!(index.len(), 1, "the trigram index on display_name exists");
+}
+
+/// The setter-tenant migration on the backend it is written for: each of the
+/// three columns is a nullable `uuid`, so a row written before it reads
+/// `NULL` and the upward disclosure boundary withholds its identity.
+#[tokio::test]
+async fn the_setter_tenant_columns_are_nullable_uuids_after_the_chain() {
+    let Some(fixture) = pg_fixture("migration").await else {
+        return;
+    };
+    run_migrations_for_testing(&fixture.db, Migrator::migrations())
+        .await
+        .expect("the chain applies on an empty database");
+
+    for (table, column) in [
+        ("setting_values", "set_by_tenant"),
+        ("tenant_permissions", "set_by_tenant"),
+        ("audit_records", "actor_tenant_id"),
+    ] {
+        let found = fixture
+            .conn
+            .query_one_raw(Statement::from_string(
+                fixture.conn.get_database_backend(),
+                format!(
+                    "SELECT data_type, is_nullable FROM information_schema.columns
+                     WHERE table_name = '{table}' AND column_name = '{column}'"
+                ),
+            ))
+            .await
+            .expect("readable")
+            .unwrap_or_else(|| panic!("`{table}.{column}` exists after the chain"));
+        assert_eq!(
+            found.try_get::<String>("", "data_type").expect("a type"),
+            "uuid",
+            "`{table}.{column}`"
+        );
+        assert_eq!(
+            found.try_get::<String>("", "is_nullable").expect("a flag"),
+            "YES",
+            "`{table}.{column}` must be nullable"
+        );
+    }
 }

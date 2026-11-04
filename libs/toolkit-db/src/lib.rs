@@ -104,6 +104,7 @@ mod db_provider;
 mod pool_opts;
 #[cfg(feature = "sqlite")]
 mod sqlite;
+mod tx_begin;
 
 // Re-export important types from new gears
 pub use config::{DbConnConfig, GlobalDatabaseConfig, PoolCfg};
@@ -145,12 +146,13 @@ pub async fn build_db(cfg: DbConnConfig, global: Option<&GlobalDatabaseConfig>) 
 /// `SeaORM` captures the callback by value at connect time, so it can't be
 /// attached later. Lets suites like `QueryRecorder` observe every statement.
 ///
-/// Gated behind the `test-support` feature; never used by production code.
+/// Available in this crate's unit tests or with the `test-support` feature
+/// for external test suites; never used by production code.
 ///
 /// # Errors
 ///
 /// Returns `DbError` under the same conditions as [`connect_db`].
-#[cfg(feature = "test-support")]
+#[cfg(any(test, feature = "test-support"))]
 pub async fn connect_db_with_metric_callback<F>(
     dsn: &str,
     opts: ConnectOpts,
@@ -358,6 +360,9 @@ pub(crate) struct DbHandle {
     dsn: String,
     sea: DatabaseConnection,
     locks: advisory_locks::LockManager,
+    /// `SQLite` `transaction_mode=immediate`: [`Db`]'s transactions that may write begin with
+    /// `BEGIN IMMEDIATE` (see `tx_begin`). Always `false` on other engines.
+    sqlite_begin_immediate: bool,
 }
 
 #[cfg(feature = "sqlite")]
@@ -414,6 +419,7 @@ impl DbHandle {
                     dsn: dsn.to_owned(),
                     sea,
                     locks,
+                    sqlite_begin_immediate: false,
                 })
             }
             #[cfg(not(feature = "pg"))]
@@ -434,6 +440,7 @@ impl DbHandle {
                     dsn: dsn.to_owned(),
                     sea,
                     locks,
+                    sqlite_begin_immediate: false,
                 })
             }
             #[cfg(not(feature = "mysql"))]
@@ -445,6 +452,8 @@ impl DbHandle {
                 // Extract SQLite PRAGMA parameters from DSN
                 let (clean_dsn, pairs) = extract_sqlite_pragmas(&dsn);
                 let pragmas = Pragmas::from_pairs(&pairs);
+                // Strict, as in a gear's `params`: a typo must not silently leave writers deferred.
+                let transaction_mode = options::sqlite_pragma::transaction_mode(&pairs)?;
 
                 // Build pool options with shared trait
                 let o = SqlitePoolOptions::new().apply(&opts);
@@ -516,6 +525,8 @@ impl DbHandle {
                     dsn: clean_dsn,
                     sea,
                     locks,
+                    sqlite_begin_immediate: transaction_mode
+                        == sqlite::pragmas::TransactionMode::Immediate,
                 })
             }
             #[cfg(not(feature = "sqlite"))]
@@ -570,6 +581,11 @@ impl DbHandle {
         &self.sea
     }
 
+    /// Whether [`Db`]'s `SQLite` transactions that may write begin with `BEGIN IMMEDIATE`.
+    pub(crate) fn sqlite_begin_immediate(&self) -> bool {
+        self.sqlite_begin_immediate
+    }
+
     // --- Advisory locks ---
 
     /// Acquire an advisory lock with the given key and gear namespace.
@@ -614,7 +630,7 @@ impl DbHandle {
     /// **Test-only**: attach a `SeaORM` metric callback to the underlying
     /// connection. See [`connect_db_with_metric_callback`] for why this must
     /// run before the handle is wrapped into `Db`.
-    #[cfg(feature = "test-support")]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn set_metric_callback_for_testing<F>(&mut self, callback: F)
     where
         F: Fn(&sea_orm::metric::Info<'_>) + Send + Sync + 'static,

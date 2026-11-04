@@ -42,8 +42,10 @@ pub struct MiniChatMetricsMeter {
     quota_reserve: Counter<u64>,
     quota_commit: Counter<u64>,
     quota_overshoot: Counter<u64>,
+    quota_overshoot_uncharged_tokens: Histogram<f64>,
     quota_estimated_tokens: Histogram<f64>,
     quota_actual_tokens: Histogram<f64>,
+    quota_usage_missing: Counter<u64>,
 
     // ── P1: Streaming Incomplete ───────────────────────────────────────
     stream_incomplete: Counter<u64>,
@@ -85,8 +87,8 @@ pub struct MiniChatMetricsMeter {
     #[allow(dead_code)]
     oagw_circuit_open: Counter<u64>,
 
-    // ── P2: Outbox (deferred: waiting for toolkit_db::outbox integration) ──
-    #[allow(dead_code)]
+    // ── P2: Outbox (`outbox_dead` is recorded by the usage handler; the
+    // rest are deferred: waiting for toolkit_db::outbox integration) ──
     outbox_dead: Counter<u64>,
     #[allow(dead_code)]
     outbox_pending_age_seconds: Histogram<f64>,
@@ -298,6 +300,12 @@ impl MiniChatMetricsMeter {
                 .u64_counter(format!("{prefix}_quota_overshoot"))
                 .with_description("Quota overshoots (actual > reserved)")
                 .build(),
+            quota_overshoot_uncharged_tokens: meter
+                .f64_histogram(format!("{prefix}_quota_overshoot_uncharged_tokens"))
+                .with_description(
+                    "Tokens over the reserve left unbilled when an overshoot is capped",
+                )
+                .build(),
             quota_estimated_tokens: meter
                 .f64_histogram(format!("{prefix}_quota_estimated_tokens"))
                 .with_description("Estimated token count at preflight")
@@ -305,6 +313,12 @@ impl MiniChatMetricsMeter {
             quota_actual_tokens: meter
                 .f64_histogram(format!("{prefix}_quota_actual_tokens"))
                 .with_description("Actual token count at settlement")
+                .build(),
+            quota_usage_missing: meter
+                .u64_counter(format!("{prefix}_quota_usage_missing"))
+                .with_description(
+                    "Completed turns settled estimated: provider reported zero or no usage",
+                )
                 .build(),
 
             // ── P1: Stream Incomplete ──────────────────────────────────
@@ -771,6 +785,16 @@ impl MiniChatMetricsPort for MiniChatMetricsMeter {
             .add(1, &[KeyValue::new(key::RESULT, result.to_owned())]);
     }
 
+    fn record_outbox_dead(&self, queue: &str, reason: &str) {
+        self.outbox_dead.add(
+            1,
+            &[
+                KeyValue::new(key::QUEUE, queue.to_owned()),
+                KeyValue::new(key::REASON, reason.to_owned()),
+            ],
+        );
+    }
+
     fn record_finalization_latency_ms(&self, ms: f64) {
         self.finalization_latency_ms.record(ms, &[]);
     }
@@ -803,12 +827,21 @@ impl MiniChatMetricsPort for MiniChatMetricsMeter {
             .add(1, &[KeyValue::new(key::PERIOD, period.to_owned())]);
     }
 
+    fn record_quota_overshoot_uncharged_tokens(&self, tokens: f64) {
+        self.quota_overshoot_uncharged_tokens.record(tokens, &[]);
+    }
+
     fn record_quota_estimated_tokens(&self, tokens: f64) {
         self.quota_estimated_tokens.record(tokens, &[]);
     }
 
     fn record_quota_actual_tokens(&self, tokens: f64) {
         self.quota_actual_tokens.record(tokens, &[]);
+    }
+
+    fn record_quota_usage_missing(&self, model: &str) {
+        self.quota_usage_missing
+            .add(1, &[KeyValue::new(key::MODEL, model.to_owned())]);
     }
 
     // ── P1: Stream Incomplete ──────────────────────────────────────────

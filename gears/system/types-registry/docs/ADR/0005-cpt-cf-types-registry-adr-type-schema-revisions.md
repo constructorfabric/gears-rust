@@ -110,7 +110,7 @@ An admission candidate becomes an admitted revision and current only after:
 
 1. canonical GTS and JSON Schema validation succeeds;
 2. the backward compatibility check defined by ADR-0003 succeeds against its baseline — the current revision of this logical Type Schema when it is major-only, or the definition of the preceding minor of its major when it is minor-bearing, unless ADR-0004's `skip_compatibility_check` waived the latter;
-3. derivation-chain, `$ref`, `x-gts-ref`, ownership, and lifecycle rules succeed;
+3. derivation-chain, `$ref`, entity-reference (`x-gts-type-ref` / `x-gts-instance-ref`), ownership, and lifecycle rules succeed;
 4. every affected registered dependent in the transitive dependency closure remains valid under the candidate and the exact dependency revision vector;
 5. every registered GTS Instance whose Type Schema dependency can be affected remains valid under ADR-0006;
 6. when P2 Validation Hooks are enabled and a required binding matches, every selected owning-gear semantic validator accepts exactly the candidate canonical content being admitted — admission re-checks that the content it commits is byte-for-byte the content the validator accepted;

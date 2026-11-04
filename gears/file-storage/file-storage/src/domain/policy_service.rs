@@ -24,11 +24,25 @@ use crate::domain::ports::PolicyStore;
 pub struct PolicyService {
     store: Arc<dyn PolicyStore>,
     authorizer: Arc<dyn Authorizer>,
+    /// Page-size defaults for `list_retention_rules`, threaded in separately because
+    /// `PolicyService` does not hold a `FileService`/`ServiceConfig`.
+    default_page_size: u64,
+    max_page_size: u64,
 }
 
 impl PolicyService {
-    pub fn new(store: Arc<dyn PolicyStore>, authorizer: Arc<dyn Authorizer>) -> Self {
-        Self { store, authorizer }
+    pub fn new(
+        store: Arc<dyn PolicyStore>,
+        authorizer: Arc<dyn Authorizer>,
+        default_page_size: u64,
+        max_page_size: u64,
+    ) -> Self {
+        Self {
+            store,
+            authorizer,
+            default_page_size,
+            max_page_size,
+        }
     }
 
     /// Get the raw (own-level) policy body for a scope, if one has been set.
@@ -114,17 +128,24 @@ impl PolicyService {
         ))
     }
 
-    /// List retention rules for the caller's tenant.
+    /// List retention rules for the caller's tenant, cursor-paginated in either direction.
     pub async fn list_retention_rules(
         &self,
         ctx: &SecurityContext,
-    ) -> Result<Vec<StoredRetentionRule>, DomainError> {
+        limit: Option<u64>,
+        cursor: Option<toolkit_odata::CursorV1>,
+    ) -> Result<toolkit_odata::Page<StoredRetentionRule>, DomainError> {
         let scope = self
             .authorizer
             .authorize(ctx, actions::READ, "", None)
             .await?;
+        let limit = crate::domain::pagination::clamp_limit(
+            limit,
+            self.default_page_size,
+            self.max_page_size,
+        )?;
         self.store
-            .list_retention_rules(&scope, ctx.subject_tenant_id())
+            .list_retention_rules_page(&scope, ctx.subject_tenant_id(), limit, cursor)
             .await
     }
 

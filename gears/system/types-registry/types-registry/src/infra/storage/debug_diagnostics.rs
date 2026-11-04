@@ -230,6 +230,7 @@ fn normalize_gts_ref(ref_val: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gts::X_GTS_TYPE_REF;
     use serde_json::json;
     use toolkit_gts::{gts_id, gts_uri};
 
@@ -264,7 +265,7 @@ mod tests {
             "allOf": [
                 { "$ref": MIXIN_ID }
             ],
-            "x-gts-ref": gts_id!("vendor.pkg.ns.other.v1~")
+            X_GTS_TYPE_REF: gts_id!("vendor.pkg.ns.other.v1~")
         });
 
         let refs = collect_schema_refs(&schema);

@@ -64,16 +64,3 @@ impl From<cluster_sdk::ClusterError> for DomainError {
         }
     }
 }
-
-/// `toolkit_db::secure::ScopeError` -> `toolkit_db::DbError`, so a
-/// transaction closure (fixed to `DBProvider<DbError>`'s error type, per
-/// `toolkit_db::DBProvider::transaction`'s signature) can propagate a scope
-/// violation through `?` like any other DB failure - a scope violation
-/// inside one of this crate's own transactions would indicate a bug in its
-/// own `AccessScope` usage, not a caller mistake, so folding it into the
-/// same generic-failure path the closure already uses is appropriate.
-/// Used by `infra::storage::Storage::check_and_enqueue`, which runs inside a
-/// `DBProvider<DbError>`-typed transaction.
-pub(crate) fn db_err_from_scope(err: &toolkit_db::secure::ScopeError) -> toolkit_db::DbError {
-    toolkit_db::DbError::Other(anyhow::anyhow!("{err}"))
-}

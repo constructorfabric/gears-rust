@@ -1,4 +1,3 @@
-// Created: 2026-09-17 by Virtuozzo International GmbH
 //! The category surface driven as a client drives it.
 //!
 //! Categories are the tree settings hang from, so their rules are the ones a
@@ -691,6 +690,46 @@ async fn a_category_that_still_holds_a_setting_is_not_removed() {
 
     let answer = h.send("GET", &uri, None, None, h.inner.tree.root).await;
     assert_eq!(answer.status, 200, "and it is still there");
+}
+
+#[tokio::test]
+async fn a_category_whose_only_declaration_is_retired_is_not_removed() {
+    // A retired declaration keeps its `category_id`, so removing the category
+    // under it would leave a dangling reference nobody is looking at.
+    let h = RestHarness::new().await;
+    let uri = format!("{CATEGORIES}/{}", h.inner.category_id());
+    let read = h.send("GET", &uri, None, None, h.inner.tree.root).await;
+    let tag = read.etag.expect("the fixture category's tag");
+    let declaration = h.inner.declare("proxy", "cascading", json!(true)).await;
+    h.inner.retire(declaration).await;
+
+    let answer = h
+        .send("DELETE", &uri, None, Some(&tag), h.inner.tree.root)
+        .await;
+    assert_eq!(answer.status, 409, "{}", answer.body);
+
+    let answer = h.send("GET", &uri, None, None, h.inner.tree.root).await;
+    assert_eq!(answer.status, 200, "and it is still there");
+}
+
+#[tokio::test]
+async fn the_refusal_says_how_many_declarations_are_in_the_way_retired_ones_included() {
+    // The fixture category starts empty, so the count is exactly what this
+    // test declares: one active and one retired.
+    let h = RestHarness::new().await;
+    let uri = format!("{CATEGORIES}/{}", h.inner.category_id());
+    let read = h.send("GET", &uri, None, None, h.inner.tree.root).await;
+    let tag = read.etag.expect("the fixture category's tag");
+    h.inner.declare("proxy", "cascading", json!(true)).await;
+    let retired = h.inner.declare("mtu", "cascading", json!(true)).await;
+    h.inner.retire(retired).await;
+
+    let answer = h
+        .send("DELETE", &uri, None, Some(&tag), h.inner.tree.root)
+        .await;
+    assert_eq!(answer.status, 409, "{}", answer.body);
+    let detail = answer.body["detail"].as_str().unwrap_or_default();
+    assert!(detail.contains("2 declaration"), "{}", answer.body);
 }
 
 #[tokio::test]

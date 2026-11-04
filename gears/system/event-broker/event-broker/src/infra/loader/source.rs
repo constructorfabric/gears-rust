@@ -13,9 +13,9 @@ use crate::domain::streaming::source::PartitionKey;
 /// Why a fetch could not be served.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SourceError {
-    /// The backend is reachable again later. The demand survives.
+    /// The source could not be read; the same call may succeed later.
     Unavailable,
-    /// The read itself failed.
+    /// The read failed for any other reason, such as an unregistered topic.
     Failed(String),
 }
 
@@ -24,10 +24,9 @@ pub trait EventSource: Send + Sync {
     /// Events with `sequence > after`, at most `max_events` of them, ascending.
     ///
     /// An empty result is not an error and does not mean the partition is
-    /// finished: a notification can arrive before the backend has assigned the
-    /// sequence, so the events may simply not exist yet. Distinguishing "there
-    /// is nothing" from "there is nothing *yet*" is not this trait's job - the
-    /// poller's backoff is what handles it.
+    /// finished: the events may simply not exist yet. Knowing when they do is
+    /// the head watch's job (`super::heads`), and the poller's backoff spaces
+    /// the reads made without it.
     fn read(
         &self,
         key: &PartitionKey,

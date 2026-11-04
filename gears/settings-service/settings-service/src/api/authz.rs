@@ -1,4 +1,3 @@
-// Created: 2026-08-13 by Virtuozzo International GmbH
 // @cpt-dod:cpt-cf-settings-service-dod-category-management-authorization:p1
 //! The authorization enforcement point.
 //!

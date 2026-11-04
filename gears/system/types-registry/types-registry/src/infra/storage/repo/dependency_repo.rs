@@ -78,7 +78,7 @@ impl DependencyRepo {
     }
 
     /// Count distinct live direct dependants across all edge kinds (SPEC §16.9).
-    /// `x-gts-ref` produces no edge. Limit the read and count to `bound + 1`.
+    /// An entity reference (`x-gts-type-ref` / `x-gts-instance-ref`) produces no edge. Limit the read and count to `bound + 1`.
     ///
     /// # Errors
     /// Propagates the scoped query's failure.

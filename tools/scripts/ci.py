@@ -604,6 +604,12 @@ def cmd_e2e(args):
                 # Set RUST_LOG to enable debug logging for types_registry module
                 server_env = os.environ.copy()
                 server_env["RUST_LOG"] = "types_registry=debug,info"
+                # Match platform_headers before AppConfig loads the gateway config.
+                # config_or_default does not expand placeholders in the YAML secret.
+                if "E2E_INTERNAL_TOKEN" in server_env:
+                    server_env["APP__GEARS__API_GATEWAY__CONFIG__INTERNAL_AUTH__SECRET"] = (
+                        server_env["E2E_INTERNAL_TOKEN"]
+                    )
                 # Apply per-OS server config overrides (e.g. grpc-hub TCP on
                 # Windows, where the config's UDS address is unsupported).
                 # setdefault keeps any explicit user-provided override.

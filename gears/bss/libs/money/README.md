@@ -18,6 +18,12 @@
   intermediate arithmetic (thirds stay thirds). Narrow to money with
   `into_posted_exact` (must land on the grid) or `round_half_even` (one rounding, ties
   to even). `exact::sum_posted` adds postings of one currency and scale exactly.
+  `numer` / `denom` read the reduced fraction and `from_parts` builds one from two
+  integers; `canonical_fraction` writes the `{numerator, denominator}` integer strings
+  of the wire, storage and hashes, and `parse_fraction` reads back only that form.
+  `parse_decimal` reads a decimal of up to 60 integer and 28 fractional digits, wider
+  than `Decimal`; `ceil` and `floor` give whole numbers for declared business rounding.
+  `exact::BigInt` re-exports the integer type.
 - `allocate::allocate(total, weights, Residual)` (feature `exact`) — proportional
   shares rounded once each, with the exact residual assigned to the last or the largest
   slot.

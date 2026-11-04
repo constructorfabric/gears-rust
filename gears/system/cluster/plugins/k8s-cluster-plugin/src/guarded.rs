@@ -156,6 +156,11 @@ pub enum Replaced<K> {
     /// [`CallSite`] and the [`Conflict`] are both in hand, so it is observable
     /// diagnostics rather than a payload every call site discards.
     Conflict,
+    /// The object was deleted between the read and the `PUT` (§10). Kubernetes
+    /// ≥ 1.34 answers with a `404` for a custom resource (`ClusterCacheEntry`); a
+    /// built-in `Lease`, and any object on ≤ 1.33, answers with a `409`, which
+    /// arrives as [`Replaced::Conflict`]. Nothing was written.
+    Gone,
 }
 
 /// The outcome of a [`create`]: the object was created, or it already existed
@@ -208,6 +213,19 @@ fn status_of(err: &kube::Error) -> Option<(u16, &str)> {
     }
 }
 
+/// Whether `err` is a `404 NotFound` for the object `name`, rather than for the
+/// resource itself (e.g. a CRD that is not served), which stays an error (§10).
+fn is_object_not_found(err: &kube::Error, name: &str) -> bool {
+    match err {
+        kube::Error::Api(status) => {
+            status.code == 404
+                && status.reason == "NotFound"
+                && status.details.as_ref().is_some_and(|d| d.name == name)
+        }
+        _ => false,
+    }
+}
+
 /// Reads `name`, returning `None` on `404` (§6.1). A `404` is "no claim / no entry
 /// exists", which every primitive's create path expects — never an error.
 ///
@@ -225,8 +243,9 @@ where
 /// was mutated from, so the API server rejects a stale write with `409` (§2.7).
 ///
 /// On success returns [`Replaced::Applied`]; on a `409` returns
-/// [`Replaced::Conflict`] carrying [`classify_conflict`]'s decision for `site`. Any
-/// other error is mapped through [`map_kube_error`].
+/// [`Replaced::Conflict`] carrying [`classify_conflict`]'s decision for `site`; on an
+/// object-level `404` (deleted since the read) returns [`Replaced::Gone`]. Any other
+/// error is mapped through [`map_kube_error`].
 ///
 /// # Errors
 ///
@@ -250,6 +269,14 @@ where
         .await
     {
         Ok(applied) => Ok(Replaced::Applied(Box::new(applied))),
+        Err(err) if is_object_not_found(&err, name) => {
+            tracing::debug!(
+                name = %name, ?site,
+                "cluster.provider.guarded_write_gone: the object was deleted before the \
+                 guarded write"
+            );
+            Ok(Replaced::Gone)
+        }
         Err(err) => {
             match status_of(&err).and_then(|(code, reason)| classify_conflict(site, code, reason)) {
                 Some(conflict) => {
@@ -443,6 +470,51 @@ mod tests {
             delete_preconditions("obj", &meta(Some("42"), Some(""))).unwrap_err(),
             "unguarded delete",
         );
+    }
+}
+
+#[cfg(test)]
+mod gone_tests {
+    use super::is_object_not_found;
+    use kube::core::{Status, response::StatusDetails};
+
+    fn api_err(code: u16, reason: &str, details_name: Option<&str>) -> kube::Error {
+        let mut status = Status::failure("x", reason).with_code(code);
+        status.details = details_name.map(|name| StatusDetails {
+            name: name.to_owned(),
+            group: String::new(),
+            kind: String::new(),
+            uid: String::new(),
+            causes: Vec::new(),
+            retry_after_seconds: 0,
+        });
+        kube::Error::Api(status.boxed())
+    }
+
+    /// Only a `404 NotFound` naming this object counts as gone.
+    #[test]
+    fn only_an_object_level_404_for_this_name_is_gone() {
+        assert!(is_object_not_found(
+            &api_err(404, "NotFound", Some("obj")),
+            "obj"
+        ));
+        assert!(!is_object_not_found(&api_err(404, "NotFound", None), "obj"));
+        assert!(!is_object_not_found(
+            &api_err(404, "NotFound", Some("")),
+            "obj"
+        ));
+        assert!(!is_object_not_found(
+            &api_err(404, "NotFound", Some("other")),
+            "obj"
+        ));
+        assert!(!is_object_not_found(
+            &api_err(404, "Failed to parse error data", None),
+            "obj"
+        ));
+        assert!(!is_object_not_found(
+            &api_err(409, "Conflict", Some("obj")),
+            "obj"
+        ));
     }
 }
 

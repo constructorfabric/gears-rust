@@ -1,4 +1,4 @@
-error: expected lifecycle args: entry="...", stop_timeout="...", await_ready[=true|false]
+error: expected lifecycle args: entry="...", stop_timeout="..." or stop_timeout_fn="...", await_ready[=true|false]
  --> tests/ui/fail/lifecycle_unknown_arg.rs:3:68
   |
 3 | #[gear(name="x", capabilities=[stateful], lifecycle(entry="serve", foo="bar"))]

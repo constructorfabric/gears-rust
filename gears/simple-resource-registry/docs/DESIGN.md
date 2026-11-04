@@ -1409,4 +1409,4 @@ Throughout this document, `ctx.subject_tenant_id` is used for `resource.tenant_i
 
 - **PRD**: [PRD.md](./PRD.md)
 - **ADRs**: [ADR/](./ADR/)
-- **Features**: [features/](./features/)
+- **Features**: `features/`

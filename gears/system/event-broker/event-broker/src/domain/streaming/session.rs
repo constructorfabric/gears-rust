@@ -266,9 +266,9 @@ impl StreamSession {
         }
 
         if let Some(index) = self.read_set.next_to_read() {
-            self.progressed_in_round |= self.read_one(index);
+            self.progressed_in_round |= self.read_one(index).await;
             self.read_set.mark_throttled(index);
-            // A read is the productive path and has no await of its own, so
+            // A read may complete without yielding (for example, filtered events), so
             // without this a session with a large resident backlog would hold a
             // runtime worker for the whole drain - starving the loader that
             // feeds it and every other session on the same thread.
@@ -340,7 +340,7 @@ impl StreamSession {
     /// Returns whether the read actually yielded a span. A round has to be able
     /// to tell an idle partition from a productive one, or the session never
     /// parks.
-    fn read_one(&mut self, index: usize) -> bool {
+    async fn read_one(&mut self, index: usize) -> bool {
         let Some(slot) = self.read_set.slot(index) else {
             return false;
         };
@@ -359,7 +359,20 @@ impl StreamSession {
 
                 for event in events.iter() {
                     examined += 1;
-                    if self.filter.matches(event) {
+                    let allowed = match self.filter.allows(event).await {
+                        Ok(allowed) => allowed,
+                        Err(error) => {
+                            tracing::warn!(%error, "event authorization failed; closing stream");
+                            // The reader has advanced internally, but the batch
+                            // is not committed to the reported frontier. Drop
+                            // its queued frames too, so a retry can replay it
+                            // without losing events during a PDP outage.
+                            self.pending.clear();
+                            self.state = SessionState::Closing(CloseReason::Teardown);
+                            return false;
+                        }
+                    };
+                    if allowed {
                         matched += 1;
                         delivered_through = event.sequence.unwrap_or(delivered_through);
                         self.pending

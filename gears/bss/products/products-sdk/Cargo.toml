@@ -26,8 +26,6 @@ uuid = { workspace = true }
 # both bindings pass the same `catalog_version x request` gate, and an
 # in-process binding cannot gate without the identity (design/06 sec 2 rule 1).
 toolkit-security = { workspace = true }
-# The resource-error identity is a GTS id, the platform's own naming.
-toolkit-gts = { workspace = true }
 # The SKU and category timestamps are instants; a string would move the parse
 # to every consumer. `time::OffsetDateTime` rather than chrono: one instant type
 # across the gear, and the one the platform's OData cursor codec decodes to.

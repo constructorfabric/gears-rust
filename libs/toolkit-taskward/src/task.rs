@@ -274,8 +274,11 @@ impl<A: WorkerAction> WorkerTask<A> {
             let cancel = self.cancel.clone();
             let pass = async {
                 match self.panic_policy {
+                    // `execute` is `fn -> impl Future`, so an implementor may
+                    // panic before returning its future; `catch_unwind` only
+                    // covers polling, so the call must happen inside it.
                     PanicPolicy::CatchAndRetry => {
-                        AssertUnwindSafe(self.action.execute(&self.cancel))
+                        AssertUnwindSafe(async { self.action.execute(&self.cancel).await })
                             .catch_unwind()
                             .await
                     }

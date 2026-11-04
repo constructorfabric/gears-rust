@@ -23,8 +23,8 @@ pub use auto_refresh::{
 };
 pub use builder_ext::HttpClientBuilderExt;
 pub use config::OAuthClientConfig;
-pub use error::TokenError;
+pub use error::{HttpOperation, TokenError};
 pub use fetch::{FetchedToken, fetch_token};
 pub use layer::BearerAuthLayer;
-pub use token::Token;
+pub use token::TokenProvider;
 pub use types::{ClientAuthMethod, SecretString};

@@ -79,7 +79,7 @@ relative to the directory contract and the REST contract-codegen client-wiring l
 * **Profile 2 / non-k8s is Option C's primary driver** - in Kubernetes, per-role naming already gives each
   role its own Service and DNS, and `StatefulSet` + headless Service gives per-pod identity (§5), so much of
   the labels machinery duplicates k8s labels there. The capability that **nothing equivalent exists for** is
-  **Profile 2 (Host + Workers)** and non-k8s on-prem: no Service, no StatefulSet, no headless DNS. That is
+  **Profile 2 (Self-Hosted)** and non-k8s on-prem: no Service, no StatefulSet, no headless DNS. That is
   where directory labels + targeted resolution earn their keep; the k8s case is the *degenerate* one, not the
   motivating one.
 * **k8s reachability reality** - Profile 3 typically fronts a gear with one Service; per-instance addressing
@@ -268,7 +268,7 @@ deployment profile (ADR-0001):
     2 or Profile 3** - Profile 1 tests exercise the degenerate single-instance path only. **Coverage owner:** the
     adopting gear owns its Profile 2/3 integration coverage of targeting (e.g. `event-broker` owns the
     dispatcher->shard tests); this ADR's own confirmation matrix (below) is defined against Profile 2/3.
-* **Profile 2 (Host + Workers)** - each OoP Worker is its own process registered with Flight Control's
+* **Profile 2 (Self-Hosted)** - each OoP Worker is its own process registered with Flight Control's
   `DirectoryService`, advertising a **per-instance** endpoint: a **UDS** socket path (single-node) or a
   **TCP + mTLS** address (multi-node), per ADR-0001. Workers are not fronted by a shared VIP, so the advertised
   endpoint is inherently instance-addressable; labels + targeted resolve work exactly as in Profile 3, keying

@@ -86,13 +86,11 @@ gear's code. It remains a planned P2 requirement (see PRD.md/DESIGN.md).
   lifecycle rule (`operations.md` → `s3_backends`). Acceptance criterion: a simulated crash between `initiate_multipart`
   and the session-row insert leaves a handle that the sweep finds and aborts within one sweep interval, verified
   against a real S3-compatible backend. Revisit once ADR-0005 is accepted.
-- **`kid`-selected signing keyset and a literal PASETO `v4.public` codec** — deliberately not implemented. Signing-key
-  rotation is solved operationally instead: the sidecar verifies a token's signature against an ordered set of keys
-  (`FS_SIDECAR_PUBLIC_KEY` plus `FS_SIDECAR_PREVIOUS_PUBLIC_KEYS`, procedure in `operations.md` → `signing_key_seed` →
-  Rotation); the token itself carries no `kid`, so keys are tried in order (one extra Ed25519 verification per
-  non-primary key). Acceptance criterion: the token carries a key identifier, the sidecar selects the verifier in
-  O(1), the keyset size is bounded by configuration, and a PASETO wrapper sits on the same `SignatureProvider` seam
-  without changing the Token Opacity Contract (ADR-0004). Phase: P3.
+- **Overlapping signing keyset, `kid` selection and a PASETO wrapper** — deferred.
+  Current code supports only one active P-256 key. Rotation requires draining
+  outstanding URLs and updating control and sidecar together (operations.md).
+  Future acceptance: bounded overlap keys, key selection and token opacity
+  preserved through the same `SignatureProvider` seam. Phase: P3.
 - **Schema-level `part_count >= 2` floor on `file_versions`** — deliberately not implemented. The application never
   writes `part_count = 1` (a one-part multipart plan degenerates to `whole-sha256` instead, ADR-0006 single-part
   amendment), but versions finalized by releases before that amendment legitimately persisted one-part multipart
@@ -118,7 +116,7 @@ gear's code. It remains a planned P2 requirement (see PRD.md/DESIGN.md).
 
 - **Purpose**: Provide a safe, resumable, server-controlled multipart upload path. The client declares total size and a preferred part size; the control plane computes the exact parts plan and returns one signed sidecar URL per part. The sidecar streams each part straight into the backend without ever buffering it whole, and enforces the per-part size claim (a streaming length counter ahead of the backend write, plus the backend's own exact-length contract, on `multipart_native` paths; a streaming `max_size` abort plus post-write exact-length check on offset-object paths). The control plane assembles and hashes the parts at complete and finalizes the new file version; binding it as the file's current content is either part of that finalize (auto-bind sessions, `bind: "auto"`) or a separate, client-issued request (manual sessions).
 
-- **Depends On**: the upload and versioning foundation (single-shot upload, file_versions table, signed-URL infrastructure -- codec-equivalent Ed25519, not literal PASETO, see ADR-0004's Implementation note -- not a formal DECOMPOSITION feature)
+- **Depends On**: the upload and versioning foundation (single-shot upload, file_versions table, signed-URL infrastructure -- private-codec ECDSA P-256/SHA-256, not literal PASETO, see ADR-0004's Implementation note -- not a formal DECOMPOSITION feature)
 
 - **Scope**:
   - `POST /api/file-storage/v1/files/{id}/multipart` -- initiate: validate MIME/size/quota, compute parts plan, mint signed sidecar URLs, pre-register pending version
@@ -595,7 +593,7 @@ cpt-cf-file-storage-feature-audit-trail (cross-cutting; every write path above a
 
 **Dependency Rationale**:
 
-- `cpt-cf-file-storage-feature-multipart-coordinator` depends on the upload and versioning foundation: the initiate endpoint pre-registers a pending version in the file_versions table; the complete endpoint finalizes that version (for auto-bind sessions the bind is part of the same finalize transaction, its CAS expectation being `content_id IS NULL` without an `If-Match` or the current content named by `If-Match`; for manual sessions a later, separate `bind` call activates it via the same CAS mechanism used for single-shot uploads); the signed-URL infrastructure (minting and verification -- a codec-equivalent Ed25519 token, not literal PASETO, per ADR-0004's Implementation note) is part of that foundation.
+- `cpt-cf-file-storage-feature-multipart-coordinator` depends on the upload and versioning foundation: the initiate endpoint pre-registers a pending version in the file_versions table; the complete endpoint finalizes that version (for auto-bind sessions the bind is part of the same finalize transaction, its CAS expectation being `content_id IS NULL` without an `If-Match` or the current content named by `If-Match`; for manual sessions a later, separate `bind` call activates it via the same CAS mechanism used for single-shot uploads); the signed-URL infrastructure (minting and verification -- a private-codec ECDSA P-256/SHA-256 token, not literal PASETO, per ADR-0004's Implementation note) is part of that foundation.
 - `cpt-cf-file-storage-feature-content-hash-modes` depends on `cpt-cf-file-storage-feature-multipart-coordinator`: it consumes the multipart plan's per-part byte offsets (`compute_plan`) and the per-part SHA-256 digests multipart-coordinator already persists into `multipart_upload_parts.part_hash`, combining them into the offset-manifest composite at `complete` instead of multipart-coordinator's current re-read-and-rehash. It introduces no new inter-feature dependency beyond this one.
 - `cpt-cf-file-storage-feature-policy-engine` depends on the upload foundation the same way multipart-coordinator does (its enforcement hooks live in `create_file`/`presign_version`), but is otherwise independent of multipart-coordinator/content-hash-modes -- it is also consumed by multipart-coordinator's own initiate flow (the MIME/size checks in `docs/features/multipart-coordinator.md`), making it a dependency of that feature too, not shown as a second arrow above to keep the diagram acyclic-readable.
 - `cpt-cf-file-storage-feature-backend-migration` depends on `cpt-cf-file-storage-feature-content-hash-modes`: its pre-commit hash check dispatches through that feature's shared `docs/features/content-hash-modes.md` algorithm rather than hard-coding a whole-object-only comparison, so a `multipart-composite-sha256` version can be migrated correctly.

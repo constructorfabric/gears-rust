@@ -7,10 +7,12 @@
 # Fast two-pass clippy used in PR CI (target: <5 min with sccache).
 # Pass 1 covers the 80+ "leaf" crates (gears, plugins, SDKs): they use `dep:`
 # guards only, so --all-features is sufficient — no --each-feature needed.
-# Pass 2 runs cargo-hack --each-feature on the three crates with real
-# #[cfg(feature = "...")] guards (mutually-exclusive DB backends, otel, fips, db).
-# These account for >95% of all cfg-gated lines in the repo. See GH issue #1574.
-CLIPPY_HACK_CRATES := -p cf-gears-toolkit -p cf-gears-toolkit-db -p cf-gears-toolkit-http
+# Pass 2 runs cargo-hack --each-feature on the crates with real
+# #[cfg(feature = "...")] guards (mutually-exclusive DB backends, otel, fips, db;
+# OAGW's in-memory-only build without `cluster`). These account for >95% of all
+# cfg-gated lines in the repo. See GH issue #1574.
+CLIPPY_HACK_CRATES := -p cf-gears-toolkit -p cf-gears-toolkit-db -p cf-gears-toolkit-http \
+	-p cf-gears-oagw
 # `_any-backend` is toolkit-db's internal "some backend is on" marker (see its
 # [features] block); enabling it *alone* asserts a driver exists while none does,
 # which the outbox benchmarks reject with a compile_error!. Not a configuration
@@ -72,6 +74,8 @@ E2E_SERVER_FEATURE_ARGS ?= $(if $(E2E_SERVER_FEATURES),--features $(E2E_SERVER_F
 OPENAPI_SERVER_FEATURES ?= $(E2E_SERVER_FEATURES)
 OPENAPI_SERVER_FEATURE_ARGS ?= $(E2E_SERVER_FEATURE_ARGS)
 
+GTS_VALIDATOR_MIN_VERSION ?= 0.16.1
+
 # -------- Set up --------
 
 .PHONY: setup py-env
@@ -104,7 +108,7 @@ setup: .setup-stamp py-env
 	cargo install cargo-fuzz
 	cargo install cargo-hack
 	cargo install --locked cargo-shear --version $(SHEAR_VERSION)
-	cargo install gts-validator
+	cargo install gts-validator --version '>=${GTS_VALIDATOR_MIN_VERSION}'
 	@if echo "$$OS" | grep -iq windows || [ -n "$$COMSPEC" ]; then \
 		echo "NOTE: kani-verifier is not supported on Windows; skipping (use WSL2/Docker for Kani)."; \
 		echo "Installing cargo-llvm-cov (supported on Windows; needs llvm-tools-preview)..."; \
@@ -125,6 +129,17 @@ setup: .setup-stamp py-env
 
 # -------- Repository checks --------
 
+.PHONY: dylint-oagw-cluster
+
+# `make dylint` also lints OAGW's proxy cache change log, which needs its
+# `cluster` feature: default features leave it unlinted, and `--all-features`
+# fails workspace-wide.
+dylint: dylint-oagw-cluster
+dylint-oagw-cluster:
+	$(call print_target_banner)
+	$(call check_tool_version,cargo-gears,>=$(CARGO_GEARS_VERSION))
+	cargo gears lint --dylint -P cf-gears-oagw -F cluster
+
 .PHONY: ensure-submodules lychee web-docs-check geiger gts-docs docker-pins validate-gear-names pr-review-lint pr-review-test check-packaging-metadata check-release-config check-release-resolver
 
 ## Verify git submodules (e.g. guidelines/DNA) are initialized; fails otherwise.
@@ -134,11 +149,14 @@ ensure-submodules:
 		echo "ERROR: Uninitialized git submodules detected. Run 'git submodule update --init --recursive'." && exit 1; \
 	fi
 
-# Run markdown checks with 'lychee'
+# Run markdown checks with 'lychee'.
+# Mirrors the pre-commit hook's scope: every tracked .md outside docs/web-docs (that tree has
+# Starlight route-relative links, see web-docs-check). git ls-files does not descend into the
+# guidelines/DNA submodule, so it is passed explicitly.
 lychee: ensure-submodules
 	$(call print_target_banner)
 	$(call check_tool,lychee)
-	lychee --exclude-path 'docs/web-docs' docs examples guidelines gears/system/event-broker/docs studio-kit-gears
+	git ls-files -z '*.md' ':!:docs/web-docs/**' | xargs -0 lychee --offline --no-progress --config lychee.toml guidelines/DNA
 
 ## Validate internal links in web-docs.
 # The web-docs pages use Starlight route-relative links (e.g. ../foo/) that only
@@ -168,7 +186,7 @@ docker-pins:
 # Uses gts-validator binary (install via: cargo install gts-validator)
 gts-docs:
 	$(call print_target_banner)
-	$(call check_tool,gts-validator)
+	$(call check_tool_version,gts-validator,>=$(GTS_VALIDATOR_MIN_VERSION))
 	gts-validator \
 		--vendor cf,vendor,example,fabrikam \
 		--exclude "target/*" \
@@ -235,8 +253,9 @@ E2E_SIDECAR_ENV := $(if $(GEAR),$(if $(filter file-storage,$(GEAR)),FS_SIDECAR_B
 GEAR_E2E_KEY := $(subst -,_,$(GEAR))
 GEAR_E2E_TARGET ?= testing/e2e/suites/$(GEAR_E2E_KEY)
 GEAR_E2E_SCOPE := $(if $(GEAR),$(GEAR_E2E_TARGET) $(E2E_TARGET),$(E2E_TARGET))
-# Coverage: pass the first resolved package + e2e target path to coverage.py.
-GEAR_COVERAGE_ARGS = $(if $(GEAR),--package $(firstword $(subst -p ,,$(GEAR_PKGS))) --e2e-target $(GEAR_E2E_TARGET),)
+# Coverage: pass the first resolved package + e2e target path to coverage.py,
+# and GEAR_FEATURES for its unit tests (e.g. GEAR=oagw GEAR_FEATURES=cluster).
+GEAR_COVERAGE_ARGS = $(if $(GEAR),--package $(firstword $(subst -p ,,$(GEAR_PKGS))) --e2e-target $(GEAR_E2E_TARGET) $(GEAR_FEATURE_ARGS),)
 
 # --- Server feature selection for run / openapi ---
 # Base features always enabled when running a focused server.
@@ -349,7 +368,7 @@ arch_status_svg_update: py-env
 
 # -------- Tests --------
 
-.PHONY: test-no-macros test-macros test-db test-integration test-graph-storage test-graph-storage-pg test-cluster-k8s coverage-cluster-k8s test-fips
+.PHONY: test-no-macros test-macros test-db test-integration test-graph-storage test-graph-storage-pg test-cluster-k8s coverage-cluster-k8s test-durable-execution-pg coverage-durable-execution-pg test-eb-pg test-eb-sqlite test-eb-mysql test-eb-mariadb test-eb-kafka test-github-mirror-db test-github-mirror-scale test-fips
 
 # Run the workspace tests except the macro test crates (CI test job)
 test-no-macros: install-tools
@@ -369,16 +388,14 @@ test-graph-storage: install-tools
 	$(call print_target_banner)
 	cargo nextest run -p cf-gears-graph-storage -p cf-gears-graph-storage-sdk
 
-## Run the graph-storage gear's PostgreSQL 19 lane (Docker required)
-## The same conformance suite against the built-in store, plus the SQL/PGQ cases that only a real
-## server can answer. It needs an image carrying PostgreSQL 19 **and**
-## pgvector — `test_containers::postgres_graph()` pins a stock 19beta
-## alpine, which has only the former — so point GEARS_TEST_PG_GRAPH_IMAGE at
-## one until the platform pin carries both. GEARS_TEST_PG_GRAPH_REQUIRED=1
+## Run the graph-storage gear's PostgreSQL lane (Docker required)
+## The same conformance suite against the built-in store, plus the cases only a real
+## server can answer. It needs PostgreSQL 16+ with pgvector: point
+## GEARS_TEST_PG_GRAPH_IMAGE at one (CI uses pgvector/pgvector:0.8.7-pg18). GEARS_TEST_PG_GRAPH_REQUIRED=1
 ## turns "no such image, skipping" into a failure, so CI cannot go green by
 ## running nothing; that is the default here, because a target whose whole
 ## purpose is the database has no business passing without one.
-## Every case in this lane gets its own PostgreSQL instance (two of them are
+## Every case in this lane gets its own PostgreSQL instance (some of them are
 ## operator surgery on server-wide state), and more than a handful at once is
 ## more than Docker and PostgreSQL will take: the pools time out and a
 ## different case fails on each run. nextest runs each case in its own
@@ -390,6 +407,43 @@ test-graph-storage-pg: install-tools
 	$(call print_target_banner)
 	GEARS_TEST_PG_GRAPH_REQUIRED=1 cargo nextest run -p cf-gears-graph-storage \
 		--test pg_conformance --test-threads=$(GRAPH_PG_TEST_THREADS)
+
+## Run the event-broker PostgreSQL backend's conformance and plugin tests (Docker required)
+## The shared backend conformance suite and the plugin's own tests against a
+## real PostgreSQL (testcontainers). `EB_TEST_POSTGRES_URL` points it at an
+## existing server.
+test-eb-pg: install-tools
+	$(call print_target_banner)
+	cargo nextest run -p cf-gears-postgres-event-broker-plugin --features integration --retries 1
+
+## Run the event-broker SQLite backend's conformance and plugin tests
+## The shared backend conformance suite and the plugin's own tests over a file
+## in a temporary directory; no Docker needed.
+test-eb-sqlite: install-tools
+	$(call print_target_banner)
+	cargo nextest run -p cf-gears-sqlite-event-broker-plugin --retries 1
+
+## Run the event-broker MySQL backend's conformance and plugin tests on MySQL (Docker required)
+## Every test of the plugin but the MariaDB ones, against a real MySQL
+## (testcontainers). `EB_TEST_MYSQL_URL` points it at an existing server.
+test-eb-mysql: install-tools
+	$(call print_target_banner)
+	cargo nextest run -p cf-gears-mysql-event-broker-plugin --features integration --retries 1 -E 'not test(/mariadb/)'
+
+## Run the event-broker MySQL backend's conformance and plugin tests on MariaDB (Docker required)
+## The plugin's MariaDB tests, against a real MariaDB (testcontainers).
+## `EB_TEST_MARIADB_URL` points it at an existing server.
+test-eb-mariadb: install-tools
+	$(call print_target_banner)
+	cargo nextest run -p cf-gears-mysql-event-broker-plugin --features integration --retries 1 -E 'test(/mariadb/)'
+
+## Run the event-broker Kafka backend's conformance and plugin tests (Docker required)
+## The shared backend conformance suite and the plugin's own tests against a
+## single-node Kafka (testcontainers). `EB_TEST_KAFKA_BOOTSTRAP` points it at
+## an existing cluster.
+test-eb-kafka: install-tools
+	$(call print_target_banner)
+	cargo nextest run -p cf-gears-kafka-event-broker-plugin --features integration --retries 1
 
 # Integration lanes
 #
@@ -404,8 +458,8 @@ test-graph-storage-pg: install-tools
 
 TOOLKIT_DB_LANES := toolkit-db-sqlite toolkit-db-pg toolkit-db-pgq toolkit-db-mysql
 INTEGRATION_LANES := $(TOOLKIT_DB_LANES) users-info-pg usage-collector-pg usage-collector-ch \
-	types-registry-db oagw-db cluster-pg cluster-redis rg-pg settings-service-pg \
-	pricing-pg coord-pg products-pg ledger-pg
+	types-registry-db oagw-db oagw-cluster cluster-pg cluster-redis rg-pg settings-service-pg \
+	pricing-pg coord-pg products-pg ledger-pg orders-pg eb-gear-db
 
 ## toolkit-db on SQLite; the examples must still build after the tests.
 lane_args_toolkit-db-sqlite = -p cf-gears-toolkit-db --features sqlite,integration
@@ -414,14 +468,9 @@ lane_post_toolkit-db-sqlite = cargo build -p cf-gears-toolkit-db --examples --fe
 ## toolkit-db on PostgreSQL.
 lane_args_toolkit-db-pg = -p cf-gears-toolkit-db --features pg,integration
 
-## The SQL/PGQ lane: toolkit-db's unit suites under the `pgq` feature (the
-## secure graph builder and its tests compile only there), the PostgreSQL 19
-## integration suite (tests/pg, Docker required; a testcontainers PG19) and the
-## trybuild guards. `pgq` implies `pg`, so without the filter this would re-run
-## every PG18 Docker suite the toolkit-db-pg lane just ran; the filter keeps only
-## what this lane adds. The PG19 suite skips itself while the pre-GA image is
-## unavailable; CI sets GEARS_TEST_PG_GRAPH_REQUIRED=1 so there the skip is a
-## failure — do the same locally once the image is expected to be present.
+## The SQL/PGQ lane: toolkit-db's unit, integration (tests/pg) and trybuild
+## suites under the `pgq` feature. `pgq` implies `pg`, so the filter keeps only
+## what this lane adds to the toolkit-db-pg lane.
 lane_args_toolkit-db-pgq = -p cf-gears-toolkit-db --features pgq,integration -E 'kind(lib) | binary(mod) | binary(ui)'
 
 ## toolkit-db on MySQL.
@@ -449,13 +498,28 @@ lane_env_usage-collector-ch = CH_REQUIRE_DOCKER=1
 ## each test spins up its own postgres or mysql container via testcontainers).
 lane_args_types-registry-db = -p cf-gears-types-registry --features integration -E 'binary(/_backends_test$$/)'
 
-## OAGW's database tier: the repository conformance suite and the
-## migration tests on PostgreSQL and MySQL (Docker required; no skip without
-## it; images pinned in test-containers).
+## The event-broker gear database on SQLite, PostgreSQL and MySQL: migrations,
+## first-publish contention and producer-chain resubmission races (Docker
+## required; each test starts its own container, the gear database and the
+## storage backend in separate schemas or databases on it).
+## EB_TEST_REQUIRE_DOCKER=1 turns an unreachable Docker into a failure; without
+## it the PostgreSQL and MySQL tests skip.
+lane_args_eb-gear-db = -p cf-gears-event-broker --features integration -E 'binary(/_backends_test$$/)'
+lane_env_eb-gear-db = EB_TEST_REQUIRE_DOCKER=1
+
+## OAGW's database tier: the repository conformance suite, the
+## migration tests and the proxy cache tests on PostgreSQL and MySQL, and the
+## proxy cache across replicas over a Redis cluster profile (Docker required;
+## no skip without it; images pinned in test-containers, Redis in the test).
 ## The in-memory and SQLite runs of the same suites are part of `make test`,
 ## except the SQLite lock races, which need the `integration` test hooks and
 ## run here (no Docker needed for them).
-lane_args_oagw-db = -p cf-gears-oagw --features integration -E 'test(/postgres|mysql|races_on_sqlite/)'
+lane_args_oagw-db = -p cf-gears-oagw --features integration -E 'test(/postgres|mysql|redis|races_on_sqlite/)'
+
+## OAGW's tests with its `cluster` feature: the proxy cache's change log,
+## publisher and watcher, and the gear on a database (ADR-0020). `make test`
+## runs OAGW in memory only. No Docker needed.
+lane_args_oagw-cluster = -p cf-gears-oagw --features cluster
 
 ## The Postgres cluster plugin's conformance (Layer 2) and Layer 3
 ## integration suites (Docker required;
@@ -495,13 +559,14 @@ lane_args_cluster-redis = -p cf-redis-cluster-plugin --features integration --re
 ## gears/system/resource-group/resource-group/tests/pg_smoke_test.rs)
 lane_args_rg-pg = -p cf-gears-resource-group --features integration
 
-## The settings-service gear's PostgreSQL migration suite (Docker required;
+## The settings-service gear's PostgreSQL suites: the migration chain, the
+## refused category delete and the declaration purge (Docker required; each
 ## spins up its own postgres container via testcontainers -- see
-## gears/settings-service/settings-service/tests/pg_migrations_test.rs). The
+## gears/settings-service/settings-service/tests/pg_*_test.rs). The
 ## suites beside the gear's migrations run on SQLite, where a statement
 ## PostgreSQL refuses can still pass; this lane runs the chain a stand's startup
 ## runs, on the backend it runs it on.
-lane_args_settings-service-pg = -p cf-gears-settings-service --features integration --test pg_migrations_test
+lane_args_settings-service-pg = -p cf-gears-settings-service --features integration --test pg_migrations_test --test pg_category_delete_test --test pg_declaration_purge_test
 
 ## bss-pricing's Postgres tier (Docker required; each suite spins up its own
 ## postgres container via testcontainers).
@@ -581,6 +646,16 @@ lane_args_products-pg = -p cf-gears-bss-products --run-ignored ignored-only -E '
 ## prints a cost. It is excluded by name, so do not add it back.
 ## `--no-fail-fast` for the reason the pricing lane gives.
 lane_args_ledger-pg = -p cf-gears-bss-ledger --run-ignored ignored-only -E 'not test(grain_fold_timing)' --no-fail-fast
+
+## bss-orders' Postgres tier (Docker required; testcontainers) and its gated tests.
+##
+## `--run-ignored all` runs the crate's ignored Docker/PG tests (the lib's `infra::storage::tests`
+## modules and the gear-boot tests in `gear::tests`) together with every non-ignored test. Orders
+## has no `postgres_*` test binary. `--features gate-dev-stubs` compiles in and runs the gated
+## tests: `infra/storage/tests/submit.rs` and the `infra::gate::tests::{faults,orchestrate,preview}`
+## lib tests. The unit tier (`make test`) keeps the tests that need neither.
+## `--no-fail-fast` for the reason the pricing lane gives.
+lane_args_orders-pg = -p cf-gears-bss-orders --features gate-dev-stubs --run-ignored all --no-fail-fast
 
 # run_lane(lane): the lane's nextest run, then its post command if it has one.
 run_lane = $(call nextest_run,$(1),$(lane_args_$(1)),$(lane_env_$(1)))$(if $(lane_post_$(1)),$(newline)$(lane_post_$(1)))
@@ -671,6 +746,25 @@ coverage-cluster-k8s:
 	$(call print_target_banner)
 	$(call k8s_cluster_suite,cargo llvm-cov test --no-report,coverage: )
 
+# Use one test binary so PostgreSQL scenarios share the testcontainers fixture.
+DURABLE_EXECUTION_PG_TEST_ARGS := -p cf-gears-toolkit-durable-execution --lib --features integration \
+	-- --skip store::process_tests::worker_child --test-threads=4
+
+## Run the durable-execution library's PostgreSQL and subprocess recovery suites (Docker required)
+## Uses `cargo test`, not `nextest`: the scenarios live in one test binary so
+## they share a single testcontainers PostgreSQL fixture.
+test-durable-execution-pg: install-tools
+	$(call print_target_banner)
+	cargo test $(DURABLE_EXECUTION_PG_TEST_ARGS)
+
+## Add the durable-execution PostgreSQL coverage to the current cargo-llvm-cov session
+## The coverage sibling of `test-durable-execution-pg`. Like
+## `coverage-cluster-k8s`, it does not clean or report: the coverage job in
+## .github/workflows/ci.yml brackets it.
+coverage-durable-execution-pg:
+	$(call print_target_banner)
+	cargo llvm-cov test --no-rustc-wrapper --no-report $(DURABLE_EXECUTION_PG_TEST_ARGS)
+
 ## Run FIPS-mode integration tests (requires Go for aws-lc-fips-sys).
 ## Covers:
 ##   - cf-gears-toolkit         : bootstrap + init_crypto_provider dispatch
@@ -692,8 +786,35 @@ coverage-cluster-k8s:
 ## compiles once.
 test-fips: install-tools
 	$(call print_target_banner)
-	cargo nextest run -p cf-gears-toolkit -p cf-gears-toolkit-http -p cf-gears-oagw -p cf-gears-clickhouse-usage-collector-plugin \
-		--features cf-gears-toolkit/bootstrap,cf-gears-toolkit/fips,cf-gears-toolkit-http/fips,cf-gears-oagw/fips
+	cargo test -p cf-gears-toolkit-security --features fips,jwt,internal-auth-cache --lib --test jwt_no_backend_fallback
+	cargo test -p cf-gears-toolkit-auth --features toolkit-security/fips --lib providers::jwks
+	cargo nextest run -p cf-gears-toolkit -p cf-gears-toolkit-http -p cf-gears-toolkit-http-proxy -p cf-gears-oagw -p cf-gears-clickhouse-usage-collector-plugin \
+		--features cf-gears-toolkit/bootstrap,cf-gears-toolkit/fips,cf-gears-toolkit-http/fips,cf-gears-toolkit-http-proxy/fips,cf-gears-oagw/fips
+
+GM_PG_TAG := $(shell sed -n 's/^pub const POSTGRES_TAG: &str = "\(.*\)";/\1/p' libs/test-containers/src/lib.rs)
+GM_MARIADB_TAG := $(shell sed -n 's/^pub const MARIADB_TAG: &str = "\(.*\)";/\1/p' libs/test-containers/src/lib.rs)
+GM_PG_URL := postgres://postgres:pass@127.0.0.1:55432/postgres
+GM_MARIADB_URL := mysql://root:root@127.0.0.1:53306/mysql
+
+## Run the github-mirror gear's suite on PostgreSQL and MariaDB (Docker required)
+test-github-mirror-db: install-tools
+	$(call print_target_banner)
+	@docker rm -f gm-test-postgres gm-test-mariadb >/dev/null 2>&1 || true
+	docker run -d --name gm-test-postgres -e POSTGRES_PASSWORD=pass -p 55432:5432 postgres:$(GM_PG_TAG)
+	docker run -d --name gm-test-mariadb -e MARIADB_ROOT_PASSWORD=root -p 53306:3306 mariadb:$(GM_MARIADB_TAG)
+	@for i in $$(seq 1 120); do docker exec gm-test-postgres pg_isready -h 127.0.0.1 -U postgres >/dev/null 2>&1 && break; sleep 1; done; \
+		docker exec gm-test-postgres pg_isready -h 127.0.0.1 -U postgres
+	@for i in $$(seq 1 120); do docker exec gm-test-mariadb mariadb-admin ping -h 127.0.0.1 -uroot -proot >/dev/null 2>&1 && break; sleep 1; done; \
+		docker exec gm-test-mariadb mariadb-admin ping -h 127.0.0.1 -uroot -proot
+	GM_TEST_DATABASE_URL=$(GM_PG_URL) cargo nextest run -p cf-gears-github-mirror --features integration --no-fail-fast; pg=$$?; \
+	GM_TEST_DATABASE_URL=$(GM_MARIADB_URL) cargo nextest run -p cf-gears-github-mirror --features integration --no-fail-fast; maria=$$?; \
+	docker rm -f gm-test-postgres gm-test-mariadb >/dev/null; \
+	test $$pg -eq 0 && test $$maria -eq 0
+
+## Run the github-mirror gear's 110,000-entity interrupt-and-resume test (SQLite, minutes)
+test-github-mirror-scale: install-tools
+	$(call print_target_banner)
+	cargo nextest run -p cf-gears-github-mirror --test scale_resume_test --run-ignored ignored-only
 
 ## Cross-compile gate for the Windows+FIPS path (Windows handshake
 ## verification is the manual runbook in cf-gears-fips-probe/README.md). Catches
@@ -726,7 +847,7 @@ check-windows-fips:
 
 # -------- Benchmarks --------
 
-.PHONY: bench-toolkit-db-outbox
+.PHONY: bench-toolkit-db-outbox bench-eb-memory bench-eb-pg bench-eb-sqlite bench-eb-mysql bench-eb-kafka longhaul-eb-pg
 
 # Outbox throughput benchmarks of cf-gears-toolkit-db, per database engine:
 # the Cargo feature that enables the engine and the benchmark filter.
@@ -756,9 +877,81 @@ help.LONGHAUL.usage := LONGHAUL=1
 help.LONGHAUL.targets := bench-toolkit-db-outbox
 help.LONGHAUL.text = Run the long-haul benchmarks (1M+10M rows; 100K on sqlite).
 
+# The event-broker bench and long-haul runs are confined to BENCH_MEMORY_MAX
+# (systemd user scope, no swap), so a runaway is killed before it takes the
+# machine with it.
+BENCH_MEMORY_MAX ?= 6G
+# Two malloc arenas: with one per thread, memory a finished phase freed on one
+# thread is not reused by the next phase's allocations on another, and RSS
+# climbs phase after phase.
+BENCH_SCOPE ?= MALLOC_ARENA_MAX=2 systemd-run --user --scope --quiet -p MemoryMax=$(BENCH_MEMORY_MAX) -p MemorySwapMax=0
+
+## Event-broker backend bench against the memory backend
+## See plugins/event-broker-backend-bench/README.md. Extra flags go in
+## BENCH_ARGS, e.g. `make bench-eb-memory BENCH_ARGS="--quick --scenarios b2"`.
+## The build runs first; only the run itself is confined to BENCH_MEMORY_MAX.
+bench-eb-memory:
+	$(call print_target_banner)
+	cargo bench -p cf-gears-memory-event-broker-plugin --bench backend --no-run
+	$(BENCH_SCOPE) cargo bench -p cf-gears-memory-event-broker-plugin --bench backend -- \
+		--out $(CURDIR)/target/eb-bench/memory.json $(BENCH_ARGS)
+
+## Event-broker backend bench against PostgreSQL
+## The server EB_BENCH_POSTGRES_URL names, or a testcontainers container (needs
+## a Docker daemon; the container runs outside the memory scope).
+bench-eb-pg:
+	$(call print_target_banner)
+	cargo bench -p cf-gears-postgres-event-broker-plugin --features integration --bench backend --no-run
+	$(BENCH_SCOPE) cargo bench -p cf-gears-postgres-event-broker-plugin --features integration --bench backend -- \
+		--out $(CURDIR)/target/eb-bench/postgres.json $(BENCH_ARGS)
+
+## Event-broker backend bench against SQLite
+## A file in a temporary directory, or the file EB_BENCH_SQLITE_PATH names (put
+## it on the disk being measured: a tmpfs makes every sync free).
+bench-eb-sqlite:
+	$(call print_target_banner)
+	cargo bench -p cf-gears-sqlite-event-broker-plugin --bench backend --no-run
+	$(BENCH_SCOPE) cargo bench -p cf-gears-sqlite-event-broker-plugin --bench backend -- \
+		--out $(CURDIR)/target/eb-bench/sqlite.json $(BENCH_ARGS)
+
+## Event-broker backend bench against MySQL
+## The server the plugin's bench is pointed at, or a testcontainers container
+## (needs a Docker daemon; the container runs outside the memory scope).
+bench-eb-mysql:
+	$(call print_target_banner)
+	cargo bench -p cf-gears-mysql-event-broker-plugin --features integration --bench backend --no-run
+	$(BENCH_SCOPE) cargo bench -p cf-gears-mysql-event-broker-plugin --features integration --bench backend -- \
+		--out $(CURDIR)/target/eb-bench/mysql.json $(BENCH_ARGS)
+
+## Event-broker backend bench against Kafka
+## The cluster the plugin's bench is pointed at, or a testcontainers broker
+## (needs a Docker daemon; the container runs outside the memory scope).
+bench-eb-kafka:
+	$(call print_target_banner)
+	cargo bench -p cf-gears-kafka-event-broker-plugin --features integration --bench backend --no-run
+	$(BENCH_SCOPE) cargo bench -p cf-gears-kafka-event-broker-plugin --features integration --bench backend -- \
+		--out $(CURDIR)/target/eb-bench/kafka.json $(BENCH_ARGS)
+
+EB_LONGHAUL_URL ?= postgres://postgres:postgres@127.0.0.1:54329/events
+
+## Event-broker PostgreSQL long-haul run, until Ctrl-C
+## See plugins/postgres-event-broker-plugin/longhaul/README.md. Runs against
+## EB_LONGHAUL_URL, by default the server longhaul/compose.yaml starts. Flags go
+## in LONGHAUL_ARGS, e.g. `make longhaul-eb-pg LONGHAUL_ARGS="--reset --duration 30m"`.
+## The binary runs without cargo in front of it: Ctrl-C reaches only the run,
+## and make returns once the run has finished and printed its report.
+longhaul-eb-pg:
+	$(call print_target_banner)
+	@bin=$$(cargo bench -p cf-gears-postgres-event-broker-plugin --features integration --bench longhaul \
+		--no-run --message-format=json-render-diagnostics \
+		| grep '"name":"longhaul"' | sed -n 's/.*"executable":"\([^"]*\)".*/\1/p' | tail -n 1); \
+	test -n "$$bin" || { echo "longhaul-eb-pg: the longhaul binary was not built" >&2; exit 1; }; \
+	exec env EB_LONGHAUL_URL=$(EB_LONGHAUL_URL) $(BENCH_SCOPE) "$$bin" \
+		--out $(CURDIR)/target/eb-longhaul/report.json $(LONGHAUL_ARGS)
+
 # -------- E2E tests --------
 
-.PHONY: e2e e2e-local e2e-local-smoke e2e-docker e2e-docker-smoke e2e-tr-authz e2e-oagw-sqlite e2e-usage-collector e2e-event-broker e2e-oop
+.PHONY: e2e e2e-local e2e-local-smoke e2e-docker e2e-docker-smoke e2e-tr-authz e2e-oagw-sqlite e2e-usage-collector e2e-event-broker e2e-event-broker-pg e2e-event-broker-sqlite e2e-event-broker-mysql e2e-event-broker-mariadb e2e-event-broker-kafka e2e-oop
 
 E2E_TARGET ?=
 # E2E selectors for `make e2e-local`:
@@ -862,12 +1055,58 @@ e2e-usage-collector: py-env
 	$(if $(filter-out $(UC_E2E_BACKENDS),$(BACKEND)),$(error Unknown BACKEND '$(BACKEND)'. Use one of: $(UC_E2E_BACKENDS)))
 	$(foreach b,$(or $(BACKEND),$(UC_E2E_BACKENDS)),cargo build --bin cf-gears-example-server --features=$(UC_E2E_FEATURES),$(b)-usage-collector$(newline)E2E_BINARY=target/debug/cf-gears-example-server UC_E2E_BACKEND=$(b) $(PYTHON) -m pytest testing/e2e/suites/usage_collector/ -vv $(E2E_TARGET)$(newline))
 
+## Run the Orders development Preview/submit E2E suite (self-managed PostgreSQL; Docker required)
+.PHONY: e2e-orders
+e2e-orders: py-env
+	$(call print_target_banner)
+	$(PYTHON) tools/scripts/run_e2e.py --suite bss-orders -- $(E2E_TARGET)
+
 ## Run event-broker E2E tests (its own standalone binary, not a cf-gears-example-server feature)
 e2e-event-broker: py-env
 	$(call print_target_banner)
 	cargo build -p cf-gears-event-broker --bin cf-gears-event-broker-server
 	E2E_BINARY=target/debug/cf-gears-event-broker-server \
 		$(PYTHON) -m pytest testing/e2e/suites/event_broker/ -vv
+
+## Run event-broker E2E tests on the PostgreSQL storage backend (Docker required)
+## The backend-sensitive tests of e2e-event-broker, with a PostgreSQL sidecar.
+e2e-event-broker-pg: py-env
+	$(call print_target_banner)
+	cargo build -p cf-gears-event-broker --bin cf-gears-event-broker-server
+	EB_E2E_BACKEND=postgres E2E_BINARY=target/debug/cf-gears-event-broker-server \
+		$(PYTHON) -m pytest testing/e2e/suites/event_broker/ -vv -m backend_sensitive
+
+## Run event-broker E2E tests on the SQLite storage backend
+## The backend-sensitive tests of e2e-event-broker, the events in a file under the server's home.
+e2e-event-broker-sqlite: py-env
+	$(call print_target_banner)
+	cargo build -p cf-gears-event-broker --bin cf-gears-event-broker-server
+	EB_E2E_BACKEND=sqlite E2E_BINARY=target/debug/cf-gears-event-broker-server \
+		$(PYTHON) -m pytest testing/e2e/suites/event_broker/ -vv -m backend_sensitive
+
+## Run event-broker E2E tests on the MySQL storage backend (Docker required)
+## The backend-sensitive tests of e2e-event-broker, with a MySQL sidecar.
+e2e-event-broker-mysql: py-env
+	$(call print_target_banner)
+	cargo build -p cf-gears-event-broker --bin cf-gears-event-broker-server
+	EB_E2E_BACKEND=mysql E2E_BINARY=target/debug/cf-gears-event-broker-server \
+		$(PYTHON) -m pytest testing/e2e/suites/event_broker/ -vv -m backend_sensitive
+
+## Run event-broker E2E tests on the MySQL storage backend on MariaDB (Docker required)
+## The backend-sensitive tests of e2e-event-broker, with a MariaDB sidecar.
+e2e-event-broker-mariadb: py-env
+	$(call print_target_banner)
+	cargo build -p cf-gears-event-broker --bin cf-gears-event-broker-server
+	EB_E2E_BACKEND=mariadb E2E_BINARY=target/debug/cf-gears-event-broker-server \
+		$(PYTHON) -m pytest testing/e2e/suites/event_broker/ -vv -m backend_sensitive
+
+## Run event-broker E2E tests on the Kafka storage backend (Docker required)
+## The backend-sensitive tests of e2e-event-broker, with a single-node Kafka sidecar.
+e2e-event-broker-kafka: py-env
+	$(call print_target_banner)
+	cargo build -p cf-gears-event-broker --bin cf-gears-event-broker-server
+	EB_E2E_BACKEND=kafka E2E_BINARY=target/debug/cf-gears-event-broker-server \
+		$(PYTHON) -m pytest testing/e2e/suites/event_broker/ -vv -m backend_sensitive
 
 ## Run the out-of-process (loopback, no-k8s) E2E suite
 # Out-of-process (loopback) E2E: boots flight-control + OoP gears as local
@@ -900,7 +1139,7 @@ coverage: py-env
 coverage-unit: py-env
 	$(call print_target_banner)
 	$(call check_tool,cargo-llvm-cov)
-	$(PYTHON) tools/scripts/coverage.py unit $(if $(GEAR),--package $(firstword $(subst -p ,,$(GEAR_PKGS))),)
+	$(PYTHON) tools/scripts/coverage.py unit $(if $(GEAR),--package $(firstword $(subst -p ,,$(GEAR_PKGS))) $(GEAR_FEATURE_ARGS),)
 
 ## Ensure needed packages and programs installed for local e2e testing
 check-prereq-e2e-local: py-env
@@ -919,6 +1158,14 @@ coverage-e2e-local: check-prereq-e2e-local
 # Run it locally with `make run PRESET=mini-chat`.
 
 .PHONY: mini-chat-docker mini-chat-helm mini-chat-helm-template mini-chat-up mini-chat-down mini-chat-port-forward
+
+# Dockerfiles that use BuildKit cache mounts need the Buildx CLI plugin. Without
+# it `docker build` stops at "BuildKit is enabled but the buildx component is
+# missing or broken", which does not say which plugin to install. $(1) is the
+# Dockerfile that needs it.
+define check_docker_buildx
+    @docker buildx version >/dev/null 2>&1 || (echo "ERROR: 'docker buildx' is not available, and $(1) uses BuildKit cache mounts. Install the Buildx plugin for your Docker distribution - see 'Prepare environment > Docker' in docs/web-docs/build-with-gears/index.mdx." && exit 1)
+endef
 
 ## Build mini-chat Docker image for K8s (dev build by default, RELEASE=1 for optimized)
 ## On linux: builds on host (reuses local target/), then packages the binary.
@@ -941,6 +1188,7 @@ ifeq ($(shell uname -s),Linux)
 	@rm -rf .docker-stage
 else
 	@echo "==> Non-linux host: full Docker build"
+	$(call check_docker_buildx,mini-chat.Dockerfile)
 	DOCKER_BUILDKIT=1 docker build \
 		-f gears/mini-chat/deploy/docker/mini-chat.Dockerfile \
 		--build-arg CARGO_FEATURES="$(MINI_CHAT_K8S_FEATURES)" \
@@ -1188,7 +1436,8 @@ all: check test-integration e2e-local openapi
 
 # Integration lanes that `make all` and `make ci` run (target-specific LANE, see tests.mk).
 all: LANE = toolkit-db-sqlite
-ci: LANE = users-info-pg usage-collector-pg usage-collector-ch types-registry-db oagw-db
+ci: LANE = users-info-pg usage-collector-pg usage-collector-ch types-registry-db oagw-db \
+	oagw-cluster
 
 # Re-run setup when a make file changes.
 .setup-stamp: Makefile gears-rust.mk .gears-dna/gears.mk

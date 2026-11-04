@@ -1,4 +1,3 @@
-// Created: 2026-08-12 by Virtuozzo International GmbH
 //! Tests for the reader degradation contract and its typed projection.
 //!
 //! Contract source: FEATURE `gear-foundation.md` §5 *Reader Degradation Contract

@@ -3032,10 +3032,6 @@ pub async fn readiness_reports_every_capability_and_only_some_block_service(
         named.contains(&graph_storage_sdk::models::DATABASE),
         "every store answers for its own storage: {named:?}"
     );
-    assert!(
-        named.contains(&graph_storage_sdk::models::SQLPGQ),
-        "and for the traversal backend it actually provides: {named:?}"
-    );
     for row in &rows {
         match row.state {
             graph_storage_sdk::models::ReadinessState::Healthy => assert!(

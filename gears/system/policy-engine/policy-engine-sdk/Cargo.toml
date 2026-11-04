@@ -28,8 +28,10 @@ uuid = { workspace = true }
 time = { workspace = true }
 
 # GTS types. `gts` is a normal dependency: the `gts_instance!` expansions of
-# the permission catalog resolve paths through `::gts`.
+# the permission catalog resolve paths through `::gts`. `schemars` is
+# required by the `gts_type_schema` expansions of the resource types.
 gts = { workspace = true }
+schemars = { workspace = true }
 toolkit-gts = { workspace = true }
 
 # ToolKit dependencies

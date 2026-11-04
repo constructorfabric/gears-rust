@@ -1,0 +1,6 @@
+{
+  "id": "gts.cf.toolkit.authz.permission.v1~cf.task_engine._.task_expedite.v1",
+  "resource_type": "gts.cf.core.tasks.task.v1~",
+  "action": "expedite",
+  "display_name": "Create or raise tasks with urgency 'critical', ahead of other tenants' work (meant for platform gears and operators)"
+}

@@ -117,8 +117,8 @@ struct TokenKey([u8; 32]);
 
 impl TokenKey {
     fn of(token: &str) -> Self {
-        use sha2::{Digest as _, Sha256};
-        Self(Sha256::digest(token.as_bytes()).into())
+        use crate::crypto::hash::Sha256;
+        Self(Sha256::digest(token.as_bytes()))
     }
 }
 

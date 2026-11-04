@@ -11,7 +11,8 @@ use serde_json::Value as JsonValue;
 use uuid::Uuid;
 
 use crate::domain::error::DomainError;
-use crate::domain::ingest::{ProducerCursors, ProducerMode, ProducerResetSelector, PublishRequest};
+use crate::domain::ingest::{ProducerCursors, ProducerMode, PublishRequest};
+use crate::domain::producer_reset::ProducerResetSelector;
 use event_broker_sdk::models::EventType;
 
 use crate::domain::model::{Meta, Sequence, Topic, TopicSegmentManifest};
@@ -192,18 +193,13 @@ pub struct RegisterProducerResponse {
     pub client_agent: String,
 }
 
-#[derive(Debug)]
-#[toolkit_macros::api_dto(response)]
-pub struct ProducerPartitionCursorDto {
-    pub partition: i32,
-    pub last_sequence: i64,
-}
-
+/// A producer's chain on one topic. No partition: the chain is kept per
+/// `(producer_id, topic)` (ADR-0004 "Chain Scope").
 #[derive(Debug)]
 #[toolkit_macros::api_dto(response)]
 pub struct ProducerTopicCursorsDto {
     pub topic: String,
-    pub partitions: Vec<ProducerPartitionCursorDto>,
+    pub last_sequence: i64,
 }
 
 #[derive(Debug)]
@@ -224,14 +220,7 @@ impl From<ProducerCursors> for ProducerCursorsResponse {
                 .into_iter()
                 .map(|t| ProducerTopicCursorsDto {
                     topic: t.topic.into_string(),
-                    partitions: t
-                        .partitions
-                        .into_iter()
-                        .map(|p| ProducerPartitionCursorDto {
-                            partition: p.partition,
-                            last_sequence: p.last_sequence,
-                        })
-                        .collect(),
+                    last_sequence: t.last_sequence,
                 })
                 .collect(),
         }
@@ -244,19 +233,11 @@ impl From<ProducerCursors> for ProducerCursorsResponse {
 pub struct ResetProducerRequest {
     #[serde(default)]
     pub topic: Option<String>,
-    #[serde(default)]
-    pub partition: Option<i32>,
 }
 
 impl From<ResetProducerRequest> for ProducerResetSelector {
-    /// Pure field mapping - no decision. Which `ProducerResetScope` these
-    /// selectors mean, and the rejection of an ambiguous shape, is the domain's
-    /// call (`ProducerResetScope::try_from`), not the request DTO's.
     fn from(req: ResetProducerRequest) -> Self {
-        ProducerResetSelector {
-            topic: req.topic,
-            partition: req.partition,
-        }
+        ProducerResetSelector { topic: req.topic }
     }
 }
 

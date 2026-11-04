@@ -1,4 +1,3 @@
-// Created: 2026-09-06 by Virtuozzo International GmbH
 //! The local effective-value cache.
 //!
 //! A copy of rows this gear already owns, keyed by setting key and scope, held

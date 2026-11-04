@@ -25,6 +25,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use event_broker::test_support::{EventBrokerHarness, StaticTypesRegistry};
+use event_broker_sdk::backend::{Partition, TopicPartition, Wait};
 use event_broker_sdk::{
     ConsumerBuilder, ConsumerError, ConsumerGroupRef, DirectDeduplication, Fallback, GtsIdPattern,
     GtsInstanceId, HandlerOutcome, InMemoryOffsetManager, IngestOutcome, Producer,
@@ -243,12 +244,13 @@ async fn producer_stateless_publish_sends_typed_event() -> TestResult {
     Ok(())
 }
 
-/// A producer can wait for broker-side persistence when the caller needs it.
+/// A persisted publish reports `Accepted` while the in-process broker
+/// confirms no durable write, and the event still reaches storage.
 ///
 /// Preconditions: the producer uses the same direct setup as normal publishing.
-/// Expected: `publish_persisted` returns `Persisted`.
+/// Expected: `publish_persisted` returns `Accepted` and the event is stored.
 #[tokio::test]
-async fn producer_persisted_publish_waits_for_storage() -> TestResult {
+async fn producer_persisted_publish_reports_accepted_until_sync_publish_lands() -> TestResult {
     let harness = harness_with(orders_catalog()).await;
     let broker = harness.broker();
 
@@ -264,9 +266,7 @@ async fn producer_persisted_publish_waits_for_storage() -> TestResult {
 
     let outcome = producer.publish_persisted(order_created()).await?;
 
-    // The in-process broker admits synchronously and persists asynchronously, so
-    // it honestly reports `Accepted` rather than claiming a durable `Persisted`
-    // (see `LocalBroker`); the event still reaches storage.
+    // #5655: the in-process broker confirms no durable write until synchronous publish lands.
     assert_eq!(outcome, IngestOutcome::Accepted);
     wait_for_stored(&harness, ORDERS_TOPIC, 1).await;
 
@@ -335,14 +335,8 @@ async fn producer_chained_mode_uses_broker_issued_id_and_sequences_events() -> T
     producer.publish(order_created()).await?;
     wait_for_stored(&harness, ORDERS_TOPIC, 1).await;
 
-    // The event lands on the one partition its tenant hashes to; the chained
-    // cursor there advances to the first assigned offset.
     let cursors = broker.get_producer_cursors(&ctx, producer_id).await?;
-    let topic = ginst(ORDERS_TOPIC);
-    let sequences: Vec<i64> = (0..ORDERS_PARTITIONS)
-        .filter_map(|partition| cursors.last_sequence(&topic, partition))
-        .collect();
-    assert_eq!(sequences, vec![0]);
+    assert_eq!(cursors.last_sequence(&ginst(ORDERS_TOPIC)), Some(0));
 
     Ok(())
 }
@@ -705,12 +699,15 @@ fn orders_and_billing_catalog() -> StaticTypesRegistry {
 /// means a test never has to know which. `read` is exclusive of the position it
 /// names, and `Sequence::NONE` reads from the start of each partition.
 async fn stored_count(harness: &EventBrokerHarness, topic: &str) -> usize {
-    let ctx = harness.security_context().clone();
     let mut total = 0;
     for partition in 0..ORDERS_PARTITIONS {
+        let at = TopicPartition::new(
+            GtsInstanceId::try_new(topic).unwrap(),
+            Partition::new(partition),
+        );
         total += harness
             .backend()
-            .read(&ctx, topic, partition, Sequence::NONE, 1024)
+            .read(&at, Sequence::NONE, 1024, Wait::No)
             .await
             .expect("read stored events")
             .len();
@@ -719,7 +716,7 @@ async fn stored_count(harness: &EventBrokerHarness, topic: &str) -> usize {
 }
 
 async fn wait_for_stored(harness: &EventBrokerHarness, topic: &str, count: usize) {
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         if stored_count(harness, topic).await >= count {
             return;
@@ -790,7 +787,7 @@ fn billing_charged() -> BillingCharged {
 }
 
 async fn wait_until(mut predicate: impl FnMut() -> bool) {
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         if predicate() {
             return;

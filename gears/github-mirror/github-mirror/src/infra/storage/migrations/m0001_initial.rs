@@ -1,96 +1,79 @@
 use sea_orm_migration::prelude::*;
-use sea_orm_migration::sea_orm::ConnectionTrait;
+use sea_orm_migration::sea_orm::{ConnectionTrait, DatabaseBackend};
 
 #[derive(DeriveMigrationName)]
 pub struct Migration;
 
+const POSTGRES: &str = include_str!("m0001_initial/postgres.sql");
+const MYSQL: &str = include_str!("m0001_initial/mysql.sql");
+const SQLITE: &str = include_str!("m0001_initial/sqlite.sql");
+
+const TABLES: [&str; 33] = [
+    "gm_active_syncs",
+    "gm_branches",
+    "gm_check_runs",
+    "gm_comments",
+    "gm_commit_comments",
+    "gm_commit_files",
+    "gm_commit_statuses",
+    "gm_commits",
+    "gm_contributors",
+    "gm_deployments",
+    "gm_entity_fingerprints",
+    "gm_http_cache",
+    "gm_issue_events",
+    "gm_issue_reactions",
+    "gm_issue_timeline",
+    "gm_issues",
+    "gm_labels",
+    "gm_logical_conversations",
+    "gm_milestones",
+    "gm_pull_request_commits",
+    "gm_pull_request_files",
+    "gm_pull_requests",
+    "gm_releases",
+    "gm_repo_sync_status",
+    "gm_repositories",
+    "gm_review_comments",
+    "gm_review_threads",
+    "gm_reviews",
+    "gm_sync_sessions",
+    "gm_sync_watermarks",
+    "gm_tags",
+    "gm_workflow_jobs",
+    "gm_workflow_runs",
+];
+
 #[async_trait::async_trait]
 impl MigrationTrait for Migration {
     async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        let backend = manager.get_database_backend();
-        let conn = manager.get_connection();
-
-        let sql = match backend {
-            sea_orm::DatabaseBackend::Postgres => {
-                r"
-CREATE TABLE IF NOT EXISTS gm_repositories (
-    tenant_id UUID NOT NULL,
-    id BIGINT NOT NULL,
-    owner VARCHAR(255) NOT NULL,
-    name VARCHAR(255) NOT NULL,
-    full_name VARCHAR(512) NOT NULL,
-    default_branch VARCHAR(255) NOT NULL,
-    private BOOLEAN NOT NULL,
-    pushed_at VARCHAR(64),
-    stars BIGINT NOT NULL DEFAULT 0,
-    forks BIGINT NOT NULL DEFAULT 0,
-    description TEXT,
-    PRIMARY KEY (tenant_id, id)
-);
-CREATE UNIQUE INDEX IF NOT EXISTS idx_gm_repositories_tenant_full_name
-    ON gm_repositories (tenant_id, full_name);
-                "
-            }
-            sea_orm::DatabaseBackend::MySql => {
-                r"
-CREATE TABLE IF NOT EXISTS gm_repositories (
-    tenant_id VARCHAR(36) NOT NULL,
-    id BIGINT NOT NULL,
-    owner VARCHAR(255) NOT NULL,
-    name VARCHAR(255) NOT NULL,
-    -- 191 = 39 (GitHub's max login length) + 1 ('/') + 100 (max repo name),
-    -- with headroom. Kept short enough to index in full on MySQL (191 chars
-    -- x 4 bytes/char for utf8mb4 = 764 bytes, under the 767-byte InnoDB
-    -- prefix-index limit); Postgres/SQLite use the full 512 since they have
-    -- no such limit. A 255-char prefix index (the previous approach) let two
-    -- full_name values that agree on their first 255 characters collide.
-    full_name VARCHAR(191) NOT NULL,
-    default_branch VARCHAR(255) NOT NULL,
-    private BOOLEAN NOT NULL,
-    pushed_at VARCHAR(64),
-    stars BIGINT NOT NULL DEFAULT 0,
-    forks BIGINT NOT NULL DEFAULT 0,
-    description MEDIUMTEXT,
-    PRIMARY KEY (tenant_id, id),
-    UNIQUE KEY idx_gm_repositories_tenant_full_name (tenant_id, full_name)
-);
-                "
-            }
-            sea_orm::DatabaseBackend::Sqlite => {
-                r"
-CREATE TABLE IF NOT EXISTS gm_repositories (
-    tenant_id TEXT NOT NULL,
-    id INTEGER NOT NULL,
-    owner TEXT NOT NULL,
-    name TEXT NOT NULL,
-    full_name TEXT NOT NULL,
-    default_branch TEXT NOT NULL,
-    private INTEGER NOT NULL,
-    pushed_at TEXT,
-    stars INTEGER NOT NULL DEFAULT 0,
-    forks INTEGER NOT NULL DEFAULT 0,
-    description TEXT,
-    PRIMARY KEY (tenant_id, id)
-);
-CREATE UNIQUE INDEX IF NOT EXISTS idx_gm_repositories_tenant_full_name
-    ON gm_repositories (tenant_id, full_name);
-                "
-            }
+        let schema = match manager.get_database_backend() {
+            DatabaseBackend::Postgres => POSTGRES,
+            DatabaseBackend::MySql => MYSQL,
+            DatabaseBackend::Sqlite => SQLITE,
             other => {
                 return Err(DbErr::Custom(format!(
                     "migration has no DDL for database backend {other:?}"
                 )));
             }
         };
-
-        conn.execute_unprepared(sql).await?;
+        let conn = manager.get_connection();
+        for statement in schema
+            .split(';')
+            .map(str::trim)
+            .filter(|statement| !statement.is_empty())
+        {
+            conn.execute_unprepared(statement).await?;
+        }
         Ok(())
     }
 
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         let conn = manager.get_connection();
-        conn.execute_unprepared("DROP TABLE IF EXISTS gm_repositories;")
-            .await?;
+        for table in TABLES {
+            conn.execute_unprepared(&format!("DROP TABLE IF EXISTS {table}"))
+                .await?;
+        }
         Ok(())
     }
 }

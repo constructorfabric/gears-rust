@@ -360,7 +360,7 @@ The base type defines behavioral traits via standard [GTS Schema Traits](https:/
 
 | Trait | Type | Default | Description |
 |-------|------|---------|-------------|
-| `allowed_parent_types` | string[] | `[]` | GTS instance identifiers of tenant types allowed as parent. Empty array means the type is root-only or leaf-only. The root tenant type has `allowed_parent_types: []` by convention. |
+| `allowed_parent_types` | string[] | `[]` | GTS type identifiers of tenant types allowed as parent. Empty array means no parent tenant type is allowed, so a tenant of this type cannot be created under any parent; it does not restrict which types may list this type as their parent. The root tenant type has `allowed_parent_types: []` by convention. |
 | `idp_provisioning` | boolean | `false` | Whether tenants of this type typically require dedicated IdP-side resources. AM still invokes `provision_tenant` / `deprovision_tenant`; provider implementations may use this trait to decide whether to create dedicated resources or reuse shared ones. Mutating IdP methods **MUST NOT** silently no-op — providers that do not support a required operation **MUST** return `idp_unsupported_operation`. |
 
 Derived type schemas resolve their behavioral traits via `x-gts-traits` (per [GTS spec §9.7](https://github.com/GlobalTypeSystem/gts-spec?tab=readme-ov-file#97---schema-traits-x-gts-traits-schema--x-gts-traits)). Properties not specified fall back to defaults from the base type's `x-gts-traits-schema`.
@@ -370,8 +370,8 @@ Derived type schemas resolve their behavioral traits via `x-gts-traits` (per [GT
 | GTS Schema ID (chained, public) | Description | `x-gts-traits` |
 |---------------------------------|-------------|----------------|
 | `gts.cf.core.am.tenant_type.v1~cf.core.am.provider.v1~` | Platform operator; root tenant | `allowed_parent_types: []`, `idp_provisioning: true` |
-| `gts.cf.core.am.tenant_type.v1~cf.core.am.reseller.v1~` | Reseller; nestable under provider or other resellers | `allowed_parent_types: [cf.core.am.provider.v1~, cf.core.am.reseller.v1~]`, `idp_provisioning: true` |
-| `gts.cf.core.am.tenant_type.v1~cf.core.am.customer.v1~` | End customer; leaf tenant | `allowed_parent_types: [cf.core.am.provider.v1~, cf.core.am.reseller.v1~]` |
+| `gts.cf.core.am.tenant_type.v1~cf.core.am.reseller.v1~` | Reseller; nestable under provider or other resellers | `allowed_parent_types: [gts.cf.core.am.tenant_type.v1~cf.core.am.provider.v1~, gts.cf.core.am.tenant_type.v1~cf.core.am.reseller.v1~]`, `idp_provisioning: true` |
+| `gts.cf.core.am.tenant_type.v1~cf.core.am.customer.v1~` | End customer; leaf tenant | `allowed_parent_types: [gts.cf.core.am.tenant_type.v1~cf.core.am.provider.v1~, gts.cf.core.am.tenant_type.v1~cf.core.am.reseller.v1~]` |
 
 **Runtime Registration:** New tenant types are registered via the GTS REST API (`POST /schemas`) or programmatically via `GtsStore.register_schema()`.
 
@@ -379,7 +379,7 @@ Derived type schemas resolve their behavioral traits via `x-gts-traits` (per [GT
 
 When strict-mode enforcement is active, AM validates the chained schema identifier against the GTS registry at tenant creation time and rejects unregistered types with `CanonicalError::InvalidArgument` (HTTP 400, `reason=INVALID_TENANT_TYPE`).
 
-**Input and storage format:** The API accepts the **full chained `GtsSchemaId`** (e.g., `gts.cf.core.am.tenant_type.v1~x.core.am.reseller.v1~`). Short-name aliases are not supported — GTS identifiers can contain multiple chained segments (up to 1024 characters per `GTS_MAX_LENGTH`), making short-name derivation ambiguous. AM validates the chained schema identifier against the GTS registry and derives a deterministic UUIDv5 `tenant_type_uuid` from that GTS identifier using the shared GTS namespace convention. The `tenants` table stores `tenant_type_uuid`; the public chained `tenant_type` is re-hydrated from Types Registry when AM needs to emit tenant projections back through the API or operator-facing diagnostics. The `allowed_parent_types` trait values in `x-gts-traits` use GTS instance identifiers (per GTS spec); AM resolves them to chained schema IDs for comparison against the requested public tenant type before persisting the derived UUID key.
+**Input and storage format:** The API accepts the **full chained `GtsSchemaId`** (e.g., `gts.cf.core.am.tenant_type.v1~x.core.am.reseller.v1~`). Short-name aliases are not supported — GTS identifiers can contain multiple chained segments (up to 1024 characters per `GTS_MAX_LENGTH`), making short-name derivation ambiguous. AM validates the chained schema identifier against the GTS registry and derives a deterministic UUIDv5 `tenant_type_uuid` from that GTS identifier using the shared GTS namespace convention. The `tenants` table stores `tenant_type_uuid`; the public chained `tenant_type` is re-hydrated from Types Registry when AM needs to emit tenant projections back through the API or operator-facing diagnostics. The `allowed_parent_types` trait values in `x-gts-traits` are full chained GTS type identifiers ending in `~` under `gts.cf.core.am.tenant_type.v1~` (enforced by `x-gts-type-ref`); AM compares them against the requested public tenant type before persisting the derived UUID key.
 
 **Trait-driven validation at tenant creation (active only under `strict_barriers = true`; PR1 default stub-admits):**
 

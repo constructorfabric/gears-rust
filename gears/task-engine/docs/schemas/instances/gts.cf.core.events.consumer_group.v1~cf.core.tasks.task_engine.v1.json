@@ -1,0 +1,4 @@
+{
+  "id": "gts.cf.core.events.consumer_group.v1~cf.core.tasks.task_engine.v1",
+  "description": "Named inbound consumer group the Task Engine uses to receive broker events for event wait conditions (DESIGN cpt-cf-task-engine-component-model, Event Consumer). Exactly one instance in the cluster processes each partition and offsets survive restarts."
+}

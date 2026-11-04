@@ -4,6 +4,7 @@
 //!
 //! Each test binary uses a subset of these helpers, hence the lint allowances.
 
+pub mod platform_server;
 mod test_stores;
 
 use std::path::{Path, PathBuf};
@@ -151,7 +152,9 @@ where
 {
     use std::time::Duration;
 
-    const DEADLINE: Duration = Duration::from_secs(2);
+    // Generous on purpose: coverage-instrumented builds under full test
+    // parallelism deliver slower, and the wait ends as soon as the value arrives.
+    const DEADLINE: Duration = Duration::from_secs(10);
     const FIRST_BACKOFF: Duration = Duration::from_millis(10);
     const MAX_BACKOFF: Duration = Duration::from_millis(100);
 

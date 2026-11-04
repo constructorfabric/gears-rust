@@ -10,11 +10,9 @@ use futures_util::StreamExt;
 use http::{HeaderMap, HeaderValue};
 use oagw_sdk::body::{Body, BodyStream};
 use oagw_sdk::{field, reason};
-use pingora_core::apps::HttpServerApp;
-use pingora_proxy::HttpProxy;
-use tokio::io::AsyncWriteExt;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
+use toolkit_http_proxy::{ReplayableBody, UpgradeOutcome, empty_body, full_body, stream_body};
 use toolkit_security::SecurityContext;
 
 use uuid::Uuid;
@@ -40,12 +38,9 @@ use crate::domain::services::{
 use crate::infra::plugin::{AuthPluginRegistry, GuardPluginRegistry, TransformPluginRegistry};
 use crate::infra::proxy::{actions, resources};
 
+use super::engine::{ProxyEngine, into_body_stream, map_proxy_error};
 use super::headers;
-use super::pingora_proxy::{
-    H_ENDPOINT_HOST, H_ENDPOINT_PORT, H_ENDPOINT_SCHEME, H_INSTANCE_URI, H_RESOLVED_ADDR,
-    H_UPSTREAM_ID, PingoraProxy,
-};
-use super::{request_builder, session_bridge};
+use super::{request_builder, streaming};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// Default maximum request body size: 100 MB.
@@ -57,7 +52,7 @@ const RATE_LIMIT_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 pub struct DataPlaneServiceImpl {
     cp: Arc<dyn ControlPlaneService>,
     backend_selector: Arc<dyn EndpointSelector>,
-    proxy: Arc<HttpProxy<PingoraProxy>>,
+    engine: Arc<ProxyEngine>,
     /// Sender kept alive so receivers see `false` (not shutting down) until drop.
     _shutdown_tx: watch::Sender<bool>,
     shutdown_rx: watch::Receiver<bool>,
@@ -92,7 +87,7 @@ impl DataPlaneServiceImpl {
         token_http_config: Option<toolkit_http::HttpClientConfig>,
         token_cache_config: TokenCacheConfig,
         backend_selector: Arc<dyn EndpointSelector>,
-        proxy: Arc<HttpProxy<PingoraProxy>>,
+        engine: Arc<ProxyEngine>,
         metrics: Arc<dyn OagwMetricsPort>,
     ) -> Self {
         let auth_registry =
@@ -105,7 +100,7 @@ impl DataPlaneServiceImpl {
         Self {
             cp,
             backend_selector,
-            proxy,
+            engine,
             _shutdown_tx: shutdown_tx,
             shutdown_rx,
             auth_registry,
@@ -242,6 +237,9 @@ impl DataPlaneServiceImpl {
         resp_body_stream: BodyStream,
         instance_uri: String,
     ) -> Result<http::Response<Body>, DomainError> {
+        // Decided on the upstream's headers, as in `forward`, so header rules
+        // cannot take an SSE body out of its idle timeout.
+        let is_sse = oagw_sdk::sse::is_server_events_response(&resp_headers);
         execute_guard_responses(
             &self.guard_registry,
             &pipeline.guard_bindings,
@@ -260,8 +258,8 @@ impl DataPlaneServiceImpl {
 
         // Apply streaming lifecycle management for SSE responses:
         // idle timeout and graceful shutdown awareness.
-        let resp_body_stream = if oagw_sdk::sse::is_server_events_response(&resp_headers) {
-            session_bridge::streaming_body_with_lifecycle(
+        let resp_body_stream = if is_sse {
+            streaming::streaming_body_with_lifecycle(
                 resp_body_stream,
                 self.streaming_idle_timeout,
                 self.shutdown_rx.clone(),
@@ -337,8 +335,8 @@ impl DataPlaneServiceImpl {
 
         // Tier 2: Automatic selection.
         if endpoints.len() == 1 {
-            // Single-endpoint: bypass LB. `resolved_addr` is None, so
-            // `upstream_peer` will fall back to DNS on the request path.
+            // Single-endpoint: bypass LB. `resolved_addr` is None, so the
+            // engine adapter resolves DNS (SSRF-filtered) on the request path.
             // Acceptable trade-off: single-endpoint upstreams don't benefit
             // from health-checked LB selection anyway.
             return Ok(SelectedEndpoint {
@@ -576,11 +574,29 @@ impl DataPlaneService for DataPlaneServiceImpl {
 
             let max_body = self.max_body_size;
 
-            // 1. Resolve upstream + route in one pass (single hierarchy walk).
-            let (upstream, route) = self
+            // 1. Resolve upstream + route in one pass (single hierarchy walk),
+            //    timed: phase="resolve".
+            //
+            // Recorded on the error path too, under the unknown labels: a
+            // request that did not resolve has no upstream or route to name.
+            let resolve_start = Instant::now();
+            let resolved = self
                 .cp
                 .resolve_proxy_target(&ctx, &alias, method.as_ref(), &path_suffix, Tags::Skip)
-                .await?;
+                .await;
+            let resolve_seconds = resolve_start.elapsed().as_secs_f64();
+            let (upstream, route) = match resolved {
+                Ok(target) => target,
+                Err(e) => {
+                    self.metrics.record_request_duration_seconds(
+                        metric_labels::UNKNOWN,
+                        metric_labels::UNKNOWN,
+                        phase::RESOLVE,
+                        resolve_seconds,
+                    );
+                    return Err(e);
+                }
+            };
 
             // Capture metric labels now that upstream + route are known, and
             // begin tracking this request in the in-flight gauge via the
@@ -593,6 +609,12 @@ impl DataPlaneService for DataPlaneServiceImpl {
                 .map_or("/", |h| h.path.as_str())
                 .to_owned();
             guard.mark_resolved(host_label.clone(), path_label.clone());
+            self.metrics.record_request_duration_seconds(
+                &host_label,
+                &path_label,
+                phase::RESOLVE,
+                resolve_seconds,
+            );
 
         // 2. CORS origin enforcement for actual cross-origin requests.
         // Preflight is handled permissively at the handler level (no upstream resolution).
@@ -760,9 +782,21 @@ impl DataPlaneService for DataPlaneServiceImpl {
         .await;
 
         // 6. Endpoint selection (two-tier: target-host header or round-robin).
-        let selected = self
-            .select_endpoint(&upstream, &req_headers, &instance_uri)
-            .await?;
+        // The request timeout covers selection (a first selection resolves
+        // the endpoints), target resolution and the exchange together.
+        let deadline = tokio::time::Instant::now() + self.request_timeout;
+        let selected = tokio::time::timeout_at(
+            deadline,
+            self.select_endpoint(&upstream, &req_headers, &instance_uri),
+        )
+        .await
+        .map_err(|_| DomainError::RequestTimeout {
+            detail: format!(
+                "selecting an endpoint timed out after {:?}",
+                self.request_timeout
+            ),
+            instance: instance_uri.clone(),
+        })??;
         let endpoint = &selected.endpoint;
 
         // 6b. Enforce HTTPS-only upstream constraint.
@@ -806,32 +840,17 @@ impl DataPlaneService for DataPlaneServiceImpl {
             &query_params,
         )?;
 
-        // 8b. Inject internal context headers for PingoraProxy.
-        let scheme_str = match endpoint.scheme {
-            Scheme::Http => "http",
-            Scheme::Https => "https",
-            Scheme::Wss => "wss",
-            Scheme::Wt => "wt",
-            Scheme::Grpc => "grpc",
-        };
-        if let Ok(v) = HeaderValue::from_str(&upstream.id.to_string()) {
-            outbound_headers.insert(H_UPSTREAM_ID, v);
-        }
-        if let Ok(v) = HeaderValue::from_str(&endpoint.host) {
-            outbound_headers.insert(H_ENDPOINT_HOST, v);
-        }
-        if let Ok(v) = HeaderValue::from_str(&endpoint.port.to_string()) {
-            outbound_headers.insert(H_ENDPOINT_PORT, v);
-        }
-        outbound_headers.insert(H_ENDPOINT_SCHEME, HeaderValue::from_static(scheme_str));
-        if let Ok(v) = HeaderValue::from_str(&instance_uri) {
-            outbound_headers.insert(H_INSTANCE_URI, v);
-        }
-        if let Some(addr) = selected.resolved_addr
-            && let Ok(v) = HeaderValue::from_str(&addr.to_string())
-        {
-            outbound_headers.insert(H_RESOLVED_ADDR, v);
-        }
+        // 8b. Engine target: the LB's pre-resolved address, or DNS with the
+        // SSRF policy for target-host / single-endpoint selection.
+        let target = tokio::time::timeout_at(deadline, self.engine.target(&selected, &instance_uri))
+            .await
+            .map_err(|_| DomainError::RequestTimeout {
+                detail: format!(
+                    "resolving {} timed out after {:?}",
+                    endpoint.host, self.request_timeout
+                ),
+                instance: instance_uri.clone(),
+            })??;
 
         let response_header_rules = upstream
             .headers
@@ -851,11 +870,13 @@ impl DataPlaneService for DataPlaneServiceImpl {
             host: &host_label,
         };
 
-        // 9. WebSocket upgrade: bypass the normal bridge and set up a
-        // bidirectional raw-byte tunnel through Pingora.
+        // 9. WebSocket upgrade: tunnel on a dedicated upstream connection,
+        // only after the upstream switched protocols.
         if is_upgrade {
             return self
                 .handle_websocket_upgrade(
+                    &target,
+                    deadline,
                     &method,
                     &url,
                     &outbound_headers,
@@ -865,9 +886,11 @@ impl DataPlaneService for DataPlaneServiceImpl {
                 .await;
         }
 
-        // 10. Bridge request into Pingora and read response.
+        // 10. Forward the request through the engine.
         let upstream_result = self
-            .bridge_and_respond(
+            .forward(
+                &target,
+                deadline,
                 &method,
                 &url,
                 &outbound_headers,
@@ -946,59 +969,58 @@ async fn sweep_rate_limits(
 
 /// Private helpers for the proxy pipeline.
 impl DataPlaneServiceImpl {
-    /// Handle a WebSocket upgrade request through the Pingora bridge.
+    /// Handle a WebSocket upgrade request.
     ///
-    /// Sets up a bidirectional raw-byte tunnel, writes the upgrade request,
-    /// validates the 101 response, runs response guards, and returns the
-    /// upgraded response with the bridge IO stashed in extensions.
+    /// The engine opens a dedicated HTTP/1.1 connection, forwards the
+    /// handshake and hands out the raw tunnel only after the upstream
+    /// answered `101 Switching Protocols`. Response guards and the response
+    /// pipeline run on the 101; the tunnel travels to the handler in the
+    /// response extensions.
+    #[allow(clippy::too_many_arguments)]
     async fn handle_websocket_upgrade(
         &self,
+        target: &toolkit_http_proxy::Target,
+        deadline: tokio::time::Instant,
         method: &http::Method,
         url: &str,
         outbound_headers: &HeaderMap,
         pipeline: &ResponsePipelineCtx<'_>,
         instance_uri: &str,
     ) -> Result<http::Response<Body>, DomainError> {
-        let (mut client_io, server_io) = tokio::io::duplex(65_536);
-        let session = pingora_core::protocols::http::ServerSession::new_http1(Box::new(server_io));
-        let proxy = self.proxy.clone();
-        let shutdown = self.shutdown_rx.clone();
-        tokio::spawn(async move {
-            proxy.process_new_http(session, &shutdown).await;
-        });
+        let mut headers = outbound_headers.clone();
+        // Passthrough may have dropped `Connection`; the handshake needs it.
+        headers.insert(
+            http::header::CONNECTION,
+            HeaderValue::from_static("upgrade"),
+        );
+        let req = build_outbound_request(method, url, headers, empty_body(), instance_uri)?;
 
-        // Write the upgrade request (Connection: Upgrade, no body).
-        let wire = session_bridge::serialize_upgrade_request_wire(method, url, outbound_headers);
-        client_io
-            .write_all(&wire)
-            .await
-            .map_err(|e| DomainError::DownstreamError {
-                detail: format!("failed to write upgrade request to proxy bridge: {e}"),
-                instance: instance_uri.to_string(),
-            })?;
-
-        // Parse only the response headers (IO stays intact for bidirectional copy).
         let upgrade_timeout = self.request_timeout;
-        let (status, resp_headers, leftover) = tokio::time::timeout(
-            upgrade_timeout,
-            session_bridge::parse_upgrade_response(&mut client_io),
-        )
-        .await
-        .map_err(|_| DomainError::RequestTimeout {
-            detail: format!("WebSocket upgrade to {url} timed out after {upgrade_timeout:?}"),
-            instance: instance_uri.to_string(),
-        })?
-        .map_err(|e| DomainError::DownstreamError {
-            detail: format!("proxy bridge error during WebSocket upgrade: {e}"),
-            instance: instance_uri.to_string(),
-        })?;
-
-        if status != http::StatusCode::SWITCHING_PROTOCOLS {
-            return Err(DomainError::ProtocolError {
-                detail: format!("upstream rejected WebSocket upgrade with status {status}"),
+        let outcome = tokio::time::timeout_at(deadline, self.engine.client().upgrade(target, req))
+            .await
+            .map_err(|_| DomainError::RequestTimeout {
+                // No URL: its query string may carry credentials.
+                detail: format!("upstream WebSocket upgrade timed out after {upgrade_timeout:?}"),
                 instance: instance_uri.to_string(),
-            });
-        }
+            })?
+            .map_err(|e| map_proxy_error(&e, instance_uri))?;
+
+        let (response, io) = match outcome {
+            UpgradeOutcome::Switched { response, io } => (response, io),
+            UpgradeOutcome::Rejected(resp) => {
+                return Err(DomainError::ProtocolError {
+                    detail: format!(
+                        "upstream rejected WebSocket upgrade with status {}",
+                        resp.status()
+                    ),
+                    instance: instance_uri.to_string(),
+                });
+            }
+        };
+        let status = response.status();
+        let mut resp_headers = response.into_parts().0.headers;
+        // Upstreams must never be able to forge gateway-internal headers.
+        headers::strip_internal_headers(&mut resp_headers);
 
         // Execute response guards on the 101.
         execute_guard_responses(
@@ -1016,12 +1038,11 @@ impl DataPlaneServiceImpl {
         // Run response transforms first, then sanitize — ensures transforms
         // cannot reintroduce hop-by-hop or body-related headers that would
         // break the 101 tunnel contract.
-        let mut resp_headers = resp_headers;
         self.apply_response_pipeline(pipeline, status, &mut resp_headers)
             .await;
         headers::sanitize_response_headers_for_upgrade(&mut resp_headers);
 
-        // Build the 101 response with the DuplexStream stashed in extensions.
+        // Build the 101 response with the upstream tunnel stashed in extensions.
         let mut resp = http::Response::builder()
             .status(http::StatusCode::SWITCHING_PROTOCOLS)
             .body(Body::Empty)
@@ -1032,8 +1053,8 @@ impl DataPlaneServiceImpl {
         resp.extensions_mut()
             .insert(super::websocket::WebSocketBridgeHandle::new(
                 super::websocket::WebSocketBridgeIo {
-                    io: client_io,
-                    leftover,
+                    io: hyper_util::rt::TokioIo::new(io),
+                    leftover: Bytes::new(),
                     idle_timeout: self.websocket_idle_timeout,
                     close_timeout: self.websocket_close_timeout,
                     shutdown_rx: self.shutdown_rx.clone(),
@@ -1044,15 +1065,17 @@ impl DataPlaneServiceImpl {
         Ok(resp)
     }
 
-    /// Bridge a request into Pingora via in-memory DuplexStream and read the
-    /// response.
+    /// Forward a request through the engine and run the response pipeline.
     ///
-    /// Handles both streaming (chunked) and buffered request bodies. The
-    /// streaming path spawns a body-forwarding task that enforces
-    /// `max_body_size` and signals 413 or abort on failures.
+    /// Buffered bodies go out with `Content-Length`; streaming bodies are
+    /// forwarded chunk by chunk with `max_body` enforced on the fly. A body
+    /// that breaches the limit (413) or fails mid-stream aborts the upstream
+    /// request without completing its framing.
     #[allow(clippy::too_many_arguments)]
-    async fn bridge_and_respond(
+    async fn forward(
         &self,
+        target: &toolkit_http_proxy::Target,
+        deadline: tokio::time::Instant,
         method: &http::Method,
         url: &str,
         outbound_headers: &HeaderMap,
@@ -1062,185 +1085,151 @@ impl DataPlaneServiceImpl {
         pipeline: &ResponsePipelineCtx<'_>,
         instance_uri: &str,
     ) -> Result<http::Response<Body>, DomainError> {
-        let (client_io, server_io) = tokio::io::duplex(65_536);
-
-        // Create Pingora H1 session from the server side of the DuplexStream.
-        // Pingora implements all IO traits for DuplexStream (in ext_io_impl).
-        let session = pingora_core::protocols::http::ServerSession::new_http1(Box::new(server_io));
-
-        // Spawn Pingora proxy processing in background.
-        let proxy = self.proxy.clone();
-        let shutdown = self.shutdown_rx.clone();
-        tokio::spawn(async move {
-            proxy.process_new_http(session, &shutdown).await;
-        });
+        let body_state = Arc::new(StreamedBodyState::default());
+        let (body, replay) = match body_stream {
+            Some(stream) => (
+                stream_body(limit_body_stream(stream, max_body, Arc::clone(&body_state))),
+                None,
+            ),
+            // A buffered body can be sent again if the upstream provably did
+            // not process the request (the engine decides when).
+            None => (full_body(body_bytes.clone()), Some(body_bytes)),
+        };
+        let mut req =
+            build_outbound_request(method, url, outbound_headers.clone(), body, instance_uri)?;
+        if let Some(bytes) = replay {
+            req.extensions_mut().insert(ReplayableBody(bytes));
+        }
 
         let timeout = self.request_timeout;
+        let outcome =
+            tokio::time::timeout_at(deadline, self.engine.client().send(target, req)).await;
 
-        if let Some(mut body_stream) = body_stream {
-            // Streaming path: write headers, then forward body chunks concurrently.
-            let (client_read, mut client_write) = tokio::io::split(client_io);
-
-            let header_bytes =
-                session_bridge::serialize_request_wire(method, url, outbound_headers, None);
-            client_write.write_all(&header_bytes).await.map_err(|e| {
-                DomainError::DownstreamError {
-                    detail: format!("failed to write to proxy bridge: {e}"),
-                    instance: instance_uri.to_string(),
-                }
+        // A failure on our side of the body wins over whatever the upstream
+        // made of the aborted request.
+        if let Some(err) = body_state.failure(max_body, instance_uri) {
+            return Err(err);
+        }
+        let resp = outcome
+            .map_err(|_| DomainError::RequestTimeout {
+                // No URL: its query string may carry credentials.
+                detail: format!("upstream request timed out after {timeout:?}"),
+                instance: instance_uri.to_string(),
+            })?
+            .map_err(|e| {
+                tracing::warn!(
+                    method = %method,
+                    path = pipeline.path_suffix,
+                    error = %e,
+                    "Proxy request failed"
+                );
+                map_proxy_error(&e, instance_uri)
             })?;
 
-            // Spawn task to forward body stream chunks with chunked encoding.
-            // Enforce max_body_size on the streaming path: signal 413 if exceeded.
-            // Signal abort on stream/write errors so the main select! can fail
-            // fast instead of waiting for the full request timeout.
-            let (limit_tx, limit_rx) = tokio::sync::oneshot::channel::<usize>();
-            let (abort_tx, abort_rx) = tokio::sync::oneshot::channel::<String>();
-            let body_instance_uri = instance_uri.to_string();
-            tokio::spawn(async move {
-                let mut total_bytes: usize = 0;
-                let mut exceeded = false;
-                while let Some(chunk) = body_stream.next().await {
-                    match chunk {
-                        Ok(bytes) if !bytes.is_empty() => {
-                            total_bytes = total_bytes.saturating_add(bytes.len());
-                            if total_bytes > max_body {
-                                tracing::warn!(
-                                    total_bytes,
-                                    max_body,
-                                    "streaming body exceeded max size, aborting"
-                                );
-                                exceeded = true;
-                                break;
-                            }
-                            // Chunked transfer encoding: {size_hex}\r\n{data}\r\n
-                            let chunk_header = format!("{:x}\r\n", bytes.len());
-                            if let Err(e) = client_write.write_all(chunk_header.as_bytes()).await {
-                                tracing::debug!(error = %e, "body stream write error");
-                                let _ = abort_tx.send(format!("body stream write error: {e}"));
-                                return;
-                            }
-                            if let Err(e) = client_write.write_all(&bytes).await {
-                                tracing::debug!(error = %e, "body stream write error");
-                                let _ = abort_tx.send(format!("body stream write error: {e}"));
-                                return;
-                            }
-                            if let Err(e) = client_write.write_all(b"\r\n").await {
-                                tracing::debug!(error = %e, "body stream write error");
-                                let _ = abort_tx.send(format!("body stream write error: {e}"));
-                                return;
-                            }
-                        }
-                        Ok(_) => {} // skip empty chunks
-                        Err(e) => {
-                            tracing::debug!(error = %e, "body stream chunk error");
-                            let _ = abort_tx.send(format!("body stream read error: {e}"));
-                            return;
-                        }
-                    }
-                }
-                if exceeded {
-                    // Shutdown sends EOF to Pingora's read side before we
-                    // signal the limit breach (drop alone won't close the pipe).
-                    let _ = client_write.shutdown().await;
-                    let _ = limit_tx.send(total_bytes);
-                } else {
-                    // Chunked terminator: signals end-of-body to Pingora.
-                    // Only written after a clean end-of-stream — not after
-                    // write failures or stream errors, where the body is
-                    // incomplete and signalling clean EOF would be wrong.
-                    let _ = client_write.write_all(b"0\r\n\r\n").await;
-                    // Do NOT call shutdown() here — Pingora still needs the
-                    // duplex open to send the response. The chunked terminator
-                    // is sufficient to signal end-of-body. Calling shutdown()
-                    // on the write half of a DuplexStream closes it for the
-                    // peer's read, which can cause Pingora to see EOF before
-                    // it finishes proxying (especially with fast streams).
-                }
-            });
+        let (parts, mut body) = resp.into_parts();
+        // SSE streams may stay silent longer than the read timeout; the
+        // streaming lifecycle in `finalize_response` owns their idle timeout.
+        if oagw_sdk::sse::is_server_events_response(&parts.headers) {
+            body.set_idle_timeout(None);
+        }
+        let mut resp_headers = parts.headers;
+        // Upstreams must never be able to forge gateway-internal headers
+        // (e.g. `x-oagw-error-source: gateway`).
+        headers::strip_internal_headers(&mut resp_headers);
+        self.finalize_response(
+            pipeline,
+            parts.status,
+            resp_headers,
+            into_body_stream(body),
+            instance_uri.to_string(),
+        )
+        .await
+    }
+}
 
-            // Parse response from the read half, but short-circuit to 413
-            // if the body-forwarding task signals a limit breach.
-            let resp_future =
-                tokio::time::timeout(timeout, session_bridge::parse_response_stream(client_read));
-            tokio::select! {
-                biased;
-                Ok(total) = limit_rx => {
-                    Err(DomainError::PayloadTooLarge {
-                        detail: format!(
-                            "streaming request body of {total} bytes exceeds maximum of {max_body} bytes"
-                        ),
-                        instance: body_instance_uri,
-                    })
-                }
-                Ok(reason) = abort_rx => {
-                    Err(DomainError::DownstreamError {
-                        detail: format!("streaming request body failed mid-stream: {reason}"),
-                        instance: body_instance_uri,
-                    })
-                }
-                result = resp_future => {
-                    let (status, resp_headers, resp_body_stream) = result
-                        .map_err(|_| DomainError::RequestTimeout {
-                            detail: format!("request to {url} timed out after {timeout:?}"),
-                            instance: instance_uri.to_string(),
-                        })?
-                        .map_err(|e| DomainError::DownstreamError {
-                            detail: format!("proxy bridge error: {e}"),
-                            instance: instance_uri.to_string(),
-                        })?;
-                    self.finalize_response(
-                        pipeline,
-                        status,
-                        resp_headers,
-                        resp_body_stream,
-                        instance_uri.to_string(),
-                    )
-                    .await
+/// Build the outbound request handed to the engine.
+fn build_outbound_request(
+    method: &http::Method,
+    url: &str,
+    headers: HeaderMap,
+    body: toolkit_http_proxy::ProxyBody,
+    instance_uri: &str,
+) -> Result<http::Request<toolkit_http_proxy::ProxyBody>, DomainError> {
+    let mut req = http::Request::builder()
+        .method(method.clone())
+        .uri(url)
+        .body(body)
+        .map_err(|e| DomainError::DownstreamError {
+            detail: format!("invalid upstream request: {e}"),
+            instance: instance_uri.to_string(),
+        })?;
+    *req.headers_mut() = headers;
+    Ok(req)
+}
+
+/// What happened on our side of a streamed request body.
+#[derive(Default)]
+struct StreamedBodyState {
+    /// Total bytes when the limit was breached.
+    exceeded: std::sync::OnceLock<usize>,
+    /// Why the client's body stream failed.
+    failed: std::sync::OnceLock<String>,
+}
+
+impl StreamedBodyState {
+    fn failure(&self, max_body: usize, instance_uri: &str) -> Option<DomainError> {
+        if let Some(total) = self.exceeded.get() {
+            return Some(DomainError::PayloadTooLarge {
+                detail: format!(
+                    "streaming request body of {total} bytes exceeds maximum of {max_body} bytes"
+                ),
+                instance: instance_uri.to_string(),
+            });
+        }
+        self.failed
+            .get()
+            .map(|reason| DomainError::DownstreamError {
+                detail: format!("streaming request body failed mid-stream: {reason}"),
+                instance: instance_uri.to_string(),
+            })
+    }
+}
+
+/// Enforce `max_body` on a streamed request body, recording failures in
+/// `state`. Empty chunks are dropped. A breach or a stream error ends the
+/// stream with an error, which aborts the upstream request without a
+/// terminating chunk.
+fn limit_body_stream(
+    stream: BodyStream,
+    max_body: usize,
+    state: Arc<StreamedBodyState>,
+) -> impl futures_util::Stream<Item = Result<Bytes, oagw_sdk::body::BoxError>> + Send {
+    let mut total: usize = 0;
+    stream.filter_map(move |chunk| {
+        let item = match chunk {
+            Ok(bytes) if bytes.is_empty() => None,
+            Ok(bytes) => {
+                total = total.saturating_add(bytes.len());
+                if total > max_body {
+                    tracing::warn!(
+                        total_bytes = total,
+                        max_body,
+                        "streaming body exceeded max size, aborting"
+                    );
+                    let _ = state.exceeded.set(total);
+                    Some(Err("request body exceeds the configured limit".into()))
+                } else {
+                    Some(Ok(bytes))
                 }
             }
-        } else {
-            // Buffered path: write full request then read response.
-            let wire = session_bridge::serialize_request_wire(
-                method,
-                url,
-                outbound_headers,
-                Some(&body_bytes),
-            );
-            let mut client_io = client_io;
-            client_io
-                .write_all(&wire)
-                .await
-                .map_err(|e| DomainError::DownstreamError {
-                    detail: format!("failed to write to proxy bridge: {e}"),
-                    instance: instance_uri.to_string(),
-                })?;
-            // Do NOT shutdown the write side — Pingora uses Content-Length to
-            // determine the request boundary, and an early write-close is
-            // misinterpreted as "downstream dropped the connection".
-
-            let (status, resp_headers, resp_body_stream) =
-                tokio::time::timeout(timeout, session_bridge::parse_response_stream(client_io))
-                    .await
-                    .map_err(|_| DomainError::RequestTimeout {
-                        detail: format!("request to {url} timed out after {timeout:?}"),
-                        instance: instance_uri.to_string(),
-                    })?
-                    .map_err(|e| DomainError::DownstreamError {
-                        detail: format!("proxy bridge error: {e}"),
-                        instance: instance_uri.to_string(),
-                    })?;
-
-            self.finalize_response(
-                pipeline,
-                status,
-                resp_headers,
-                resp_body_stream,
-                instance_uri.to_string(),
-            )
-            .await
-        }
-    }
+            Err(e) => {
+                tracing::debug!(error = %e, "body stream chunk error");
+                let _ = state.failed.set(format!("body stream read error: {e}"));
+                Some(Err(e))
+            }
+        };
+        std::future::ready(item)
+    })
 }
 
 /// Execute the auth plugin for the upstream, mutating outbound headers with
@@ -1936,6 +1925,16 @@ mod tests {
         selector: Arc<dyn EndpointSelector>,
         metrics: Arc<dyn OagwMetricsPort>,
     ) -> DataPlaneServiceImpl {
+        build_svc_resolving(selector, metrics, None)
+    }
+
+    /// Like [`build_svc_with_metrics`], with a CP whose `resolve_proxy_target`
+    /// returns `resolved`, or "not found" when it is `None`.
+    fn build_svc_resolving(
+        selector: Arc<dyn EndpointSelector>,
+        metrics: Arc<dyn OagwMetricsPort>,
+        resolved: Option<(Upstream, crate::domain::model::Route)>,
+    ) -> DataPlaneServiceImpl {
         use authz_resolver_sdk::{
             AuthZResolverApi, EvaluationRequest, EvaluationResponse, EvaluationResponseContext,
             PolicyEnforcer,
@@ -1966,12 +1965,12 @@ mod tests {
             Arc::new(credstore_sdk::test_util::MockCredStoreClient::empty());
         let policy_enforcer = PolicyEnforcer::new(Arc::new(AllowAllAuthZ));
 
-        // Minimal CP — never called by select_endpoint().
+        // Minimal CP — only the proxy lookup is implemented.
         use crate::domain::error::DomainError;
         use crate::domain::model::*;
         use crate::domain::services::ControlPlaneService;
 
-        struct NoopCp;
+        struct NoopCp(Option<(Upstream, Route)>);
         #[async_trait]
         impl ControlPlaneService for NoopCp {
             async fn create_upstream(
@@ -2047,22 +2046,27 @@ mod tests {
                 _: &str,
                 _: Tags,
             ) -> Result<(Upstream, Route), DomainError> {
-                unimplemented!()
+                self.0
+                    .clone()
+                    .ok_or_else(|| DomainError::not_found("upstream", Uuid::nil()))
             }
         }
 
-        let cp: Arc<dyn ControlPlaneService> = Arc::new(NoopCp);
-        let server_conf = Arc::new(pingora_core::server::configuration::ServerConf::default());
-        let pingora = crate::infra::proxy::pingora_proxy::PingoraProxy::new(
-            Duration::from_secs(10),
-            Duration::from_secs(30),
-            Duration::from_secs(3600),
-            Arc::new(crate::domain::ssrf::SsrfGuard::disabled()),
+        let cp: Arc<dyn ControlPlaneService> = Arc::new(NoopCp(resolved));
+        crate::domain::test_support::ensure_crypto_provider();
+        let engine = Arc::new(
+            crate::infra::proxy::engine::ProxyEngine::new(
+                &crate::infra::proxy::engine::EngineSettings {
+                    connect_timeout: Duration::from_secs(10),
+                    read_timeout: Duration::from_secs(30),
+                    protocol_cache_ttl: Duration::from_secs(3600),
+                    #[cfg(feature = "test-utils")]
+                    skip_upstream_tls_verify: false,
+                },
+                Arc::new(crate::domain::ssrf::SsrfGuard::disabled()),
+            )
+            .expect("test proxy engine"),
         );
-        let proxy = Arc::new(crate::infra::proxy::pingora_proxy::new_http_proxy(
-            &server_conf,
-            pingora,
-        ));
 
         DataPlaneServiceImpl::new(
             cp,
@@ -2071,7 +2075,7 @@ mod tests {
             None,
             TokenCacheConfig::default(),
             selector,
-            proxy,
+            engine,
             metrics,
         )
     }
@@ -2351,6 +2355,166 @@ mod tests {
             .unwrap();
     }
 
+    /// Keeps only the request-duration observations.
+    #[derive(Default)]
+    struct DurationRecorder(std::sync::Mutex<Vec<(String, String, String)>>);
+
+    impl DurationRecorder {
+        fn phases(&self, phase: &str) -> Vec<(String, String)> {
+            self.0
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(_, _, p)| p == phase)
+                .map(|(host, path, _)| (host.clone(), path.clone()))
+                .collect()
+        }
+    }
+
+    impl OagwMetricsPort for DurationRecorder {
+        fn record_request(&self, _: &str, _: &str, _: &str, _: u16) {}
+        fn record_error(&self, _: &str, _: &str, _: &str) {}
+        fn record_request_duration_seconds(&self, host: &str, path: &str, phase: &str, _: f64) {
+            self.0
+                .lock()
+                .unwrap()
+                .push((host.to_owned(), path.to_owned(), phase.to_owned()));
+        }
+        fn increment_in_flight(&self, _: &str) {}
+        fn decrement_in_flight(&self, _: &str) {}
+        fn record_rate_limit_exceeded(&self, _: &str, _: &str) {}
+        fn record_rate_limit_usage_ratio(&self, _: &str, _: &str, _: f64) {}
+        fn increment_active_websocket_sessions(&self, _: &str) {}
+        fn decrement_active_websocket_sessions(&self, _: &str) {}
+        fn record_websocket_session_duration_seconds(&self, _: &str, _: f64) {}
+        fn record_rate_limit_sweep(&self, _: u64, _: u64) {}
+        fn record_registry_provisioning_failure(&self, _: &str, _: &str) {}
+        fn record_registry_provisioning_run(&self, _: &str) {}
+        fn record_credential_withheld(&self, _: &str, _: &'static str) {}
+        fn record_proxy_cache_lookup(
+            &self,
+            _: crate::domain::ports::metric_labels::CacheMap,
+            _: crate::domain::ports::metric_labels::CacheLookup,
+        ) {
+        }
+        fn record_proxy_cache_entries(
+            &self,
+            _: crate::domain::ports::metric_labels::CacheMap,
+            _: u64,
+        ) {
+        }
+        fn record_proxy_cache_evictions(
+            &self,
+            _: crate::domain::ports::metric_labels::CacheMap,
+            _: crate::domain::ports::metric_labels::CacheEviction,
+            _: u64,
+        ) {
+        }
+        fn record_proxy_cache_change(&self, _: &str) {}
+        fn record_proxy_cache_flush(&self, _: &str) {}
+        fn record_proxy_cache_load_discarded(
+            &self,
+            _: crate::domain::ports::metric_labels::CacheMap,
+        ) {
+        }
+        fn record_proxy_cache_stale_served(
+            &self,
+            _: crate::domain::ports::metric_labels::CacheMap,
+            _: crate::domain::ports::metric_labels::CacheStale,
+        ) {
+        }
+        fn record_proxy_cache_publish_failures(&self, _: &str, _: u64) {}
+    }
+
+    fn test_ctx() -> SecurityContext {
+        SecurityContext::builder()
+            .subject_tenant_id(Uuid::new_v4())
+            .subject_id(Uuid::new_v4())
+            .build()
+            .expect("test security context")
+    }
+
+    fn proxy_get(uri: &str) -> http::Request<Body> {
+        http::Request::builder()
+            .method(http::Method::GET)
+            .uri(uri)
+            .body(Body::Empty)
+            .unwrap()
+    }
+
+    /// A resolved request records the `resolve` phase once, under the
+    /// upstream's alias and the route's path.
+    #[tokio::test]
+    async fn resolve_phase_recorded_with_resolved_labels() {
+        use crate::domain::model::{HttpMatch, HttpMethod, MatchRules, Route};
+
+        let upstream = upstream_with(vec![Endpoint {
+            scheme: Scheme::Https,
+            host: "127.0.0.1".into(),
+            port: 1,
+        }]);
+        let route = Route {
+            id: Uuid::new_v4(),
+            tenant_id: upstream.tenant_id,
+            upstream_id: upstream.id,
+            match_rules: MatchRules {
+                http: Some(HttpMatch {
+                    methods: vec![HttpMethod::Get],
+                    path: "/v1".into(),
+                    query_allowlist: vec![],
+                    path_suffix_mode: PathSuffixMode::Append,
+                }),
+                grpc: None,
+            },
+            plugins: None,
+            rate_limit: None,
+            cors: None,
+            tags: vec![],
+            priority: 0,
+            enabled: true,
+            managed_by: ManagedBy::Api,
+        };
+        let metrics = Arc::new(DurationRecorder::default());
+        let svc = build_svc_resolving(
+            Arc::new(MockSelector::new()),
+            metrics.clone(),
+            Some((upstream, route)),
+        );
+
+        // The query parameter is not allowlisted: the request fails right
+        // after resolution, before any network call.
+        let err = svc
+            .proxy_request(test_ctx(), proxy_get("/test/v1/chat?x=1"))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, DomainError::Validation { .. }), "{err:?}");
+
+        assert_eq!(
+            metrics.phases(phase::RESOLVE),
+            vec![("test".to_owned(), "/v1".to_owned())]
+        );
+    }
+
+    /// A request that does not resolve still records the `resolve` phase,
+    /// under the unknown labels.
+    #[tokio::test]
+    async fn resolve_phase_recorded_when_resolution_fails() {
+        let metrics = Arc::new(DurationRecorder::default());
+        let svc = build_svc_resolving(Arc::new(MockSelector::new()), metrics.clone(), None);
+
+        let err = svc
+            .proxy_request(test_ctx(), proxy_get("/missing/v1/chat"))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, DomainError::NotFound { .. }), "{err:?}");
+
+        let unknown = metric_labels::UNKNOWN.to_owned();
+        assert_eq!(
+            metrics.phases(phase::RESOLVE),
+            vec![(unknown.clone(), unknown)]
+        );
+    }
+
     /// Keeps only what the sweep reports.
     #[derive(Default)]
     struct SweepRecorder(std::sync::Mutex<Vec<(u64, u64)>>);
@@ -2371,6 +2535,40 @@ mod tests {
         }
         fn record_registry_provisioning_failure(&self, _: &str, _: &str) {}
         fn record_registry_provisioning_run(&self, _: &str) {}
+        fn record_credential_withheld(&self, _: &str, _: &'static str) {}
+        fn record_proxy_cache_lookup(
+            &self,
+            _: crate::domain::ports::metric_labels::CacheMap,
+            _: crate::domain::ports::metric_labels::CacheLookup,
+        ) {
+        }
+        fn record_proxy_cache_entries(
+            &self,
+            _: crate::domain::ports::metric_labels::CacheMap,
+            _: u64,
+        ) {
+        }
+        fn record_proxy_cache_evictions(
+            &self,
+            _: crate::domain::ports::metric_labels::CacheMap,
+            _: crate::domain::ports::metric_labels::CacheEviction,
+            _: u64,
+        ) {
+        }
+        fn record_proxy_cache_change(&self, _: &str) {}
+        fn record_proxy_cache_flush(&self, _: &str) {}
+        fn record_proxy_cache_load_discarded(
+            &self,
+            _: crate::domain::ports::metric_labels::CacheMap,
+        ) {
+        }
+        fn record_proxy_cache_stale_served(
+            &self,
+            _: crate::domain::ports::metric_labels::CacheMap,
+            _: crate::domain::ports::metric_labels::CacheStale,
+        ) {
+        }
+        fn record_proxy_cache_publish_failures(&self, _: &str, _: u64) {}
     }
 
     /// The sweeper the gear spawns ticks every interval, reports evicted and

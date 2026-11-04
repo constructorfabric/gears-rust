@@ -9,7 +9,7 @@
 //! leaves nothing half-written.
 
 use std::collections::hash_map::Entry;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use async_trait::async_trait;
@@ -38,6 +38,7 @@ use crate::domain::scope::{CollectionMode, ScopeConfig};
 #[derive(Debug, Clone, Default)]
 pub struct SweptEnd {
     pub page1_etag: Option<String>,
+    pub stage_etags: BTreeMap<String, String>,
     pub head_sha: Option<String>,
 }
 
@@ -155,17 +156,11 @@ impl RunState {
     /// may be promoted. Independent of [`Self::completeness`]: a walk bounded
     /// by `updated_after` saw everything it asked for without seeing everything there
     /// is, so it may advance the watermark but not drive reconciliation.
-    fn mark_swept(&self, family: Family, page1_etag: Option<String>, head_sha: Option<String>) {
+    fn mark_swept(&self, family: Family, end: SweptEnd) {
         self.swept
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .insert(
-                family,
-                SweptEnd {
-                    page1_etag,
-                    head_sha,
-                },
-            );
+            .insert(family, end);
     }
 
     #[must_use]
@@ -278,6 +273,7 @@ impl MirrorWorker {
             return Ok(());
         }
         let run = &self.run;
+        run.options.telemetry.add_indexed(candidates.len());
         let items: Vec<(&str, &GateInputs)> = candidates
             .iter()
             .map(|candidate| (candidate.entity_id.as_str(), &candidate.inputs))
@@ -291,11 +287,12 @@ impl MirrorWorker {
                 entity,
                 &items,
                 Utc::now(),
-                run.options.force,
+                run.options.force.refetches_all(),
             )
             .await?;
         for (candidate, reason) in candidates.into_iter().zip(reasons) {
             let Some(reason) = reason else {
+                run.options.telemetry.add_skipped();
                 continue;
             };
             tracing::debug!(
@@ -325,7 +322,9 @@ impl MirrorWorker {
                 entity_id,
                 Utc::now(),
             )
-            .await
+            .await?;
+        run.options.telemetry.add_refined();
+        Ok(())
     }
 
     fn seed(
@@ -368,6 +367,9 @@ impl MirrorWorker {
         run.repo_id.set(stored.id).map_err(|_| {
             DomainError::internal("the repository was discovered twice in one sync")
         })?;
+        run.options.public_repo.set(!stored.private).map_err(|_| {
+            DomainError::internal("the repository was discovered twice in one sync")
+        })?;
         run.tally(|s| s.repository.clone_from(&stored.full_name));
 
         let objects = run.options.scope.objects;
@@ -403,12 +405,18 @@ impl MirrorWorker {
         let repo_id = run.repo_id()?;
         let start = self
             .watermark
-            .start_sweep(&run.scope, repo_id, Family::Issues, run.options.force)
+            .start_sweep(
+                &run.scope,
+                repo_id,
+                Family::Issues,
+                run.options.force.refetches_all(),
+            )
             .await?;
         let updated_after = start.updated_after;
         let collection = run.options.scope.collection;
         let mut high = updated_after;
         let mut page1_etag: Option<String> = None;
+        let mut stage_etags: BTreeMap<String, String> = BTreeMap::new();
         let mut swept: HashSet<i64> = HashSet::new();
         let mut continue_from: Option<String> = None;
 
@@ -420,6 +428,7 @@ impl MirrorWorker {
                     ListCursor {
                         updated_after,
                         page1_etag: start.page1_etag.as_deref(),
+                        stage_etags: Some(&start.stage_etags),
                         last_head_sha: None,
                         continue_from: continue_from.as_deref(),
                     },
@@ -430,8 +439,16 @@ impl MirrorWorker {
             if page1_etag.is_none() {
                 page1_etag.clone_from(&listing.page1_etag);
             }
+            stage_etags.extend(listing.stage_etag.take());
             if listing.swept_to_end && self.moves_watermarks() {
-                run.mark_swept(Family::Issues, page1_etag.clone(), None);
+                run.mark_swept(
+                    Family::Issues,
+                    SweptEnd {
+                        page1_etag: page1_etag.clone(),
+                        stage_etags: stage_etags.clone(),
+                        head_sha: None,
+                    },
+                );
             }
             let seen: Vec<&str> = listing
                 .issues
@@ -439,9 +456,6 @@ impl MirrorWorker {
                 .map(|i| i.updated_at.as_str())
                 .collect();
             high = high_water(&seen, high);
-            if listing.unchanged {
-                return Ok(());
-            }
 
             let mut candidates = Vec::new();
             for issue in &listing.issues {
@@ -526,11 +540,17 @@ impl MirrorWorker {
         let repo_id = run.repo_id()?;
         let start = self
             .watermark
-            .start_sweep(&run.scope, repo_id, Family::PullRequests, run.options.force)
+            .start_sweep(
+                &run.scope,
+                repo_id,
+                Family::PullRequests,
+                run.options.force.refetches_all(),
+            )
             .await?;
         let updated_after = start.updated_after;
         let mut high = updated_after;
         let mut page1_etag: Option<String> = None;
+        let mut stage_etags: BTreeMap<String, String> = BTreeMap::new();
         let mut swept: HashSet<i64> = HashSet::new();
         let mut continue_from: Option<String> = None;
 
@@ -542,6 +562,7 @@ impl MirrorWorker {
                     ListCursor {
                         updated_after,
                         page1_etag: start.page1_etag.as_deref(),
+                        stage_etags: Some(&start.stage_etags),
                         last_head_sha: None,
                         continue_from: continue_from.as_deref(),
                     },
@@ -552,8 +573,16 @@ impl MirrorWorker {
             if page1_etag.is_none() {
                 page1_etag.clone_from(&listing.page1_etag);
             }
+            stage_etags.extend(listing.stage_etag.take());
             if listing.swept_to_end && self.moves_watermarks() {
-                run.mark_swept(Family::PullRequests, page1_etag.clone(), None);
+                run.mark_swept(
+                    Family::PullRequests,
+                    SweptEnd {
+                        page1_etag: page1_etag.clone(),
+                        stage_etags: stage_etags.clone(),
+                        head_sha: None,
+                    },
+                );
             }
             let seen: Vec<&str> = listing
                 .pull_requests
@@ -561,9 +590,6 @@ impl MirrorWorker {
                 .map(|p| p.updated_at.as_str())
                 .collect();
             high = high_water(&seen, high);
-            if listing.unchanged {
-                return Ok(());
-            }
 
             let mut candidates = Vec::new();
             for pull in &listing.pull_requests {
@@ -711,7 +737,12 @@ impl MirrorWorker {
         let repo_id = run.repo_id()?;
         let start = self
             .watermark
-            .start_sweep(&run.scope, repo_id, Family::Commits, run.options.force)
+            .start_sweep(
+                &run.scope,
+                repo_id,
+                Family::Commits,
+                run.options.force.refetches_all(),
+            )
             .await?;
         let with_ci = run.options.scope.collection.actions == CollectionMode::All;
         let mut page1_etag: Option<String> = None;
@@ -727,6 +758,7 @@ impl MirrorWorker {
                     ListCursor {
                         updated_after: None,
                         page1_etag: start.page1_etag.as_deref(),
+                        stage_etags: None,
                         last_head_sha: start.last_head_sha.as_deref(),
                         continue_from: continue_from.as_deref(),
                     },
@@ -741,7 +773,14 @@ impl MirrorWorker {
                 head_sha.clone_from(&listing.head_sha);
             }
             if listing.swept_to_end && self.moves_watermarks() {
-                run.mark_swept(Family::Commits, page1_etag.clone(), head_sha.clone());
+                run.mark_swept(
+                    Family::Commits,
+                    SweptEnd {
+                        page1_etag: page1_etag.clone(),
+                        stage_etags: BTreeMap::new(),
+                        head_sha: head_sha.clone(),
+                    },
+                );
             }
             let mut candidates = Vec::new();
             for commit in &listing.commits {

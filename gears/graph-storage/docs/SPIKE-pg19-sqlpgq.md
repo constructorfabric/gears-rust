@@ -26,6 +26,8 @@
 
 <!-- /toc -->
 
+> **Overtaken, 2026-10-14.** PostgreSQL reverted SQL/PGQ in 19 beta 4 (2026-09-24), so 19 GA ships without it and this spike cannot be re-run at GA as planned below. The gear retired its SQL/PGQ hop (ADR-0001 addendum, gears-rust #5267); this report stays as the evidence of what was measured on the 19 betas.
+
 **Date:** 2026-08-13 · **Status:** complete · **Companion to:** [ADR-0001](./ADR/0001-cpt-cf-graph-storage-adr-single-postgres-store.md) (Confirmation gate)
 
 **Question:** does the SQL/PGQ target backend hold up — does pgvector build and run on PG19, does `GRAPH_TABLE` serve the gear's fixed-depth neighborhood shapes within the latency budget, and does graph+vector+FTS compose in one statement?

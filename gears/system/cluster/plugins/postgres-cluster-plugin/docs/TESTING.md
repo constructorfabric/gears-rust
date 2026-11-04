@@ -2,8 +2,8 @@
 
 > **Companion documents:**
 > - [DESIGN.md](./DESIGN.md) — implementation design for this plugin
-> - [TESTING-STRATEGY.md](../../docs/TESTING-STRATEGY.md) — platform-wide cluster testing strategy (layers, tooling, CI cadence)
-> - [Scenario Catalog](../../docs/scenarios/README.md) — `SC-*` IDs referenced below
+> - [TESTING-STRATEGY.md](../../../docs/TESTING-STRATEGY.md) — platform-wide cluster testing strategy (layers, tooling, CI cadence)
+> - [Scenario Catalog](../../../docs/scenarios/README.md) — `SC-*` IDs referenced below
 
 <!-- toc -->
 
@@ -36,7 +36,7 @@
 > plugin. Scenario IDs cited below (`SC-*`) are drawn from `docs/scenarios/` as
 > of its current state.
 
-The Postgres plugin testing strategy follows the four-layer pyramid from the platform-wide [TESTING-STRATEGY.md](../../docs/TESTING-STRATEGY.md):
+The Postgres plugin testing strategy follows the four-layer pyramid from the platform-wide [TESTING-STRATEGY.md](../../../docs/TESTING-STRATEGY.md):
 
 ```
 L4  Fault injection (Toxiproxy, controlled disconnects)  — nightly

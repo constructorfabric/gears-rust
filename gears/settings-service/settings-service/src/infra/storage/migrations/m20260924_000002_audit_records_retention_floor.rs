@@ -1,4 +1,3 @@
-// Created: 2026-09-24 by Virtuozzo International GmbH
 // @cpt-dod:cpt-cf-settings-service-dod-audit-store-table:p1
 //! `audit_records` refuses deleting a record younger than the platform
 //! minimum retention.

@@ -328,6 +328,15 @@ impl<'a> ApprovalSubject<DbTx<'a>> for Subject {
         Ok(())
     }
 }
+/// Approve `id`, racing another writer.
+///
+/// `interleave`, on a deferred database: both transactions read the pending unit before either
+/// writes, so the loser's lock upgrade fails with `SQLITE_BUSY` and goes through the typed retry
+/// classifier (counted in `contentions`). Otherwise, on a database with
+/// `transaction_mode=immediate`: the writers start together and serialize at `BEGIN IMMEDIATE`.
+/// There the barrier must sit before the transaction: inside it the first writer would hold the
+/// write lock at the barrier, waiting for a second writer that cannot begin.
+#[allow(clippy::too_many_arguments)]
 async fn writer(
     db: Db,
     scope: AccessScope,
@@ -336,7 +345,11 @@ async fn writer(
     subject: Subject,
     barrier: Arc<tokio::sync::Barrier>,
     contentions: Arc<AtomicUsize>,
+    interleave: bool,
 ) -> Result<ApproveOutcome, TxErr> {
+    if !interleave {
+        barrier.wait().await;
+    }
     let mut attempt = 0;
     db.transaction_with_retry(
         TxConfig::default(),
@@ -351,7 +364,7 @@ async fn writer(
         },
         move |tx| {
             attempt += 1;
-            let first = attempt == 1;
+            let read_first = interleave && attempt == 1;
             let scope = scope.clone();
             let subject = subject.clone();
             let barrier = Arc::clone(&barrier);
@@ -360,7 +373,7 @@ async fn writer(
                     scope,
                     tenant_id: tenant,
                 };
-                if first {
+                if read_first {
                     assert_eq!(store.unit(tx, id).await?.unwrap().state, UnitState::Pending);
                     barrier.wait().await;
                 }
@@ -382,17 +395,36 @@ async fn writer(
 }
 #[tokio::test]
 async fn two_real_writers_apply_once_and_lock_errors_remain_typed_for_retry() {
+    two_real_writers_apply_once(true).await;
+}
+/// With the gear's `transaction_mode=immediate` the writers serialize at `BEGIN`: one applies, and
+/// the loser waits for its commit and is still typed for retry.
+#[tokio::test]
+async fn two_real_writers_on_an_immediate_database_serialize_and_apply_once() {
+    two_real_writers_apply_once(false).await;
+}
+/// Two writers on their own connections approve one unit (see [`writer`] for `interleave`).
+async fn two_real_writers_apply_once(interleave: bool) {
     let (db, scope, tenant, dsn) = test_db().await;
-    let other = toolkit_db::connect_db(
-        &dsn,
-        toolkit_db::ConnectOpts {
-            max_conns: Some(1),
-            min_conns: Some(1),
-            ..Default::default()
-        },
-    )
-    .await
-    .unwrap();
+    // `test_db`'s pool is immediate, as the gear's config sets it; interleaving needs two deferred
+    // pools on the same file.
+    let pool = |dsn: String| async move {
+        toolkit_db::connect_db(
+            &dsn,
+            toolkit_db::ConnectOpts {
+                max_conns: Some(1),
+                min_conns: Some(1),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap()
+    };
+    let (first, other) = if interleave {
+        (pool(dsn.to_string()).await, pool(dsn.to_string()).await)
+    } else {
+        (db.db(), pool(crate::test_support::toolkit_dsn(&dsn)).await)
+    };
     let conn = db.conn().unwrap();
     let cat = repo::insert_category(
         &conn,
@@ -475,13 +507,14 @@ async fn two_real_writers_apply_once_and_lock_errors_remain_typed_for_retry() {
     let (a, b) = tokio::time::timeout(std::time::Duration::from_secs(20), async {
         tokio::join!(
             writer(
-                db.db(),
+                first,
                 scope.clone(),
                 tenant,
                 id,
                 subject.clone(),
                 Arc::clone(&barrier),
-                Arc::clone(&contentions)
+                Arc::clone(&contentions),
+                interleave
             ),
             writer(
                 other,
@@ -490,7 +523,8 @@ async fn two_real_writers_apply_once_and_lock_errors_remain_typed_for_retry() {
                 id,
                 subject,
                 barrier,
-                Arc::clone(&contentions)
+                Arc::clone(&contentions),
+                interleave
             )
         )
     })
@@ -507,7 +541,9 @@ async fn two_real_writers_apply_once_and_lock_errors_remain_typed_for_retry() {
     );
     // The loser is typed for retry: the unit already decided or contended, or a lock error the
     // toolkit's classifier calls contention, the one a door answers 409 `UNIT_CONTENDED` after its
-    // retries (`tx_to_canonical_coded`). Which one depends on how long the winner holds its lock.
+    // retries (`tx_to_canonical_coded`). Which one depends on how long the winner holds its lock;
+    // on an immediate database the loser waits for the winner's commit and sees the unit decided,
+    // unless its `busy_timeout` runs out first.
     assert_eq!(
         results
             .iter()
@@ -523,10 +559,12 @@ async fn two_real_writers_apply_once_and_lock_errors_remain_typed_for_retry() {
         1,
         "{results:?}"
     );
-    assert!(
-        contentions.load(Ordering::SeqCst) > 0,
-        "the lock-upgrade error reached the typed retry classifier"
-    );
+    if interleave {
+        assert!(
+            contentions.load(Ordering::SeqCst) > 0,
+            "the lock-upgrade error reached the typed retry classifier"
+        );
+    }
     assert_eq!(
         decisions_of(&conn, &scope, tenant, id).await.unwrap().len(),
         1

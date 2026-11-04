@@ -981,7 +981,7 @@ The Turn Status API `state: "error"` maps to internal `chat_turns.state = 'faile
 - When actual usage exceeds overshoot tolerance (actual/reserve > `quota.overshoot_tolerance_factor`), the turn remains in `state: "done"` (internal `chat_turns.state = completed`)
 - Billing is capped at reserved credits, but the completed response is delivered to the user
 - The "completed remains completed" rule (see Reserve Overshoot Reconciliation Rule, section 5.8.1) is absolute: a COMPLETED turn MUST remain COMPLETED regardless of overshoot magnitude
-- It does NOT result in `state: "error"` or any error_code visible to the client. P1 has no dedicated metric or log for the capped case: `mini_chat_quota_overshoot_total{period}` counts every actual settlement (completed, or failed with provider usage) whose actual tokens exceed the reserve, whether or not the tolerance was exceeded (`mini_chat_quota_overshoot_exceeded_total` is not defined)
+- It does NOT result in `state: "error"` or any error_code visible to the client. `mini_chat_quota_overshoot_total{period}` counts every actual settlement (completed, or failed with provider usage) whose actual tokens exceed the reserve, whether or not the tolerance was exceeded; the capped case alone is recorded in the `mini_chat_quota_overshoot_uncharged_tokens` histogram (`actual_tokens - reserve_tokens`, the tokens left unbilled)
 
 The Turn Status API deliberately hides billing outcomes to keep the client contract simple. Billing settlement details (outcome, settlement method, charged credits) are internal to the system and NOT exposed via this endpoint.
 
@@ -3415,7 +3415,7 @@ Knowledge search lets the model query an organization-level knowledge base (one 
 - **Tool**: `search_knowledge` is added as a function tool, and `knowledge_search.guard` is appended to the system prompt. The model supplies `query` and optionally `top_k`, which is capped at `knowledge_search.top_k` (default 5). Each chunk is trimmed to `knowledge_search.max_chunk_chars` (default 2000) and returned to the model as a `function_call_output`.
 - **Agentic loop**: each `search_knowledge` call ends the current provider request with a tool-use outcome; the gear runs the retrieval, appends the call and its output to the input and issues the next provider request. At most `knowledge_search.max_calls_per_message` (default 3) retrievals run per message; further calls get a "search limit reached" output so the model answers from what it has. The loop is hard-capped at `max_calls_per_message + 2` iterations; exceeding it finalizes the turn as `failed` with SSE `error{code: "agentic_iterations_exceeded"}`. A tool use for any other function name ends the turn with `unexpected_tool_use`.
 - **Mutual exclusion with `file_search`**: when the chat has ready documents and `file_search` is included, the knowledge-search parameters are not built and `search_knowledge` is not offered for that turn (file_search wins, to avoid double retrieval and double billing). The two tools are never sent in the same request.
-- **Accounting**: successful retrievals are counted in `chat_turns.file_search_completed_count`. The `file_search_calls` field of the usage and audit events comes from an in-memory per-turn count of `search_knowledge` calls, which is incremented before the retrieval runs, so failed `search_knowledge` retrievals are counted there but not in `file_search_completed_count`; the orphan watchdog reports `file_search_completed_count`. Provider-native `file_search` calls (tool `done` events) update both counters; the two tools are never enabled in the same request, so the counts do not mix. Only the final provider iteration's usage is settled; billing of the earlier agentic iterations is **not implemented** ([ADR-0008](./ADR/0008-cpt-cf-mini-chat-adr-quota-policy-scope.md)).
+- **Accounting**: successful retrievals are counted in `chat_turns.file_search_completed_count`. The `file_search_calls` field of the usage and audit events comes from an in-memory per-turn count of `search_knowledge` calls, which is incremented before the retrieval runs, so failed `search_knowledge` retrievals are counted there but not in `file_search_completed_count`; the orphan watchdog reports `file_search_completed_count`. Provider-native `file_search` calls (tool `done` events) update both counters; the two tools are never enabled in the same request, so the counts do not mix. Each tool-use outcome carries the usage of its provider call, and the turn's usage is the sum over all of its provider calls: it is settled, stored on the assistant message and emitted in the usage and audit events. If the last call fails without usage, the turn's usage is unknown and it settles estimated. The reserve covers one provider call, so the sum is subject to the overshoot cap (section 5.8.1); and because the assistant message stores the sum, the next turn's `prior_context_tokens` overstates the history after a multi-call turn.
 - **Metrics**: `mini_chat_knowledge_search{result}`, `mini_chat_knowledge_search_latency_ms`, `mini_chat_knowledge_search_chunks`.
 
 ### MCP Servers Support
@@ -3779,6 +3779,8 @@ The gear records metrics with an OpenTelemetry meter. ToolKit exports metrics ov
 | Attachments | `mini_chat_attachment_background_indexing` | counter | `result`: `ready` \| `failed` \| `timeout` \| `set_ready_failed`. Outcome of the background indexing task for a document returned as `uploaded`; the upload itself was already counted in `mini_chat_attachment_upload{result="ok"}` |
 | Quota | `mini_chat_quota_preflight` | counter | `decision`, `model`, `tier` |
 | Quota | `mini_chat_quota_reserve`, `mini_chat_quota_commit`, `mini_chat_quota_overshoot` | counter | `period`. `quota_commit` is recorded only for actual settlements; `quota_overshoot` for actual settlements whose actual tokens exceed the reserve |
+| Quota | `mini_chat_quota_overshoot_uncharged_tokens` | histogram | — (`actual_tokens - reserve_tokens` of an actual settlement whose overshoot exceeded `quota.overshoot_tolerance_factor` and was capped at the reserve; recorded after commit) |
+| Quota | `mini_chat_quota_usage_missing` | counter | `model`. A completed turn whose provider reported zero or no usage; it settles estimated instead of free |
 | Quota | `mini_chat_quota_estimated_tokens`, `mini_chat_quota_actual_tokens` | histogram | — (`quota_estimated_tokens` records the turn's `reserve_tokens` = estimated input + `max_output_tokens_applied` after an allow/downgrade preflight, before the reserve is written, so a request rejected later still records it; `quota_actual_tokens` only for actual settlements) |
 | Tools | `mini_chat_code_interpreter_calls` | counter | `model` (incremented by the number of calls; recorded only for actual settlements, so estimated and orphan settlements are not counted) |
 | Knowledge search | `mini_chat_knowledge_search` | counter | `result`: `ok` \| `error` |
@@ -3798,10 +3800,11 @@ The gear records metrics with an OpenTelemetry meter. ToolKit exports metrics ov
 | Cleanup | `mini_chat_secondary_cleanup_skipped` | counter | `provider_kind` |
 | Audit | `mini_chat_audit_emit` | counter | `result`: `ok` \| `retry` \| `reject` \| `dropped`. Delivery outcomes of the outbox audit handler only; nothing is recorded at enqueue. `ok`: the plugin accepted the event. `retry`: transient plugin error or timeout, plugin resolution failure, resolved instance without a ClientHub client. `reject`: corrupt payload, permanent plugin error, or a retry on the last of 120 attempts. `dropped`: no plugin registered; the handler acknowledges the message without delivery |
 | Finalization | `mini_chat_finalization_latency_ms` | histogram | — |
+| Outbox | `mini_chat_outbox_dead` | counter | `queue`: `usage`; `reason`: `invalid_payload` \| `permanent` \| `max_attempts`. Recorded by the usage handler for every message it dead-letters; other queues are not counted here |
 
 ##### Declared but not recorded (deferred)
 
-These instruments are registered but never recorded: `stream_replay`, `quota_preflight_v2`, `quota_tier_downgrade`, `quota_negative`, `quota_overshoot_tokens`, `quota_image_commit`, `tokens_after_cancel`, `time_from_ui_disconnect_to_cancel_ms`, `cancel_orphan`, `tool_calls`, `tool_call_limited`, `file_search_latency_ms`, `web_search_latency_ms`, `web_search_disabled`, `citations_count`, `citations_by_source`, `retrieval_latency_ms`, `retrieval_chunks_returned`, `retrieval_zero_hit`, `indexed_chunks_per_chat`, `upload_rejected`, `vector_stores_per_user`, `context_truncation`, `provider_requests`, `provider_errors`, `provider_latency_ms`, `oagw_retries`, `oagw_upstream_latency_ms`, `oagw_circuit_open`, `attachment_index`, `attachment_summary`, `attachments_failed`, `attachment_index_latency_ms`, `image_turns`, `media_rejected`, `cleanup_backlog`, `audit_redaction_hits`, `summary_regen`, `outbox_enqueue`, `outbox_dispatch`, `outbox_dead`, `outbox_dead_rows`, `outbox_pending_age_seconds`, `outbox_oldest_pending_age_seconds`, `db_query_latency_ms`, `db_errors`, `unknown_error_code`, `credits_overflow` (all with the `mini_chat_` prefix).
+These instruments are registered but never recorded: `stream_replay`, `quota_preflight_v2`, `quota_tier_downgrade`, `quota_negative`, `quota_overshoot_tokens`, `quota_image_commit`, `tokens_after_cancel`, `time_from_ui_disconnect_to_cancel_ms`, `cancel_orphan`, `tool_calls`, `tool_call_limited`, `file_search_latency_ms`, `web_search_latency_ms`, `web_search_disabled`, `citations_count`, `citations_by_source`, `retrieval_latency_ms`, `retrieval_chunks_returned`, `retrieval_zero_hit`, `indexed_chunks_per_chat`, `upload_rejected`, `vector_stores_per_user`, `context_truncation`, `provider_requests`, `provider_errors`, `provider_latency_ms`, `oagw_retries`, `oagw_upstream_latency_ms`, `oagw_circuit_open`, `attachment_index`, `attachment_summary`, `attachments_failed`, `attachment_index_latency_ms`, `image_turns`, `media_rejected`, `cleanup_backlog`, `audit_redaction_hits`, `summary_regen`, `outbox_enqueue`, `outbox_dispatch`, `outbox_dead_rows`, `outbox_pending_age_seconds`, `outbox_oldest_pending_age_seconds`, `db_query_latency_ms`, `db_errors`, `unknown_error_code`, `credits_overflow` (all with the `mini_chat_` prefix).
 
 ##### Not defined
 
@@ -3824,7 +3827,7 @@ Alerts on series listed under "Declared but not recorded" or "Not defined" above
 - Orphan watchdog activity: sustained increase in `mini_chat_orphan_detected_total{reason="stale_progress"}` without a corresponding increase in `mini_chat_orphan_finalized_total{reason="stale_progress"}`
 - Cleanup backlog growth: rising `mini_chat_cleanup_backlog{state="pending",resource_type="file"}` or sustained `mini_chat_cleanup_backlog{state="failed",resource_type="file"}`
 - Summary or cleanup dead letters: `mini_chat_outbox_dead_letter_backlog{kind=~"thread_summary|chat_cleanup"}` > 0 (series not defined)
-- Mini-Chat usage dead letters: `mini_chat_outbox_dead_letter_backlog{kind="usage"}` > 0 (series not defined)
+- Mini-Chat usage dead letters: `increase(mini_chat_outbox_dead_total{queue="usage"}[1h])` > 0; each one needs a dead-letter replay or it is never billed. The backlog series `mini_chat_outbox_dead_letter_backlog{kind="usage"}` is not defined
 - Audit emission failures: `mini_chat_audit_emit_total{result="reject"}` > 0 (permanent failure, dead-lettered) or sustained `mini_chat_audit_emit_total{result="retry"}`
 - Quota anomalies: sustained increase in `mini_chat_quota_negative_total`
 
@@ -4702,7 +4705,7 @@ The following terms are used throughout sections 5.4–5.9:
 >
 > **P2 Enhancement Option**: Add `chat_turns.provider_request_started_at TIMESTAMPTZ` column for exact crash recovery if operational metrics show meaningful impact.
 
-- **Usage known**: the provider returned actual token counts (`usage.input_tokens`, `usage.output_tokens`) — either via a terminal `response.completed` / `response.incomplete` event or via error metadata. Settlement uses `settlement_method = "actual"`. A `completed` turn (including a provider `incomplete` response) always settles on the actual path with the usage it received: when the provider reported zero or no usage, the turn is charged 0 credits. The "at least one non-zero field" rule below applies only to failed turns; cancelled turns carry no usage and always settle estimated.
+- **Usage known**: the provider returned actual token counts (`usage.input_tokens`, `usage.output_tokens`) — either via a terminal `response.completed` / `response.incomplete` event or via error metadata. Settlement uses `settlement_method = "actual"`. Usage is known only when at least one of `input_tokens`, `output_tokens` is non-zero, for completed and failed turns alike. A `completed` turn (including a provider `incomplete` response) whose provider reported zero or no usage settles on the estimated path, logs a warning and increments `mini_chat_quota_usage_missing_total{model}`; it is never charged 0 credits. Cancelled turns carry no usage and always settle estimated.
 
 > **Canonical provider usage fields (normative)**: the authoritative usage metadata is read from the provider's terminal response event. The canonical field names are `usage.input_tokens` (integer, non-negative) and `usage.output_tokens` (integer, non-negative). OAGW passes provider responses through unchanged. If a provider uses different field names (e.g., `prompt_tokens`, `completion_tokens`), the Mini-Chat provider adapter normalizes them to the internal usage type (`input_tokens`, `output_tokens`, cache and reasoning counts) ([ADR-0005](./ADR/0005-cpt-cf-mini-chat-adr-multi-provider-adapters.md)). If `usage` object is present but either field is missing, treat the missing field as `0`. If the `usage` object is absent entirely, usage is "unknown" (estimated settlement path).
 
@@ -5000,9 +5003,10 @@ In the normal scheme you should not exceed limits, because:
            committed_tokens = reserve_tokens
            committed_credits_micro = reserved_credits_micro
 
-           // Target (not implemented in P1): a dedicated metric and error log for
-           // the capped case. P1 records only mini_chat_quota_overshoot_total{period}
-           // and sets an internal overshoot_capped flag on the settlement result (not exported).
+           // The settlement result carries overshoot_capped = true (not exported in
+           // events). After commit, finalization records
+           // mini_chat_quota_overshoot_uncharged_tokens = actual_tokens - reserve_tokens.
+           // No log line is emitted for the capped case.
    ```
 
    **Type specifications (normative):**
@@ -5023,9 +5027,9 @@ In the normal scheme you should not exceed limits, because:
 
    **Monitoring**:
    - If `mini_chat_quota_overshoot_total` (incremented once per period, `daily` and `monthly`, for each actual settlement with actual tokens > reserve) exceeds 5% of completed turns, operators SHOULD review estimation budgets (image_token_budget, tool_surcharge_tokens, web_search_surcharge_tokens, safety_margin_pct) and consider increasing conservative margins.
-   - Overshoot beyond tolerance (billing capped at reserve) indicates a severe estimation failure. P1 has no series that isolates it; `mini_chat_quota_overshoot_exceeded_total` is not defined.
+   - Overshoot beyond tolerance (billing capped at reserve) indicates a severe estimation failure. `mini_chat_quota_overshoot_uncharged_tokens` isolates it: its count is the number of capped settlements and its sum the tokens left unbilled. `mini_chat_quota_overshoot_exceeded_total` is not defined.
 
-   **Invariant (P1 normative)**: A COMPLETED turn MUST remain COMPLETED regardless of overshoot magnitude. The "never retroactively cancel a completed response" principle is absolute. Overshoot beyond tolerance caps billing at reserve_tokens but does NOT change turn state to FAILED or prevent response delivery. In P1 the cap is silent: no log line or dedicated metric is emitted (the `overshoot_capped` flag on the settlement result is not used).
+   **Invariant (P1 normative)**: A COMPLETED turn MUST remain COMPLETED regardless of overshoot magnitude. The "never retroactively cancel a completed response" principle is absolute. Overshoot beyond tolerance caps billing at reserve_tokens but does NOT change turn state to FAILED or prevent response delivery. The cap emits no log line; it is visible only in `mini_chat_quota_overshoot_uncharged_tokens`.
 
    #### Actual vs Committed Usage (Normative)
 
@@ -5506,8 +5510,8 @@ Mini-Chat MUST use the shared outbox pipeline rather than implementing its own S
 1. Mini-Chat registers a leased usage handler for usage-publication messages. The external side effect (`publish_usage` on the model policy plugin) happens outside the database.
 2. The handler receives a message (payload, attempt count) from the shared outbox queue.
 3. On success, the handler returns `Ok`.
-4. On transient failure (plugin resolution failure, a transient `PublishError`), the handler returns `Retry`. Retry backoff, lease handling, reclaim, partition concurrency, sequencer wake-up, and vacuum are then handled by the shared outbox using the queue registration settings.
-5. On a payload that cannot be deserialized or a permanent `PublishError`, the handler returns `Reject(reason)`. The shared outbox moves the message to its dead-letter store. Operators recover via `dead_letter_*` APIs; Mini-Chat does not define a separate `dead` row state.
+4. On transient failure (plugin resolution failure, a transient `PublishError`), the handler returns `Retry`. Retry backoff, lease handling, reclaim, partition concurrency, sequencer wake-up, and vacuum are then handled by the shared outbox using the queue registration settings. A `Retry` is bounded: on the 120th attempt (about two hours with the default processor backoff of 1 s doubling to 60 s) the handler returns `Reject` instead, so one event that keeps failing does not block the usage events of every tenant in its partition.
+5. On a payload that cannot be deserialized or a permanent `PublishError`, the handler returns `Reject(reason)`. The shared outbox moves the message to its dead-letter store. Operators recover via `dead_letter_*` APIs; Mini-Chat does not define a separate `dead` row state. Every `Reject` is logged at `error` and counted in `mini_chat_outbox_dead_total{queue="usage",reason}` (`invalid_payload`, `permanent`, `max_attempts`).
 
 The other handlers follow the same contract: the cleanup handlers return `Reject` after `cleanup_worker.max_attempts` (per attachment in the attachment cleanup handler; per chat cleanup message for a failing vector-store delete in the chat cleanup handler), the thread-summary handler after `thread_summary_worker.max_attempts`, and the audit handler calls the plugin with a 30 s timeout (a timeout is the audit plugin error `PluginTimeout`, which is transient), deserializes the payload before it resolves the plugin, and returns `Reject` on a malformed payload (whether or not a plugin is registered or can be resolved, since the payload is checked first), `Ok` on success or when no audit plugin is registered and the payload is valid (the event is dropped; the lookup is repeated on the next delivery), `Retry` on a transient plugin error (`Transient`, `PluginTimeout`), a plugin resolution failure or a resolved instance whose client is missing from ClientHub, and `Reject` on a permanent plugin error (`Permanent`). Every outcome is counted in `mini_chat_audit_emit_total{result}`; "no plugin registered" is counted as `result="dropped"`.
 
@@ -5792,7 +5796,7 @@ A turn MUST NOT transition to `completed` unless the full assistant message cont
 
 **1) completed** (normal `done`):
 
-- Settle using actual provider usage (`response.usage.input_tokens` + `response.usage.output_tokens`).
+- Settle using actual provider usage (`response.usage.input_tokens` + `response.usage.output_tokens`). If the provider reported zero or no usage, settle with the estimated formula instead (section 5.8) and emit `settlement_method = "estimated"`.
 - Release unused reserve, commit actual usage to `quota_usage` bucket rows (bucket `total` always; bucket `tier:premium` if premium turn).
 - If actual exceeds estimate (overshoot), commit the overshoot; never retroactively cancel a completed response.
 - If the provider returns terminal `response.incomplete` (e.g. due to `max_tokens`), the turn is still treated as `completed` (assistant message persisted, settle on actual usage). The incomplete reason is a **non-fatal completion signal**: it is logged and used as the `reason` label of `mini_chat_stream_incomplete_total`, and it MUST NOT be written to `chat_turns.error_code`. It is not included in the audit or outbox payload.
@@ -5833,7 +5837,7 @@ Three subcases:
 
 **3) aborted** (client disconnect / pod crash / orphan watchdog):
 
-- An aborted turn always settles `estimated`: the cancel path finalizes without usage, and the orphan watchdog has no usage either. For failed turns, **"usage known" requires a `usage` object with at least one non-zero field** (`input_tokens > 0` OR `output_tokens > 0`); a `usage` object present with both fields equal to zero (or missing) is treated as "usage unknown" and MUST follow the estimated path — not the actual path. A completed turn is not subject to this rule (it always settles actual). This prevents zero-charge exploitation: the no-free-cancel rule (§5.4 Settlement Definitions) mandates a non-zero debit whenever the provider request started; the estimated path enforces this via `minimal_generation_floor_applied`.
+- An aborted turn always settles `estimated`: the cancel path finalizes without usage, and the orphan watchdog has no usage either. For completed and failed turns, **"usage known" requires a `usage` object with at least one non-zero field** (`input_tokens > 0` OR `output_tokens > 0`); a `usage` object present with both fields equal to zero (or missing) is treated as "usage unknown" and MUST follow the estimated path — not the actual path. This prevents zero-charge exploitation: the no-free-cancel rule (§5.4 Settlement Definitions) mandates a non-zero debit whenever the provider request started; the estimated path enforces this via `minimal_generation_floor_applied`.
 - Settle using the deterministic charged token formula: `charged_tokens = min(reserve_tokens, estimated_input_tokens + minimal_generation_floor_applied)` where `minimal_generation_floor_applied` is read from `chat_turns.minimal_generation_floor_applied` (persisted at preflight from MiniChat ConfigMap, immutable after insert), consistent with the cancel/disconnect rule (see section 3.2) and the aborted-stream reconciliation (section 5.8).
 - Emit the outbox message with `billing_outcome = "aborted"`, `settlement_method = "estimated"`.
 
@@ -5895,6 +5899,8 @@ stateDiagram-v2
     note right of COMPLETED
         Outbox billing_outcome: "completed"
         Settlement method: "actual"
+        ("estimated" if the provider reported
+        zero or no usage)
         Charge: credits_micro(
           actual_input_tokens,
           actual_output_tokens,
@@ -5983,7 +5989,7 @@ The orphan watchdog demonstrates this separation:
 
 | Internal Terminal Condition | Billing Outcome | Outbox `billing_outcome` | Outbox `settlement_method` | Notes |
 |------------------------------|-----------------|------------------|---------------------------|-------|
-| `state = 'completed'` | `COMPLETED` | `"completed"` | `"actual"` | Normal success. Always actual, even when the provider reported zero or no usage (then 0 credits are charged) |
+| `state = 'completed'` | `COMPLETED` | `"completed"` | `"actual"` OR `"estimated"` (if the provider reported zero or no usage) | Normal success. A completed turn without usage is never free: it settles with the estimated formula and increments `mini_chat_quota_usage_missing_total{model}` |
 | `state = 'failed'` AND `error_code IN ('provider_error', 'provider_timeout', 'rate_limited')` | `FAILED` | `"failed"` | `"actual"` (if provider reported partial usage) OR `"estimated"` (if no usage available) | Provider terminal error after streaming started |
 | `state = 'failed'` AND `error_code IN ('web_search_calls_exceeded', 'code_interpreter_calls_exceeded', 'agentic_iterations_exceeded', 'unexpected_tool_use', 'message_persistence_failed')` | `FAILED` | `"failed"` | `"actual"` (if provider reported partial usage) OR `"estimated"` (if no usage available) | Per-turn tool call limit breached mid-turn; turn was post-provider-start; mirrors `provider_error` settlement. MUST NOT use `"released"` even if partial usage is unavailable — the provider was already called. |
 | `state = 'failed'` AND `error_code IN ('context_length_exceeded', 'validation_error', 'input_too_long', 'turn_setup_failed')` | `FAILED` | `"failed"` | `"released"` | Pre-provider failure; zero charge. For retry/edit setup failures no reserve exists yet and no settlement runs (unstarted retry/edit turn, section 5.7). |
@@ -6449,7 +6455,7 @@ The system **MUST** finalize turns using CAS on `chat_turn.state` and MUST emit 
 
 Not implemented in P1 and recorded in ADRs:
 
-- PolicySnapshot cache, persistence and `POST /internal/policy:notify`; per-user daily image quota and image byte cap; billing of knowledge-search agentic iterations; tenant operational bucket, audit and kill-switch checks for system tasks; `ai_chat` license feature — [ADR-0008](./ADR/0008-cpt-cf-mini-chat-adr-quota-policy-scope.md)
+- PolicySnapshot cache, persistence and `POST /internal/policy:notify`; per-user daily image quota and image byte cap; tenant operational bucket, audit and kill-switch checks for system tasks; `ai_chat` license feature — [ADR-0008](./ADR/0008-cpt-cf-mini-chat-adr-quota-policy-scope.md)
 - Per-user daily `file_search` limit — [ADR-0007](./ADR/0007-cpt-cf-mini-chat-adr-document-retrieval-scope.md)
 - Immutable replay `done` payload — [ADR-0010](./ADR/0010-cpt-cf-mini-chat-adr-runtime-consistency-limitations.md)
 - Group chat usage attribution — [ADR-0003](./ADR/0003-cpt-cf-mini-chat-adr-group-chat-usage-attribution.md)

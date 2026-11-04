@@ -113,12 +113,6 @@ pub struct TopicSegment {
     pub segments: Vec<serde_json::Value>,
 }
 
-#[derive(Debug, Clone)]
-pub struct PartitionLeader {
-    pub partition: u32,
-    pub endpoint: String,
-}
-
 /// Paginated result wrapper used by list endpoints (e.g. GET /v1/consumer-groups).
 #[derive(Debug, Clone)]
 pub struct Page<T> {
@@ -176,16 +170,14 @@ impl ConsumerGroupQuery {
 
 /// Scope of a producer chain reset
 /// ([`EventBrokerApi::reset_producer_chain`](crate::api::EventBrokerApi::reset_producer_chain)).
-/// Models the valid combinations directly - a partition reset always names its topic,
-/// so "partition without topic" is unrepresentable.
+/// A producer keeps one chain per topic (ADR-0004 "Chain Scope"), so a reset
+/// clears every topic's chain or one topic's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResetScope<'a> {
-    /// Reset every (topic, partition) chain for the producer.
+    /// Reset the producer's chain on every topic.
     AllTopics,
-    /// Reset every partition chain under one topic.
+    /// Reset the producer's chain on one topic.
     Topic(&'a str),
-    /// Reset a single (topic, partition) chain.
-    Partition { topic: &'a str, partition: u32 },
 }
 
 /// The event envelope. Matches `gts.cf.core.events.event.v1~.schema.json` in the design and is the
@@ -283,5 +275,4 @@ pub struct ProducerMeta {
     pub producer_id: Option<uuid::Uuid>,
     pub previous: Option<i64>,
     pub sequence: Option<i64>,
-    pub partition_hint: Option<u32>,
 }

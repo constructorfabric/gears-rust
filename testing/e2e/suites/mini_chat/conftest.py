@@ -745,7 +745,10 @@ def _patch_mini_chat_config(config_text: str, env) -> str:
     from .config.generator import load_credentials
 
     # home_dir
-    config_text = re.sub(r"(home_dir\s*:\s*).*", rf'\1"{_TEMP_HOME}"', config_text, count=1)
+    home = Path(_TEMP_HOME).as_posix()
+    config_text = re.sub(
+        r"(home_dir\s*:\s*).*", lambda m: f'{m.group(1)}"{home}"', config_text, count=1
+    )
 
     # Log level — mini_chat logging is already in base.yaml; only inject oagw
     mini_chat_log = os.environ.get("MINI_CHAT_LOG", "debug")

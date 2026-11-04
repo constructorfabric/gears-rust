@@ -1,12 +1,12 @@
 //! Signed content URLs.
 //!
-//! The control plane is the sole minter; it holds an Ed25519 private key and signs short-lived,
+//! The control plane is the sole minter; it holds an ECDSA P-256/SHA-256 private key and signs short-lived,
 //! opaque tokens that authorize exactly one content operation (`op`, file/version, backend
 //! path, expiry) against the sidecar. The sidecar holds only the public key and verifies
 //! statelessly (no DB lookup).
 //!
-//! The token is an Ed25519-signed compact token (`base64url(payload).base64url(signature)`),
-//! an equivalent of the PASETO `v4.public` from ADR-0004; its format is an internal detail.
+//! The token is an ECDSA P-256/SHA-256-signed compact token (`base64url(payload).base64url(signature)`),
+//! with a DER-encoded signature; it is a private codec, not JWT or PASETO.
 //! Signing and verification go through `SignatureProvider` / `SignatureVerifier` (see
 //! `provider`), never a crypto crate directly, so the algorithm is replaceable (ADR-0004).
 
@@ -15,13 +15,13 @@ use std::sync::Arc;
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::{Deserialize, Serialize};
-use time::OffsetDateTime;
+use time::{Duration, OffsetDateTime};
 use uuid::Uuid;
 
 use crate::domain::error::DomainError;
 
 mod provider;
-pub use provider::{Ed25519Provider, SignatureProvider, SignatureVerifier};
+pub use provider::{EcdsaP256Provider, SignatureProvider, SignatureVerifier};
 
 /// The content operation a token authorizes (checked against the HTTP method by the sidecar).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -99,6 +99,11 @@ pub struct Claims {
     /// without a DB lookup.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub etag: String,
+    /// Tells finalize to also bind the version under a `content_id IS NULL` CAS (`op = put` only).
+    /// Minted only by `POST /files` with `bind: "auto"` for a new file; replacing content goes through
+    /// the authorized `bind`. The sidecar never reads it; `#[serde(default)]` tolerates older tokens.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub bind_on_finalize: bool,
 }
 
 fn is_default_constraints(c: &UploadConstraints) -> bool {
@@ -117,18 +122,18 @@ pub struct Issuer {
 }
 
 impl Issuer {
-    /// Generate a new static `Ed25519Provider` signing key (single keypair, no rotation).
+    /// Generate a new static `EcdsaP256Provider` signing key (single keypair, no rotation).
     pub fn generate(max_ttl_secs: i64) -> Result<Self, DomainError> {
         Ok(Self::with_provider(
-            Arc::new(Ed25519Provider::generate()?),
+            Arc::new(EcdsaP256Provider::generate()?),
             max_ttl_secs,
         ))
     }
 
-    /// Build an issuer from a 32-byte Ed25519 seed, so the keypair is stable across restarts.
-    pub fn from_seed(seed: &[u8], max_ttl_secs: i64) -> Result<Self, DomainError> {
+    /// Build an issuer from a PKCS#8 DER P-256 private key, so the keypair is stable across restarts.
+    pub fn from_pkcs8(key: &[u8], max_ttl_secs: i64) -> Result<Self, DomainError> {
         Ok(Self::with_provider(
-            Arc::new(Ed25519Provider::from_seed(seed)?),
+            Arc::new(EcdsaP256Provider::from_pkcs8(key)?),
             max_ttl_secs,
         ))
     }
@@ -164,7 +169,7 @@ impl Issuer {
         }
         let payload = serde_json::to_vec(&claims)
             .map_err(|e| DomainError::token_invalid(format!("serialize claims: {e}")))?;
-        let sig = self.provider.sign(&payload);
+        let sig = self.provider.sign(&payload)?;
         Ok(format!(
             "{}.{}",
             URL_SAFE_NO_PAD.encode(&payload),
@@ -180,18 +185,12 @@ pub struct Verifier {
 }
 
 impl Verifier {
-    /// Construct from raw Ed25519 public-key bytes. The key length is validated up front so a
-    /// malformed `FS_SIDECAR_PUBLIC_KEY` fails at startup, not as a request-time error.
-    pub fn from_public_key(public_key: Vec<u8>) -> Result<Self, DomainError> {
-        const ED25519_PUBLIC_KEY_LEN: usize = 32;
-        if public_key.len() != ED25519_PUBLIC_KEY_LEN {
-            return Err(DomainError::token_invalid(format!(
-                "invalid Ed25519 public key length: expected {ED25519_PUBLIC_KEY_LEN} bytes, got {}",
-                public_key.len()
-            )));
-        }
+    /// Construct from an uncompressed SEC1 P-256 public key (65 bytes).
+    /// Checks length, uncompressed encoding and backend availability at startup.
+    /// The backend validates the curve point when verifying a signature.
+    pub fn from_public_key(public_key: &[u8]) -> Result<Self, DomainError> {
         Ok(Self {
-            verifier: Arc::new(provider::Ed25519Verifier::new(public_key)),
+            verifier: Arc::new(provider::EcdsaP256Verifier::from_sec1_bytes(public_key)?),
         })
     }
 
@@ -204,6 +203,20 @@ impl Verifier {
     /// Verify a token's signature and expiry, returning its claims. The caller still checks
     /// `op` against the HTTP method and enforces upload constraints.
     pub fn verify(&self, token: &str, now: OffsetDateTime) -> Result<Claims, DomainError> {
+        self.verify_with_grace(token, now, Duration::ZERO)
+    }
+
+    /// Like [`Self::verify`], but an expired token is accepted while `now < exp + grace`.
+    ///
+    /// For the s2s finalize/report-part callbacks only: the sidecar checked the token strictly at
+    /// upload start, so a slow upload can outlive the TTL. Only `exp` gets slack; signature, `op`
+    /// and the `(file_id, version_id)` binding are checked as usual.
+    pub fn verify_with_grace(
+        &self,
+        token: &str,
+        now: OffsetDateTime,
+        grace: Duration,
+    ) -> Result<Claims, DomainError> {
         let (payload_b64, sig_b64) = token
             .split_once('.')
             .ok_or_else(|| DomainError::token_invalid("malformed token"))?;
@@ -219,8 +232,9 @@ impl Verifier {
         let claims: Claims = serde_json::from_slice(&payload)
             .map_err(|_| DomainError::token_invalid("bad claims"))?;
 
-        // Expiry is exclusive: unusable from `exp` on.
-        if now.unix_timestamp() >= claims.exp {
+        // Exclusive; `grace` is clamped to whole seconds and saturates rather than overflowing `i64`.
+        let expires_at = claims.exp.saturating_add(grace.whole_seconds());
+        if now.unix_timestamp() >= expires_at {
             return Err(DomainError::token_invalid("token expired"));
         }
         Ok(claims)

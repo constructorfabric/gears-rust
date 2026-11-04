@@ -4,9 +4,9 @@ name: Unused Deps (nightly)
 #
 # `make shear` runs `cargo shear --expand`, which macro-expands the entire
 # workspace on a pinned nightly toolchain. That is effectively a full second
-# build (~1h) with no reusable target cache, which made it the longest job in
-# the PR pipeline while being advisory-only. Unused dependencies are a
-# slow-moving property, so this runs nightly instead.
+# build (~2h, growing with the crate count) with no reusable target cache,
+# which made it the longest job in the PR pipeline while being advisory-only.
+# Unused dependencies are a slow-moving property, so this runs nightly instead.
 #
 # A failure implicates every commit merged that day, but attribution is cheap:
 # cargo-shear names the offending package and dependency, which points at one
@@ -27,8 +27,8 @@ on:
   workflow_dispatch:
 
 # No concurrency group: cron runs are 24h apart and the job caps out well under
-# that, so the only way to overlap is a manual dispatch landing inside the ~1h
-# window a scheduled run is active. Not worth guarding against.
+# that, so the only way to overlap is a manual dispatch landing inside the few
+# hours a scheduled run is active. Not worth guarding against.
 
 permissions:
   contents: read
@@ -55,13 +55,19 @@ env:
 jobs:
   shear:
     name: Unused Deps (cargo-shear)
-    runs-on: ubuntu-latest
-    # Measured ~57m. Generous headroom on purpose: a false timeout costs the
-    # only signal of the day and stays invisible for another 24h, while an
-    # over-long cap on a genuinely hung job costs runner minutes once.
-    timeout-minutes: 120
+    runs-on: ${{ (vars.GEARS_FORCE_GITHUB_HOSTED == 'true' || github.repository != 'constructorfabric/gears-rust' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && 'ubuntu-latest' || 'gears-large' }}
+    # Run time grows with the number of workspace crates: about 0.66 min per
+    # crate on a normal night (77m for 118 crates on 2026-09-25, 104m for 153
+    # on 2026-10-27) and up to 1.2 min per crate on a slow one (2026-11-03).
+    # With 164 crates that is 110-200m, so the old cap of 120 timed out every
+    # night from 2026-10-28. Generous headroom on purpose: a false timeout
+    # costs the only signal of the day and stays invisible for another 24h,
+    # while an over-long cap on a genuinely hung job costs runner minutes once.
+    # Raise it again as the workspace grows.
+    timeout-minutes: 240
     steps:
       - name: Free disk space
+        if: runner.environment == 'github-hosted'
         uses: jlumbroso/free-disk-space@ceedf095f4ec1a097402bc6bd80831f2e1a6fde6 # v2.0.0
         with:
           tool-cache: false
@@ -77,7 +83,8 @@ jobs:
           persist-credentials: false
 
       - name: Install protoc
-        uses: taiki-e/install-action@861a07ce7084f55488e375df125cdc99bba60eb7 # v2.87.23
+        if: runner.environment == 'github-hosted'
+        uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
         with:
           tool: protoc@3.34.1
 
@@ -85,34 +92,39 @@ jobs:
       # -Zunpretty=expanded. llvm-tools-preview belongs to cargo-llvm-cov and
       # rustc-dev to the dylint drivers; neither is used here.
       - name: Install Rust nightly toolchain
+        if: runner.environment == 'github-hosted'
         uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2 # nightly
         with:
           toolchain: ${{ env.RUSTUP_TOOLCHAIN_NIGHTLY }}
 
+      # This workflow never runs on a push to main, so it only reads the
+      # shared build cache.
+      - name: Set up the shared build cache
+        id: cache
+        uses: ./.github/actions/ci-cache
+        with:
+          rust: true
+          downloads: |
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          downloads-key: cargo-${{ hashFiles('**/Cargo.lock') }}
+          downloads-restore-keys: cargo-
+
+      # GitHub-hosted runs (fork pull requests, the kill switch) keep the
+      # registry cache; on the self-hosted runners ci-cache covers it.
       - name: Cache Cargo/target
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        if: ${{ steps.cache.outputs.mode == 'none' }}
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           cache-bin: false
           cache-targets: false
           shared-key: nightly-${{ runner.os }}-${{ env.RUSTUP_TOOLCHAIN_NIGHTLY }}-shear
 
-      - name: Install sccache
-        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
-
-      - name: Probe sccache & set RUSTC_WRAPPER
-        shell: bash
-        run: |
-          if sccache --start-server >/dev/null 2>&1; then
-            echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
-            echo "SCCACHE_GHA_ENABLED=true" >> "$GITHUB_ENV"
-          else
-            echo "sccache failed, falling back to plain rustc"
-          fi
-
       # Keep this version in sync with SHEAR_VERSION in gears-rust.mk, so a local
       # `make shear` and this job reach the same verdict.
       - name: Install cargo-shear
-        uses: taiki-e/install-action@861a07ce7084f55488e375df125cdc99bba60eb7 # v2.87.23
+        if: runner.environment == 'github-hosted'
+        uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
         with:
           tool: cargo-shear@1.13.1
 
@@ -122,98 +134,54 @@ jobs:
         shell: bash
         run: make shear RUST_NIGHTLY="$RUSTUP_TOOLCHAIN_NIGHTLY" 2>&1 | tee "$RUNNER_TEMP/shear.txt"
 
+      # The issue quotes the cargo-shear output. It names the package and the
+      # dependency, so one `git log` finds the commit.
+      - name: Write issue details
+        if: failure() && github.event_name == 'schedule'
+        shell: bash
+        run: |
+          out="$RUNNER_TEMP/shear.txt"
+          max=3000
+          # The backticks are Markdown, not command substitution.
+          # shellcheck disable=SC2016
+          {
+            echo 'A missing `[workspace.metadata.cargo-shear] ignored` entry is the usual'
+            echo 'cause. See the gear-dependencies section of CONTRIBUTING.md. To find the'
+            echo 'commit: `git log --since=yesterday -- path/to/Cargo.toml`.'
+            echo
+            if [ -s "$out" ]; then
+              echo '<details><summary>cargo-shear output</summary>'
+              echo
+              echo '```'
+              if [ "$(wc -c < "$out")" -gt "$max" ]; then
+                echo '…(truncated, see run log)'
+              fi
+              tail -c "$max" "$out"
+              # Add a newline if the output has none, so the closing fence
+              # starts on its own line.
+              [ -z "$(tail -c 1 "$out")" ] || echo
+              echo '```'
+              echo '</details>'
+            else
+              echo '_No output captured. The job failed before `cargo shear` ran. See the run log._'
+            fi
+          } > "$RUNNER_TEMP/issue.md"
+
       - name: Open or update issue on nightly failure
         if: failure() && github.event_name == 'schedule'
-        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        uses: ./.github/actions/nightly-issue
         with:
-          script: |
-            const fs = require('fs');
-            const { owner, repo } = context.repo;
-            const title = process.env.SHEAR_ISSUE_TITLE;
-            const mention = (process.env.SHEAR_ISSUE_MENTION || '').trim();
-            const runUrl = `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`;
-
-            // Quoting cargo-shear's own output is what makes triage a single
-            // `git log` away — it names the package and the dependency.
-            let captured = '';
-            try {
-              captured = fs.readFileSync(`${process.env.RUNNER_TEMP}/shear.txt`, 'utf8');
-            } catch (e) {
-              core.info(`No shear output captured: ${e.message}`);
-            }
-            const MAX = 3000;
-            const tail = (captured.length > MAX
-              ? `…(truncated, see run log)\n${captured.slice(-MAX)}`
-              : captured).trim();
-
-            const details = tail
-              ? ['<details><summary>cargo-shear output</summary>', '', '```', tail, '```', '</details>'].join('\n')
-              : '_No output captured — the job failed before `cargo shear` ran. See the run log._';
-
-            const lines = [];
-            if (mention) lines.push(mention, '');
-            lines.push(
-              '`cargo shear` failed on `main`.',
-              '',
-              `- Commit: ${context.sha}`,
-              `- Run: ${runUrl}`,
-              '',
-              'A missing `[workspace.metadata.cargo-shear] ignored` entry is the usual',
-              'cause — see the gear-dependencies section of CONTRIBUTING.md. To find the',
-              'commit: `git log --since=yesterday -- path/to/Cargo.toml`.',
-              '',
-              details,
-            );
-            const body = lines.join('\n');
-
-            // Find the previous run's issue by exact title. listForRepo rather
-            // than the search API: no index lag, no separate rate limit. The
-            // `creator` filter narrows to bot-authored issues so this is
-            // normally one request; paginate keeps it correct even if that
-            // filter is ignored. listForRepo returns PRs too, hence the guard.
-            const candidates = await github.paginate(github.rest.issues.listForRepo, {
-              owner, repo, state: 'open', creator: 'github-actions[bot]', per_page: 100,
-            });
-            const existing = candidates.filter((i) => !i.pull_request && i.title === title);
-
-            if (existing.length > 0) {
-              await github.rest.issues.createComment({
-                owner, repo, issue_number: existing[0].number, body,
-              });
-              core.info(`Commented on #${existing[0].number}`);
-            } else {
-              // Only pre-existing labels: creating a new one needs rights we
-              // don't assume, and an unknown label would be a needless failure.
-              const created = await github.rest.issues.create({
-                owner, repo, title, body, labels: ['bug', 'ci'],
-              });
-              core.info(`Created #${created.data.number}`);
-            }
+          title: ${{ env.SHEAR_ISSUE_TITLE }}
+          subject: '`cargo shear`'
+          result: failure
+          details-file: ${{ runner.temp }}/issue.md
+          mention: ${{ env.SHEAR_ISSUE_MENTION }}
 
       # Without this the issue outlives the breakage and stops meaning anything.
       - name: Close nightly issue on success
         if: success() && github.event_name == 'schedule'
-        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        uses: ./.github/actions/nightly-issue
         with:
-          script: |
-            const { owner, repo } = context.repo;
-            const title = process.env.SHEAR_ISSUE_TITLE;
-            const runUrl = `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`;
-
-            const candidates = await github.paginate(github.rest.issues.listForRepo, {
-              owner, repo, state: 'open', creator: 'github-actions[bot]', per_page: 100,
-            });
-            const open = candidates.filter((i) => !i.pull_request && i.title === title);
-
-            for (const issue of open) {
-              await github.rest.issues.createComment({
-                owner,
-                repo,
-                issue_number: issue.number,
-                body: `Resolved — \`cargo shear\` passed on ${context.sha}.\n\n- Run: ${runUrl}`,
-              });
-              await github.rest.issues.update({
-                owner, repo, issue_number: issue.number, state: 'closed',
-              });
-              core.info(`Closed #${issue.number}`);
-            }
+          title: ${{ env.SHEAR_ISSUE_TITLE }}
+          subject: '`cargo shear`'
+          result: success

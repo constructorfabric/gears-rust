@@ -11,7 +11,8 @@ use crate::infra::events::{self, enqueue_typed};
 use crate::test_support::{authed_ctx, flat_in_enforcer, resolved_usage_types, test_db_with};
 use axum::{Router, body::Body, http::Request};
 use event_broker::test_support::{EventBrokerHarness, StaticTypesRegistry};
-use event_broker_sdk::{Sequence, api::EventBrokerApi};
+use event_broker_sdk::backend::{Partition, TopicPartition, Wait};
+use event_broker_sdk::{GtsInstanceId, Sequence, api::EventBrokerApi};
 use serde_json::{Value, json};
 use std::{collections::BTreeSet, time::Duration};
 use toolkit_db::secure::TxConfig;
@@ -99,15 +100,13 @@ async fn bound() -> (
 async fn stored(broker: &EventBrokerHarness) -> Vec<(String, Value)> {
     let mut all = Vec::new();
     for partition in 0..PARTITIONS {
+        let at = TopicPartition::new(
+            GtsInstanceId::try_new(TOPIC).unwrap(),
+            Partition::new(partition),
+        );
         let events = broker
             .backend()
-            .read(
-                broker.security_context(),
-                TOPIC,
-                partition,
-                Sequence::NONE,
-                1024,
-            )
+            .read(&at, Sequence::NONE, 1024, Wait::No)
             .await
             .unwrap();
         for event in events {

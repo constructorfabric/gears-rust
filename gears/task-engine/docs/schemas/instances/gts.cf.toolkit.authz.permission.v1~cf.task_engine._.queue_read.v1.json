@@ -1,0 +1,6 @@
+{
+  "id": "gts.cf.toolkit.authz.permission.v1~cf.task_engine._.queue_read.v1",
+  "resource_type": "gts.cf.core.tasks.queue.v1~",
+  "action": "read",
+  "display_name": "Read queues: list, detail, depth and executing counts, effective limits"
+}

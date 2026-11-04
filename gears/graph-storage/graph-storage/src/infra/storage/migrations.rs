@@ -1,10 +1,8 @@
 //! Migrations of the built-in `PostgreSQL` store.
 //!
 //! Raw SQL is permitted here and nowhere else: `tsvector` generation, partial
-//! indexes, HNSW, identity columns and `CREATE PROPERTY GRAPH` are all beyond
-//! what `sea-orm-migration`'s schema builder models. The property-graph DDL
-//! itself is still *generated* — from the one declaration `MATCH` uses
-//! (Policy 3) — never hand-written.
+//! indexes, HNSW and identity columns are all beyond what
+//! `sea-orm-migration`'s schema builder models.
 
 use sea_orm_migration::prelude::*;
 
@@ -17,6 +15,7 @@ pub mod m0006_type_revision;
 pub mod m0007_source_namespace_owner;
 pub mod m0008_edge_scope_owner;
 pub mod m0009_read_path_indexes;
+pub mod m0010_drop_property_graph;
 
 /// Text-search configuration used for both the GIN index expression and every
 /// lexical query. One constant, so predicate and index cannot drift apart —
@@ -37,6 +36,7 @@ impl MigratorTrait for Migrator {
             Box::new(m0007_source_namespace_owner::Migration),
             Box::new(m0008_edge_scope_owner::Migration),
             Box::new(m0009_read_path_indexes::Migration),
+            Box::new(m0010_drop_property_graph::Migration),
         ]
     }
 }

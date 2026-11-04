@@ -1,5 +1,5 @@
 ---
-status: proposed
+status: superseded
 date: 2026-08-19
 decision-makers: Graph Storage design review
 ---
@@ -32,6 +32,8 @@ decision-makers: Graph Storage design review
 <!-- /toc -->
 
 **ID**: `cpt-cf-graph-storage-adr-sqlpgq-access`
+
+> **Superseded, 2026-10-14** (gears-rust #5267; ADR-0001 addendum). The gear no longer emits SQL/PGQ: PostgreSQL 19 GA ships without it (reverted in 19 beta 4), and on the reference graph the pattern hop measured slower than the two-query hop. The mechanism below — a typed pattern builder, a closed identifier vocabulary, a pattern that proposes and a scoped query that authorizes — is kept as the record of how SQL/PGQ was emitted safely, for whoever revisits it on PostgreSQL 20. The platform side it relied on (`toolkit-db`'s `pgq` feature, secure-orm ADR-0002) is the platform's to keep or retire.
 
 ## Context and Problem Statement
 

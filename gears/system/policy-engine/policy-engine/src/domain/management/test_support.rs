@@ -4,6 +4,8 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::collections::{BTreeSet, HashSet};
+use std::future::Future;
+use std::pin::Pin;
 
 use async_trait::async_trait;
 use authz_resolver_sdk::AuthZResolverApi;
@@ -21,6 +23,9 @@ use crate::domain::model::{
     BundleId, BundleVersion, ContentLimits, Document, VersionId, VersionState,
 };
 use crate::domain::ports::{PortError, TypeCatalogPort};
+
+/// A one-shot action the fake PDP awaits before answering.
+pub type Hook = Pin<Box<dyn Future<Output = ()> + Send>>;
 
 /// How the fake PDP answers.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -62,6 +67,9 @@ pub struct SeenRequest {
 pub struct FakePdp {
     mode: Mutex<PdpMode>,
     pub seen: Mutex<Vec<SeenRequest>>,
+    /// Awaited once, before the next answer: a concurrent writer acting
+    /// between a caller's reads.
+    pub before_next: Mutex<Option<Hook>>,
 }
 
 impl FakePdp {
@@ -69,6 +77,7 @@ impl FakePdp {
         Self {
             mode: Mutex::new(mode),
             seen: Mutex::new(Vec::new()),
+            before_next: Mutex::new(None),
         }
     }
 
@@ -94,6 +103,10 @@ impl AuthZResolverApi for FakePdp {
         _ctx: PlatformSecurityContext,
         request: EvaluationRequest,
     ) -> Result<EvaluationResponse, CanonicalError> {
+        let hook = self.before_next.lock().take();
+        if let Some(hook) = hook {
+            hook.await;
+        }
         let owner = request
             .resource
             .properties
@@ -252,9 +265,14 @@ pub mod governance {
     use toolkit_security::SecurityContext;
     use uuid::Uuid;
 
+    use time::OffsetDateTime;
+    use toolkit_db::secure::AccessScope;
+
     use super::{FakePdp, ctx};
     use super::{FakeTypes, WIDGET, deny_on, limits};
     use crate::domain::management::{ManagementService, ManagementServiceParts, StoreSet};
+    use crate::domain::model::{Assignment, AssignmentId, BundleId, VersionId, VersionState};
+    use crate::domain::repos::{AssignmentRepository, VersionRepository};
     use crate::domain::validation::ContentValidator;
     use crate::infra::storage::content_repo::{
         OrmAssignmentRepository, OrmBundleRepository, OrmVersionRepository,
@@ -309,6 +327,11 @@ pub mod governance {
     }
 
     pub async fn harness_with(pdp: FakePdp) -> Harness {
+        harness_over(pdp, tree()).await
+    }
+
+    /// A harness over `tree` instead of the tree above.
+    pub async fn harness_over(pdp: FakePdp, tree: FakeTree) -> Harness {
         let db = migrated_db().await;
         let validator = Arc::new(ContentValidator::new(Arc::new(FakeTypes), limits()));
         let store = Arc::new(StoreSet {
@@ -320,7 +343,7 @@ pub mod governance {
             assignments: OrmAssignmentRepository,
         });
         let pdp = Arc::new(pdp);
-        let tree = Arc::new(tree());
+        let tree = Arc::new(tree);
         let service = Arc::new(ManagementService::new(ManagementServiceParts {
             db: db.clone(),
             store,
@@ -397,6 +420,56 @@ pub mod governance {
                 .await
                 .unwrap();
             (bundle, active)
+        }
+
+        /// An assignment of `bundle_id` made by `owner` at `tenant`, stored
+        /// directly - as one made before a barrier was raised would be.
+        pub async fn stored_by(
+            &self,
+            bundle_id: BundleId,
+            owner: Uuid,
+            tenant: Uuid,
+        ) -> Assignment {
+            let conn = self.db.conn().unwrap();
+            let at = OffsetDateTime::now_utc();
+            OrmAssignmentRepository
+                .insert(
+                    &conn,
+                    &AccessScope::allow_all(),
+                    &Assignment {
+                        id: AssignmentId(Uuid::new_v4()),
+                        bundle_id,
+                        tenant_id: tenant,
+                        owner_tenant_id: owner,
+                        enforce: true,
+                        created_at: at,
+                        created_by: ALICE,
+                        updated_at: at,
+                        updated_by: ALICE,
+                    },
+                )
+                .await
+                .unwrap()
+        }
+
+        /// The stored assignment, read under the gear's own scope.
+        pub async fn stored_assignment(&self, id: AssignmentId) -> Option<Assignment> {
+            let conn = self.db.conn().unwrap();
+            OrmAssignmentRepository
+                .get(&conn, &AccessScope::allow_all(), id)
+                .await
+                .unwrap()
+        }
+
+        /// The version's stored state, read under the gear's own scope.
+        pub async fn stored_state(&self, id: VersionId) -> VersionState {
+            let conn = self.db.conn().unwrap();
+            OrmVersionRepository
+                .get_with_content(&conn, &AccessScope::allow_all(), id)
+                .await
+                .unwrap()
+                .expect("version exists")
+                .state
         }
     }
 }

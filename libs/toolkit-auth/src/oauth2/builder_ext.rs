@@ -3,7 +3,7 @@ use tower::ServiceExt;
 
 use super::auto_refresh::{BearerAuthAutoRefreshLayer, BearerAuthAutoRefreshOpts};
 use super::layer::BearerAuthLayer;
-use super::token::Token;
+use super::token::TokenProvider;
 
 /// Extension trait for adding bearer auth to [`toolkit_http::HttpClientBuilder`].
 ///
@@ -12,7 +12,7 @@ use super::token::Token;
 /// ```ignore
 /// use toolkit_auth::HttpClientBuilderExt;
 ///
-/// let token = Token::new(config).await?;
+/// let token = TokenProvider::new(config)?;
 /// let client = HttpClientBuilder::new()
 ///     .with_bearer_auth(token)
 ///     .build()?;
@@ -20,16 +20,16 @@ use super::token::Token;
 pub trait HttpClientBuilderExt {
     /// Add `Authorization: Bearer <token>` injection to the HTTP client.
     #[must_use]
-    fn with_bearer_auth(self, token: Token) -> Self;
+    fn with_bearer_auth(self, token: TokenProvider) -> Self;
 
     /// Add `<header_name>: Bearer <token>` injection to the HTTP client.
     #[must_use]
-    fn with_bearer_auth_header(self, token: Token, header_name: HeaderName) -> Self;
+    fn with_bearer_auth_header(self, token: TokenProvider, header_name: HeaderName) -> Self;
 
     /// Add bearer auth plus reactive refresh-on-401 to the HTTP client.
     ///
     /// Default options: `Authorization` header, retry on `401` only,
-    /// 15-minute throttle on `Token::invalidate`. See
+    /// 15-minute throttle on `TokenProvider::invalidate`. See
     /// [`BearerAuthAutoRefreshLayer`] (Rust port of go-appkit's
     /// `AuthBearerRoundTripper`) for the full behavior contract.
     ///
@@ -38,25 +38,29 @@ pub trait HttpClientBuilderExt {
     /// [`HttpClientBuilderExt::with_bearer_auth`] when the upstream is known
     /// not to revoke tokens out-of-band.
     #[must_use]
-    fn with_bearer_auth_auto_refresh(self, token: Token) -> Self;
+    fn with_bearer_auth_auto_refresh(self, token: TokenProvider) -> Self;
 
     /// Add bearer auth plus reactive refresh-on-401 stamped into a custom
     /// header. Other options (predicate, throttle) use defaults.
     #[must_use]
-    fn with_bearer_auth_auto_refresh_header(self, token: Token, header_name: HeaderName) -> Self;
+    fn with_bearer_auth_auto_refresh_header(
+        self,
+        token: TokenProvider,
+        header_name: HeaderName,
+    ) -> Self;
 
     /// Add bearer auth plus reactive refresh-on-401 with explicit options.
     /// See [`BearerAuthAutoRefreshOpts`].
     #[must_use]
     fn with_bearer_auth_auto_refresh_opts(
         self,
-        token: Token,
+        token: TokenProvider,
         opts: BearerAuthAutoRefreshOpts,
     ) -> Self;
 }
 
 impl HttpClientBuilderExt for toolkit_http::HttpClientBuilder {
-    fn with_bearer_auth(self, token: Token) -> Self {
+    fn with_bearer_auth(self, token: TokenProvider) -> Self {
         let layer = BearerAuthLayer::new(token);
         self.with_auth_layer(move |svc| {
             tower::ServiceBuilder::new()
@@ -66,7 +70,7 @@ impl HttpClientBuilderExt for toolkit_http::HttpClientBuilder {
         })
     }
 
-    fn with_bearer_auth_header(self, token: Token, header_name: HeaderName) -> Self {
+    fn with_bearer_auth_header(self, token: TokenProvider, header_name: HeaderName) -> Self {
         let layer = BearerAuthLayer::with_header_name(token, header_name);
         self.with_auth_layer(move |svc| {
             tower::ServiceBuilder::new()
@@ -76,7 +80,7 @@ impl HttpClientBuilderExt for toolkit_http::HttpClientBuilder {
         })
     }
 
-    fn with_bearer_auth_auto_refresh(self, token: Token) -> Self {
+    fn with_bearer_auth_auto_refresh(self, token: TokenProvider) -> Self {
         let layer = BearerAuthAutoRefreshLayer::new(token);
         self.with_auth_layer(move |svc| {
             tower::ServiceBuilder::new()
@@ -86,7 +90,11 @@ impl HttpClientBuilderExt for toolkit_http::HttpClientBuilder {
         })
     }
 
-    fn with_bearer_auth_auto_refresh_header(self, token: Token, header_name: HeaderName) -> Self {
+    fn with_bearer_auth_auto_refresh_header(
+        self,
+        token: TokenProvider,
+        header_name: HeaderName,
+    ) -> Self {
         self.with_bearer_auth_auto_refresh_opts(
             token,
             BearerAuthAutoRefreshOpts {
@@ -98,7 +106,7 @@ impl HttpClientBuilderExt for toolkit_http::HttpClientBuilder {
 
     fn with_bearer_auth_auto_refresh_opts(
         self,
-        token: Token,
+        token: TokenProvider,
         opts: BearerAuthAutoRefreshOpts,
     ) -> Self {
         let layer = BearerAuthAutoRefreshLayer::with_opts(token, opts);
@@ -141,6 +149,7 @@ mod tests {
         format!(r#"{{"access_token":"{token}","expires_in":{expires_in},"token_type":"Bearer"}}"#)
     }
 
+    /// The builder obtains a token lazily before sending the first request.
     #[tokio::test]
     async fn with_bearer_auth_injects_header() {
         // OAuth token endpoint
@@ -163,7 +172,7 @@ mod tests {
                 .body(r#"{"ok":true}"#);
         });
 
-        let token = Token::new(token_config(&oauth_server)).await.unwrap();
+        let token = TokenProvider::new(token_config(&oauth_server)).unwrap();
 
         let client = toolkit_http::HttpClientBuilder::new()
             .with_bearer_auth(token)
@@ -179,6 +188,7 @@ mod tests {
         api_mock.assert();
     }
 
+    /// The builder injects credentials using the configured header.
     #[tokio::test]
     async fn with_bearer_auth_header_injects_custom_header() {
         let oauth_server = MockServer::start();
@@ -199,7 +209,8 @@ mod tests {
                 .body(r#"{"ok":true}"#);
         });
 
-        let token = Token::new(token_config(&oauth_server)).await.unwrap();
+        let token = TokenProvider::new(token_config(&oauth_server)).unwrap();
+        token.get().await.unwrap();
         let custom = HeaderName::from_static("x-api-key");
 
         let client = toolkit_http::HttpClientBuilder::new()
@@ -216,6 +227,7 @@ mod tests {
         api_mock.assert();
     }
 
+    /// The composed HTTP client replaces a rejected token and replays once.
     #[tokio::test]
     async fn with_bearer_auth_auto_refresh_retries_on_401() {
         // Token endpoint: returns tok-A initially, then tok-B after the
@@ -227,7 +239,8 @@ mod tests {
                 .header("content-type", "application/json")
                 .body(token_json("tok-auto-A", 3600));
         });
-        let token = Token::new(token_config(&oauth_server)).await.unwrap();
+        let token = TokenProvider::new(token_config(&oauth_server)).unwrap();
+        token.get().await.unwrap();
         assert_eq!(initial_mock.calls(), 1, "initial fetch");
 
         initial_mock.delete();

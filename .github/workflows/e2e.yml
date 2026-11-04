@@ -25,8 +25,8 @@ permissions:
   issues: write
 
 concurrency:
-  group: e2e-${{ github.ref }}
-  cancel-in-progress: false
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -43,7 +43,7 @@ jobs:
   # Catches the two ways these pins drift silently - the Rust version getting
   # out of step with rust-toolchain.toml, and a FROM line losing its digest.
   docker-pins:
-    runs-on: ubuntu-latest
+    runs-on: ${{ (vars.GEARS_FORCE_GITHUB_HOSTED == 'true' || github.repository != 'constructorfabric/gears-rust' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && 'ubuntu-latest' || 'gears-small' }}
     timeout-minutes: 5
     steps:
       - name: Checkout
@@ -58,7 +58,7 @@ jobs:
   # trigger, so gating on pushes would be a no-op; the real gap is a PR that
   # edits the docker lane and merges without it ever being built.
   docker-changes:
-    runs-on: ubuntu-latest
+    runs-on: ${{ (vars.GEARS_FORCE_GITHUB_HOSTED == 'true' || github.repository != 'constructorfabric/gears-rust' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && 'ubuntu-latest' || 'gears-small' }}
     timeout-minutes: 5
     outputs:
       docker: ${{ steps.filter.outputs.docker }}
@@ -115,7 +115,7 @@ jobs:
         github.event_name == 'workflow_dispatch' ||
         needs.docker-changes.outputs.docker == 'true'
       )
-    runs-on: ubuntu-latest
+    runs-on: ${{ (vars.GEARS_FORCE_GITHUB_HOSTED == 'true' || github.repository != 'constructorfabric/gears-rust' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && 'ubuntu-latest' || 'gears-large' }}
     timeout-minutes: 60
 
     env:
@@ -128,7 +128,7 @@ jobs:
           persist-credentials: false
 
       - name: Set up Python
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.11"
 
@@ -171,7 +171,7 @@ jobs:
 
       - name: Upload E2E test results
         if: ${{ !cancelled() }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: e2e-tests-docker
           path: test-results/e2e/*.xml
@@ -185,7 +185,7 @@ jobs:
         run: docker compose -f testing/docker/docker-compose.yml down -v || true
 
   e2e:
-    runs-on: ubuntu-latest
+    runs-on: ${{ (vars.GEARS_FORCE_GITHUB_HOSTED == 'true' || github.repository != 'constructorfabric/gears-rust' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && 'ubuntu-latest' || 'gears-large' }}
     timeout-minutes: 45
 
     steps:
@@ -195,12 +195,13 @@ jobs:
           persist-credentials: false
 
       - name: Install system dependencies
+        if: runner.environment == 'github-hosted'
         run: |
           sudo apt-get update
           sudo apt-get install -y protobuf-compiler
 
       - name: Set up Python
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.11"
 
@@ -213,29 +214,29 @@ jobs:
       # binary and the lane-specific targets below each build their own feature
       # configuration. Without a cache every run started from zero, which is
       # what put e2e runs at 29-41 minutes. Mirrors the `integration` job in
-      # ci.yml — same actions, same pinned SHAs, same cache-targets: false
-      # (rust-cache holds the registry; sccache holds the compiled objects).
+      # ci.yml: the shared build cache on the self-hosted runners, rust-cache for
+      # the registry on GitHub-hosted ones; sccache holds the compiled objects.
+      # This workflow never runs on a push to main, so it only reads that cache.
+      - name: Set up the shared build cache
+        id: cache
+        uses: ./.github/actions/ci-cache
+        with:
+          rust: true
+          downloads: |
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          downloads-key: cargo-${{ hashFiles('**/Cargo.lock') }}
+          downloads-restore-keys: cargo-
+
+      # GitHub-hosted runs (fork pull requests, the kill switch) keep the
+      # registry cache; on the self-hosted runners ci-cache covers it.
       - name: Cache Cargo/target
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        if: ${{ steps.cache.outputs.mode == 'none' }}
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           cache-bin: false
           cache-targets: false
           shared-key: pr-${{ runner.os }}-e2e-${{ hashFiles('rust-toolchain.toml') }}
-
-      # Install sccache (cross-platform)
-      - name: Install sccache
-        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
-
-      # Probe sccache; if startup fails, fall back to plain rustc (no hard CI failure).
-      - name: Probe sccache & set RUSTC_WRAPPER
-        shell: bash
-        run: |
-          if sccache --start-server >/dev/null 2>&1; then
-            echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
-            echo "SCCACHE_GHA_ENABLED=true" >> "$GITHUB_ENV"
-          else
-            echo "sccache failed, falling back to plain rustc"
-          fi
 
       - name: Install Python dependencies
         id: setup
@@ -313,6 +314,22 @@ jobs:
           PYTEST_ADDOPTS: "--junitxml=${{ github.workspace }}/test-results/e2e/oop.xml -o junit_suite_name=e2e-oop"
         run: tools/scripts/with_rust_annotations.sh make e2e-oop
 
+      # Self-managed suite (launcher: pytest): its own server binary. The whole
+      # suite runs on the in-process memory backend; the `backend_sensitive`
+      # tests run again on PostgreSQL (a container, so the second step needs a
+      # reachable Docker daemon).
+      - name: Run event-broker E2E tests (memory backend)
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        env:
+          PYTEST_ADDOPTS: "--junitxml=${{ github.workspace }}/test-results/e2e/event-broker.xml -o junit_suite_name=e2e-event-broker"
+        run: tools/scripts/with_rust_annotations.sh make e2e-event-broker
+
+      - name: Run event-broker E2E tests (PostgreSQL backend)
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        env:
+          PYTEST_ADDOPTS: "--junitxml=${{ github.workspace }}/test-results/e2e/event-broker-pg.xml -o junit_suite_name=e2e-event-broker-pg"
+        run: tools/scripts/with_rust_annotations.sh make e2e-event-broker-pg
+
       # pytest records the assertion but not where it failed; take that from
       # the traceback so the report can annotate the test's source line.
       # --github also annotates the failures on this job and writes the job
@@ -330,7 +347,7 @@ jobs:
 
       - name: Upload E2E test results
         if: ${{ !cancelled() }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: e2e-tests-local
           path: test-results/e2e/*.xml
@@ -339,7 +356,7 @@ jobs:
 
       - name: Upload E2E logs
         if: failure()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: e2e-logs-${{ github.run_id }}
           if-no-files-found: ignore
@@ -415,7 +432,17 @@ jobs:
                 repo,
                 title,
                 body,
-                labels: ["bug", "e2e-nightly", "ci"],
+                labels: ["bug", "e2e-nightly", "ci", "nightly"],
               });
               await tryAssign(created.data.number);
             }
+
+      # The failure step above opens "Nightly E2E failed" but nothing closed it,
+      # so the issue outlived the breakage. A green scheduled run closes it.
+      - name: Close nightly issue on success
+        if: success() && github.event_name == 'schedule'
+        uses: ./.github/actions/nightly-issue
+        with:
+          title: Nightly E2E failed
+          subject: Nightly E2E
+          result: success

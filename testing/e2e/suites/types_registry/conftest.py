@@ -17,15 +17,19 @@ SCENARIO_TESTS = pytest.StashKey[dict[str, list[str]]]()
 
 @pytest.fixture
 def registry_api_path():
-    """Use the configured API version without an automatic fallback."""
-    return f"types-registry/{os.getenv('TYPES_REGISTRY_API_VERSION', 'v2')}"
+    """Use the configured API for the whole workflow, without a fallback."""
+    return f"types-registry/{os.getenv('TYPES_REGISTRY_API_VERSION', 'v2/platform')}"
 
 
 @pytest.fixture
-async def registry_http(base_url, auth_headers):
+async def registry_http(base_url, registry_api_path, auth_headers, platform_headers):
+    """Use the selected API's credentials for writes, polling and reads alike."""
+    credentials = (
+        platform_headers if registry_api_path.endswith("/platform") else auth_headers
+    )
     async with httpx.AsyncClient(
         base_url=base_url.rstrip("/") + "/",
-        headers={**auth_headers, "traceparent": TRACEPARENT},
+        headers={**credentials, "traceparent": TRACEPARENT},
         timeout=3.0,
     ) as client:
         yield client

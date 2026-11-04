@@ -198,6 +198,18 @@ impl<E> SecureSelect<E, Scoped>
 where
     E: EntityTrait,
 {
+    /// Lock matching scoped rows for concurrent readers inside a transaction.
+    pub fn lock_shared(mut self) -> Self {
+        self.inner = self.inner.lock_shared();
+        self
+    }
+
+    /// Lock matching scoped rows exclusively inside a transaction.
+    pub fn lock_exclusive(mut self) -> Self {
+        self.inner = self.inner.lock_exclusive();
+        self
+    }
+
     /// Execute the query and return all matching results.
     ///
     /// # Errors

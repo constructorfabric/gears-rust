@@ -10,7 +10,7 @@ use super::subscription::TraceMailbox;
 use super::trace::TraceAdvance;
 use super::types::{LeaseConfig, OutboxError};
 use crate::Db;
-use sea_orm::{ConnectionTrait, DatabaseExecutor, FromQueryResult, Statement, TransactionTrait};
+use sea_orm::{ConnectionTrait, DatabaseExecutor, FromQueryResult, Statement};
 use toolkit_taskward::stop_deadline;
 
 /// Context for processing a single partition's batch.
@@ -452,8 +452,7 @@ impl ProcessingStrategy for TransactionalStrategy {
         ctx: &ProcessContext<'_>,
         msg_batch_size: u32,
     ) -> Result<Option<ProcessResult>, OutboxError> {
-        let conn = ctx.db.sea_internal();
-        let txn = conn.begin().await?;
+        let txn = ctx.db.begin_tx().await?;
 
         let Some(proc_row) = try_lock_and_read_state(&txn, &ctx.store, ctx.partition_id).await?
         else {
@@ -534,8 +533,7 @@ async fn acquire_lease_and_read(
     lease_secs: i64,
     msg_batch_size: u32,
 ) -> Result<Option<(Vec<OutboxMessage>, TraceIds)>, OutboxError> {
-    let sea_conn = ctx.db.sea_internal();
-    let txn = sea_conn.begin().await?;
+    let txn = ctx.db.begin_tx().await?;
 
     let proc_row = ctx
         .store
@@ -682,8 +680,7 @@ async fn lease_guarded_ack(
     processed: u32,
     rejections: &[super::batch::Rejection],
 ) -> Result<Option<ProcessResult>, OutboxError> {
-    let ack_conn = ctx.db.sea_internal();
-    let ack_txn = ack_conn.begin().await?;
+    let ack_txn = ctx.db.begin_tx().await?;
     let count = u32::try_from(msgs.len()).unwrap_or(u32::MAX);
 
     // All three branches persist rejections first, then differ in cursor behavior.

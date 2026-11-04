@@ -60,7 +60,8 @@ impl QuarantineBreach {
 /// Reject stable candidates that derive from, `$ref`, or conform to major 0.
 /// Uses [`extract_edges`](crate::domain::dependency::extract_edges), shared with
 /// the dependency graph. Target identifiers suffice; no documents are loaded.
-/// `x-gts-ref` creates no dependency and is absent from these edges.
+/// An entity reference (`x-gts-type-ref` / `x-gts-instance-ref`) creates no
+/// dependency and is absent from these edges.
 ///
 /// An unreadable candidate major is treated as stable; baseline selection rejects
 /// it earlier. Unreadable target majors are left to resolution validation.

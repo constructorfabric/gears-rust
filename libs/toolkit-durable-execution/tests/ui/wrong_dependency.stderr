@@ -1,0 +1,21 @@
+error[E0631]: type mismatch in closure arguments
+ --> tests/ui/wrong_dependency.rs:7:26
+  |
+7 |       let _ = builder.then(Step::with_deps("use", Duration::from_secs(1), &count, |_, n: u32, text: String| async move {
+  |                            ^                                                      ------------------------- found signature defined here
+  |  __________________________|
+  | |
+8 | |         Ok(format!("{n}{text}"))
+9 | |     }));
+  | |______^ expected due to this
+  |
+  = note: expected closure signature `fn(ActivityContext, u32, u32) -> _`
+             found closure signature `fn(ActivityContext, u32, String) -> _`
+note: required by a bound in `toolkit_durable_execution::workflow::Step::<I, O>::with_deps`
+ --> src/workflow.rs
+  |
+  |     pub fn with_deps<D, F, Fut>(
+  |            --------- required by a bound in this associated function
+...
+  |         F: Fn(ActivityContext, I, D::Values) -> Fut + Send + Sync + 'static,
+  |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ required by this bound in `Step::<I, O>::with_deps`

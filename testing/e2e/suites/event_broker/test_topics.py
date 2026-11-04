@@ -1,4 +1,4 @@
-"""Topic introspection scenarios (topics/1.01-1.04).
+"""Topic introspection scenarios (topics/1.01-1.05).
 
 All tests are read-only.  The pre-provisioned topics injected into the
 session-scoped server at startup (``TOPIC_STREAM``, ``TOPIC_LONGPOLL``,
@@ -7,9 +7,18 @@ session-scoped server at startup (``TOPIC_STREAM``, ``TOPIC_LONGPOLL``,
 
 from __future__ import annotations
 
+from datetime import datetime
+
 import pytest
 
-from .conftest import EVENT_TYPE_STREAM, TOPIC_STREAM, TOPIC_LONGPOLL, TRACE_ID
+from .conftest import (
+    EVENT_TYPE_STREAM,
+    TOPIC_LONGPOLL,
+    TOPIC_PREFILLED,
+    TOPIC_STREAM,
+    TOPIC_STRICT,
+    TRACE_ID,
+)
 
 
 async def test_list_topics_returns_paged_list(api):
@@ -37,6 +46,7 @@ async def test_list_topics_returns_paged_list(api):
     }
 
 
+@pytest.mark.backend_sensitive
 async def test_list_topic_segments_returns_manifest(api):
     """scenario: topics/1.02-positive-list-topic-segments.md"""
     async with api() as client:
@@ -55,6 +65,24 @@ async def test_list_topic_segments_returns_manifest(api):
         "segments": body["segments"],
     }
     assert isinstance(body["segments"], list)
+
+
+async def test_segments_of_an_empty_partition_report_an_empty_manifest(api):
+    """scenario: topics/1.05-positive-segments-empty-partition.md"""
+    # TOPIC_STRICT only ever sees publishes the broker refuses, so it stores no events.
+    async with api() as client:
+        resp = await client.get(f"/topics/segments?topic={TOPIC_STRICT}&partition=0")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body == {
+        "topic": TOPIC_STRICT,
+        "partition": 0,
+        "start_sequence": 0,
+        "end_sequence": 0,
+        "start_time": None,
+        "end_time": None,
+        "segments": [],
+    }
 
 
 async def test_segments_for_unknown_topic_returns_404(api):
@@ -100,3 +128,52 @@ async def test_list_event_types_returns_paged_list(api):
         "partition_key": happy_et["partition_key"],
         "data_schema": happy_et["data_schema"],
     }
+
+
+@pytest.mark.backend_sensitive
+async def test_segments_report_the_stored_range(api, prefilled_topic):
+    """feature 0003 / 0007 §2.6 - `query` reports the stored range.
+
+    TOPIC_PREFILLED holds exactly the seeded events, so the manifest's range is
+    theirs: from the first seeded event's sequence and storage time to the
+    last's. The `segments` entries are the backend's own shape and stay opaque.
+    """
+    first, last = prefilled_topic.events[0], prefilled_topic.events[-1]
+    async with api() as client:
+        resp = await client.get(f"/topics/segments?topic={TOPIC_PREFILLED}&partition=0")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body == {
+        "topic": TOPIC_PREFILLED,
+        "partition": 0,
+        "start_sequence": first["sequence"],
+        "end_sequence": last["sequence"],
+        "start_time": body["start_time"],
+        "end_time": body["end_time"],
+        "segments": body["segments"],
+    }
+    assert _instant(body["start_time"]) == _instant(first["sequence_time"])
+    assert _instant(body["end_time"]) == _instant(last["sequence_time"])
+
+
+async def test_segments_for_a_partition_past_the_count_returns_400(api):
+    """feature 0003 - a partition at or above the topic's count is InvalidPartition."""
+    async with api() as client:
+        resp = await client.get(f"/topics/segments?topic={TOPIC_PREFILLED}&partition=1")
+    assert resp.status_code == 400
+    assert resp.json() == {
+        "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~",
+        "title": "Invalid Argument",
+        "status": 400,
+        "detail": "InvalidPartition: partition must be in [0, 1) for this topic",
+        "instance": "/event-broker/v1/topics/segments",
+        "trace_id": TRACE_ID,
+        "context": {
+            "format": "InvalidPartition: partition must be in [0, 1) for this topic",
+            "resource_type": "gts.cf.core.events.request.v1~",
+        },
+    }
+
+
+def _instant(text: str) -> datetime:
+    return datetime.fromisoformat(text.replace("Z", "+00:00"))

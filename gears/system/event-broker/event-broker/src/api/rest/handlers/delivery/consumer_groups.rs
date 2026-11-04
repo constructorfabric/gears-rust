@@ -37,13 +37,6 @@ pub async fn create_consumer_group(
             .into()
     };
 
-    if let Some(client_agent) = input.client_agent.as_deref() {
-        event_broker_sdk::validate::client_agent(client_agent).map_err(DomainError::from)?;
-    }
-    if let Some(description) = input.description.as_deref() {
-        event_broker_sdk::validate::description(description).map_err(DomainError::from)?;
-    }
-
     let group = state.delivery.create_consumer_group(&ctx, input).await?;
     let id = group.id.clone();
     Ok(created_json(

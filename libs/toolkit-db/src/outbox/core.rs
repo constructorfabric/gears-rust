@@ -18,7 +18,7 @@ use super::trace::{TraceOutcome, TraceState};
 use super::types::{OutboxConfig, OutboxError, OutboxMessageId};
 use super::wake::Wake;
 use crate::Db;
-use crate::secure::SeaOrmRunner;
+use crate::secure::{SeaOrmRunner, TxConfig, TxIsolationLevel};
 
 /// Per-partition notify map shared between sequencer and processors.
 type PartitionNotifyMap = Arc<HashMap<i64, Arc<Notify>>>;
@@ -300,6 +300,11 @@ impl Outbox {
     /// `register_queue` concurrently for the same queue. The INSERT uses
     /// `ON CONFLICT DO NOTHING`, so concurrent inserts are safe — the
     /// second caller will see the already-inserted rows on its read-back.
+    /// PostgreSQL, MySQL and MariaDB use `READ COMMITTED` here so registration
+    /// observes commits from active processors, rather than retaining a stale metadata
+    /// snapshot. This override does not change the pooled connection's default.
+    /// On MySQL and MariaDB, when binary logging is enabled, use `ROW` or
+    /// `MIXED` for these writes.
     pub async fn register_queue(
         &self,
         db: &Db,
@@ -307,8 +312,16 @@ impl Outbox {
         num_partitions: u16,
     ) -> Result<(), OutboxError> {
         super::validation::validate_queue_name(queue)?;
-        let conn = db.sea_internal();
-        let txn = conn.begin().await?;
+        // Queue metadata must observe commits from active processors and other
+        // registrants, regardless of the server connection's default isolation.
+        let isolation = matches!(db.backend(), DbBackend::Postgres | DbBackend::MySql)
+            .then_some(TxIsolationLevel::ReadCommitted);
+        let txn = db
+            .begin_tx_with_config(TxConfig {
+                isolation,
+                access_mode: None,
+            })
+            .await?;
         let store = OutboxStore::new(self.statements());
 
         let ids = Self::ensure_partition_rows(&txn, &store, queue, num_partitions).await?;

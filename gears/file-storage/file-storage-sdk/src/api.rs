@@ -5,7 +5,3 @@ pub trait FileStorageClientV1: Send + Sync {
     /// Module name of the backing gear. Placeholder until real operations land.
     fn module_name(&self) -> &'static str;
 }
-
-#[cfg(test)]
-#[path = "api_tests.rs"]
-mod api_tests;

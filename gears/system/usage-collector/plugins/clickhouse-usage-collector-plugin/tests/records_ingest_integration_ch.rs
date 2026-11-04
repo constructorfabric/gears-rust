@@ -3,19 +3,22 @@
 //! `ClickHouse`-backed integration tests for [`ChRecordStore`] ingest:
 //! single insert with idempotency dedup (insert / absorb / conflict),
 //! compensation persistence, batch per-row outcomes, deactivation cascade,
-//! cascade atomicity, the dedup-convergence race, and the engine-side insert
-//! dedup token. Requires Docker, except for the fixture-contract test at the
-//! bottom of the file.
+//! cascade atomicity, the dedup-convergence race, the per-`INSERT` settings
+//! each write intent carries (async for record creates, synchronous for
+//! markers), and the engine-side insert dedup token. Requires Docker, except
+//! for the fixture-contract test at the bottom of the file.
 
 mod common;
 
+use bigdecimal::BigDecimal;
 use rust_decimal::Decimal;
 use tokio::sync::Barrier;
 use uuid::Uuid;
 
+use toolkit_odata::{ODataOrderBy, ODataQuery, OrderKey, SortDir};
 use usage_collector_sdk::{
-    UsageCollectorPluginError, UsageRecord, UsageRecordStatus, created_at_micros,
-    derive_usage_record_id,
+    AggregationOp, AggregationSpec, UsageCollectorPluginError, UsageRecord, UsageRecordStatus,
+    created_at_micros, derive_usage_record_id,
 };
 
 use clickhouse_usage_collector_plugin::domain::ports::{CatalogStore, RecordStore};
@@ -214,10 +217,9 @@ async fn seed_row_with_id(client: &clickhouse::Client, id: Uuid, record: &UsageR
 
 /// How many logical rows share `record`'s canonical dedup tuple.
 ///
-/// Deliberately keeps `FINAL`, which the store itself no longer emits: this is
-/// an independent oracle. It checks convergence using the engine's own version
-/// resolution rather than restating the store's `ORDER BY version DESC LIMIT 1
-/// BY …`, so a bug in how the store spells its resolution cannot make this
+/// An independent oracle: it counts under the engine's own `FINAL` resolution
+/// rather than restating the point reads' `ORDER BY version DESC LIMIT 1 BY
+/// …`, so a bug in how the store spells its resolution cannot make this
 /// helper agree with it.
 async fn count_rows_for_dedup_key(client: &clickhouse::Client, record: &UsageRecord) -> u64 {
     let sql = "SELECT count() FROM usage_records FINAL \
@@ -1146,22 +1148,14 @@ async fn ch_usage_records_insert_carries_the_async_insert_settings() {
     );
 }
 
-/// The multi-row `INSERT` path must stay **synchronous**, whatever the
-/// configured `async_insert` says.
-///
-/// `async_insert = 1` coalesces across statements and flushes on its own
-/// schedule, so one statement's rows are not guaranteed to land in a single
-/// commit. `create_batch` is documented as a whole-batch write, and the
-/// deactivation cascade requires its marker rows to flip together —
-/// `ch_deactivation_cascade_is_atomic` is what actually fails when they do
-/// not, and it did fail before this path was pinned synchronous.
-///
-/// This test is the cheap, deterministic guard for the same decision: a
-/// refactor that "makes the two insert sites consistent" trips here rather
-/// than intermittently in the race test.
+/// The multi-row record-create `INSERT` goes through the async-insert buffer
+/// like the single-row one: a request-shaped batch stream is the same
+/// part-per-request problem, and `wait_for_async_insert = 1` keeps the ack a
+/// durability ack. The outcomes come back only after the flush committed —
+/// which the immediate `get` of every row proves.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires Docker (testcontainers)"]
-async fn ch_batch_insert_is_synchronous_even_with_async_insert_enabled() {
+async fn ch_batch_insert_carries_the_async_insert_settings() {
     let Some((h, store)) = setup().await else {
         return;
     };
@@ -1173,35 +1167,100 @@ async fn ch_batch_insert_is_synchronous_even_with_async_insert_enabled() {
             common::fixture_usage_record(
                 VCPU_GTS,
                 tenant,
-                &format!("idem-batch-sync-{i}"),
+                &format!("idem-batch-async-{i}"),
                 Decimal::new(i64::from(i) + 1, 0),
             )
         })
         .collect();
+    let ids: Vec<Uuid> = batch.iter().map(|r| r.id).collect();
     let outcomes = store.create_batch(batch).await.expect("create batch");
     assert_eq!(outcomes.len(), 3, "every batch row gets an outcome");
+    assert!(outcomes.iter().all(Result::is_ok), "{outcomes:?}");
+    for id in ids {
+        assert_eq!(
+            store.get(id).await.expect("get").id,
+            id,
+            "a row acknowledged by create_batch is already committed and readable"
+        );
+    }
 
-    let (async_insert, _wait, token) = last_insert_settings(&h.client, "usage_records").await;
+    let (async_insert, wait_for_async_insert, token) =
+        last_insert_settings(&h.client, "usage_records").await;
     assert!(
         Uuid::parse_str(&token).is_ok(),
         "the batch insert must carry a UUID insert_deduplication_token (got {token:?})"
     );
+    assert_eq!(
+        async_insert, "1",
+        "the multi-row record INSERT must go through the async-insert buffer"
+    );
+    let effective_wait = if wait_for_async_insert.is_empty() {
+        server_setting_default(&h.client, "wait_for_async_insert").await
+    } else {
+        wait_for_async_insert
+    };
+    assert_eq!(
+        effective_wait, "1",
+        "a batch must be acknowledged only after the buffer flushed and committed"
+    );
+}
+
+/// Deactivation markers are written **synchronously**, with `async_insert = 0`
+/// sent explicitly, whatever the store's `async_insert` says: the cascade
+/// needs one statement's markers to flip together (per partition), which a
+/// shared buffer flushing on its own schedule does not give —
+/// `ch_deactivation_cascade_is_atomic` is what fails when they do not.
+///
+/// `query_log.Settings` records only values that differ from the server
+/// default, so an explicit `0` shows up as either `"0"` or — when the server
+/// default is `0` — as empty; both are resolved against the server's default.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires Docker (testcontainers)"]
+async fn ch_deactivation_markers_are_inserted_synchronously() {
+    let Some((h, store)) = setup().await else {
+        return;
+    };
+    let tenant = Uuid::from_u128(0x10A3);
+
+    let rec =
+        common::fixture_usage_record(VCPU_GTS, tenant, "idem-marker-sync", Decimal::new(5, 0));
+    let id = rec.id;
+    store.create(rec).await.expect("create record");
+    store.deactivate(id).await.expect("deactivate record");
+
+    // The last INSERT into usage_records is the marker statement.
+    let (async_insert, _wait, token) = last_insert_settings(&h.client, "usage_records").await;
     assert!(
-        async_insert.is_empty() || async_insert == "0",
-        "the multi-row INSERT must not set async_insert (got {async_insert:?}); \
-         the server-side buffer can split one statement's rows across flushes, \
-         which breaks the whole-batch and cascade visibility guarantees"
+        Uuid::parse_str(&token).is_ok(),
+        "the marker insert keeps the engine-side dedup token (got {token:?})"
+    );
+    let effective_async = if async_insert.is_empty() {
+        server_setting_default(&h.client, "async_insert").await
+    } else {
+        async_insert
+    };
+    assert_eq!(
+        effective_async, "0",
+        "the marker INSERT must be synchronous: a buffered marker set can be split across \
+         flushes and let a reader see a flipped compensation under a still-active target"
+    );
+    assert_eq!(
+        store.get(id).await.expect("get").status,
+        UsageRecordStatus::Inactive
     );
 }
 
 // ---------------------------------------------------------------------------
 // Engine-side insert deduplication
 //
-// `list` and `aggregate` no longer collapse duplicate creates at read time, so
-// the engine has to stop them from being stored. Every `usage_records` INSERT
-// carries an `insert_deduplication_token` derived from its row ids, and the
-// table keeps a `non_replicated_deduplication_window`; ClickHouse enforces the
-// token on synchronous inserts, which is why these tests use the sync store.
+// Every `usage_records` INSERT carries an `insert_deduplication_token` derived
+// from its row ids, and the table keeps a `non_replicated_deduplication_window`.
+// Where ClickHouse honours the token — on synchronous inserts, which is why
+// the physical-row-count tests use the sync store — an exact racing twin is
+// never stored, which bounds write amplification. It is a safeguard, not what
+// keeps the reads correct: a twin the engine does store is one more physical
+// row under the same sort key, which `get` resolves with `LIMIT 1 BY` and
+// `list` / `aggregate` with `FINAL` (the async-tier test below pins that).
 // Merges are stopped so a collapsed row count can only come from the engine's
 // dedup, never from a merge that happened to run.
 // ---------------------------------------------------------------------------
@@ -1285,16 +1344,17 @@ async fn ch_deactivation_marker_is_not_deduplicated_against_its_source_row() {
     );
 }
 
-/// Two racing identical batches store each row exactly once: the batch token is
-/// the `UUIDv5` of the sorted row ids, so byte-identical batches — the realistic
-/// client-timeout retry — share it.
+/// Two racing identical synchronous batches store each row exactly once: the
+/// batch token is the `UUIDv5` of the sorted row ids, so byte-identical
+/// batches — the realistic client-timeout retry — share it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires Docker (testcontainers)"]
 async fn ch_identical_racing_batches_are_deduplicated_by_token() {
-    let Some((h, store)) = setup().await else {
+    let Some((h, _async_store)) = setup().await else {
         return;
     };
     common::stop_merges(&h).await;
+    let store = common::record_store_sync(&h);
     let tenant = Uuid::from_u128(0xDED3);
 
     let batch: Vec<UsageRecord> = (0..3)
@@ -1339,6 +1399,109 @@ async fn ch_identical_racing_batches_are_deduplicated_by_token() {
             common::raw_rows_for_id(&h, id).await,
             1,
             "record {id} must be stored once across the two racing batches"
+        );
+    }
+}
+
+/// The async tier makes no physical-row promise: with `async_insert = 1` the
+/// engine honours the token only on `Replicated*` tables, so two racing
+/// identical batches may both be stored. What is promised is the API result —
+/// every record listed once, counted once, summed once — whatever the engine
+/// stored, because `list` / `aggregate` resolve under `FINAL`. Merges are
+/// stopped so the resolution, not a merge, is what the assertions prove.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires Docker (testcontainers)"]
+async fn ch_racing_async_batches_are_read_once_whatever_the_engine_stored() {
+    let Some((h, store)) = setup().await else {
+        return;
+    };
+    common::stop_merges(&h).await;
+    let tenant = Uuid::from_u128(0xDED4);
+
+    let batch: Vec<UsageRecord> = (0..3)
+        .map(|i| {
+            common::fixture_usage_record_at(
+                VCPU_GTS,
+                tenant,
+                &format!("idem-async-batch-race-{i}"),
+                Decimal::new(i64::from(i) + 1, 0),
+                common::fixture_created_at_offset(i64::from(i)),
+            )
+        })
+        .collect();
+    let ids: Vec<Uuid> = batch.iter().map(|r| r.id).collect();
+    let twin = batch.clone();
+
+    let barrier = std::sync::Arc::new(Barrier::new(2));
+    let b1 = std::sync::Arc::clone(&barrier);
+    let b2 = std::sync::Arc::clone(&barrier);
+    let s1 = store.clone();
+    let s2 = store.clone();
+    let (r1, r2) = tokio::join!(
+        tokio::spawn(async move {
+            b1.wait().await;
+            s1.create_batch(batch).await
+        }),
+        tokio::spawn(async move {
+            b2.wait().await;
+            s2.create_batch(twin).await
+        }),
+    );
+    let r1 = r1.expect("task a join").expect("batch a");
+    let r2 = r2.expect("task b join").expect("batch b");
+    assert!(
+        r1.iter().chain(r2.iter()).all(Result::is_ok),
+        "every slot of both batches succeeds (insert or absorb): {r1:?} / {r2:?}"
+    );
+
+    // Physical rows are reported, not asserted: one or two per id are both
+    // legitimate outcomes on this tier.
+    for id in &ids {
+        let physical = common::raw_rows_for_id(&h, *id).await;
+        assert!(
+            (1..=2).contains(&physical),
+            "record {id}: {physical} physical rows"
+        );
+        eprintln!("async batch race: record {id} stored {physical} physical row(s)");
+    }
+
+    let page = store
+        .list(
+            common::fixture_gts_id(VCPU_GTS),
+            &ODataQuery::new().with_order(ODataOrderBy(vec![
+                OrderKey {
+                    field: "created_at".to_owned(),
+                    dir: SortDir::Asc,
+                },
+                OrderKey {
+                    field: "id".to_owned(),
+                    dir: SortDir::Asc,
+                },
+            ])),
+            &[],
+        )
+        .await
+        .expect("list");
+    let listed: Vec<Uuid> = page.items.iter().map(|r| r.id).collect();
+    assert_eq!(listed, ids, "each record is listed exactly once, in order");
+
+    for (op, want) in [(AggregationOp::Count, 3_i64), (AggregationOp::Sum, 6)] {
+        let result = store
+            .aggregate(
+                common::fixture_gts_id(VCPU_GTS),
+                &ODataQuery::new(),
+                &[],
+                AggregationSpec {
+                    op,
+                    group_by: Vec::new(),
+                },
+            )
+            .await
+            .expect("aggregate");
+        assert_eq!(
+            result.buckets[0].value,
+            Some(BigDecimal::from(want)),
+            "{op:?} must see each record once"
         );
     }
 }

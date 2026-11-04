@@ -72,6 +72,8 @@ pub struct SegmentFilter {
     pub name: Option<NameFilter>,
     pub major: Option<i64>,
     pub minor: Option<i64>,
+    /// The stored segment must carry a minor, whatever its value.
+    pub minor_required: bool,
     pub is_type: Option<bool>,
 }
 
@@ -111,6 +113,7 @@ pub fn compile(pattern: &GtsIdPattern) -> Result<PatternPlan, UnsupportedSegment
                     name: Some(NameFilter::Exact(name(parts))),
                     major: Some(i64::from(major)),
                     minor: parts.ver_minor().map(i64::from),
+                    minor_required: false,
                     is_type: Some(parts.is_type()),
                 });
             }
@@ -126,7 +129,8 @@ pub fn compile(pattern: &GtsIdPattern) -> Result<PatternPlan, UnsupportedSegment
 }
 
 /// A trailing wildcard: its given fields, never `is_type`. A bare `*` also
-/// matches an absent segment, so it yields no filter at all.
+/// matches an absent segment, so it yields no filter at all. `v1.*` selects only
+/// identifiers that spell a minor (GTS spec §10), so a given major requires one.
 fn wildcard(
     segment_no: i16,
     parts: &GtsIdSegmentParts,
@@ -154,6 +158,7 @@ fn wildcard(
         name,
         major: parts.ver_major_opt().map(i64::from),
         minor: parts.ver_minor().map(i64::from),
+        minor_required: parts.ver_major_opt().is_some(),
         is_type: None,
     }))
 }

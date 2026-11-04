@@ -1,0 +1,263 @@
+{
+  "$id": "gts://gts.cf.core.graph.node.v1~cf.core.graph.owned_node.v1~cf.construct.person.role.v1~",
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "description": "A person's roles: current role, education, programme, affiliations and work history. One node is one fact. Its payload holds one property, which names the fact, and the origin of the fact. It also holds record, the record the fact came from, exactly when the fact came from a record.",
+  "type": "object",
+  "allOf": [
+    {
+      "$ref": "gts://gts.cf.core.graph.node.v1~cf.core.graph.owned_node.v1~"
+    },
+    {
+      "type": "object",
+      "properties": {
+        "payload": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "origin"
+          ],
+          "properties": {
+            "origin": {
+              "$ref": "gts://gts.cf.core.graph.attribute.v1~cf.core.graph.provenance.v1~"
+            },
+            "record": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "connector",
+                "provenance",
+                "version"
+              ],
+              "description": "The record a fact came from, when it came from one: the connector that sent it and the record's identity.",
+              "properties": {
+                "connector": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 500,
+                  "pattern": "\\S",
+                  "description": "The connector that sent the record."
+                },
+                "provenance": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 500,
+                  "pattern": "\\S",
+                  "description": "The record's identity within the connector."
+                },
+                "version": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 500,
+                  "pattern": "\\S",
+                  "description": "The record's version."
+                }
+              }
+            },
+            "active_course": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 500,
+              "pattern": "\\S"
+            },
+            "affiliation_history": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "organization"
+              ],
+              "properties": {
+                "organization": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 500,
+                  "pattern": "\\S"
+                },
+                "country": {
+                  "type": "string",
+                  "pattern": "^[A-Z]{2}$",
+                  "description": "ISO 3166-1 alpha-2 country code."
+                },
+                "start_year": {
+                  "type": "integer",
+                  "minimum": 1800,
+                  "description": "Calendar year.",
+                  "maximum": 2100
+                },
+                "end_year": {
+                  "type": "integer",
+                  "minimum": 1800,
+                  "description": "Calendar year.",
+                  "maximum": 2100
+                }
+              }
+            },
+            "board_memberships": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "organization"
+              ],
+              "properties": {
+                "organization": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 500,
+                  "pattern": "\\S"
+                },
+                "role": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 500,
+                  "pattern": "\\S"
+                },
+                "start_year": {
+                  "type": "integer",
+                  "minimum": 1800,
+                  "description": "Calendar year.",
+                  "maximum": 2100
+                },
+                "end_year": {
+                  "type": "integer",
+                  "minimum": 1800,
+                  "description": "Calendar year.",
+                  "maximum": 2100
+                }
+              }
+            },
+            "current_affiliation": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 500,
+              "pattern": "\\S"
+            },
+            "education_level": {
+              "type": "string",
+              "enum": [
+                "k12",
+                "higher_ed",
+                "professional"
+              ]
+            },
+            "group_memberships": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 500,
+              "pattern": "\\S"
+            },
+            "instructor": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 500,
+              "pattern": "\\S"
+            },
+            "major": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 500,
+              "pattern": "\\S"
+            },
+            "program": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 500,
+              "pattern": "\\S"
+            },
+            "role": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 500,
+              "pattern": "\\S"
+            },
+            "roles_and_affiliations": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "role"
+              ],
+              "properties": {
+                "role": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 500,
+                  "pattern": "\\S"
+                },
+                "organization": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 500,
+                  "pattern": "\\S"
+                }
+              }
+            },
+            "school_grade": {
+              "type": "string",
+              "pattern": "^[a-z0-9_]+$",
+              "description": "Normalized lowercase token.",
+              "maxLength": 100
+            },
+            "section": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 500,
+              "pattern": "\\S"
+            },
+            "work_history": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "organization"
+              ],
+              "properties": {
+                "organization": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 500,
+                  "pattern": "\\S"
+                },
+                "title": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 500,
+                  "pattern": "\\S"
+                },
+                "start_year": {
+                  "type": "integer",
+                  "minimum": 1800,
+                  "description": "Calendar year.",
+                  "maximum": 2100
+                },
+                "end_year": {
+                  "type": "integer",
+                  "minimum": 1800,
+                  "description": "Calendar year.",
+                  "maximum": 2100
+                }
+              }
+            }
+          },
+          "oneOf": [
+            {
+              "required": [
+                "record"
+              ],
+              "minProperties": 3,
+              "maxProperties": 3
+            },
+            {
+              "not": {
+                "required": [
+                  "record"
+                ]
+              },
+              "minProperties": 2,
+              "maxProperties": 2
+            }
+          ]
+        }
+      },
+      "required": [
+        "payload"
+      ]
+    }
+  ]
+}

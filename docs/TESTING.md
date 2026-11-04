@@ -16,7 +16,7 @@ build whenever feasible.
 
 | Layer | Scope | Tooling | Feature gate | Runs in CI |
 |-------|-------|---------|--------------|------------|
-| **Unit** | Single function / struct / gear in isolation | `cargo test --workspace` | none (always compiled) | Every PR (`ci.yml` — `test` job, all OS) |
+| **Unit** | Single function / struct / gear in isolation | `cargo test --workspace` | none (always compiled) | Every PR on Ubuntu (`ci.yml` — `test` job); macOS and Windows nightly (`macos-windows-tests.yml`) |
 | **Integration** | Cross-crate or DB-backed logic (SQLite, Postgres, MySQL) | `cargo test -p <pkg> --features integration` | `#[cfg(feature = "integration")]` | Every PR (`ci.yml` — `integration` job, Ubuntu) |
 | **E2E** | Full HTTP request → response through a running server | pytest + httpx against `cf-gears-example-server` | n/a (Python tests) | PRs to `main`, nightly schedule (`e2e.yml`) |
 | **Fuzz** | Parser / validator robustness against arbitrary input | `cargo-fuzz` (libFuzzer) | nightly toolchain | PRs + nightly (`clusterfuzzlite.yml`) |
@@ -146,6 +146,7 @@ behind the `integration` Cargo feature so that `cargo test --workspace` (without
 | `cf-gears-toolkit-db` | `pgq,integration` | PostgreSQL 19 SQL/PGQ (testcontainers; `make test-integration LANE=toolkit-db-pgq`) |
 | `cf-gears-toolkit-db` | `mysql,integration` | MySQL (requires running instance) |
 | `users-info` | `integration` | PostgreSQL |
+| `cf-gears-event-broker` | `integration` | Gear database on SQLite, PostgreSQL and MySQL (testcontainers, or `EB_TEST_POSTGRES_URL` / `EB_TEST_MYSQL_URL`; `make test-integration LANE=eb-gear-db`) |
 
 ### 4.2 Running
 
@@ -199,7 +200,7 @@ let container = test_containers::postgres_tagged("16-alpine").start().await?;
 ```
 
 Helpers: `postgres()`, `postgres_named()`, `postgres_tagged()`, `postgres_graph()`, `mysql()`,
-`timescaledb()`, `mariadb()`, `clickhouse()`.
+`redis()`, `timescaledb()`, `mariadb()`, `clickhouse()`.
 
 `timescaledb()`, `mariadb()` and `clickhouse()` return a `GenericImage` rather than a
 `ContainerRequest`: there is no `testcontainers-modules` image module for them, so the caller
@@ -220,6 +221,7 @@ An unset *or empty* variable means "use the pinned constant".
 | `GEARS_TEST_TIMESCALEDB_TAG` | `TIMESCALEDB_TAG` |
 | `GEARS_TEST_MARIADB_TAG` | `MARIADB_TAG` |
 | `GEARS_TEST_CLICKHOUSE_TAG` | `CLICKHOUSE_TAG` |
+| `GEARS_TEST_REDIS_TAG` | `REDIS_TAG` |
 
 ```bash
 GEARS_TEST_PG_TAG=16-alpine cargo nextest run -p cf-gears-toolkit-db --features pg,integration
@@ -456,7 +458,9 @@ Gear runtime settings are YAML-driven under `gears:<gear_name>:` with a `config`
 ```
 PR opened / updated
   ├── ci.yml
-  │     ├── test          — fmt + clippy + unit tests (Ubuntu, macOS, Windows)
+  │     ├── clippy        — clippy
+  │     ├── repo-checks   — repo file checks (gear names, release config)
+  │     ├── test          — unit tests (Ubuntu)
   │     ├── integration   — DB integration tests (Ubuntu)
   │     ├── test-fips     — FIPS verification / platform-specific FIPS test lanes
   │     ├── security      — cargo-deny
@@ -477,6 +481,7 @@ Additional quality workflows
   └── pr-reviewer-check.yml — reviewer assignment hygiene
 
 Nightly (schedule)
+  ├── macos-windows-tests.yml — unit tests on macOS and Windows (auto-creates issue on failure)
   ├── e2e.yml              — full E2E + specialized E2E lanes (auto-creates issue on failure)
   ├── clusterfuzzlite      — fuzz testing
   ├── codeql.yml           — scheduled code scanning
@@ -484,7 +489,27 @@ Nightly (schedule)
   └── pr-reviewer-check.yml — reviewer assignment checks
 ```
 
----
+### 7.4 CI build cache
+
+On the organisation's self-hosted runners (`.github/runners/README.md`) the Rust jobs
+compile with sccache against the shared build cache, wired up by
+`.github/actions/ci-cache`: sccache for compiled objects, a download cache for the Cargo
+registry and git checkouts. Only a push to `main` writes. That job enters the
+`ci-trusted` environment, whose secrets `CI_CACHE_RW_KEY_ID` and `CI_CACHE_RW_SECRET`
+hold the read-write key and whose deployment-branch policy admits `main` alone; every
+other run reads with the read-only key the runner carries. PR code can read its job's
+key, so only the branch rule keeps the write key out of PRs.
+
+On a GitHub-hosted runner (fork pull requests, the `GEARS_FORCE_GITHUB_HOSTED` kill
+switch) the action prints a notice and does nothing: those runs keep
+`Swatinem/rust-cache` for the registry and build with plain rustc.
+
+The action's post step writes `sccache --show-stats` into the job summary. A `main`
+run whose job is not under `ci-trusted` shows a warning and reads only.
+
+Tool versions on the self-hosted runners (protoc, nextest, cargo-llvm-cov, cargo-hack,
+cargo-deny, cargo-shear, the nightly pin) come from the runner image, which the platform
+owners rebuild weekly; a bump in the workflows needs the matching change there.
 
 ## 8. Custom Architecture Lints
 

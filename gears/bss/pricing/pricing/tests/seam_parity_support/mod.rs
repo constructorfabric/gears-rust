@@ -380,7 +380,7 @@ pub fn restart(dsn: &p::entry_support::TestDsn) {
 pub async fn open(dsn: &str) -> DBProvider<DbError> {
     DBProvider::new(
         toolkit_db::connect_db(
-            dsn,
+            &p::entry_support::toolkit_dsn(dsn),
             toolkit_db::ConnectOpts {
                 max_conns: Some(2),
                 min_conns: Some(0),

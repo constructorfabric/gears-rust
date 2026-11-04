@@ -217,8 +217,8 @@ impl<'a> CatalogBuilder<'a> {
     }
 
     /// The projection's effective `admitted_metrics` trait, every entry a
-    /// registered instance of the metric base. `x-gts-ref` proved only the
-    /// prefix; registration and the instance-of relation are checked here.
+    /// registered instance of the metric base. `x-gts-instance-ref` proved only
+    /// the kind and prefix; registration and the instance-of relation are checked here.
     async fn admitted_metrics_of(
         &self,
         projection: &RegisteredType,
@@ -381,12 +381,11 @@ impl<'a> CatalogBuilder<'a> {
 
     /// Compile a registered schema, rejecting one that does not compile.
     fn compile(&self, registered: &RegisteredType) -> Result<CompiledContract, DomainError> {
-        CompiledContract::compile(registered.id.clone(), registered.schema.clone()).map_err(|e| {
-            self.reject(
-                ValidationReason::SchemaInvalid,
-                format!("{}: {e}", registered.id),
-            )
-        })
+        registered
+            .payload
+            .clone()
+            .map(|validator| CompiledContract::new(validator, registered.schema.clone()))
+            .map_err(|e| self.reject(ValidationReason::SchemaInvalid, e.to_string()))
     }
 
     /// Record and build one rejection. The catalogue is never published after

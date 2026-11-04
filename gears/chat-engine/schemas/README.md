@@ -79,6 +79,6 @@ Schemas use JSON Schema `$ref` for reusable types. References are relative paths
 
 ## See Also
 
-- [DESIGN.md](../DESIGN.md) - Full architecture and design documentation
-- [PRD.md](../PRD.md) - Product requirements
-- [ADR/](../ADR/) - Architecture decision records
+- [DESIGN.md](../docs/DESIGN.md) - Full architecture and design documentation
+- [PRD.md](../docs/PRD.md) - Product requirements
+- [ADR/](../docs/ADR/) - Architecture decision records

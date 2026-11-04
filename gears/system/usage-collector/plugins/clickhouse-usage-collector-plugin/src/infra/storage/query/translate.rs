@@ -148,6 +148,43 @@ pub fn translate_usage_type_filter<F: FilterField>(
     translate_filter(node, ctx, usage_type_column)
 }
 
+/// Flatten `node`'s top-level `AND` spine into its conjuncts, recursing into
+/// nested `AND`s; any other node is a conjunct whole.
+///
+/// Callers translate each conjunct as its own `WHERE` clause rather than the
+/// whole filter as one fragment, for two reasons: an empty `AND` (which the
+/// gateway can send) would otherwise render as a bare `()`, which `ClickHouse`
+/// rejects, and the `tenant_id` / `created_at` conjuncts the gateway sends
+/// then stand on their own as fixed sorting-key predicates. An `OR` or `NOT`
+/// is not a conjunction and stays whole, so the caller's semantics are
+/// preserved exactly: `AND`-joining the conjuncts is the original filter.
+///
+/// Borrowed from the caller's `FilterNode`, so each conjunct is translated in
+/// place rather than cloned. An empty `AND` yields no conjuncts.
+#[must_use]
+pub fn and_conjuncts<F: FilterField>(node: &FilterNode<F>) -> Vec<&FilterNode<F>> {
+    let mut out = Vec::new();
+    collect_and_conjuncts(node, &mut out);
+    out
+}
+
+fn collect_and_conjuncts<'a, F: FilterField>(
+    node: &'a FilterNode<F>,
+    out: &mut Vec<&'a FilterNode<F>>,
+) {
+    if let FilterNode::Composite {
+        op: FilterOp::And,
+        children,
+    } = node
+    {
+        for child in children {
+            collect_and_conjuncts(child, out);
+        }
+    } else {
+        out.push(node);
+    }
+}
+
 /// Shared recursive walker parameterised over the column allowlist.
 fn translate_filter<F: FilterField>(
     node: &FilterNode<F>,

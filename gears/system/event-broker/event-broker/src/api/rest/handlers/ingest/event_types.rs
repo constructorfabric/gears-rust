@@ -10,7 +10,9 @@ use crate::api::rest::pagination::{eval_filter, paginate_by_key};
 use crate::api::rest::state::HandlerState;
 
 /// # Errors
-/// Returns `400` for an invalid `$filter` expression or pagination cursor.
+///
+/// Returns `400` for an invalid `$filter` expression or pagination cursor, or
+/// `503` if the event types cannot be read.
 pub async fn list_event_types(
     Extension(ctx): Extension<SecurityContext>,
     Extension(state): Extension<HandlerState>,

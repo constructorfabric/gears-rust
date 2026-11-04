@@ -1,4 +1,3 @@
-// Created: 2026-08-11 by Virtuozzo International GmbH
 //! Tests for the public SDK models.
 //!
 //! Acceptance criteria: FEATURE `gear-foundation.md` §6 — models serialize

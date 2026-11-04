@@ -53,7 +53,7 @@ The broker is unshipped. Re-iterating the consumer subscription surface now - be
 * **Two-level type filtering**: events the consumer doesn't pattern-match on `types[]` should be skipped before invoking the engine (cheap), with the engine reserved for richer predicates over `event.data` etc.
 * **GTS spec compliance**: type patterns follow `GlobalTypeSystem/gts-spec` §10 wildcard rules exactly — no broker-specific extensions.
 * **Rolling-deploy unambiguity**: different members of the same consumer group can declare different interest sets without positional-correspondence games.
-* **Symmetric plugin pattern**: filter engines plug in via the same GTS-typed `types_registry` + `ClientHub` resolution as storage backends and OAGW auth/guard/transform plugins.
+* **Symmetric plugin pattern**: filter engines plug in via the same GTS-typed `types_registry` + `ClientHub` resolution as OAGW auth/guard/transform plugins.
 
 ## Considered Options
 
@@ -153,7 +153,7 @@ At JOIN, the broker:
 
 ### Filter-Engine Plugin Pattern
 
-Mirrors storage backends and OAGW plugins:
+Mirrors OAGW plugins:
 
 - **Base type**: `gts.cf.core.events.filter.v1~` (registered via `types_registry`).
 - **Built-in v1 engine**: `gts.cf.core.events.filter.v1~cf.core.expression.cel.v1`.
@@ -207,7 +207,7 @@ The CEL engine binds one variable `event` whose fields are the read-side event (
 | `event.subject` | string | publish input |
 | `event.subject_type` | string (GTS) | publish input |
 | `event.occurred_at` | timestamp | publish input |
-| `event.partition` | int | broker-derived |
+| `event.partition` | int | backend-assigned |
 | `event.sequence` | int (i64) | backend-assigned |
 | `event.sequence_time` | timestamp | backend-assigned |
 | `event.trace_parent` | string (optional) | publish input |
@@ -234,10 +234,10 @@ POST /v1/subscriptions { consumer_group, client_agent, session_timeout, interest
   ↓
 1. Authn: SecurityContext present? else 401.
 2. Per-tenant rate cap on JOIN (`cpt-cf-evbk-nfr-tenant-rate-caps`; default 60/min/tenant) else 429.
-3. consumer_group exists in evbk_consumer_group? else 404 ConsumerGroupNotFound.
+3. consumer_group exists in event_broker_consumer_group? else 404 ConsumerGroupNotFound.
 4. interests[] length cap check → 400 TooManyInterests.
 5. For each interest in interests[]:
-   5a. topic exists in evbk_topic? else 404 TopicNotFound.
+   5a. topic exists in the specification cache (`event_broker_spec_cache`)? else 404 TopicNotFound.
    5b. tenant_id authz via platform tenant resolver → 403 TenantIdNotAuthorized.
    5c. topic-level consume authz → 403 TopicNotAuthorized.
    5d. types[] length cap → 400 TooManyTypes.
@@ -310,7 +310,7 @@ Two layers, both all-or-nothing:
 
 - Good, because the wire shape eliminates the parallel-array ambiguity by construction.
 - Good, because topic is explicit (Kafka-style) — partition assignment, rebalance, and authz operate on the same unit the consumer declared.
-- Good, because filter engines are extensible via the same GTS-typed plugin registry used for storage backends + OAGW plugins.
+- Good, because filter engines are extensible via the same GTS-typed plugin registry used for OAGW plugins.
 - Good, because event-type filtering happens before engine eval — the broker skips non-matching events cheaply.
 - Good, because the optional `filter` object lets the common case (no filter beyond topic+tenant+types) be the simplest wire.
 - Good, because GTS-spec-compliant patterns mean every other system that handles GTS identifiers (types_registry, authz resolver, observability) understands the broker's patterns natively.

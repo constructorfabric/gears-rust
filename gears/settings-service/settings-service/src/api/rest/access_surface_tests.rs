@@ -1,4 +1,3 @@
-// Created: 2026-09-17 by Virtuozzo International GmbH
 //! The tenant-access surface driven as a client drives it.
 //!
 //! What a tenant may do with a setting is a sparse decision on a
@@ -578,4 +577,57 @@ async fn a_retired_setting_refuses_a_restriction_change_with_410_and_keeps_its_r
     );
     let (body, _) = read(&h, "proxy", a, root).await;
     assert_eq!(body["stored"]["access"], json!("read_only"), "{body}");
+}
+
+/// A failed cross-gear lookup must abort before any restriction is changed.
+/// Both caller and target chains are needed even for a non-root administrator.
+#[tokio::test]
+async fn hierarchy_failure_leaves_set_and_clear_unchanged() {
+    let h = RestHarness::new().await;
+    h.inner.declare("proxy", "cascading", json!(true)).await;
+    let caller = h.inner.tree.a;
+    let target = h.inner.tree.b;
+    let uri = format!("{}?tenant={target}", permissions(&h, "proxy"));
+
+    h.inner.hierarchy.fail_next_chains(1);
+    let failed = h
+        .send(
+            "PUT",
+            &uri,
+            Some(json!({"access": "read_only"})),
+            Some("absent"),
+            caller,
+        )
+        .await;
+    assert_eq!(failed.status, 503, "{}", failed.body);
+    let (body, tag) = read(&h, "proxy", target, caller).await;
+    assert!(body.get("stored").is_none(), "{body}");
+    assert_eq!(tag, "\"absent\"");
+
+    let set = h
+        .send(
+            "PUT",
+            &uri,
+            Some(json!({"access": "read_only"})),
+            Some(&tag),
+            caller,
+        )
+        .await;
+    assert_eq!(set.status, 200, "{}", set.body);
+    let stored_tag = set.etag.expect("stored tag");
+    h.inner.hierarchy.fail_next_chains(1);
+    let failed = h
+        .send("DELETE", &uri, None, Some(&stored_tag), caller)
+        .await;
+    assert_eq!(failed.status, 503, "{}", failed.body);
+    let (body, unchanged_tag) = read(&h, "proxy", target, caller).await;
+    assert_eq!(unchanged_tag, stored_tag);
+    assert_eq!(body["effective"]["access"], "read_only");
+
+    let cleared = h
+        .send("DELETE", &uri, None, Some(&stored_tag), caller)
+        .await;
+    assert_eq!(cleared.status, 200, "{}", cleared.body);
+    assert_eq!(cleared.body["effective"]["access"], "overridable");
+    assert!(cleared.body.get("stored").is_none());
 }

@@ -49,6 +49,27 @@ impl Authorization {
             })
         })
     }
+
+    /// Whether the scope admits every row owned by `owner_tenant_id`,
+    /// decided in memory: some constraint filters on `owner_tenant_id` alone
+    /// and lists it. A constraint that also narrows by resource identity, or
+    /// that only the database can resolve, does not.
+    #[must_use]
+    pub fn covers_tenant(&self, owner_tenant_id: Uuid) -> bool {
+        if self.scope.is_unconstrained() {
+            return true;
+        }
+        self.scope.constraints().iter().any(|constraint| {
+            constraint.filters().iter().all(|filter| {
+                filter.property() == pep_properties::OWNER_TENANT_ID
+                    && filter.is_representable_in_memory()
+                    && filter
+                        .values()
+                        .iter()
+                        .any(|v| v.as_uuid() == Some(owner_tenant_id))
+            })
+        })
+    }
 }
 
 /// Why an authorisation did not succeed. The caller decides the projection

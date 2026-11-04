@@ -263,6 +263,8 @@ impl ComponentReadiness {
 /// Matrix row names, spelled once so the endpoint and the documentation cannot
 /// drift apart.
 pub const DATABASE: &str = "database_and_migrations";
+/// The retired SQL/PGQ row; readiness has no such row.
+#[deprecated(note = "the SQL/PGQ hop is retired (gears-rust #5267); readiness has no such row")]
 pub const SQLPGQ: &str = "server_major_and_sqlpgq";
 pub const EMBEDDING_PROVIDER: &str = "embedding_provider";
 pub const EMBEDDING_SPACE: &str = "embedding_space_identity";
@@ -1426,10 +1428,9 @@ fn identity_hash(
     normalization: &serde_json::Value,
     dimension: u32,
 ) -> String {
-    // `aws-lc-rs` is the workspace's FIPS-capable backend; a pure-Rust hasher
-    // is refused by the DE0708 lint. Field boundaries are length-prefixed so
+    // The facade selects the platform/FIPS backend. Field boundaries are length-prefixed so
     // no concatenation of distinct identities can collide.
-    let mut hasher = aws_lc_rs::digest::Context::new(&aws_lc_rs::digest::SHA256);
+    let mut hasher = toolkit_security::crypto::hash::Sha256::new();
     let preprocessing = canonical_json(preprocessing).to_string();
     let pooling = canonical_json(pooling).to_string();
     let normalization = canonical_json(normalization).to_string();
@@ -1441,10 +1442,10 @@ fn identity_hash(
         normalization.as_bytes(),
         &dimension.to_be_bytes(),
     ] {
-        hasher.update(&(part.len() as u64).to_be_bytes());
+        hasher.update((part.len() as u64).to_be_bytes());
         hasher.update(part);
     }
-    hex::encode(hasher.finish())
+    hex::encode(hasher.finalize())
 }
 
 #[cfg(test)]

@@ -1,0 +1,93 @@
+[
+  {
+    "name": "a-second-skill-is-added-beside-the-first",
+    "profile": [{ "property": "skills", "value": { "name": "Python" } }],
+    "record": { "user_says": "I've been using Kotlin for three years." },
+    "expect": { "skills": "add" }
+  },
+  {
+    "name": "a-skill-held-under-another-name-is-not-added",
+    "profile": [{ "property": "skills", "value": { "name": "JavaScript" } }],
+    "record": { "user_says": "I can code in JS." }
+  },
+  {
+    "name": "a-skill-not-used-anymore-is-removed",
+    "profile": [
+      { "property": "skills", "value": { "name": "Excel" } },
+      { "property": "skills", "value": { "name": "SQL" } }
+    ],
+    "record": { "user_says": "I don't use Excel anymore." },
+    "expect": { "skills": "remove" },
+    "gone": [{ "property": "skills", "value": { "name": "Excel" } }],
+    "holds": [{ "property": "skills", "value": { "name": "SQL" } }]
+  },
+  {
+    "name": "a-higher-level-replaces-the-skill",
+    "profile": [{ "property": "skills", "value": { "name": "Go", "level": "beginner" } }],
+    "record": { "user_says": "I've gotten much better at Go, I'd call myself advanced now." },
+    "expect": { "skills": "replace" },
+    "gone": [{ "property": "skills", "value": { "name": "Go", "level": "beginner" } }]
+  },
+  {
+    "name": "each-spoken-language-is-added",
+    "profile": [],
+    "record": { "user_says": "Besides Portuguese I'm fluent in French and Italian." },
+    "expect": { "languages": "add" },
+    "holds": [
+      { "property": "languages", "value": "fr" },
+      { "property": "languages", "value": "it" }
+    ]
+  },
+  {
+    "name": "a-language-held-is-not-added-again",
+    "profile": [
+      { "property": "languages", "value": "en" },
+      { "property": "languages", "value": "fr" }
+    ],
+    "record": { "user_says": "I speak French." }
+  },
+  {
+    "name": "a-fellowship-is-an-award",
+    "profile": [],
+    "record": { "user_says": "I received a Marie Curie fellowship in 2022." },
+    "expect": { "awards": "add" }
+  },
+  {
+    "name": "a-skill-with-its-years-is-added",
+    "profile": [],
+    "record": { "user_says": "I've been writing Go professionally for five years." },
+    "expect": { "skills": "add" }
+  },
+  {
+    "name": "two-skills-in-one-message-are-added",
+    "profile": [],
+    "record": { "user_says": "I know SQL and Excel well." },
+    "expect": { "skills": "add" }
+  },
+  {
+    "name": "a-forgotten-language-is-removed",
+    "profile": [{ "property": "languages", "value": "fr" }],
+    "record": { "user_says": "I've completely forgotten my French." },
+    "expect": { "languages": "remove" },
+    "gone": [{ "property": "languages", "value": "fr" }]
+  },
+  {
+    "name": "a-language-stated-in-spanish-is-added",
+    "profile": [{ "property": "languages", "value": "es" }],
+    "record": { "user_says": "Hablo portugués también." },
+    "expect": { "languages": "add" }
+  },
+  {
+    "name": "an-award-from-a-message-is-added",
+    "profile": [],
+    "record": { "user_says": "Last year I won the ACM SIGMOD best paper award." },
+    "expect": { "awards": "add" }
+  },
+  {
+    "name": "a-corrected-skill-level-replaces-the-skill",
+    "profile": [{ "property": "skills", "value": { "name": "Java", "level": "expert" } }],
+    "record": { "user_says": "I overstated it, my Java is intermediate at best." },
+    "expect": { "skills": "replace" },
+    "gone": [{ "property": "skills", "value": { "name": "Java", "level": "expert" } }]
+  }
+]

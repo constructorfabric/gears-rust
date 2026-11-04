@@ -22,6 +22,7 @@ pub mod key {
     #[allow(dead_code)] // declared ahead of call site (metrics infra uses string literals)
     pub const STATE: &str = "state";
     pub const PROVIDER_KIND: &str = "provider_kind";
+    pub const QUEUE: &str = "queue";
 }
 
 // ── Label values ─────────────────────────────────────────────────────────
@@ -48,6 +49,21 @@ pub mod result {
     /// Audit event acknowledged without delivery: no audit plugin is
     /// registered.
     pub const DROPPED: &str = "dropped";
+}
+
+/// Outbox queue labels (`queue` label of `outbox_dead`).
+pub mod outbox_queue {
+    pub const USAGE: &str = "usage";
+}
+
+/// Why an outbox message was dead-lettered (`reason` label of `outbox_dead`).
+pub mod outbox_dead_reason {
+    /// The payload does not deserialize.
+    pub const INVALID_PAYLOAD: &str = "invalid_payload";
+    /// The consumer reported a permanent failure.
+    pub const PERMANENT: &str = "permanent";
+    /// Retries reached the handler's attempt limit.
+    pub const MAX_ATTEMPTS: &str = "max_attempts";
 }
 
 /// Quota preflight decision labels (`decision` label).

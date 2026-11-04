@@ -1,4 +1,3 @@
-// Created: 2026-09-17 by Virtuozzo International GmbH
 //! Tests for the hub-backed tenant hierarchy.
 //!
 //! The resolver answers in its own shape and the walk needs another: parents

@@ -94,3 +94,28 @@ fn empty_update_is_empty() {
 // driven path is exercised through service-level tests that wire a
 // `MockTypesRegistryClient` with the `gts.cf.core.am.tenant.v1~`
 // schema registered.
+
+#[test]
+fn verify_tenant_name_rejects_empty_and_all_whitespace() {
+    for name in ["", "   ", "\t\n "] {
+        match verify_tenant_name("create_tenant", name.to_owned()) {
+            Err(DomainError::Validation { detail }) => assert!(
+                detail.starts_with("create_tenant:") && detail.contains("all-whitespace"),
+                "Validation must name the caller and the rule; got: {detail}"
+            ),
+            other => panic!("expected Validation for {name:?}, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn verify_tenant_name_trims_surrounding_whitespace() {
+    let name = verify_tenant_name("create_tenant", "  acme corp\t".to_owned()).expect("valid");
+    assert_eq!(name.as_str(), "acme corp");
+    assert_eq!(
+        verify_tenant_name("create_tenant", "acme".to_owned())
+            .expect("valid")
+            .into_inner(),
+        "acme"
+    );
+}

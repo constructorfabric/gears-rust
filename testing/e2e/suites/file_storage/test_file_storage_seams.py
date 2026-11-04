@@ -1,12 +1,9 @@
 """E2E integration-seam tests for the file-storage control plane.
 
 Each test targets exactly one seam that unit tests cannot see (real HTTP +
-real PostgreSQL + real AuthZ wiring). Domain invariants, CHECK constraints, and
-the migration SQL are covered by the Rust unit/integration suite
-(``gears/file-storage/file-storage``) and are deliberately NOT retested here.
-
-The whole module is gated by ``require_file_storage_mounted`` (see conftest):
-it skips until the M5 endpoints are mounted, then runs for real.
+real PostgreSQL + real AuthZ wiring). Domain invariants and the migration SQL
+are covered by the Rust suite (``gears/file-storage/file-storage``) and are
+deliberately NOT retested here.
 
 Seam map (api.md §"P1 — Control plane"):
   - route registration                → test_route_smoke_endpoints_registered
@@ -23,20 +20,70 @@ import pytest
 
 REQUEST_TIMEOUT = 5.0
 
+pytestmark = pytest.mark.usefixtures("require_file_storage_mounted")
+
+# Every public control-plane route. s2s callbacks (finalize / part report) are
+# internal-token routes and are exercised by the lifecycle suites.
+# (method, path, json body). Writes use an empty body or a random id so the
+# probe cannot change state; PUT /policy is covered by GET /policy (same path).
+_ROUTES = [
+    ("GET", "/files", None),
+    ("POST", "/files", {}),
+    ("GET", "/files/{id}", None),
+    ("PATCH", "/files/{id}", {}),
+    ("DELETE", "/files/{id}", None),
+    ("POST", "/files/{id}/bind", {}),
+    ("GET", "/files/{id}/download-url", None),
+    ("GET", "/files/{id}/versions", None),
+    ("POST", "/files/{id}/versions", None),
+    ("DELETE", "/files/{id}/versions/{id}", None),
+    ("POST", "/files/{id}/multipart", {}),
+    ("GET", "/files/{id}/multipart/{id}", None),
+    ("POST", "/files/{id}/multipart/{id}/complete", None),
+    ("DELETE", "/files/{id}/multipart/{id}", None),
+    ("POST", "/files/{id}/migrate", {}),
+    ("POST", "/files/{id}/transfer", {}),
+    ("GET", "/storages", None),
+    ("GET", "/storages/{id}", None),
+    ("GET", "/policy", None),
+    ("GET", "/policy/effective", None),
+    ("GET", "/retention-rules", None),
+    ("POST", "/retention-rules", {}),
+    ("DELETE", "/retention-rules/{id}", None),
+]
+
 
 @pytest.mark.asyncio
 async def test_route_smoke_endpoints_registered(base_url, api_base, auth_headers):
-    """Seam: route registration — handlers mounted on the expected paths.
+    """Seam: route registration — handlers mounted on the expected method + path.
 
-    A handler missing from ``gear.rs`` passes every unit test but 404s here.
+    A handler missing from ``gear.rs`` passes every unit test but 404s/405s here.
+    A 404 is accepted only for a path with an ``{id}`` parameter when the
+    problem ``detail`` names the random id we sent: that is the handler's own
+    "resource not found", proving the route matched (``instance`` is ignored,
+    it echoes the request path even for an unmatched route).
     """
-    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
-        responses = await asyncio.gather(
-            client.request("OPTIONS", f"{base_url}{api_base}/files", headers=auth_headers),
-            client.request("OPTIONS", f"{base_url}{api_base}/storages", headers=auth_headers),
-        )
-    for r in responses:
-        assert r.status_code != 404, f"endpoint not registered: {r.request.url}"
+    probe = str(uuid.uuid4())
+
+    def names_probe(r):
+        try:
+            return probe in str(r.json().get("detail", ""))
+        except ValueError:
+            return False
+
+    async def call(method, path, body):
+        url = f"{base_url}{api_base}{path.replace('{id}', probe)}"
+        async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
+            return method, path, await client.request(method, url, json=body, headers=auth_headers)
+
+    results = await asyncio.gather(*(call(*route) for route in _ROUTES))
+    unregistered = [
+        f"{method} {path} -> {r.status_code}"
+        for method, path, r in results
+        if r.status_code == 405
+        or (r.status_code == 404 and not ("{id}" in path and names_probe(r)))
+    ]
+    assert not unregistered, f"endpoints not registered: {unregistered}"
 
 
 @pytest.mark.asyncio
@@ -50,11 +97,19 @@ async def test_list_storages_returns_capabilities(base_url, api_base, auth_heade
         r = await client.get(f"{base_url}{api_base}/storages", headers=auth_headers)
     assert r.status_code == 200, f"expected 200, got {r.status_code}: {r.text}"
     assert r.headers.get("content-type", "").startswith("application/json")
-    # Lock the wire format: GET /storages returns a top-level JSON array
-    # (Json(Vec<StorageDto>)). Accepting alternative envelopes here would let a
-    # breaking shape change slip through this seam.
+    # Lock the wire format: GET /storages returns a cursor page
+    # (Page<StorageDto>: `{items, page_info}`), never a bare JSON array.
+    # Accepting alternative envelopes here would let a breaking shape change
+    # slip through this seam.
     data = r.json()
-    assert isinstance(data, list), f"GET /storages must return a JSON array, got: {data!r}"
+    assert isinstance(data, dict), f"GET /storages must return a page object, got: {data!r}"
+    items = data.get("items")
+    assert isinstance(items, list) and items, f"GET /storages must list at least one backend, got: {data!r}"
+    for item in items:
+        assert isinstance(item.get("id"), str), f"backend without a string id: {item!r}"
+        assert isinstance(item.get("capabilities"), dict), f"backend without capabilities: {item!r}"
+    page_info = data.get("page_info")
+    assert isinstance(page_info, dict) and "limit" in page_info, f"missing page_info.limit in: {data!r}"
 
 
 @pytest.mark.asyncio

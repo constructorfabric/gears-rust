@@ -2,13 +2,13 @@
 
 use std::collections::BTreeMap;
 
-use aws_lc_rs::digest::{SHA256, digest as sha256};
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use bss_approvals_sdk::{Order, SortKey, SourceNarrowing};
 use serde::{Deserialize, Serialize};
 use toolkit_canonical_errors::CanonicalError;
 use toolkit_odata::Error as ODataError;
+use toolkit_security::crypto::hash::Sha256;
 use uuid::Uuid;
 
 const CURSOR_VERSION: u32 = 2;
@@ -58,7 +58,7 @@ pub fn narrowing_hash(narrowing: &SourceNarrowing) -> String {
         state: narrowing.state.as_deref(),
     };
     let bytes = serde_json::to_vec(&canonical).unwrap_or_default();
-    hex_digest(sha256(&SHA256, &bytes).as_ref())
+    hex_digest(Sha256::digest(&bytes).as_ref())
 }
 
 /// Encodes the cursor the next page sends back.

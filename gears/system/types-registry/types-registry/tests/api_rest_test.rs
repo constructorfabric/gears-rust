@@ -11,7 +11,7 @@ use toolkit_db::{DBProvider, DbError};
 use toolkit_gts::{gts_id, gts_uri};
 use tower::ServiceExt;
 
-use types_registry::api::rest::routes::{V1, V2};
+use types_registry::api::rest::routes::{PLATFORM, V1, V2};
 use types_registry::config::TypesRegistryConfig;
 use types_registry::domain::admission::OperationDispatch;
 use types_registry::domain::policy::RegistrationPolicy;
@@ -34,15 +34,15 @@ const HTTP_REQUEST_RESOURCE_TYPE: &str = gts_id!("cf.core.http.request.v1~");
 
 const MUTATION_OPERATIONS: [&str; 4] = [
     "types_registry.register",
-    "types_registry.submit_entities",
-    "types_registry.batch_delete_entities",
-    "types_registry.delete_entity",
+    "types_registry.platform.submit_entities",
+    "types_registry.platform.batch_delete_entities",
+    "types_registry.platform.delete_entity",
 ];
 
-const V2_MUTATION_OPERATIONS: [&str; 3] = [
-    "types_registry.submit_entities",
-    "types_registry.batch_delete_entities",
-    "types_registry.delete_entity",
+const PLATFORM_MUTATION_OPERATIONS: [&str; 3] = [
+    "types_registry.platform.submit_entities",
+    "types_registry.platform.batch_delete_entities",
+    "types_registry.platform.delete_entity",
 ];
 
 type DeclaredParam = (
@@ -75,6 +75,8 @@ struct TestOpenApi {
     response_headers: std::sync::Mutex<Vec<(String, Vec<DeclaredResponseHeader>)>>,
     /// `operation_id -> gateway visibility`.
     exposure: std::sync::Mutex<Vec<(String, bool)>>,
+    /// `operation_id -> the plane the route admits`.
+    auth: std::sync::Mutex<Vec<(String, toolkit_security::RouteAuth)>>,
 }
 
 impl OpenApiRegistry for TestOpenApi {
@@ -125,6 +127,10 @@ impl OpenApiRegistry for TestOpenApi {
             .lock()
             .expect("exposure lock")
             .push((spec.operation_id.clone().unwrap_or_default(), spec.exposed));
+        self.auth
+            .lock()
+            .expect("auth lock")
+            .push((spec.operation_id.clone().unwrap_or_default(), spec.auth));
     }
     fn ensure_schema_raw(
         &self,
@@ -156,17 +162,22 @@ impl std::ops::Deref for TestApi {
     }
 }
 
-/// The gear's routes with the request context `.authenticated()` installs in production:
-/// these tests call the handlers directly, below the authentication layer.
+/// The gear's routes with the request contexts `.authenticated()` and
+/// `.platform_authenticated()` install in production: these tests call the handlers
+/// directly, below the authentication layer.
 fn routes(
     router: Router,
     openapi: &dyn toolkit::api::OpenApiRegistry,
     legacy: Arc<TypesRegistryService>,
     registry: Option<Arc<RegistryService>>,
 ) -> Router {
-    types_registry::api::rest::routes::register_routes(router, openapi, legacy, registry).layer(
-        axum::Extension(toolkit_security::SecurityContext::anonymous()),
-    )
+    types_registry::api::rest::routes::register_routes(router, openapi, legacy, registry)
+        .layer(axum::Extension(
+            toolkit_security::SecurityContext::anonymous(),
+        ))
+        .layer(axum::Extension(
+            toolkit_security::PlatformSecurityContext::outbound_marker(),
+        ))
 }
 
 /// A router with both services wired, as `register_rest` builds it.
@@ -452,7 +463,7 @@ fn assert_invalid_argument_rejection(
 }
 
 fn submit(key: Option<&str>, body: &Value) -> Request<Body> {
-    submit_to(&format!("{V2}/entities"), key, body)
+    submit_to(&format!("{PLATFORM}/entities"), key, body)
 }
 
 fn submit_to(uri: &str, key: Option<&str>, body: &Value) -> Request<Body> {
@@ -487,7 +498,7 @@ fn one_candidate(gts_id: &str) -> Value {
 #[tokio::test]
 async fn malformed_submission_json_is_a_canonical_invalid_argument() {
     let router = router_with_db().await;
-    let request = Request::post(format!("{V2}/entities"))
+    let request = Request::post(format!("{PLATFORM}/entities"))
         .header("content-type", "application/json")
         .header("idempotency-key", "malformed-json")
         .body(Body::from("{not-json}"))
@@ -521,7 +532,7 @@ async fn invalid_list_query_is_a_canonical_invalid_argument() {
 async fn invalid_operation_uuid_is_a_canonical_invalid_argument() {
     let router = router_with_db().await;
 
-    let response = call(&router, get(&format!("{V2}/operations/not-a-uuid"))).await;
+    let response = call(&router, get(&format!("{PLATFORM}/operations/not-a-uuid"))).await;
 
     assert_invalid_argument_rejection(
         &response,
@@ -552,7 +563,7 @@ async fn a_registration_is_accepted_polled_and_read_back() {
         .as_deref()
         .expect("a 202 carries Location");
     assert!(
-        location.ends_with(&format!("{V2}/operations/{operation_id}")),
+        location.ends_with(&format!("{PLATFORM}/operations/{operation_id}")),
         "the receipt must point at the operation, prefix and all: {location}",
     );
     assert_eq!(
@@ -562,7 +573,11 @@ async fn a_registration_is_accepted_polled_and_read_back() {
     );
     assert_eq!(accepted.body["replayed"], json!(false));
 
-    let operation = call(&router, get(&format!("{V2}/operations/{operation_id}"))).await;
+    let operation = call(
+        &router,
+        get(&format!("{PLATFORM}/operations/{operation_id}")),
+    )
+    .await;
     assert_eq!(operation.status, StatusCode::OK);
     assert_eq!(operation.body["status"], json!("completed"));
     assert_eq!(operation.body["kind"], json!("registration"));
@@ -583,7 +598,7 @@ async fn a_registration_is_accepted_polled_and_read_back() {
     let entity = call(
         &router,
         get(&format!(
-            "{V2}/entities/{CF_TYPE}?$select=gts_id,kind,origin,content,resolved_schema,\
+            "{PLATFORM}/entities/{CF_TYPE}?$select=gts_id,kind,origin,content,resolved_schema,\
              effective_traits"
         )),
     )
@@ -597,6 +612,97 @@ async fn a_registration_is_accepted_polled_and_read_back() {
     assert!(entity.body["resolved_schema"].is_object());
     assert!(entity.body["effective_traits"].is_object());
     assert!(entity.body["content"].is_object());
+}
+
+/// The tenant reads are the platform reads (D17): one domain call answers both, with the
+/// same body and validator; the tenant plane has no mutation and no operation read.
+#[tokio::test]
+async fn the_tenant_reads_answer_as_the_platform_reads() {
+    let router = router_with_db().await;
+    let accepted = call(&router, submit(Some("key-tenant"), &one_candidate(CF_TYPE))).await;
+    assert_eq!(accepted.status, StatusCode::ACCEPTED);
+
+    let select = "$select=gts_id,origin,content,resolved_schema";
+    let platform = call(
+        &router,
+        get(&format!("{PLATFORM}/entities/{CF_TYPE}?{select}")),
+    )
+    .await;
+    let tenant = call(&router, get(&format!("{V2}/entities/{CF_TYPE}?{select}"))).await;
+    assert_eq!(platform.status, StatusCode::OK);
+    assert_eq!(
+        (tenant.status, &tenant.body),
+        (platform.status, &platform.body)
+    );
+    assert_eq!(
+        tenant.etag, platform.etag,
+        "one validator from either plane"
+    );
+
+    let etag = tenant.etag.clone().expect("an exact read carries its ETag");
+    let unchanged = call(
+        &router,
+        Request::builder()
+            .method("GET")
+            .uri(format!("{V2}/entities/{CF_TYPE}?{select}"))
+            .header("if-none-match", etag.as_str())
+            .body(Body::empty())
+            .expect("request"),
+    )
+    .await;
+    assert_eq!(unchanged.status, StatusCode::NOT_MODIFIED);
+
+    let keys = json!({ "items": [{ "entity_key": CF_TYPE, "if_none_match": etag }], "$select": "gts_id,origin,content,resolved_schema" });
+    let platform_batch = call(&router, batch_get(&keys)).await;
+    let tenant_batch = call(&router, post(&format!("{V2}/entities:batchGet"), &keys)).await;
+    assert_eq!(
+        result_for(&tenant_batch.body, CF_TYPE)["status"],
+        json!("unchanged")
+    );
+    assert_eq!(tenant_batch.body, platform_batch.body);
+
+    let platform_page = call(&router, get(&format!("{PLATFORM}/entities?{select}"))).await;
+    let tenant_page = call(&router, get(&format!("{V2}/entities?{select}"))).await;
+    assert_eq!(tenant_page.status, StatusCode::OK);
+    assert_eq!(tenant_page.body, platform_page.body);
+
+    for (method, uri) in [
+        ("POST", format!("{V2}/entities")),
+        ("POST", format!("{V2}/entities:batchDelete")),
+        (
+            "DELETE",
+            format!("{V2}/entities/{CF_TYPE}?expected_resource_version=1"),
+        ),
+        (
+            "GET",
+            format!(
+                "{V2}/operations/{}",
+                accepted.body["operation_id"].as_str().expect("id")
+            ),
+        ),
+    ] {
+        let response = call_raw(
+            &router,
+            Request::builder()
+                .method(method)
+                .uri(&uri)
+                .header("content-type", "application/json")
+                .header("idempotency-key", "key-tenant-write")
+                .body(Body::from(
+                    serde_json::to_vec(&one_candidate(CF_OTHER)).expect("body"),
+                ))
+                .expect("request"),
+        )
+        .await;
+        assert!(
+            matches!(
+                response.status,
+                StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED
+            ),
+            "{method} {uri} must not be served on the tenant plane, got {}",
+            response.status
+        );
+    }
 }
 
 #[tokio::test]
@@ -618,14 +724,18 @@ async fn an_instance_reads_back_with_its_authored_value() {
     let operation_id = accepted.body["operation_id"]
         .as_str()
         .expect("operation_id");
-    let operation = call(&router, get(&format!("{V2}/operations/{operation_id}"))).await;
+    let operation = call(
+        &router,
+        get(&format!("{PLATFORM}/operations/{operation_id}")),
+    )
+    .await;
     assert_eq!(operation.body["items"][0]["status"], json!("succeeded"));
     assert!(operation.body["items"][0].get("revision_no").is_none());
 
     let entity = call(
         &router,
         get(&format!(
-            "{V2}/entities/{CF_INSTANCE}?$select=gts_id,kind,origin,content,resolved_schema,\
+            "{PLATFORM}/entities/{CF_INSTANCE}?$select=gts_id,kind,origin,content,resolved_schema,\
              effective_traits,effective_traits_schema"
         )),
     )
@@ -675,7 +785,9 @@ async fn an_instance_is_readable_by_registry_reference() {
         .to_uuid();
     let by_uuid = call(
         &router,
-        get(&format!("{V2}/entities/{uuid}?$select=gts_id,content")),
+        get(&format!(
+            "{PLATFORM}/entities/{uuid}?$select=gts_id,content"
+        )),
     )
     .await;
     assert_eq!(by_uuid.status, StatusCode::OK);
@@ -691,7 +803,7 @@ async fn an_entity_is_readable_by_registry_reference() {
     call(&router, submit(Some("key-1"), &one_candidate(CF_TYPE))).await;
 
     let uuid = gts::GtsId::try_new(CF_TYPE).expect("identifier").to_uuid();
-    let by_uuid = call(&router, get(&format!("{V2}/entities/{uuid}"))).await;
+    let by_uuid = call(&router, get(&format!("{PLATFORM}/entities/{uuid}"))).await;
     assert_eq!(by_uuid.status, StatusCode::OK);
     assert_eq!(by_uuid.body["gts_id"], json!(CF_TYPE));
     assert_eq!(by_uuid.body["gts_uuid"], json!(uuid.to_string()));
@@ -756,7 +868,7 @@ async fn the_receipt_is_followable_under_a_gateway_prefix() {
     let accepted = call(
         &prefixed,
         submit_to(
-            &format!("/cf{V2}/entities"),
+            &format!("/cf{PLATFORM}/entities"),
             Some("key-1"),
             &one_candidate(CF_TYPE),
         ),
@@ -770,7 +882,7 @@ async fn the_receipt_is_followable_under_a_gateway_prefix() {
     assert_eq!(
         location,
         format!(
-            "/cf{V2}/operations/{}",
+            "/cf{PLATFORM}/operations/{}",
             accepted.body["operation_id"]
                 .as_str()
                 .expect("operation_id")
@@ -788,7 +900,7 @@ async fn the_receipt_is_followable_under_a_gateway_prefix() {
     let unprefixed = call(
         &prefixed,
         get(&format!(
-            "{V2}/operations/{}",
+            "{PLATFORM}/operations/{}",
             accepted.body["operation_id"]
                 .as_str()
                 .expect("operation_id")
@@ -812,7 +924,7 @@ async fn a_missing_idempotency_key_is_a_synchronous_refusal() {
     assert!(refused.body["type"].is_string(), "{:?}", refused.body);
 
     // Nothing was accepted, so nothing is readable.
-    let entity = call(&router, get(&format!("{V2}/entities/{CF_TYPE}"))).await;
+    let entity = call(&router, get(&format!("{PLATFORM}/entities/{CF_TYPE}"))).await;
     assert_eq!(entity.status, StatusCode::NOT_FOUND);
 }
 
@@ -837,7 +949,7 @@ async fn a_dry_run_is_accepted_and_writes_nothing() {
         accepted.body,
     );
 
-    let entity = call(&router, get(&format!("{V2}/entities/{CF_TYPE}"))).await;
+    let entity = call(&router, get(&format!("{PLATFORM}/entities/{CF_TYPE}"))).await;
     assert_eq!(
         entity.status,
         StatusCode::NOT_FOUND,
@@ -852,7 +964,7 @@ async fn a_non_utf8_idempotency_key_is_not_reported_as_a_missing_one() {
     let router = router_with_db().await;
     let request = Request::builder()
         .method("POST")
-        .uri(format!("{V2}/entities"))
+        .uri(format!("{PLATFORM}/entities"))
         .header("content-type", "application/json")
         .header(
             "idempotency-key",
@@ -1084,7 +1196,7 @@ async fn a_batch_with_one_mismatched_schema_id_writes_no_operation() {
         operations.is_empty(),
         "a refused batch writes and enqueues no operation: {operations:?}",
     );
-    let neighbour = call_raw(&router, get(&format!("{V2}/entities/{CF_TYPE}"))).await;
+    let neighbour = call_raw(&router, get(&format!("{PLATFORM}/entities/{CF_TYPE}"))).await;
     assert_eq!(
         neighbour.status,
         StatusCode::NOT_FOUND,
@@ -1145,7 +1257,11 @@ async fn naming_a_version_does_not_get_a_candidate_past_a_closed_region() {
         .as_str()
         .expect("operation_id");
 
-    let operation = call(&router, get(&format!("{V2}/operations/{operation_id}"))).await;
+    let operation = call(
+        &router,
+        get(&format!("{PLATFORM}/operations/{operation_id}")),
+    )
+    .await;
     let item = &operation.body["items"][0];
     assert_eq!(item["status"], json!("failed"));
     let text = serde_json::to_string(&item["error"]).expect("serialize");
@@ -1155,7 +1271,7 @@ async fn naming_a_version_does_not_get_a_candidate_past_a_closed_region() {
     );
 
     // The claim that matters: no entity exists in the closed region.
-    let entity = call(&router, get(&format!("{V2}/entities/{acme}"))).await;
+    let entity = call(&router, get(&format!("{PLATFORM}/entities/{acme}"))).await;
     assert_eq!(entity.status, StatusCode::NOT_FOUND);
 }
 
@@ -1180,14 +1296,18 @@ async fn a_revision_is_readable_through_the_entity_route() {
     let operation_id = accepted.body["operation_id"]
         .as_str()
         .expect("operation_id");
-    let operation = call(&router, get(&format!("{V2}/operations/{operation_id}"))).await;
+    let operation = call(
+        &router,
+        get(&format!("{PLATFORM}/operations/{operation_id}")),
+    )
+    .await;
     assert_eq!(operation.body["items"][0]["status"], json!("succeeded"));
     assert_eq!(operation.body["items"][0]["resource_version"], json!(2));
 
     let entity = call(
         &router,
         get(&format!(
-            "{V2}/entities/{CF_TYPE}?$select=origin,content,resolved_schema"
+            "{PLATFORM}/entities/{CF_TYPE}?$select=origin,content,resolved_schema"
         )),
     )
     .await;
@@ -1219,12 +1339,16 @@ async fn unchanged_content_reports_unchanged_on_the_operation() {
     let operation_id = accepted.body["operation_id"]
         .as_str()
         .expect("operation_id");
-    let operation = call(&router, get(&format!("{V2}/operations/{operation_id}"))).await;
+    let operation = call(
+        &router,
+        get(&format!("{PLATFORM}/operations/{operation_id}")),
+    )
+    .await;
     let item = &operation.body["items"][0];
     assert_eq!(item["status"], json!("unchanged"));
     assert_eq!(item["resource_version"], json!(1));
 
-    let entity = call(&router, get(&format!("{V2}/entities/{CF_TYPE}"))).await;
+    let entity = call(&router, get(&format!("{PLATFORM}/entities/{CF_TYPE}"))).await;
     assert_eq!(entity.body["origin"]["resource_version"], json!(1));
 }
 
@@ -1237,7 +1361,7 @@ async fn absent_resources_are_not_found_problems() {
     let operation = call(
         &router,
         get(&format!(
-            "{V2}/operations/00000000-0000-0000-0000-000000000001"
+            "{PLATFORM}/operations/00000000-0000-0000-0000-000000000001"
         )),
     )
     .await;
@@ -1257,7 +1381,7 @@ async fn absent_resources_are_not_found_problems() {
     );
 
     let absent = gts_id!("cf.core.absent.type.v1~");
-    let entity = call(&router, get(&format!("{V2}/entities/{absent}"))).await;
+    let entity = call(&router, get(&format!("{PLATFORM}/entities/{absent}"))).await;
     assert_eq!(entity.status, StatusCode::NOT_FOUND);
     assert!(entity.body["type"].is_string());
     assert_eq!(
@@ -1292,7 +1416,11 @@ async fn a_candidate_refused_by_admission_surfaces_through_the_operation() {
     let operation_id = accepted.body["operation_id"]
         .as_str()
         .expect("operation_id");
-    let operation = call(&router, get(&format!("{V2}/operations/{operation_id}"))).await;
+    let operation = call(
+        &router,
+        get(&format!("{PLATFORM}/operations/{operation_id}")),
+    )
+    .await;
     assert_eq!(operation.body["status"], json!("completed"));
     let item = &operation.body["items"][0];
     assert_eq!(item["status"], json!("failed"));
@@ -1324,10 +1452,10 @@ async fn without_a_database_the_routes_report_service_unavailable() {
     for req in [
         submit(Some("key-1"), &one_candidate(CF_TYPE)),
         get(&format!(
-            "{V2}/operations/00000000-0000-0000-0000-000000000001"
+            "{PLATFORM}/operations/00000000-0000-0000-0000-000000000001"
         )),
         get(&format!(
-            "{V2}/entities/{}",
+            "{PLATFORM}/entities/{}",
             gts_id!("cf.core.example.type.v1~")
         )),
     ] {
@@ -1380,7 +1508,7 @@ async fn a_v1_registration_is_absent_from_v2_and_the_reverse() {
         StatusCode::OK,
     );
     assert_eq!(
-        call(&router, get(&format!("{V2}/entities/{v1_id}")))
+        call(&router, get(&format!("{PLATFORM}/entities/{v1_id}")))
             .await
             .status,
         StatusCode::NOT_FOUND,
@@ -1399,7 +1527,7 @@ async fn a_v1_registration_is_absent_from_v2_and_the_reverse() {
 
     // It is readable on v2 and absent on v1.
     assert_eq!(
-        call(&router, get(&format!("{V2}/entities/{v2_id}")))
+        call(&router, get(&format!("{PLATFORM}/entities/{v2_id}")))
             .await
             .status,
         StatusCode::OK,
@@ -1497,28 +1625,43 @@ fn both_versions_are_declared_with_distinct_operation_ids() {
         ),
         (
             "POST",
-            "/types-registry/v2/entities",
-            "types_registry.submit_entities",
+            "/types-registry/v2/platform/entities",
+            "types_registry.platform.submit_entities",
         ),
         (
             "GET",
-            "/types-registry/v2/operations/{operation_id}",
-            "types_registry.get_operation",
+            "/types-registry/v2/platform/operations/{operation_id}",
+            "types_registry.platform.get_operation",
+        ),
+        (
+            "POST",
+            "/types-registry/v2/platform/entities:batchDelete",
+            "types_registry.platform.batch_delete_entities",
+        ),
+        (
+            "DELETE",
+            "/types-registry/v2/platform/entities/{entity_key}",
+            "types_registry.platform.delete_entity",
+        ),
+        (
+            "GET",
+            "/types-registry/v2/platform/entities/{entity_key}",
+            "types_registry.platform.get_entity",
+        ),
+        (
+            "POST",
+            "/types-registry/v2/platform/entities:batchGet",
+            "types_registry.platform.batch_get_entities",
+        ),
+        (
+            "GET",
+            "/types-registry/v2/platform/entities",
+            "types_registry.platform.list_entities",
         ),
         (
             "GET",
             "/types-registry/v2/entities/{entity_key}",
             "types_registry.get_entity",
-        ),
-        (
-            "POST",
-            "/types-registry/v2/entities:batchDelete",
-            "types_registry.batch_delete_entities",
-        ),
-        (
-            "DELETE",
-            "/types-registry/v2/entities/{entity_key}",
-            "types_registry.delete_entity",
         ),
         (
             "POST",
@@ -1534,6 +1677,54 @@ fn both_versions_are_declared_with_distinct_operation_ids() {
     expected.sort_unstable();
 
     assert_eq!(actual, expected);
+}
+
+/// One plane per route (D17): every database operation is on the platform plane, the
+/// entity reads also on the tenant plane, and no route admits either credential.
+#[test]
+fn every_database_route_serves_exactly_one_plane() {
+    use toolkit_security::RouteAuth;
+
+    let openapi = TestOpenApi::default();
+    let config = TypesRegistryConfig::default();
+    let legacy = Arc::new(TypesRegistryService::new(
+        Arc::new(InMemoryGtsRepository::new(config.to_gts_config())),
+        config,
+    ));
+    let _router = routes(Router::new(), &openapi, legacy, None);
+
+    let auth = openapi.auth.lock().expect("auth lock").clone();
+    let operations = openapi.operations.lock().expect("operations lock").clone();
+    for (_, path, operation_id) in &operations {
+        let (_, route_auth) = auth
+            .iter()
+            .find(|(id, _)| id == operation_id)
+            .expect("every registered operation records its auth");
+        let expected = if path.starts_with(PLATFORM) {
+            RouteAuth::Platform
+        } else {
+            assert!(
+                path.starts_with(V1) || path.starts_with(V2),
+                "{operation_id} is under an unknown prefix: {path}"
+            );
+            RouteAuth::Authenticated
+        };
+        assert_eq!(*route_auth, expected, "{operation_id} at {path}");
+    }
+    let tenant_v2: Vec<_> = operations
+        .iter()
+        .filter(|(_, path, _)| path.starts_with(V2) && !path.starts_with(PLATFORM))
+        .map(|(method, path, _)| format!("{method} {path}"))
+        .collect();
+    assert_eq!(
+        tenant_v2,
+        [
+            "GET /types-registry/v2/entities/{entity_key}",
+            "POST /types-registry/v2/entities:batchGet",
+            "GET /types-registry/v2/entities",
+        ],
+        "the tenant plane reads entities only: no mutation and no operation read",
+    );
 }
 
 /// Ceiling C8's fail-closed fallback is executable: until a platform listener
@@ -1574,7 +1765,7 @@ fn the_idempotency_key_header_is_declared_as_a_required_parameter() {
     let _router = routes(Router::new(), &openapi, legacy, None);
 
     let params = openapi.params.lock().expect("params lock").clone();
-    for operation_id in V2_MUTATION_OPERATIONS {
+    for operation_id in PLATFORM_MUTATION_OPERATIONS {
         let declared = params
             .iter()
             .find(|(id, _)| id == operation_id)
@@ -1608,7 +1799,7 @@ fn the_single_deletion_query_parameters_are_declared() {
     let params = openapi.params.lock().expect("params lock").clone();
     let declared = params
         .iter()
-        .find(|(id, _)| id == "types_registry.delete_entity")
+        .find(|(id, _)| id == "types_registry.platform.delete_entity")
         .map(|(_, p)| p.clone())
         .expect("the single deletion operation is registered");
 
@@ -1659,7 +1850,7 @@ fn submission_response_headers_are_declared() {
         .response_headers
         .lock()
         .expect("response headers lock");
-    for operation_id in V2_MUTATION_OPERATIONS {
+    for operation_id in PLATFORM_MUTATION_OPERATIONS {
         let declared = headers
             .iter()
             .find(|(id, _)| id == operation_id)
@@ -1705,8 +1896,8 @@ fn json_extractor_error_statuses_are_declared_for_both_post_operations() {
     let responses = openapi.responses.lock().expect("responses lock");
     for operation_id in [
         "types_registry.register",
-        "types_registry.submit_entities",
-        "types_registry.batch_delete_entities",
+        "types_registry.platform.submit_entities",
+        "types_registry.platform.batch_delete_entities",
         "types_registry.batch_get_entities",
     ] {
         let declared = responses
@@ -1730,12 +1921,12 @@ async fn deletion_receipts_are_followable_under_a_gateway_prefix() {
     let batch_key = gts_id!("cf.core.example.batch_prefixed.v1~");
     for request in [
         submit_to(
-            &format!("/cf{V2}/entities"),
+            &format!("/cf{PLATFORM}/entities"),
             Some("register-one"),
             &one_candidate(CF_TYPE),
         ),
         submit_to(
-            &format!("/cf{V2}/entities"),
+            &format!("/cf{PLATFORM}/entities"),
             Some("register-two"),
             &one_candidate(batch_key),
         ),
@@ -1752,13 +1943,13 @@ async fn deletion_receipts_are_followable_under_a_gateway_prefix() {
     let single = Request::builder()
         .method("DELETE")
         .uri(format!(
-            "/cf{V2}/entities/{CF_TYPE}?expected_resource_version=1"
+            "/cf{PLATFORM}/entities/{CF_TYPE}?expected_resource_version=1"
         ))
         .header("idempotency-key", "delete-single")
         .body(Body::empty())
         .expect("request");
     let batch = submit_to(
-        &format!("/cf{V2}/entities:batchDelete"),
+        &format!("/cf{PLATFORM}/entities:batchDelete"),
         Some("delete-batch"),
         &one_target(batch_key, 1),
     );
@@ -1778,7 +1969,7 @@ async fn deletion_receipts_are_followable_under_a_gateway_prefix() {
         assert_eq!(
             location,
             format!(
-                "/cf{V2}/operations/{}",
+                "/cf{PLATFORM}/operations/{}",
                 accepted.body["operation_id"]
                     .as_str()
                     .expect("operation_id")
@@ -1797,13 +1988,13 @@ async fn deletion_receipts_are_followable_under_a_gateway_prefix() {
 }
 
 fn batch_delete(key: Option<&str>, body: &Value) -> Request<Body> {
-    submit_to(&format!("{V2}/entities:batchDelete"), key, body)
+    submit_to(&format!("{PLATFORM}/entities:batchDelete"), key, body)
 }
 
 fn delete_one(key: Option<&str>, entity_key: &str, query: &str) -> Request<Body> {
     let mut builder = Request::builder()
         .method("DELETE")
-        .uri(format!("{V2}/entities/{entity_key}{query}"));
+        .uri(format!("{PLATFORM}/entities/{entity_key}{query}"));
     if let Some(key) = key {
         builder = builder.header("idempotency-key", key);
     }
@@ -1832,7 +2023,11 @@ async fn poll(router: &Router, accepted: &Response) -> Value {
     let operation_id = accepted.body["operation_id"]
         .as_str()
         .expect("a receipt carries an operation_id");
-    let operation = call(router, get(&format!("{V2}/operations/{operation_id}"))).await;
+    let operation = call(
+        router,
+        get(&format!("{PLATFORM}/operations/{operation_id}")),
+    )
+    .await;
     assert_eq!(operation.status, StatusCode::OK, "{:?}", operation.body);
     operation.body
 }
@@ -1862,7 +2057,7 @@ async fn a_deletion_is_accepted_polled_and_leaves_a_tombstone() {
         .expect("a 202 carries Location");
     assert_eq!(
         location,
-        format!("{V2}/operations/{operation_id}"),
+        format!("{PLATFORM}/operations/{operation_id}"),
         "the receipt must point at the operation",
     );
     assert_eq!(accepted.retry_after.as_deref(), Some("1"));
@@ -1875,7 +2070,7 @@ async fn a_deletion_is_accepted_polled_and_leaves_a_tombstone() {
     assert_eq!(item["entity_key"], json!(CF_TYPE));
     assert_eq!(item["status"], json!("succeeded"));
 
-    let entity = call(&router, get(&format!("{V2}/entities/{CF_TYPE}"))).await;
+    let entity = call(&router, get(&format!("{PLATFORM}/entities/{CF_TYPE}"))).await;
     assert_eq!(
         entity.status,
         StatusCode::OK,
@@ -1919,7 +2114,7 @@ async fn a_batch_deletion_reports_outcomes_in_request_order() {
 async fn deleting_by_registry_reference_echoes_the_reference() {
     let router = router_with_db().await;
     register_entity(&router, "register", CF_TYPE).await;
-    let entity = call(&router, get(&format!("{V2}/entities/{CF_TYPE}"))).await;
+    let entity = call(&router, get(&format!("{PLATFORM}/entities/{CF_TYPE}"))).await;
     let reference = entity.body["gts_uuid"]
         .as_str()
         .expect("the read carries the Registry Reference")
@@ -1948,7 +2143,7 @@ async fn deleting_by_registry_reference_echoes_the_reference() {
 async fn deleting_by_a_non_canonical_reference_echoes_it_canonically() {
     let router = router_with_db().await;
     register_entity(&router, "register", CF_TYPE).await;
-    let entity = call(&router, get(&format!("{V2}/entities/{CF_TYPE}"))).await;
+    let entity = call(&router, get(&format!("{PLATFORM}/entities/{CF_TYPE}"))).await;
     let reference = entity.body["gts_uuid"]
         .as_str()
         .expect("the read carries the Registry Reference")
@@ -2012,7 +2207,7 @@ async fn a_batch_mixing_identifiers_and_references_pairs_every_outcome() {
 
     let mut references = Vec::new();
     for id in [CF_OTHER, CF_THIRD] {
-        let entity = call(&router, get(&format!("{V2}/entities/{id}"))).await;
+        let entity = call(&router, get(&format!("{PLATFORM}/entities/{id}"))).await;
         references.push(
             entity.body["gts_uuid"]
                 .as_str()
@@ -2184,7 +2379,7 @@ async fn a_misspelled_dry_run_is_refused_rather_than_committed() {
         refused.body,
     );
 
-    let read = call(&router, get(&format!("{V2}/entities/{CF_TYPE}"))).await;
+    let read = call(&router, get(&format!("{PLATFORM}/entities/{CF_TYPE}"))).await;
     assert_eq!(read.status, StatusCode::OK, "{:?}", read.body);
 }
 
@@ -2255,7 +2450,7 @@ async fn both_deletion_routes_refuse_an_if_match_header() {
     let single = Request::builder()
         .method("DELETE")
         .uri(format!(
-            "{V2}/entities/{CF_TYPE}?expected_resource_version=1"
+            "{PLATFORM}/entities/{CF_TYPE}?expected_resource_version=1"
         ))
         .header("idempotency-key", "delete")
         .header("if-match", "\"1\"")
@@ -2263,7 +2458,7 @@ async fn both_deletion_routes_refuse_an_if_match_header() {
         .expect("request");
     let batch = Request::builder()
         .method("POST")
-        .uri(format!("{V2}/entities:batchDelete"))
+        .uri(format!("{PLATFORM}/entities:batchDelete"))
         .header("content-type", "application/json")
         .header("idempotency-key", "batch")
         .header("if-match", "\"1\"")
@@ -2289,7 +2484,7 @@ async fn both_deletion_routes_refuse_an_if_match_header() {
             "and the parameter that replaces it: {text}",
         );
     }
-    let entity = call(&router, get(&format!("{V2}/entities/{CF_TYPE}"))).await;
+    let entity = call(&router, get(&format!("{PLATFORM}/entities/{CF_TYPE}"))).await;
     assert_eq!(entity.body["lifecycle_status"], json!("active"));
     assert_eq!(entity.body["origin"]["resource_version"], json!(1));
 }
@@ -2325,7 +2520,7 @@ async fn the_two_deletion_spellings_agree_on_a_version_mismatch() {
         "DELETE is sugar over a one-item batch, so the outcomes must be identical",
     );
 
-    let entity = call(&router, get(&format!("{V2}/entities/{CF_TYPE}"))).await;
+    let entity = call(&router, get(&format!("{PLATFORM}/entities/{CF_TYPE}"))).await;
     assert_eq!(entity.body["lifecycle_status"], json!("active"));
     assert_eq!(entity.body["origin"]["resource_version"], json!(1));
 }
@@ -2370,7 +2565,7 @@ async fn a_dry_run_deletion_predicts_and_the_commit_performs() {
         assert_eq!(item["entity_key"], json!(CF_TYPE), "{idempotency_key}");
         assert_eq!(item["status"], json!("succeeded"), "{idempotency_key}");
 
-        let entity = call(&router, get(&format!("{V2}/entities/{CF_TYPE}"))).await;
+        let entity = call(&router, get(&format!("{PLATFORM}/entities/{CF_TYPE}"))).await;
         assert_eq!(
             entity.body["lifecycle_status"],
             json!("active"),
@@ -2398,7 +2593,7 @@ async fn a_dry_run_deletion_predicts_and_the_commit_performs() {
         poll(&router, &committed).await["items"][0]["status"],
         json!("succeeded"),
     );
-    let entity = call(&router, get(&format!("{V2}/entities/{CF_TYPE}"))).await;
+    let entity = call(&router, get(&format!("{PLATFORM}/entities/{CF_TYPE}"))).await;
     assert_eq!(entity.body["lifecycle_status"], json!("deleted"));
 }
 
@@ -2423,7 +2618,7 @@ async fn a_dry_run_registration_reaches_a_terminal_outcome_and_writes_nothing() 
     );
 
     assert_eq!(
-        call(&router, get(&format!("{V2}/entities/{CF_TYPE}")))
+        call(&router, get(&format!("{PLATFORM}/entities/{CF_TYPE}")))
             .await
             .status,
         StatusCode::NOT_FOUND,
@@ -2436,7 +2631,7 @@ async fn a_dry_run_registration_reaches_a_terminal_outcome_and_writes_nothing() 
         "{:?}",
         committed.body
     );
-    let entity = call(&router, get(&format!("{V2}/entities/{CF_TYPE}"))).await;
+    let entity = call(&router, get(&format!("{PLATFORM}/entities/{CF_TYPE}"))).await;
     assert_eq!(entity.status, StatusCode::OK);
     assert_eq!(entity.body["origin"]["resource_version"], json!(1));
 }
@@ -2514,7 +2709,7 @@ async fn reusing_one_key_for_a_dry_run_then_a_commit_is_a_conflict() {
         commit.body,
     );
 
-    let entity = call(&router, get(&format!("{V2}/entities/{CF_TYPE}"))).await;
+    let entity = call(&router, get(&format!("{PLATFORM}/entities/{CF_TYPE}"))).await;
     assert_eq!(entity.body["lifecycle_status"], json!("active"));
 }
 
@@ -2560,11 +2755,11 @@ async fn await_operation(router: &Router, receipt: &Response, what: &str) -> Val
         .expect("a receipt carries an operation_id")
         .to_owned();
     // The receipt's own `Location` keeps any gateway prefix the router is nested
-    // under; a path rebuilt from `V2` would miss it.
+    // under; a path rebuilt from `PLATFORM` would miss it.
     let uri = receipt
         .location
         .clone()
-        .unwrap_or_else(|| format!("{V2}/operations/{operation_id}"));
+        .unwrap_or_else(|| format!("{PLATFORM}/operations/{operation_id}"));
     common::await_delivery(what, || async {
         let response = call_raw(router, get(&uri)).await;
         assert_eq!(response.status, StatusCode::OK, "{:?}", response.body);
@@ -2659,7 +2854,7 @@ async fn every_mutation_reaches_a_terminal_outcome_through_the_outbox() {
             operation["items"],
         );
 
-        let entity = call(&router, get(&format!("{V2}/entities/{CF_TYPE}"))).await;
+        let entity = call(&router, get(&format!("{PLATFORM}/entities/{CF_TYPE}"))).await;
         match (mutation, dry_run) {
             (Mutation::Register, false) => {
                 assert_eq!(entity.status, StatusCode::OK, "{case}: {:?}", entity.body);
@@ -2753,7 +2948,11 @@ async fn the_operation_polling_response_refuses_to_be_cached() {
         .expect("a receipt carries an operation_id")
         .to_owned();
 
-    let polled = call(&router, get(&format!("{V2}/operations/{operation_id}"))).await;
+    let polled = call(
+        &router,
+        get(&format!("{PLATFORM}/operations/{operation_id}")),
+    )
+    .await;
     assert_eq!(polled.status, StatusCode::OK, "{:?}", polled.body);
     assert_eq!(
         polled.body["status"],
@@ -2802,9 +3001,9 @@ fn post(uri: &str, body: &Value) -> Request<Body> {
         .expect("request")
 }
 
-/// `POST {V2}/entities:batchGet`. No `Idempotency-Key`: a read is not a mutation.
+/// `POST {PLATFORM}/entities:batchGet`. No `Idempotency-Key`: a read is not a mutation.
 fn batch_get(body: &Value) -> Request<Body> {
-    post(&format!("{V2}/entities:batchGet"), body)
+    post(&format!("{PLATFORM}/entities:batchGet"), body)
 }
 
 /// A `:batchGet` result by its echoed key: batch order is not contractual
@@ -2825,9 +3024,9 @@ fn keys(keys: &[&str]) -> Value {
     json!({ "items": keys.iter().map(|k| json!({ "entity_key": k })).collect::<Vec<_>>() })
 }
 
-/// `GET {V2}/entities`, with the query string spelled by the caller.
+/// `GET {PLATFORM}/entities`, with the query string spelled by the caller.
 fn discover(query: &str) -> Request<Body> {
-    get(&format!("{V2}/entities{query}"))
+    get(&format!("{PLATFORM}/entities{query}"))
 }
 
 /// Register [`CF_TYPE`] and an Instance of it, both terminal on return.
@@ -3002,8 +3201,16 @@ async fn duplicate_keys_collapse_to_one_result() {
 async fn an_impossible_identifier_is_classified_alike_by_both_read_surfaces() {
     let router = router_with_db().await;
 
-    let impossible = call(&router, get(&format!("{V2}/entities/{IMPOSSIBLE_KEY}"))).await;
-    let absent = call(&router, get(&format!("{V2}/entities/{CF_ABSENT_TYPE}"))).await;
+    let impossible = call(
+        &router,
+        get(&format!("{PLATFORM}/entities/{IMPOSSIBLE_KEY}")),
+    )
+    .await;
+    let absent = call(
+        &router,
+        get(&format!("{PLATFORM}/entities/{CF_ABSENT_TYPE}")),
+    )
+    .await;
     assert_eq!(impossible.status, StatusCode::NOT_FOUND);
     assert_eq!(absent.status, impossible.status);
     assert_eq!(absent.content_type, impossible.content_type);
@@ -3031,7 +3238,7 @@ async fn a_batch_read_refuses_an_if_none_match_header() {
 
     let request = Request::builder()
         .method("POST")
-        .uri(format!("{V2}/entities:batchGet"))
+        .uri(format!("{PLATFORM}/entities:batchGet"))
         .header("content-type", "application/json")
         .header("if-none-match", "\"anything\"")
         .body(Body::from(
@@ -3199,7 +3406,7 @@ async fn discovery_lists_tombstones_only_on_request() {
         }
     }
 
-    let exact = call(&router, get(&format!("{V2}/entities/{CF_TYPE}"))).await;
+    let exact = call(&router, get(&format!("{PLATFORM}/entities/{CF_TYPE}"))).await;
     assert_eq!(exact.status, StatusCode::OK, "{:?}", exact.body);
     assert_eq!(exact.body["lifecycle_status"], json!("deleted"));
 }
@@ -3710,13 +3917,13 @@ fn the_discovery_query_parameters_are_declared() {
 #[test]
 fn all_seven_v2_operations_declare_problem_responses() {
     const V2_OPERATIONS: [&str; 7] = [
-        "types_registry.submit_entities",
-        "types_registry.batch_delete_entities",
-        "types_registry.delete_entity",
+        "types_registry.platform.submit_entities",
+        "types_registry.platform.batch_delete_entities",
+        "types_registry.platform.delete_entity",
         "types_registry.batch_get_entities",
         "types_registry.get_entity",
         "types_registry.list_entities",
-        "types_registry.get_operation",
+        "types_registry.platform.get_operation",
     ];
 
     let openapi = TestOpenApi::default();
@@ -3837,7 +4044,7 @@ async fn seed_ids(db: &Arc<DBProvider<DbError>>, ids: &[&str]) {
 const DEFAULT_FIELDS: [&str; 5] = ["gts_id", "gts_uuid", "kind", "lifecycle_status", "origin"];
 
 fn exact(key: &str, query: &str) -> Request<Body> {
-    get(&format!("{V2}/entities/{key}{query}"))
+    get(&format!("{PLATFORM}/entities/{key}{query}"))
 }
 
 /// A batch read of `keys` under one body `$select`.
@@ -4184,7 +4391,7 @@ async fn undeclared_query_parameters_are_refused_on_both_routes() {
     assert_field_refusal(&repeated, "$select", "VALIDATION_FAILED");
 
     let in_query = post(
-        &format!("{V2}/entities:batchGet?$select=content"),
+        &format!("{PLATFORM}/entities:batchGet?$select=content"),
         &keys(&[CF_TYPE]),
     );
     let refused = call(&router, in_query).await;
@@ -4763,7 +4970,7 @@ async fn a_cursor_binds_the_normalized_lifecycle_status() {
 #[test]
 fn discovery_declares_kind_and_lifecycle_status_as_optional_strings() {
     let doc = generated_openapi();
-    let params = doc["paths"][format!("{V2}/entities")]["get"]["parameters"]
+    let params = doc["paths"][format!("{PLATFORM}/entities")]["get"]["parameters"]
         .as_array()
         .expect("discovery parameters")
         .clone();
@@ -4883,15 +5090,15 @@ fn every_entity_read_requires_identity_kind_and_lifecycle_in_the_generated_docum
     };
     let entity_ref = "#/components/schemas/EntityDto";
     assert_eq!(
-        body(format!("{V2}/entities/{{entity_key}}"), "get"),
+        body(format!("{PLATFORM}/entities/{{entity_key}}"), "get"),
         entity_ref
     );
     assert_eq!(
-        body(format!("{V2}/entities:batchGet"), "post"),
+        body(format!("{PLATFORM}/entities:batchGet"), "post"),
         "#/components/schemas/EntityLookupsDto"
     );
     assert_eq!(
-        body(format!("{V2}/entities"), "get"),
+        body(format!("{PLATFORM}/entities"), "get"),
         "#/components/schemas/EntityPageDto"
     );
     let lookup = &schemas["EntityLookupDto"]["properties"]["entity"]["oneOf"];
@@ -5148,7 +5355,7 @@ fn discovery_declares_depth_as_a_positive_integer() {
 #[test]
 fn discovery_declares_the_page_size_as_positive_on_request_and_page() {
     let doc = generated_openapi();
-    let params = doc["paths"][format!("{V2}/entities")]["get"]["parameters"]
+    let params = doc["paths"][format!("{PLATFORM}/entities")]["get"]["parameters"]
         .as_array()
         .expect("discovery parameters")
         .clone();
@@ -5185,7 +5392,7 @@ async fn an_unreadable_if_none_match_header_is_refused() {
     for value in [over.as_str(), "unquoted", "*, \"a\"", " , ", "\"a b\""] {
         let refused = call(
             &router,
-            get_if_none_match(&format!("{V2}/entities/{CF_TYPE}"), value),
+            get_if_none_match(&format!("{PLATFORM}/entities/{CF_TYPE}"), value),
         )
         .await;
         assert_field_refusal(&refused, "If-None-Match", "VALIDATION_FAILED");
@@ -5203,7 +5410,7 @@ async fn an_unreadable_if_none_match_header_is_refused() {
 async fn a_current_etag_answers_304_with_the_same_etag() {
     let router = router_with_db().await;
     register_entity(&router, "arrange", CF_TYPE).await;
-    let uri = format!("{V2}/entities/{CF_TYPE}");
+    let uri = format!("{PLATFORM}/entities/{CF_TYPE}");
 
     let first = call(&router, get(&uri)).await;
     assert_eq!(first.status, StatusCode::OK, "{:?}", first.body);
@@ -5232,7 +5439,7 @@ async fn a_current_etag_answers_304_with_the_same_etag() {
 async fn a_stale_or_narrower_etag_answers_200_with_the_representation() {
     let router = router_with_db().await;
     register_entity(&router, "arrange", CF_TYPE).await;
-    let uri = format!("{V2}/entities/{CF_TYPE}");
+    let uri = format!("{PLATFORM}/entities/{CF_TYPE}");
     let stale = call(&router, get(&uri)).await.etag.expect("ETag");
 
     let wide = call(
@@ -5280,7 +5487,7 @@ async fn a_batch_answers_unchanged_per_key_with_the_same_etag() {
             .expect("a found result carries etag")
             .to_owned()
     };
-    let exact = call(&router, get(&format!("{V2}/entities/{CF_TYPE}"))).await;
+    let exact = call(&router, get(&format!("{PLATFORM}/entities/{CF_TYPE}"))).await;
     assert_eq!(
         exact.etag,
         Some(etag(CF_TYPE)),
@@ -5326,7 +5533,7 @@ async fn discovery_carries_no_validator() {
 #[test]
 fn the_exact_read_declares_if_none_match_and_a_304_carrying_the_etag() {
     let doc = generated_openapi();
-    let read = &doc["paths"][format!("{V2}/entities/{{entity_key}}")]["get"];
+    let read = &doc["paths"][format!("{PLATFORM}/entities/{{entity_key}}")]["get"];
     let params = read["parameters"].as_array().expect("parameters");
     assert!(
         params.iter().any(|p| p["name"] == "If-None-Match"
@@ -5349,4 +5556,136 @@ fn the_exact_read_declares_if_none_match_and_a_304_carrying_the_etag() {
     let statuses = schemas["EntityLookupStatusDto"].to_string();
     assert!(statuses.contains("\"unchanged\""), "{statuses}");
     assert!(schemas["EntityLookupDto"]["properties"]["etag"].is_object());
+}
+
+/// The caller gate (SPEC §8.4) refuses only the registry's own routes: a host route the
+/// registry is merged into, another method on a registry path and the host's fallback keep
+/// their answers, and still see the registry's service extension.
+#[tokio::test]
+async fn the_caller_gate_covers_only_the_registrys_own_routes() {
+    use axum::Extension;
+    use axum::routing::{get, patch};
+
+    let config = TypesRegistryConfig::default();
+    let legacy = Arc::new(TypesRegistryService::new(
+        Arc::new(InMemoryGtsRepository::new(config.to_gts_config())),
+        config,
+    ));
+    let host = Router::new()
+        .route(
+            "/host",
+            get(|Extension(_): Extension<Arc<TypesRegistryService>>| async {
+                StatusCode::NO_CONTENT
+            }),
+        )
+        .route(
+            &format!("{V1}/entities"),
+            patch(|| async { StatusCode::ACCEPTED }),
+        )
+        .fallback(|| async { StatusCode::IM_A_TEAPOT });
+    let openapi = toolkit::api::OpenApiRegistryImpl::new();
+    let app = types_registry::api::rest::routes::register_routes(host, &openapi, legacy, None);
+
+    for (method, uri, expected) in [
+        ("GET", "/host".to_owned(), StatusCode::NO_CONTENT),
+        ("PATCH", format!("{V1}/entities"), StatusCode::ACCEPTED),
+        ("GET", "/elsewhere".to_owned(), StatusCode::IM_A_TEAPOT),
+        // No caller context: the listener installed no plane for these.
+        ("GET", format!("{V1}/entities"), StatusCode::UNAUTHORIZED),
+        ("GET", format!("{V2}/entities"), StatusCode::UNAUTHORIZED),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(&uri)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), expected, "{method} {uri}");
+    }
+}
+
+/// The request line's verb a binding method declares.
+fn verb(method: toolkit_contract::HttpMethod) -> &'static str {
+    use toolkit_contract::HttpMethod;
+    match method {
+        HttpMethod::Get => "GET",
+        HttpMethod::Post => "POST",
+        HttpMethod::Put => "PUT",
+        HttpMethod::Patch => "PATCH",
+        HttpMethod::Delete => "DELETE",
+        other => panic!("no verb mapped for {other:?}"),
+    }
+}
+/// The SDK's HTTP binding descriptors, which `#[toolkit::provides]` validates, bind each
+/// contract method to the route that implements it — the operation, not only a route that
+/// exists — and each plane's binding stays on its own base path.
+#[test]
+fn the_sdk_bindings_name_the_routes_the_registry_serves() {
+    let openapi = TestOpenApi::default();
+    let config = TypesRegistryConfig::default();
+    let legacy = Arc::new(TypesRegistryService::new(
+        Arc::new(InMemoryGtsRepository::new(config.to_gts_config())),
+        config,
+    ));
+    let _router = routes(Router::new(), &openapi, legacy, None);
+    let declared: std::collections::HashMap<(String, String), String> = openapi
+        .operations
+        .lock()
+        .expect("operations lock")
+        .iter()
+        .map(|(method, path, operation_id)| ((method.clone(), path.clone()), operation_id.clone()))
+        .collect();
+
+    for (binding, base, expected) in [
+        (
+            types_registry_sdk::platform_types_registry_api_rest_http_binding(),
+            PLATFORM,
+            &[
+                (
+                    "batch_get_entities",
+                    "types_registry.platform.batch_get_entities",
+                ),
+                ("list_entities", "types_registry.platform.list_entities"),
+                (
+                    "register_entities",
+                    "types_registry.platform.submit_entities",
+                ),
+                (
+                    "delete_entities",
+                    "types_registry.platform.batch_delete_entities",
+                ),
+                ("get_operation", "types_registry.platform.get_operation"),
+            ][..],
+        ),
+        (
+            types_registry_sdk::types_registry_api_rest_http_binding(),
+            V2,
+            &[
+                ("batch_get_entities", "types_registry.batch_get_entities"),
+                ("list_entities", "types_registry.list_entities"),
+            ][..],
+        ),
+    ] {
+        assert_eq!(binding.base_path, base);
+        assert_eq!(binding.methods.len(), expected.len());
+        for (method_name, operation_id) in expected {
+            let method = binding
+                .find_method(method_name)
+                .unwrap_or_else(|| panic!("{method_name} is bound"));
+            let route = (
+                verb(method.http_method).to_owned(),
+                format!("{}{}", binding.base_path, method.path_template),
+            );
+            assert_eq!(
+                declared.get(&route).map(String::as_str),
+                Some(*operation_id),
+                "{method_name} binds {route:?}"
+            );
+        }
+    }
 }

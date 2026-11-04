@@ -1,4 +1,3 @@
-// Created: 2026-09-24 by Virtuozzo International GmbH
 //! The one reading of `If-Match` every mutation handler shares.
 
 use axum::http::{HeaderMap, HeaderValue, header};

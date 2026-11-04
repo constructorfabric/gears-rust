@@ -69,8 +69,7 @@
     },
     "type": {
       "type": "string",
-      "format": "gts-type-id",
-      "x-gts-ref": "gts.cf.core.graph.node.v1~",
+      "x-gts-type-ref": "/$id",
       "description": "The node's registered GTS type."
     },
     "name": {

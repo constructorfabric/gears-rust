@@ -963,7 +963,7 @@ async fn rd_spec_014_sharded_pubsub_is_detected_but_not_used() {
         let handle = RedisClusterPlugin::builder(config)
             .build_and_start()
             .await
-            .expect("the plugin starts against Redis 7");
+            .expect("the plugin starts against Redis 7+");
         let cache = handle.cache();
         cache
             .put(PutRequest {
@@ -977,7 +977,7 @@ async fn rd_spec_014_sharded_pubsub_is_detected_but_not_used() {
         assert_eq!(
             common::count_occurrences(&log, logs::SHARDED_PUBSUB_AVAILABLE),
             1,
-            "Redis 7 supports SPUBLISH/SSUBSCRIBE, and the capability must be recorded once. \
+            "Redis 7+ supports SPUBLISH/SSUBSCRIBE, and the capability must be recorded once. \
              Captured: {}",
             common::captured(&log)
         );
@@ -1007,7 +1007,7 @@ async fn rd_spec_014_sharded_pubsub_is_detected_but_not_used() {
         common::count_occurrences(&log, logs::SHARDED_PUBSUB_AVAILABLE),
         0,
         "Redis 6 has no sharded pub/sub, so the detection must say nothing. A detection that \
-         reported it everywhere would be indistinguishable from a working one on Redis 7. \
+         reported it everywhere would be indistinguishable from a working one on Redis 7+. \
          Captured: {}",
         common::captured(&log)
     );

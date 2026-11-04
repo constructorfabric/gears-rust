@@ -154,7 +154,9 @@ and the sold-as bundle and grants (D-411), and drops quote and the Studio wiring
 | D-534 | M | The pricing migrations are edited in place for the price's currency spec and the settings | DECIDED 2026-10-12 · Owner, 2026-10-08 (fresh schema); amends D-412, D-427 |
 | D-535 | M | No tenant rounding setting; an invoice line rounds HALF_EVEN | DECIDED 2026-10-12 · Owner, 2026-10-11; BSS money ADR rule 7; supersedes D-437; amends D-421, D-439 |
 | D-536 | L | A minimum billable unit is deferred (owner, 2026-10-11) | DECIDED 2026-10-12 · Owner, 2026-10-11; BSS money ADR rule 5 |
-| D-537 | M | The currency table is a read: GET /currencies | DECIDED 2026-10-14 · Owner, 2026-10-14; extends D-529 |
+| D-537 | M | The currency table is a read: GET /currencies | DECIDED 2026-10-14 · Owner, 2026-10-14; extends D-529; amended 2026-10-21 (no permission) |
+| D-538 | M | A field violation names the refused decimal's path | DECIDED 2026-10-21 · Owner, 2026-10-21 (a client parsed the prose); extends D-528 |
+| D-539 | M | Snapshot prices carry their currency spec | DECIDED 2026-10-21 · Owner, 2026-10-21 (a review rendered money without its scale); extends D-531 |
 
 ## Entries
 
@@ -2337,13 +2339,13 @@ A finished price book stayed on the Price Books screen for ever, and its entries
 | --- | --- |
 | A decimal of a price sent as a JSON number | 400 `AMOUNT_INVALID`: decimals are JSON strings |
 | A decimal of a price that is not plain decimal text | 400 `AMOUNT_INVALID`: the plain decimal text rule |
-| A negative value; a zero or negative `package_size` | 400 `AMOUNT_INVALID`, naming the field (`rate must not be negative`, `package_size must be above zero`) |
-| More fractional places or more digits than the field takes | 400 `AMOUNT_OUT_OF_RANGE`, naming the field and its limit |
+| A negative value; a zero or negative `package_size` | 400 `AMOUNT_INVALID`, naming the field (`rate must not be negative`, `package_size must be above zero`); the violation's `field` is the decimal's path (D-538) |
+| More fractional places or more digits than the field takes | 400 `AMOUNT_OUT_OF_RANGE`, naming the field and its limit; the violation's `field` is the decimal's path (D-538) |
 | A `min_fee` sent as a JSON number | 400 `MIN_FEE_INVALID`: decimals are JSON strings |
 | A `min_fee` that is not plain decimal text, has more than 28 digits, is negative or is off the currency increment | 400 `MIN_FEE_INVALID`, naming the cause: the plain decimal text rule, the 28-digit limit, or the sign and increment rule |
 | At book create, a currency the currency table does not know, or one that is not three uppercase letters | 400 `BOOK_CURRENCY_INVALID` |
 | A new price, a PATCH, a submit or an approval in a book whose currency the table no longer lists | 409 `BOOK_CURRENCY_INVALID`; the detail says that no edit makes the draft a price |
-| At PUT /settings, an offered currency the table does not know, or a code listed twice | 400 `CURRENCY_INVALID`, naming the code and the reason |
+| At PUT /settings, an offered currency the table does not know, or a code listed twice | 400 `CURRENCY_INVALID`, naming the code and the reason, on the code's place in the list (`currencies[1]`, D-538) |
 | At PUT /settings, an offered value that is not three uppercase letters | 400 `CURRENCY_INVALID`, with a fixed message that does not repeat the value |
 | At submit or approval, a draft stored at another scale than the table gives today | 409 `CURRENCY_SCALE_CHANGED`, naming both scales and the remedy |
 | At startup, a `currency_scales` key that is not three uppercase letters, is an ISO 4217 code with a scale, or has a scale over 28 | The gear does not start; the error names the key and the cause (`CURRENCY_SCALES_INVALID`) |
@@ -2434,11 +2436,32 @@ Pricing rates the actual quantity. No tariff field says "per started hour" or "w
 
 #### D-537 [M] The currency table is a read: GET /currencies
 
-**Status:** DECIDED 2026-10-14.
+**Status:** DECIDED 2026-10-14. Amended 2026-10-21.
 
 - **The endpoint.** `GET /bss-pricing/v1/currencies` returns `{ items: [ { code, scale, iso } ] }`: every currency code the currency table accepts (D-529), once each, sorted by code. `scale` is the number of decimal places a new price in that currency uses, as a JSON integer. `iso` is true for an ISO 4217 code and false for a code that the deployment's `currency_scales` config adds. The list has no paging and no filter: it holds the 165 active ISO 4217 codes and the deployment's own codes.
-- **Access.** The table belongs to the deployment and is the same for every tenant. The endpoint requires `config:read`, like `GET /settings`, and applies no tenant filter. It sets no ETag, because the table changes only when the service starts with a different config.
+- **Access.** The table belongs to the deployment and is the same for every tenant. The endpoint requires an authenticated caller and nothing else: it asks no permission and makes no PDP call, and applies no tenant filter. The table holds no tenant data (the ISO 4217 codes and the deployment's config), and a price author who reads a book or a plan needs a currency's scale whether or not they hold `config:read`; a permission here protected nothing and cost a PDP round trip. It sets no ETag, because the table changes only when the service starts with a different config.
 - **What it is for.** A client takes the scale of a new price, the minimum-fee step and the list of currencies a book or the settings can use from this endpoint, not from its own copy of the table. The settings' `currencies` limit only which currency a new book can use (D-438). A saved price keeps its own `currency_scale` (D-531): when the table gives a different scale, submitting that draft is refused with `CURRENCY_SCALE_CHANGED`.
 - **One table.** `bss_money::iso_codes` returns the same ISO table that `iso_scale` reads, so this endpoint and the price checks use the same data.
 
-**Source:** Owner, 2026-10-14 (a client needs a currency's scale before its book has a price). Extends D-529.
+**Source:** Owner, 2026-10-14 (a client needs a currency's scale before its book has a price). Extends D-529. Amended 2026-10-21 (owner: `config:read` gated nothing on a table every tenant reads alike; before, the endpoint required it like `GET /settings`).
+
+#### D-538 [M] A field violation names the refused decimal's path
+
+**Status:** DECIDED 2026-10-21.
+
+- **The field is a path.** A 400 of a price write (`POST /price-book-entries/{id}/prices`, `PATCH /prices/{id}`) that refuses one decimal names it in the violation's `field` as its path under the request: `price.amount`, `price.rate`, `price.package_size`, `price.package_price`, `price.tiers[1].up_to`, `price.tiers[1].rate`. The index is the tier's place in the `tiers` sent, from 0. A JSON number is named the same way; a number under a key that is no decimal of a price, and a body that is not the model's shape (`PRICE_MISSING`), name `price`. `min_fee` stays `min_fee`.
+- **The settings.** A 400 `CURRENCY_INVALID` of `PUT /settings` names the offending code's place in the list: `currencies[1]`. The first refused code is named; the list is judged in order.
+- **The prose stays.** `reason` and `description` are as D-528 gives them: the description still says `rate must not be negative` or `"BTC" is not a currency the currency table knows`. A client maps the violation by `field` and `reason`, and no longer reads the description to learn which decimal or which code was refused. The refused value is in the client's own request at that path; the violation does not repeat it.
+- **Elsewhere.** No other door changes: a violation on a field of the body (`effective_from`, `dim_value`, `currency`, `code`) names it as before.
+
+**Source:** Owner, 2026-10-21 (a client parsed the description's English to find the sub-field and the refused code). Extends D-528.
+
+#### D-539 [M] Snapshot prices carry their currency spec
+
+**Status:** DECIDED 2026-10-21.
+
+- **Stored at submit.** Each price of a prices unit's snapshot carries `currency` and `currency_scale` beside its money: in `after` (the proposed price, and a cancel or end row), and in `before` (the predecessor it changes). They are the price row's own spec (D-531), the one its money was authored at, so a review renders the money from the unit alone, as `GET /prices/{id}` lets a client do. They are part of the fingerprinted content: a unit pending at the change finds its content changed at its next vote or reject and is refreshed once, at the next generation, as D-467's units were.
+- **A unit stored before.** A snapshot stored before this decision carries none; every read of it (the card, the list, a receipt, and the approvals inbox) puts both beside each price that lacks them, read from the price's row in one grouped statement, none when every price carries its spec. The stored snapshot and the fingerprint are unchanged. A row that is gone (a rejected draft deleted since) leaves that price as it was stored.
+- **A plan revision.** Its snapshot names entries and SKUs, no money, so nothing is added there.
+
+**Source:** Owner, 2026-10-21 (a review needed the currency table or other prices to show the right decimals). Extends D-531, D-516.

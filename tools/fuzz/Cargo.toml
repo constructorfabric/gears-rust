@@ -12,6 +12,8 @@ libfuzzer-sys = "0.4"
 
 # Dependencies for fuzzing internal crates
 toolkit-odata = { package = "cf-gears-toolkit-odata", path = "../../libs/toolkit-odata", features = [] }
+toolkit-http-proxy = { package = "cf-gears-toolkit-http-proxy", path = "../../libs/toolkit-http-proxy" }
+http = "1"
 
 [[bin]]
 name = "fuzz_odata_filter"
@@ -28,5 +30,11 @@ doc = false
 [[bin]]
 name = "fuzz_odata_orderby"
 path = "fuzz_targets/fuzz_odata_orderby.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_http_proxy_sanitize"
+path = "fuzz_targets/fuzz_http_proxy_sanitize.rs"
 test = false
 doc = false

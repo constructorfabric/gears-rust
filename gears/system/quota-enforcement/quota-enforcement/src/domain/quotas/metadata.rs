@@ -60,9 +60,8 @@ pub fn validate_metadata(
 
     // @cpt-begin:cpt-cf-quota-enforcement-algo-quota-metadata-validation:p1:inst-qmd-contract
     // @cpt-begin:cpt-cf-quota-enforcement-algo-quota-metadata-validation:p1:inst-qmd-envelope
-    // The whole `{type, metadata}` document is validated, never the inner
-    // object alone: the inner path would skip the base's own `required` and
-    // `additionalProperties` rules (ADR-0007).
+    // Validate the full envelope so base `required` and
+    // `additionalProperties` constraints apply.
     let envelope = json!({
         "type": constraint.reference.type_id.as_ref(),
         "metadata": metadata,
@@ -93,16 +92,13 @@ pub fn validate_metadata(
     // @cpt-end:cpt-cf-quota-enforcement-algo-quota-metadata-validation:p1:inst-qmd-mismatch-if
 
     // @cpt-begin:cpt-cf-quota-enforcement-algo-quota-metadata-validation:p1:inst-qmd-snapshot
-    // The accepted contract id and version travel with the row; a stored value
-    // is not revalidated during evaluation (ADR-0003, ADR-0007).
+    // Persist the accepted contract; evaluation does not revalidate metadata.
     let snapshot = constraint.reference.clone();
     // @cpt-end:cpt-cf-quota-enforcement-algo-quota-metadata-validation:p1:inst-qmd-snapshot
 
     // @cpt-begin:cpt-cf-quota-enforcement-algo-quota-metadata-validation:p1:inst-qmd-opaque
     // @cpt-begin:cpt-cf-quota-enforcement-algo-quota-metadata-validation:p1:inst-qmd-pii
-    // Nothing here reads a key for its meaning or indexes one: the object is
-    // Platform Operational Data the operator keeps free of regulated content,
-    // stored and forwarded verbatim as the Engine's `arbitration` object.
+    // Metadata is opaque to QE and forwarded as the engine's `arbitration` object.
     // @cpt-end:cpt-cf-quota-enforcement-algo-quota-metadata-validation:p1:inst-qmd-pii
     // @cpt-end:cpt-cf-quota-enforcement-algo-quota-metadata-validation:p1:inst-qmd-opaque
 

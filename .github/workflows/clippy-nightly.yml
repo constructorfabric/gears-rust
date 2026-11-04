@@ -13,7 +13,7 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: clippy-nightly-${{ github.ref }}
+  group: clippy-nightly-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
 
 permissions:
@@ -27,7 +27,12 @@ env:
 jobs:
   clippy-deep:
     name: Clippy deep (all features × all crates)
-    runs-on: ubuntu-latest
+    runs-on: ${{ (vars.GEARS_FORCE_GITHUB_HOSTED == 'true' || github.repository != 'constructorfabric/gears-rust' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && 'ubuntu-latest' || 'gears-large' }}
+    # Only a push to main enters the environment, whose read-write key for the
+    # shared build cache GitHub releases to main alone; every other run reads.
+    environment:
+      name: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') && 'ci-trusted' || '' }}
+      deployment: false
     env:
       RUSTFLAGS: "-C debuginfo=0"
     steps:
@@ -35,7 +40,8 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install protoc
-        uses: taiki-e/install-action@861a07ce7084f55488e375df125cdc99bba60eb7 # v2.87.23
+        if: runner.environment == 'github-hosted'
+        uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
         with:
           tool: protoc@3.34.1
 
@@ -51,29 +57,34 @@ jobs:
           rustup show
 
       - name: Install cargo-hack
-        uses: taiki-e/install-action@861a07ce7084f55488e375df125cdc99bba60eb7 # v2.87.23
+        if: runner.environment == 'github-hosted'
+        uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
         with:
           tool: cargo-hack
 
+      - name: Set up the shared build cache
+        id: cache
+        uses: ./.github/actions/ci-cache
+        with:
+          rw-key-id: ${{ secrets.CI_CACHE_RW_KEY_ID }}
+          rw-secret: ${{ secrets.CI_CACHE_RW_SECRET }}
+          trusted: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+          rust: true
+          downloads: |
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          downloads-key: cargo-${{ hashFiles('**/Cargo.lock') }}
+          downloads-restore-keys: cargo-
+
+      # GitHub-hosted runs (fork pull requests, the kill switch) keep the
+      # registry cache; on the self-hosted runners ci-cache covers it.
       - name: Cache Cargo/target
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        if: ${{ steps.cache.outputs.mode == 'none' }}
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           cache-bin: false
           cache-targets: false
           shared-key: nightly-clippy-${{ hashFiles('rust-toolchain.toml') }}
-
-      - name: Install sccache
-        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
-
-      - name: Probe sccache & set RUSTC_WRAPPER
-        shell: bash
-        run: |
-          if sccache --start-server >/dev/null 2>&1; then
-            echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
-            echo "SCCACHE_GHA_ENABLED=true" >> "$GITHUB_ENV"
-          else
-            echo "sccache failed, falling back to plain rustc"
-          fi
 
       - name: cargo clippy (full feature matrix)
         run: make clippy-deep

@@ -16,7 +16,6 @@ arc-swap = { workspace = true }
 futures = { workspace = true }
 tracing = { workspace = true }
 async-trait = { workspace = true }
-aws-lc-rs = { workspace = true }
 axum = { workspace = true }
 base64 = { workspace = true }
 bss-approvals-sdk = { workspace = true }
@@ -27,7 +26,6 @@ serde_json = { workspace = true }
 time = { workspace = true }
 toolkit = { workspace = true }
 toolkit-canonical-errors = { workspace = true }
-toolkit-gts = { workspace = true }
 toolkit-macros = { workspace = true }
 toolkit-odata = { workspace = true }
 toolkit-security = { workspace = true }
@@ -35,7 +33,6 @@ utoipa = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
-http-body-util = { workspace = true }
 proptest = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tokio-util = { workspace = true }

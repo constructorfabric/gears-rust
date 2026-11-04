@@ -1,8 +1,10 @@
 //! Exercise timestamp binding, persisted reload and generation replacement on SQL.
 
 use super::*;
-use crate::producer::types::{MissingProducerRegistration, UnknownProducerRegistration};
+use sea_orm::ActiveValue;
+use toolkit_db::secure::secure_insert;
 
+#[cfg(feature = "outbox")]
 async fn round_trip(url: &str) {
     let db = toolkit_db::connect_db(
         url,
@@ -20,24 +22,28 @@ async fn round_trip(url: &str) {
     .await
     .unwrap();
     let store = ProducerRegistrationStore::new(db.clone());
-    let managed = ManagedDeduplication {
+    let slot = RegistrationSlot {
         key: "timestamp-regression".to_owned(),
-        mode: ProducerMode::Chained,
-        on_missing: MissingProducerRegistration::RegisterNew,
-        on_unknown: UnknownProducerRegistration::Fail,
+        queue: "events".to_owned(),
+        partition: 7,
     };
     let original = store
-        .insert_new(&managed, ProducerId(uuid::Uuid::new_v4()), "regression/1")
+        .insert_new(NewRegistration {
+            slot: &slot,
+            producer_id: ProducerId(uuid::Uuid::new_v4()),
+            mode: ProducerMode::Chained,
+            client_agent: "regression/1",
+        })
         .await
         .unwrap();
-    let loaded = store.load(&managed.key).await.unwrap().unwrap();
+    let loaded = store.load(&slot).await.unwrap().unwrap();
     assert_eq!(loaded.producer_id, original.producer_id);
     let replacement = ProducerId(uuid::Uuid::new_v4());
     store
         .replace_with_new_generation(&loaded, replacement)
         .await
         .unwrap();
-    let loaded = store.load(&managed.key).await.unwrap().unwrap();
+    let loaded = store.load(&slot).await.unwrap().unwrap();
     assert_eq!(loaded.producer_id, replacement);
     assert_eq!(loaded.generation, 2);
     let row = Entity::find()
@@ -50,15 +56,77 @@ async fn round_trip(url: &str) {
     assert!(row.updated_at >= row.created_at);
 }
 
+#[cfg(feature = "outbox")]
 #[tokio::test]
 async fn sqlite_managed_registration_timestamp_round_trip() {
     round_trip("sqlite::memory:").await;
 }
 
+#[cfg(feature = "outbox")]
 #[tokio::test]
 #[ignore = "requires fresh EVENT_SDK_POSTGRES_URL database"]
 async fn postgres_managed_registration_timestamp_round_trip() {
     round_trip(&std::env::var("EVENT_SDK_POSTGRES_URL").unwrap()).await;
+}
+
+/// A replace computed from a generation the slot has since left matches no
+/// row, so it never overwrites the newer id.
+#[cfg(feature = "outbox")]
+#[tokio::test]
+async fn a_stale_replace_does_not_overwrite_a_newer_generation() {
+    let db = toolkit_db::connect_db(
+        "sqlite::memory:",
+        toolkit_db::ConnectOpts {
+            max_conns: Some(1),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    toolkit_db::migration_runner::run_migrations_for_testing(
+        &db,
+        crate::producer_registration_migrations(),
+    )
+    .await
+    .unwrap();
+    let store = ProducerRegistrationStore::new(db);
+    let slot = RegistrationSlot {
+        key: "stale-replace".to_owned(),
+        queue: "events".to_owned(),
+        partition: 4,
+    };
+    let current = store
+        .insert_new(NewRegistration {
+            slot: &slot,
+            producer_id: ProducerId(uuid::Uuid::from_u128(0xA)),
+            mode: ProducerMode::Chained,
+            client_agent: "stale/1",
+        })
+        .await
+        .unwrap();
+    let replaced_b = ProducerRegistration {
+        slot: slot.clone(),
+        producer_id: ProducerId(uuid::Uuid::from_u128(0xB)),
+        mode: ProducerMode::Chained,
+        client_agent: "stale/1".to_owned(),
+        generation: 2,
+    };
+
+    let first = store
+        .replace_with_new_generation(&current, ProducerId(uuid::Uuid::from_u128(0xB)))
+        .await
+        .unwrap();
+    let second = store
+        .replace_with_new_generation(&current, ProducerId(uuid::Uuid::from_u128(0xC)))
+        .await
+        .unwrap();
+
+    assert_eq!(first, Replaced::Done(replaced_b.clone()));
+    assert_eq!(second, Replaced::Lost);
+    assert_eq!(
+        store.load_all("stale-replace").await.unwrap(),
+        vec![replaced_b]
+    );
 }
 
 /// Rows written before the `DateTimeUtc` binding still load on SQLite, where
@@ -89,6 +157,8 @@ async fn sqlite_registration_rows_written_as_legacy_text_still_load() {
         secure_insert::<legacy::Entity>(
             legacy::ActiveModel {
                 registration_key: ActiveValue::Set(key.to_owned()),
+                queue: ActiveValue::Set("events".to_owned()),
+                outbox_partition: ActiveValue::Set(1),
                 producer_id: ActiveValue::Set(uuid::Uuid::new_v4()),
                 mode: ActiveValue::Set("chained".to_owned()),
                 client_agent: ActiveValue::Set("legacy/1".to_owned()),
@@ -106,9 +176,10 @@ async fn sqlite_registration_rows_written_as_legacy_text_still_load() {
     let store = ProducerRegistrationStore::new(db);
     for key in ["legacy-rfc3339", "legacy-sqlite-default"] {
         let loaded = store
-            .load(key)
+            .load_all(key)
             .await
             .unwrap_or_else(|error| panic!("legacy row {key} failed to load: {error}"))
+            .pop()
             .unwrap_or_else(|| panic!("legacy row {key} missing"));
         // Generation and identity survive the binding change unchanged.
         assert_eq!(loaded.generation, 3);
@@ -126,6 +197,10 @@ mod legacy {
     pub struct Model {
         #[sea_orm(primary_key, auto_increment = false)]
         pub registration_key: String,
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub queue: String,
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub outbox_partition: i64,
         pub producer_id: uuid::Uuid,
         pub mode: String,
         pub client_agent: String,

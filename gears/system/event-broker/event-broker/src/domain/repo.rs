@@ -4,9 +4,9 @@
 //! Signatures only - no implementation (backed by `infra::storage::Storage`
 //! for persisted entities, `domain::cluster` for ephemeral cache-backed ones
 //! per the Domain Model's persisted-vs-ephemeral split). Topics and events
-//! have no repo contract here (eb-single-process-implementation D1/D3):
-//! topics go through `SpecificationManager` exclusively, and events go
-//! straight to the resolved `event_broker_sdk::EventBrokerBackend`
+//! have no repo contract here: topics go through `SpecificationManager`
+//! exclusively, and events go
+//! straight to the resolved `event_broker_sdk::backend::Backend`
 //! (`domain::backend::BackendResolver`) - no repo-level indirection for
 //! either.
 //!

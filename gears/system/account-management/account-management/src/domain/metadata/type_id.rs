@@ -61,7 +61,9 @@ impl ParsedTypeId {
     /// specific failure mode (malformed GTS, wrong root segment,
     /// missing chained segment, instance-id shape).
     pub(crate) fn parse(s: &str) -> Result<Self, DomainError> {
-        let parsed = GtsId::try_new(s).map_err(|err| DomainError::MetadataValidation {
+        // `gts-id` validates identifiers as spelled; AM accepts surrounding
+        // whitespace on the wire and stores the trimmed form.
+        let parsed = GtsId::try_new(s.trim()).map_err(|err| DomainError::MetadataValidation {
             detail: format!("malformed metadata schema id: {err}"),
         })?;
 
@@ -108,9 +110,8 @@ impl ParsedTypeId {
         // imports the `gts` crate.
         let uuid = parsed.to_uuid();
 
-        // Use parsed.as_ref(), not the original `s`: GtsId::try_new trims
-        // whitespace; storing the trimmed form keeps schema_uuid
-        // consistent with reverse-hydration.
+        // Use parsed.as_ref(), not the original `s`: storing the trimmed
+        // form keeps schema_uuid consistent with reverse-hydration.
         Ok(Self {
             raw: GtsTypeId::new(parsed.as_ref()),
             uuid,

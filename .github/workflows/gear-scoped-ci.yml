@@ -37,7 +37,7 @@ env:
 jobs:
   detect:
     name: Detect gear scope
-    runs-on: ubuntu-latest
+    runs-on: ${{ (vars.GEARS_FORCE_GITHUB_HOSTED == 'true' || github.repository != 'constructorfabric/gears-rust' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && 'ubuntu-latest' || 'gears-small' }}
     outputs:
       scoped: ${{ steps.scope.outputs.scoped }}
       gear: ${{ steps.scope.outputs.gear }}
@@ -196,11 +196,12 @@ jobs:
     name: Scoped CI (${{ needs.detect.outputs.scope_path }})
     needs: detect
     if: needs.detect.outputs.scoped == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ${{ (vars.GEARS_FORCE_GITHUB_HOSTED == 'true' || github.repository != 'constructorfabric/gears-rust' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && 'ubuntu-latest' || 'gears-large' }}
     env:
       RUSTFLAGS: "-C debuginfo=0"
     steps:
       - name: Free disk space
+        if: runner.environment == 'github-hosted'
         uses: jlumbroso/free-disk-space@ceedf095f4ec1a097402bc6bd80831f2e1a6fde6 # v2.0.0
         with:
           tool-cache: false
@@ -216,6 +217,7 @@ jobs:
           submodules: recursive
 
       - name: Install protoc
+        if: runner.environment == 'github-hosted'
         uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
@@ -232,25 +234,29 @@ jobs:
           rustup show
 
       - name: Install cargo tools
-        uses: taiki-e/install-action@861a07ce7084f55488e375df125cdc99bba60eb7 # v2.87.23
+        if: runner.environment == 'github-hosted'
+        uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
         with:
           tool: cargo-hack, nextest, cargo-llvm-cov
 
-      - name: Install sccache
-        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+      # This workflow never runs on a push to main, so it only reads the
+      # shared build cache.
+      - name: Set up the shared build cache
+        id: cache
+        uses: ./.github/actions/ci-cache
+        with:
+          rust: true
+          downloads: |
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          downloads-key: cargo-${{ hashFiles('**/Cargo.lock') }}
+          downloads-restore-keys: cargo-
 
-      - name: Probe sccache & set RUSTC_WRAPPER
-        shell: bash
-        run: |
-          if sccache --start-server >/dev/null 2>&1; then
-            echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
-            echo "SCCACHE_GHA_ENABLED=true" >> "$GITHUB_ENV"
-          else
-            echo "sccache failed, falling back to plain rustc"
-          fi
-
+      # GitHub-hosted runs (fork pull requests, the kill switch) keep the
+      # registry cache; on the self-hosted runners ci-cache covers it.
       - name: Cache Cargo/target
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        if: ${{ steps.cache.outputs.mode == 'none' }}
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           cache-bin: false
           cache-targets: false
@@ -266,7 +272,7 @@ jobs:
     name: Full CI required
     needs: detect
     if: needs.detect.outputs.scoped != 'true'
-    runs-on: ubuntu-latest
+    runs-on: ${{ (vars.GEARS_FORCE_GITHUB_HOSTED == 'true' || github.repository != 'constructorfabric/gears-rust' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && 'ubuntu-latest' || 'gears-small' }}
     steps:
       - name: Report non-scoped changes
         run: echo "Changes are not limited to exactly one supported gear or library scope. Full CI should run without GEAR=..." >> "$GITHUB_STEP_SUMMARY"

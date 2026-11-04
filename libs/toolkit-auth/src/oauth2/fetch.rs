@@ -5,7 +5,7 @@
 //! their own cache (e.g. an auth plugin with a TTL-based token cache).
 //!
 //! For long-lived service singletons that benefit from automatic background
-//! refresh, use [`Token`](super::Token) instead.
+//! refresh, use [`TokenProvider`](super::TokenProvider) instead.
 
 use std::fmt;
 use std::time::Duration;
@@ -50,26 +50,11 @@ impl fmt::Debug for FetchedToken {
 /// # Errors
 ///
 /// Returns [`TokenError::ConfigError`] if the configuration is invalid.
-/// Returns [`TokenError::Http`] if the token (or discovery) request fails.
+/// Returns [`TokenError::Http`] or [`TokenError::HttpStatus`] if the token (or discovery) request fails.
 /// Returns [`TokenError::UnsupportedTokenType`] if the server returns a
 /// non-Bearer token type.
-pub async fn fetch_token(mut config: OAuthClientConfig) -> Result<FetchedToken, TokenError> {
+pub async fn fetch_token(config: OAuthClientConfig) -> Result<FetchedToken, TokenError> {
     config.validate()?;
-
-    // Resolve issuer_url → token_endpoint via OIDC discovery (one-time).
-    if let Some(issuer_url) = config.issuer_url.take() {
-        let http_config = config
-            .http_config
-            .clone()
-            .unwrap_or_else(toolkit_http::HttpClientConfig::token_endpoint);
-        let client = toolkit_http::HttpClientBuilder::with_config(http_config)
-            .build()
-            .map_err(|e| {
-                TokenError::Http(crate::http_error::format_http_error(&e, "OIDC discovery"))
-            })?;
-        let resolved = super::discovery::discover_token_endpoint(&client, &issuer_url).await?;
-        config.token_endpoint = Some(resolved);
-    }
 
     let mut source = OAuthTokenSource::new(&config)?;
     let token = source.request_token().await?;
@@ -83,6 +68,7 @@ pub async fn fetch_token(mut config: OAuthClientConfig) -> Result<FetchedToken, 
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
+    use super::super::error::HttpOperation;
     use super::*;
     use httpmock::prelude::*;
     use url::Url;
@@ -170,6 +156,7 @@ mod tests {
         assert_eq!(fetched.expires_in, Duration::from_mins(30));
     }
 
+    /// One-shot acquisition propagates discovery failures.
     #[tokio::test]
     async fn discovery_failure_returns_error() {
         let server = MockServer::start();
@@ -191,14 +178,14 @@ mod tests {
         assert!(
             matches!(
                 err,
-                TokenError::Http(ref msg) if msg.contains("OIDC discovery") && msg.contains("500")
+                TokenError::HttpStatus { operation: HttpOperation::Discovery, .. } if err.status() == Some(http::StatusCode::INTERNAL_SERVER_ERROR)
             ),
             "expected Http error with OIDC discovery prefix, got: {err}"
         );
     }
 
     // -----------------------------------------------------------------------
-    // Token fetch
+    // TokenProvider fetch
     // -----------------------------------------------------------------------
 
     #[tokio::test]
@@ -249,6 +236,7 @@ mod tests {
         assert_eq!(fetched.expires_in, Duration::ZERO);
     }
 
+    /// One-shot acquisition exposes the token endpoint response status.
     #[tokio::test]
     async fn http_error_returns_token_error() {
         let server = MockServer::start();
@@ -262,7 +250,7 @@ mod tests {
         assert!(
             matches!(
                 err,
-                TokenError::Http(ref msg) if msg.contains("OAuth2 token") && msg.contains("500")
+                TokenError::HttpStatus { operation: HttpOperation::TokenRequest, .. } if err.status() == Some(http::StatusCode::INTERNAL_SERVER_ERROR)
             ),
             "expected Http error, got: {err}"
         );

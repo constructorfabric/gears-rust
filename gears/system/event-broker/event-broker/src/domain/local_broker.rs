@@ -32,7 +32,7 @@ use event_broker_sdk as sdk;
 use sdk::EventBrokerError;
 use sdk::api::{
     AssignedPartition, ControlCode, EventBrokerApi, FrameStream, IngestOutcome, JoinRequest,
-    PartitionCursor, PartitionPosition, ProducerCursors, ProducerMode, SeekPosition, SeekResult,
+    PartitionPosition, ProducerCursors, ProducerMode, SeekPosition, SeekResult,
     SubscriptionAssignment, SubscriptionInterest, TopicCursors, WireEvent, WireFrame,
 };
 use sdk::ids::{ConsumerGroupId, ProducerId, SubscriptionId};
@@ -50,8 +50,8 @@ use crate::domain::delivery::{
 use crate::domain::error::DomainError;
 use crate::domain::id_parse::{parse_consumer_group_id, parse_topic_id, parse_type_id};
 use crate::domain::ingest::{
-    IngestService, ProducerCursors as DomainProducerCursors, ProducerMode as DomainProducerMode,
-    ProducerPartitionCursor, ProducerRegistrationInput, ProducerResetScope, ProducerTopicCursors,
+    BatchAck, IngestService, ProducerCursors as DomainProducerCursors,
+    ProducerMode as DomainProducerMode, ProducerRegistrationInput, ProducerTopicCursors,
     PublishAck, PublishRequest,
 };
 use crate::domain::model::{
@@ -60,6 +60,7 @@ use crate::domain::model::{
     FilterSpec, Interest, Meta, Subscription as DomainSubscription,
     TenantTraversalDepth as DomainDepth, Topic as DomainTopic, TopicSegmentManifest,
 };
+use crate::domain::producer_reset::ProducerResetScope;
 use crate::domain::streaming::frames::{
     ControlCode as DomainControlCode, Frame, Position as DomainPosition,
 };
@@ -232,18 +233,12 @@ impl From<CreateConsumerGroupRequest> for ConsumerGroupCreateInput {
     }
 }
 
-/// SDK reset scope -> domain reset scope. The domain scope is either "all" or
-/// one `(topic, partition)`, so a topic-only reset collapses to "all" - the
-/// same collapse the server makes (`ingest::dto`'s `From<ResetProducerRequest>`:
-/// only `(Some topic, Some partition)` is `TopicPartition`, every other shape is
-/// `All`). Neither path can reset a single whole topic.
 impl From<ResetScope<'_>> for ProducerResetScope {
     fn from(scope: ResetScope<'_>) -> Self {
         match scope {
-            ResetScope::AllTopics | ResetScope::Topic(_) => ProducerResetScope::All,
-            ResetScope::Partition { topic, partition } => ProducerResetScope::TopicPartition {
+            ResetScope::AllTopics => ProducerResetScope::All,
+            ResetScope::Topic(topic) => ProducerResetScope::Topic {
                 topic: topic.to_owned(),
-                partition: i32::try_from(partition).unwrap_or_default(),
             },
         }
     }
@@ -262,11 +257,13 @@ impl From<PublishAck> for IngestOutcome {
     }
 }
 
-impl From<ProducerPartitionCursor> for PartitionCursor {
-    fn from(cursor: ProducerPartitionCursor) -> Self {
-        PartitionCursor {
-            partition: u32::try_from(cursor.partition).unwrap_or_default(),
-            last_sequence: cursor.last_sequence,
+/// An all-duplicate batch stored nothing new, so it answers `Duplicate` the
+/// way REST answers `200`.
+impl From<BatchAck> for IngestOutcome {
+    fn from(ack: BatchAck) -> Self {
+        match ack {
+            BatchAck::Accepted => IngestOutcome::Accepted,
+            BatchAck::Duplicate => IngestOutcome::Duplicate,
         }
     }
 }
@@ -275,7 +272,7 @@ impl From<ProducerTopicCursors> for TopicCursors {
     fn from(cursors: ProducerTopicCursors) -> Self {
         TopicCursors {
             topic: cursors.topic,
-            partitions: cursors.partitions.into_iter().map(Into::into).collect(),
+            last_sequence: cursors.last_sequence,
         }
     }
 }
@@ -537,14 +534,12 @@ impl EventBrokerApi for LocalBroker {
             .iter()
             .map(PublishRequest::try_from)
             .collect::<Result<Vec<_>, _>>()?;
-        // All-or-nothing: any rejection is a `DomainError` for the whole batch;
-        // the per-event `BatchResult` is not surfaced on success (matching the
-        // REST contract), so an `Ok` is one `Accepted`.
-        self.ingest
+        let ack = self
+            .ingest
             .publish_batch(ctx, requests)
             .await
             .map_err(to_sdk_err)?;
-        Ok(IngestOutcome::Accepted)
+        Ok(ack.into())
     }
 
     async fn get_producer_cursors(
@@ -740,7 +735,9 @@ impl EventBrokerApi for LocalBroker {
         // is a REST-side window this in-process path does not apply.
         let topic = parse_topic_id(topic).map_err(to_sdk_err)?;
         self.ingest
-            .list_topic_segments(ctx, &topic, i32::try_from(partition).unwrap_or_default())
+            // Past `i32::MAX` is past every topic's partition count, so it is
+            // rejected as such rather than wrapped onto a real partition.
+            .list_topic_segments(ctx, &topic, i32::try_from(partition).unwrap_or(i32::MAX))
             .await
             .map(TopicSegment::from)
             .map_err(to_sdk_err)

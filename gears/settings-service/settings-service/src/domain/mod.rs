@@ -1,4 +1,3 @@
-// Created: 2026-08-12 by Virtuozzo International GmbH
 //! Domain layer.
 
 pub mod access;

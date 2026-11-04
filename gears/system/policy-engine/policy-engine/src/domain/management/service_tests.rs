@@ -8,7 +8,6 @@ use policy_engine_sdk::management::{
     self as sdk, BundlePatch, DocumentSpec, LimitKind, ManagementError, NewBundle, VersionContent,
     finding, limits,
 };
-use toolkit_db::secure::AccessScope;
 use toolkit_odata::ODataQuery;
 use uuid::Uuid;
 
@@ -19,8 +18,14 @@ use crate::domain::management::test_support::governance::{
 };
 use crate::domain::management::test_support::{FakePdp, PdpMode};
 use crate::domain::model::{BundleId, VersionId, VersionState};
-use crate::domain::repos::VersionRepository;
-use crate::infra::storage::content_repo::OrmVersionRepository;
+
+/// The findings a `VALIDATION_FAILED` error carries.
+fn findings_of(err: ManagementError) -> Vec<sdk::ValidationFinding> {
+    match err {
+        ManagementError::ValidationFailed { findings } => findings,
+        other => panic!("expected VALIDATION_FAILED, got {other:?}"),
+    }
+}
 
 fn content(documents: Vec<DocumentSpec>) -> VersionContent {
     VersionContent { documents }
@@ -34,16 +39,6 @@ fn syntax_error(name: &str) -> DocumentSpec {
 }
 
 impl Harness {
-    async fn stored_state(&self, id: VersionId) -> VersionState {
-        let conn = self.db.conn().unwrap();
-        OrmVersionRepository
-            .get_with_content(&conn, &AccessScope::allow_all(), id)
-            .await
-            .unwrap()
-            .expect("version exists")
-            .state
-    }
-
     /// A draft of `bundle` (Alice's) with valid documents `names`.
     async fn draft_with(&self, bundle: &sdk::Bundle, names: &[&str]) -> sdk::BundleVersion {
         let draft = self
@@ -106,18 +101,17 @@ async fn lifecycle_create_draft_validate_activate_seed_supersede() {
         )
         .await
         .unwrap();
-    let report = h
+    let invalid = h
         .service
         .validate_version(&a, bundle.id, v1.id)
         .await
-        .unwrap();
-    assert!(!report.is_valid());
-    assert!(report.findings.iter().any(|f| {
+        .unwrap_err();
+    let findings = findings_of(invalid.clone());
+    assert!(findings.iter().any(|f| {
         f.document_name.as_deref() == Some("broken") && f.code == finding::SYNTAX_ERROR
     }));
     assert!(
-        report
-            .findings
+        findings
             .iter()
             .all(|f| f.document_name.as_deref() != Some("deny_delete"))
     );
@@ -128,6 +122,7 @@ async fn lifecycle_create_draft_validate_activate_seed_supersede() {
         .unwrap_err();
     assert_eq!(err.category().http_status(), 400);
     assert_eq!(reason_of(&err).as_deref(), Some("VALIDATION_FAILED"));
+    assert_eq!(err, invalid, "validation answers what activation would");
     assert_eq!(h.stored_state(v1.id).await, VersionState::Draft);
 
     // Valid content activates; the bundle points at it.
@@ -141,13 +136,10 @@ async fn lifecycle_create_draft_validate_activate_seed_supersede() {
         valid
     );
     assert_eq!(valid.documents[0].spec, spec("deny_delete"));
-    assert!(
-        h.service
-            .validate_version(&a, bundle.id, v1.id)
-            .await
-            .unwrap()
-            .is_valid()
-    );
+    h.service
+        .validate_version(&a, bundle.id, v1.id)
+        .await
+        .unwrap();
     let active = h
         .service
         .activate_version(&a, bundle.id, v1.id)
@@ -366,13 +358,13 @@ async fn concrete_resource_types_must_exist_and_patterns_must_parse() {
         .await
         .unwrap();
 
-    let report = h
-        .service
-        .validate_version(&a, bundle.id, draft.id)
-        .await
-        .unwrap();
-    let codes: Vec<(&str, &str)> = report
-        .findings
+    let findings = findings_of(
+        h.service
+            .validate_version(&a, bundle.id, draft.id)
+            .await
+            .unwrap_err(),
+    );
+    let codes: Vec<(&str, &str)> = findings
         .iter()
         .map(|f| (f.document_name.as_deref().unwrap(), f.code.as_str()))
         .collect();
@@ -500,6 +492,83 @@ async fn bundles_update_and_names_stay_unique_per_tenant() {
         .await
         .unwrap();
     assert_eq!(page.items.len(), 2);
+}
+
+#[tokio::test]
+async fn a_bundle_is_found_by_its_name() {
+    let h = harness().await;
+    let a = alice();
+    let wanted = h
+        .service
+        .create_bundle(&a, NewBundle::new("baseline"))
+        .await
+        .unwrap();
+    h.service
+        .create_bundle(&a, NewBundle::new("baseline-strict"))
+        .await
+        .unwrap();
+    // Bob's namesake is outside Alice's scope.
+    h.service
+        .create_bundle(&bob(), NewBundle::new("baseline"))
+        .await
+        .unwrap();
+
+    let by_name = ODataQuery::default().with_filter(
+        toolkit_odata::parse_filter_string("name eq 'baseline'")
+            .unwrap()
+            .into_expr(),
+    );
+    let page = h.service.list_bundles(&a, &by_name).await.unwrap();
+    assert_eq!(page.items, vec![wanted]);
+}
+
+#[tokio::test]
+async fn a_name_and_an_owning_tenant_name_exactly_one_bundle() {
+    // A grant over two tenants, each with a bundle of the same name.
+    let h = harness_with(FakePdp::new(PdpMode::Administers(vec![TENANT_A, TENANT_B]))).await;
+    let in_a = h
+        .service
+        .create_bundle(&alice(), NewBundle::new("baseline"))
+        .await
+        .unwrap();
+    let in_b = h
+        .service
+        .create_bundle(&bob(), NewBundle::new("baseline"))
+        .await
+        .unwrap();
+    let query = |filter: String| {
+        ODataQuery::default().with_filter(
+            toolkit_odata::parse_filter_string(&filter)
+                .unwrap()
+                .into_expr(),
+        )
+    };
+
+    let mut both: Vec<_> = h
+        .service
+        .list_bundles(&alice(), &query("name eq 'baseline'".to_owned()))
+        .await
+        .unwrap()
+        .items
+        .into_iter()
+        .map(|b| b.id)
+        .collect();
+    both.sort_by_key(|id| id.0);
+    let mut expected = vec![in_a.id, in_b.id];
+    expected.sort_by_key(|id| id.0);
+    assert_eq!(both, expected, "one namesake per tenant");
+
+    let one = h
+        .service
+        .list_bundles(
+            &alice(),
+            &query(format!(
+                "name eq 'baseline' and owner_tenant_id eq {TENANT_B}"
+            )),
+        )
+        .await
+        .unwrap();
+    assert_eq!(one.items, vec![in_b]);
 }
 
 // ---------------------------------------------------------------------------

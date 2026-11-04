@@ -286,7 +286,7 @@ with `Send` bounds before stabilisation) must be replaced with stable alternativ
 ### 3.1 Domain Model
 
 **Technology**: Rust structs and traits
-**Location**: [`serverless-runtime-sdk/src/`](../src/)
+**Location**: `serverless-runtime-sdk/src/`
 
 #### InvocationRecord → Context Field Mapping
 
@@ -938,6 +938,6 @@ in these areas is deliberate, not an omission.
 ## 6. Traceability
 
 - **PRD**: [PRD.md](./PRD.md)
-- **Source**: [serverless-runtime-sdk/src/](../src/)
+- **Source**: `serverless-runtime-sdk/src/`
 - **Serverless Runtime DESIGN**: [gears/serverless-runtime/docs/DESIGN.md](../../docs/DESIGN.md)
 - **Serverless Runtime Rust Types**: [gears/serverless-runtime/docs/DESIGN_RUST_TYPES.md](../../docs/DESIGN_RUST_TYPES.md)

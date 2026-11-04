@@ -11,6 +11,7 @@ import uuid
 from datetime import datetime, timezone
 
 import httpx
+import pytest
 
 from .conftest import (
     ALL_EVENT_TYPES_PATTERN,
@@ -21,6 +22,7 @@ from .conftest import (
 )
 
 
+@pytest.mark.backend_sensitive
 async def test_publish_then_consume_happy_path(api, test_env):
     """scenario: consumer/stream/1.09-positive-sse-event-stream.md"""
     async with api() as client:
@@ -126,6 +128,7 @@ async def test_publish_then_consume_happy_path(api, test_env):
             }
 
 
+@pytest.mark.backend_sensitive
 async def test_wildcard_interest_delivers_every_event_type(api, test_env):
     """scenario: consumer/stream/1.15-positive-wildcard-event-type-stream.md
 

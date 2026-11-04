@@ -61,13 +61,14 @@ There is no consumer archetype that genuinely lacks a durable store. A broker-ma
 ```
 POST /v1/subscriptions/{id}:seek
 {
-  "partition_positions": {
-    "<topic>:<partition>": "at:2026-06-14T10:00:00Z"
+  "topology_version": 3,
+  "positions": {
+    "<topic>": [{ "partition": 0, "value": "at:2026-06-14T10:00:00Z" }]
   }
 }
 ```
 
-The broker resolves the timestamp to the offset of the first event whose `occurred_at ≥ timestamp` and sets the cursor in one step. The response returns the resolved integer offset per partition, which the consumer may persist for future re-seeks. No separate endpoint is introduced.
+The broker resolves the timestamp to the offset of the first event whose `sequence_time ≥ timestamp` - when the broker stored it, never the producer's `occurred_at`, which is untrusted and unordered within a partition - and sets the cursor in one step. The response returns the resolved integer offset per partition, which the consumer may persist for future re-seeks. No separate endpoint is introduced.
 
 ### Consequences
 
@@ -78,7 +79,7 @@ The broker resolves the timestamp to the offset of the first event whose `occurr
 - `acknowledge()` method from `DeliveryService`
 
 **Added:**
-- `"at:<ISO-8601>"` sentinel on `POST /v1/subscriptions/{id}:seek` — resolves to the offset of the first event whose `occurred_at ≥ timestamp`. Boundary behaviour:
+- `"at:<ISO-8601>"` sentinel on `POST /v1/subscriptions/{id}:seek` — resolves to the offset of the first event whose `sequence_time ≥ timestamp` (storage time, never `occurred_at`). Boundary behaviour:
   - `timestamp` before retention floor → retention floor offset (first available event)
   - `timestamp` beyond current HWM → HWM (consumer streams only future events, equivalent to `"latest"`)
   - Response returns the resolved integer offset per partition; consumer may persist it for future re-seeks

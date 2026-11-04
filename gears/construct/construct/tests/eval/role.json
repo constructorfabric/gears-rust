@@ -1,0 +1,95 @@
+[
+  {
+    "name": "a-stated-job-is-added-as-the-role",
+    "profile": [],
+    "record": { "user_says": "I work as a nurse." },
+    "expect": { "role": "add" }
+  },
+  {
+    "name": "a-career-switch-replaces-the-role",
+    "profile": [{ "property": "role", "value": "nurse" }],
+    "record": { "user_says": "I switched careers and I'm a data analyst now." },
+    "expect": { "role": "replace" },
+    "gone": [{ "property": "role", "value": "nurse" }]
+  },
+  {
+    "name": "a-past-job-goes-to-the-work-history",
+    "profile": [],
+    "record": { "user_says": "I was a teaching assistant at Ghent University from 2018 to 2021." },
+    "expect": { "work_history": "add" }
+  },
+  {
+    "name": "leaving-an-employer-ends-the-current-affiliation",
+    "profile": [{ "property": "current_affiliation", "value": "Ghent University" }],
+    "record": { "user_says": "I left Ghent University in 2023, I no longer work there." },
+    "expect": { "current_affiliation": "remove", "affiliation_history": "add" },
+    "gone": [{ "property": "current_affiliation", "value": "Ghent University" }]
+  },
+  {
+    "name": "an-employer-is-the-current-affiliation",
+    "profile": [],
+    "record": { "user_says": "I work at the Fraunhofer Institute for Solar Energy Systems." },
+    "expect": { "current_affiliation": "add" }
+  },
+  {
+    "name": "a-field-of-study-is-the-major",
+    "profile": [{ "property": "role", "value": "student" }],
+    "record": { "user_says": "I study mechanical engineering." },
+    "expect": { "major": "add" }
+  },
+  {
+    "name": "a-corrected-major-replaces-the-old-one",
+    "profile": [
+      { "property": "role", "value": "student" },
+      { "property": "major", "value": "mechanical engineering" }
+    ],
+    "record": { "user_says": "Correction: my major is mechatronics, not mechanical engineering." },
+    "expect": { "major": "replace" },
+    "gone": [{ "property": "major", "value": "mechanical engineering" }]
+  },
+  {
+    "name": "high-school-is-the-k12-level",
+    "profile": [{ "property": "role", "value": "student" }],
+    "record": { "user_says": "I'm still in high school." },
+    "expect": { "education_level": "add" },
+    "holds": [{ "property": "education_level", "value": "k12" }]
+  },
+  {
+    "name": "a-board-seat-is-a-board-membership",
+    "profile": [],
+    "record": { "user_says": "I've been on the board of the Lisbon Rowing Club since 2019." },
+    "expect": { "board_memberships": "add" }
+  },
+  {
+    "name": "a-society-is-a-group-membership",
+    "profile": [],
+    "record": { "user_says": "I'm a member of our university's robotics society." },
+    "expect": { "group_memberships": "add" }
+  },
+  {
+    "name": "a-corrected-role-replaces-the-old-one",
+    "profile": [{ "property": "role", "value": "teacher" }],
+    "record": { "user_says": "Sorry, I'm not a teacher, I'm a school librarian." },
+    "expect": { "role": "replace" },
+    "gone": [{ "property": "role", "value": "teacher" }]
+  },
+  {
+    "name": "a-group-left-is-removed",
+    "profile": [{ "property": "group_memberships", "value": "Chess Club" }],
+    "record": { "user_says": "I'm not part of the Chess Club anymore." },
+    "expect": { "group_memberships": "remove" },
+    "gone": [{ "property": "group_memberships", "value": "Chess Club" }]
+  },
+  {
+    "name": "a-past-job-with-its-years-goes-to-the-work-history",
+    "profile": [],
+    "record": { "user_says": "From 2015 to 2018 I worked as a nurse at St. Mary's Hospital." },
+    "expect": { "work_history": "add" }
+  },
+  {
+    "name": "an-instructor-is-added",
+    "profile": [],
+    "record": { "user_says": "My instructor for this course is Dr. Kim." },
+    "expect": { "instructor": "add" }
+  }
+]

@@ -3,7 +3,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use gts::{GtsInstanceId, GtsTypeId};
+use gts::{CompilePayloadValidatorError, GtsInstanceId, GtsTypeId};
 use quota_enforcement_sdk::{
     METRIC_BASE_TYPE, REQUEST_BASE, SCOPE_TYPE, SCOPE_USER, SUBJECT_BASE, owned_definitions,
 };
@@ -28,15 +28,6 @@ fn type_id(raw: &str) -> GtsTypeId {
     GtsTypeId::try_new(raw).expect("type id")
 }
 
-/// True when any `$ref` remains anywhere in `value`.
-fn has_ref(value: &Value) -> bool {
-    match value {
-        Value::Object(map) => map.contains_key("$ref") || map.values().any(has_ref),
-        Value::Array(items) => items.iter().any(has_ref),
-        _ => false,
-    }
-}
-
 #[tokio::test]
 async fn a_derived_contract_resolves_with_its_traits_dialect_and_inlined_parent() {
     let registry = adapter(mock_registry(&llm_gateway_documents(), &[]));
@@ -49,13 +40,8 @@ async fn a_derived_contract_resolves_with_its_traits_dialect_and_inlined_parent(
     assert_eq!(user.ancestors, vec![type_id(SUBJECT_BASE)]);
     assert!(user.derives_from(SUBJECT_BASE));
     assert_eq!(user.effective_traits["scope"], SCOPE_USER);
-    assert_eq!(user.schema["$schema"], crate::test_support::DRAFT7);
-    assert!(user.schema["$id"].is_string(), "the id is kept");
-    assert!(
-        !has_ref(&user.schema),
-        "the parent is inlined: {}",
-        user.schema
-    );
+    let payload = user.payload.as_ref().expect("the projection compiles");
+    assert_eq!(payload.type_id(), &type_id(LLM_USER_PROJECTION));
 
     let base = registry
         .type_schema(&type_id(SUBJECT_BASE))
@@ -64,6 +50,35 @@ async fn a_derived_contract_resolves_with_its_traits_dialect_and_inlined_parent(
         .expect("the base is registered");
     assert!(base.is_abstract);
     assert!(base.ancestors.is_empty());
+    assert!(
+        matches!(base.payload, Err(CompilePayloadValidatorError::Abstract(_))),
+        "an abstract type has no payload validator"
+    );
+}
+
+#[tokio::test]
+async fn scope_reference_syntax_and_prefix_are_enforced() {
+    for scope in ["not-an-id", METRIC_TOKENS] {
+        let mut documents = llm_gateway_documents();
+        let projection = documents
+            .iter_mut()
+            .find(|doc| doc["$id"] == format!("gts://{LLM_USER_PROJECTION}"))
+            .expect("user projection");
+        projection["x-gts-traits"]["scope"] = json!(scope);
+        let registry = adapter(mock_registry(&documents, &[]));
+
+        let err = registry
+            .type_schema(&type_id(LLM_USER_PROJECTION))
+            .await
+            .expect_err("the scope must match its x-gts-instance-ref constraint");
+        match err {
+            DomainError::TypesRegistryUnavailable(reason) => {
+                assert!(reason.contains("trait"), "{scope}: {reason}");
+                assert!(reason.contains("scope"), "{scope}: {reason}");
+            }
+            other => panic!("expected drift for {scope}, got {other:?}"),
+        }
+    }
 }
 
 #[tokio::test]
@@ -75,12 +90,11 @@ async fn local_and_mixin_references_are_resolved_transitively() {
         .await
         .expect("registry answers")
         .expect("registered");
-    assert!(!has_ref(&contract.schema), "{}", contract.schema);
     assert_eq!(contract.effective_traits["metric"], METRIC_TOKENS);
 
-    let validator = jsonschema::options()
-        .with_draft(jsonschema::Draft::Draft7)
-        .build(&contract.schema)
+    let validator = contract
+        .payload
+        .as_ref()
         .expect("the resolved contract compiles");
     let good = json!({ "type": MIXIN_REQUEST, "metadata": { "region": "eu", "when": "2026-09-08T10:00:00Z" } });
     assert!(validator.is_valid(&good));

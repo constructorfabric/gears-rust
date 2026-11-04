@@ -1,4 +1,3 @@
-// Created: 2026-09-08 by Virtuozzo International GmbH
 //! Administrative authoring of declarations: create, revive, edit metadata,
 //! retire.
 //!
@@ -8,9 +7,12 @@
 //! or a classification and every lifecycle change demand credential step-up,
 //! and a gear's contributed declarations are not admin-editable at all.
 
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use toolkit_macros::domain_model;
 
+use futures_util::StreamExt as _;
 use secrecy::ExposeSecret;
 use serde_json::{Map, Value};
 use settings_service_sdk::{SettingKey, SettingKeyError};
@@ -18,21 +20,25 @@ use toolkit_db::secure::DBRunner;
 use toolkit_security::AccessScope;
 use uuid::Uuid;
 
-use crate::audit::{AuditOperation, AuditRecord, AuditSink, AuditValue};
+use crate::audit::{ActorTenant, AuditOperation, AuditRecord, AuditSink, AuditValue};
 use crate::domain::category::repo::CategoryRepository;
 use crate::domain::category::visibility;
 use crate::domain::contribution::SettingTypeRegistrar;
 use crate::domain::declaration::{
-    Declaration, DeclarationDraft, DeclarationMetadata, DeclarationRepository,
+    DataClassification, Declaration, DeclarationDraft, DeclarationMetadata, DeclarationRepository,
+    DeclarationStatus,
 };
 use crate::domain::error::DomainError;
+use crate::domain::ports::{SecretManager, StepUpOperation, WriteMetrics};
 use crate::domain::precondition::{self, ETag};
 use crate::domain::resolution::EffectiveCache;
+use crate::domain::secrets::pending::PendingSecretRepository;
 use crate::domain::stepup::{StepUpRefusal, StepUpVerifier};
 use crate::domain::validation::{TraitSet, TypeValidator};
 use crate::domain::value::{StoredValue, ValueDraft, ValueRepository};
 use crate::domain::writes::WriteActor;
 use crate::field;
+use crate::log_text::LogSafe;
 
 /// Conflict reasons this path raises; the text a `409` carries starts with one.
 pub mod conflict {
@@ -50,6 +56,51 @@ pub mod conflict {
     /// A revive names another value type; the setting's own GTS type stays
     /// registered with the one it was declared with.
     pub const VALUE_TYPE_CHANGED: &str = "value_type_changed";
+    /// A purge removes only a retired declaration; it never retires one.
+    pub const NOT_RETIRED: &str = "declaration_not_retired";
+}
+
+/// How many Credential Store releases a purge has in flight at once.
+const RELEASE_CONCURRENCY: usize = 4;
+
+/// A Credential Store entry a purged declaration held: what the release asks
+/// the Secret Manager to delete.
+#[domain_model]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeldSecret {
+    /// The tenant the entry was stored for.
+    pub tenant: Uuid,
+    /// The reference of the entry; never logged.
+    pub secret_ref: String,
+}
+
+/// What a committed purge hands on: the key it freed and the entries to release.
+#[domain_model]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PurgedDeclaration {
+    /// The id of the declaration that is gone.
+    pub id: Uuid,
+    /// The key of the declaration that is gone.
+    pub key: String,
+    /// Every entry its values and staged secrets held, each reference once,
+    /// less those another declaration still holds.
+    pub secrets: Vec<HeldSecret>,
+    /// The references left out because a value or staged row of another
+    /// declaration still names them: an evolution copies a retired
+    /// predecessor's references into its successor. Checked again after the
+    /// commit ([`DeclarationAdmin::reclaim_kept`]): the other declaration may
+    /// have been purged meanwhile, and then nobody else would release them.
+    pub kept_secrets: Vec<HeldSecret>,
+}
+
+/// How a release ended.
+#[domain_model]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReleaseSummary {
+    /// Entries the store released, or already did not hold.
+    pub released: usize,
+    /// Entries the store refused; left to an operator's reconcile.
+    pub failed: usize,
 }
 
 /// What an administrator supplies to declare a setting.
@@ -85,12 +136,146 @@ pub struct Created {
     pub retired: Option<String>,
 }
 
+/// What the create's first phase found: the composed key, the normalised
+/// display name and the declarations at the key and on its path.
+#[domain_model]
+#[derive(Debug, Clone)]
+struct Located {
+    key: SettingKey,
+    display_name: Option<String>,
+    existing: Option<Declaration>,
+    on_path: Vec<Declaration>,
+}
+
+impl Located {
+    /// The active declaration on the version-stripped path, whatever its major.
+    fn active(&self) -> Option<&Declaration> {
+        self.on_path.iter().find(|d| d.status.is_active())
+    }
+
+    /// The retired declaration a create here would revive: the one at the
+    /// composed key, when nothing active is on the path.
+    fn retired(&self) -> Option<&Declaration> {
+        if self.active().is_some() {
+            return None;
+        }
+        self.existing.as_ref().filter(|d| d.status.is_retired())
+    }
+}
+
+/// What the create's second phase resolved for the dispatch: the derived
+/// classification and the metadata a new or revived row carries.
+#[domain_model]
+struct Checked {
+    derived: DerivedClassification,
+    metadata: DeclarationMetadata,
+}
+
+/// The problem code of a revival report that has nothing to revive: no retired
+/// declaration at the key, or an active one on its path. It rides the
+/// `NotFound` the report answers, distinct from a missing category's.
+pub const NOTHING_TO_REVIVE: &str = "nothing_to_revive";
+
+/// A body that would revive a retired declaration, as far as the create's
+/// first checks can tell.
+#[domain_model]
+#[derive(Debug, Clone)]
+pub struct RevivalPlan {
+    retired: Declaration,
+    located: Located,
+}
+
+impl RevivalPlan {
+    /// The retired declaration the body would revive.
+    #[must_use]
+    pub fn retired(&self) -> &Declaration {
+        &self.retired
+    }
+}
+
+/// The tenants a report walks, the caller's first and the rest in
+/// breadth-first order, and whether the node budget cut the walk.
+#[domain_model]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Walk {
+    pub tenants: Vec<Uuid>,
+    pub truncated: bool,
+}
+
+/// One retained value a revive would re-validate, as far as it is listed.
+#[domain_model]
+#[derive(Debug, Clone, PartialEq)]
+pub struct RevivalRow {
+    pub tenant_id: Uuid,
+    /// The inline value; `None` for a secret, held by reference.
+    pub value: Option<Value>,
+    /// The classification the row itself is stored under.
+    pub data_classification: DataClassification,
+    /// Whether the revive would flag the value: it no longer validates.
+    pub needs_review: bool,
+    /// Why, when it would be flagged.
+    pub needs_review_detail: Option<String>,
+}
+
+/// What a revive would do to the retained values: every row counted, the
+/// first `limit` of them, in the walk's order, listed.
+#[domain_model]
+#[derive(Debug, Clone, PartialEq)]
+pub struct RevivalReport {
+    pub key: String,
+    pub declaration_id: Uuid,
+    /// The stricter of the declaration's stored classification and the body's
+    /// derived one; a listed value is masked by the strictest of this and its
+    /// row's own.
+    pub data_classification: DataClassification,
+    /// The first `limit` rows, values and details kept for these alone.
+    pub rows: Vec<RevivalRow>,
+    /// Every row found at the walked tenants.
+    pub total: usize,
+    /// How many of them the revive would flag.
+    pub total_needs_review: usize,
+    /// The tenants walked, the caller included.
+    pub scanned: usize,
+    /// Whether the walk was whole: the counts are all there are.
+    pub complete: bool,
+}
+
+/// How many tenants of the walk one listing read asks for: the listing is
+/// fetched in the walk's order, a batch at a time, until `limit` rows are in
+/// hand. Well inside the bind-parameter bound of every backend.
+const REVIVAL_TENANT_BATCH: usize = 500;
+
+/// The port the report's read gate is asked through: whether the caller may
+/// read the retired declaration the way the single read would show it — its
+/// grant, administrative domain and `hidden` restriction, the licence
+/// predicate joining in R2. The adapter owns the caller's scope and chain.
+#[async_trait::async_trait]
+pub trait RevivalReadGate: Send + Sync {
+    /// # Errors
+    /// [`DomainError`] when the gate's own reads fail.
+    async fn may_read(&self, declaration: &Declaration) -> Result<bool, DomainError>;
+}
+
+/// The strictest of any number of classifications: `secret` over `pii` over
+/// `public`, and `public` for none. A stored string reaches this through
+/// [`DataClassification::from_stored`], which is where an unknown class fails
+/// closed.
+#[must_use]
+pub fn strictest_classification(
+    classifications: impl IntoIterator<Item = DataClassification>,
+) -> DataClassification {
+    classifications
+        .into_iter()
+        .max()
+        .unwrap_or(DataClassification::Public)
+}
+
 /// What the value type's traits and the author's wish resolve to.
 #[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DerivedClassification {
     pub has_secret_trait: bool,
-    pub data_classification: &'static str,
+    pub data_classification: DataClassification,
 }
 
 /// The class a field of an update request falls into.
@@ -153,7 +338,7 @@ fn validation(field: &str, code: &'static str, message: impl Into<String>) -> Do
 fn revive_refusal(
     retired: &Declaration,
     request: &CreateDeclaration,
-    derived: &DerivedClassification,
+    derived: DerivedClassification,
 ) -> Result<(), DomainError> {
     // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-reactivate:p1:inst-decl-react-13
     // What a revive may not change: the secret boundary (a secret's values
@@ -250,7 +435,7 @@ pub fn derive_classification(
         // @cpt-begin:cpt-cf-settings-service-algo-setting-declarations-classification:p1:inst-decl-class-3
         // @cpt-begin:cpt-cf-settings-service-algo-setting-declarations-classification:p1:inst-decl-class-4
         if let Some(other) = supplied
-            && other != "secret"
+            && other != DataClassification::Secret.as_str()
         {
             return Err(validation(
                 "data_classification",
@@ -261,7 +446,7 @@ pub fn derive_classification(
                 ),
             ));
         }
-        "secret"
+        DataClassification::Secret
         // @cpt-end:cpt-cf-settings-service-algo-setting-declarations-classification:p1:inst-decl-class-4
         // @cpt-end:cpt-cf-settings-service-algo-setting-declarations-classification:p1:inst-decl-class-3
         // @cpt-end:cpt-cf-settings-service-algo-setting-declarations-classification:p1:inst-decl-class-2
@@ -278,8 +463,8 @@ pub fn derive_classification(
                      classification",
                 ));
             }
-            Some("pii") => "pii",
-            Some("public") | None => "public",
+            Some("pii") => DataClassification::Pii,
+            Some("public") | None => DataClassification::Public,
             Some(other) => {
                 return Err(validation(
                     "data_classification",
@@ -359,12 +544,12 @@ pub fn classify_field(
             Some("secret") => FieldClass::Immutable,
             // @cpt-end:cpt-cf-settings-service-algo-setting-declarations-mutation-class:p1:inst-decl-mutcls-6
             Some(requested @ ("public" | "pii")) => {
-                match (current.data_classification.as_str(), requested) {
+                match (current.classification(), requested) {
                     // Derived from the trait: never author-changed.
-                    ("secret", _) => FieldClass::Immutable,
+                    (DataClassification::Secret, _) => FieldClass::Immutable,
                     // @cpt-begin:cpt-cf-settings-service-algo-setting-declarations-mutation-class:p1:inst-decl-mutcls-5
                     // Loosening un-masks content previously withheld.
-                    ("pii", "public") => FieldClass::StepUp,
+                    (DataClassification::Pii, "public") => FieldClass::StepUp,
                     // @cpt-end:cpt-cf-settings-service-algo-setting-declarations-mutation-class:p1:inst-decl-mutcls-5
                     // @cpt-begin:cpt-cf-settings-service-algo-setting-declarations-mutation-class:p1:inst-decl-mutcls-4
                     // Tightening, and a no-op, both apply at once.
@@ -393,7 +578,7 @@ fn snapshot(declaration: &Declaration) -> Value {
         "default_value": declaration.default_value,
         "scope_class": declaration.scope_class,
         "mode": declaration.mode,
-        "status": declaration.status,
+        "status": declaration.status.as_str(),
         "description": declaration.description,
         "display_name": declaration.display_name,
         "domain_affinity": declaration.domain_affinity,
@@ -418,8 +603,9 @@ fn optional_string(value: &Value) -> Option<String> {
 // @cpt-dod:cpt-cf-settings-service-dod-setting-declarations-lifecycle:p1
 // @cpt-dod:cpt-cf-settings-service-dod-setting-declarations-contributed-protection:p1
 // @cpt-dod:cpt-cf-settings-service-dod-setting-declarations-audit:p1
+// @cpt-dod:cpt-cf-settings-service-dod-setting-declarations-revival-report:p1
 #[domain_model]
-pub struct DeclarationAdmin<R, Cat, Val, S> {
+pub struct DeclarationAdmin<R, Cat, Val, S, P> {
     declarations: R,
     categories: Cat,
     values: Val,
@@ -428,14 +614,18 @@ pub struct DeclarationAdmin<R, Cat, Val, S> {
     step_up: Arc<dyn StepUpVerifier>,
     sink: S,
     cache: Arc<EffectiveCache>,
+    pending: P,
+    secrets: Arc<dyn SecretManager>,
+    metrics: Arc<dyn WriteMetrics>,
 }
 
-impl<R, Cat, Val, S> DeclarationAdmin<R, Cat, Val, S>
+impl<R, Cat, Val, S, P> DeclarationAdmin<R, Cat, Val, S, P>
 where
     R: DeclarationRepository,
     Cat: CategoryRepository,
     Val: ValueRepository,
     S: AuditSink,
+    P: PendingSecretRepository,
 {
     /// Assemble the service over its repositories and ports.
     #[allow(clippy::too_many_arguments)]
@@ -448,6 +638,9 @@ where
         step_up: Arc<dyn StepUpVerifier>,
         sink: S,
         cache: Arc<EffectiveCache>,
+        pending: P,
+        secrets: Arc<dyn SecretManager>,
+        metrics: Arc<dyn WriteMetrics>,
     ) -> Self {
         Self {
             declarations,
@@ -458,6 +651,9 @@ where
             step_up,
             sink,
             cache,
+            pending,
+            secrets,
+            metrics,
         }
     }
 
@@ -477,6 +673,277 @@ where
         request: CreateDeclaration,
         actor: &WriteActor,
     ) -> Result<Created, DomainError> {
+        let located = self.locate(conn, scope, &request).await?;
+        let Checked { derived, metadata } = self.check(&located, &request).await?;
+        let Located {
+            key,
+            existing,
+            on_path,
+            ..
+        } = located;
+
+        if let Some(active) = on_path.iter().find(|d| d.status.is_active()) {
+            // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-evolve:p1:inst-decl-evolve-2
+            // A request matching the active declaration is not evolution: a
+            // retry after a lost response must not mint a major by accident,
+            // and a metadata change goes through PATCH.
+            if !changes_behaviour(active, &request) {
+                return Err(conflict(
+                    conflict::KEY_CONFLICT,
+                    format!(
+                        "`{}` is the active declaration of this setting and the request changes \
+                         none of its value type, Schema Default or scope class; metadata changes \
+                         use PATCH",
+                        active.key
+                    ),
+                ));
+            }
+            // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-evolve:p1:inst-decl-evolve-2
+            return self
+                .evolve(
+                    conn,
+                    scope,
+                    &key,
+                    active.clone(),
+                    &on_path,
+                    &request,
+                    derived,
+                    metadata,
+                    actor,
+                )
+                .await;
+        }
+
+        match existing {
+            // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-reactivate:p1:inst-decl-react-6
+            Some(active) if active.status.is_active() => Err(conflict(
+                conflict::KEY_CONFLICT,
+                format!(
+                    "`{}` is an active declaration; metadata changes use PATCH",
+                    active.key
+                ),
+            )),
+            // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-reactivate:p1:inst-decl-react-6
+            Some(retired) => {
+                self.revive(
+                    conn, scope, &key, retired, &request, derived, metadata, actor,
+                )
+                .await
+            }
+            // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-reactivate:p1:inst-decl-react-5
+            None => {
+                self.insert_new(conn, scope, &key, &request, derived, metadata, actor)
+                    .await
+            } // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-reactivate:p1:inst-decl-react-5
+        }
+    }
+
+    /// Plan a revival report: the create's first checks on the body, whether
+    /// the body would revive a retired declaration at all, and whether the
+    /// caller may read that declaration.
+    ///
+    /// # Errors
+    /// The create's own refusals up to the lookup, as [`Self::create`] answers
+    /// them; [`DomainError::NotFound`] with [`NOTHING_TO_REVIVE`] when no
+    /// retired declaration sits at the key, an active one sits on the path —
+    /// the create would then evolve or duplicate, not revive — or the gate
+    /// refuses the retired declaration to the caller.
+    pub async fn plan_revival<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        request: &CreateDeclaration,
+        gate: &dyn RevivalReadGate,
+    ) -> Result<RevivalPlan, DomainError> {
+        // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-revival-report:p1:inst-decl-revival-3
+        let located = self.locate(conn, scope, request).await?;
+        // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-revival-report:p1:inst-decl-revival-3
+        // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-revival-report:p1:inst-decl-revival-4
+        let nothing = || DomainError::NotFound {
+            resource: NOTHING_TO_REVIVE,
+        };
+        let retired = located.retired().cloned().ok_or_else(nothing)?;
+        // One answer for every way of not being there, so what the caller
+        // may not read is not told apart from what does not exist.
+        if !gate.may_read(&retired).await? {
+            return Err(nothing());
+        }
+        Ok(RevivalPlan { retired, located })
+        // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-revival-report:p1:inst-decl-revival-4
+    }
+
+    /// Report what a revive of the planned declaration would do to the values
+    /// it retained, changing nothing: the create's remaining checks, the leaf
+    /// name, the retained subject-less rows at the walked tenants, each
+    /// re-validated as the revive would re-validate it. Every row is counted;
+    /// the first `limit`, in the walk's order, are listed.
+    ///
+    /// The walk is asked for only here, after every refusal.
+    ///
+    /// # Errors
+    /// The create's refusals up to step-up, as [`Self::create`] answers them;
+    /// [`DomainError::Conflict`] with `leaf_name_taken` when an active
+    /// declaration holds the leaf name in the category;
+    /// [`DomainError::Unavailable`] when the Type Validator cannot answer.
+    pub async fn revival_report<C, F, Fut>(
+        &self,
+        conn: &C,
+        value_scope: &AccessScope,
+        plan: RevivalPlan,
+        request: &CreateDeclaration,
+        limit: usize,
+        walk: F,
+    ) -> Result<RevivalReport, DomainError>
+    where
+        C: DBRunner,
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<Walk, DomainError>>,
+    {
+        let RevivalPlan { retired, located } = plan;
+        // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-revival-report:p1:inst-decl-revival-5
+        let checked = self.check(&located, request).await?;
+        // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-revival-report:p1:inst-decl-revival-5
+        // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-revival-report:p1:inst-decl-revival-6
+        // Unscoped, as the revive's unique index is: a holder outside the
+        // caller's scope still blocks the revive, so it must be found. What
+        // this tells the caller — that the leaf name is taken in the
+        // declaration's own category — the create tells it too, as its insert
+        // collides on the same index.
+        if self
+            .declarations
+            .find_active_by_leaf(
+                conn,
+                &AccessScope::allow_all(),
+                retired.category_id,
+                &retired.leaf_slug,
+            )
+            .await?
+            .is_some_and(|holder| holder.id != retired.id)
+        {
+            return Err(conflict(
+                conflict::LEAF_NAME_TAKEN,
+                format!(
+                    "the leaf name `{}` is held by an active declaration in this category; \
+                     a revive of `{}` would collide with it",
+                    retired.leaf_slug, retired.key
+                ),
+            ));
+        }
+        // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-revival-report:p1:inst-decl-revival-6
+        // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-revival-report:p1:inst-decl-revival-7
+        let walked = walk().await?;
+        // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-revival-report:p1:inst-decl-revival-7
+        // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-revival-report:p1:inst-decl-revival-8
+        // Three reads, none of them whole rows. The count is every row of the
+        // declaration at the walked tenants; the grouped read is its distinct
+        // `(value, classification)` pairs with their multiplicity; the listing
+        // is the first `limit` rows in the walk's order, fetched a batch of
+        // tenants at a time and no further than `limit` needs. The work grows
+        // with `limit` and the number of distinct values, not the subtree.
+        let total = self
+            .values
+            .count_in_tenants(conn, value_scope, retired.id, &walked.tenants)
+            .await?;
+        let groups = self
+            .values
+            .distinct_values_in_tenants(conn, value_scope, retired.id, &walked.tenants)
+            .await?;
+        // The walk's position of every tenant, built once: the order of a
+        // batch is a sort on an O(1) lookup.
+        let position: HashMap<Uuid, usize> = walked
+            .tenants
+            .iter()
+            .enumerate()
+            .map(|(at, tenant)| (*tenant, at))
+            .collect();
+        let mut listed = Vec::with_capacity(limit.min(walked.tenants.len()));
+        for batch in walked.tenants.chunks(REVIVAL_TENANT_BATCH) {
+            if listed.len() >= limit {
+                break;
+            }
+            let mut found = self
+                .values
+                .list_in_tenants(conn, value_scope, retired.id, batch)
+                .await?;
+            found.sort_by_key(|row| position.get(&row.tenant_id).copied().unwrap_or(usize::MAX));
+            listed.extend(found);
+        }
+        listed.truncate(limit);
+        // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-revival-report:p1:inst-decl-revival-8
+        // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-revival-report:p1:inst-decl-revival-9
+        // A value shared by many rows — the same override copied down a
+        // tree — is judged once: the verdict depends on the value and the
+        // type alone, so it is reused for every row holding that value. The
+        // groups are judged first; a group that fails adds its multiplicity to
+        // the count. The verdicts are keyed by the value itself: `Value`
+        // hashes an object's members in key order whatever the build, as its
+        // equality ignores their order, so one verdict stands per value — a
+        // backend that groups JSON textually (sqlite) may return two equal
+        // objects with different key order as two groups, and they still meet
+        // one judgement. A secret row has no value here to judge.
+        let mut verdicts: HashMap<Value, Option<String>> = HashMap::new();
+        let mut total_needs_review: u64 = 0;
+        for group in &groups {
+            if let Some(value) = &group.value
+                && self
+                    .verdict_of(&retired.value_type_id, &mut verdicts, value)
+                    .await?
+                    .is_some()
+            {
+                total_needs_review += group.count;
+            }
+        }
+        // Each listed row takes its verdict from the same map; a value the
+        // groups somehow did not cover is judged on the spot.
+        let mut rows = Vec::with_capacity(listed.len());
+        for row in listed {
+            let detail = match &row.value {
+                None => None,
+                Some(value) => {
+                    self.verdict_of(&retired.value_type_id, &mut verdicts, value)
+                        .await?
+                }
+            };
+            rows.push(RevivalRow {
+                tenant_id: row.tenant_id,
+                value: row.value,
+                data_classification: DataClassification::from_stored(&row.data_classification),
+                needs_review: detail.is_some(),
+                needs_review_detail: detail,
+            });
+        }
+        // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-revival-report:p1:inst-decl-revival-9
+        Ok(RevivalReport {
+            key: retired.key.clone(),
+            declaration_id: retired.id,
+            data_classification: strictest_classification([
+                retired.classification(),
+                checked.derived.data_classification,
+            ]),
+            rows,
+            total: usize::try_from(total).unwrap_or(usize::MAX),
+            total_needs_review: usize::try_from(total_needs_review).unwrap_or(usize::MAX),
+            scanned: walked.tenants.len(),
+            complete: !walked.truncated,
+        })
+    }
+
+    /// The create's first phase, which the revival report shares: the
+    /// category, the key composed from the body, its display name and Scope
+    /// Class, the declarations found at the key and on its version-stripped
+    /// path, and the refusal of an active `module_contributed` one on the path.
+    ///
+    /// # Errors
+    /// [`DomainError::NotFound`] on the category; [`DomainError::Validation`]
+    /// for a key segment, display name or Scope Class the rules refuse;
+    /// [`DomainError::Conflict`] for an active contributed declaration on the
+    /// path.
+    async fn locate<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        request: &CreateDeclaration,
+    ) -> Result<Located, DomainError> {
         // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-create:p1:inst-decl-create-4
         // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-create:p1:inst-decl-create-5
         let category = self
@@ -528,11 +995,11 @@ where
         // and looking it up alone would revive it beside the live `v2`.
         let on_path = self.declarations_on_path(conn, scope, &key).await?;
         // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-evolve:p1:inst-decl-evolve-1
-        let active = on_path.iter().find(|d| d.status == "active");
-        let retired = if active.is_none() {
-            existing.as_ref().filter(|d| d.status == "retired")
-        } else {
-            None
+        let located = Located {
+            key,
+            display_name,
+            existing,
+            on_path,
         };
         // Who may change the row at all is judged before anything about the
         // request is resolved: a gear's declaration answers with its owner,
@@ -543,7 +1010,7 @@ where
         // package an admin key is composed with, so its declaration can sit at
         // this key or on this path.
         // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-evolve:p1:inst-decl-evolve-8
-        if let Some(active) = active
+        if let Some(active) = located.active()
             && active.source == "module_contributed"
         {
             return Err(conflict(
@@ -556,6 +1023,24 @@ where
             ));
         }
         // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-evolve:p1:inst-decl-evolve-8
+        Ok(located)
+    }
+
+    /// The create's second phase, which the revival report shares: everything
+    /// the create judges before it would ask for step-up — a retired
+    /// `module_contributed` declaration, the value type's traits and the
+    /// derived classification, a revive's own refusals, the Schema Default and
+    /// the remaining body fields.
+    ///
+    /// # Errors
+    /// [`DomainError::Conflict`], [`DomainError::Validation`] and
+    /// [`DomainError::Unavailable`], as the create answers them.
+    async fn check(
+        &self,
+        located: &Located,
+        request: &CreateDeclaration,
+    ) -> Result<Checked, DomainError> {
+        let retired = located.retired();
         if let Some(retired) = retired {
             // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-reactivate:p1:inst-decl-react-15
             // A revive would replace its Schema Default and metadata.
@@ -577,8 +1062,9 @@ where
         // judged first, so a retype is refused as one rather than as a default
         // that does not fit the type it could never adopt.
         if let Some(retired) = retired {
-            revive_refusal(retired, &request, &derived)?;
+            revive_refusal(retired, request, derived)?;
         }
+        // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-reactivate:p1:inst-decl-react-16
         // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-create:p1:inst-decl-create-11
         // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-create:p1:inst-decl-create-12
         // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-create:p1:inst-decl-create-13
@@ -603,13 +1089,13 @@ where
         // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-create:p1:inst-decl-create-11
         // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-create:p1:inst-decl-create-14
         let anonymous_exposable = request.anonymous_exposable.unwrap_or(false);
-        if anonymous_exposable && derived.data_classification != "public" {
+        if anonymous_exposable && derived.data_classification != DataClassification::Public {
             return Err(validation(
                 "anonymous_exposable",
                 field::EXPOSABLE_NOT_SENSITIVE,
                 format!(
                     "a `{}` setting cannot be exposed on the anonymous surface",
-                    derived.data_classification
+                    derived.data_classification.as_str()
                 ),
             ));
         }
@@ -628,70 +1114,17 @@ where
         };
         let metadata = DeclarationMetadata {
             mode: mode.to_owned(),
-            display_name,
+            display_name: located.display_name.clone(),
             description: request.description.clone(),
             domain_affinity: request.domain_affinity.clone(),
             licence_feature: request.licence_feature.clone(),
-            data_classification: derived.data_classification.to_owned(),
+            data_classification: derived.data_classification.as_str().to_owned(),
             requires_step_up: request.requires_step_up.unwrap_or(true),
             anonymous_exposable,
         };
         // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-create:p1:inst-decl-create-15
-
-        if let Some(active) = on_path.iter().find(|d| d.status == "active") {
-            // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-evolve:p1:inst-decl-evolve-2
-            // A request matching the active declaration is not evolution: a
-            // retry after a lost response must not mint a major by accident,
-            // and a metadata change goes through PATCH.
-            if !changes_behaviour(active, &request) {
-                return Err(conflict(
-                    conflict::KEY_CONFLICT,
-                    format!(
-                        "`{}` is the active declaration of this setting and the request changes \
-                         none of its value type, Schema Default or scope class; metadata changes \
-                         use PATCH",
-                        active.key
-                    ),
-                ));
-            }
-            // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-evolve:p1:inst-decl-evolve-2
-            return self
-                .evolve(
-                    conn,
-                    scope,
-                    &key,
-                    active.clone(),
-                    &on_path,
-                    &request,
-                    derived,
-                    metadata,
-                    actor,
-                )
-                .await;
-        }
-
-        match existing {
-            // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-reactivate:p1:inst-decl-react-6
-            Some(active) if active.status == "active" => Err(conflict(
-                conflict::KEY_CONFLICT,
-                format!(
-                    "`{}` is an active declaration; metadata changes use PATCH",
-                    active.key
-                ),
-            )),
-            // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-reactivate:p1:inst-decl-react-6
-            Some(retired) => {
-                self.revive(
-                    conn, scope, &key, retired, &request, derived, metadata, actor,
-                )
-                .await
-            }
-            // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-reactivate:p1:inst-decl-react-5
-            None => {
-                self.insert_new(conn, scope, &key, &request, derived, metadata, actor)
-                    .await
-            } // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-reactivate:p1:inst-decl-react-5
-        }
+        // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-reactivate:p1:inst-decl-react-16
+        Ok(Checked { derived, metadata })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -728,7 +1161,7 @@ where
             anonymous_exposable: metadata.anonymous_exposable,
             domain_affinity: metadata.domain_affinity.clone(),
             has_secret_trait: derived.has_secret_trait,
-            data_classification: derived.data_classification.to_owned(),
+            data_classification: derived.data_classification.as_str().to_owned(),
             source: "admin_authored".to_owned(),
             owner_module: None,
             licence_feature: metadata.licence_feature.clone(),
@@ -794,11 +1227,29 @@ where
         // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-reactivate:p1:inst-decl-react-8
         // Reactivation changes whether a live setting resolves: gated like a
         // value change, before anything else is inspected.
-        self.verify_step_up(actor).await?;
+        self.verify_step_up(actor, StepUpOperation::Reactivate)
+            .await?;
         // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-reactivate:p1:inst-decl-react-8
+        // The row for update, then read again by id: a purge of this retired
+        // declaration holds the row until it commits, so this waits for it and
+        // finds the row gone (`404`) rather than writing against it. What was
+        // read before the lock is only a hint.
+        self.declarations
+            .lock_for_update(conn, scope, retired.id)
+            .await?;
+        let retired = self.find(conn, scope, retired.id).await?;
+        if !retired.status.is_retired() {
+            return Err(conflict(
+                conflict::KEY_CONFLICT,
+                format!(
+                    "`{}` is an active declaration; metadata changes use PATCH",
+                    retired.key
+                ),
+            ));
+        }
         // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-reactivate:p1:inst-decl-react-7
         // Again here, whoever calls: `create` asks first, before the default.
-        revive_refusal(&retired, request, &derived)?;
+        revive_refusal(&retired, request, derived)?;
         // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-reactivate:p1:inst-decl-react-14
         // The type the row goes live under is the registered one, confirmed
         // before anything is written — as a create registers before it inserts.
@@ -834,7 +1285,7 @@ where
         }
         if let Err(err) = self
             .declarations
-            .set_status(conn, scope, retired.id, "active", None)
+            .set_status(conn, scope, retired.id, DeclarationStatus::Active, None)
             .await
         {
             return Err(match err {
@@ -904,7 +1355,24 @@ where
         // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-evolve:p1:inst-decl-evolve-3
         // Evolution retires a live setting's current major: gated like a value
         // change, before anything else is inspected.
-        self.verify_step_up(actor).await?;
+        self.verify_step_up(actor, StepUpOperation::Evolve).await?;
+        // The active row for update, then read again by id: a retire and a
+        // purge of it, or another evolution, hold it until they commit, so
+        // this waits for them and sees what they left — a row gone is `404`,
+        // one no longer active is the conflict a second evolution gets.
+        self.declarations
+            .lock_for_update(conn, scope, active.id)
+            .await?;
+        let active = self.find(conn, scope, active.id).await?;
+        if !active.status.is_active() {
+            return Err(conflict(
+                conflict::KEY_CONFLICT,
+                format!(
+                    "`{}` is no longer the active declaration of this setting; read it again",
+                    active.key
+                ),
+            ));
+        }
         // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-evolve:p1:inst-decl-evolve-3
         // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-evolve:p1:inst-decl-evolve-4
         // A contributed declaration never reaches this point: `create` refuses
@@ -950,7 +1418,7 @@ where
         // all the unique index admits.
         // @cpt-begin:cpt-cf-settings-service-state-setting-declarations-lifecycle:p1:inst-decl-state-5
         self.declarations
-            .set_status(conn, scope, active.id, "retired", None)
+            .set_status(conn, scope, active.id, DeclarationStatus::Retired, None)
             .await?;
         // @cpt-end:cpt-cf-settings-service-state-setting-declarations-lifecycle:p1:inst-decl-state-5
         let retired = self.reload(conn, scope, &active.key).await?;
@@ -992,10 +1460,11 @@ where
                         tenant_id: row.tenant_id,
                         value: row.value.clone(),
                         secret_ref: row.secret_ref.clone(),
-                        data_classification: derived.data_classification.to_owned(),
+                        data_classification: derived.data_classification.as_str().to_owned(),
                         needs_review: detail.is_some(),
                         needs_review_detail: detail,
                         set_by: row.set_by.clone(),
+                        set_by_tenant: row.set_by_tenant,
                     },
                 )
                 .await?;
@@ -1031,6 +1500,36 @@ where
             .collect())
     }
 
+    /// The verdict on one value, judged once: found in `verdicts` by hash and
+    /// `Value` equality, or judged now and remembered.
+    async fn verdict_of(
+        &self,
+        value_type_id: &str,
+        verdicts: &mut HashMap<Value, Option<String>>,
+        value: &Value,
+    ) -> Result<Option<String>, DomainError> {
+        if let Some(verdict) = verdicts.get(value) {
+            return Ok(verdict.clone());
+        }
+        let judged = self.judge(value_type_id, value).await?;
+        verdicts.insert(value.clone(), judged.clone());
+        Ok(judged)
+    }
+
+    /// The first violation of a value against `value_type_id`, as the detail
+    /// a `needs_review` flag carries; `None` when it validates.
+    async fn judge(
+        &self,
+        value_type_id: &str,
+        value: &Value,
+    ) -> Result<Option<String>, DomainError> {
+        let result = self.validator.validate_value(value_type_id, value).await?;
+        Ok(result
+            .violations
+            .first()
+            .map(|first| format!("{} — {}", first.field, first.message)))
+    }
+
     /// The first violation of a retained value against `value_type_id`, as
     /// the detail a `needs_review` flag carries; `None` when it validates, and
     /// for a secret row, whose plaintext is not here to validate.
@@ -1042,11 +1541,7 @@ where
         let Some(value) = &row.value else {
             return Ok(None);
         };
-        let result = self.validator.validate_value(value_type_id, value).await?;
-        Ok(result
-            .violations
-            .first()
-            .map(|first| format!("{} — {}", first.field, first.message)))
+        self.judge(value_type_id, value).await
     }
 
     /// Edit a declaration's metadata under the mutation-class discipline.
@@ -1103,7 +1598,7 @@ where
         // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-update:p1:inst-decl-update-8
         // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-update:p1:inst-decl-update-11
         if needs_step_up {
-            self.verify_step_up(actor).await?;
+            self.verify_step_up(actor, StepUpOperation::Update).await?;
         }
         // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-update:p1:inst-decl-update-11
         // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-update:p1:inst-decl-update-10
@@ -1133,13 +1628,19 @@ where
                     metadata.anonymous_exposable = value.as_bool().unwrap_or(false);
                 }
                 "data_classification" => {
-                    metadata.data_classification = value.as_str().unwrap_or("public").to_owned();
+                    metadata.data_classification = value
+                        .as_str()
+                        .unwrap_or(DataClassification::Public.as_str())
+                        .to_owned();
                 }
                 _ => {}
             }
         }
         // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-update:p1:inst-decl-update-12
-        if metadata.anonymous_exposable && metadata.data_classification != "public" {
+        if metadata.anonymous_exposable
+            && DataClassification::from_stored(&metadata.data_classification)
+                != DataClassification::Public
+        {
             return Err(validation(
                 "anonymous_exposable",
                 field::EXPOSABLE_NOT_SENSITIVE,
@@ -1217,7 +1718,7 @@ where
         // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-retire:p1:inst-decl-retire-5
         // Retire drops a live setting out of resolution at once: gated like a
         // value change, before the declaration is even looked up.
-        self.verify_step_up(actor).await?;
+        self.verify_step_up(actor, StepUpOperation::Retire).await?;
         // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-retire:p1:inst-decl-retire-5
         // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-retire:p1:inst-decl-retire-4
         // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-retire:p1:inst-decl-retire-6
@@ -1231,7 +1732,7 @@ where
         // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-retire:p1:inst-decl-retire-9
         precondition::evaluate(if_match, &etag_of(&current))?;
         // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-retire:p1:inst-decl-retire-9
-        if current.status == "retired" {
+        if current.status.is_retired() {
             return Ok(current);
         }
         // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-retire:p1:inst-decl-retire-10
@@ -1242,7 +1743,13 @@ where
         // excluded from resolution by the status alone and revived with it. A
         // retired declaration keeps occupying its category with them.
         self.declarations
-            .set_status(conn, scope, id, "retired", Some(current.updated_at))
+            .set_status(
+                conn,
+                scope,
+                id,
+                DeclarationStatus::Retired,
+                Some(current.updated_at),
+            )
             .await?;
         // @cpt-end:cpt-cf-settings-service-state-setting-declarations-lifecycle:p1:inst-decl-state-4
         // @cpt-end:cpt-cf-settings-service-state-setting-declarations-lifecycle:p1:inst-decl-state-2
@@ -1269,6 +1776,307 @@ where
         // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-retire:p1:inst-decl-retire-14
         Ok(retired)
         // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-retire:p1:inst-decl-retire-14
+    }
+
+    /// Purge a retired, admin-authored declaration: the row, and by cascade
+    /// every value, restriction and staged secret filed under it. Irreversible.
+    ///
+    /// Answers the Credential Store entries those rows held, for the caller to
+    /// release once the transaction has committed ([`Self::release_purged`]).
+    ///
+    /// # Errors
+    /// [`DomainError::StepUpRequired`] / [`DomainError::Unauthorized`] /
+    /// [`DomainError::Unavailable`] without step-up, judged before anything is
+    /// read; [`DomainError::NotFound`]; [`DomainError::Conflict`] on a
+    /// contributed declaration and on one that is not retired; the
+    /// precondition errors on the tag.
+    // @cpt-dod:cpt-cf-settings-service-dod-setting-declarations-purge:p2
+    pub async fn purge<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        id: Uuid,
+        if_match: Option<&str>,
+        actor: &WriteActor,
+    ) -> Result<PurgedDeclaration, DomainError> {
+        // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-purge:p2:inst-decl-purge-4
+        // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-purge:p2:inst-decl-purge-5
+        // Irreversible, and it frees the key and the category: gated before the
+        // declaration is even looked up.
+        self.verify_step_up(actor, StepUpOperation::Purge).await?;
+        // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-purge:p2:inst-decl-purge-5
+        // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-purge:p2:inst-decl-purge-4
+        // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-purge:p2:inst-decl-purge-7
+        // The row for update: a value write in flight holds it for share, and a
+        // concurrent revive or retire takes it too, so each is serialized
+        // against this purge and what is read below is what gets deleted.
+        self.declarations.lock_for_update(conn, scope, id).await?;
+        // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-purge:p2:inst-decl-purge-7
+        // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-purge:p2:inst-decl-purge-8
+        let current = self.find(conn, scope, id).await?;
+        // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-purge:p2:inst-decl-purge-8
+        // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-purge:p2:inst-decl-purge-9
+        // Before the status: a module owns what it contributes, retired or not.
+        Self::refuse_contributed(&current)?;
+        // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-purge:p2:inst-decl-purge-9
+        // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-purge:p2:inst-decl-purge-10
+        if !current.status.is_retired() {
+            return Err(conflict(
+                conflict::NOT_RETIRED,
+                format!(
+                    "`{}` is {}; only a retired declaration is purged, and a purge never \
+                     retires",
+                    current.key,
+                    current.status.as_str()
+                ),
+            ));
+        }
+        // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-purge:p2:inst-decl-purge-10
+        // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-purge:p2:inst-decl-purge-11
+        precondition::evaluate(if_match, &etag_of(&current))?;
+        // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-purge:p2:inst-decl-purge-11
+        // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-purge:p2:inst-decl-purge-12
+        // Collected under the lock and before the delete: the cascade removes
+        // the rows, and with them the only record of what the store holds.
+        let mut seen = HashSet::new();
+        let mut entries = Vec::new();
+        let held = self.values.secret_refs(conn, id).await?;
+        let staged = self
+            .pending
+            .list_for_declaration(conn, id)
+            .await?
+            .into_iter()
+            .map(|row| (row.tenant_id, row.secret_ref));
+        for (tenant, secret_ref) in held.into_iter().chain(staged) {
+            if seen.insert(secret_ref.clone()) {
+                entries.push(HeldSecret { tenant, secret_ref });
+            }
+        }
+        // An evolution copies the predecessor's references into the successor's
+        // rows, and the store deletes by reference: what another declaration's
+        // value or staged row still names is that declaration's, not ours.
+        let references: Vec<String> = entries.iter().map(|e| e.secret_ref.clone()).collect();
+        let mut others = self
+            .values
+            .references_held_by_others(conn, id, &references)
+            .await?;
+        others.extend(
+            self.pending
+                .references_held_by_others(conn, id, &references)
+                .await?,
+        );
+        let (entries, kept): (Vec<HeldSecret>, Vec<HeldSecret>) = entries
+            .into_iter()
+            .partition(|entry| !others.contains(&entry.secret_ref));
+        // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-purge:p2:inst-decl-purge-12
+        // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-purge:p2:inst-decl-purge-13
+        self.declarations
+            .delete(conn, scope, id, current.updated_at)
+            .await?;
+        // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-purge:p2:inst-decl-purge-13
+        // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-purge:p2:inst-decl-purge-14
+        // The definition is the pre-image; nothing is left to be a post-image.
+        self.record(
+            conn,
+            &current,
+            actor,
+            AuditOperation::Remove,
+            Some(snapshot(&current)),
+            None,
+        )
+        .await?;
+        // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-purge:p2:inst-decl-purge-14
+        // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-purge:p2:inst-decl-purge-15
+        self.cache.invalidate_key(&current.key);
+        // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-purge:p2:inst-decl-purge-15
+        Ok(PurgedDeclaration {
+            id,
+            key: current.key,
+            secrets: entries,
+            kept_secrets: kept,
+        })
+    }
+
+    /// After the commit, re-check the Credential Store references the purge
+    /// kept because another declaration still held them, and move every one
+    /// nobody holds any more into the set to release.
+    ///
+    /// Needed when two retired declarations sharing an entry are purged at the
+    /// same time: each keeps it for the other, so without this re-check nobody
+    /// would release it. Runs on its own connection, after the purge's
+    /// transaction. A failed check leaves the references kept and logs it; the
+    /// purge is committed and stands.
+    pub async fn reclaim_kept<C: DBRunner>(&self, conn: &C, purged: &mut PurgedDeclaration) {
+        if purged.kept_secrets.is_empty() {
+            return;
+        }
+        let references: Vec<String> = purged
+            .kept_secrets
+            .iter()
+            .map(|e| e.secret_ref.clone())
+            .collect();
+        let mut others = match self
+            .values
+            .references_held_by_others(conn, purged.id, &references)
+            .await
+        {
+            Ok(others) => others,
+            Err(err) => {
+                tracing::warn!(
+                    key = %purged.key,
+                    kept = purged.kept_secrets.len(),
+                    err = %LogSafe(&err),
+                    "declaration purge: the kept references could not be checked again; they stay kept"
+                );
+                return;
+            }
+        };
+        match self
+            .pending
+            .references_held_by_others(conn, purged.id, &references)
+            .await
+        {
+            Ok(more) => others.extend(more),
+            Err(err) => {
+                tracing::warn!(
+                    key = %purged.key,
+                    kept = purged.kept_secrets.len(),
+                    err = %LogSafe(&err),
+                    "declaration purge: the kept references could not be checked again; they stay kept"
+                );
+                return;
+            }
+        }
+        let (still, freed): (Vec<HeldSecret>, Vec<HeldSecret>) =
+            std::mem::take(&mut purged.kept_secrets)
+                .into_iter()
+                .partition(|entry| others.contains(&entry.secret_ref));
+        purged.kept_secrets = still;
+        purged.secrets.extend(freed);
+    }
+
+    /// Release the Credential Store entries of a committed purge, at most
+    /// [`RELEASE_CONCURRENCY`] at a time, and answer how it went.
+    ///
+    /// The work runs in a spawned task, so a caller that is dropped
+    /// mid-release does not cut it short. A refusal never undoes the purge:
+    /// it is counted and logged without the secret, and the entry is left as
+    /// an orphan an operator reconciles; nothing retries it. A task that
+    /// panics or is torn down counts every entry it did not report as failed.
+    pub async fn release_purged(
+        &self,
+        purged: PurgedDeclaration,
+        request_id: &str,
+    ) -> ReleaseSummary {
+        let store = Arc::clone(&self.secrets);
+        let metrics = Arc::clone(&self.metrics);
+        let request_id = request_id.to_owned();
+        let total = purged.secrets.len();
+        let key_for_loss = purged.key.clone();
+        // Shared with the task, so what it reported survives it.
+        let released = Arc::new(AtomicUsize::new(0));
+        let failed = Arc::new(AtomicUsize::new(0));
+        // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-purge:p2:inst-decl-purge-18
+        let task = tokio::spawn({
+            let metrics = Arc::clone(&metrics);
+            let request_id = request_id.clone();
+            let released = Arc::clone(&released);
+            let failed = Arc::clone(&failed);
+            async move {
+                let PurgedDeclaration {
+                    key,
+                    secrets,
+                    kept_secrets,
+                    ..
+                } = purged;
+                tracing::info!(
+                    key = %key,
+                    entries = secrets.len(),
+                    kept = kept_secrets.len(),
+                    request_id = %request_id,
+                    "declaration purge: releasing credential store entries"
+                );
+                // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-purge:p2:inst-decl-purge-18
+                // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-purge:p2:inst-decl-purge-19
+                let mut in_flight = futures_util::stream::iter(secrets)
+                    .map(|entry| {
+                        let store = Arc::clone(&store);
+                        let key = key.as_str();
+                        async move {
+                            let outcome = store
+                                .delete_secret(key, entry.tenant, &entry.secret_ref)
+                                .await;
+                            (entry.tenant, outcome)
+                        }
+                    })
+                    .buffer_unordered(RELEASE_CONCURRENCY);
+                // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-purge:p2:inst-decl-purge-19
+                while let Some((tenant, outcome)) = in_flight.next().await {
+                    match outcome {
+                        // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-purge:p2:inst-decl-purge-20
+                        Ok(()) => {
+                            metrics.purge_released();
+                            released.fetch_add(1, Ordering::SeqCst);
+                        }
+                        // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-purge:p2:inst-decl-purge-20
+                        // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-purge:p2:inst-decl-purge-21
+                        Err(err) => {
+                            // Neither the secret nor its reference: the
+                            // reference names the entry an operator would
+                            // reach for.
+                            tracing::error!(
+                                key = %key,
+                                tenant = %tenant,
+                                err = %LogSafe(&err),
+                                "declaration purge: a credential store entry was not released"
+                            );
+                            metrics.purge_release_failed();
+                            failed.fetch_add(1, Ordering::SeqCst);
+                        } // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-purge:p2:inst-decl-purge-21
+                    }
+                }
+                // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-purge:p2:inst-decl-purge-22
+                let summary = ReleaseSummary {
+                    released: released.load(Ordering::SeqCst),
+                    failed: failed.load(Ordering::SeqCst),
+                };
+                tracing::info!(
+                    key = %key,
+                    released = summary.released,
+                    failed = summary.failed,
+                    request_id = %request_id,
+                    "declaration purge: credential store release finished"
+                );
+                // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-purge:p2:inst-decl-purge-22
+                summary
+            }
+        });
+        match task.await {
+            Ok(summary) => summary,
+            Err(err) => {
+                // The purge is committed; a task that panicked or was torn down
+                // with the runtime does not turn that into a failed request.
+                // What it did not report is counted as failed: no one knows
+                // those entries were released.
+                let done_ok = released.load(Ordering::SeqCst);
+                let done_failed = failed.load(Ordering::SeqCst);
+                let unreached = total.saturating_sub(done_ok + done_failed);
+                for _ in 0..unreached {
+                    metrics.purge_release_failed();
+                }
+                tracing::error!(
+                    key = %key_for_loss,
+                    request_id = %request_id,
+                    entries = total,
+                    err = %LogSafe(&err),
+                    "declaration purge: the release task did not finish"
+                );
+                ReleaseSummary {
+                    released: done_ok,
+                    failed: done_failed + unreached,
+                }
+            }
+        }
     }
 
     /// Evict a key from the effective cache, once the change is durable.
@@ -1322,9 +2130,15 @@ where
 
     /// The step-up gate, as the value write path applies it: an interactive
     /// caller must present a fresh assertion; a service principal cannot and
-    /// is refused outright.
-    async fn verify_step_up(&self, actor: &WriteActor) -> Result<(), DomainError> {
+    /// is refused outright. The outcome is counted in `settings_step_up_total`
+    /// under `operation`.
+    async fn verify_step_up(
+        &self,
+        actor: &WriteActor,
+        operation: StepUpOperation,
+    ) -> Result<(), DomainError> {
         if !actor.is_interactive() {
+            self.metrics.step_up(operation, "service_principal");
             return Err(DomainError::Unauthorized {
                 resource: settings_service_sdk::gts::DECLARATION_SCHEMA,
             });
@@ -1341,19 +2155,27 @@ where
             )
             .await
         {
-            Ok(()) => Ok(()),
-            // An outage of the platform's AuthN is not a verdict on the token:
-            // the client retries rather than re-authenticates.
-            Err(StepUpRefusal::Unavailable(detail)) => Err(DomainError::Unavailable {
-                detail: format!("step-up could not be verified: {detail}"),
-            }),
+            Ok(()) => {
+                self.metrics.step_up(operation, "verified");
+                Ok(())
+            }
             Err(refusal) => {
-                let requirement = self.step_up.requirement();
-                Err(DomainError::StepUpRequired {
-                    reason: refusal.code(),
-                    max_age_seconds: requirement.max_age.as_secs(),
-                    acr_values: requirement.acr_values.clone(),
-                })
+                self.metrics.step_up(operation, refusal.code());
+                match refusal {
+                    // An outage of the platform's AuthN is not a verdict on the
+                    // token: the client retries rather than re-authenticates.
+                    StepUpRefusal::Unavailable(detail) => Err(DomainError::Unavailable {
+                        detail: format!("step-up could not be verified: {detail}"),
+                    }),
+                    refusal => {
+                        let requirement = self.step_up.requirement();
+                        Err(DomainError::StepUpRequired {
+                            reason: refusal.code(),
+                            max_age_seconds: requirement.max_age.as_secs(),
+                            acr_values: requirement.acr_values.clone(),
+                        })
+                    }
+                }
             }
         }
     }
@@ -1375,6 +2197,7 @@ where
             declaration.key.as_str(),
             None,
             actor.subject(),
+            ActorTenant::of(actor.tenant()),
             operation,
             actor.request_id.clone(),
         );

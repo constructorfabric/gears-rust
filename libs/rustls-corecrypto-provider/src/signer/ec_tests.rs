@@ -24,7 +24,7 @@ fn pkcs8_to_sec1_ec(pkcs8: &PrivateKeyDer<'_>) -> PrivateKeyDer<'static> {
         PrivateKeyDer::Pkcs8(p) => p.secret_pkcs8_der(),
         other => panic!("expected PKCS#8 input, got {other:?}"),
     };
-    let info = pkcs8::PrivateKeyInfo::try_from(pkcs8_bytes).expect("parse PKCS#8");
+    let info = pkcs8::PrivateKeyInfoRef::try_from(pkcs8_bytes).expect("parse PKCS#8");
     assert_eq!(info.algorithm.oid, ID_EC_PUBLIC_KEY, "test helper EC only");
     let curve_oid: ObjectIdentifier = info
         .algorithm
@@ -35,7 +35,8 @@ fn pkcs8_to_sec1_ec(pkcs8: &PrivateKeyDer<'_>) -> PrivateKeyDer<'static> {
 
     // Parse the inner SEC1 OCTET STRING, then re-set its parameters
     // field so the resulting DER is a standalone bare-SEC1 key.
-    let inner = sec1::EcPrivateKey::try_from(info.private_key).expect("parse inner SEC1");
+    let inner =
+        sec1::EcPrivateKey::try_from(info.private_key.as_bytes()).expect("parse inner SEC1");
     let with_params = sec1::EcPrivateKey {
         private_key: inner.private_key,
         parameters: Some(EcParameters::NamedCurve(curve_oid)),
@@ -173,8 +174,8 @@ fn sec1_without_public_key_is_rejected() {
         PrivateKeyDer::Pkcs8(p) => p.secret_pkcs8_der(),
         _ => unreachable!(),
     };
-    let info = pkcs8::PrivateKeyInfo::try_from(pkcs8_bytes).expect("PKCS#8");
-    let inner = sec1::EcPrivateKey::try_from(info.private_key).expect("inner SEC1");
+    let info = pkcs8::PrivateKeyInfoRef::try_from(pkcs8_bytes).expect("PKCS#8");
+    let inner = sec1::EcPrivateKey::try_from(info.private_key.as_bytes()).expect("inner SEC1");
     let stripped = sec1::EcPrivateKey {
         private_key: inner.private_key,
         parameters: Some(EcParameters::NamedCurve(SECP256R1_OID)),
@@ -215,8 +216,8 @@ fn sec1_with_compressed_public_key_is_rejected() {
         PrivateKeyDer::Pkcs8(p) => p.secret_pkcs8_der(),
         _ => unreachable!(),
     };
-    let info = pkcs8::PrivateKeyInfo::try_from(pkcs8_bytes).expect("PKCS#8");
-    let inner = sec1::EcPrivateKey::try_from(info.private_key).expect("inner SEC1");
+    let info = pkcs8::PrivateKeyInfoRef::try_from(pkcs8_bytes).expect("PKCS#8");
+    let inner = sec1::EcPrivateKey::try_from(info.private_key.as_bytes()).expect("inner SEC1");
     let original_pub = inner.public_key.expect("inner has publicKey");
     assert_eq!(original_pub[0], 0x04, "rcgen produces uncompressed");
     assert_eq!(original_pub.len(), 1 + 64);
@@ -378,8 +379,9 @@ fn ec_signing_key_rejects_non_p_curve_oid() {
         PrivateKeyDer::Pkcs8(p) => p.secret_pkcs8_der(),
         _ => unreachable!(),
     };
-    let info_p256 = pkcs8::PrivateKeyInfo::try_from(p256_bytes).expect("PKCS#8 P-256");
-    let inner_p256 = sec1::EcPrivateKey::try_from(info_p256.private_key).expect("inner SEC1 P-256");
+    let info_p256 = pkcs8::PrivateKeyInfoRef::try_from(p256_bytes).expect("PKCS#8 P-256");
+    let inner_p256 =
+        sec1::EcPrivateKey::try_from(info_p256.private_key.as_bytes()).expect("inner SEC1 P-256");
 
     // Re-wrap that SEC1 under a PKCS#8 envelope whose
     // algorithm.parameters claim secp256k1. Use the `pkcs8` crate's
@@ -399,9 +401,10 @@ fn ec_signing_key_rejects_non_p_curve_oid() {
             pkcs8::der::AnyRef::from_der(&secp256k1_oid_der).expect("AnyRef from OID"),
         ),
     };
-    let info = pkcs8::PrivateKeyInfo {
+    let info = pkcs8::PrivateKeyInfoRef {
         algorithm: alg,
-        private_key: &sec1_inner_der,
+        private_key: pkcs8::der::asn1::OctetStringRef::new(&sec1_inner_der)
+            .expect("wrap inner SEC1 in OCTET STRING"),
         public_key: None,
     };
     let pkcs8_der = info.to_der().expect("encode PKCS#8");

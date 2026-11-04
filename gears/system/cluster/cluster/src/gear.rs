@@ -35,6 +35,31 @@ use crate::domain::wiring::{ClusterHandle, ClusterWiring};
 use cluster_sdk::grpc::stubs;
 
 #[toolkit::gear(name = "cluster", capabilities = [stateful, system, grpc, rest])]
+// The four coordination contracts this gear serves, over gRPC only. In-process
+// consumers reach the
+// same services through the `ClusterClient` seam (`LocalClusterClient`), so no
+// second, contract-level local implementation exists or is declared. The
+// generated `wire_*` methods are not called: the SDK owns consumer wiring.
+#[toolkit::provides(
+    contract = cluster_sdk::contract::ClusterCacheApi,
+    transports = [grpc],
+    grpc_client = cluster_sdk::grpc::ClusterCacheApiGrpcClient
+)]
+#[toolkit::provides(
+    contract = cluster_sdk::contract::DistributedLockApi,
+    transports = [grpc],
+    grpc_client = cluster_sdk::grpc::DistributedLockApiGrpcClient
+)]
+#[toolkit::provides(
+    contract = cluster_sdk::contract::LeaderElectionApi,
+    transports = [grpc],
+    grpc_client = cluster_sdk::grpc::LeaderElectionApiGrpcClient
+)]
+#[toolkit::provides(
+    contract = cluster_sdk::contract::ClusterProfileApi,
+    transports = [grpc],
+    grpc_client = cluster_sdk::grpc::ClusterProfileApiGrpcClient
+)]
 struct ClusterGear {
     /// Captured in `init` so `start` (which gets no `GearCtx`) can register
     /// backends into it.

@@ -1,27 +1,24 @@
 //! The catalogue's entities and its read API.
 //!
-//! Every contract schema is compiled once, here, under the Draft-07 dialect it
-//! declares, with format assertion on, the GTS id formats registered, and
-//! `x-gts-ref` compiled as a keyword of the schema itself. A GTS reference
-//! constraint therefore counts toward a branch's validity like `type` or
-//! `format` does: a `oneOf` over two branches that differ only in their
-//! `x-gts-ref` picks exactly one, and a branch that carries no GTS constraint
-//! is not "matched" by default. The request path then validates a document
-//! with no allocation beyond the envelope it wraps.
+//! Every contract is validated by the `gts` payload validator compiled from
+//! its resolved type, the one the registry itself validates with. The
+//! dialect the schema declares applies, with format assertion on, and
+//! `x-gts-type-ref`, `x-gts-instance-ref` and `x-gts-pattern-ref` are compiled
+//! as keywords of the schema itself. A GTS reference constraint therefore
+//! counts toward a branch's validity like `type` or `format` does: a `oneOf`
+//! over two branches that differ only in their entity reference picks exactly
+//! one, and a branch that carries no GTS constraint is not "matched" by
+//! default. The request path then validates a document with no allocation
+//! beyond the envelope it wraps.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::Arc;
 
-use gts::{GTS_ID_URI_PREFIX, GtsId, GtsIdPattern, GtsInstanceId, GtsTypeId};
-use jsonschema::paths::Location;
-use jsonschema::{Draft, Keyword, ValidationError, Validator};
+use gts::{GtsId, GtsTypeId, PayloadValidationError, PayloadValidator};
 use quota_enforcement_sdk::{ContractRef, METRIC_BASE_TYPE, MetricId, SubjectScope};
-use serde_json::{Map, Value};
+use serde_json::Value;
 use toolkit_macros::domain_model;
-
-/// The GTS reference keyword of the `gts` schema dialect.
-const X_GTS_REF: &str = "x-gts-ref";
 
 /// A well-formed instance id whose declaring type is the metric base. Whether
 /// the registry knows it is a separate question the bootstrap answers.
@@ -37,157 +34,60 @@ pub fn parse_metric_under_base(text: &str) -> Option<MetricId> {
 /// A resolved contract schema compiled for validation.
 #[domain_model]
 pub struct CompiledContract {
-    type_id: GtsTypeId,
-    validator: Validator,
+    validator: PayloadValidator,
+    schema: Arc<Value>,
 }
 
 impl CompiledContract {
-    /// Compile `schema`, the fully resolved body of `type_id`.
-    ///
-    /// # Errors
-    ///
-    /// Returns the compiler's diagnostic when the schema does not compile,
-    /// including an `x-gts-ref` whose value is not a GTS id or pattern, or a
-    /// pointer form that does not resolve to one in this schema.
-    pub fn compile(type_id: GtsTypeId, schema: Value) -> Result<Self, String> {
-        let root = Arc::new(schema);
-        let root_for_keyword = Arc::clone(&root);
-        let validator = jsonschema::options()
-            .with_draft(Draft::Draft7)
-            .should_validate_formats(true)
-            .with_format("gts-type-id", |s| GtsTypeId::try_new(s).is_ok())
-            .with_format("gts-instance-id", |s| GtsInstanceId::try_new(s).is_ok())
-            .with_keyword(X_GTS_REF, move |parent, value, location| {
-                GtsRefKeyword::compile(&root_for_keyword, parent, value, location)
-            })
-            .build(&root)
-            .map_err(|e| e.to_string())?;
-        Ok(Self { type_id, validator })
+    /// Wrap the payload validator and the resolved schema it was compiled from.
+    #[must_use]
+    pub fn new(validator: PayloadValidator, schema: Value) -> Self {
+        Self {
+            validator,
+            schema: Arc::new(schema),
+        }
+    }
+
+    /// The resolved schema used by this immutable catalogue, without a registry read.
+    #[must_use]
+    pub fn schema(&self) -> &Value {
+        &self.schema
     }
 
     /// The contract type.
     #[must_use]
     pub fn type_id(&self) -> &GtsTypeId {
-        &self.type_id
+        self.validator.type_id()
     }
 
     /// Validate the whole `document` (the `{type, metadata}` envelope, never
-    /// the inner object alone) against the schema, its GTS formats, and its
-    /// `x-gts-ref` constraints in one pass. The diagnostics are for the log;
+    /// the inner object alone) against the schema and its entity references
+    /// in one pass. The diagnostics are for the log;
     /// callers surface a closed reason token.
     ///
     /// # Errors
     ///
-    /// Returns every violation found.
+    /// Returns the JSON Schema violations found or, only when none is, the
+    /// GTS reference violations. A rejection too costly to explain is
+    /// reported as one unexplained reason.
     pub fn validate(&self, document: &Value) -> Result<(), Vec<String>> {
-        if self.validator.is_valid(document) {
-            return Ok(());
-        }
-        Err(self
-            .validator
-            .iter_errors(document)
-            .map(|e| format!("{}: {e}", e.instance_path()))
-            .collect())
-    }
-}
-
-/// `x-gts-ref` as a schema keyword: a string value must be a well-formed GTS
-/// id that matches the declared pattern. Non-string values are left to `type`,
-/// as the `gts` validator does, so the keyword adds a constraint and never
-/// duplicates one.
-///
-/// The value is an absolute id or pattern (`gts.cf.core.qe.scope.v1~`,
-/// `gts.cf.*`) or a JSON pointer (`/$id`, `/properties/type`) into the root
-/// schema whose target is one; a `gts://` prefix on the target is stripped.
-/// Both forms are checked when the schema compiles, so a request never meets
-/// a malformed constraint.
-struct GtsRefKeyword {
-    pattern: GtsIdPattern,
-    declared: String,
-}
-
-impl GtsRefKeyword {
-    /// Build the keyword from its declared `x-gts-ref` pattern.
-    fn compile<'a>(
-        root: &Value,
-        _parent: &'a Map<String, Value>,
-        value: &'a Value,
-        _location: Location,
-    ) -> Result<Box<dyn Keyword>, ValidationError<'a>> {
-        let Some(declared) = value.as_str() else {
-            return Err(ValidationError::custom(format!(
-                "{X_GTS_REF} must be a string, got {value}"
-            )));
-        };
-        let text = if declared.starts_with('/') {
-            Self::resolve_pointer(root, declared).ok_or_else(|| {
-                ValidationError::custom(format!(
-                    "{X_GTS_REF} '{declared}' does not point at a GTS pattern in this schema"
-                ))
-            })?
-        } else {
-            declared.to_owned()
-        };
-        let pattern = GtsIdPattern::try_new(&text).map_err(|e| {
-            ValidationError::custom(format!(
-                "{X_GTS_REF} '{declared}' is not a GTS id or pattern: {e}"
-            ))
-        })?;
-        Ok(Box::new(Self {
-            pattern,
-            declared: declared.to_owned(),
-        }))
-    }
-
-    /// The pointer form resolves against the root schema to a string, or to a
-    /// sub-schema whose own `x-gts-ref` is absolute; deeper pointer chains are
-    /// not followed.
-    fn resolve_pointer(root: &Value, pointer: &str) -> Option<String> {
-        let target = root.pointer(pointer)?;
-        let text = match target {
-            Value::String(s) => s.as_str(),
-            Value::Object(map) => map.get(X_GTS_REF)?.as_str()?,
-            _ => return None,
-        };
-        if text.starts_with('/') {
-            return None;
-        }
-        Some(
-            text.strip_prefix(GTS_ID_URI_PREFIX)
-                .unwrap_or(text)
-                .to_owned(),
-        )
-    }
-
-    /// Whether a string value is a GTS id matching the pattern; non-strings pass.
-    fn matches(&self, instance: &Value) -> bool {
-        match instance.as_str() {
-            Some(text) => GtsId::try_new(text).is_ok_and(|id| id.matches_pattern(&self.pattern)),
-            None => true,
-        }
-    }
-}
-
-impl Keyword for GtsRefKeyword {
-    fn validate<'i>(&self, instance: &'i Value) -> Result<(), ValidationError<'i>> {
-        if self.matches(instance) {
-            return Ok(());
-        }
-        Err(ValidationError::custom(format!(
-            "{instance} is not a GTS id under {X_GTS_REF} '{}'",
-            self.declared
-        )))
-    }
-
-    fn is_valid(&self, instance: &Value) -> bool {
-        self.matches(instance)
+        self.validator
+            .validate(document)
+            .map_err(|error| match error {
+                PayloadValidationError::Constraints(violations) => violations,
+                PayloadValidationError::References(violations) => violations
+                    .into_iter()
+                    .map(|v| format!("{}: {}", v.field_path, v.reason))
+                    .collect(),
+                PayloadValidationError::Unexplained(reason) => vec![reason],
+            })
     }
 }
 
 impl fmt::Debug for CompiledContract {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("CompiledContract")
-            .field("type_id", &self.type_id)
+            .field("type_id", self.type_id())
             .finish_non_exhaustive()
     }
 }
@@ -390,6 +290,11 @@ impl ProjectionContractCatalog {
     /// The configured subject projections.
     pub fn subject_projections(&self) -> impl Iterator<Item = &SubjectProjectionContract> {
         self.subjects.values()
+    }
+
+    /// The configured resource projections.
+    pub fn resource_projections(&self) -> impl Iterator<Item = &ResourceProjectionContract> {
+        self.resources.values()
     }
 
     /// The admitted metrics.

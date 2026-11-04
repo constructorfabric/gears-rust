@@ -152,7 +152,7 @@ pub struct IdpProvisionTenantRequest {
     /// `gts.cf.core.am.tenant_type.v1~cf.core.am.customer.v1~`).
     /// Typed via [`GtsTypeId`] rather than `String` so the field
     /// is self-describing for plugin authors and surfaces with
-    /// `format: gts-schema-id` in any generated JSON Schema. The
+    /// `x-gts-type-ref: "gts.*"` in any generated JSON Schema. The
     /// wire shape stays a string; AM-side consumers run full chain
     /// validation by passing the value through `gts::GtsId::try_new`.
     pub tenant_type: GtsTypeId,

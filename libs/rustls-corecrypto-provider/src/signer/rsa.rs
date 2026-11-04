@@ -217,7 +217,7 @@ const RSA_ENCRYPTION_OID: pkcs8::ObjectIdentifier =
 /// algorithm OID is not rsaEncryption (e.g. an EC key would be rejected
 /// here and the dispatcher would then fall through to the EC path).
 fn extract_rsa_pkcs1_from_pkcs8(pkcs8_der: &[u8]) -> Result<Zeroizing<Vec<u8>>, Error> {
-    let info = pkcs8::PrivateKeyInfo::try_from(pkcs8_der)
+    let info = pkcs8::PrivateKeyInfoRef::try_from(pkcs8_der)
         .map_err(|e| Error::General(format!("PKCS#8 parse failed: {e}")))?;
     if info.algorithm.oid != RSA_ENCRYPTION_OID {
         return Err(Error::General(format!(
@@ -225,7 +225,7 @@ fn extract_rsa_pkcs1_from_pkcs8(pkcs8_der: &[u8]) -> Result<Zeroizing<Vec<u8>>, 
             info.algorithm.oid
         )));
     }
-    Ok(Zeroizing::new(info.private_key.to_vec()))
+    Ok(Zeroizing::new(info.private_key.as_bytes().to_vec()))
 }
 
 #[cfg(test)]

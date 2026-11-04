@@ -1,4 +1,25 @@
-use std::collections::HashMap;
+//! The direct producer: stamps each event's producer metadata from a local
+//! chain head per `(producer_id, topic)` and publishes it straight to the
+//! broker.
+//!
+//! The broker accepts a single writer per `producer_id` (ADR-0004 "Producer
+//! Concurrency"), and a `Producer` is that writer, so it serializes its own
+//! concurrent publishes per topic. Each topic has a `tokio::sync::Mutex`,
+//! held from stamping through the broker's answer to the advance of the head.
+//! Without it, two concurrent publishes would read the same head, carry the
+//! same numbers, and the broker would store one and answer the other
+//! `Duplicate`. A failed publish drops the lock without advancing, so the
+//! next publish re-stamps the same numbers. If the failed publish was stored
+//! after all, the re-stamped event is answered `Duplicate` and lost (tracked
+//! in #5660). Topics do not share a lock, so they still publish in parallel.
+//!
+//! Lock order: the topic locks first, then the `sequence_state` `RwLock`. A
+//! batch takes every topic lock it needs in ascending topic order, so two
+//! batches cannot deadlock. The `RwLock` is a `std` lock, taken only for a
+//! synchronous read or write: it is never held across an await, and never
+//! while waiting for a topic lock.
+
+use std::collections::{BTreeSet, HashMap};
 use std::marker::PhantomData;
 use std::sync::Arc;
 
@@ -20,9 +41,13 @@ pub struct Has;
 
 type ProducerBuilderState<Broker, Ctx, Identity, Dedup, Topics, Patterns> =
     PhantomData<(Broker, Ctx, Identity, Dedup, Topics, Patterns)>;
-type ProducerSequenceKey = (ProducerId, String, u32);
+/// A producer's chain is kept per `(producer_id, topic)` (ADR-0004 "Chain Scope").
+type ProducerSequenceKey = (ProducerId, String);
 pub(super) type ProducerSequenceCursor = HashMap<ProducerSequenceKey, i64>;
 type SharedProducerSequenceCursor = Arc<std::sync::RwLock<ProducerSequenceCursor>>;
+/// Keyed by topic alone: a `Producer`'s `producer_id` is fixed, so the topic
+/// names its chain.
+type TopicPublishLocks = HashMap<String, tokio::sync::Mutex<()>>;
 
 pub struct ProducerBuilder<
     Broker = Missing,
@@ -39,7 +64,6 @@ pub struct ProducerBuilder<
     topics: Vec<String>,
     event_type_patterns: Vec<String>,
     validation_timing: ValidationTiming,
-    broker_partitions: u32,
     _state: ProducerBuilderState<Broker, Ctx, Identity, Dedup, Topics, Patterns>,
 }
 
@@ -54,7 +78,6 @@ impl ProducerBuilder {
             topics: Vec::new(),
             event_type_patterns: Vec::new(),
             validation_timing: ValidationTiming::Eager,
-            broker_partitions: super::schema_cache::DEFAULT_BROKER_PARTITIONS,
             _state: PhantomData,
         }
     }
@@ -71,7 +94,6 @@ impl<B, C, I, D, T, P> ProducerBuilder<B, C, I, D, T, P> {
             topics: self.topics,
             event_type_patterns: self.event_type_patterns,
             validation_timing: self.validation_timing,
-            broker_partitions: self.broker_partitions,
             _state: PhantomData,
         }
     }
@@ -86,7 +108,6 @@ impl<B, C, I, D, T, P> ProducerBuilder<B, C, I, D, T, P> {
             topics: self.topics,
             event_type_patterns: self.event_type_patterns,
             validation_timing: self.validation_timing,
-            broker_partitions: self.broker_partitions,
             _state: PhantomData,
         }
     }
@@ -101,7 +122,6 @@ impl<B, C, I, D, T, P> ProducerBuilder<B, C, I, D, T, P> {
             topics: self.topics,
             event_type_patterns: self.event_type_patterns,
             validation_timing: self.validation_timing,
-            broker_partitions: self.broker_partitions,
             _state: PhantomData,
         }
     }
@@ -119,7 +139,6 @@ impl<B, C, I, D, T, P> ProducerBuilder<B, C, I, D, T, P> {
             topics: self.topics,
             event_type_patterns: self.event_type_patterns,
             validation_timing: self.validation_timing,
-            broker_partitions: self.broker_partitions,
             _state: PhantomData,
         }
     }
@@ -138,7 +157,6 @@ impl<B, C, I, D, T, P> ProducerBuilder<B, C, I, D, T, P> {
             topics: topics.into_iter().map(Into::into).collect(),
             event_type_patterns: self.event_type_patterns,
             validation_timing: self.validation_timing,
-            broker_partitions: self.broker_partitions,
             _state: PhantomData,
         }
     }
@@ -157,7 +175,6 @@ impl<B, C, I, D, T, P> ProducerBuilder<B, C, I, D, T, P> {
             topics: self.topics,
             event_type_patterns: patterns.into_iter().map(Into::into).collect(),
             validation_timing: self.validation_timing,
-            broker_partitions: self.broker_partitions,
             _state: PhantomData,
         }
     }
@@ -167,24 +184,30 @@ impl<B, C, I, D, T, P> ProducerBuilder<B, C, I, D, T, P> {
         self.validation_timing = ValidationTiming::Lazy;
         self
     }
-
-    /// Partition count the producer assumes the broker gives every topic it
-    /// publishes to. It feeds the partition a producer-state chain is keyed by and
-    /// the partition hint an outbox envelope carries. A topic does not report a
-    /// count, so a producer whose broker is configured away from the default must
-    /// declare it here.
-    #[must_use]
-    pub fn broker_partitions(mut self, partitions: u32) -> Self {
-        self.broker_partitions = partitions;
-        self
-    }
 }
 
 impl ProducerBuilder<Has, Has, Has, Has, Has, Has> {
+    /// Builds the producer and prepares every declared topic and event type
+    /// now, whatever the validation timing.
+    ///
+    /// # Errors
+    ///
+    /// [`EventBrokerError::InvalidProducerOptions`] for an empty or blank topic
+    /// or event-type pattern list, a blank identity source, or a registering
+    /// deduplication in stateless mode; otherwise whatever preparing the
+    /// topics and event types, registering the producer, or reading its
+    /// cursors fails with.
     pub async fn prepare_all(self) -> Result<Producer, EventBrokerError> {
         self.build_inner(true).await
     }
 
+    /// Builds the producer. Unless [`lazy_validation`](Self::lazy_validation)
+    /// was set, every declared topic and event type is prepared now.
+    ///
+    /// # Errors
+    ///
+    /// As [`prepare_all`](Self::prepare_all), except that a lazy builder
+    /// reports a preparation error on the first publish of the event type.
     pub async fn build(self) -> Result<Producer, EventBrokerError> {
         let prepare_all = matches!(self.validation_timing, ValidationTiming::Eager);
         self.build_inner(prepare_all).await
@@ -202,7 +225,7 @@ impl ProducerBuilder<Has, Has, Has, Has, Has, Has> {
         identity.validate()?;
         deduplication.validate()?;
 
-        let cache = Arc::new(ProducerSchemaCache::new(self.broker_partitions));
+        let cache = Arc::new(ProducerSchemaCache::new());
         if prepare_all {
             cache
                 .prepare_all(&broker, &ctx, &self.topics, &self.event_type_patterns)
@@ -222,6 +245,11 @@ impl ProducerBuilder<Has, Has, Has, Has, Has, Has> {
             DirectDeduplication::Reuse { mode, producer_id } => (Some(producer_id), mode),
         };
 
+        let publish_locks = self
+            .topics
+            .iter()
+            .map(|topic| (topic.clone(), tokio::sync::Mutex::new(())))
+            .collect();
         let producer = Producer {
             broker,
             ctx,
@@ -233,12 +261,19 @@ impl ProducerBuilder<Has, Has, Has, Has, Has, Has> {
             validation_timing: self.validation_timing,
             cache,
             sequence_state: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            publish_locks,
         };
         producer.prime_sequence_state().await?;
         Ok(producer)
     }
 }
 
+/// Publishes typed events straight to the broker.
+///
+/// Concurrent publishes on one `Producer` are serialized per topic, so each
+/// one is stamped after the previous one on its topic was answered; different
+/// topics publish in parallel. Stateless producers stamp nothing and take no
+/// lock.
 pub struct Producer {
     broker: Arc<dyn EventBrokerApi>,
     ctx: SecurityContext,
@@ -250,14 +285,27 @@ pub struct Producer {
     validation_timing: ValidationTiming,
     cache: Arc<ProducerSchemaCache>,
     sequence_state: SharedProducerSequenceCursor,
+    publish_locks: TopicPublishLocks,
 }
 
 impl Producer {
+    /// Starts building a direct producer.
     #[must_use]
     pub fn builder() -> ProducerBuilder {
         ProducerBuilder::new()
     }
 
+    /// Prepares `E`'s event type and the declared topics, so a lazy
+    /// producer's first publish of `E` looks nothing up.
+    ///
+    /// # Errors
+    ///
+    /// [`EventBrokerError::EventTypeNotDeclared`] if `E` matches no declared
+    /// pattern, [`EventBrokerError::TopicNotFound`] for a declared topic the
+    /// broker does not list, [`EventBrokerError::TypeNotInDeclaredTopic`] if
+    /// `E` belongs to an undeclared topic, [`EventBrokerError::Internal`] if
+    /// its data schema does not compile; otherwise whatever the broker's
+    /// lookups fail with.
     pub async fn prepare<E: TypedEvent>(&self) -> Result<(), EventBrokerError> {
         self.cache
             .prepare_one(
@@ -270,6 +318,17 @@ impl Producer {
             .await
     }
 
+    /// Prepares every event type the declared patterns match, and the
+    /// declared topics.
+    ///
+    /// # Errors
+    ///
+    /// [`EventBrokerError::TopicNotFound`] for a declared topic the broker
+    /// does not list, [`EventBrokerError::EventTypeUnknown`] if the patterns
+    /// match no event type, [`EventBrokerError::TypeNotInDeclaredTopic`] if a
+    /// matched type belongs to an undeclared topic,
+    /// [`EventBrokerError::Internal`] if a matched type's data schema does not
+    /// compile; otherwise whatever the broker's lookups fail with.
     pub async fn prepare_all(&self) -> Result<(), EventBrokerError> {
         self.cache
             .prepare_all(
@@ -281,10 +340,23 @@ impl Producer {
             .await
     }
 
+    /// The broker-registered id stamped on this producer's events; `None` for
+    /// a stateless producer.
     pub fn producer_id(&self) -> Option<ProducerId> {
         self.producer_id
     }
 
+    /// Publishes `event` through [`EventBrokerApi::publish`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the error of preparing `event` or of the broker's publish, or
+    /// [`EventBrokerError::Internal`] on a broken internal invariant (no
+    /// publish lock for the event's declared topic).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the producer's sequence-state lock is poisoned.
     pub async fn publish<E: TypedEvent>(
         &self,
         event: E,
@@ -292,6 +364,21 @@ impl Producer {
         self.publish_inner(event, false).await
     }
 
+    /// Publishes `event` through [`EventBrokerApi::publish_sync`]. Until #5655
+    /// neither broker confirms the durable write: the REST client publishes
+    /// asynchronously and reports the server's status, and the in-process
+    /// `LocalBroker` inherits the trait default that delegates to `publish`;
+    /// both report `Accepted` or `Duplicate`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error of preparing `event` or of the broker's publish, or
+    /// [`EventBrokerError::Internal`] on a broken internal invariant (no
+    /// publish lock for the event's declared topic).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the producer's sequence-state lock is poisoned.
     pub async fn publish_persisted<E: TypedEvent>(
         &self,
         event: E,
@@ -299,36 +386,60 @@ impl Producer {
         self.publish_inner(event, true).await
     }
 
+    /// Publishes `events` as one all-or-nothing batch through
+    /// [`EventBrokerApi::publish_batch`]. An empty `events` publishes nothing
+    /// and returns no outcomes.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error of preparing an event or of the broker's publish, or
+    /// [`EventBrokerError::Internal`] on a broken internal invariant (no
+    /// publish lock for an event's declared topic).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the producer's sequence-state lock is poisoned.
     pub async fn publish_batch<E: TypedEvent>(
         &self,
         events: Vec<E>,
     ) -> Result<Vec<IngestOutcome>, EventBrokerError> {
+        if events.is_empty() {
+            return Ok(Vec::new());
+        }
         let mut prepared = Vec::with_capacity(events.len());
+        for event in events {
+            prepared.push(self.prepare_wire_event(event).await?);
+        }
+        let mut publish_guards = Vec::new();
+        if self.producer_id.is_some() {
+            let topics = prepared
+                .iter()
+                .map(|prepared| prepared.topic.as_str())
+                .collect::<BTreeSet<_>>();
+            for topic in topics {
+                publish_guards.push(self.publish_lock(topic)?.lock().await);
+            }
+        }
         let mut batch_sequence_state = self
             .sequence_state
             .read()
             .expect("producer sequence state lock poisoned")
             .clone();
-        for event in events {
-            let event = self
-                .prepare_wire_event_with_meta(event, |topic, partition| {
-                    self.producer_meta_from_cursor(&batch_sequence_state, topic, partition)
-                })
-                .await?;
+        for prepared in &mut prepared {
+            prepared.event.meta =
+                self.producer_meta_from_cursor(&batch_sequence_state, &prepared.topic);
             advance_cursor(
                 &mut batch_sequence_state,
-                &event.topic,
-                event.broker_partition,
-                event.event.meta.as_ref(),
+                &prepared.topic,
+                prepared.event.meta.as_ref(),
             );
-            prepared.push(event);
         }
         let wire_events = prepared
             .iter()
             .map(|prepared| prepared.event.clone())
             .collect::<Vec<_>>();
-        // A batch is all-or-nothing: the broker reports one outcome for the
-        // whole batch. Apply it to every prepared event's local chain state.
+        // A batch is all-or-nothing: its one outcome means the broker holds
+        // every event, so each one advances the local chain.
         let outcome = self.broker.publish_batch(&self.ctx, &wire_events).await?;
         for prepared in &prepared {
             self.advance_after_acceptance(prepared, outcome).await;
@@ -336,6 +447,13 @@ impl Producer {
         Ok(vec![outcome; prepared.len()])
     }
 
+    /// Resets this producer's chain on the broker, over `scope`.
+    ///
+    /// # Errors
+    ///
+    /// [`EventBrokerError::Internal`] if called on a stateless producer, a
+    /// caller error since it has no chain; otherwise whatever the broker's
+    /// reset fails with.
     pub async fn reset_chain(&self, scope: ResetScope<'_>) -> Result<(), EventBrokerError> {
         let producer_id = self.producer_id.ok_or_else(|| {
             EventBrokerError::Internal("reset_chain called on a stateless producer".to_owned())
@@ -350,7 +468,12 @@ impl Producer {
         event: E,
         persisted: bool,
     ) -> Result<IngestOutcome, EventBrokerError> {
-        let prepared = self.prepare_wire_event(event).await?;
+        let mut prepared = self.prepare_wire_event(event).await?;
+        let _publish_guard = match self.producer_id {
+            Some(_) => Some(self.publish_lock(&prepared.topic)?.lock().await),
+            None => None,
+        };
+        prepared.event.meta = self.producer_meta(&prepared.topic);
         let outcome = if persisted {
             self.broker.publish_sync(&self.ctx, &prepared.event).await?
         } else {
@@ -360,20 +483,11 @@ impl Producer {
         Ok(outcome)
     }
 
+    /// Prepares the event unstamped: its producer metadata is set only under
+    /// the topic's publish lock.
     async fn prepare_wire_event<E: TypedEvent>(
         &self,
         event: E,
-    ) -> Result<super::event_factory::PreparedEvent, EventBrokerError> {
-        self.prepare_wire_event_with_meta(event, |topic, partition| {
-            self.producer_meta(topic, partition)
-        })
-        .await
-    }
-
-    async fn prepare_wire_event_with_meta<E: TypedEvent>(
-        &self,
-        event: E,
-        meta_for_partition: impl FnOnce(&str, u32) -> Option<ProducerMeta>,
     ) -> Result<super::event_factory::PreparedEvent, EventBrokerError> {
         self.cache
             .ensure_declared(&self.event_type_patterns, E::TYPE_ID)
@@ -383,63 +497,67 @@ impl Producer {
         {
             self.prepare::<E>().await?;
         }
-        prepare_event(
-            &self.cache,
-            &self.identity,
-            &self.ctx,
-            event,
-            meta_for_partition,
-        )
-        .await
+        prepare_event(&self.cache, &self.identity, &self.ctx, event).await
     }
 
-    fn producer_meta(&self, topic: &str, partition: u32) -> Option<ProducerMeta> {
+    /// A miss is an internal fault: preparing an event already checked that its
+    /// topic is declared, and every declared topic has a lock.
+    fn publish_lock(&self, topic: &str) -> Result<&tokio::sync::Mutex<()>, EventBrokerError> {
+        self.publish_locks.get(topic).ok_or_else(|| {
+            EventBrokerError::Internal(format!("no publish lock for the declared topic {topic}"))
+        })
+    }
+
+    fn producer_meta(&self, topic: &str) -> Option<ProducerMeta> {
         let sequence_state = self
             .sequence_state
             .read()
             .expect("producer sequence state lock poisoned");
-        self.producer_meta_from_cursor(&sequence_state, topic, partition)
+        self.producer_meta_from_cursor(&sequence_state, topic)
     }
 
     fn producer_meta_from_cursor(
         &self,
         cursor: &ProducerSequenceCursor,
         topic: &str,
-        partition: u32,
     ) -> Option<ProducerMeta> {
         let producer_id = self.producer_id?;
         let last = cursor
-            .get(&(producer_id, topic.to_owned(), partition))
+            .get(&(producer_id, topic.to_owned()))
             .copied()
             .unwrap_or(-1);
-        producer_meta_for_last(self.mode, producer_id, last, partition)
+        producer_meta_for_last(self.mode, producer_id, last)
     }
 
-    async fn advance_after_acceptance(
+    /// Moves the local chain up to `prepared`'s sequence once the broker
+    /// holds the event. Every outcome means it does: a `Duplicate` says the
+    /// broker already holds this sequence or a later one, so staying behind
+    /// would re-stamp every following event with these numbers and have each
+    /// dropped as one more duplicate. The caller holds the topic's publish
+    /// lock, so `prepared` carries the head's next sequence; the state only
+    /// ever moves forward.
+    pub(super) async fn advance_after_acceptance(
         &self,
         prepared: &super::event_factory::PreparedEvent,
         outcome: IngestOutcome,
     ) {
-        if !matches!(outcome, IngestOutcome::Accepted | IngestOutcome::Persisted) {
-            return;
-        }
+        // Irrefutable, so a new outcome has to decide whether it advances.
+        let (IngestOutcome::Accepted | IngestOutcome::Persisted | IngestOutcome::Duplicate) =
+            outcome;
         let Some(meta) = &prepared.event.meta else {
             return;
         };
         let (Some(producer_id), Some(sequence)) = (meta.producer_id, meta.sequence) else {
             return;
         };
-        self.sequence_state
+        let mut sequence_state = self
+            .sequence_state
             .write()
-            .expect("producer sequence state lock poisoned")
-            .insert(
-                (
-                    ProducerId(producer_id),
-                    prepared.topic.clone(),
-                    prepared.broker_partition,
-                ),
-                sequence,
-            );
+            .expect("producer sequence state lock poisoned");
+        let last = sequence_state
+            .entry((ProducerId(producer_id), prepared.topic.clone()))
+            .or_insert(sequence);
+        *last = (*last).max(sequence);
     }
 
     async fn prime_sequence_state(&self) -> Result<(), EventBrokerError> {
@@ -453,14 +571,11 @@ impl Producer {
         self.sequence_state
             .write()
             .expect("producer sequence state lock poisoned")
-            .extend(cursors.topics.into_iter().flat_map(|topic| {
-                let topic_id = topic.topic.into_string();
-                topic.partitions.into_iter().map(move |p| {
-                    (
-                        (producer_id, topic_id.clone(), p.partition),
-                        p.last_sequence,
-                    )
-                })
+            .extend(cursors.topics.into_iter().map(|topic| {
+                (
+                    (producer_id, topic.topic.into_string()),
+                    topic.last_sequence,
+                )
             }));
         Ok(())
     }
@@ -469,7 +584,6 @@ impl Producer {
 pub(super) fn advance_cursor(
     cursor: &mut ProducerSequenceCursor,
     topic: &str,
-    partition: u32,
     meta: Option<&ProducerMeta>,
 ) {
     let Some(meta) = meta else {
@@ -478,17 +592,13 @@ pub(super) fn advance_cursor(
     let (Some(producer_id), Some(sequence)) = (meta.producer_id, meta.sequence) else {
         return;
     };
-    cursor.insert(
-        (ProducerId(producer_id), topic.to_owned(), partition),
-        sequence,
-    );
+    cursor.insert((ProducerId(producer_id), topic.to_owned()), sequence);
 }
 
 pub(super) fn producer_meta_for_last(
     mode: ProducerMode,
     producer_id: ProducerId,
     last: i64,
-    partition: u32,
 ) -> Option<ProducerMeta> {
     match mode {
         ProducerMode::Stateless => None,
@@ -497,14 +607,12 @@ pub(super) fn producer_meta_for_last(
             producer_id: Some(producer_id.0),
             previous: None,
             sequence: Some(last + 1),
-            partition_hint: Some(partition),
         }),
         ProducerMode::Chained => Some(ProducerMeta {
             version: 1,
             producer_id: Some(producer_id.0),
             previous: Some(last),
             sequence: Some(last + 1),
-            partition_hint: Some(partition),
         }),
     }
 }

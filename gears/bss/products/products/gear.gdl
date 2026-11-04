@@ -1,0 +1,33 @@
+gdl_version = "1.0"
+
+# Every GDL field: https://github.com/constructorfabric/gearbox/blob/main/docs/gdl.md
+#
+# Gearbox product metadata for the bss-products gear.
+#
+# Projected from #[toolkit::gear]: id, runtime_caps (db, rest, stateful),
+# colocated_deps (authz-resolver, types-registry, usage-collector), lifecycle;
+# the ProductCatalogClientV1 contract from #[toolkit::provides].
+
+gear(
+    deps = ["authz-resolver", "types-registry", "usage-collector"],
+    source = git(url = "https://github.com/constructorfabric/gears-rust", path = "gears/bss/products/products"),
+    maturity = "preview",
+    implementation = "in-progress",
+    name = "Product & SKU Management",
+    description = "Multi-tenant catalog registry for products, SKUs, taxonomy, and versioned snapshots.",
+    category = "bss",
+    visibility = "internal",
+
+    package = cargo(
+        crate_name = "cf-gears-bss-products",
+        lib = "bss_products",
+        path = ".",
+    ),
+    sdk = cargo(
+        crate_name = "cf-gears-bss-products-sdk",
+        lib = "bss_products_sdk",
+        path = "../products-sdk",
+    ),
+
+    config_schema = config(),
+)

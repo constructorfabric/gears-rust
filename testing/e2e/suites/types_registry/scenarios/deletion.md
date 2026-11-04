@@ -36,7 +36,7 @@ Successful deletion increments `resource_version` once and leaves a readable tom
   - [TR-DEL-208 — A failed dependant deletion leaves its target blocked](#tr-del-208--a-failed-dependant-deletion-leaves-its-target-blocked)
   - [TR-DEL-209 — Remove a blocker and retry deletion of its target](#tr-del-209--remove-a-blocker-and-retry-deletion-of-its-target)
   - [TR-DEL-210 — Only the current revision's references protect a target](#tr-del-210--only-the-current-revisions-references-protect-a-target)
-  - [TR-DEL-211 — An x-gts-ref constraint does not protect its named entity](#tr-del-211--an-x-gts-ref-constraint-does-not-protect-its-named-entity)
+  - [TR-DEL-211 — An entity reference does not protect its named entity](#tr-del-211--an-entity-reference-does-not-protect-its-named-entity)
   - [TR-DEL-212 — Count direct dependants rather than the transitive closure](#tr-del-212--count-direct-dependants-rather-than-the-transitive-closure)
   - [TR-DEL-213 — Multiple dependency kinds do not multiply dependent entities](#tr-del-213--multiple-dependency-kinds-do-not-multiply-dependent-entities)
 - [Request identity and idempotency](#request-identity-and-idempotency)
@@ -300,15 +300,15 @@ Successful deletion increments `resource_version` once and leaves a readable tom
 
 **Then:** `person_schema` succeeds; `replacement_person_schema` fails `has_registered_dependents`. `person_referrer_schema` remains active at its revised version referring to `replacement_person_schema`. `person_referrer_schema`'s retained historical reference to `person_schema` does not block deletion of `person_schema`.
 
-### TR-DEL-211 — An x-gts-ref constraint does not protect its named entity
+### TR-DEL-211 — An entity reference does not protect its named entity
 
-**Fixtures:** [person_schema](../fixtures/deletion/person_schema.json), [person_x_gts_ref_schema](../fixtures/deletion/person_x_gts_ref_schema.json).
+**Fixtures:** [person_schema](../fixtures/deletion/person_schema.json), [person_entity_ref_schema](../fixtures/deletion/person_entity_ref_schema.json).
 
-**Given:** register `person_schema` and `person_x_gts_ref_schema`. The latter names `person_schema` through `x-gts-ref` on its string-valued `payload.person` property and has no `$ref`, derivation or conformance dependency on it.
+**Given:** register `person_schema` and `person_entity_ref_schema`. The latter names `person_schema` through the entity reference `x-gts-instance-ref` on its string-valued `payload.person` property and has no `$ref`, derivation or conformance dependency on it.
 
 **When:** delete `person_schema`.
 
-**Then:** `person_schema` succeeds. `person_x_gts_ref_schema` stays active with unchanged content, effective documents, resource version and same-projection ETag. The constraint does not promise target availability or cause deletion-time refresh.
+**Then:** `person_schema` succeeds. `person_entity_ref_schema` stays active with unchanged content, effective documents, resource version and same-projection ETag. The constraint does not promise target availability or cause deletion-time refresh.
 
 ### TR-DEL-212 — Count direct dependants rather than the transitive closure
 

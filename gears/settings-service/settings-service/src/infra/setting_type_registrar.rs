@@ -1,4 +1,3 @@
-// Created: 2026-09-06 by Virtuozzo International GmbH
 // @cpt-dod:cpt-cf-settings-service-dod-module-contributions-type:p1
 //! Registration of a setting's own type in the types registry.
 

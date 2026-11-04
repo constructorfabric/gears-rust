@@ -1,7 +1,0 @@
-[gear]
-name = "Contracts & Agreements"
-description = "System of Record for signed commercial terms, negotiated prices, and commitments."
-category = "bss"
-is_plugin = false
-has_plugins = false
-has_extension_point = true

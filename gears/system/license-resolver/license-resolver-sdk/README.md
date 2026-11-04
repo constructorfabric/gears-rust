@@ -100,7 +100,7 @@ A trait on the Resource contract type listing the Subject **contract** types
 (i.e. legal `subject.type` values) it may be checked against. It is enforced
 twice:
 
-- **At registration** — each entry carries an `x-gts-ref` to
+- **At registration** — each entry carries an `x-gts-type-ref` to
   `gts.cf.core.lic.subj.v1~`, so the types registry checks the *shape* of every
   id: pointing it at a *domain* type by mistake
   (`gts.cf.genai.llm_gateway.user.v1~`) fails there. Only the shape — a

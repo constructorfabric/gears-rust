@@ -13,7 +13,7 @@
 //! only for the contracts the catalogue selects.
 
 use async_trait::async_trait;
-use gts::{GtsInstanceId, GtsTypeId};
+use gts::{CompilePayloadValidatorError, GtsInstanceId, GtsTypeId, PayloadValidator};
 use quota_enforcement_sdk::OwnedDefinition;
 use serde_json::Value;
 use toolkit_macros::domain_model;
@@ -32,10 +32,13 @@ pub struct RegisteredType {
     pub ancestors: Vec<GtsTypeId>,
     /// Chain-merged trait values. `Value::Null` when the chain declares none.
     pub effective_traits: Value,
-    /// The type body with every `#/` and `gts://` `$ref` inlined. `$id`,
-    /// `$schema`, and `x-gts-ref` are kept: the dialect and the GTS value
-    /// constraints are part of the contract.
+    /// The resolved schema used by the payload validator and policy snapshots.
     pub schema: Value,
+    /// The payload validator compiled from the resolved type: every `#/` and
+    /// `gts://` `$ref` inlined, with the declared dialect and the GTS value
+    /// constraints kept as part of the contract. `Err` says why there is none,
+    /// for an abstract type or a schema that does not compile.
+    pub payload: Result<PayloadValidator, CompilePayloadValidatorError>,
 }
 
 impl RegisteredType {

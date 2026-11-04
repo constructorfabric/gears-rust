@@ -54,7 +54,7 @@ An `S3Backend` needs, at minimum, the following operations, all invoked from **a
 Two properties of this gear narrow the option space considerably:
 
 1. **Presigned URLs are not needed.** `cpt-cf-file-storage-adr-signed-url-transport` (ADR-0004) already gives the gear
-   its own Ed25519 signed-URL format, minted by the control plane and verified by the sidecar; the sidecar is the only
+   its own ECDSA P-256/SHA-256 signed-URL format, minted by the control plane and verified by the sidecar; the sidecar is the only
    component that ever holds S3 credentials and calls S3 directly with them. An S3 client's presigning surface — a
    headline feature of most S3 SDKs — is therefore irrelevant to this decision.
 2. **`reqwest` 0.13 (rustls 0.23) is already a dependency** of this crate — it is what the sidecar uses today for its
@@ -399,4 +399,4 @@ This decision directly addresses the following requirements or design elements:
 * `cpt-cf-file-storage-nfr-bandwidth` (ADR-0003) — the sidecar is the sole component that opens the chosen S3 client
   and moves bytes against it; the client choice does not change the sidecar/control-plane split
 * `cpt-cf-file-storage-adr-signed-url-transport` (ADR-0004) — confirms the chosen client's presigning features are
-  unused; the gear's own Ed25519 signed URLs remain the only credential surface exposed outside the sidecar
+  unused; the gear's own ECDSA P-256/SHA-256 signed URLs remain the only credential surface exposed outside the sidecar

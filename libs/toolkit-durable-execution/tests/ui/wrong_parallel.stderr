@@ -1,0 +1,15 @@
+error[E0277]: the trait bound `(toolkit_durable_execution::workflow::Step<u32, u32>, toolkit_durable_execution::workflow::Step<String, String>): workflow::sealed::Parallel<u32>` is not satisfied
+ --> tests/ui/wrong_parallel.rs:4:61
+  |
+4 |     let _ = WorkflowBuilder::<u32>::new("typed.invalid.v1").parallel((
+  |                                                             ^^^^^^^^ unsatisfied trait bound
+  |
+  = help: the trait `workflow::sealed::Parallel<u32>` is not implemented for `(toolkit_durable_execution::workflow::Step<u32, u32>, toolkit_durable_execution::workflow::Step<String, String>)`
+  = help: the following other types implement trait `workflow::sealed::Parallel<I>`:
+            (toolkit_durable_execution::workflow::Step<I, A>, toolkit_durable_execution::workflow::Step<I, B>)
+            (toolkit_durable_execution::workflow::Step<I, A>, toolkit_durable_execution::workflow::Step<I, B>, toolkit_durable_execution::workflow::Step<I, C>)
+            (toolkit_durable_execution::workflow::Step<I, A>, toolkit_durable_execution::workflow::Step<I, B>, toolkit_durable_execution::workflow::Step<I, C>, toolkit_durable_execution::workflow::Step<I, D>)
+            (toolkit_durable_execution::workflow::Step<I, A>, toolkit_durable_execution::workflow::Step<I, B>, toolkit_durable_execution::workflow::Step<I, C>, toolkit_durable_execution::workflow::Step<I, D>, toolkit_durable_execution::workflow::Step<I, E>)
+            (toolkit_durable_execution::workflow::Step<I, A>, toolkit_durable_execution::workflow::Step<I, B>, toolkit_durable_execution::workflow::Step<I, C>, toolkit_durable_execution::workflow::Step<I, D>, toolkit_durable_execution::workflow::Step<I, E>, toolkit_durable_execution::workflow::Step<I, F>)
+            (toolkit_durable_execution::workflow::Step<I, A>, toolkit_durable_execution::workflow::Step<I, B>, toolkit_durable_execution::workflow::Step<I, C>, toolkit_durable_execution::workflow::Step<I, D>, toolkit_durable_execution::workflow::Step<I, E>, toolkit_durable_execution::workflow::Step<I, F>, toolkit_durable_execution::workflow::Step<I, G>)
+            (toolkit_durable_execution::workflow::Step<I, A>, toolkit_durable_execution::workflow::Step<I, B>, toolkit_durable_execution::workflow::Step<I, C>, toolkit_durable_execution::workflow::Step<I, D>, toolkit_durable_execution::workflow::Step<I, E>, toolkit_durable_execution::workflow::Step<I, F>, toolkit_durable_execution::workflow::Step<I, G>, toolkit_durable_execution::workflow::Step<I, H>)

@@ -1,0 +1,33 @@
+gdl_version = "1.0"
+
+# Every GDL field: https://github.com/constructorfabric/gearbox/blob/main/docs/gdl.md
+#
+# Gearbox product metadata for the Nodes Registry.
+#
+# Projected from #[toolkit::gear]: id, runtime_caps (rest), and the client it
+# publishes (`nodes_registry_sdk::NodesRegistryClient`).
+#
+# No config_schema: the gear reads no configuration.
+
+gear(
+    deps = [],
+    source = git(url = "https://github.com/constructorfabric/gears-rust", path = "gears/system/nodes-registry/nodes-registry"),
+    maturity = "preview",
+    implementation = "in-progress",
+    name = "Nodes Registry",
+    description = "Registry of deployed gear nodes and their capabilities for discovery and management.",
+    category = "core-functionality",
+    visibility = "internal",
+
+    package = cargo(
+        crate_name = "cf-gears-nodes-registry",
+        lib = "nodes_registry",
+        path = ".",
+    ),
+
+    sdk = cargo(
+        crate_name = "cf-gears-nodes-registry-sdk",
+        lib = "nodes_registry_sdk",
+        path = "../nodes-registry-sdk",
+    ),
+)

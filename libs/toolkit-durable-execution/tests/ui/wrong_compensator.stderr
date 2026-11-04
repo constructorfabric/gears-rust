@@ -1,0 +1,15 @@
+error[E0308]: mismatched types
+ --> tests/ui/wrong_compensator.rs:5:21
+  |
+5 |         .compensate(Compensation::new(Duration::from_secs(1), |_, _: String, _: String| async { Ok(()) }));
+  |          ---------- ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ expected `Compensation<u32, String>`, found `Compensation<String, String>`
+  |          |
+  |          arguments to this method are incorrect
+  |
+  = note: expected struct `toolkit_durable_execution::Compensation<u32, String>`
+             found struct `toolkit_durable_execution::Compensation<String, String>`
+note: method defined here
+ --> src/workflow.rs
+  |
+  |     pub fn compensate(mut self, compensation: Compensation<I, O>) -> Self {
+  |            ^^^^^^^^^^

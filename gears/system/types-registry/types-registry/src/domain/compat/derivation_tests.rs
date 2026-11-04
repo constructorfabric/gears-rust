@@ -3,7 +3,7 @@
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
-use gts::{GtsId, GtsIdSegment};
+use gts::{GtsId, GtsIdSegment, X_GTS_INSTANCE_REF, X_GTS_TYPE_REF};
 use serde_json::{Value, json};
 use toolkit_gts::gts_id;
 
@@ -123,18 +123,21 @@ fn the_quarantine_names_the_immediate_base_and_not_a_deeper_ancestor() {
     );
 }
 
-/// `x-gts-ref` constrains an instance value and resolves nothing, so it is
-/// outside the rule — exactly, and through a pattern.
+/// An entity reference (`x-gts-type-ref` / `x-gts-instance-ref`) constrains an
+/// instance value and resolves nothing, so it is outside the rule — exactly,
+/// and through a pattern.
 #[test]
-fn an_x_gts_ref_naming_major_zero_is_outside_the_quarantine() {
-    for target in [UNSTABLE.to_owned(), format!("{UNSTABLE}*")] {
-        let mut content = schema(STABLE, &[]);
-        content["properties"] = json!({ "role": { "type": "string", "x-gts-ref": target } });
-        assert_eq!(
-            verdict(STABLE, &content),
-            Ok(()),
-            "x-gts-ref '{target}' is an instance-value constraint, not a dependency",
-        );
+fn an_entity_ref_naming_major_zero_is_outside_the_quarantine() {
+    for keyword in [X_GTS_TYPE_REF, X_GTS_INSTANCE_REF] {
+        for target in [UNSTABLE.to_owned(), format!("{UNSTABLE}*")] {
+            let mut content = schema(STABLE, &[]);
+            content["properties"] = json!({ "role": { "type": "string", keyword: target } });
+            assert_eq!(
+                verdict(STABLE, &content),
+                Ok(()),
+                "{keyword} '{target}' is an instance-value constraint, not a dependency",
+            );
+        }
     }
 }
 

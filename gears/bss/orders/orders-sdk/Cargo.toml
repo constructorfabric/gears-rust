@@ -1,0 +1,30 @@
+[package]
+name = "cf-gears-bss-orders-sdk"
+edition.workspace = true
+license.workspace = true
+description = "Orders shared contract and typed local SDK boundary"
+
+[lib]
+name = "bss_orders_sdk"
+
+[lints]
+workspace = true
+
+[dependencies]
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+time = { workspace = true }
+toolkit-security = { workspace = true }
+toolkit-canonical-errors = { workspace = true }
+toolkit-gts = { workspace = true }
+bss-pricing-sdk = { workspace = true }
+rust_decimal = { workspace = true }
+# Canonical decimal text for quantities and prices, shared with Pricing and Ledger (D-213).
+bss-money = { workspace = true, features = ["serde"] }
+
+[dev-dependencies]
+# Property tests over the schema-2 codec (approvals `cursor_tests.rs`, pricing-sdk `numeric_tests.rs`).
+proptest = { workspace = true }

@@ -9,6 +9,9 @@ repository.workspace = true
 rust-version.workspace = true
 publish = false
 
+[[bin]]
+name = "xtask"
+
 [dependencies]
 serde_json = { workspace = true }
 # `visit` on top of the workspace feature set: the pin checker walks the AST.
