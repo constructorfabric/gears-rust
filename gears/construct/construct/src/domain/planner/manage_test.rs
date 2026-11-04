@@ -19,7 +19,7 @@ use uuid::Uuid;
 
 use super::manage::ManageFacts;
 use super::processing::Written;
-use super::test_data::{AGENT, Chain, Contexts, Profiles, SUBJECT, TENANT, adding_rust};
+use super::test_data::{AGENT, CONSTRUCT, Chain, Contexts, Profiles, SUBJECT, TENANT, adding_rust};
 use crate::api::rest::dto::{CONVERSATION_LIMIT, MESSAGE_LIMIT};
 use crate::api::rest::routes::register_manage_route;
 use crate::domain::plan::Origin;
@@ -53,6 +53,21 @@ fn router_in(
 /// An application acting for the subject from its own tenant, naming the subject's tenant.
 fn app_router(chain: &Chain, resolver: Arc<dyn AuthZResolverApi>) -> Router {
     router_in(chain, resolver, AGENT, APP_HOME)
+}
+
+/// The subject calling for itself, and an application calling for it in the subject's tenant: the router of each,
+/// with the path it calls.
+fn both_callers(chain: &Chain) -> [(Router, String); 2] {
+    [
+        (
+            router(chain, Arc::new(AllowResolver), SUBJECT),
+            format!("/construct/v1/subjects/{SUBJECT}/facts/manage"),
+        ),
+        (
+            app_router(chain, Arc::new(AllowResolver)),
+            format!("/construct/v1/subjects/{SUBJECT}/facts/manage?tenant={TENANT}"),
+        ),
+    ]
 }
 
 /// Allows like [`AllowResolver`] but names only the tenant: a grant on every subject of the tenant.
@@ -434,17 +449,51 @@ async fn an_application_asks_the_policy_service_about_the_named_tenant() {
 }
 
 #[tokio::test]
-async fn an_application_without_a_processing_context_stores_nothing() {
-    let mut chain = Chain::new(adding_rust(1), &[Ok(Written::Stored)]);
+async fn the_subject_and_an_application_both_read_and_write_as_construct() {
+    let chain = Chain::new(adding_rust(2), &[Ok(Written::Stored)]);
+
+    for (caller, uri) in both_callers(&chain) {
+        let (status, body) = post_to(caller, &uri, &said("I also know Rust.")).await;
+
+        assert_eq!(status, StatusCode::OK, "{uri}: {body}");
+    }
+    assert_eq!(
+        chain.readers(),
+        [CONSTRUCT, CONSTRUCT],
+        "who read the profile"
+    );
+    assert_eq!(
+        chain.writer.writers(),
+        [CONSTRUCT, CONSTRUCT],
+        "who wrote the facts"
+    );
+    let origins: Vec<_> = chain
+        .writer
+        .plans()
+        .into_iter()
+        .map(|plan| plan.origin)
+        .collect();
+    assert_eq!(
+        origins,
+        [
+            Origin::Agent { agent: SUBJECT },
+            Origin::Agent { agent: AGENT }
+        ],
+        "the agent in the origin is still the caller"
+    );
+}
+
+#[tokio::test]
+async fn without_a_processing_context_no_caller_stores_anything() {
+    let mut chain = Chain::new(adding_rust(2), &[Ok(Written::Stored)]);
     chain.contexts = false;
 
-    let (status, body) = post_for_tenant(
-        app_router(&chain, Arc::new(AllowResolver)),
-        TENANT,
-        &said("I also know Rust."),
-    )
-    .await;
+    for (caller, uri) in both_callers(&chain) {
+        let (status, body) = post_to(caller, &uri, &said("I also know Rust.")).await;
 
-    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{uri}: {body}");
+    }
+    assert_eq!(chain.reads(), 0);
     assert!(chain.writer.plans().is_empty());
+    assert!(chain.model.requests().is_empty());
 }

@@ -311,9 +311,9 @@ impl Processing {
     }
 
     /// Takes what a subject told an agent through the planner, the checks, Admission and the writer, under the
-    /// caller's own context and scope. The deadline cuts off only the steps before the write: a write that started is
-    /// awaited, so the answer never says nothing changed while the write lands. A conflict plans again on a new read
-    /// while time is left, at most `max_reruns` times.
+    /// processing context and scope of the message's tenant. The deadline cuts off only the steps before the write: a
+    /// write that started is awaited, so the answer never says nothing changed while the write lands. A conflict plans
+    /// again on a new read while time is left, at most `max_reruns` times.
     ///
     /// # Errors
     ///

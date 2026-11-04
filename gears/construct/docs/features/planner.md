@@ -252,10 +252,10 @@ deployment configuration.
 
 - [ ] `p1` - **ID**: `cpt-cf-construct-algo-planner-manage`
 
-1. [ ] - `p1` - What a subject told an agent runs through the same chain as a record and answers at once. For the
-   subject itself it runs under the caller's own security context and scope; for an application or agent acting for
-   the subject it runs as Construct, under the processing context and scope of the subject's tenant, as a record does
-   - `inst-manage-chain`
+1. [ ] - `p1` - What a subject told an agent runs through the same chain as a record and answers at once. Whether the
+   caller is the subject itself or an application or agent acting for the subject, it runs as Construct, under the
+   processing context and scope of the subject's tenant, as a record does: the profile is read and the facts are
+   written by one identity - `inst-manage-chain`
 2. [ ] - `p1` - A deadline bounds the steps before the write: the profile read, the agent loop, the checks and
    Admission. Past it, nothing is stored and the answer is `timeout`. A write that started is awaited, so the answer
    never says nothing was stored while the write lands - `inst-manage-deadline`
@@ -421,8 +421,8 @@ record that fails with one content-free event.
 - [x] `p1` - **ID**: `cpt-cf-construct-dod-planner-manage`
 
 The system **MUST** take what a subject told an agent through the planner, the checks, Admission and the writer under
-the caller's context, **MUST** answer what it stored or why it stored nothing, and **MUST** cut off only the steps
-before the write at the deadline.
+the processing context of the subject's tenant, **MUST** answer what it stored or why it stored nothing, and **MUST**
+cut off only the steps before the write at the deadline.
 
 **Implements**:
 - `cpt-cf-construct-algo-planner-manage`
@@ -447,8 +447,9 @@ have the "manage facts" permission: the route asks the AuthZ resolver for `gts.c
 action `manage`, the subject as the resource id and the tenant as the context tenant (root only) and as the owner
 tenant, with constraints required. One constraint of the answer must name the tenant, and may narrow the grant to named
 subjects with a resource id filter: a constraint that names only the tenant covers every subject in it, and one that
-names no tenant, or a property Construct cannot decide, grants nothing. Its facts are then written as Construct's
-processing identity, and without one the call answers `501`. It **MUST** answer `404`, as for a subject that does not
+names no tenant, or a property Construct cannot decide, grants nothing. For the subject itself and for another caller
+alike, the profile is then read and the facts are written as Construct's processing identity in the subject's tenant,
+never as the caller, and without one the call answers `501`. It **MUST** answer `404`, as for a subject that does not
 exist, when the caller may not act for the subject: no "manage facts" permission from the AuthZ resolver, a policy
 scope that does not reach the subject in the tenant, or one that leaves the subject's settings out. It **MUST** answer
 `400`
@@ -471,7 +472,8 @@ without record processing answers `501`.
 `a_grant_that_names_only_the_tenant_covers_every_subject_in_it`,
 `an_application_without_a_grant_on_the_named_tenant_answers_as_a_subject_that_does_not_exist`,
 `an_application_asks_the_policy_service_about_the_named_tenant`,
-`an_application_without_a_processing_context_stores_nothing`,
+`the_subject_and_an_application_both_read_and_write_as_construct`,
+`without_a_processing_context_no_caller_stores_anything`,
 `a_tenant_constraint_reaches_every_subject_in_the_tenant_and_no_other_tenant`,
 `a_resource_id_filter_narrows_the_grant_to_the_subjects_it_names`,
 `a_constraint_without_the_tenant_or_with_another_property_reaches_nothing`,

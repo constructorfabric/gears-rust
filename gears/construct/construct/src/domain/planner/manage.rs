@@ -68,7 +68,7 @@ fn reaches(scope: &AccessScope, key: SubjectKey) -> bool {
 }
 
 impl ManageFacts {
-    /// `contexts` gives the context the facts are written as when the caller acts for another subject. `budget`
+    /// `contexts` gives the context the profile is read and the facts are written as, for every caller. `budget`
     /// bounds the steps before the write, so the answer fits the gateway's request timeout.
     #[must_use]
     pub fn new(
@@ -103,16 +103,17 @@ impl ManageFacts {
     /// Takes `message`, with the agent's recent `conversation`, for `subject_id` in `tenant`, or else in the caller's
     /// own tenant. The agent in the plan's origin is the caller the platform authenticated.
     ///
-    /// The subject itself manages its facts under its own context and scope. Any other caller, an application or an
-    /// agent acting for the subject, needs the permission to manage facts on the subject in that tenant, and the facts
-    /// are then written as Construct, through [`ProcessingContexts`], as record processing writes them.
+    /// The subject itself needs the permission to manage its own facts. Any other caller, an application or an agent
+    /// acting for the subject, needs the permission to manage facts on the subject in that tenant. For either caller the
+    /// profile is then read and the facts are written as Construct, through [`ProcessingContexts`], as record
+    /// processing reads and writes them, so one identity writes every profile.
     ///
     /// # Errors
     ///
     /// [`DomainError::Forbidden`] when the subject may not manage its own facts, and [`DomainError::NotVisible`] when
     /// another caller may not act for the subject in the tenant, both answered like a subject that does not exist.
     /// Not configured when the deployment does not configure record processing. The errors of
-    /// [`Processing::manage`].
+    /// [`ProcessingContexts::for_tenant`] and [`Processing::manage`].
     ///
     /// @cpt-dod:cpt-cf-construct-dod-planner-manage-route:p1
     #[tracing::instrument(skip_all, fields(caller = %ctx.subject_id(), subject_id = %subject_id))]
@@ -137,8 +138,7 @@ impl ManageFacts {
             conversation,
         };
         if ctx.subject_id() == subject_id && key.tenant_id == ctx.subject_tenant_id() {
-            let scope = self
-                .policy_enforcer
+            self.policy_enforcer
                 .access_scope_with(
                     ctx,
                     &SUBJECT_FACTS_RESOURCE,
@@ -148,13 +148,9 @@ impl ManageFacts {
                         .resource_property(pep_properties::OWNER_TENANT_ID, key.tenant_id),
                 )
                 .await?;
-            let processing = self.processing()?;
-            if message.message.trim().is_empty() {
-                return Ok(Managed::NothingStored(NothingStored::NoChange));
-            }
-            return processing.manage(ctx, &scope, &message, deadline).await;
+        } else {
+            self.authorize_for_subject(ctx, key).await?;
         }
-        self.authorize_for_subject(ctx, key).await?;
         let processing = self.processing()?;
         if message.message.trim().is_empty() {
             return Ok(Managed::NothingStored(NothingStored::NoChange));
