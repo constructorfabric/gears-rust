@@ -21,7 +21,8 @@ use crate::domain::subject_control::{SubjectControlEvent, SubjectControlService}
 use crate::domain::subject_settings::{SubjectKey, SubjectSettings, SubjectSettingsReader};
 use crate::test_support::{
     AllowResolver, DenyResolver, FixedSubjectSettings, MemoryProfile, MemoryWriter,
-    RecordingResolver, RecordingSubjectControlEvents, context_of, stored_fact, subject_control,
+    RecordingResolver, RecordingSubjectControlEvents, SlowResolver, context_of, stored_fact,
+    subject_control,
 };
 
 const OFF_AND_ERASING: SubjectSettings = SubjectSettings {
@@ -497,6 +498,37 @@ async fn a_read_past_the_budget_is_cut_off_and_nothing_is_written() {
         Duration::from_secs(20),
         "answered when the budget ran out, not when the read did"
     );
+    assert!(fixture.writer.plans().is_empty());
+    assert_eq!(fixture.profile.live().len(), 2, "nothing was deleted");
+    assert!(fixture.events.taken().is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_policy_service_that_outlasts_the_budget_is_cut_off_and_nothing_is_read_or_written() {
+    let fixture = Fixture::new(0);
+    let service = fixture
+        .service(Arc::new(SlowResolver(Duration::from_secs(30))))
+        .with_budget(Duration::from_secs(20));
+    let started = tokio::time::Instant::now();
+
+    let deleted = service
+        .delete(
+            &fixture.owner(),
+            fixture.subject,
+            &fixture.fact_id(Category::Skill),
+        )
+        .await;
+
+    assert!(
+        matches!(deleted, Err(DomainError::Unavailable(_))),
+        "{deleted:?}"
+    );
+    assert_eq!(
+        started.elapsed(),
+        Duration::from_secs(20),
+        "answered when the budget ran out, not when the policy service did"
+    );
+    assert!(fixture.profile.reads.lock().unwrap().is_empty());
     assert!(fixture.writer.plans().is_empty());
     assert_eq!(fixture.profile.live().len(), 2, "nothing was deleted");
     assert!(fixture.events.taken().is_empty());

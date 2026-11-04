@@ -128,6 +128,22 @@ impl AuthZResolverApi for DenyResolver {
     }
 }
 
+/// Answers as [`AllowResolver`] once `delay` has passed: a stalled policy
+/// service.
+pub struct SlowResolver(pub std::time::Duration);
+
+#[async_trait]
+impl AuthZResolverApi for SlowResolver {
+    async fn evaluate(
+        &self,
+        ctx: PlatformSecurityContext,
+        request: EvaluationRequest,
+    ) -> Result<EvaluationResponse, CanonicalError> {
+        tokio::time::sleep(self.0).await;
+        AllowResolver.evaluate(ctx, request).await
+    }
+}
+
 pub async fn inmem_db() -> Db {
     use sea_orm_migration::MigratorTrait;
 

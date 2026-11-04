@@ -287,8 +287,9 @@ impl SubjectControlService {
     /// within the budget.
     ///
     /// NOT cancel-safe: a drop after the writer stored the plan leaves the
-    /// fact deleted without its delete event. So the budget cuts off a read
-    /// and starts no write past its end, but never cuts off a write.
+    /// fact deleted without its delete event. So the budget cuts off the
+    /// permission check, the context and a read, and starts no write past its
+    /// end, but never cuts off a write.
     ///
     /// # Errors
     ///
@@ -307,8 +308,16 @@ impl SubjectControlService {
     ) -> Result<(), DomainError> {
         // @cpt-begin:cpt-cf-construct-algo-subject-control-delete:p1:inst-del-own
         let deadline = Instant::now() + self.budget;
-        let key = self.own(ctx, subject_id, actions::DELETE).await?;
-        let (construct, _) = self.ports.contexts.for_tenant(key.tenant_id).await?;
+        // The permission check and the context write nothing, so the budget
+        // may cut them off, like a read.
+        let (key, construct) =
+            tokio::time::timeout(deadline.saturating_duration_since(Instant::now()), async {
+                let key = self.own(ctx, subject_id, actions::DELETE).await?;
+                let (construct, _) = self.ports.contexts.for_tenant(key.tenant_id).await?;
+                Ok::<_, DomainError>((key, construct))
+            })
+            .await
+            .map_err(|_| out_of_time(fact_id))??;
         // @cpt-end:cpt-cf-construct-algo-subject-control-delete:p1:inst-del-own
         for attempt in 0..=self.max_reruns {
             // @cpt-begin:cpt-cf-construct-algo-subject-control-delete:p1:inst-del-read
