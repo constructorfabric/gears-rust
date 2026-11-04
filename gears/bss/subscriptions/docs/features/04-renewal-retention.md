@@ -69,7 +69,7 @@ Execute accepted term policy while keeping service access, obligation production
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-subscriptions-flow-renewal-grace-rnw`
 
-1. At the accepted term boundary, acquire the `(subscriptionId, currentTermSequence)` renewal fence and inspect pending non-renewal/cancel intent first. Its suppression wins over automatic and manual extension until explicitly resolved. An end-of-term cancellation requested while renewal is refused, or during grace or suspension, takes the grace end as its boundary; a payment success inside grace re-anchors it to the renewed term's end, and once grace is spent the boundary stays at the recorded grace end.
+1. At the accepted term boundary, acquire the `(subscriptionId, currentTermSequence)` renewal fence and inspect pending non-renewal/cancel intent first. Its suppression wins over automatic and manual extension until explicitly resolved. An end-of-term cancellation requested during refused renewal or renewal grace, including suspension from that episode, takes its recorded grace end as the boundary if that instant has not passed; payment success alone neither renews the term nor moves that cancellation. Renewal may proceed only after an authorized withdrawal or reschedule of the cancellation, confirmed before its charging cutoff under Foundation rules. Recheck that resolution in the renewal commit. Without it, keep the cancellation boundary at the recorded grace end and recover any payment through the financial owner; a late capture cannot override cancellation. Suspension without a renewal-grace episode uses the accepted term or billing-period boundary; it does not invent a grace deadline. If the selected boundary has already passed, confirm a new cutoff at or after the request time under the ordinary cancellation rules, without retroactive cancellation or erasing prior obligations.
 2. Evaluate explicitly bound Contract terms or versioned platform defaults and retain the selected provenance. Accepted order-line terms determine a new uncontracted subscription's fixed/evergreen term; ContractSigned alone never creates or binds a subscription.
 3. If auto-renew is disabled and no manual renew exists, execute end-of-term cancel with reason `term_expired`. Evergreen end-of-term means the end of the current commercial billing period.
 4. Stage the settlement evidence required by accepted terms (prescribed prepay payment or authorized postpay eligibility) and supported renewal bindings. Recheck current local state at application. Collection-pause bypass is deferred.
@@ -171,6 +171,8 @@ Release requires contracts/evidence for accepted post-stop and confirmed chargin
 
 ## 6. Acceptance Criteria
 
+- [ ] End-of-term cancellation is pending during renewal grace, then payment succeeds: the term and cancellation boundary stay unchanged until an authorized cancellation withdrawal/reschedule is confirmed before cutoff. That resolution and renewal race under the same guards; payment after applied cancellation cannot reopen service.
+
 - [ ] Concurrent auto/manual renewal and restart extend a term once; a pending cancellation prevents both.
 - [ ] Late payment resumes the correct blocked renewal using historical payer/composition; suspension intervals remain visible to Rating.
 - [ ] Payment resolution followed by Policy or another independent resume refusal voids the old debt timer, retains the place and never cancels the paid customer later through that stale timer.
@@ -221,7 +223,7 @@ Config changes and transport retries do not create a new occurrence or move its 
 
 Definitive financial refusal follows the frozen grace policy; unknown outcomes preserve recovery and do not authorize renewal. Grace starts at its accepted term boundary and does not restart on each failed retry. A blocked next-term recurring obligation is not emitted merely because grace began. Actual permitted service/usage and valid independent usage facts remain truthful under the accepted grace/billing posture. Collection-pause bypass and trial-grace inheritance are unavailable.
 
-If that same renewal later succeeds while still admissible, its term retains the original boundary; the receipt also records actual application time and the genuine served/suspended intervals. Rating receives those intervals and frozen terms, not fabricated continuous service. Any liability follows accepted historical service/posture; the callback cannot invent waiting-gap debt or backdate activation/resume. This continuity rule is distinct from a new trial-to-paid start.
+If that same renewal later succeeds while still admissible, including an explicitly resolved cancellation guard, its term retains the original boundary; the receipt also records actual application time and the genuine served/suspended intervals. Rating receives those intervals and frozen terms, not fabricated continuous service. Any liability follows accepted historical service/posture; the callback cannot invent waiting-gap debt or backdate activation/resume. This continuity rule is distinct from a new trial-to-paid start.
 
 Multiple elapsed boundaries cannot be skipped by one unqualified extension: each supported term occurrence needs its own evidence; unsupported historical catch-up stays pending for explicit recovery. An already cancelled subscription does not reopen because a payment arrives.
 
