@@ -87,6 +87,22 @@ async fn test_docx_parser_with_two_page_file() {
 
     let document = result.unwrap();
     assert!(!document.blocks.is_empty(), "Document should have blocks");
+    assert!(
+        document.blocks.iter().any(|b| matches!(
+            b,
+            file_parser::domain::ir::ParsedBlock::Heading { inlines, .. }
+                if inline_text(inlines).contains("Fran\u{e7}ais")
+        )),
+        "Document should contain a heading with 'Fran\u{e7}ais'"
+    );
+    assert!(
+        document.blocks.iter().any(|b| matches!(
+            b,
+            file_parser::domain::ir::ParsedBlock::Paragraph { inlines }
+                if inline_text(inlines).contains("The quick brown fox jumps over the lazy dog")
+        )),
+        "Document should contain the English pangram paragraph"
+    );
 }
 
 #[tokio::test]
@@ -106,6 +122,15 @@ async fn test_docx_parser_with_big_english_file() {
 
     let document = result.unwrap();
     assert!(!document.blocks.is_empty(), "Document should have blocks");
+    // The golden has no headings, only body paragraphs.
+    assert!(
+        document.blocks.iter().any(|b| matches!(
+            b,
+            file_parser::domain::ir::ParsedBlock::Paragraph { inlines }
+                if inline_text(inlines).contains("Video provides a powerful way to help you prove your point")
+        )),
+        "Document should contain the 'Video provides a powerful way' paragraph"
+    );
 }
 
 #[tokio::test]
@@ -154,10 +179,13 @@ async fn test_docx_parser_with_image_multilingual_file() {
 
     let document = result.unwrap();
     assert!(!document.blocks.is_empty(), "Document should have blocks");
-
-    eprintln!(
-        "Successfully parsed complex DOCX file with images ({} blocks)",
-        document.blocks.len()
+    assert!(
+        document.blocks.iter().all(|b| !matches!(
+            b,
+            file_parser::domain::ir::ParsedBlock::Image { src, .. }
+                if src.as_deref().is_none_or(|s| s.trim().is_empty())
+        )),
+        "Images without a source should be dropped"
     );
 }
 
