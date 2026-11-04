@@ -430,6 +430,70 @@ mod tests {
             ),
             "got {blocks:?}"
         );
+        assert_eq!(heading_of(&blocks[0]), (2, "X".to_owned()));
+    }
+
+    fn heading_of(block: &ParsedBlock) -> (u8, String) {
+        let ParsedBlock::Heading { level, inlines } = block else {
+            panic!("expected heading, got {block:?}");
+        };
+        let text = inlines
+            .iter()
+            .map(|i| match i {
+                Inline::Text { text, .. }
+                | Inline::Link { text, .. }
+                | Inline::Code { text, .. } => text.as_str(),
+            })
+            .collect();
+        (*level, text)
+    }
+
+    #[test]
+    fn group_heading_not_repeated_when_first_child_is_title() {
+        let doc = group_doc(NodeContent::Title {
+            text: "X".to_owned(),
+        });
+        let blocks = blocks_of(&doc);
+        let headings = blocks
+            .iter()
+            .filter(|b| matches!(b, ParsedBlock::Heading { .. }))
+            .count();
+        assert_eq!(headings, 1, "got {blocks:?}");
+    }
+
+    #[test]
+    fn group_heading_and_different_first_child_heading_both_emitted() {
+        let doc = group_doc(NodeContent::Heading {
+            level: 2,
+            text: "Y".to_owned(),
+        });
+        let blocks = blocks_of(&doc);
+        assert!(
+            matches!(
+                blocks.as_slice(),
+                [
+                    ParsedBlock::Heading { .. },
+                    ParsedBlock::Heading { .. },
+                    ParsedBlock::Paragraph { .. }
+                ]
+            ),
+            "got {blocks:?}"
+        );
+        assert_eq!(heading_of(&blocks[0]).1, "X");
+        assert_eq!(heading_of(&blocks[1]).1, "Y");
+    }
+
+    #[test]
+    fn group_without_children_emits_single_heading() {
+        let mut doc = DocumentStructure::new();
+        doc.push_node(node(NodeContent::Group {
+            label: None,
+            heading_level: Some(2),
+            heading_text: Some("X".to_owned()),
+        }));
+        let blocks = blocks_of(&doc);
+        assert_eq!(blocks.len(), 1, "got {blocks:?}");
+        assert_eq!(heading_of(&blocks[0]), (2, "X".to_owned()));
     }
 
     #[test]

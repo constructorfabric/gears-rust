@@ -1,10 +1,35 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::use_debug)]
 
+use file_parser::domain::error::DomainError;
 use file_parser::domain::parser::FileParserBackend;
 use file_parser::infra::parsers::KreuzbergParser;
 use std::path::PathBuf;
 
 mod common;
+
+fn inline_text(inlines: &[file_parser::domain::ir::Inline]) -> String {
+    use file_parser::domain::ir::Inline;
+    inlines
+        .iter()
+        .map(|i| match i {
+            Inline::Text { text, .. } | Inline::Link { text, .. } | Inline::Code { text, .. } => {
+                text.as_str()
+            }
+        })
+        .collect()
+}
+
+fn cell_text(cell: &file_parser::domain::ir::TableCell) -> String {
+    use file_parser::domain::ir::ParsedBlock;
+    cell.blocks
+        .iter()
+        .filter_map(|b| match b {
+            ParsedBlock::Paragraph { inlines } => Some(inline_text(inlines)),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
 
 fn get_test_file_path(filename: &str) -> PathBuf {
     common::fixture_path("docx", filename)
@@ -54,17 +79,11 @@ async fn test_docx_parser_with_two_page_file() {
 
     let result = parser.parse_local_path(&test_file, None).await;
 
-    // Note: docx-rust has issues with files containing gradient fills without
-    // the "rotate_with_shape" field, so this may fail
-    if result.is_err() {
-        let error = result.err().unwrap();
-        let error_msg = error.to_string();
-        if error_msg.contains("malformed XML") || error_msg.contains("rotate_with_shape") {
-            eprintln!("Known docx-rust limitation with gradient fills: {error_msg}");
-            return; // Skip test due to known limitation
-        }
-        panic!("Unexpected error: {error_msg:?}");
-    }
+    assert!(
+        result.is_ok(),
+        "Failed to parse DOCX file: {:?}",
+        result.err()
+    );
 
     let document = result.unwrap();
     assert!(!document.blocks.is_empty(), "Document should have blocks");
@@ -79,30 +98,23 @@ async fn test_docx_parser_with_big_english_file() {
 
     let result = parser.parse_local_path(&test_file, None).await;
 
-    // Note: docx-rust has issues with files containing gradient fills without
-    // the "rotate_with_shape" field, so this may fail
-    if result.is_err() {
-        let error = result.err().unwrap();
-        let error_msg = error.to_string();
-        if error_msg.contains("malformed XML") || error_msg.contains("rotate_with_shape") {
-            eprintln!("Known docx-rust limitation with gradient fills: {error_msg}");
-            return; // Skip test due to known limitation
-        }
-        panic!("Unexpected error: {error_msg:?}");
-    }
+    assert!(
+        result.is_ok(),
+        "Failed to parse DOCX file: {:?}",
+        result.err()
+    );
 
     let document = result.unwrap();
     assert!(!document.blocks.is_empty(), "Document should have blocks");
 }
 
 #[tokio::test]
-async fn test_docx_parser_with_edge_cases_file_returns_error() {
+async fn test_docx_parser_with_edge_cases_file_parses() {
     let parser = KreuzbergParser::new();
     let test_file = get_test_file_path("test_file_1table_edge_cases.docx");
 
     assert!(test_file.exists(), "test fixture missing: {test_file:?}");
 
-    // This should return an error due to parser limitations
     let result = parser.parse_local_path(&test_file, None).await;
     assert!(
         result.is_ok(),
@@ -113,6 +125,14 @@ async fn test_docx_parser_with_edge_cases_file_returns_error() {
     let document = result.unwrap();
     assert!(!document.blocks.is_empty(), "Document should have blocks");
     assert!(document.meta.original_filename.is_some());
+    assert!(
+        document.blocks.iter().any(|b| matches!(
+            b,
+            file_parser::domain::ir::ParsedBlock::Heading { inlines, .. }
+                if inline_text(inlines) == "Table with corners cases"
+        )),
+        "Document should contain the heading 'Table with corners cases'"
+    );
 }
 
 #[tokio::test]
@@ -222,12 +242,9 @@ async fn test_docx_parser_nonexistent_file() {
     let error = result.err().unwrap();
     let error_msg = error.to_string();
     assert!(
-        error_msg.contains("Failed to read file")
-            || error_msg.contains("No such file")
-            || error_msg.contains("Failed to open DOCX file")
-            || error_msg.contains("File does not exist")
-            || error_msg.contains("cannot find the path"),
-        "Error should mention file reading issue, got: {error_msg}"
+        matches!(&error, DomainError::ParseError { .. })
+            && error_msg.contains("IO error: File does not exist"),
+        "Error should report a missing file, got: {error_msg}"
     );
 }
 
@@ -245,9 +262,8 @@ async fn test_docx_parser_invalid_docx_bytes() {
     let error = result.err().unwrap();
     let error_msg = error.to_string();
     assert!(
-        error_msg.contains("Failed to parse DOCX")
-            || error_msg.contains("Failed to open DOCX file")
-            || error_msg.contains("DOCX parsing failed"),
+        matches!(&error, DomainError::ParseError { .. })
+            && error_msg.contains("DOCX parsing failed"),
         "Error should mention DOCX parsing failure, got: {error_msg}"
     );
 }
@@ -342,4 +358,24 @@ async fn test_docx_parser_table_edge_cases() {
         table_count > 0,
         "Document should contain at least one table"
     );
+
+    let table = document
+        .blocks
+        .iter()
+        .find_map(|block| match block {
+            ParsedBlock::Table(t) => Some(t),
+            _ => None,
+        })
+        .unwrap();
+
+    // Ground truth: testing/e2e/testdata/md/test_file_1table_edge_cases.md
+    assert_eq!(table.rows.len(), 5, "header row plus four data rows");
+    assert!(table.rows[0].is_header, "first row should be the header");
+    assert!(table.rows.iter().all(|r| r.cells.len() == 4));
+    assert_eq!(cell_text(&table.rows[0].cells[2]), "Pipe\\test");
+    assert_eq!(
+        cell_text(&table.rows[3].cells[2]),
+        "Test with \u{201c}\\\u{201d} double pipe in quotes"
+    );
+    assert_eq!(cell_text(&table.rows[4].cells[0]), "Espa\u{f1}ol");
 }
