@@ -931,7 +931,7 @@ temp-env = { version = "0.3", features = ["async_closure"] }
 wiremock = "0.6"
 
 # Additional utilities
-nanoid = "0.4"
+nanoid = "0.5"
 fnv = "1.0"
 
 # GTS dependencies
