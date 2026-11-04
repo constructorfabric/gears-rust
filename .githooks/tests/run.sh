@@ -326,10 +326,13 @@ on_branch() {
     git -C "$r" checkout -q feat; git -C "$r" branch -qD "$1"
 }
 # nojq <case-less>: runs push with a PATH that has the stubs and git/sed/grep etc. but no jq.
+# Each tool is an exec wrapper, not a link: Git Bash's ln -s makes a copy, and a copied .exe
+# cannot load the DLLs that sit next to the original.
 nojq() {
     mkdir -p "$T/nojq"
     for t in git sh bash grep sed sort dirname head cat env tr uname basename wc awk id; do
-        tp=$(PATH=$real_path command -v "$t") && link_hook "$tp" "$T/nojq/$t"
+        tp=$(PATH=$real_path command -v "$t") &&
+            printf '#!/bin/sh\nexec "%s" "$@"\n' "$tp" > "$T/nojq/$t" && chmod +x "$T/nojq/$t"
     done
     saved_path=$PATH; PATH="$T/stubs:$T/nojq"
     "$@"
