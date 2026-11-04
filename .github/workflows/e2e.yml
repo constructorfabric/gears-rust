@@ -436,3 +436,13 @@ jobs:
               });
               await tryAssign(created.data.number);
             }
+
+      # The failure step above opens "Nightly E2E failed" but nothing closed it,
+      # so the issue outlived the breakage. A green scheduled run closes it.
+      - name: Close nightly issue on success
+        if: success() && github.event_name == 'schedule'
+        uses: ./.github/actions/nightly-issue
+        with:
+          title: Nightly E2E failed
+          subject: Nightly E2E
+          result: success
