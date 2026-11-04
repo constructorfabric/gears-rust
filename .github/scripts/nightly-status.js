@@ -73,7 +73,7 @@ module.exports = async ({ github, context, core }) => {
     '',
     '✅ passed · ❌ failed, cancelled or timed out · ⚪ skipped or still running',
     '',
-    `All nightly runs: ${repoUrl}/actions?query=event%3Aschedule`,
+    `Open nightly issues (failures and this one): ${repoUrl}/issues?q=is%3Aissue%20is%3Aopen%20label%3Anightly`,
     `Updated ${new Date().toISOString()} by [this run](${repoUrl}/actions/runs/${context.runId}).`,
   ].join('\n');
 
