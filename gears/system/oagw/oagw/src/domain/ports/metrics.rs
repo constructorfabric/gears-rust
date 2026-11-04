@@ -20,12 +20,12 @@
 //! - no `tenant_id` label anywhere on the surface
 //!
 //! The proxy configuration cache's labels are typed ([`CacheMap`],
-//! [`CacheLookup`], [`CacheEviction`]) where a method takes two, so they
+//! [`CacheLookup`], [`CacheEviction`], [`CacheStale`]) where a method takes two, so they
 //! cannot be swapped; the rest are `&'static str` constants from
 //! [`super::metric_labels`], so the hot path never copies a label.
 use toolkit_macros::domain_model;
 
-use super::metric_labels::{CacheEviction, CacheLookup, CacheMap};
+use super::metric_labels::{CacheEviction, CacheLookup, CacheMap, CacheStale};
 
 /// Output port for recording OAGW operational metrics.
 pub trait OagwMetricsPort: Send + Sync {
@@ -154,6 +154,12 @@ pub trait OagwMetricsPort: Send + Sync {
     /// change detached the load while it ran.
     fn record_proxy_cache_load_discarded(&self, map: CacheMap);
 
+    /// `{prefix}_proxy_cache_stale_served_total` — counter
+    ///
+    /// One key of section `map` answered with a stale entry instead of its
+    /// reload's result, by `cause` ([`CacheStale`]).
+    fn record_proxy_cache_stale_served(&self, map: CacheMap, cause: CacheStale);
+
     /// `{prefix}_proxy_cache_publish_failures_total` — counter
     ///
     /// `count` configuration changes that did not reach the cluster change
@@ -196,5 +202,6 @@ impl OagwMetricsPort for NoopMetrics {
     fn record_proxy_cache_change(&self, _: &str) {}
     fn record_proxy_cache_flush(&self, _: &str) {}
     fn record_proxy_cache_load_discarded(&self, _: CacheMap) {}
+    fn record_proxy_cache_stale_served(&self, _: CacheMap, _: CacheStale) {}
     fn record_proxy_cache_publish_failures(&self, _: &str, _: u64) {}
 }

@@ -41,11 +41,8 @@ pub mod key {
     pub const RESULT: &str = "result";
     /// Where a proxy configuration change came from.
     pub const SOURCE: &str = "source";
-    /// Why the proxy configuration cache was emptied.
-    #[cfg_attr(
-        all(not(feature = "cluster"), not(test)),
-        expect(dead_code, reason = "recorded by the change log watcher")
-    )]
+    /// Why the proxy configuration cache was emptied, or why a lookup was
+    /// answered with a stale entry.
     pub const CAUSE: &str = "cause";
 }
 
@@ -161,6 +158,8 @@ pub enum CacheLookup {
     Miss,
     /// A load another request started.
     Joined,
+    /// A stale entry, without a load: a reload of it failed moments ago.
+    Stale,
 }
 
 impl CacheLookup {
@@ -171,6 +170,32 @@ impl CacheLookup {
             Self::Hit => "hit",
             Self::Miss => "miss",
             Self::Joined => "joined",
+            Self::Stale => "stale",
+        }
+    }
+}
+
+/// Why a proxy configuration cache lookup was answered with a stale entry
+/// (`cause` label of `proxy_cache_stale_served_total`).
+#[domain_model]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheStale {
+    /// The entry's reload failed.
+    Error,
+    /// The entry's reload ran past the stale wait.
+    Slow,
+    /// A reload of the entry failed moments ago, so none was tried.
+    RetryWindow,
+}
+
+impl CacheStale {
+    /// The label value.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Error => "error",
+            Self::Slow => "slow",
+            Self::RetryWindow => "retry_window",
         }
     }
 }
@@ -182,7 +207,8 @@ impl CacheLookup {
 pub enum CacheEviction {
     /// A configuration change (including emptying the whole cache).
     Change,
-    /// The entry outlived the TTL.
+    /// The entry outlived the TTL and `max_stale`, so it can no longer be
+    /// served even when its reload fails.
     Ttl,
     /// The section was full.
     Capacity,

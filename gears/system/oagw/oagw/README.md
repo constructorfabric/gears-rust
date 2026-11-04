@@ -117,7 +117,7 @@ In memory, the reconcile runs once in `post_init`, before the pod serves; an inf
 
 ### Proxy configuration cache
 
-With a database, each replica caches the configuration the proxy reads, so a repeated lookup runs no query. A write evicts the entries it affects, at once on the writing replica and, through a short change log in the cluster gear, on the others; the TTL bounds staleness when a change is lost. The database stays the only store of configuration. See [ADR-0020 Proxy Configuration Cache](../docs/ADR/0020-proxy-config-cache.md).
+With a database, each replica caches the configuration the proxy reads, so a repeated lookup runs no query. A write evicts the entries it affects, at once on the writing replica and, through a short change log in the cluster gear, on the others; the TTL bounds staleness when a change is lost. When the database is down or slow, an entry past its TTL keeps answering for up to `max_stale`, so proxying continues for what a replica has cached. The database stays the only store of configuration. See [ADR-0020 Proxy Configuration Cache](../docs/ADR/0020-proxy-config-cache.md).
 
 ```yaml
 gears:
@@ -126,6 +126,7 @@ gears:
       proxy_cache:
         enabled: true      # default; no effect without a database
         ttl: 60s           # humantime, from 1s to 1h
+        max_stale: 15m     # humantime, from 0s (off) to 24h; how long past the TTL an entry answers when its reload fails
         max_entries: 10000 # per section (aliases, routes); 1 to 1000000
 ```
 
@@ -133,10 +134,11 @@ gears:
 - **With a database and `enabled: false`**, there is no cache and no change log, and OAGW needs no cluster gear (nor the `cluster` feature): every request reads the database. Set `enabled` alike on every replica: a replica with the cache off does not publish its writes, so replicas that cache see them only after the TTL.
 - **Without a database**, OAGW needs no cluster gear and supports one replica only: each replica's in-memory configuration is its own.
 - **Standalone cluster backend**: one replica only. Several replicas need a shared backend (Redis, PostgreSQL, k8s). OAGW does not detect several replicas on a standalone backend: health stays green, and each replica sees the others' writes only after the TTL.
-- **Health** (all Degraded, never Unhealthy, unless noted): `proxy_cache_watch_connecting` while the change log watch connects or reconnects; `proxy_cache_watch_down` once it is closed for good or stopped (freshness falls back to the TTL); `proxy_cache_newer_log` while appends skip a change log of a newer format. Cluster readiness is included: a cluster still starting or a degraded profile is Degraded, a misconfiguration Unhealthy. OAGW waits at most 250 ms for the cluster's check, reports its last result while a slow check runs, and after 10 s reports `cluster_readiness_slow`. The worst part sets status and code (the cache before registry provisioning on a tie); the message names every unhealthy part.
+- **Database outage**: an entry past its TTL is reloaded on use; if the reload fails, or has not answered 2 s after it started, the stale entry answers and that key is not reloaded again for 5 s. Only cached configuration survives: other keys fail, and a replica started during the outage serves nothing. A change log flush marks entries stale instead of removing them, so a partition that also breaks the watch does not stop proxying. `max_stale: 0s` turns this off.
+- **Health** (all Degraded, never Unhealthy, unless noted): `proxy_cache_serving_stale` for 30 s after a stale entry answered (the database is failing or slow); `proxy_cache_watch_connecting` while the change log watch connects or reconnects; `proxy_cache_watch_down` once it is closed for good or stopped (freshness falls back to the TTL); `proxy_cache_newer_log` while appends skip a change log of a newer format. Cluster readiness is included: a cluster still starting or a degraded profile is Degraded, a misconfiguration Unhealthy. OAGW waits at most 250 ms for the cluster's check, reports its last result while a slow check runs, and after 10 s reports `cluster_readiness_slow`. The worst part sets status and code (the cache before registry provisioning on a tie); the message names every unhealthy part.
 - **Rollback**: after rolling back a release that wrote a newer change log format, older replicas stay Degraded with `proxy_cache_newer_log` and skip their appends. Delete the cluster key `oagw/proxy-config-changes`: the next write starts a new log, and every replica empties its cache once.
 - **A cancelled write** (its future dropped) is published again 30 s later (while the change feed runs), in case its statement commits late. If that second append fails, it counts as a change of its own in `oagw_proxy_cache_publish_failures_total`.
-- **Metrics**: `oagw_proxy_cache_lookups_total{map,result}`, `oagw_proxy_cache_entries{map}`, `oagw_proxy_cache_evictions_total{map,reason}`, `oagw_proxy_cache_changes_total{source}`, `oagw_proxy_cache_flushes_total{cause}`, `oagw_proxy_cache_loads_discarded_total{map}`, `oagw_proxy_cache_publish_failures_total{reason}` (`append_failed`, `newer_log`, `publisher_stopped`; once per change not appended), and lookup time as `oagw_request_duration_seconds{phase="resolve"}`. Alert on publish failures and on flushes with `cause="log_gap"` or `"watch_closed"`.
+- **Metrics**: `oagw_proxy_cache_lookups_total{map,result}`, `oagw_proxy_cache_entries{map}`, `oagw_proxy_cache_evictions_total{map,reason}`, `oagw_proxy_cache_changes_total{source}`, `oagw_proxy_cache_flushes_total{cause}`, `oagw_proxy_cache_loads_discarded_total{map}`, `oagw_proxy_cache_stale_served_total{map,cause}` (`error`, `slow`, `retry_window`), `oagw_proxy_cache_publish_failures_total{reason}` (`append_failed`, `newer_log`, `publisher_stopped`; once per change not appended), and lookup time as `oagw_request_duration_seconds{phase="resolve"}`. Alert on publish failures, on flushes with `cause="log_gap"` or `"watch_closed"`, and on any stale answers.
 
 A standalone `oagw` profile, for one replica:
 

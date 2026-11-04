@@ -9,7 +9,10 @@ use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
-use super::{Evict, LOAD_TIMEOUT, LoadMany, LoadOne, Section, SectionKey, SectionValue};
+use super::{
+    Evict, LOAD_TIMEOUT, LoadMany, LoadOne, RETRY_WINDOW, STALE_WAIT, Section, SectionKey,
+    SectionValue, WARN_INTERVAL,
+};
 use crate::domain::ports::metric_labels::CacheMap;
 use crate::domain::ports::{NoopMetrics, OagwMetricsPort};
 use crate::domain::repo::RepositoryError;
@@ -55,7 +58,13 @@ fn section(max_entries: usize) -> TestSection {
 
 /// A section recording its metrics to `metrics` under the `map` label `m`.
 fn section_recording(max_entries: usize, metrics: Arc<dyn OagwMetricsPort>) -> TestSection {
-    Arc::new(Section::new(CacheMap::Alias, TTL, max_entries, metrics))
+    Arc::new(Section::new(
+        CacheMap::Alias,
+        TTL,
+        Duration::ZERO,
+        max_entries,
+        metrics,
+    ))
 }
 
 /// A scripted database. A load reads the rows when it starts; a gated
@@ -829,4 +838,440 @@ async fn a_load_panicking_with_a_formatted_message_logs_it() {
     script.release(1);
     request.await.unwrap().unwrap_err();
     assert!(logs_contain("scripted formatted panic over 1 keys"));
+}
+
+// ── Serving stale (ADR-0020 Failure Handling) ───────────────────────────
+
+const MAX_STALE: Duration = Duration::from_mins(10);
+
+/// A section serving stale entries for [`MAX_STALE`] past the TTL, and the
+/// metrics it records.
+fn stale_section(max_entries: usize) -> (TestSection, Arc<CacheMetrics>) {
+    let metrics = Arc::new(CacheMetrics::default());
+    let section = Arc::new(Section::new(
+        CacheMap::Alias,
+        TTL,
+        MAX_STALE,
+        max_entries,
+        Arc::clone(&metrics) as Arc<dyn OagwMetricsPort>,
+    ));
+    (section, metrics)
+}
+
+/// ADR-0020: CACHE-STALE-001.
+#[tokio::test(start_paused = true)]
+async fn a_failed_reload_answers_the_stale_entry_and_keeps_it() {
+    let (section, metrics) = stale_section(10);
+    let script = Script::open();
+    let (a, old) = (key("a", 1), rows(1));
+    script.set(&a, &old);
+    get(&section, &script, &a).await.unwrap();
+    assert_eq!(section.last_stale(), None);
+
+    tokio::time::advance(TTL).await;
+    script.fail(true);
+    assert_rows(&get(&section, &script, &a).await, &old);
+
+    assert_eq!(
+        script.calls().len(),
+        2,
+        "the stale entry was reloaded first"
+    );
+    assert_eq!(metrics.count("stale alias error"), 1);
+    assert_eq!(metrics.count("lookups alias miss"), 2);
+    assert_eq!(metrics.count("evictions alias ttl"), 0);
+    assert!(section.contains(&a), "the stale entry is kept");
+    assert!(section.last_stale().is_some());
+    section.assert_consistent();
+}
+
+/// ADR-0020: CACHE-STALE-001.
+#[tokio::test(start_paused = true)]
+async fn a_successful_reload_replaces_the_stale_entry() {
+    let (section, metrics) = stale_section(10);
+    let script = Script::open();
+    let (a, old, new) = (key("a", 1), rows(1), rows(1));
+    script.set(&a, &old);
+    get(&section, &script, &a).await.unwrap();
+
+    tokio::time::advance(TTL).await;
+    script.set(&a, &new);
+    assert_rows(&get(&section, &script, &a).await, &new);
+    assert_rows(&get(&section, &script, &a).await, &new);
+
+    assert_eq!(script.calls().len(), 2, "the reloaded entry is fresh");
+    assert_eq!(metrics.count("stale alias error"), 0);
+    assert_eq!(section.last_stale(), None);
+}
+
+/// ADR-0020: CACHE-STALE-002.
+#[tokio::test(start_paused = true)]
+async fn an_entry_past_max_stale_is_removed_and_its_failed_reload_answers_the_error() {
+    let (section, metrics) = stale_section(10);
+    let script = Script::open();
+    let a = key("a", 1);
+    get(&section, &script, &a).await.unwrap();
+
+    tokio::time::advance(TTL + MAX_STALE).await;
+    script.fail(true);
+    get(&section, &script, &a).await.unwrap_err();
+
+    assert!(!section.contains(&a));
+    assert_eq!(metrics.count("evictions alias ttl"), 1);
+    assert_eq!(metrics.count("stale alias error"), 0);
+    section.assert_consistent();
+}
+
+/// ADR-0020: CACHE-STALE-002. Without `max_stale` an entry past the TTL is
+/// never served (the sections built by `section` serve no stale entries).
+#[tokio::test(start_paused = true)]
+async fn without_max_stale_a_failed_reload_answers_the_error() {
+    let (section, script) = (section(10), Script::open());
+    let a = key("a", 1);
+    get(&section, &script, &a).await.unwrap();
+
+    tokio::time::advance(TTL).await;
+    script.fail(true);
+    get(&section, &script, &a).await.unwrap_err();
+    assert!(!section.contains(&a));
+}
+
+/// ADR-0020: CACHE-STALE-003. The waiter answers the stale entry
+/// [`STALE_WAIT`] after the reload started; the reload runs on and stores
+/// its answer.
+#[tokio::test(start_paused = true)]
+async fn a_slow_reload_answers_the_stale_entry_after_the_stale_wait() {
+    let (section, metrics) = stale_section(10);
+    let script = Script::gated();
+    let (a, old, new) = (key("a", 1), rows(1), rows(1));
+    script.set(&a, &old);
+    script.release(1);
+    get(&section, &script, &a).await.unwrap();
+
+    tokio::time::advance(TTL).await;
+    script.set(&a, &new);
+    let started = tokio::time::Instant::now();
+    assert_rows(&get(&section, &script, &a).await, &old);
+    assert_eq!(started.elapsed(), STALE_WAIT);
+    assert_eq!(metrics.count("stale alias slow"), 1);
+    assert_eq!(section.loads(), 1, "the reload runs on");
+
+    script.release(1);
+    settle().await;
+    assert_rows(&get(&section, &script, &a).await, &new);
+    assert_eq!(script.calls().len(), 2, "the late reload was stored");
+}
+
+/// ADR-0020: CACHE-STALE-003. The wait counts from the reload's start, so a
+/// request joining a reload already running for [`STALE_WAIT`] answers at
+/// once.
+#[tokio::test(start_paused = true)]
+async fn a_request_joining_a_reload_older_than_the_stale_wait_answers_at_once() {
+    let (section, metrics) = stale_section(10);
+    let script = Script::gated();
+    let (a, old) = (key("a", 1), rows(1));
+    script.set(&a, &old);
+    script.release(1);
+    get(&section, &script, &a).await.unwrap();
+
+    tokio::time::advance(TTL).await;
+    let first = spawn_get(&section, &script, &a);
+    script.started(2).await;
+    tokio::time::advance(STALE_WAIT).await;
+    assert_rows(&first.await.unwrap(), &old);
+
+    let joined_at = tokio::time::Instant::now();
+    assert_rows(&get(&section, &script, &a).await, &old);
+    assert_eq!(joined_at.elapsed(), Duration::ZERO);
+    assert_eq!(metrics.count("lookups alias joined"), 1);
+    assert_eq!(metrics.count("stale alias slow"), 2);
+    assert_eq!(script.calls().len(), 2, "one reload");
+}
+
+/// ADR-0020: CACHE-STALE-004.
+#[tokio::test(start_paused = true)]
+async fn after_a_failed_reload_the_stale_entry_answers_without_a_reload_for_the_retry_window() {
+    let (section, metrics) = stale_section(10);
+    let script = Script::open();
+    let (a, old, new) = (key("a", 1), rows(1), rows(1));
+    script.set(&a, &old);
+    get(&section, &script, &a).await.unwrap();
+    tokio::time::advance(TTL).await;
+    script.fail(true);
+    get(&section, &script, &a).await.unwrap();
+    assert_eq!(script.calls().len(), 2);
+
+    tokio::time::advance(RETRY_WINDOW - Duration::from_millis(1)).await;
+    assert_rows(&get(&section, &script, &a).await, &old);
+    assert_eq!(script.calls().len(), 2, "no reload in the window");
+    assert_eq!(metrics.count("stale alias retry_window"), 1);
+    assert_eq!(metrics.count("lookups alias stale"), 1);
+
+    tokio::time::advance(Duration::from_millis(1)).await;
+    script.fail(false);
+    script.set(&a, &new);
+    assert_rows(&get(&section, &script, &a).await, &new);
+    assert_eq!(script.calls().len(), 3, "reloaded after the window");
+}
+
+/// ADR-0020: CACHE-STALE-004. A change detaches every load in flight; a
+/// detached reload that fails still opens the retry window.
+#[tokio::test(start_paused = true)]
+async fn a_detached_failed_reload_still_opens_the_retry_window() {
+    let (section, metrics) = stale_section(10);
+    let script = Script::gated();
+    let (a, b, old) = (key("a", 1), key("b", 1), rows(1));
+    script.set(&a, &old);
+    script.release(1);
+    get(&section, &script, &a).await.unwrap();
+    tokio::time::advance(TTL).await;
+
+    script.fail(true);
+    let in_flight = spawn_get(&section, &script, &a);
+    script.started(2).await;
+    section.evict(|_| Evict::Keys(vec![b.clone()]));
+    script.release(1);
+    assert_rows(&in_flight.await.unwrap(), &old);
+    assert_eq!(metrics.count("stale alias error"), 1);
+
+    script.release(Semaphore::MAX_PERMITS - 1);
+    assert_rows(&get(&section, &script, &a).await, &old);
+    assert_eq!(script.calls().len(), 2, "no reload in the window");
+    assert_eq!(metrics.count("stale alias retry_window"), 1);
+}
+
+/// ADR-0020: CACHE-STALE-004. A failing key does not hold back another.
+#[tokio::test(start_paused = true)]
+async fn the_retry_window_is_per_key() {
+    let (section, _) = stale_section(10);
+    let script = Script::open();
+    let (a, b) = (key("a", 1), key("b", 1));
+    get(&section, &script, &a).await.unwrap();
+    get(&section, &script, &b).await.unwrap();
+    tokio::time::advance(TTL).await;
+    script.fail(true);
+    get(&section, &script, &a).await.unwrap();
+
+    script.fail(false);
+    get(&section, &script, &b).await.unwrap();
+    assert_eq!(script.calls().len(), 4, "b reloads despite a's window");
+}
+
+/// ADR-0020: CACHE-STALE-005. A flush marks the entries stale: the next
+/// lookup reloads, and answers the old entry only if the reload fails or is
+/// slow.
+#[tokio::test(start_paused = true)]
+async fn a_flush_marks_the_entries_stale_instead_of_removing_them() {
+    let (section, metrics) = stale_section(10);
+    let script = Script::open();
+    let (a, b, old, new) = (key("a", 1), key("b", 1), rows(1), rows(1));
+    script.set(&a, &old);
+    get(&section, &script, &a).await.unwrap();
+    get(&section, &script, &b).await.unwrap();
+
+    section.evict(|_| Evict::Everything);
+    assert_eq!(section.len(), 2, "kept");
+    assert_eq!(metrics.count("evictions alias change"), 0);
+    section.assert_consistent();
+
+    script.fail(true);
+    assert_rows(&get(&section, &script, &a).await, &old);
+    assert_eq!(metrics.count("stale alias error"), 1);
+
+    script.fail(false);
+    script.set(&b, &new);
+    assert_rows(&get(&section, &script, &b).await, &new);
+    assert_eq!(script.calls().len(), 4, "both reloaded after the flush");
+}
+
+/// ADR-0020: CACHE-STALE-005. A flush ends the retry window.
+#[tokio::test(start_paused = true)]
+async fn a_flush_reloads_an_entry_inside_its_retry_window() {
+    let (section, _) = stale_section(10);
+    let script = Script::open();
+    let (a, new) = (key("a", 1), rows(1));
+    get(&section, &script, &a).await.unwrap();
+    tokio::time::advance(TTL).await;
+    script.fail(true);
+    get(&section, &script, &a).await.unwrap();
+
+    section.evict(|_| Evict::Everything);
+    script.fail(false);
+    script.set(&a, &new);
+    assert_rows(&get(&section, &script, &a).await, &new);
+    assert_eq!(script.calls().len(), 3, "reloaded after the flush");
+}
+
+/// ADR-0020: CACHE-STALE-005. A flush detaches the loads in flight, as
+/// before.
+#[tokio::test(start_paused = true)]
+async fn a_flush_detaches_the_loads_in_flight() {
+    let (section, _) = stale_section(10);
+    let script = Script::gated();
+    let a = key("a", 1);
+    let in_flight = spawn_get(&section, &script, &a);
+    script.started(1).await;
+
+    section.evict(|_| Evict::Everything);
+    assert_eq!(section.loads(), 0);
+    script.release(1);
+    in_flight.await.unwrap().unwrap();
+    assert!(!section.contains(&a), "the detached load is not stored");
+}
+
+/// ADR-0020: CACHE-STALE-006. A change removes the entries it affects, stale
+/// or not: they are known to be wrong.
+#[tokio::test(start_paused = true)]
+async fn a_change_removes_a_stale_entry() {
+    let (section, _) = stale_section(10);
+    let script = Script::open();
+    let a = key("a", 1);
+    get(&section, &script, &a).await.unwrap();
+    tokio::time::advance(TTL).await;
+
+    section.evict(|_| Evict::Keys(vec![a.clone()]));
+    script.fail(true);
+    get(&section, &script, &a).await.unwrap_err();
+}
+
+/// ADR-0020: CACHE-STALE-007. A failed batched reload answers each key with
+/// a stale entry, and fails a lookup with a key that has none.
+#[tokio::test(start_paused = true)]
+async fn a_failed_batched_reload_falls_back_per_key() {
+    let (section, metrics) = stale_section(10);
+    let script = Script::open();
+    let (a, b, c) = (key("a", 1), key("b", 1), key("c", 1));
+    let (rows_a, rows_b) = (rows(1), rows(2));
+    script.set(&a, &rows_a);
+    script.set(&b, &rows_b);
+    section
+        .get_or_load_many(&[a.clone(), b.clone()], script.load_many())
+        .await
+        .unwrap();
+    tokio::time::advance(TTL).await;
+    script.fail(true);
+
+    let both = section
+        .get_or_load_many(&[a.clone(), b.clone()], script.load_many())
+        .await
+        .unwrap();
+    assert_eq!((&*both[0], &*both[1]), (&rows_a[..], &rows_b[..]));
+    assert_eq!(metrics.count("stale alias error"), 2);
+
+    tokio::time::advance(RETRY_WINDOW).await;
+    section
+        .get_or_load_many(&[a, c], script.load_many())
+        .await
+        .unwrap_err();
+}
+
+/// ADR-0020: CACHE-STALE-008. Stale entries are kept until the TTL and
+/// `max_stale` have passed, and count toward the capacity.
+#[tokio::test(start_paused = true)]
+async fn stale_entries_stay_until_their_lifetime_and_count_toward_the_capacity() {
+    let (section, metrics) = stale_section(2);
+    let script = Script::open();
+    let [a, b, c] = [key("a", 1), key("b", 1), key("c", 1)];
+    get(&section, &script, &a).await.unwrap();
+    tokio::time::advance(TTL).await;
+    get(&section, &script, &b).await.unwrap();
+    assert!(section.contains(&a), "stale, kept by a store");
+
+    get(&section, &script, &c).await.unwrap();
+    assert!(
+        !section.contains(&a),
+        "the least recently used goes for room"
+    );
+    assert_eq!(metrics.count("evictions alias capacity"), 1);
+
+    // b and c were stored at the TTL: their lifetime ends a TTL and
+    // `max_stale` later.
+    tokio::time::advance(TTL + MAX_STALE - Duration::from_millis(1)).await;
+    assert!(section.contains(&b) && section.contains(&c));
+    tokio::time::advance(Duration::from_millis(1)).await;
+    get(&section, &script, &key("d", 1)).await.unwrap();
+    assert!(
+        !section.contains(&b),
+        "past its lifetime: dropped by a store"
+    );
+    assert!(
+        !section.contains(&c),
+        "past its lifetime: dropped by a store"
+    );
+    assert_eq!(metrics.count("evictions alias ttl"), 2);
+    assert_eq!(
+        metrics.count("evictions alias capacity"),
+        1,
+        "no room needed"
+    );
+    section.assert_consistent();
+}
+
+/// ADR-0020: CACHE-STALE-009. A section logs at most one failed reload per
+/// [`WARN_INTERVAL`], with the count of the others.
+#[tokio::test(start_paused = true)]
+#[tracing_test::traced_test]
+async fn failed_reloads_log_once_per_interval() {
+    let (section, _) = stale_section(10);
+    let script = Script::open();
+    let (a, b, c) = (key("a", 1), key("b", 1), key("c", 1));
+    for key in [&a, &b, &c] {
+        get(&section, &script, key).await.unwrap();
+    }
+    tokio::time::advance(TTL).await;
+
+    script.fail(true);
+    get(&section, &script, &a).await.unwrap();
+    get(&section, &script, &b).await.unwrap();
+    tokio::time::advance(WARN_INTERVAL).await;
+    get(&section, &script, &c).await.unwrap();
+    logs_assert(|lines: &[&str]| {
+        let warned = lines
+            .iter()
+            .filter(|line| line.contains("A proxy cache reload failed; serving the stale entries"))
+            .collect::<Vec<_>>();
+        match warned.as_slice() {
+            [first, second]
+                if first.contains("suppressed=0") && second.contains("suppressed=1") =>
+            {
+                Ok(())
+            }
+            other => Err(format!("expected two warnings, got {other:?}")),
+        }
+    });
+}
+
+/// ADR-0020: CACHE-STALE-009. A failed reload logs once, however many
+/// requests answered its stale entry.
+#[tokio::test(start_paused = true)]
+#[tracing_test::traced_test]
+async fn a_failed_reload_logs_once() {
+    let (section, _) = stale_section(10);
+    let script = Script::gated();
+    let a = key("a", 1);
+    script.release(1);
+    get(&section, &script, &a).await.unwrap();
+    tokio::time::advance(TTL).await;
+
+    script.fail(true);
+    let requests = [
+        spawn_get(&section, &script, &a),
+        spawn_get(&section, &script, &a),
+    ];
+    script.started(2).await;
+    settle().await;
+    script.release(1);
+    for request in requests {
+        request.await.unwrap().unwrap();
+    }
+    logs_assert(|lines: &[&str]| {
+        let warned = lines
+            .iter()
+            .filter(|line| line.contains("A proxy cache reload failed; serving the stale entries"))
+            .collect::<Vec<_>>();
+        match warned.as_slice() {
+            [line] if line.contains("stale=1") && line.contains("database down") => Ok(()),
+            other => Err(format!("expected one warning, got {other:?}")),
+        }
+    });
 }

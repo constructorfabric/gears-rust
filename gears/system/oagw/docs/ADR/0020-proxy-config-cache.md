@@ -14,6 +14,7 @@ date: 2026-10-13
   - [What Is Cached](#what-is-cached)
   - [Request Path](#request-path)
   - [Keeping the Cache Fresh](#keeping-the-cache-fresh)
+  - [Serving Stale](#serving-stale)
   - [The Change Log](#the-change-log)
   - [Cluster Setup](#cluster-setup)
   - [Failure Handling](#failure-handling)
@@ -33,6 +34,7 @@ date: 2026-10-13
   - [In-memory cache, database generation poll](#in-memory-cache-database-generation-poll)
   - [In-memory cache, TTL only](#in-memory-cache-ttl-only)
   - [Configuration in a shared cache](#configuration-in-a-shared-cache)
+  - [Control plane / data plane split, data plane without a database](#control-plane--data-plane-split-data-plane-without-a-database)
   - [No cache](#no-cache)
 - [More Information](#more-information)
 - [Traceability](#traceability)
@@ -59,6 +61,7 @@ The write rate is unknown. Many tenants write through the Management API, so the
 * Results are the same as without the cache: the same upstream, the same route, and the same errors.
 * A deployment without a database needs no cluster gear, and a single replica with a database needs no extra infrastructure.
 * A lost change never leaves a replica stale forever.
+* Proxying keeps working for the configuration a replica has seen while the database is slow or down, not only until the TTL.
 
 ## Considered Options
 
@@ -67,11 +70,14 @@ The write rate is unknown. Many tenants write through the Management API, so the
 * In-memory cache, database generation poll
 * In-memory cache, TTL only
 * Configuration in a shared cache (Redis as a second cache level, as in ADR-0007)
+* Control plane / data plane split: every replica holds the whole configuration, pushed by a control plane (data plane without a database)
 * No cache
 
 ## Decision Outcome
 
 Chosen option: "In-memory cache, cluster change log, targeted eviction, TTL backstop". Each replica keeps an in-memory cache of the configuration the proxy reads. Every configuration write evicts only the entries it can affect, on the writer at once and on every other replica through a short change log kept in the cluster gear. Each entry also expires after a TTL, so a lost change is corrected within the TTL. When a replica cannot know what it missed (a gap in the log, a new log, a log it cannot read, a watch that fell behind or reconnected), it empties its whole cache.
+
+An entry past its TTL is not dropped at once: it is kept for `proxy_cache.max_stale` more (default 15 min) and answered when its reload fails or is slow, so a replica keeps proxying through a database outage ([Serving Stale](#serving-stale)). In this ADR, *emptying* the cache means making every entry unusable without a reload: with `max_stale` above zero it marks every entry stale (each is reloaded on its next use, and answered only if that reload fails or is slow), and with `max_stale: 0s` it removes every entry.
 
 The cluster gear carries only the change log. It never stores configuration. OAGW requires the cluster gear only when a database is configured and the cache is enabled.
 
@@ -91,10 +97,10 @@ The cache is OAGW's own, in `infra/proxy_cache/`. It has two sections, both per 
 * **Routes are cached per upstream, not per request path**, which is unbounded. `select_route` runs per request over the cached routes.
 * **The route section is separate** so an ancestor upstream used by many tenants keeps one copy of its routes. A route's tenant is always its upstream's (composite foreign key), so `RowKey` keeps the secure-ORM tenant scope of the load.
 * **"Not found" and "disabled" are cached**, so an unknown alias runs no `SELECT` on repeat. An alias that fails the Management API's alias rules (longer than 253 bytes, or invalid characters) is answered "not found" before the cache, with no read and no entry, so requests cannot flood the alias section.
-* **Errors are never cached.** A failed read returns its error to every waiter; the next request tries again.
+* **Errors are never cached.** A failed read returns its error to every waiter that has no stale entry to fall back on ([Serving Stale](#serving-stale)); the next request tries again.
 * **Each section indexes its entries by the IDs they hold**: the alias section by candidate upstream ID and by alias; the route section by route ID. Writes find affected entries through these indexes, which change only with the entries, under the section's lock.
-* **Size and expiry.** Each section holds at most `proxy_cache.max_entries` entries; when full, the least recently used entry is evicted, so a hot entry outlives a run of one-off keys (such as unknown aliases) shorter than the section. An entry older than the TTL is a miss, and its lookup removes it. Full keys are stored, so keys never collide.
-* **One load per key.** Concurrent misses on a key share one load and its result, error included. The load runs as its own task, so it finishes even if every waiter is cancelled. A load over 30 s is dropped and its waiters get an error. `routes_of` serves hits, joins running loads, and starts one batched load for the rest.
+* **Size and expiry.** Each section holds at most `proxy_cache.max_entries` entries; when full, the least recently used entry is evicted, so a hot entry outlives a run of one-off keys (such as unknown aliases) shorter than the section. An entry older than the TTL is reloaded like a miss; it is removed once older than the TTL and `max_stale`, by its lookup or by a store that finds it at the least recently used end. Stale entries count toward `max_entries`. Full keys are stored, so keys never collide.
+* **One load per key.** Concurrent misses on a key share one load and its result, error included. The load runs as its own task, so it finishes even if every waiter is cancelled. A load over 30 s is dropped and its waiters get an error (or their stale entry). `routes_of` serves hits, joins running loads, and starts one batched load for the rest.
 * **Why not `pingora-memory-cache`.** It cannot list its keys and keys entries by a 64-bit hash only, so it cannot support the ID indexes targeted eviction needs.
 
 ### Request Path
@@ -167,7 +173,25 @@ A request that starts after step 3 reads the new data. A Management API or SDK w
 
 **In-flight loads.** A load that started before a write may return pre-write rows. So a change that touches a section also detaches every load in flight there: each load has an ID and stores its result only if it is still the section's load for its key. A detached load still answers its existing waiters but is not stored; a later request starts a new load that reads the committed rows. All loads of the section are detached because a load's rows are unknown until it returns; loads in flight are few, so this is cheap. Entries stored before the change are caught by the eviction rules.
 
-**The TTL.** Every entry expires after `proxy_cache.ttl` (default 60 s), bounding staleness from a lost change.
+**The TTL.** Every entry expires after `proxy_cache.ttl` (default 60 s), bounding staleness from a lost change while the database answers.
+
+### Serving Stale
+
+Without this, a cache hit skips the database only until the TTL: about a minute into a database outage the entries expire, their reloads fail, and proxying stops for those aliases. While the database is down no one can write configuration either, so the entry a replica holds is the latest committed configuration, unless a change was lost, the case the TTL covers while the database answers.
+
+**Ages.** An entry is *fresh* for `ttl`, then *stale* for `max_stale`, then removed (counted as an eviction with `reason="ttl"`). With `max_stale: 0s` an entry is removed at the TTL and none of this section applies.
+
+**A stale entry is reloaded on use**, as a miss is (and counted as `miss` or `joined`). A request that has the stale entry waits for the reload for at most 2 s, counted from the reload's start, and then answers the stale entry while the reload runs on to its 30 s limit and stores its result. A request that joins a reload already running for 2 s answers at once. A healthy database answers well within 2 s, so the stale entry is answered only when the database fails or is slow. The wait is bounded because a database that is down fails slowly: the connection pool retries refused connections until its acquire timeout (30 s by default).
+
+**A failed reload** (an error, the 30 s limit, a panic, or no entry for the key) leaves the stale entry in place and answers it to the requests waiting on the reload. For the next 5 s (the retry window) that entry is answered without a reload (counted as `stale`); the first request after the window reloads it once more. The window is per key: a key whose reload keeps failing for its own reason (for example a row that no longer parses) does not hold back other keys, nor make them stale while the database answers. Every load error falls back: the repositories report every read failure as one internal error, and "not found" and "disabled" are stored values, not errors.
+
+**Emptying marks stale.** When the change log watcher empties the cache ([The Change Log](#the-change-log)), every entry is marked stale instead of being removed, and the loads in flight are detached as before. Each entry is reloaded on its next use and answered only if that reload fails or is slow. A network partition often cuts a replica off from the database and the cluster together; every reconnect of the watch empties the cache, so removing the entries would end proxying at the first reconnect. A marked entry may miss a change, as an entry past its TTL may; `max_stale` bounds both. A change still removes the entries it affects: they are known to be wrong.
+
+**Requests already waiting when a change arrives.** A change detaches the loads in flight; a request already waiting on one keeps the stale entry it found and answers it if the load fails or is slow. Like the detached load's own answer, that answer predates the change.
+
+**Bounds.** `max_stale` (default 15 min, at most 24 h) caps how long a lost or missed change can still be served while reloads fail. Stale entries count toward `max_entries` and are evicted least recently used first, so memory stays bounded. Only what a replica has seen survives an outage: a key with nothing stored returns the database error, and a replica that starts during an outage has nothing to serve.
+
+**Visibility.** Each stale answer is counted in `oagw_proxy_cache_stale_served_total` by `map` and `cause`. A failed reload that leaves stale entries logs a warning, with the section, the number of keys and of stale entries, and the error; each section logs at most one such warning, or load timeout, every 30 s, with the number it did not log. The health check reports `Degraded` with code `proxy_cache_serving_stale` for 30 s after a stale answer ([Health and Metrics](#health-and-metrics)).
 
 ### The Change Log
 
@@ -277,8 +301,8 @@ gears:
 
 | Failure | Behavior |
 |---|---|
-| Database down | Cache hits are served. A miss returns the database error, as today. Errors are not cached; the next miss tries again. |
-| A cache load hangs | After 30 s the load is dropped and every request waiting on it gets an error; the next miss starts a new load. |
+| Database down | Cache hits are served. An entry past its TTL is reloaded; when the reload fails, or has not answered 2 s after it started, the stale entry is answered, for up to `max_stale` past the TTL, and the next reload of that key is tried 5 s after a failure. Health reports `Degraded` (`proxy_cache_serving_stale`). A key with nothing stored returns the database error, as today. Errors are not cached ([Serving Stale](#serving-stale)). |
+| A cache load hangs | After 30 s the load is dropped. Requests with a stale entry answered it 2 s after the load started; the others get an error. The next miss starts a new load. |
 | Appending to the change log fails, or takes longer than 2 s | The write still succeeds and local entries are evicted. OAGW logs a warning naming the change. A change whose append fails for good is counted (`reason="append_failed"`); one still in flight when the write stops waiting is not. Other replicas pick it up within the TTL. |
 | A cluster call hangs | Each append attempt is cut after 1 s and retried; the append fails after about 5 s. A log read is cut after 5 s: the cache is emptied and the watch reconnects. |
 | A newer build's log, during a rolling upgrade | An old replica skips its appends (`reason="newer_log"`) and reports `Degraded` (`proxy_cache_newer_log`); other replicas see its writes within the TTL. After a rollback, delete the log key ([Rolling upgrades](#the-change-log)). |
@@ -300,15 +324,16 @@ gears:
     config:
       proxy_cache:
         enabled: true      # default true; no effect without a database
-        ttl: 60s           # how long an entry may live; 1s to 1h
+        ttl: 60s           # how long an entry is fresh; 1s to 1h
+        max_stale: 15m     # how long past the TTL an entry may answer when its reload fails; 0s (off) to 24h
         max_entries: 10000 # per section; 1 to 1000000
 ```
 
-* `ttl` is a humantime duration. Unknown keys are rejected.
+* `ttl` and `max_stale` are humantime durations. Unknown keys are rejected.
 * Without a database, the cache is off and no cluster configuration is needed.
 * With a database and `enabled: true`, the cluster gear must have an `oagw` profile ([Cluster Setup](#cluster-setup)). With `enabled: false` there is no change log and no cluster is needed; set it alike on every replica.
 * A build without the `cluster` feature cannot cache: with a database and `enabled: true`, `init` fails with an error naming the feature and `enabled: false`.
-* The log bounds (128 changes, 32 KiB), the append attempts (5) and each attempt's limit (1 s), the write's wait for its append (2 s), the second apply of a dropped write (30 s later), a cache load's limit (30 s), a log read's limit (5 s), the health check's wait for the cluster readiness check (250 ms) and how long it reuses that check's last result (10 s) are constants, not configuration.
+* The log bounds (128 changes, 32 KiB), the append attempts (5) and each attempt's limit (1 s), the write's wait for its append (2 s), the second apply of a dropped write (30 s later), a cache load's limit (30 s), the wait for a stale entry's reload (2 s), the retry window after a failed reload (5 s), how often a section logs a failed load (30 s), how long a stale answer shows in the health check (30 s), a log read's limit (5 s), the health check's wait for the cluster readiness check (250 ms) and how long it reuses that check's last result (10 s) are constants, not configuration.
 
 ### Health and Metrics
 
@@ -316,6 +341,7 @@ gears:
 
 * the change log watch, only with a database and the cache enabled: `Degraded` with code `proxy_cache_watch_connecting` while connecting or reconnecting, `proxy_cache_watch_down` once down (a non-retryable close, or after `stop`), and `proxy_cache_newer_log` while the watch is up but this replica's appends skip a newer-format log. A down watch never makes OAGW `Unhealthy`: the cache stays correct within the TTL;
 * the cluster SDK's readiness (`cluster_sdk::cluster_readiness`), only with a database and the cache enabled. `cluster-starting` and `cluster-profile-degraded` make OAGW `Degraded` (not `Unhealthy` as the SDK reports them), since OAGW needs the cluster only for freshness; `cluster-misconfigured` makes it `Unhealthy`. The SDK's check can be slow, so OAGW runs it on its own task and waits at most 250 ms (half the API gateway's default 500 ms per check). A running check is left to finish and shared by later health checks; meanwhile OAGW reports the last result for up to 10 s after the check began, then `Degraded` with code `cluster_readiness_slow`. A gateway per-check timeout below 250 ms still times OAGW out;
+* stale answers, only with a database and the cache enabled: `Degraded` with code `proxy_cache_serving_stale` while a stale entry was answered in the last 30 s ([Serving Stale](#serving-stale)). It is the only part that shows a database outage, and never makes OAGW `Unhealthy`;
 * registry provisioning, as before.
 
 The status and code are the worst part's (the earlier part's on a tie); the message names every unhealthy part.
@@ -324,12 +350,13 @@ The status and code are the worst part's (the earlier part's on a tie); the mess
 
 | Metric | Type | Labels |
 |---|---|---|
-| `oagw_proxy_cache_lookups_total` | counter | `map` (`alias`, `route`), `result` (`hit`, `miss`, `joined`: waited for a load another request started) |
+| `oagw_proxy_cache_lookups_total` | counter | `map` (`alias`, `route`), `result` (`hit`, `miss`, `joined`: waited for a load another request started; `stale`: a stale entry answered in its retry window, without a load) |
 | `oagw_proxy_cache_entries` | gauge | `map` |
-| `oagw_proxy_cache_evictions_total` | counter | `map`, `reason` (`change`, including emptying the whole cache; `ttl`; `capacity`) |
+| `oagw_proxy_cache_evictions_total` | counter | `map`, `reason` (`change`, including emptying the whole cache when that removes entries, that is with `max_stale: 0s`; `ttl`: older than the TTL and `max_stale`; `capacity`) |
 | `oagw_proxy_cache_changes_total` | counter | `source` (`local`: a write on this replica; `remote`: another replica's, from the log) |
 | `oagw_proxy_cache_flushes_total` | counter | `cause` (`watch_reset`: the watch started, was re-established or fell behind; `log_gap`; `log_reset`: another log, or the log deleted, expired or gone; `log_unreadable`; `watch_closed`) |
 | `oagw_proxy_cache_loads_discarded_total` | counter | `map` (loads not stored because a change detached them) |
+| `oagw_proxy_cache_stale_served_total` | counter | `map`, `cause` (`error`: the reload failed; `slow`: the reload had not answered 2 s after it started; `retry_window`: a reload failed less than 5 s before, so none ran). One per key answered stale |
 | `oagw_proxy_cache_publish_failures_total` | counter | `reason` (`append_failed`: every attempt conflicted, failed or timed out, or the cluster refused it; `newer_log`: a newer build's log was left alone; `publisher_stopped`: the publisher had stopped, or stopped before the append). Each change not appended is counted once; a write that stops waiting after 2 s is not counted |
 
 ### Out of Scope
@@ -405,7 +432,8 @@ Production lookups are compared through the `resolve` phase and the cache metric
 ### Consequences
 
 * A cache hit runs no database query. The database load from proxying drops from three `SELECT`s per request to about one load per active key, per replica, per TTL, plus one reload of each entry a write affects.
-* Proxying keeps working for cached aliases while the database is slow or down.
+* Proxying keeps working for cached aliases while the database is slow or down, for up to `max_stale` (default 15 min) past their TTL. A key a replica has not cached, or a replica that starts during the outage, still fails ([Serving Stale](#serving-stale)).
+* A replica that loses both the database and the cluster keeps proxying an upstream or route disabled or deleted on another replica for up to the TTL and `max_stale` (16 min by default, 1 min without serving stale). A write on the replica itself evicts at once. Set `max_stale: 0s` where revocation must be fast.
 * With several replicas, another replica's write can take up to the TTL to show when a change is lost.
 * Every deployment with a database and the cache enabled needs the cluster gear and an `oagw` profile whose cache supports watches (a single replica can use the infrastructure-free standalone backend). With the cache disabled it needs neither, and every request reads the database. A deployment without a database needs neither, and supports one replica only.
 * The proxy reads through a new port, `ProxyConfigReader`, given to `ControlPlaneServiceImpl` when the cache is enabled. On a database, repository decorators evict and publish on every write. `RouteRepository` gets `list_proxy_routes` ([ADR-0009 Appendix B](./0009-storage-schema.md#appendix-b-queries-and-access-frequency) Q15). `RepositoryError` becomes `Clone`, so waiters on one load share its error.
@@ -435,7 +463,7 @@ Each scenario lists what happens and the test IDs that check it (see [Confirmati
 16. **Read races a write.** A request starts loading the old configuration, a write's change detaches the load, then the load finishes. The requests waiting on it get its result, it is not stored, and a later request starts a new load. (`CACHE-RACE-001`, `CACHE-EVICT-006`)
 17. **Many misses at once.** Many requests miss the same key at the same time. One `SELECT` runs, and all requests get its result. (`CACHE-RACE-002`)
 18. **Host denied after caching.** The SSRF policy starts denying a cached upstream's host. The next request is rejected. (`CACHE-SAFE-001`)
-19. **Database down.** Cached aliases keep resolving. A miss returns the database error, and the error is not cached. (`CACHE-FAIL-001`)
+19. **Database down.** Cached aliases keep resolving, past their TTL from the stale entries. Each stale entry's reload is tried, then not again for 5 s. A miss with nothing stored returns the database error, and the error is not cached. When the database is back, the next reload refreshes the entries. (`CACHE-FAIL-001`, `CACHE-STALE-001`, `CACHE-STALE-004`, `CACHE-STALE-010`)
 20. **Change cannot be appended.** The write succeeds and the local entries are evicted. Each change not appended is counted once, by reason, and logged with its IDs; changes queued when OAGW stops are still appended. Other replicas see the change within the TTL. (`CACHE-FAIL-002`)
 21. **Watch down.** Proxying continues, the health check reports `Degraded` (`proxy_cache_watch_connecting` while reconnecting, `proxy_cache_watch_down` once closed), and freshness falls back to the TTL. A log read that hangs breaks the watch. Quick reconnects back off. After reconnecting, the cache is emptied and health recovers. (`CACHE-FAIL-003`)
 22. **Cluster profile missing.** With a database, the cache enabled and no `oagw` profile, an embedded build fails startup. (`CACHE-CONF-001`)
@@ -444,6 +472,10 @@ Each scenario lists what happens and the test IDs that check it (see [Confirmati
 25. **Cache full.** The least recently used entry is evicted, and requests still resolve correctly. (`CACHE-HIT-004`)
 26. **Cluster service unreachable at startup.** In the remote build, OAGW starts, reports `Degraded` (the watch connecting; the cluster SDK's `cluster-starting` is `Degraded` too, not `Unhealthy`), and recovers when the watch connects. A misconfiguration the SDK reports after its grace period makes OAGW `Unhealthy`. (`CACHE-CONF-004`)
 27. **No database, no cluster.** Without a database, OAGW starts and is ready with no cluster gear linked and no `oagw` profile. (`CACHE-CONF-005`)
+28. **Slow database.** A stale entry's reload has not answered 2 s after it started: its requests answer the stale entry, later requests joining the reload answer at once, and the reload's late answer is stored. (`CACHE-STALE-003`)
+29. **Partition: database and cluster unreachable together.** Each watch reconnect empties the cache by marking the entries stale; their reloads fail and the stale entries keep answering. (`CACHE-STALE-005`)
+30. **Outage longer than `max_stale`.** An entry older than the TTL and `max_stale` is removed, and its lookup returns the database error. With `max_stale: 0s`, an entry past the TTL is never answered. (`CACHE-STALE-002`)
+31. **Stale answers are visible.** Each stale answer is counted by cause, each section logs at most one failed reload every 30 s, and the health check reports `Degraded` (`proxy_cache_serving_stale`) for 30 s after the last stale answer. (`CACHE-STALE-009`, `CACHE-STALE-011`)
 
 ### Confirmation
 
@@ -495,6 +527,20 @@ Each behavior below has an ID. The tests that prove it name the ID in their doc 
 **Failures**
 
 * `CACHE-FAIL-001`: with the database unavailable, cached lookups succeed, a miss returns the error, and the next lookup tries the database again.
+
+**Serving stale**
+
+* `CACHE-STALE-001`: a failed reload of a stale entry answers the stale entry and keeps it; a successful reload replaces it.
+* `CACHE-STALE-002`: an entry older than the TTL and `max_stale` is removed, and its failed reload returns the error; with `max_stale: 0s` an entry past the TTL is never answered.
+* `CACHE-STALE-003`: a request with a stale entry answers it 2 s after its reload started; a request joining a reload older than 2 s answers at once; the reload's late answer is stored.
+* `CACHE-STALE-004`: after a failed reload the stale entry is answered without a reload for 5 s, then reloaded; the window is per key.
+* `CACHE-STALE-005`: emptying the cache marks every entry stale and detaches the loads in flight; each entry is reloaded on its next use and answered only if the reload fails or is slow.
+* `CACHE-STALE-006`: a change removes the stale entries it affects.
+* `CACHE-STALE-007`: a failed batched reload answers each key that has a stale entry, and fails a lookup with a key that has none.
+* `CACHE-STALE-008`: stale entries stay until the TTL and `max_stale` have passed, and count toward the capacity.
+* `CACHE-STALE-009`: a failed reload logs one warning, whatever the number of requests that answered its stale entry; a section logs at most one every 30 s, with the number it did not log.
+* `CACHE-STALE-010`: through the proxy lookup on a database that goes down, a cached lookup resolves past the TTL, its reload is retried only after 5 s, a lookup with nothing cached fails, and the entries refresh once the database is back.
+* `CACHE-STALE-011`: the health check reports `Degraded` with code `proxy_cache_serving_stale` for 30 s after a stale answer, then healthy.
 * `CACHE-FAIL-002`: when appending the change fails, the write succeeds, the local entries are evicted, and each change not appended is logged with its IDs and counted once in `oagw_proxy_cache_publish_failures_total` by `reason`; a hung cluster call fails its attempt after 1 s; on stop the queued changes are still appended, and those the publisher cannot take are counted.
 * `CACHE-FAIL-003`: when the watch breaks, or a log read hangs for 5 s, the health check reports `Degraded` with code `proxy_cache_watch_connecting`; after it reconnects, the cache is emptied and the health check recovers; quick reconnects back off from 1 s doubling.
 
@@ -511,6 +557,7 @@ Each behavior below has an ID. The tests that prove it name the ID in their doc 
 These choices are proposed defaults, to confirm in review:
 
 * The TTL default: 60 s.
+* The `max_stale` default: 15 min (0 s to 24 h).
 * Applying a write's change after every write call, including failed ones, instead of only after successful commits.
 * Keying the alias section by alias and tenant chain. It needs no eviction when a tenant moves, but quiet tenants miss often (see [Expected Gains](#expected-gains)).
 
@@ -524,6 +571,11 @@ Answered:
 * Whether requests waiting on one load share its error: yes. Errors are still never stored.
 * Whether the `oagw` profile must be `Linearizable`: no ([Consistency](#the-change-log)).
 * The log's size: 128 changes and 32 KiB.
+* Whether a reload failure answers the cache's last entry: yes, for up to `max_stale` past the TTL ([Serving Stale](#serving-stale)).
+* How long a request with a stale entry waits for its reload: at most 2 s from the reload's start, as a database that is down fails only after the pool's acquire timeout.
+* Whether a failed reload is retried on every request: no, after a 5 s window per key; a window for the whole cache would let one failing key make every entry stale while the database answers.
+* Whether emptying the cache removes the entries: only with `max_stale: 0s`; otherwise it marks them stale, so a partition that also breaks the watch does not end proxying.
+* Whether stale answers show in health: yes, `Degraded` (`proxy_cache_serving_stale`) for 30 s after one, as nothing else in OAGW's health reports the database.
 
 ## Pros and Cons of the Options
 
@@ -534,9 +586,11 @@ Answered:
 * Good, because the database stays the only store of configuration
 * Good, because the cluster backend is chosen by configuration (Redis, PostgreSQL, k8s)
 * Good, because the TTL bounds staleness when a change is lost, and a replica that cannot know what it missed empties its cache
+* Good, because a replica keeps answering what it has cached for up to `max_stale` while the database is down
 * Bad, because the eviction rules must be complete: a missed case leaves a stale entry until the TTL. A randomized model test (`CACHE-EVICT-007`) checks them against the uncached lookup
 * Bad, because every deployment with a database and the cache enabled needs the cluster gear, and several replicas need a shared backend (Redis, PostgreSQL, k8s)
 * Bad, because a change appended after the commit can be lost, so staleness up to the TTL is possible
+* Bad, because only configuration a replica has cached survives a database outage: other keys fail, and a replica that starts during the outage serves nothing
 
 ### In-memory cache, cluster change signal, full flush
 
@@ -571,6 +625,36 @@ Store the configuration in Redis as a second cache level (ADR-0007).
 * Bad, because the domain types need serialization, and values and keys must fit the shared cache's limits
 * Bad, because it still needs a per-replica cache and invalidation to remove I/O from the proxy path
 
+### Control plane / data plane split, data plane without a database
+
+Each replica's data plane holds the whole configuration in memory, receives new versions from a control plane by push or watch, never reads the database on the request path, and keeps its last known configuration while the control plane is down. Most gateways work this way:
+
+* Envoy, Istio and Envoy Gateway receive configuration over xDS gRPC streams; Envoy keeps its last configuration when the xDS server goes away. Delta xDS and on-demand discovery exist for large configurations.
+* Kong in hybrid mode: the control plane owns PostgreSQL and pushes the configuration to data planes without a database over a websocket; the data planes cache it on disk and can start from it while the control plane is down. Kong's classic database mode, where every node reads PostgreSQL, caches entities, and invalidates through a `cluster_events` table it polls every few seconds, is close to the chosen option; Kong now recommends hybrid mode over it.
+* Apache APISIX keeps its configuration in etcd; every node watches etcd and holds all of it in memory. A standalone mode reads a YAML file.
+* Traefik watches its providers (Kubernetes, files, Consul) and holds the whole configuration in memory.
+* Envoy AI Gateway translates Kubernetes resources into xDS for Envoy.
+
+**Size.** Every replica would hold every tenant's upstreams and routes. Measured in memory (heap and inline bytes, before allocator rounding), an upstream takes 0.8 KiB with only its required fields and 2.5 KiB with every optional field; an HTTP route takes 0.4 KiB and 1.3 KiB. Assuming 10 upstreams per tenant with 10 routes each:
+
+| Tenants | Configuration per replica |
+|---|---|
+| 1,000 | 50–160 MB |
+| 10,000 | 0.5–1.6 GB |
+| 100,000 | 5–16 GB |
+
+Add about half again for allocator rounding and the lookup indexes, and a full load (or snapshot transfer) on every replica start. The chosen cache is bounded by `max_entries` whatever the number of tenants: its route section, the larger, holds at most about 40–130 MB at the default 10,000 entries.
+
+**Middle ground.** Delta or on-demand loading, as in Envoy, is lazy like the chosen cache, but pushed from a control plane instead of read from the database. [Serving Stale](#serving-stale) already gives the chosen option the property that matters most here, a data plane that keeps its last known configuration through a database outage, for the configuration it has seen and for up to `max_stale`. The proxy reads through the `ProxyConfigReader` port, so a pushed store can replace the cache later without touching the proxy.
+
+* Good, because the request path never reads the database, and a control plane outage of any length leaves the data plane on its last known configuration, including keys it never served and replicas that restart (with a configuration kept on disk)
+* Good, because a versioned stream does not lose changes, so no TTL is needed to bound staleness
+* Bad, because each replica's memory and start-up load grow with every tenant's configuration, not with the part in use (see the table)
+* Bad, because it needs a control plane service and a versioned snapshot and delta protocol that OAGW does not have, with failure modes of its own (consistent snapshots across tables, slow consumers, resynchronization)
+* Bad, because it is a larger change than the problem needs: the database stays the source of truth either way, and the costs to remove are the per-request queries and the outage behavior, both covered by the chosen option
+
+Not chosen now, for its size per replica and the control plane it needs. Revisit it if the configuration must survive outages longer than `max_stale`, or for keys a replica has not served.
+
 ### No cache
 
 * Good, because it needs no change
@@ -592,7 +676,7 @@ Store the configuration in Redis as a second cache level (ADR-0007).
 This decision directly addresses the following requirements or design elements:
 
 * `cpt-cf-oagw-nfr-low-latency` — A cache hit runs no database query on the proxy path
-* `cpt-cf-oagw-nfr-high-availability` — Cached aliases keep resolving while the database is unavailable
+* `cpt-cf-oagw-nfr-high-availability` — Cached aliases keep resolving while the database is unavailable, past their TTL for up to `max_stale`
 * `cpt-cf-oagw-fr-alias-resolution` — Alias resolution over the tenant chain, served from the cache with the same results
 * `cpt-cf-oagw-fr-hierarchical-config` — A write in an ancestor tenant evicts every entry whose tenant chain contains it, so descendant lookups see it
 * `cpt-cf-oagw-fr-config-persistence` — The database stays the only store of configuration
