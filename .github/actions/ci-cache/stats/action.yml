@@ -1,0 +1,8 @@
+---
+name: ci-cache stats
+description: Post step of ci-cache; writes `sccache --show-stats` into the job summary.
+runs:
+  using: node24
+  main: main.js
+  post: post.js
+  post-if: always()
