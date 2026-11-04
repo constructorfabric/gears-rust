@@ -124,7 +124,11 @@ Each is the shipped behaviour, with the contract that fixes it.
   hydration), so read → change → write with `expected_version` set to what
   was read is a compare-and-set that refuses a write someone made in
   between. Edges carry no version (`envelope.version` is absent): their
-  identity is derived from their endpoints.
+  identity is derived from their type, their endpoints and an optional
+  `discriminator`, which is what tells apart two edges of one type between
+  the same two nodes. Reads return it on `EdgeRef` and `AdjacencyEntry`, and
+  a traversal can follow only the discriminators it names
+  (`edge_discriminators`).
 - **Scope replacement removes what carries the scope.** `replace_scope:
   {attribute, value, generation}` removes, after the batch's own writes, the
   nodes of `scope_managed` types whose payload field `attribute` equals

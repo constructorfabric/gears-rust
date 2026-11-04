@@ -726,9 +726,9 @@ Every node and edge returned by any read surface **MUST** carry a gear-assigned 
 
 - [x] `p1` - **ID**: `cpt-cf-graph-storage-fr-sdk-client`
 
-The system **MUST** ship a transport-agnostic SDK crate with a typed client trait covering type registration, ingest, search, traversal, projection, and metrics, registered in ClientHub for in-process consumption by other gears, with canonical platform error types. The in-process path **MUST** be subject to the same admission limits as the REST surface — resource bounds are enforced in the shared service layer, not at the HTTP edge only.
+The system **MUST** ship a transport-agnostic SDK crate with a typed client trait covering type registration, ingest, search, traversal, and projection, registered in ClientHub for in-process consumption by other gears, with canonical platform error types. The in-process path **MUST** be subject to the same admission limits as the REST surface — resource bounds are enforced in the shared service layer, not at the HTTP edge only.
 
-> **Found while building the prototype.** Metrics are not part of the client (analytics moved out of this gear), and the trait is narrower than REST: no edge read and no source-namespace operations; registration takes the REST options, dry run and migrations included, through `register_types_with` (README § Known limitations).
+> **Found while building the prototype.** Graph metrics are not part of the client: analytics moved out of this gear, so they are the `graph-analytics` gear's to serve. The trait is narrower than REST: no edge read and no source-namespace operations; registration takes the REST options, dry run and migrations included, through `register_types_with` (README § Known limitations).
 
 - **Rationale**: Producer and consumer gears integrate in-process; the SDK trait is the platform's inter-gear contract pattern.
 - **Actors**: `cpt-cf-graph-storage-actor-producer-gear`, `cpt-cf-graph-storage-actor-consumer-gear`
@@ -888,7 +888,7 @@ The gear **MUST** maintain at least 85% line coverage across its library crates.
 
 - **Type**: Rust trait (ClientHub client) in the SDK crate
 - **Stability**: unstable (v1 during incubation)
-- **Description**: Typed async client trait mirroring the REST capabilities for in-process gear-to-gear calls, with transport-agnostic models and canonical errors. Behavioural parity with REST is a contract requirement, not a convention: identical permission checks and identical admission limits, both enforced in the shared domain layer. *Found while building the prototype:* parity holds for every operation the trait carries; the `V1` trait is narrower than REST (no edge read, no compatibility dry run, no registration options or migrations, no source-namespace operations), and widening it is a `ClientV2` change under the policy below.
+- **Description**: Typed async client trait mirroring the REST capabilities for in-process gear-to-gear calls, with transport-agnostic models and canonical errors. Behavioural parity with REST is a contract requirement, not a convention: identical permission checks and identical admission limits, both enforced in the shared domain layer. *Found while building the prototype:* parity holds for every operation the trait carries; the `V1` trait is narrower than REST (no edge read, no source-namespace operations), and widening it further is a `ClientV2` change under the policy below. Registration is not narrower: `register_types_with` takes the REST options, compatibility dry run and migrations included.
 - **Breaking Change Policy**: Versioned trait names (`...ClientV1`); breaking changes introduce a new trait version.
 
 ### 7.2 External Integration Contracts

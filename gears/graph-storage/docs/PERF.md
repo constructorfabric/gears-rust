@@ -121,9 +121,10 @@ gears-rust#5517:
 - a scale curve — the same scenarios at 0.1×, 1× and 10× the reference graph;
 - a consumer-shaped query — resolve a node, one typed hop, filter and page the
   far nodes by a payload path;
-- ingest throughput in the command above: the same file asserts
-  `nfr-ingest-throughput` in `a_producer_sized_batch_lands_inside_its_budget`,
-  but the command runs the retrieval scenarios only, and the ingest test
-  reports no `RESULT` lines for the summary (gears-rust#5040);
+- ingest in the command above, which runs the retrieval scenarios only. The
+  same file has two ingest tests, run by name: `a_producer_sized_batch_lands_inside_its_budget`
+  asserts `nfr-ingest-throughput` and prints its wall clock, and
+  `overlapping_ingest_batches` times concurrent writers on one key pool and
+  prints `RESULT` and `CONTENTION` lines (gears-rust#5040, #5042);
 - many tenants in one database, a database on a separate host, and the request
   end to end through REST and the PDP.
