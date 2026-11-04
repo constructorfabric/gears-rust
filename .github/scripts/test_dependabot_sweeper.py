@@ -4,7 +4,7 @@ import subprocess
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime, timezone
-from unittest import mock
+import unittest.mock as mock
 
 import dependabot_sweeper as s
 
