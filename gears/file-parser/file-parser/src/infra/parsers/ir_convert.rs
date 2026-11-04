@@ -147,6 +147,11 @@ fn collect_blocks_from_node(
                     title: None,
                     src: src.clone(),
                 });
+            } else {
+                tracing::debug!(
+                    has_description = description.is_some(),
+                    "dropping image node without a source"
+                );
             }
         }
         // Container nodes: slide, group — recurse into children
