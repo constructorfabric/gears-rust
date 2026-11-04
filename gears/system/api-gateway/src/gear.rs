@@ -31,12 +31,15 @@ use crate::middleware::errors::ApiGatewayGatewayError;
 
 /// Map a `tower::timeout` `Elapsed` (or any other unexpected `BoxError`)
 /// into a canonical `application/problem+json` response.
-async fn timeout_to_canonical(err: BoxError) -> axum::response::Response {
+fn timeout_to_canonical(err: &BoxError, timeout: Duration) -> axum::response::Response {
     use axum::response::IntoResponse;
 
     if err.is::<tower::timeout::error::Elapsed>() {
-        let canonical =
-            ApiGatewayGatewayError::deadline_exceeded("Request exceeded 30s timeout").create();
+        let canonical = ApiGatewayGatewayError::deadline_exceeded(format!(
+            "Request exceeded {} timeout",
+            humantime_serde::re::humantime::format_duration(timeout)
+        ))
+        .create();
         return canonical.into_response();
     }
 
@@ -551,14 +554,17 @@ impl ApiGateway {
         router = router.layer(RequestBodyLimitLayer::new(config.defaults.body_limit_bytes));
         router = router.layer(DefaultBodyLimit::max(config.defaults.body_limit_bytes));
 
-        // 6) Timeout — emits canonical `deadline_exceeded` Problem with
-        //    `application/problem+json` body when the inner service exceeds
-        //    the deadline. Layer position is unchanged (between BodyLimit
-        //    and CatchPanic).
+        // 6) Timeout (`defaults.request_timeout`) — emits canonical
+        //    `deadline_exceeded` Problem with `application/problem+json` body
+        //    when the inner service exceeds the deadline. Layer position is
+        //    unchanged (between BodyLimit and CatchPanic).
+        let request_timeout = config.defaults.request_timeout;
         router = router.layer(
             ServiceBuilder::new()
-                .layer(HandleErrorLayer::new(timeout_to_canonical))
-                .timeout(Duration::from_secs(30)),
+                .layer(HandleErrorLayer::new(move |err: BoxError| {
+                    std::future::ready(timeout_to_canonical(&err, request_timeout))
+                }))
+                .timeout(request_timeout),
         );
 
         // 5) CatchPanic (converts panics to 500 before metrics sees them)
@@ -1233,6 +1239,8 @@ impl toolkit::Gear for ApiGateway {
         cfg.gateway_proxy
             .validate()
             .map_err(|e| anyhow::anyhow!(e))?;
+        // Fail fast on a zero request timeout, which would 504 every request.
+        cfg.defaults.validate().map_err(|e| anyhow::anyhow!(e))?;
         self.config.store(Arc::new(cfg.clone()));
 
         debug!(
@@ -1719,6 +1727,91 @@ mod tests {
         let _router = api
             .apply_middleware_stack(Router::new(), None)
             .expect("stack builds with the platform-plane layer");
+    }
+
+    /// Serve one request for `/slow` (a handler that sleeps `handler_delay`)
+    /// through the full middleware stack configured with `request_timeout`.
+    async fn call_slow_route(
+        request_timeout: Duration,
+        handler_delay: Duration,
+    ) -> axum::response::Response {
+        use tower::ServiceExt;
+
+        let mut config = ApiGatewayConfig {
+            auth_disabled: true,
+            ..Default::default()
+        };
+        config.defaults.request_timeout = request_timeout;
+        let api = ApiGateway::new(config);
+        let router = Router::new().route(
+            "/slow",
+            axum::routing::get(move || async move {
+                tokio::time::sleep(handler_delay).await;
+                "done"
+            }),
+        );
+        let (router, _pruner) = api
+            .apply_middleware_stack(router, None)
+            .expect("stack builds");
+        router
+            .oneshot(
+                axum::extract::Request::builder()
+                    .uri("/slow")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    /// The timeout layer uses `defaults.request_timeout`: a handler slower
+    /// than the configured deadline gets the canonical 504.
+    #[tokio::test]
+    async fn request_timeout_from_config_cuts_off_slow_handler() {
+        let resp = call_slow_route(Duration::from_millis(50), Duration::from_secs(5)).await;
+        assert_eq!(resp.status(), http::StatusCode::GATEWAY_TIMEOUT);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8_lossy(&body);
+        assert!(
+            body.contains("50ms"),
+            "detail should name the deadline: {body}"
+        );
+    }
+
+    /// A handler within the configured deadline completes normally.
+    #[tokio::test]
+    async fn request_timeout_from_config_lets_handler_finish() {
+        let resp = call_slow_route(Duration::from_secs(5), Duration::from_millis(50)).await;
+        assert_eq!(resp.status(), http::StatusCode::OK);
+    }
+
+    /// `init` refuses a zero `defaults.request_timeout`.
+    #[tokio::test]
+    async fn init_rejects_zero_request_timeout() {
+        struct Provider(serde_json::Value);
+        impl toolkit::config::ConfigProvider for Provider {
+            fn get_gear_config(&self, _gear: &str) -> Option<&serde_json::Value> {
+                Some(&self.0)
+            }
+        }
+        let ctx = toolkit::context::GearCtx::new(
+            "api-gateway",
+            uuid::Uuid::new_v4(),
+            Arc::new(Provider(serde_json::json!({
+                "config": {
+                    "bind_addr": "127.0.0.1:0",
+                    "defaults": { "request_timeout": "0s" }
+                }
+            }))),
+            Arc::new(toolkit::ClientHub::new()),
+            tokio_util::sync::CancellationToken::new(),
+        );
+        let err = toolkit::Gear::init(&ApiGateway::default(), &ctx)
+            .await
+            .expect_err("zero request_timeout must fail init");
+        assert!(err.to_string().contains("request_timeout"), "{err}");
     }
 
     /// `build_router` always builds fresh: an earlier revision short-circuited
