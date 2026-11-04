@@ -322,6 +322,7 @@ async fn default_broker_gives_the_plugin_no_api_key() {
         h.tool_schemas.clone(),
         Arc::new(crate::domain::provider_rules::ProviderRulesRegistry::permissive()),
         &h.limits,
+        &h.stream,
     );
     svc.create_response(&ctx(), body("m"))
         .await
@@ -505,17 +506,21 @@ async fn local_client_surfaces_service_errors() {
 }
 
 #[tokio::test]
-async fn local_client_streaming_is_capability_not_supported() {
+async fn local_client_streaming_without_model_support_is_capability_not_supported() {
     let h = Harness::new();
     let client = LlmGatewayLocalClient::new(h.service());
     let err = client
         .create_response_stream(&ctx(), body("m"))
         .await
         .err()
-        .expect("streaming is not served yet");
+        .expect("the default model has no streaming capability");
 
     assert_eq!(err.code(), "capability_not_supported");
-    assert_eq!(h.pdp.calls(), 0, "nothing of the pipeline ran");
+    assert_eq!(
+        h.pdp.calls(),
+        1,
+        "streaming requests are authorized first (F-006)"
+    );
 }
 
 #[tokio::test]

@@ -60,6 +60,7 @@ impl Gear for LlmGatewayModule {
             Arc::new(TypesRegistryToolSchemas::new(hub.clone())),
             Arc::new(ProviderRulesRegistry::permissive()),
             &cfg.limits,
+            &cfg.stream,
         ));
 
         self.service

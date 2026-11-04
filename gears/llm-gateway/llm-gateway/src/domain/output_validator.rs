@@ -42,16 +42,32 @@ impl OutputValidator {
     /// # Errors
     ///
     /// `output_validation_error` for non-JSON output or a schema mismatch.
-    #[allow(clippy::unused_self)] // instance method: the validator may gain configuration
     pub fn validate(
         self,
         schema: &serde_json::Value,
         resource: &ResponseResource,
     ) -> Result<(), LlmGatewayError> {
-        let text = assembled_text(resource).ok_or_else(|| {
+        self.validate_text(schema, assembled_text(resource).as_deref())
+    }
+
+    /// Validate already assembled output `text` (`None`: the response had no
+    /// output text) against `schema`. Used by the stream path, which
+    /// accumulates the text from `response.output_text.delta` events.
+    ///
+    /// # Errors
+    ///
+    /// `output_validation_error` for missing or non-JSON output or a schema
+    /// mismatch.
+    #[allow(clippy::unused_self)] // instance method: the validator may gain configuration
+    pub fn validate_text(
+        self,
+        schema: &serde_json::Value,
+        text: Option<&str>,
+    ) -> Result<(), LlmGatewayError> {
+        let text = text.ok_or_else(|| {
             LlmGatewayError::output_validation("the response has no output text to validate")
         })?;
-        let instance: serde_json::Value = serde_json::from_str(&text)
+        let instance: serde_json::Value = serde_json::from_str(text)
             .map_err(|_| LlmGatewayError::output_validation("the output text is not valid JSON"))?;
         let validator = jsonschema::validator_for(schema).map_err(|_| {
             LlmGatewayError::output_validation("the response schema could not be compiled")

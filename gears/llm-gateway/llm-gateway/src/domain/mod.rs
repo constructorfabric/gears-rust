@@ -8,6 +8,7 @@ pub mod output_validator;
 pub mod ports;
 pub mod provider_rules;
 pub mod service;
+pub mod stream_supervisor;
 #[cfg(test)]
 pub mod test_support;
 pub mod tool_resolver;

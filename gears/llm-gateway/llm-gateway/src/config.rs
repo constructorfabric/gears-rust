@@ -8,6 +8,26 @@ use serde::{Deserialize, Serialize};
 pub struct LlmGatewayConfig {
     /// Protective operational bounds.
     pub limits: LimitsConfig,
+    /// Streaming behavior.
+    pub stream: StreamConfig,
+}
+
+/// Streaming configuration (DESIGN §4.5, `stream.*`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct StreamConfig {
+    /// Capacity (in events) of the bounded channel between the Stream
+    /// Supervisor and the consumer. A full channel applies backpressure to
+    /// the plugin stream; it is not an error.
+    pub channel_capacity: usize,
+}
+
+impl Default for StreamConfig {
+    fn default() -> Self {
+        Self {
+            channel_capacity: 64,
+        }
+    }
 }
 
 /// Protective operational bounds (DESIGN §4.5, `limits.*`).
@@ -19,6 +39,11 @@ pub struct LimitsConfig {
     /// instance. A request over the limit fails with `gateway_unavailable`
     /// before model resolution.
     pub max_inflight_sync: usize,
+    /// Maximum number of streaming create-response requests in flight per
+    /// instance; the slot is held for the lifetime of the stream. A request
+    /// over the limit fails with `gateway_unavailable` before model
+    /// resolution.
+    pub max_inflight_streams: usize,
     /// Maximum number of input items in one request. A request over the
     /// limit fails with `validation_error` before quota admission and
     /// credential retrieval.
@@ -36,6 +61,7 @@ impl Default for LimitsConfig {
     fn default() -> Self {
         Self {
             max_inflight_sync: 256,
+            max_inflight_streams: 1_024,
             max_input_items: 1_000,
             max_tools: 128,
             max_schema_bytes: 262_144,

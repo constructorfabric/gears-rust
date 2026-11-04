@@ -14,12 +14,14 @@ use authz_resolver_sdk::models::{
 };
 use authz_resolver_sdk::{AuthZResolverApi, PolicyEnforcer};
 use llm_gateway_sdk::models::core::{
-    ReasoningConfig, ResponseStatus, TextFormat, ToolChoice, ToolChoiceMode, TruncationStrategy,
+    ReasoningConfig, ResponseError, ResponseStatus, TextFormat, ToolChoice, ToolChoiceMode,
+    TruncationStrategy,
 };
+use llm_gateway_sdk::models::streaming::{ErrorEvent, OutputTextEvent, ResponseSnapshotEvent};
 use llm_gateway_sdk::{
     CreateResponseBody, EmbeddingRequest, EmbeddingResponse, LlmGatewayError,
     LlmGatewayProviderPluginClientV1, MediaInputMode, ProviderCallCtx, ProviderPluginCapabilities,
-    ResponseEventStream, ResponseInput, ResponseResource,
+    ResponseEventStream, ResponseInput, ResponseResource, StreamingEvent, Usage,
 };
 use model_registry_sdk::{ModelInfoV1, ModelV1};
 use secrecy::SecretString;
@@ -33,7 +35,7 @@ use super::ports::{
     CredentialBroker, ModelResolver, PluginDirectory, ResolvedPlugin, ToolSchemaSource,
 };
 use super::provider_rules::{ProviderRules, ProviderRulesRegistry};
-use crate::config::LimitsConfig;
+use crate::config::{LimitsConfig, StreamConfig};
 
 /// Provider identity used by the sample model and plugin.
 pub const OPENAI_TYPE: &str = "gts.cf.genai.model.info.v1~cf.genai._.openai.v1~";
@@ -186,6 +188,86 @@ pub fn sample_response_with_text(id: &str, model: &str, text: &str) -> ResponseR
     }]))
     .expect("output message deserializes");
     resource
+}
+
+// ── Streaming event builders ────────────────────────────────────────────────
+
+/// Snapshot of response `id` with `status` (and `usage` when given).
+#[must_use]
+pub fn snapshot(id: &str, status: ResponseStatus, usage: Option<Usage>) -> ResponseResource {
+    let mut resource = sample_response(id, "gpt-4o");
+    resource.status = status;
+    resource.usage = usage;
+    resource
+}
+
+/// `response.created` carrying a provider-side `id` and `seq`.
+#[must_use]
+pub fn ev_created(seq: u64, id: &str) -> StreamingEvent {
+    StreamingEvent::Created(ResponseSnapshotEvent {
+        sequence_number: seq,
+        response: snapshot(id, ResponseStatus::InProgress, None),
+    })
+}
+
+/// `response.in_progress`, optionally carrying provider usage.
+#[must_use]
+pub fn ev_in_progress(seq: u64, id: &str, usage: Option<Usage>) -> StreamingEvent {
+    StreamingEvent::InProgress(ResponseSnapshotEvent {
+        sequence_number: seq,
+        response: snapshot(id, ResponseStatus::InProgress, usage),
+    })
+}
+
+/// `response.output_text.delta` with `text`.
+#[must_use]
+pub fn ev_text_delta(seq: u64, text: &str) -> StreamingEvent {
+    StreamingEvent::OutputTextDelta(OutputTextEvent {
+        sequence_number: seq,
+        item_id: "msg_1".to_owned(),
+        output_index: 0,
+        content_index: 0,
+        text: text.to_owned(),
+        logprobs: None,
+    })
+}
+
+/// `response.completed` with a provider-side `id` and optional usage.
+#[must_use]
+pub fn ev_completed(seq: u64, id: &str, usage: Option<Usage>) -> StreamingEvent {
+    StreamingEvent::Completed(ResponseSnapshotEvent {
+        sequence_number: seq,
+        response: snapshot(id, ResponseStatus::Completed, usage),
+    })
+}
+
+/// `response.incomplete` with a provider-side `id`.
+#[must_use]
+pub fn ev_incomplete(seq: u64, id: &str) -> StreamingEvent {
+    StreamingEvent::Incomplete(ResponseSnapshotEvent {
+        sequence_number: seq,
+        response: snapshot(id, ResponseStatus::Incomplete, None),
+    })
+}
+
+/// Provider-sent `response.failed` with error `code`.
+#[must_use]
+pub fn ev_failed(seq: u64, id: &str, code: &str) -> StreamingEvent {
+    let mut response = snapshot(id, ResponseStatus::Failed, None);
+    response.error = Some(ResponseError::new(code, "provider failure"));
+    StreamingEvent::Failed(ResponseSnapshotEvent {
+        sequence_number: seq,
+        response,
+    })
+}
+
+/// Provider-sent standalone `error` event with `code`.
+#[must_use]
+pub fn ev_error(seq: u64, code: &str) -> StreamingEvent {
+    StreamingEvent::Error(ErrorEvent {
+        sequence_number: seq,
+        error: ResponseError::new(code, "provider error"),
+    })
 }
 
 /// Ordered log of dependency calls, shared by all fakes of one harness.
@@ -375,6 +457,48 @@ pub struct FakePlugin {
     /// Releases a parked call (only when `gated`).
     pub release: Notify,
     gated: bool,
+    streaming_transport: AtomicBool,
+    script: Mutex<StreamScript>,
+    stream_calls: AtomicUsize,
+    stream_dropped: Arc<AtomicBool>,
+    stream_dropped_notify: Arc<Notify>,
+}
+
+/// What the fake plugin's `create_response_stream` does.
+#[derive(Clone)]
+pub enum StreamScript {
+    /// Yield the events, then end the stream normally.
+    Events(Vec<StreamingEvent>),
+    /// Yield the events, then stay pending until dropped.
+    EventsThenHang(Vec<StreamingEvent>),
+    /// Fail before the stream starts.
+    StartError(fn() -> LlmGatewayError),
+}
+
+/// Stream wrapper that records its own drop (the plugin side of upstream
+/// cancellation).
+struct TrackedStream {
+    inner: ResponseEventStream,
+    dropped: Arc<AtomicBool>,
+    notify: Arc<Notify>,
+}
+
+impl futures_core::Stream for TrackedStream {
+    type Item = StreamingEvent;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        self.inner.as_mut().poll_next(cx)
+    }
+}
+
+impl Drop for TrackedStream {
+    fn drop(&mut self) {
+        self.dropped.store(true, Ordering::SeqCst);
+        self.notify.notify_one();
+    }
 }
 
 impl FakePlugin {
@@ -406,6 +530,11 @@ impl FakePlugin {
             entered: Notify::new(),
             release: Notify::new(),
             gated,
+            streaming_transport: AtomicBool::new(false),
+            script: Mutex::new(StreamScript::Events(Vec::new())),
+            stream_calls: AtomicUsize::new(0),
+            stream_dropped: Arc::new(AtomicBool::new(false)),
+            stream_dropped_notify: Arc::new(Notify::new()),
         })
     }
 
@@ -413,6 +542,43 @@ impl FakePlugin {
     #[must_use]
     pub fn calls(&self) -> usize {
         self.calls.load(Ordering::SeqCst)
+    }
+
+    /// Report (or stop reporting) `streaming_transport`.
+    pub fn set_streaming_transport(&self, enabled: bool) {
+        self.streaming_transport.store(enabled, Ordering::SeqCst);
+    }
+
+    /// Script the next `create_response_stream` calls.
+    pub fn set_stream(&self, script: StreamScript) {
+        *self.script.lock().expect("script") = script;
+    }
+
+    /// Number of `create_response_stream` calls.
+    #[must_use]
+    pub fn stream_calls(&self) -> usize {
+        self.stream_calls.load(Ordering::SeqCst)
+    }
+
+    /// Whether the stream handed out by the plugin has been dropped.
+    #[must_use]
+    pub fn stream_dropped(&self) -> bool {
+        self.stream_dropped.load(Ordering::SeqCst)
+    }
+
+    /// Wait (bounded) until the stream handed out by the plugin is dropped.
+    ///
+    /// # Panics
+    ///
+    /// When it is not dropped within two seconds.
+    pub async fn wait_stream_dropped(&self) {
+        let notified = self.stream_dropped_notify.notified();
+        if self.stream_dropped() {
+            return;
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(2), notified)
+            .await
+            .expect("the plugin stream was not dropped in time");
     }
 
     /// Report (or stop reporting) the `web_search` integration capability.
@@ -436,7 +602,10 @@ impl FakePlugin {
 #[async_trait]
 impl LlmGatewayProviderPluginClientV1 for FakePlugin {
     fn capabilities(&self) -> ProviderPluginCapabilities {
-        let caps = ProviderPluginCapabilities::new(MediaInputMode::UrlForward);
+        let mut caps = ProviderPluginCapabilities::new(MediaInputMode::UrlForward);
+        if self.streaming_transport.load(Ordering::SeqCst) {
+            caps = caps.with_streaming_transport();
+        }
         if self.web_search.load(Ordering::SeqCst) {
             caps.with_web_search()
         } else {
@@ -464,10 +633,27 @@ impl LlmGatewayProviderPluginClientV1 for FakePlugin {
     async fn create_response_stream(
         &self,
         _ctx: &SecurityContext,
-        _call: &ProviderCallCtx,
-        _body: CreateResponseBody,
+        call: &ProviderCallCtx,
+        body: CreateResponseBody,
     ) -> Result<ResponseEventStream, LlmGatewayError> {
-        Err(LlmGatewayError::internal("test fake: no streaming"))
+        self.stream_calls.fetch_add(1, Ordering::SeqCst);
+        self.log.push("plugin");
+        self.bodies.lock().expect("bodies").push(body);
+        self.contexts.lock().expect("contexts").push(call.clone());
+        let script = self.script.lock().expect("script").clone();
+        let inner: ResponseEventStream = match script {
+            StreamScript::StartError(make) => return Err(make()),
+            StreamScript::Events(events) => Box::pin(futures_util::stream::iter(events)),
+            StreamScript::EventsThenHang(events) => Box::pin(futures_util::StreamExt::chain(
+                futures_util::stream::iter(events),
+                futures_util::stream::pending(),
+            )),
+        };
+        Ok(Box::pin(TrackedStream {
+            inner,
+            dropped: Arc::clone(&self.stream_dropped),
+            notify: Arc::clone(&self.stream_dropped_notify),
+        }))
     }
 
     async fn create_embedding(
@@ -725,6 +911,7 @@ pub struct Harness {
     /// Rules registered for [`OPENAI_TYPE`]; supports everything by default.
     pub rules: FakeRules,
     pub limits: LimitsConfig,
+    pub stream: StreamConfig,
 }
 
 impl Harness {
@@ -744,6 +931,7 @@ impl Harness {
             tool_schemas: FakeToolSchemas::new(log),
             rules: FakeRules::default(),
             limits: LimitsConfig::default(),
+            stream: StreamConfig::default(),
         }
     }
 
@@ -763,6 +951,24 @@ impl Harness {
         );
     }
 
+    /// Serve a model that supports streaming and a plugin with streaming
+    /// transport, so `create_response_stream` passes the capability gate.
+    pub fn enable_streaming(&mut self) {
+        self.enable_streaming_with(|_| {});
+    }
+
+    /// [`Self::enable_streaming`] with an extra patch on the model's wire JSON.
+    pub fn enable_streaming_with(&mut self, patch: impl FnOnce(&mut serde_json::Value)) {
+        self.models = FakeModels::found(
+            sample_model_info_patched(OPENAI_TYPE, |v| {
+                v["capabilities"]["streaming"] = serde_json::json!(true);
+                patch(v);
+            }),
+            self.log.clone(),
+        );
+        self.plugin.set_streaming_transport(true);
+    }
+
     /// Build the service over the current fakes.
     #[must_use]
     pub fn service(&self) -> Arc<Service> {
@@ -777,6 +983,7 @@ impl Harness {
                     .with_rules(OPENAI_TYPE, Arc::new(self.rules.clone())),
             ),
             &self.limits,
+            &self.stream,
         ))
     }
 }

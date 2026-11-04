@@ -22,7 +22,8 @@ pub fn register_routes(
         .operation_id("llm_gateway.responses.create")
         .summary("Create a response")
         .description(
-            "Open Responses create-response, non-streaming: returns the assembled response.",
+            "Open Responses create-response. `stream=false` returns the assembled response as JSON; \
+             `stream=true` returns a `text/event-stream` of streaming events closed by `data: [DONE]`.",
         )
         .tag(RESPONSES_TAG)
         .authenticated()
@@ -32,7 +33,11 @@ pub fn register_routes(
         .json_response_with_schema::<dto::ResponseResourceDto>(
             openapi,
             StatusCode::OK,
-            "The created response",
+            "The created response (`stream=false`)",
+        )
+        .sse_json::<dto::StreamingEventDto>(
+            openapi,
+            "SSE stream of Open Responses streaming events (`stream=true`), closed by `[DONE]`",
         )
         .standard_errors(openapi)
         .problem_response(

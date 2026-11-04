@@ -8,9 +8,9 @@ use std::sync::Arc;
 use authz_resolver_sdk::PolicyEnforcer;
 use llm_gateway_sdk::{
     CreateResponseBody, InputItem, LlmGatewayError, ProviderCallCtx, ProviderErrorCategory,
-    ResponseInput, ResponseResource, TextFormatKind,
+    ResponseEventStream, ResponseInput, ResponseResource, TextFormatKind,
 };
-use tokio::sync::Semaphore;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
 use toolkit_macros::domain_model;
 use toolkit_security::SecurityContext;
@@ -20,10 +20,13 @@ use uuid::Uuid;
 use super::authz::{actions, authorize};
 use super::capability_checker::{CapabilityChecker, EffectiveRequest};
 use super::output_validator::OutputValidator;
-use super::ports::{CredentialBroker, ModelResolver, PluginDirectory, ToolSchemaSource};
+use super::ports::{
+    CredentialBroker, ModelResolver, PluginDirectory, ResolvedPlugin, ToolSchemaSource,
+};
 use super::provider_rules::ProviderRulesRegistry;
+use super::stream_supervisor::{StreamParams, initial_snapshot, supervise};
 use super::tool_resolver::ToolResolver;
-use crate::config::LimitsConfig;
+use crate::config::{LimitsConfig, StreamConfig};
 
 /// A failed create-response call together with the response `id` that was
 /// allocated for it, so REST Problems can carry the id.
@@ -120,6 +123,26 @@ fn has_item_reference(body: &CreateResponseBody) -> bool {
     )
 }
 
+/// Which in-flight pool and gates a request goes through.
+#[domain_model]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    Sync,
+    Stream,
+}
+
+/// Output of the shared pre-dispatch pipeline.
+#[domain_model]
+struct Prepared {
+    plugin: ResolvedPlugin,
+    call: ProviderCallCtx,
+    body: CreateResponseBody,
+    ignored_parameters: Vec<String>,
+    output_schema: Option<serde_json::Value>,
+    /// Held until the call (sync) or the stream (stream) is over.
+    slot: OwnedSemaphorePermit,
+}
+
 /// Domain service running the request pipeline.
 #[domain_model]
 pub struct Service {
@@ -132,11 +155,14 @@ pub struct Service {
     validator: OutputValidator,
     max_tools: usize,
     inflight_sync: Arc<Semaphore>,
+    inflight_streams: Arc<Semaphore>,
+    channel_capacity: usize,
 }
 
 impl Service {
     /// Build the service from its ports and the configured limits.
     #[must_use]
+    #[allow(clippy::too_many_arguments)] // ports plus the two config sections
     pub fn new(
         enforcer: PolicyEnforcer,
         models: Arc<dyn ModelResolver>,
@@ -145,6 +171,7 @@ impl Service {
         tool_schemas: Arc<dyn ToolSchemaSource>,
         rules: Arc<ProviderRulesRegistry>,
         limits: &LimitsConfig,
+        stream: &StreamConfig,
     ) -> Self {
         Self {
             enforcer,
@@ -156,6 +183,8 @@ impl Service {
             validator: OutputValidator,
             max_tools: limits.max_tools,
             inflight_sync: Arc::new(Semaphore::new(limits.max_inflight_sync)),
+            inflight_streams: Arc::new(Semaphore::new(limits.max_inflight_streams)),
+            channel_capacity: stream.channel_capacity,
         }
     }
 
@@ -193,16 +222,67 @@ impl Service {
         let _cancel_on_drop = cancel.clone().drop_guard();
 
         let model = body.model.clone();
+        // `_slot` is held to the end of the function: released on every exit path.
+        let Prepared {
+            plugin,
+            call,
+            body,
+            ignored_parameters,
+            output_schema,
+            slot: _slot,
+        } = self
+            .prepare(ctx, body, response_id, cancel, Mode::Sync)
+            .await?;
+        let span = |stage: &'static str| tracing::info_span!("llm_gateway.stage", stage, response_id = %response_id, model = %model);
+
+        // One call, never retried: LLM calls are not idempotent.
+        let mut resource = plugin
+            .client
+            .create_response(ctx, &call, body)
+            .instrument(span("dispatch"))
+            .await?;
+
+        if let Some(schema) = output_schema {
+            let _enter = span("output_validation").entered();
+            self.validator.validate(&schema, &resource)?;
+        }
+
+        let mut ignored = std::mem::take(&mut resource.ignored_parameters);
+        ignored.extend(ignored_parameters);
+        ignored.sort();
+        ignored.dedup();
+        resource.ignored_parameters = ignored;
+        response_id.clone_into(&mut resource.id);
+        Ok(resource)
+    }
+
+    /// The pre-dispatch pipeline shared by the sync and stream paths:
+    /// authorize, take an in-flight slot (of the `mode`'s pool), reject
+    /// `item_reference`, resolve model, select plugin, resolve tools, gate
+    /// streaming (stream mode), run the capability checks and resolve
+    /// credentials.
+    async fn prepare(
+        &self,
+        ctx: &SecurityContext,
+        body: CreateResponseBody,
+        response_id: &str,
+        cancel: CancellationToken,
+        mode: Mode,
+    ) -> Result<Prepared, LlmGatewayError> {
+        let model = body.model.clone();
         let span = |stage: &'static str| tracing::info_span!("llm_gateway.stage", stage, response_id = %response_id, model = %model);
 
         authorize(&self.enforcer, ctx, actions::CREATE_RESPONSE)
             .instrument(span("authorize"))
             .await?;
 
-        // Held to the end of the function: released on every exit path.
-        let _slot = {
+        let slot = {
             let _enter = span("acquire_slot").entered();
-            Arc::clone(&self.inflight_sync)
+            let pool = match mode {
+                Mode::Sync => &self.inflight_sync,
+                Mode::Stream => &self.inflight_streams,
+            };
+            Arc::clone(pool)
                 .try_acquire_owned()
                 .map_err(|_| LlmGatewayError::GatewayUnavailable)?
         };
@@ -240,6 +320,15 @@ impl Service {
             );
         }
 
+        if mode == Mode::Stream {
+            let _enter = span("streaming_gate").entered();
+            let model_streams =
+                model_info.capabilities.streaming && !model_info.disabled_capabilities.streaming;
+            if !model_streams || !plugin.capabilities().streaming_transport {
+                return Err(LlmGatewayError::capability_not_supported("streaming"));
+            }
+        }
+
         let effective = {
             let _enter = span("capability_check").entered();
             self.checker.check(&model_info, &plugin, body)?
@@ -266,26 +355,14 @@ impl Service {
         if let Some(key) = api_key {
             call = call.with_api_key(key);
         }
-
-        // One call, never retried: LLM calls are not idempotent.
-        let mut resource = plugin
-            .client
-            .create_response(ctx, &call, body)
-            .instrument(span("dispatch"))
-            .await?;
-
-        if let Some(schema) = output_schema {
-            let _enter = span("output_validation").entered();
-            self.validator.validate(&schema, &resource)?;
-        }
-
-        let mut ignored = std::mem::take(&mut resource.ignored_parameters);
-        ignored.extend(ignored_parameters);
-        ignored.sort();
-        ignored.dedup();
-        resource.ignored_parameters = ignored;
-        response_id.clone_into(&mut resource.id);
-        Ok(resource)
+        Ok(Prepared {
+            plugin,
+            call,
+            body,
+            ignored_parameters,
+            output_schema,
+            slot,
+        })
     }
 
     /// Create a response (sync); SDK-shaped wrapper over
@@ -305,6 +382,99 @@ impl Service {
     }
 }
 
+impl Service {
+    /// Create a response and stream it: the same pre-stream pipeline as the
+    /// sync path (authorization, in-flight stream slot, checks, credentials),
+    /// then the plugin stream is handed to the Stream Supervisor. Returns the
+    /// failure with the allocated response `id` when anything fails before the
+    /// stream starts; later failures are in-band `response.failed` events.
+    ///
+    /// # Errors
+    ///
+    /// Any pre-stream [`LlmGatewayError`] (DESIGN §4.1), including
+    /// `capability_not_supported` when the model or plugin cannot stream.
+    pub async fn create_response_stream_traced(
+        &self,
+        ctx: &SecurityContext,
+        body: CreateResponseBody,
+    ) -> Result<ResponseEventStream, Box<CreateResponseFailure>> {
+        let response_id = format!("resp_{}", Uuid::now_v7().simple());
+        match self.start_stream(ctx, body, &response_id).await {
+            Ok(stream) => Ok(stream),
+            Err(error) => {
+                log_failure(&response_id, &error);
+                Err(Box::new(CreateResponseFailure { response_id, error }))
+            }
+        }
+    }
+
+    async fn start_stream(
+        &self,
+        ctx: &SecurityContext,
+        body: CreateResponseBody,
+        response_id: &str,
+    ) -> Result<ResponseEventStream, LlmGatewayError> {
+        // Cancelled on every pre-stream failure exit (and on a dropped
+        // future); disarmed once the supervisor owns the token.
+        let cancel = CancellationToken::new();
+        let guard = cancel.clone().drop_guard();
+        let model = body.model.clone();
+
+        let Prepared {
+            plugin,
+            call,
+            body,
+            ignored_parameters,
+            output_schema,
+            slot,
+        } = self
+            .prepare(ctx, body, response_id, cancel.clone(), Mode::Stream)
+            .await?;
+        let snapshot = initial_snapshot(response_id, &body);
+
+        // One call, never retried: LLM calls are not idempotent.
+        let upstream = plugin
+            .client
+            .create_response_stream(ctx, &call, body)
+            .instrument(tracing::info_span!(
+                "llm_gateway.stage",
+                stage = "dispatch",
+                response_id = %response_id,
+                model = %model
+            ))
+            .await?;
+
+        guard.disarm();
+        Ok(supervise(
+            upstream,
+            StreamParams {
+                response_id: response_id.to_owned(),
+                snapshot,
+                channel_capacity: self.channel_capacity,
+                cancel,
+                output_schema,
+                ignored_parameters,
+                slot: Some(slot),
+            },
+        ))
+    }
+
+    /// SDK-shaped wrapper over [`Self::create_response_stream_traced`].
+    ///
+    /// # Errors
+    ///
+    /// Any pre-stream [`LlmGatewayError`] (DESIGN §4.1).
+    pub async fn create_response_stream(
+        &self,
+        ctx: &SecurityContext,
+        body: CreateResponseBody,
+    ) -> Result<ResponseEventStream, LlmGatewayError> {
+        self.create_response_stream_traced(ctx, body)
+            .await
+            .map_err(|failure| failure.error)
+    }
+}
+
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 #[path = "service_tests.rs"]
@@ -314,3 +484,8 @@ mod service_tests;
 #[cfg_attr(coverage_nightly, coverage(off))]
 #[path = "service_checks_tests.rs"]
 mod service_checks_tests;
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+#[path = "service_stream_tests.rs"]
+mod service_stream_tests;

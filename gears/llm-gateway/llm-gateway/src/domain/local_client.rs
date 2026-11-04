@@ -38,10 +38,10 @@ impl LlmGatewayClientV1 for LlmGatewayLocalClient {
 
     async fn create_response_stream(
         &self,
-        _ctx: &SecurityContext,
-        _body: CreateResponseBody,
+        ctx: &SecurityContext,
+        body: CreateResponseBody,
     ) -> Result<ResponseEventStream, LlmGatewayError> {
-        Err(LlmGatewayError::capability_not_supported("streaming"))
+        self.svc.create_response_stream(ctx, body).await
     }
 
     async fn create_embedding(
