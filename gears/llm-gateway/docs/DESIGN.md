@@ -79,6 +79,7 @@ Requirements that significantly influence architecture decisions.
 | `cpt-cf-llm-gateway-fr-provider-error-normalization-v1` | Plugins map provider errors to the fixed category set with provider code, message, and `provider_request_id`; the core maps categories to canonical errors and RFC 9457 Problems (§ 4.1) and to `response.failed` mid-stream. |
 | `cpt-cf-llm-gateway-fr-completion-status-v1` | Plugins map stop reasons to `status` and `incomplete_details.reason` and always include the original stop reason; Stream Supervisor guarantees exactly one terminal event. |
 | `cpt-cf-llm-gateway-fr-request-traceability-v1` | Request Pipeline allocates the response `id` before any dependency call and carries it in the provider call context, usage records, error Problems, logs, and trace spans; plugins capture `provider_request_id`. |
+| `cpt-cf-llm-gateway-fr-pass-through-apis-v1` | Pass-through REST routes for the OpenAI and Anthropic APIs (§ 3.3) accept and return the provider's native request, response, and streaming format. The Request Pipeline still runs authorization, model resolution from the request's `model` field, quota admission and settle, and credential retrieval; the matching provider plugin forwards the body through OAGW to the model's upstream alias without translation to Open Responses, and extracts usage from the native response for AI credit cost and usage reporting. |
 | Not covered by this design | `cpt-cf-llm-gateway-fr-filestorage-media-v1`, `cpt-cf-llm-gateway-fr-image-generation-v1`, `cpt-cf-llm-gateway-fr-text-to-speech-v1`, `cpt-cf-llm-gateway-fr-video-understanding-v1`, `cpt-cf-llm-gateway-fr-async-jobs-v1`, `cpt-cf-llm-gateway-fr-timeout-v1`, `cpt-cf-llm-gateway-fr-rate-limiting-v1`, `cpt-cf-llm-gateway-fr-speech-to-text-v1`, `cpt-cf-llm-gateway-fr-video-generation-v1`, `cpt-cf-llm-gateway-fr-realtime-audio-v1`, `cpt-cf-llm-gateway-fr-batch-processing-v1`, `cpt-cf-llm-gateway-fr-audit-events-v1` |
 
 #### NFR Allocation
@@ -623,6 +624,8 @@ Paths are relative to the api-gateway prefix (deployment `prefix_path`, empty by
 |--------|------|-------------|-----------|
 | `POST` | `/llm-gateway/v1/responses` | Create a response. `stream=false`: `200` JSON Response. `stream=true`: `200` SSE stream of StreamingEvents. | stable (P1) |
 | `POST` | `/llm-gateway/v1/embeddings` | Generate embeddings | stable (P1) |
+| `POST` | `/llm-gateway/v1/passthrough/openai/{path}` | OpenAI API pass-through: provider-native request and response (JSON or SSE), routed by the `model` field | stable (P1) |
+| `POST` | `/llm-gateway/v1/passthrough/anthropic/{path}` | Anthropic API pass-through: provider-native request and response (JSON or SSE), routed by the `model` field | stable (P1) |
 
 **Operation registration**:
 

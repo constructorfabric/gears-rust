@@ -281,6 +281,7 @@ Gateway acts as a processor — consumers own request/response data; Gateway own
 - Usage in responses: cost in AI credits, generic token usage, provider-specific raw usage
 - AI credit usage tracking with guaranteed at-least-once delivery (cost computed by the provider plugin from model pricing)
 - Per-tenant AI credit quota enforcement via Quota Enforcement
+- Pass-through APIs for OpenAI and Anthropic APIs
 
 **P2+**:
 - Media generation (images, audio, video) and video/audio understanding
@@ -540,6 +541,14 @@ The system **MUST** capture the `provider_request_id` returned by the provider (
 Cross-cutting concern — applies to all operations, no dedicated UC.
 
 **Actors**: `cpt-cf-llm-gateway-actor-consumer`, `cpt-cf-llm-gateway-actor-provider`, `cpt-cf-llm-gateway-actor-usage-collector`
+
+#### Pass-Through APIs
+
+- [ ] `p1` - **ID**: `cpt-cf-llm-gateway-fr-pass-through-apis-v1`
+
+The system **MUST** provide pass-through APIs for the OpenAI and Anthropic APIs, so that consumers built for those provider APIs can use the Gateway with the provider's native request and response format.
+
+**Actors**: `cpt-cf-llm-gateway-actor-consumer`, `cpt-cf-llm-gateway-actor-provider`
 
 ### P2 — Reliability, Governance & Media
 
