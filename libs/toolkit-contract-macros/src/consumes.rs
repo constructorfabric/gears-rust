@@ -2,6 +2,12 @@
 //! consumes a contract provided by another gear, wired via eventual-readiness
 //! directory discovery.
 //!
+//! Several contracts fit in one attribute:
+//! `contract = [sdk::Api, sdk::OtherApi(from = "other", resolving_client = ...)]`.
+//! A top-level `from` applies to every entry unless the entry sets its own;
+//! `resolving_client` names one contract, so with several it goes on the entry.
+//! The list expands exactly like one attribute per contract.
+//!
 //! Applied on the **gear struct** (alongside `#[toolkit::gear]`). Emits a
 //! non-capturing `fn` plus an `inventory::submit!` of a
 //! [`toolkit::discovery::ConsumerRegistration`] that the runtime's proxy-wiring
@@ -14,8 +20,9 @@
 //! The runtime passes the consuming gear's view of the hub
 //! (`ClientHub::for_gear`), so the proxy belongs to that gear and is built from
 //! its own `consumer_wiring.<dep>` settings. Two gears consuming one contract
-//! get two proxies. One gear declaring the same contract twice is a boot error:
-//! it would get one proxy for both.
+//! get two proxies. One gear declaring the same contract twice would get one
+//! proxy for both: on one struct that is a compile error, and the wire fn also
+//! refuses it at boot for spellings the macro cannot compare.
 //!
 //! **Requirements on the consuming crate.** The emission is unconditional, so
 //! the crate needs a `toolkit` dependency (for `ClientHub`, `discovery` and the
@@ -46,16 +53,23 @@
 
 use heck::{ToKebabCase, ToSnakeCase};
 use proc_macro2::TokenStream;
-use quote::{format_ident, quote};
+use quote::{ToTokens, format_ident, quote};
 use syn::Result as SynResult;
 use syn::parse::{Parse, ParseStream};
-use syn::punctuated::Punctuated;
-use syn::{Expr, Ident, ItemStruct, Path, Token};
+use syn::{ItemStruct, Path};
 
-use crate::support::{append_segment, parent_module};
+use crate::support::{
+    ContractArgs, append_segment, expr_into_path, expr_into_string, parent_module,
+};
 
-/// Parsed `#[toolkit::consumes(...)]` attribute.
+/// Parsed `#[toolkit::consumes(...)]` attribute: one entry per contract.
 pub struct ConsumesAttr {
+    /// Consumed contracts in declaration order; never empty.
+    pub contracts: Vec<ConsumedContract>,
+}
+
+/// One consumed contract, with the top-level defaults applied.
+pub struct ConsumedContract {
     /// Path of the contract trait being consumed.
     pub contract: Path,
     /// Name of the providing gear (the `from = "..."` argument).
@@ -70,83 +84,96 @@ pub struct ConsumesAttr {
     pub resolving_client: Option<Path>,
 }
 
-struct KeyValue {
-    key: Ident,
-    value: Expr,
-}
-
-impl Parse for KeyValue {
-    fn parse(input: ParseStream) -> SynResult<Self> {
-        let key: Ident = input.parse()?;
-        let _: Token![=] = input.parse()?;
-        let value: Expr = input.parse()?;
-        Ok(Self { key, value })
-    }
-}
-
 impl Parse for ConsumesAttr {
     fn parse(input: ParseStream) -> SynResult<Self> {
-        let mut contract: Option<Path> = None;
+        let args: ContractArgs = input.parse()?;
+
         let mut from: Option<String> = None;
         let mut resolving_client: Option<Path> = None;
-
-        let items: Punctuated<KeyValue, Token![,]> = Punctuated::parse_terminated(input)?;
-        for KeyValue { key, value } in items {
-            match key.to_string().as_str() {
-                "contract" => contract = Some(expr_into_path(value, &key)?),
-                "from" => from = Some(expr_into_string(value, &key)?),
-                "resolving_client" => resolving_client = Some(expr_into_path(value, &key)?),
+        for kv in &args.rest {
+            match kv.key.to_string().as_str() {
+                "from" => from = Some(expr_into_string(kv.value.clone(), &kv.key)?),
+                "resolving_client" => {
+                    args.check_per_contract_key(&kv.key)?;
+                    resolving_client = Some(expr_into_path(kv.value.clone(), &kv.key)?);
+                }
                 other => {
                     return Err(syn::Error::new(
-                        key.span(),
+                        kv.key.span(),
                         format!("unknown #[toolkit::consumes] arg `{other}`"),
                     ));
                 }
             }
         }
+        args.require_contract()?;
 
-        let contract = contract.ok_or_else(|| {
-            syn::Error::new(
-                proc_macro2::Span::call_site(),
-                "missing required arg `contract = path::to::TraitName`",
-            )
-        })?;
-        let from = from.ok_or_else(|| {
-            syn::Error::new(
-                proc_macro2::Span::call_site(),
-                "missing required arg `from = \"provider-gear-name\"`",
-            )
-        })?;
+        let mut contracts = Vec::with_capacity(args.contracts.len());
+        for entry in &args.contracts {
+            let mut entry_from = from.clone();
+            let mut entry_resolving_client = resolving_client.clone();
+            for kv in &entry.opts {
+                match kv.key.to_string().as_str() {
+                    "from" => entry_from = Some(expr_into_string(kv.value.clone(), &kv.key)?),
+                    "resolving_client" => {
+                        entry_resolving_client = Some(expr_into_path(kv.value.clone(), &kv.key)?);
+                    }
+                    other => {
+                        return Err(syn::Error::new(
+                            kv.key.span(),
+                            format!("unknown #[toolkit::consumes] arg `{other}`"),
+                        ));
+                    }
+                }
+            }
+            let from = entry_from.ok_or_else(|| {
+                args.error_at(
+                    entry,
+                    "missing required arg `from = \"provider-gear-name\"`",
+                )
+            })?;
+            contracts.push(ConsumedContract {
+                contract: entry.path.clone(),
+                from,
+                resolving_client: entry_resolving_client,
+            });
+        }
+        Ok(Self { contracts })
+    }
+}
 
-        Ok(Self {
-            contract,
-            from,
-            resolving_client,
+/// A contract this attribute consumes that another `#[toolkit::consumes]` on
+/// the same struct also consumes is an error: the gear would get one client for
+/// both. Each attribute sees the ones written below it, so the topmost of any
+/// pair reports it. At runtime the same duplicate is caught only when the
+/// provider is remote, so a monolith would boot and a split deployment would not.
+fn reject_stacked_duplicates(attr: &ConsumesAttr, item: &ItemStruct) -> SynResult<()> {
+    let below: std::collections::HashSet<String> = item
+        .attrs
+        .iter()
+        .filter(|a| {
+            let path = a.path();
+            path.segments.last().is_some_and(|s| s.ident == "consumes")
+                && (path.segments.len() == 1
+                    || path
+                        .segments
+                        .first()
+                        .is_some_and(|s| s.ident == "toolkit" || s.ident == "toolkit_contract"))
         })
+        // An attribute that does not parse reports its own error when it expands.
+        .filter_map(|a| a.parse_args::<ConsumesAttr>().ok())
+        .flat_map(|other| other.contracts)
+        .map(|c| c.contract.to_token_stream().to_string())
+        .collect();
+    for c in &attr.contracts {
+        if below.contains(&c.contract.to_token_stream().to_string()) {
+            return Err(syn::Error::new_spanned(
+                &c.contract,
+                "contract is consumed by another #[toolkit::consumes] on this struct; \
+                 a gear gets one client per contract",
+            ));
+        }
     }
-}
-
-fn expr_into_path(e: Expr, key: &Ident) -> SynResult<Path> {
-    match e {
-        Expr::Path(p) => Ok(p.path),
-        other => Err(syn::Error::new_spanned(
-            other,
-            format!("`{key}` expects a path"),
-        )),
-    }
-}
-
-fn expr_into_string(e: Expr, key: &Ident) -> SynResult<String> {
-    match e {
-        Expr::Lit(syn::ExprLit {
-            lit: syn::Lit::Str(s),
-            ..
-        }) => Ok(s.value()),
-        other => Err(syn::Error::new_spanned(
-            other,
-            format!("`{key}` expects a string literal"),
-        )),
-    }
+    Ok(())
 }
 
 /// The `name = "..."` of a `#[toolkit::gear(...)]` (or `#[gear(...)]`) still on
@@ -183,7 +210,29 @@ fn declared_gear_name(item: &ItemStruct) -> Option<String> {
 
 /// Top-level entry point invoked by the proc-macro shim in `lib.rs`.
 pub fn generate(attr: &ConsumesAttr, item: &ItemStruct) -> SynResult<TokenStream> {
-    let struct_ident = &item.ident;
+    // `owner_gear` is the *gear name*, not the Rust type name: the runtime uses
+    // it as a config key (`gears.<owner_gear>.config.consumer_wiring.<dep>`) for
+    // the ADR-0004 static-endpoint override, and as a log/error field. Gear
+    // names are kebab-case, so derive it from the struct ident rather than
+    // emitting `stringify!` — `stringify!(ApiContractsConsumer)` would look up
+    // `gears.ApiContractsConsumer`, which no config declares, and the override
+    // would silently never fire.
+    let owner_gear =
+        declared_gear_name(item).unwrap_or_else(|| item.ident.to_string().to_kebab_case());
+    reject_stacked_duplicates(attr, item)?;
+    let wirings = attr
+        .contracts
+        .iter()
+        .map(|c| generate_one(c, &owner_gear))
+        .collect::<SynResult<Vec<_>>>()?;
+    Ok(quote! {
+        #item
+        #(#wirings)*
+    })
+}
+
+/// The wire fn and `ConsumerRegistration` for one consumed contract.
+fn generate_one(attr: &ConsumedContract, owner_gear: &str) -> SynResult<TokenStream> {
     let contract_path = &attr.contract;
     let contract_ident = contract_path
         .segments
@@ -213,19 +262,7 @@ pub fn generate(attr: &ConsumesAttr, item: &ItemStruct) -> SynResult<TokenStream
         from.replace(['-', '.'], "_"),
     );
 
-    // `owner_gear` is the *gear name*, not the Rust type name: the runtime uses
-    // it as a config key (`gears.<owner_gear>.config.consumer_wiring.<dep>`) for
-    // the ADR-0004 static-endpoint override, and as a log/error field. Gear
-    // names are kebab-case, so derive it from the struct ident rather than
-    // emitting `stringify!` — `stringify!(ApiContractsConsumer)` would look up
-    // `gears.ApiContractsConsumer`, which no config declares, and the override
-    // would silently never fire.
-    let owner_gear =
-        declared_gear_name(item).unwrap_or_else(|| struct_ident.to_string().to_kebab_case());
-
     Ok(quote! {
-        #item
-
         #[doc(hidden)]
         #[allow(non_snake_case)]
         fn #wire_fn(
@@ -390,6 +427,140 @@ mod tests {
             out.contains("stringify ! (billing_sdk :: BillingApi)"),
             "got:\n{out}"
         );
+    }
+
+    fn expand_with(attr: &str) -> syn::Result<String> {
+        let attr: ConsumesAttr = syn::parse_str(attr)?;
+        let item: syn::ItemStruct = parse_quote!(
+            pub struct OrdersGear;
+        );
+        Ok(generate(&attr, &item)?.to_string())
+    }
+
+    /// The list form wires each contract and emits the struct once.
+    #[test]
+    fn a_contract_list_wires_each_contract() {
+        let out = expand_with(
+            r#"from = "registry", contract = [sdk::PlatformApi, sdk::TenantApi(from = "tenants")]"#,
+        )
+        .unwrap();
+        assert_eq!(out.matches("pub struct OrdersGear").count(), 1, "{out}");
+        assert_eq!(out.matches("inventory :: submit !").count(), 2, "{out}");
+        assert!(
+            out.contains("__toolkit_wire_platform_api_from_registry"),
+            "{out}"
+        );
+        assert!(
+            out.contains("__toolkit_wire_tenant_api_from_tenants"),
+            "{out}"
+        );
+        assert!(out.contains("sdk :: TenantApiRestResolvingClient"), "{out}");
+    }
+
+    #[test]
+    fn a_one_element_list_expands_like_the_single_form() {
+        let single = expand_with(r#"contract = sdk::Api, from = "billing""#).unwrap();
+        let list = expand_with(r#"contract = [sdk::Api], from = "billing""#).unwrap();
+        assert_eq!(single, list);
+    }
+
+    #[test]
+    fn an_entry_sets_its_own_resolving_client() {
+        let out = expand_with(
+            r#"from = "b", contract = [sdk::Api(resolving_client = sdk::rest::Client), sdk::Other]"#,
+        )
+        .unwrap();
+        assert!(out.contains("sdk :: rest :: Client :: new"), "{out}");
+        assert!(
+            out.contains("sdk :: OtherRestResolvingClient :: new"),
+            "{out}"
+        );
+    }
+
+    /// A list and a separate attribute on one struct: each expands on its own,
+    /// leaving the other attribute on the item for the compiler to expand next.
+    #[test]
+    fn a_list_mixes_with_a_separate_attribute() {
+        let attr: ConsumesAttr =
+            syn::parse_str(r#"from = "registry", contract = [sdk::PlatformApi, sdk::TenantApi]"#)
+                .unwrap();
+        let item: syn::ItemStruct = parse_quote! {
+            #[toolkit::consumes(contract = billing_sdk::BillingApi, from = "billing")]
+            pub struct OrdersGear;
+        };
+        let out = generate(&attr, &item).unwrap().to_string();
+        assert!(
+            out.contains("# [toolkit :: consumes (contract = billing_sdk :: BillingApi"),
+            "{out}"
+        );
+        assert_eq!(out.matches("inventory :: submit !").count(), 2, "{out}");
+    }
+
+    #[test]
+    fn a_contract_stacked_twice_is_an_error() {
+        let attr: ConsumesAttr =
+            syn::parse_str(r#"contract = billing_sdk::BillingApi, from = "a""#).unwrap();
+        for item in [
+            parse_quote! {
+                #[toolkit::consumes(contract = billing_sdk::BillingApi, from = "b")]
+                pub struct OrdersGear;
+            },
+            parse_quote! {
+                #[consumes(from = "b", contract = [other::Api, billing_sdk::BillingApi])]
+                pub struct OrdersGear;
+            },
+        ] {
+            let err = generate(&attr, &item).unwrap_err().to_string();
+            assert!(err.contains("consumed by another"), "{err}");
+        }
+    }
+
+    #[test]
+    fn a_misspelled_contract_key_is_reported_as_unknown() {
+        let err = expand_with(r#"contrct = sdk::Api, from = "b""#).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("unknown #[toolkit::consumes] arg `contrct`"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn list_errors() {
+        for (attr, expected) in [
+            (
+                r#"from = "b", resolving_client = x::C, contract = [sdk::A, sdk::B]"#,
+                "`resolving_client` is per contract",
+            ),
+            (
+                r#"from = "b", contract = [sdk::A, sdk::A]"#,
+                "listed more than once",
+            ),
+            (r#"from = "b", contract = []"#, "lists no contracts"),
+            (
+                r#"contract = [sdk::A(from = "a"), sdk::B]"#,
+                "missing required arg `from",
+            ),
+            (
+                r#"from = "b", contract = [sdk::A(bogus = 1)]"#,
+                "unknown #[toolkit::consumes] arg `bogus`",
+            ),
+            (
+                r#"from = "b", contract = [sdk::A(contract = x)]"#,
+                "cannot be set on a list entry",
+            ),
+            (
+                r#"from = "b", contract = [sdk::A], contract = sdk::B"#,
+                "given more than once",
+            ),
+            (
+                r#"from = "b", contract = sdk::A, contract = [sdk::B]"#,
+                "given more than once",
+            ),
+        ] {
+            let err = expand_with(attr).expect_err(attr);
+            assert!(err.to_string().contains(expected), "{attr}: {err}");
+        }
     }
 
     #[test]

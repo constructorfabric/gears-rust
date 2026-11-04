@@ -1,0 +1,5 @@
+error: `resolving_client` is per contract; with several contracts set it on the list entry: `contract = [path::Api(resolving_client = ...), ...]`
+  --> tests/ui/fail/consumes_list_top_level_resolving_client.rs:11:26
+   |
+11 | #[consumes(from = "bar", resolving_client = FooClient, contract = [FooApi, BarApi])]
+   |                          ^^^^^^^^^^^^^^^^

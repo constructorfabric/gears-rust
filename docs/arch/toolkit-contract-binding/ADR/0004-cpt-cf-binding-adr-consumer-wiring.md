@@ -88,7 +88,24 @@ pub struct OrdersGear { … }
 ```
 
 Multiple `#[toolkit::consumes]` attributes are allowed on the same struct, one per dependency trait.
-Each is independent; they may name the same or different provider gears.
+Each is independent; they may name the same or different provider gears. One attribute can also
+list several contracts. A top-level `from` applies to every entry, and an entry can set its own
+`from` or `resolving_client`:
+
+```rust
+#[toolkit::consumes(
+    from = "types-registry",
+    contract = [
+        types_registry_sdk::PlatformTypesRegistryApi,
+        types_registry_sdk::TypesRegistryApi,
+        billing_sdk::BillingApi(from = "billing"),
+    ],
+)]
+pub struct OrdersGear { … }
+```
+
+The list form expands to the same registrations as one attribute per contract. A contract consumed
+twice on one struct, in one list or across stacked attributes, is a compile error.
 
 ### What the macro generates
 
@@ -140,7 +157,9 @@ returns the gear's view, and `get`/`try_get` there return, in order: a local imp
 proxy, a process-wide proxy. A local impl registered after wiring still wins. A registration whose
 `owner_gear` is not a gear in the process (an SDK-level one such as cluster-sdk's) is wired into
 the plain hub, and its proxy is process-wide. One gear declaring the same contract twice would get
-one proxy for both declarations, so it is a boot error.
+one proxy for both declarations. The macro rejects that at compile time for declarations on one
+struct. The wire fn also refuses it at boot, but only on the remote path: with a co-located
+provider both declarations resolve to the local impl.
 
 **The short-circuit must use `try_get_local`, not `try_get`.** Proxies are stored apart from
 local registrations, and `try_get_local` sees only the latter. `try_get` also returns a
