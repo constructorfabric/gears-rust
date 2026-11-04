@@ -11,7 +11,8 @@ trap 'chmod -R u+rwx "$T" 2>/dev/null; rm -rf "$T"' EXIT INT TERM
 export RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}" CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
 mkdir "$T/home"; HOME="$T/home"; export HOME
 export GIT_CONFIG_GLOBAL="$T/gitconfig" GIT_CONFIG_NOSYSTEM=1 STUB_LOG="$T/stub.log"
-unset CI GEARS_NO_HOOKS FAIL_CLIPPY
+unset CI GEARS_NO_HOOKS FAIL_CLIPPY STUB_METADATA_FAIL STUB_DRAIN GEARS_HOOKS_BASE
+export STUB_METADATA="$T/metadata.json"
 git config --global user.name hooktests
 git config --global user.email hooktests@example.com
 git config --global init.defaultBranch main
@@ -24,7 +25,7 @@ cat > "$T/stubs/cfs" <<'STUB'
 echo "cfs $*" >> "$STUB_LOG"
 exit 0
 STUB
-cp "$T/stubs/cfs" "$T/stubs/jq"; cp "$T/stubs/cfs" "$T/stubs/cargo-gears"
+cp "$T/stubs/cfs" "$T/stubs/cargo-gears"
 cat > "$T/stubs/lychee" <<'STUB'
 #!/bin/sh
 for a in "$@"; do echo "lychee-arg $a" >> "$STUB_LOG"; done
@@ -33,10 +34,13 @@ STUB
 cat > "$T/stubs/cargo" <<'STUB'
 #!/bin/sh
 if [ "$1 $2" = "clippy --version" ]; then [ -z "${FAIL_CLIPPY:-}" ]; exit; fi
+[ -z "${STUB_DRAIN:-}" ] || cat > /dev/null
+if [ "$1" = metadata ]; then [ -z "${STUB_METADATA_FAIL:-}" ] || exit 101; cat "$STUB_METADATA"; exit 0; fi
 echo "cargo $*" >> "$STUB_LOG"
 exit 0
 STUB
 chmod +x "$T/stubs/"*
+# No jq stub: the pre-push package logic needs the real one (cases needing it skip when it is absent).
 real_path=$PATH
 PATH="$T/stubs:$PATH"
 
@@ -255,6 +259,17 @@ printf '#!/bin/sh\nexit 0\n' > "$r/.github/scripts/check-forbidden-words.sh"
 chmod +x "$r/.github/scripts/check-forbidden-words.sh"
 printf '[package]\nname = "pk"\n' > "$r/pk/Cargo.toml"
 echo 'fn a() {}' > "$r/pk/src/lib.rs"; printf '[workspace]\n' > "$r/Cargo.toml"
+# app depends on pk; fz is outside the workspace; cf-gears-oagw sits in gears/oagw
+for pn in app:app fz:fz cf-gears-oagw:gears/oagw; do
+    mkdir -p "$r/${pn#*:}/src"
+    printf '[package]\nname = "%s"\n' "${pn%%:*}" > "$r/${pn#*:}/Cargo.toml"
+    echo 'fn a() {}' > "$r/${pn#*:}/src/lib.rs"
+done
+cat > "$T/metadata.json" <<'JSON'
+{"packages":[{"id":"pk","name":"pk"},{"id":"app","name":"app"},{"id":"fz","name":"fz"},{"id":"cf-gears-oagw","name":"cf-gears-oagw"}],
+ "workspace_members":["pk","app","cf-gears-oagw"],
+ "resolve":{"nodes":[{"id":"pk","deps":[]},{"id":"app","deps":[{"pkg":"pk"}]},{"id":"cf-gears-oagw","deps":[]}]}}
+JSON
 git -C "$r" add -A; git -C "$r" commit -qm base
 git -C "$r" branch -M main; git -C "$r" config --local gears.hooks true
 git -C "$r" checkout -qb feat0
@@ -285,16 +300,101 @@ assert "pre-push: sha != HEAD runs no clippy" test -z "$(grep clippy "$STUB_LOG"
 git -C "$r" checkout -q feat
 
 push "$(head_sha)"
-assert "pre-push: package change -> -p pk" grep -q 'cargo clippy -p pk ' "$STUB_LOG"
+if [ -n "$have_jq" ]; then
+    assert "pre-push: package change -> -p pk" grep -q 'cargo clippy .*-p pk ' "$STUB_LOG"
+else
+    skip "pre-push: package change -> -p pk" "needs jq"
+fi
 
 echo 'fn c() {}' >> "$r/pk/src/lib.rs"
 push "$(head_sha)"
 assert "pre-push: dirty .rs -> note" grep -q 'uncommitted Rust/Cargo changes' "$T/out"
 git -C "$r" checkout -q -- pk/src/lib.rs
 
-FAIL_CLIPPY=1 push "$(head_sha)"
+FAIL_CLIPPY=1; export FAIL_CLIPPY
+push "$(head_sha)"
+unset FAIL_CLIPPY
 assert "pre-push: cargo without clippy -> skip notice" grep -q 'skipping clippy: clippy not found' "$T/out"
 assert "pre-push: cargo without clippy exits 0" test "$rc" = 0
+
+# ---- pre-push: workspace members, dependents, dylint, base, stdin ----
+# on_branch <name> <file>: new branch off main with one commit touching <file>; push it; back on feat.
+on_branch() {
+    git -C "$r" checkout -q main; git -C "$r" checkout -qb "$1"
+    echo 'fn z() {}' >> "$r/$2"; git -C "$r" commit -qam "$1"
+    push "$(head_sha)"
+    git -C "$r" checkout -q feat; git -C "$r" branch -qD "$1"
+}
+# nojq <case-less>: runs push with a PATH that has the stubs and git/sed/grep etc. but no jq.
+nojq() {
+    mkdir -p "$T/nojq"
+    for t in git sh bash grep sed sort dirname head cat env tr uname basename wc awk id; do
+        tp=$(PATH=$real_path command -v "$t") && link_hook "$tp" "$T/nojq/$t"
+    done
+    saved_path=$PATH; PATH="$T/stubs:$T/nojq"
+    "$@"
+    PATH=$saved_path
+}
+if [ -z "$have_jq" ]; then
+    for c in "change outside the workspace is skipped" "change in pk also checks dependents" \
+        "no jq -> clippy --workspace" "metadata failure -> clippy --workspace" "oagw change runs the cluster dylint" \
+        "metadata failure + oagw change runs the cluster dylint"; do skip "pre-push: $c" "needs jq"; done
+else
+    on_branch feat-fz fz/src/lib.rs
+    assert "pre-push: non-member package: no -p fz" test -z "$(grep -e '-p fz' "$STUB_LOG")"
+    assert "pre-push: non-member package: no clippy" test -z "$(grep 'cargo clippy' "$STUB_LOG")"
+    assert "pre-push: non-member package: skip line" grep -q 'hook: clippy: skipping fz (not a workspace member)' "$T/out"
+    assert "pre-push: non-member package: exits 0" test "$rc" = 0
+
+    push "$(head_sha)"
+    assert "pre-push: pk change -> -p pk" grep -q 'cargo clippy .*-p pk ' "$STUB_LOG"
+    assert "pre-push: pk change -> dependent -p app" grep -q 'cargo clippy .*-p app ' "$STUB_LOG"
+    assert "pre-push: pk change -> summary" grep -q 'clippy: 2 package(s): 1 changed + 1 dependent(s)' "$T/out"
+    assert "pre-push: pk only -> no OAGW cluster dylint" test -z "$(grep -e '-P cf-gears-oagw' "$STUB_LOG")"
+    assert "pre-push: pk only -> workspace dylint" grep -q 'cargo gears lint --dylint$' "$STUB_LOG"
+
+    nojq push "$(head_sha)"
+    assert "pre-push: no jq -> clippy --workspace" grep -q 'cargo clippy --workspace' "$STUB_LOG"
+    assert "pre-push: no jq -> note" grep -q 'note: jq not found (install: brew install jq / apt install jq); running clippy on the whole workspace' "$T/out"
+
+    STUB_METADATA_FAIL=1; export STUB_METADATA_FAIL
+    push "$(head_sha)"
+    unset STUB_METADATA_FAIL
+    assert "pre-push: metadata failure -> clippy --workspace" grep -q 'cargo clippy --workspace' "$STUB_LOG"
+    assert "pre-push: metadata failure -> note" grep -q 'note: cargo metadata failed; running clippy on the whole workspace' "$T/out"
+    assert "pre-push: metadata failure exits 0" test "$rc" = 0
+
+    on_branch feat-oagw gears/oagw/src/lib.rs
+    assert "pre-push: oagw change -> cluster dylint" grep -q 'cargo gears lint --dylint -P cf-gears-oagw -F cluster' "$STUB_LOG"
+    assert "pre-push: oagw change -> workspace dylint too" grep -q 'cargo gears lint --dylint$' "$STUB_LOG"
+    STUB_METADATA_FAIL=1; export STUB_METADATA_FAIL
+    on_branch feat-oagw gears/oagw/src/lib.rs
+    unset STUB_METADATA_FAIL
+    assert "pre-push: unknown package set + oagw files -> cluster dylint" grep -q 'cargo gears lint --dylint -P cf-gears-oagw -F cluster' "$STUB_LOG"
+fi
+
+# base ref: upstream/main beats origin/main; GEARS_HOOKS_BASE overrides; an unknown override skips
+git -C "$r" update-ref refs/remotes/origin/main "$(head_sha)"
+git -C "$r" update-ref refs/remotes/upstream/main main
+push "$(head_sha)"
+assert "pre-push: base prefers upstream/main" grep -q 'hook: base upstream/main (merge-base ' "$T/out"
+GEARS_HOOKS_BASE=origin/main; export GEARS_HOOKS_BASE
+push "$(head_sha)"
+assert "pre-push: GEARS_HOOKS_BASE overrides" grep -q 'hook: base origin/main (merge-base ' "$T/out"
+GEARS_HOOKS_BASE=nope; export GEARS_HOOKS_BASE
+push "$(head_sha)"
+unset GEARS_HOOKS_BASE
+assert "pre-push: unknown GEARS_HOOKS_BASE says so" grep -q 'skipping all checks: base nope not found' "$T/out"
+assert "pre-push: unknown GEARS_HOOKS_BASE exits 0" test "$rc" = 0
+git -C "$r" update-ref -d refs/remotes/origin/main; git -C "$r" update-ref -d refs/remotes/upstream/main
+
+# stdin belongs to the hook: a tool that reads stdin must not swallow the other pushed refs
+: > "$STUB_LOG"; rc=0
+STUB_DRAIN=1; export STUB_DRAIN
+printf 'refs/heads/a %s refs/heads/a %s\nrefs/heads/b %s refs/heads/b %s\n' "$(head_sha)" "$zeros" "$(head_sha)" "$zeros" |
+    (cd "$r" && sh .githooks/pre-push) > "$T/out" 2>&1 || rc=$?
+unset STUB_DRAIN
+assert "pre-push: tools reading stdin do not eat later refs" test "$(grep -c '^hook: base ' "$T/out")" = 2
 
 # Stubs standing in for BSD grep (stock macOS): -P is rejected, anything else runs the real grep.
 mkdir "$T/nopgrep"
@@ -309,8 +409,8 @@ printf '#!/bin/sh\nexit 2\n' > "$T/nopgrep/ggrep"
 chmod +x "$T/nopgrep/"*
 
 # pre-push: without a working grep -P the forbidden-words step is skipped, not run or failed
-if [ -z "$have_bash4" ]; then
-    skip "pre-push: no grep -P skips forbidden-words" "needs bash >= 4"
+if [ -z "$have_bash4" ] || [ -z "$have_jq" ]; then
+    skip "pre-push: no grep -P skips forbidden-words" "needs bash >= 4 and jq"
 else
     printf '#!/bin/sh\necho ran > "%s/fw-ran"\n' "$T" > "$r/.github/scripts/check-forbidden-words.sh"
     saved_path=$PATH; PATH="$T/nopgrep:$PATH"
