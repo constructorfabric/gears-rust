@@ -84,7 +84,7 @@ The gear declares the dependencies `authz_resolver` and `types_registry` and the
 
 **Capability hooks, called separately by the runtime**:
 1. [x] - `p1` - The database capability hook returns the migration set in order: `initial_001`, `m002_subject_settings`, `m003_record_ids`. - `inst-start-migrations`
-2. [x] - `p1` - The REST capability hook registers the routes on the router. It fails if the service is not initialized. - `inst-start-rest`
+2. [x] - `p1` - The REST capability hook registers the routes on the router, the manage-facts route included. It fails if the service is not initialized. - `inst-start-rest`
 
 ### Map Domain Errors to Problem Errors
 

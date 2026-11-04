@@ -22,6 +22,7 @@ use crate::domain::error::DomainError;
 use crate::domain::model_client::ModelClient;
 use crate::domain::planner::agent::{Planner, PlannerCaps};
 use crate::domain::planner::catalog::PropertyCatalog;
+use crate::domain::planner::manage::ManageFacts;
 use crate::domain::planner::processing::{Processing, ProcessingContexts, ProcessingPorts};
 use crate::domain::profile_read::{CategoryCheck, ProfileReadPorts, ProfileReadService};
 use crate::domain::record_intake::{
@@ -141,13 +142,20 @@ pub struct Pipeline {
     /// The worker to start, none when processing is not configured.
     pub worker: Option<Worker>,
     pub profile: Arc<ProfileReadService>,
+    /// Manage-facts, on the worker's processing chain; not configured when processing is not.
+    pub manage: Arc<ManageFacts>,
 }
+
+/// How long manage-facts may take before its write: inside the API gateway's 30-second request timeout, leaving the
+/// rest to the write, which is awaited once it started.
+const MANAGE_BUDGET: Duration = Duration::from_secs(20);
 
 /// Build the pipeline from the config.
 ///
 /// Processing runs when both a processing identity and a model are
 /// configured; otherwise intake keeps dropping received records with an
-/// event, as before the planner existed. The profile read needs the identity.
+/// event, as before the planner existed, and manage-facts answers not
+/// configured. The profile read needs the identity.
 ///
 /// # Errors
 ///
@@ -219,7 +227,7 @@ pub fn assemble(
             contexts: Arc::clone(&contexts),
             events: Arc::new(LogProfileEvents),
         },
-        policy_enforcer,
+        policy_enforcer.clone(),
         // Without an identity the read answers not configured before it
         // checks a category, so the check it would take does not matter.
         match cfg.identity().map(|identity| identity.category_check) {
@@ -239,6 +247,7 @@ pub fn assemble(
             hand_off: Arc::new(DroppingHandOff::new(Arc::new(LogIntakeEvents))),
             worker: None,
             profile,
+            manage: Arc::new(ManageFacts::not_configured(policy_enforcer)),
         });
     };
     let (hand_off, queue) = record_queue(cfg.config().processing.queue_capacity);
@@ -293,6 +302,13 @@ pub fn assemble(
         },
         cfg.config().processing.max_reruns,
     ));
+    // @cpt-begin:cpt-cf-construct-algo-profile-reader-wire:p1:inst-wire-manage
+    let manage = Arc::new(ManageFacts::new(
+        Arc::clone(&processing),
+        policy_enforcer,
+        MANAGE_BUDGET,
+    ));
+    // @cpt-end:cpt-cf-construct-algo-profile-reader-wire:p1:inst-wire-manage
     Ok(Pipeline {
         hand_off,
         worker: Some(Worker {
@@ -304,6 +320,7 @@ pub fn assemble(
             events,
         }),
         profile,
+        manage,
     })
     // @cpt-end:cpt-cf-construct-algo-profile-reader-wire:p1:inst-wire-processing
 }
@@ -351,8 +368,8 @@ impl Configured {
     /// Say at start-up what is not configured: an info line when processing
     /// is off on purpose (neither identity nor model), a warning when it is
     /// only partly configured or lacks the opt-in to run without
-    /// sensitive-data checks, and a warning when the profile read is not
-    /// configured.
+    /// sensitive-data checks, each naming manage-facts as not configured too,
+    /// and a warning when the profile read is not configured.
     #[expect(
         clippy::cognitive_complexity,
         reason = "three log lines; the tracing macros count toward the complexity"
@@ -361,18 +378,21 @@ impl Configured {
         let (identity, model) = (self.identity.present(), self.model.present());
         if !identity && !model {
             tracing::info!(
-                "construct: record processing is not configured; received records are dropped"
+                "construct: record processing is not configured; received records are dropped \
+                 and manage-facts answers 501"
             );
         } else if identity && model {
             tracing::warn!(
                 "construct: record processing needs processing.run_without_sensitive_data_checks \
-                 while no sensitive-data check exists; received records are dropped"
+                 while no sensitive-data check exists; received records are dropped and manage-facts \
+                 answers 501"
             );
         } else {
             tracing::warn!(
                 processing_identity = identity,
                 model = model,
-                "construct: record processing is only partly configured; received records are dropped"
+                "construct: record processing is only partly configured; received records are \
+                 dropped and manage-facts answers 501"
             );
         }
         if !identity {

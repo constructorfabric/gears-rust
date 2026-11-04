@@ -444,20 +444,23 @@ for the subject: another subject, no "manage facts" permission from the AuthZ re
 the subject's settings out. It **MUST** answer `400`
 naming the field, without a model call, for a `message` longer than 4 000 characters or a `conversation` longer than
 16 000. A blank message stores nothing without a model call. A failed dependency answers `503`. The agent in the plan's origin is the caller the
-platform authenticated, and the steps before the write have a deadline inside the gateway's request timeout.
+platform authenticated, and the steps before the write have a deadline inside the gateway's request timeout. The gear
+registers the route on the record worker's processing chain (`cpt-cf-construct-algo-profile-reader-wire`); a deployment
+without record processing answers `501`.
 
 **Implements**:
 - `cpt-cf-construct-algo-planner-manage`
 
 **Touches**:
-- Code: `domain::planner::manage::ManageFacts`, `api::rest::routes::register_manage_route`,
+- Code: `domain::planner::manage::ManageFacts`, `api::rest::routes::register_manage_route`, `gear::ConstructGear`,
   `api::rest::dto::{ManageFactsRequest, ManageFactsResponse}`, `api::rest::error::{for_facts, too_long}`
 
 **Verified by**: `the_subject_gets_what_was_stored`,
 `a_subject_the_caller_may_not_act_for_answers_as_one_that_does_not_exist`,
 `a_text_past_its_limit_is_refused_before_a_model_call`,
-`a_blank_message_stores_nothing_without_a_model_call`, `a_call_with_personalization_off_says_so` and
-`an_unreachable_profile_answers_unavailable`.
+`a_blank_message_stores_nothing_without_a_model_call`, `a_call_with_personalization_off_says_so`,
+`an_unreachable_profile_answers_unavailable`, `the_gear_routes_manage_facts_to_the_processing_chain` and
+`without_processing_the_gear_answers_manage_facts_not_configured`.
 
 ### Reference Evaluation Set
 

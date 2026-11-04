@@ -1,13 +1,21 @@
-//! The gear's processing worker: started with the gear, stopped with it.
+//! The gear's processing worker, started with the gear and stopped with it,
+//! and the routes the gear registers.
 
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Weak};
 
 use async_trait::async_trait;
 use authz_resolver_sdk::PolicyEnforcer;
+use axum::body::{Body, to_bytes};
+use axum::http::{Method, Request, StatusCode, header};
+use axum::{Extension, Router};
+use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
-use toolkit::contracts::RunnableCapability;
+use toolkit::api::OpenApiRegistryImpl;
+use toolkit::contracts::{RestApiCapability, RunnableCapability};
+use toolkit::{ClientHub, ConfigProvider, GearCtx};
 use toolkit_security::SecurityContext;
+use tower::ServiceExt;
 use uuid::Uuid;
 
 use super::{ConstructGear, Running, lock};
@@ -18,8 +26,8 @@ use crate::infra::pipeline::assemble;
 use crate::infra::processing_metrics::WorkerLoad;
 use crate::infra::record_queue::record_queue;
 use crate::test_support::{
-    AllowResolver, fake_graph_storage, inmem_db, received_chat_record, settings_service,
-    unchecked_processing,
+    AllowResolver, IntakeFixture, context_of, fake_graph_storage, inmem_db, received_chat_record,
+    settings_service, unchecked_processing,
 };
 
 /// A model no test record reaches.
@@ -220,4 +228,107 @@ async fn stop_gives_up_on_an_aborted_worker_that_does_not_end_and_says_so() {
         started.elapsed()
     );
     assert!(logs_contain("did not end after it was aborted"));
+}
+
+/// No gear config: `register_rest` reads none.
+struct NoConfig;
+
+impl ConfigProvider for NoConfig {
+    fn get_gear_config(&self, _gear_name: &str) -> Option<&Value> {
+        None
+    }
+}
+
+/// The router the gear registers, with its services built from `cfg` and
+/// `model` as `init` builds them, and the caller `subject_id` authenticated.
+async fn router_of(
+    cfg: ConstructConfig,
+    model: Option<Arc<dyn ModelClient>>,
+    subject_id: Uuid,
+) -> Router {
+    let db = inmem_db().await;
+    let settings = Arc::new(settings_service(&db, Arc::new(AllowResolver), true));
+    let pipeline = assemble(
+        &cfg.validated().unwrap(),
+        model,
+        fake_graph_storage(),
+        Arc::clone(&settings) as _,
+        PolicyEnforcer::new(Arc::new(AllowResolver)),
+    )
+    .unwrap();
+    let gear = ConstructGear::default();
+    assert!(
+        gear.intake
+            .set(Arc::new(IntakeFixture::default().build(&db)))
+            .is_ok()
+    );
+    assert!(gear.settings.set(settings).is_ok());
+    assert!(gear.profile.set(pipeline.profile).is_ok());
+    assert!(gear.manage.set(pipeline.manage).is_ok());
+    let ctx = GearCtx::new(
+        ConstructGear::MODULE_NAME,
+        Uuid::new_v4(),
+        Arc::new(NoConfig),
+        Arc::new(ClientHub::new()),
+        CancellationToken::new(),
+    );
+    gear.register_rest(&ctx, Router::new(), &OpenApiRegistryImpl::new())
+        .unwrap()
+        .layer(Extension(context_of(subject_id, Uuid::new_v4())))
+}
+
+async fn manage(router: Router, subject_id: Uuid) -> (StatusCode, Value) {
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri(format!("/construct/v1/subjects/{subject_id}/facts/manage"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            json!({ "message": "I also know Rust.", "conversation": "" }).to_string(),
+        ))
+        .unwrap();
+    let response = router.oneshot(request).await.unwrap();
+    let status = response.status();
+    let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    // A route that is not registered answers with no body.
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
+}
+
+#[tokio::test]
+async fn the_gear_routes_manage_facts_to_the_processing_chain() {
+    let subject = Uuid::new_v4();
+    let cfg = ConstructConfig {
+        processing_identity: Some(Uuid::new_v4()),
+        processing: unchecked_processing(),
+        profile_category_check: Some(CategoryCheckConfig::OneCall),
+        ..ConstructConfig::default()
+    };
+
+    let (status, body) = manage(
+        router_of(cfg, Some(Arc::new(Unused)), subject).await,
+        subject,
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        (&body["outcome"], &body["reason"]),
+        (&json!("nothing_changed"), &json!("model_failed")),
+        "the call reached the planner's model"
+    );
+}
+
+#[tokio::test]
+async fn without_processing_the_gear_answers_manage_facts_not_configured() {
+    let subject = Uuid::new_v4();
+
+    let (status, body) = manage(
+        router_of(ConstructConfig::default(), None, subject).await,
+        subject,
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{body}");
 }

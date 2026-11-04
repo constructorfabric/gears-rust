@@ -19,7 +19,7 @@ use crate::test_support::{AllowResolver, DenyResolver, context_of};
 
 fn router(chain: &Chain, resolver: Arc<dyn AuthZResolverApi>, caller: Uuid) -> Router {
     let manage = ManageFacts::new(
-        chain.processing(),
+        Arc::new(chain.processing()),
         PolicyEnforcer::new(resolver),
         Duration::from_secs(20),
     );

@@ -161,7 +161,7 @@ pub fn register_routes(
         .layer(Extension(profile))
 }
 
-/// The synchronous manage-facts route. The gear registers it together with the planner chain it runs on.
+/// The synchronous manage-facts route. The gear always registers it; without record processing it answers 501.
 ///
 /// @cpt-dod:cpt-cf-construct-dod-planner-manage-route:p1
 pub fn register_manage_route(
@@ -190,6 +190,11 @@ pub fn register_manage_route(
         )
         .standard_errors(openapi)
         .error_503(openapi)
+        .problem_response(
+            openapi,
+            StatusCode::NOT_IMPLEMENTED,
+            "The deployment does not provide manage-facts",
+        )
         .register(Router::new(), openapi);
     router.merge(not_stored(facts)).layer(Extension(manage))
 }

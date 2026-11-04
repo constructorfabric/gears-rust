@@ -21,6 +21,7 @@ use crate::api::rest::routes;
 use crate::api::rest::types::{ConcreteIntake, ConcreteProfile, ConcreteSettings};
 use crate::config::ConstructConfig;
 use crate::domain::local_client::LocalClient;
+use crate::domain::planner::manage::ManageFacts;
 use crate::domain::record_intake::{IntakePorts, RecordIntakeService};
 use crate::domain::subject_settings::SubjectSettingsService;
 use crate::infra::connector_switch::ConfigConnectorSwitch;
@@ -32,8 +33,8 @@ use crate::infra::storage::subject_settings_repo::SeaOrmSubjectSettingsRepositor
 use crate::infra::tenant_defaults::SettingsServiceDefaults;
 
 /// The Construct gear: record intake for connectors, the processing of
-/// received records into a subject's profile, and the profile read, with
-/// tenant-scoped storage and an in-process client.
+/// received records into a subject's profile, manage-facts, and the profile
+/// read, with tenant-scoped storage and an in-process client.
 ///
 /// @cpt-dod:cpt-cf-construct-dod-gear-foundation-anatomy:p1
 #[toolkit::gear(
@@ -45,6 +46,7 @@ pub struct ConstructGear {
     intake: OnceLock<Arc<ConcreteIntake>>,
     settings: OnceLock<Arc<ConcreteSettings>>,
     profile: OnceLock<Arc<ConcreteProfile>>,
+    manage: OnceLock<Arc<ManageFacts>>,
     /// The processing worker, until `start` takes it.
     worker: Mutex<Option<Worker>>,
     running: Mutex<Option<Running>>,
@@ -63,6 +65,7 @@ impl Default for ConstructGear {
             intake: OnceLock::new(),
             settings: OnceLock::new(),
             profile: OnceLock::new(),
+            manage: OnceLock::new(),
             worker: Mutex::new(None),
             running: Mutex::new(None),
         }
@@ -140,6 +143,9 @@ impl Gear for ConstructGear {
         self.profile
             .set(Arc::clone(&profile))
             .map_err(|_| anyhow::anyhow!("{} gear already initialized", Self::MODULE_NAME))?;
+        self.manage
+            .set(pipeline.manage)
+            .map_err(|_| anyhow::anyhow!("{} gear already initialized", Self::MODULE_NAME))?;
         *lock(&self.worker) = pipeline.worker;
         let ports = IntakePorts {
             types,
@@ -198,7 +204,14 @@ impl toolkit::contracts::RestApiCapability for ConstructGear {
             .map(Arc::clone)
             .ok_or_else(|| anyhow::anyhow!("Profile read not initialized"))?;
 
+        let manage = self
+            .manage
+            .get()
+            .map(Arc::clone)
+            .ok_or_else(|| anyhow::anyhow!("Manage-facts not initialized"))?;
+
         let router = routes::register_routes(router, openapi, intake, settings, profile);
+        let router = routes::register_manage_route(router, openapi, manage);
         info!("Construct gear: REST routes registered");
         Ok(router)
         // @cpt-end:cpt-cf-construct-algo-gear-foundation-start-gear:p1:inst-start-rest
