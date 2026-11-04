@@ -22,8 +22,8 @@ use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
 use crate::domain::authz::{
-    CONSUMER_GROUP_FAMILY_RESOURCE, authorize_in_tenant, consumer_group_resource,
-    event_type_interest_resource, tenant_authorized, topic_resource, with_forbidden_code,
+    CONSUMER_GROUP_FAMILY_RESOURCE, consumer_group_resource, event_type_interest_resource,
+    tenant_authorized, topic_resource, with_forbidden_code,
 };
 use crate::domain::backend::BackendResolver;
 use crate::domain::consumer_group_coordinator::{ConsumerGroupCoordinator, TopicInterest};
@@ -435,42 +435,55 @@ where
             // JOIN via `?`'s early return, before a subscription is
             // created (spec.md "A single unauthorized interest blocks the
             // whole JOIN").
-            authorize_in_tenant(
-                ctx,
-                &self.policy_enforcer,
-                &topic_resource(&interest.topic),
-                "consume",
-                AccessRequest::new().resource_property("topic_id", interest.topic.as_ref()),
-                interest.tenant_id,
-            )
-            .await
-            .map_err(|e| with_forbidden_code(e.into(), ErrorCode::TopicNotAuthorized))?;
+            self.policy_enforcer
+                .access_scope_with(
+                    ctx,
+                    &topic_resource(&interest.topic),
+                    "consume",
+                    None,
+                    &AccessRequest::new()
+                        .resource_property("topic_id", interest.topic.as_ref())
+                        .resource_property(
+                            toolkit_security::pep_properties::OWNER_TENANT_ID,
+                            interest.tenant_id,
+                        )
+                        .require_constraints(false),
+                )
+                .await
+                .map_err(|e| with_forbidden_code(e.into(), ErrorCode::TopicNotAuthorized))?;
 
             for pattern in &interest.types {
                 let pattern_str = pattern.pattern();
                 let interest_resource = event_type_interest_resource(pattern)?;
-                authorize_in_tenant(
-                    ctx,
-                    &self.policy_enforcer,
-                    &interest_resource,
-                    "consume",
-                    AccessRequest::new().resource_property("event_type_id", pattern_str),
-                    interest.tenant_id,
-                )
-                .await
-                .map_err(|e| {
-                    let mut err = with_forbidden_code(e.into(), ErrorCode::EventTypeNotAuthorized);
-                    if let DomainError::Forbidden {
-                        message, resource, ..
-                    } = &mut err
-                    {
-                        *message = format!(
-                            "calling principal lacks consume on event type '{pattern_str}'"
-                        );
-                        pattern_str.clone_into(resource);
-                    }
-                    err
-                })?;
+                self.policy_enforcer
+                    .access_scope_with(
+                        ctx,
+                        &interest_resource,
+                        "consume",
+                        None,
+                        &AccessRequest::new()
+                            .resource_property("event_type_id", pattern_str)
+                            .resource_property(
+                                toolkit_security::pep_properties::OWNER_TENANT_ID,
+                                interest.tenant_id,
+                            )
+                            .require_constraints(false),
+                    )
+                    .await
+                    .map_err(|e| {
+                        let mut err =
+                            with_forbidden_code(e.into(), ErrorCode::EventTypeNotAuthorized);
+                        if let DomainError::Forbidden {
+                            message, resource, ..
+                        } = &mut err
+                        {
+                            *message = format!(
+                                "calling principal lacks consume on event type '{pattern_str}'"
+                            );
+                            pattern_str.clone_into(resource);
+                        }
+                        err
+                    })?;
             }
 
             tenant_authorized(ctx, &self.policy_enforcer, "consume", interest.tenant_id).await?;

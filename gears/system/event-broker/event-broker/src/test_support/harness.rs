@@ -336,12 +336,6 @@ impl EventBrokerHarness {
         crate::test_support::outbox_queue_partitions(&self.dsn).await
     }
 
-    /// How many message bodies the `default` outbox group holds: non-zero
-    /// once anything was enqueued for ingestion.
-    pub async fn outbox_body_rows(&self) -> i64 {
-        crate::test_support::outbox_body_rows(&self.dsn).await
-    }
-
     #[must_use]
     pub fn builder() -> EventBrokerHarnessBuilder {
         EventBrokerHarnessBuilder::default()

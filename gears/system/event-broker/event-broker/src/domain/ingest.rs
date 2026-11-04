@@ -10,7 +10,7 @@ use toolkit_gts::GtsInstanceId;
 use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
-use crate::domain::authz::{authorize_in_tenant, event_type_resource, tenant_authorized};
+use crate::domain::authz::{event_type_resource, tenant_authorized};
 use crate::domain::backend::BackendResolver;
 use crate::domain::error::{DomainError, ErrorCode};
 use event_broker_sdk::models::EventType;
@@ -288,35 +288,6 @@ pub struct IngestServiceImpl<R> {
 }
 
 impl<R> IngestServiceImpl<R> {
-    /// The publish gates for one `(event type, tenant)` pair: `produce` on the
-    /// concrete event type in that tenant, then authority over the tenant.
-    ///
-    /// # Errors
-    /// `DomainError::NotFound` with `EventTypeNotFound` for a type outside the
-    /// event family; `Forbidden` with `NotAuthorizedToProduce` or
-    /// `TenantIdNotAuthorized` on a denial; `Internal` on a PDP failure.
-    async fn authorize_publish(
-        &self,
-        ctx: &SecurityContext,
-        event_type: &GtsTypeId,
-        tenant: Uuid,
-    ) -> Result<(), DomainError> {
-        let resource = event_type_resource(event_type)?;
-        authorize_in_tenant(
-            ctx,
-            &self.policy_enforcer,
-            &resource,
-            "produce",
-            AccessRequest::new().resource_property("event_type_id", event_type.as_ref()),
-            tenant,
-        )
-        .await
-        .map_err(|e| {
-            crate::domain::authz::with_forbidden_code(e.into(), ErrorCode::NotAuthorizedToProduce)
-        })?;
-        tenant_authorized(ctx, &self.policy_enforcer, "produce", tenant).await
-    }
-
     /// The topic an event type publishes to, as the type's `topic` trait names
     /// it. An event carries only its type, so this is the only route from a
     /// publish request to a stream.
@@ -370,8 +341,29 @@ where
 
         // Reject non-event types, then authorize before topic/schema validation
         // (`docs/DESIGN.md`, Validation Pipeline step 1 and §3.3).
-        self.authorize_publish(ctx, &request.r#type, request.tenant_id)
-            .await?;
+        let event_type_resource = event_type_resource(&request.r#type)?;
+        self.policy_enforcer
+            .access_scope_with(
+                ctx,
+                &event_type_resource,
+                "produce",
+                None,
+                &AccessRequest::new()
+                    .resource_property("event_type_id", request.r#type.as_ref())
+                    .resource_property(
+                        toolkit_security::pep_properties::OWNER_TENANT_ID,
+                        request.tenant_id,
+                    )
+                    .require_constraints(false),
+            )
+            .await
+            .map_err(|e| {
+                crate::domain::authz::with_forbidden_code(
+                    e.into(),
+                    ErrorCode::NotAuthorizedToProduce,
+                )
+            })?;
+        tenant_authorized(ctx, &self.policy_enforcer, "produce", request.tenant_id).await?;
 
         // NOTE(perf): most first-level fields are deterministic per type (a few are type-overridden), so they could be checked without full schema validation.
         let event_type = self
@@ -599,22 +591,6 @@ where
         // before the failure is still not rolled back - the same documented
         // simplification of this in-memory backing noted above; a transactional
         // backend validates the batch before appending any of it.)
-        //
-        // Authorization is decided for the whole batch before anything is
-        // enqueued: produce is granted per tenant, so a batch mixing tenants
-        // could otherwise append the permitted events and then reject the
-        // request. Each distinct `(type, tenant)` pair is checked once.
-        // `publish_event` still checks each event; this pass only moves the
-        // denials ahead of the first append.
-        let mut authorized: Vec<(&GtsTypeId, Uuid)> = Vec::new();
-        for request in &requests {
-            let key = (&request.r#type, request.tenant_id);
-            if !authorized.contains(&key) {
-                self.authorize_publish(ctx, key.0, key.1).await?;
-                authorized.push(key);
-            }
-        }
-
         let mut result = BatchResult::default();
         for request in requests {
             let stamped = self.publish_event(ctx, request).await?.into_event();

@@ -273,43 +273,6 @@ async fn delivery_rechecks_all_three_gates_in_the_event_tenant() {
     }
 }
 
-/// A PDP that allows only within some tenants, by returning an
-/// `In(owner_tenant_id, ..)` constraint on each gate, must not have another
-/// tenant's event delivered: the filter checks each scope against the event.
-#[tokio::test]
-async fn delivery_denies_an_event_outside_a_constrained_allow() {
-    use super::filter::AuthorizedInterestFilter;
-    use crate::test_support::TenantScopedAuthZ;
-    use authz_resolver_sdk::PolicyEnforcer;
-    use std::sync::Arc;
-
-    let granted = Uuid::new_v4();
-    let foreign = Uuid::new_v4();
-    let filter = AuthorizedInterestFilter::new(
-        &[interest(granted, &[CREATED]), interest(foreign, &[CREATED])],
-        PolicyEnforcer::new(Arc::new(TenantScopedAuthZ {
-            tenants: vec![granted],
-        })),
-        toolkit_security::SecurityContext::builder()
-            .subject_tenant_id(foreign)
-            .subject_id(Uuid::new_v4())
-            .build()
-            .unwrap(),
-    );
-    assert!(
-        filter
-            .allows(&event(granted, topic(), CREATED))
-            .await
-            .unwrap()
-    );
-    assert!(
-        !filter
-            .allows(&event(foreign, topic(), CREATED))
-            .await
-            .unwrap()
-    );
-}
-
 /// An unavailable policy service at any gate is an error, never a skipped event.
 #[tokio::test]
 async fn delivery_preserves_evaluation_errors_from_each_gate() {

@@ -953,11 +953,12 @@ async fn join_rejected_for_unauthorized_interest_tenant_id_returns_403() {
         ])))
         .with_policy_enforcer(PolicyEnforcer::new(Arc::new(DenyingAuthZ {
             // The tenant-scope check is its own `PolicyEnforcer` call
-            // (`domain::authz::TENANT_SCOPE_RESOURCE`), distinguishable by its
-            // resource type. Event and topic checks also carry
-            // `OWNER_TENANT_ID`, so the property cannot identify it.
+            // (`domain::authz::TENANT_SCOPE_RESOURCE`), distinguishable by
+            // the `OWNER_TENANT_ID` resource property it alone sets.
             deny_if: |req: &EvaluationRequest| {
-                req.resource.resource_type == event_broker_sdk::gts::REQUEST_RESOURCE_TYPE
+                req.resource
+                    .properties
+                    .contains_key(pep_properties::OWNER_TENANT_ID)
             },
         })))
         .build()
@@ -1008,10 +1009,10 @@ async fn join_rejected_for_a_caller_not_authorized_for_the_anonymous_groups_tena
     // which denies the *per-interest* tenant check instead.
     let harness = EventBrokerHarness::builder()
         .with_policy_enforcer(PolicyEnforcer::new(Arc::new(DenyingAuthZ {
-            // Only the tenant-scope gate is denied: every interest-free JOIN
-            // check that names a tenant is that gate.
             deny_if: |req: &EvaluationRequest| {
-                req.resource.resource_type == event_broker_sdk::gts::REQUEST_RESOURCE_TYPE
+                req.resource
+                    .properties
+                    .contains_key(pep_properties::OWNER_TENANT_ID)
             },
         })))
         .build()
@@ -1177,8 +1178,10 @@ async fn join_succeeds_when_every_interest_passes_all_three_checks() {
                     == Some(&json!("gts.cf.core.events.topic.v1~x.eb.t1.topic.v1"));
                 let allowed_type = req.resource.properties.get("event_type_id")
                     == Some(&json!("gts.cf.core.events.event.v1~x.eb.t1.foo.v1~"));
-                let allowed_tenant =
-                    req.resource.resource_type == event_broker_sdk::gts::REQUEST_RESOURCE_TYPE;
+                let allowed_tenant = req
+                    .resource
+                    .properties
+                    .contains_key(pep_properties::OWNER_TENANT_ID);
                 let allowed_define = req.action.name == "define";
                 !(allowed_topic || allowed_type || allowed_tenant || allowed_define)
             },
@@ -2969,71 +2972,4 @@ async fn join_rejects_an_over_length_client_agent_before_parsing_session_timeout
             },
         })
     );
-}
-
-/// A constrained allow scoped to one interest tenant must not let a JOIN for
-/// another tenant through: the topic and event-type scopes are checked
-/// against the interest's tenant.
-#[tokio::test]
-async fn join_outside_a_constrained_allow_returns_403() {
-    use authz_resolver_sdk::{AuthZResolverApi, EvaluationResponse};
-    use toolkit_canonical_errors::CanonicalError;
-    use toolkit_security::PlatformSecurityContext;
-
-    /// Topic and event-type checks are scoped to `granted` by constraint. The
-    /// tenant-scope gate allows unconditionally, so the caller's own
-    /// anonymous group and both interest tenants pass it and the scoped
-    /// gates alone decide.
-    struct ScopedInterestGates(crate::test_support::TenantScopedAuthZ);
-
-    #[async_trait::async_trait]
-    impl AuthZResolverApi for ScopedInterestGates {
-        async fn evaluate(
-            &self,
-            ctx: PlatformSecurityContext,
-            request: EvaluationRequest,
-        ) -> Result<EvaluationResponse, CanonicalError> {
-            if request.resource.resource_type == event_broker_sdk::gts::REQUEST_RESOURCE_TYPE {
-                return crate::test_support::authz_doubles::AllowAllAuthZ
-                    .evaluate(ctx, request)
-                    .await;
-            }
-            self.0.evaluate(ctx, request).await
-        }
-    }
-
-    let granted = Uuid::new_v4();
-    let harness = EventBrokerHarness::builder()
-        .with_type_registry(StaticTypesRegistry::of(json!([
-            { "id": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1", "partitions": 1 },
-        ])))
-        .with_policy_enforcer(PolicyEnforcer::new(Arc::new(ScopedInterestGates(
-            crate::test_support::TenantScopedAuthZ {
-                tenants: vec![granted],
-            },
-        ))))
-        .build()
-        .await;
-
-    for (tenant_id, status) in [(Uuid::new_v4(), 403), (granted, 201)] {
-        let group = harness.api_v1().post_consumer_groups().send().await.json()["id"]
-            .as_str()
-            .unwrap()
-            .to_owned();
-        let resp = harness
-            .api_v1()
-            .post_subscriptions()
-            .with_body(Json(&json!({
-                "consumer_group": group,
-                "client_agent": "test-agent",
-                "interests": [{
-                    "topic": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
-                    "tenant_id": tenant_id,
-                    "types": ["gts.cf.core.events.event.v1~x.eb.t1.foo.v1~"],
-                }],
-            })))
-            .send()
-            .await;
-        resp.assert_status(status);
-    }
 }

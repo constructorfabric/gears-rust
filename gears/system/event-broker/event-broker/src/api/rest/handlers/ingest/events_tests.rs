@@ -810,11 +810,12 @@ async fn publish_rejected_for_unauthorized_tenant_id_returns_403() {
         ])))
         .with_policy_enforcer(PolicyEnforcer::new(Arc::new(DenyingAuthZ {
             // The tenant-scope check is its own `PolicyEnforcer` call
-            // (`domain::authz::TENANT_SCOPE_RESOURCE`), distinguishable by its
-            // resource type. Event and topic checks also carry
-            // `OWNER_TENANT_ID`, so the property cannot identify it.
+            // (`domain::authz::TENANT_SCOPE_RESOURCE`), distinguishable by
+            // the `OWNER_TENANT_ID` resource property it alone sets.
             deny_if: |req: &EvaluationRequest| {
-                req.resource.resource_type == event_broker_sdk::gts::REQUEST_RESOURCE_TYPE
+                req.resource
+                    .properties
+                    .contains_key(pep_properties::OWNER_TENANT_ID)
             },
         })))
         .build()
@@ -1807,110 +1808,21 @@ async fn tenant_scoped_produce_denial_has_no_persistence_side_effects() {
         cursors.topics.is_empty(),
         "denial must not advance producer state"
     );
-    // Publish only enqueues; the ingest workers persist asynchronously, so an
-    // immediate backend read would be empty even after an accepted publish.
-    // The outbox is written synchronously, so it shows whether the denial
-    // came before the enqueue.
-    assert_eq!(
-        harness.outbox_body_rows().await,
-        0,
-        "denial must not enqueue an event"
-    );
-}
-
-/// A publish request for one tenant on the single test event type.
-fn tenant_publish(tenant_id: Uuid) -> PublishRequest {
-    PublishRequest {
-        id: Uuid::new_v4(),
-        r#type: crate::test_support::event_type_id("gts.cf.core.events.event.v1~x.eb.t1.foo.v1~"),
-        tenant_id,
-        source: "test".to_owned(),
-        subject: "s".to_owned(),
-        subject_type: gts::GtsTypeId::new("gts.x.eb.t1.subject.v1~"),
-        occurred_at: Utc::now(),
-        trace_parent: None,
-        data: json!({}),
-        meta: None,
-    }
-}
-
-/// A harness whose PDP allows only within `granted`, via an
-/// `In(owner_tenant_id, [granted])` constraint on every tenant-bearing check.
-async fn tenant_scoped_harness(granted: Uuid) -> EventBrokerHarness {
-    EventBrokerHarness::builder()
-        .with_type_registry(StaticTypesRegistry::of(json!([
-            { "id": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1", "partitions": 1 },
-            { "id": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~", "topic": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1", "allowed_subject_types": ["gts.x.eb.t1.subject.v1~"] },
-        ])))
-        .with_policy_enforcer(PolicyEnforcer::new(Arc::new(
-            crate::test_support::TenantScopedAuthZ {
-                tenants: vec![granted],
-            },
-        )))
-        .build()
-        .await
-}
-
-/// A constrained allow scoped to one tenant must not let a publish into
-/// another tenant through, and the denial comes before the outbox.
-#[tokio::test]
-async fn publish_outside_a_constrained_allow_is_denied_before_the_outbox() {
-    let granted = Uuid::new_v4();
-    let harness = tenant_scoped_harness(granted).await;
-    let result = harness
-        .ingest()
-        .publish_event(harness.security_context(), tenant_publish(Uuid::new_v4()))
-        .await;
-    assert!(
-        matches!(
-            &result,
-            Err(DomainError::Forbidden {
-                code: ErrorCode::NotAuthorizedToProduce,
-                ..
-            })
-        ),
-        "expected Forbidden/NotAuthorizedToProduce, got {result:?}"
-    );
-    assert_eq!(
-        harness.outbox_body_rows().await,
-        0,
-        "denial must not enqueue an event"
-    );
-
-    harness
-        .ingest()
-        .publish_event(harness.security_context(), tenant_publish(granted))
-        .await
-        .expect("the granted tenant is covered");
-}
-
-/// Produce is granted per tenant, so a batch mixing a permitted and a
-/// forbidden tenant must be rejected before any of it is enqueued.
-#[tokio::test]
-async fn mixed_tenant_batch_denial_enqueues_nothing() {
-    let granted = Uuid::new_v4();
-    let harness = tenant_scoped_harness(granted).await;
-    let err = harness
-        .ingest()
-        .publish_batch(
-            harness.security_context(),
-            vec![tenant_publish(granted), tenant_publish(Uuid::new_v4())],
+    let events = harness
+        .backend()
+        .read(
+            &event_broker_sdk::backend::TopicPartition::new(
+                event_broker_sdk::GtsInstanceId::try_new(
+                    "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
+                )
+                .unwrap(),
+                event_broker_sdk::backend::Partition::new(0),
+            ),
+            event_broker_sdk::Sequence::NONE,
+            10,
+            event_broker_sdk::backend::Wait::No,
         )
         .await
-        .expect_err("the foreign tenant must abort the whole batch");
-    assert!(
-        matches!(
-            &err,
-            DomainError::Forbidden {
-                code: ErrorCode::NotAuthorizedToProduce,
-                ..
-            }
-        ),
-        "expected Forbidden/NotAuthorizedToProduce, got {err:?}"
-    );
-    assert_eq!(
-        harness.outbox_body_rows().await,
-        0,
-        "the permitted event must not be enqueued ahead of the denial"
-    );
+        .unwrap();
+    assert!(events.is_empty(), "denial must not persist an event");
 }

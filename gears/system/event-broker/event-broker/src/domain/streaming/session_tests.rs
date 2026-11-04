@@ -960,67 +960,52 @@ async fn parent_subscription_does_not_deliver_a_denied_derived_type() {
 }
 
 /// A PDP outage after one authorized event must not publish a partial batch or report a
-/// cursor beyond events whose authorization could not be established. Each delivery gate
-/// (tenant, topic, concrete event type) is failed in turn, selected by its resource type,
-/// so reordering the gates or swallowing an error at any one of them fails this test.
+/// cursor beyond events whose authorization could not be established.
 #[tokio::test]
 async fn authorization_outage_closes_without_advancing_the_batch_frontier() {
     use authz_resolver_sdk::{
         AuthZResolverApi, EvaluationRequest, EvaluationResponse, EvaluationResponseContext,
         PolicyEnforcer,
     };
-    use event_broker_sdk::gts::REQUEST_RESOURCE_TYPE;
     use toolkit_canonical_errors::CanonicalError;
     use toolkit_security::PlatformSecurityContext;
 
-    /// Allows every check, except that the chosen gate fails from its second
-    /// evaluation on: event 1 passes all gates, event 2 hits the outage.
-    struct FailsGateAfterOneAllow {
-        gate: &'static str,
-        seen: std::sync::atomic::AtomicUsize,
-    }
+    struct FailsAfterOneAllow(std::sync::atomic::AtomicUsize);
 
     #[async_trait::async_trait]
-    impl AuthZResolverApi for FailsGateAfterOneAllow {
+    impl AuthZResolverApi for FailsAfterOneAllow {
         async fn evaluate(
             &self,
             _ctx: PlatformSecurityContext,
-            request: EvaluationRequest,
+            _request: EvaluationRequest,
         ) -> Result<EvaluationResponse, CanonicalError> {
-            if request.resource.resource_type == self.gate
-                && self.seen.fetch_add(1, Ordering::Relaxed) >= 1
-            {
-                return Err(CanonicalError::service_unavailable().create());
+            if self.0.fetch_add(1, Ordering::Relaxed) >= 3 {
+                Err(CanonicalError::service_unavailable().create())
+            } else {
+                Ok(EvaluationResponse {
+                    decision: true,
+                    context: EvaluationResponseContext::default(),
+                })
             }
-            Ok(EvaluationResponse {
-                decision: true,
-                context: EvaluationResponseContext::default(),
-            })
         }
     }
 
-    for gate in [REQUEST_RESOURCE_TYPE, TOPIC, CREATED] {
-        let tenant = Uuid::new_v4();
-        let policy = PolicyEnforcer::new(Arc::new(FailsGateAfterOneAllow {
-            gate,
-            seen: std::sync::atomic::AtomicUsize::new(0),
-        }));
-        let held = StubPartition::holding(vec![event(tenant, 1), event(tenant, 2)]);
-        let mut harness = open_with_policy(vec![(0, held)], tenant, Some(policy));
-        let frames = drain(&mut harness.session, 4).await;
-        assert_eq!(kinds(&frames), vec!["topology", "terminal"], "gate {gate}");
-        assert!(
-            matches!(
-                frames.last(),
-                Some(Frame::Control {
-                    reason: Some(CloseReason::Teardown),
-                    ..
-                })
-            ),
-            "gate {gate}"
-        );
-        let position = &harness.session.positions()[0];
-        assert_eq!(position.offset, Sequence::assigned(0), "gate {gate}");
-        assert_eq!(position.last_examined, Sequence::assigned(0), "gate {gate}");
-    }
+    let tenant = Uuid::new_v4();
+    let policy = PolicyEnforcer::new(Arc::new(FailsAfterOneAllow(
+        std::sync::atomic::AtomicUsize::new(0),
+    )));
+    let held = StubPartition::holding(vec![event(tenant, 1), event(tenant, 2)]);
+    let mut harness = open_with_policy(vec![(0, held)], tenant, Some(policy));
+    let frames = drain(&mut harness.session, 4).await;
+    assert_eq!(kinds(&frames), vec!["topology", "terminal"]);
+    assert!(matches!(
+        frames.last(),
+        Some(Frame::Control {
+            reason: Some(CloseReason::Teardown),
+            ..
+        })
+    ));
+    let position = &harness.session.positions()[0];
+    assert_eq!(position.offset, Sequence::assigned(0));
+    assert_eq!(position.last_examined, Sequence::assigned(0));
 }

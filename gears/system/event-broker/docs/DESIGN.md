@@ -1749,21 +1749,6 @@ a separate tenant-authority allow never broadens an event or topic grant.
 Named consumer groups remain shared resources identified by their globally
 unique GTS instance and are checked independently of event-data tenant scope.
 
-These checks are point decisions: the broker never applies a returned
-`AccessScope` as a query predicate. So every tenant-bearing check (publish,
-JOIN, delivery, and the tenant-scope check itself) also requires the scope to
-cover the concrete tenant. An unconstrained allow covers every tenant. A
-constrained allow covers a tenant only when one of its constraints consists of
-`owner_tenant_id` equality or `IN` filters that list it; a constraint on any
-other property, or a subquery filter such as a tenant subtree, cannot be
-decided in memory and is treated as a denial. A PDP that scopes by constraint
-therefore authorizes exactly the tenants it names, and a PDP that decides the
-tenant itself should answer an allow without constraints.
-
-A batch is authorized as a whole before any of it is enqueued: each distinct
-`(event type, tenant)` pair passes the publish checks first, so a batch that
-mixes a permitted and a forbidden tenant enqueues nothing.
-
 Before authorization, publishing a type outside the event family returns
 `404 EventTypeNotFound`. A JOIN pattern that neither covers nor is covered by
 the event family returns `400 BadTypePattern`.
@@ -1775,11 +1760,8 @@ This includes derived types matched by a parent selector.
 Denied events count as examined but are not delivered. If evaluation returns an error,
 the stream closes with `teardown`; the current batch is neither emitted nor
 reported as progress, so it can be replayed. Decisions are not cached: each
-matching event requires all three PEP evaluations to allow. The three are
-evaluated concurrently, so one matching event costs one PDP round-trip of
-latency. An evaluation error at any of them closes the stream, even when
-another denied. Revoking any of the three permissions takes effect on
-subsequent matching events.
+matching event requires all three PEP evaluations to allow. Revoking any of
+the three permissions takes effect on subsequent matching events.
 
 **Subject_type is enforced on two independent dimensions**:
 1. **Authorization** (the `subject_type:produce` / `subject_type:consume` permission above) — *capability*: can the principal write or read events whose subject is of this type?
