@@ -17,7 +17,7 @@ permissions:
 jobs:
   includes:
     name: Makefile modules (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ matrix.os == 'ubuntu-latest' && ((vars.GEARS_FORCE_GITHUB_HOSTED == 'true' || github.repository != 'constructorfabric/gears-rust' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && 'ubuntu-latest' || 'gears-small') || matrix.os }}
     strategy:
       fail-fast: false
       matrix:

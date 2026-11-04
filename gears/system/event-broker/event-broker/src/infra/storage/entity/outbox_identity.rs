@@ -2,6 +2,7 @@
 //! group (feature 0005 §2.5), the high half of every fence key its messages
 //! append under. Platform data, not tenant data, so `unrestricted`.
 
+use chrono::{DateTime, Utc};
 use sea_orm::entity::prelude::*;
 use toolkit_db_macros::Scopable;
 
@@ -14,8 +15,8 @@ pub struct Model {
     pub name: String,
     /// The identity's 16 lowercase hex digits (`OutboxId`'s `Display`).
     pub outbox_id: String,
-    /// When the identity was minted, RFC 3339 UTC.
-    pub created_at: String,
+    /// When the identity was minted.
+    pub created_at: DateTime<Utc>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

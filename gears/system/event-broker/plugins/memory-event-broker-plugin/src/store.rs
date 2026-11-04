@@ -11,7 +11,7 @@ use chrono::{DateTime, Utc};
 use event_broker_sdk::backend::support::{LocalHeads, partition_for};
 use event_broker_sdk::backend::{
     AppendRequest, Appended, BackendError, FenceKey, FenceSeq, Head, LogClaim, LogId, Partition,
-    Provisioning, Retention, TopicPartition, TopicSpec,
+    Provisioning, Retention, Stored, TopicPartition, TopicSpec,
 };
 use event_broker_sdk::{Event, GtsInstanceId, PartitionRange, Position, Sequence, TopicSegment};
 
@@ -58,18 +58,23 @@ impl Store {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Claims the topic's log for `claim`; `LogConflict` when the stored log
-    /// id is not one the claim accepts.
+    /// Claims the topic's log for `claim` per [`LogClaim::check`]: a claim it
+    /// refuses changes nothing, and a [`Replacing::Held`] claim over a topic
+    /// this store holds nothing for creates nothing and answers
+    /// `NotProvisioned`.
+    ///
+    /// [`Replacing::Held`]: event_broker_sdk::backend::Replacing::Held
     pub fn provision(
         &self,
         spec: &TopicSpec,
         claim: &LogClaim,
     ) -> Result<Provisioning, BackendError> {
         let mut state = self.state();
-        let stored = state.logs.get(&spec.topic).map(|log| log.id);
-        if !claim.accepts(stored) {
-            return Err(BackendError::log_conflict("provision"));
-        }
+        let stored = state
+            .logs
+            .get(&spec.topic)
+            .map_or(Stored::Nothing, |log| Stored::Log(log.id));
+        claim.check("provision", stored)?;
         let log = state.logs.entry(spec.topic.clone()).or_insert_with(|| Log {
             id: claim.new,
             retention: spec.retention,
@@ -143,10 +148,10 @@ impl Store {
     ) -> Result<Vec<Event>, BackendError> {
         let state = self.state();
         let partition = partition(&state, at, "read")?;
+        let start = partition.index_of(offset.as_i64().saturating_add(1));
         Ok(partition
             .events
-            .iter()
-            .filter(|stored| stored_sequence(stored) > offset.as_i64())
+            .range(start..)
             .take(max_events)
             .map(|stored| stored.event.clone())
             .collect())
@@ -212,12 +217,15 @@ impl Store {
     ) -> Result<Vec<TopicSegment>, BackendError> {
         let state = self.state();
         let partition = partition(&state, at, "query")?;
-        let start = range.start_offset.map_or(i64::MIN, Sequence::as_i64);
-        let end = range.end_offset.map_or(i64::MAX, Sequence::as_i64);
+        let start = range
+            .start_offset
+            .map_or(0, |start| partition.index_of(start.as_i64()));
+        let end = range.end_offset.map_or(partition.events.len(), |end| {
+            partition.index_of(end.as_i64().saturating_add(1))
+        });
         let matched: Vec<&StoredEvent> = partition
             .events
-            .iter()
-            .filter(|stored| (start..=end).contains(&stored_sequence(stored)))
+            .range(start..end.max(start))
             .take(usize::try_from(range.limit).unwrap_or(usize::MAX))
             .collect();
         let (Some(first), Some(last)) = (matched.first(), matched.last()) else {
@@ -225,8 +233,6 @@ impl Store {
         };
         let start_sequence = Sequence::assigned(stored_sequence(first));
         let end_sequence = Sequence::assigned(stored_sequence(last));
-        // One synthetic segment over the matched range: this backend has no
-        // real segments.
         Ok(vec![TopicSegment {
             topic: at.topic.to_string(),
             partition: at.partition.value(),
@@ -292,6 +298,21 @@ impl Store {
 }
 
 impl PartitionLog {
+    /// The index of the stored event with `sequence`, clamped to the stored
+    /// range: `0` below the front event, `len` past the head.
+    ///
+    /// A partition's stored sequences are contiguous from its front event:
+    /// [`Store::append`] assigns `head + 1` to the event it pushes to the back,
+    /// and removal ([`Self::remove_while`], behind retention and truncation)
+    /// only pops the front, so the event at index `i` holds `front + i`.
+    fn index_of(&self, sequence: i64) -> usize {
+        let Some(front) = self.events.front() else {
+            return 0;
+        };
+        let offset = sequence.saturating_sub(stored_sequence(front)).max(0);
+        usize::try_from(offset).map_or(self.events.len(), |offset| offset.min(self.events.len()))
+    }
+
     /// Removes events from the front while `expired(oldest, stored_bytes)`
     /// holds, so what remains is always a suffix of what was stored.
     fn remove_while(&mut self, expired: impl Fn(&StoredEvent, u64) -> bool) {

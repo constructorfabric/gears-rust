@@ -161,6 +161,14 @@ impl ManagedDeduplicationBuilder {
         self
     }
 
+    /// Builds the managed deduplication setting.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvalidProducerOptions`](crate::error::EventBrokerError::InvalidProducerOptions)
+    /// on the first failing check, in this order: a `Stateless` mode, a
+    /// missing key, a blank key, a key with leading or trailing whitespace,
+    /// and a key longer than the registration row holds.
     pub fn build(self) -> Result<DbDeduplication, crate::error::EventBrokerError> {
         if self.mode == ProducerMode::Stateless {
             return Err(crate::error::EventBrokerError::InvalidProducerOptions {
@@ -178,6 +186,16 @@ impl ManagedDeduplicationBuilder {
                 detail: "managed producer registration key must not be empty".to_owned(),
             });
         }
+        // MySQL's PAD SPACE collation equates names that differ only in
+        // trailing spaces; edge whitespace is refused on every engine so all
+        // engines agree on which names collide.
+        if key != key.trim() {
+            return Err(crate::error::EventBrokerError::InvalidProducerOptions {
+                detail:
+                    "managed producer registration key must not have leading or trailing whitespace"
+                        .to_owned(),
+            });
+        }
         if key.len() > super::registration::MAX_NAME_LEN {
             return Err(crate::error::EventBrokerError::InvalidProducerOptions {
                 detail: format!(
@@ -193,11 +211,6 @@ impl ManagedDeduplicationBuilder {
     }
 }
 
-#[cfg(feature = "db")]
-impl From<ManagedDeduplicationBuilder> for DbDeduplication {
-    fn from(builder: ManagedDeduplicationBuilder) -> Self {
-        builder
-            .build()
-            .expect("managed producer deduplication must be complete")
-    }
-}
+#[cfg(all(test, feature = "db"))]
+#[path = "types_tests.rs"]
+mod tests;

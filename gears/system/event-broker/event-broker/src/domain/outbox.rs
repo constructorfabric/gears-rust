@@ -28,7 +28,7 @@ pub const INGEST_QUEUE_NAME: &str = "default";
 pub const OUTBOX_TABLE_PREFIX: &str = "event_broker__ob_default";
 
 /// `payload_type` every ingest outbox row is stamped with.
-pub const INGEST_PAYLOAD_TYPE: &str = "application/vnd.event-broker.ingest-event+json;version=2";
+pub const INGEST_PAYLOAD_TYPE: &str = "application/vnd.event-broker.ingest-event+json;version=1";
 
 /// How many partitions an outbox group drains through: a power of 2 from 1 to
 /// 64, the toolkit-db outbox's limit (feature 0005 §2.4, C8). Fixed once the

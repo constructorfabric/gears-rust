@@ -5,8 +5,12 @@
 //! (`super::scheduler`), so a reader parked at the frontier costs no fetch and
 //! holds no permit while it waits. One watch per topic, over the topic's live
 //! partitions: reopened when that set changes, and resubscribed with backoff
-//! when it fails or ends. A backend that pushes heads is watched natively; one
-//! that cannot is polled through `resolve(Latest)` behind the same stream.
+//! when it fails or ends. The backoff starts over only after a watch proved
+//! healthy - it reported a head above its first head for some partition, or
+//! stayed open for the backoff ceiling - so a watch that reports its first
+//! heads and then fails, every time, still backs off. A backend that pushes
+//! heads is watched natively; one that cannot is polled through
+//! `resolve(Latest)` behind the same stream.
 //!
 //! Heads are a hint, not the authority: a lost or late head costs a late wake,
 //! and every reopen starts with the current head of each partition.
@@ -18,6 +22,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::task::JoinHandle;
+use tokio::time::Instant;
 use tokio_stream::{Stream, StreamExt};
 use tokio_util::sync::CancellationToken;
 use toolkit_gts::GtsInstanceId;
@@ -120,7 +125,9 @@ impl Drop for TopicWatch {
 }
 
 /// Follows one topic's heads until aborted, reopening the watch with backoff
-/// whenever it fails, ends, or cannot be opened.
+/// whenever it fails, ends, or cannot be opened. The backoff doubles per
+/// reopen up to the ceiling, and starts over from the floor after a healthy
+/// watch.
 async fn follow<H: HeadSource>(
     source: Arc<H>,
     topics: Arc<TopicManager>,
@@ -129,7 +136,7 @@ async fn follow<H: HeadSource>(
 ) {
     let mut backoff = RESUBSCRIBE_FLOOR;
     loop {
-        if watch_once(source.as_ref(), &topics, &topic, &partitions).await {
+        if watch_once(source.as_ref(), &topics, &topic, &partitions).await == WatchEnd::Healthy {
             backoff = RESUBSCRIBE_FLOOR;
         }
         tokio::time::sleep(jittered(backoff)).await;
@@ -137,26 +144,57 @@ async fn follow<H: HeadSource>(
     }
 }
 
-/// Opens one watch and records its heads until it fails or ends; `true` when
-/// it reported at least one, so the next failure starts the backoff over.
+/// How one watch ended, as far as the backoff is concerned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WatchEnd {
+    /// It reported a head above its first head for some partition, or stayed
+    /// open for `RESUBSCRIBE_CEILING`: the next failure starts the backoff
+    /// over.
+    Healthy,
+    /// It could not be opened, or ended having reported no head above the
+    /// first head of its partition: the backoff keeps growing.
+    Failed,
+}
+
+/// Opens one watch and records its heads until it fails or ends.
+///
+/// Every watch starts by reporting the current heads, which a medium that
+/// then fails on another partition reports as readily as a healthy one, so
+/// they are no proof of health; neither is a re-sent equal head, which is no
+/// change. Only a head above the first one of its partition, or lasting the
+/// ceiling, is.
 async fn watch_once<H: HeadSource>(
     source: &H,
     topics: &TopicManager,
     topic: &GtsInstanceId,
     partitions: &[i32],
-) -> bool {
-    let mut heads = match source.watch(topic, partitions).await {
+) -> WatchEnd {
+    let heads = match source.watch(topic, partitions).await {
         Ok(heads) => heads,
         Err(error) => {
             tracing::warn!(topic = %topic, ?error, "head watch could not be opened");
-            return false;
+            return WatchEnd::Failed;
         }
     };
-    let mut reported = false;
+    let opened = Instant::now();
+    let changed = record(heads, topics, topic).await;
+    if changed || opened.elapsed() >= RESUBSCRIBE_CEILING {
+        WatchEnd::Healthy
+    } else {
+        WatchEnd::Failed
+    }
+}
+
+/// Records the heads of one open watch until it fails or ends; `true` when it
+/// reported a head above the first one it reported for that partition.
+async fn record(mut heads: HeadStream, topics: &TopicManager, topic: &GtsInstanceId) -> bool {
+    let mut first: HashMap<i32, Sequence> = HashMap::new();
+    let mut changed = false;
     while let Some(item) = heads.next().await {
         match item {
             Ok(head) => {
-                reported = true;
+                let first = *first.entry(head.key.partition).or_insert(head.head);
+                changed |= head.head > first;
                 topics.publish_head(&head.key, head.head);
             }
             Err(error) => {
@@ -165,7 +203,7 @@ async fn watch_once<H: HeadSource>(
             }
         }
     }
-    reported
+    changed
 }
 
 /// Somewhere in the upper half of `backoff`, so the watches of many topics

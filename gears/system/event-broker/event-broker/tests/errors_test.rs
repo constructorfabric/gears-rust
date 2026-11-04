@@ -276,7 +276,9 @@ async fn a_chained_publish_off_the_head_answers_412() {
                 "violations": [{
                     "type": "sequence_mismatch",
                     "subject": "(producer)",
-                    "description": format!("topic={TOPIC} expected_previous=1"),
+                    "description": format!(
+                        "index=0 producer_id={producer_id} topic={TOPIC} last_sequence=1"
+                    ),
                 }],
             },
         })

@@ -7,7 +7,7 @@ use settings_service_sdk::SettingKey;
 use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
-use super::{AccessActor, AccessService};
+use super::{AccessActor, AccessReadout, AccessService};
 use crate::domain::access::{ABSENT_RESTRICTION_TAG, TenantAccess};
 use crate::domain::category::DomainVisibility;
 use crate::domain::error::DomainError;
@@ -46,6 +46,44 @@ impl Harness {
     fn key(&self, name: &str) -> SettingKey {
         self.base.key(name)
     }
+
+    /// Resolve the chains, then store the restriction — the two steps the
+    /// REST handler takes around its transaction, here over one runner.
+    async fn set<C: toolkit_db::secure::DBRunner>(
+        &self,
+        conn: &C,
+        actor: &AccessActor,
+        key: &SettingKey,
+        target: Uuid,
+        access: TenantAccess,
+        if_match: Option<&str>,
+    ) -> Result<AccessReadout, DomainError> {
+        let chains = self
+            .service
+            .authorized_hierarchy_chains(actor, target)
+            .await?;
+        self.service
+            .set(conn, actor, &chains, key, target, access, if_match)
+            .await
+    }
+
+    /// Resolve the chains, then clear the restriction; as [`Self::set`].
+    async fn clear<C: toolkit_db::secure::DBRunner>(
+        &self,
+        conn: &C,
+        actor: &AccessActor,
+        key: &SettingKey,
+        target: Uuid,
+        if_match: Option<&str>,
+    ) -> Result<AccessReadout, DomainError> {
+        let chains = self
+            .service
+            .authorized_hierarchy_chains(actor, target)
+            .await?;
+        self.service
+            .clear(conn, actor, &chains, key, target, if_match)
+            .await
+    }
 }
 
 fn actor(tenant: Uuid) -> AccessActor {
@@ -80,7 +118,6 @@ async fn set_read_and_clear_round_trip_with_their_tags_and_records() {
     assert_eq!(fresh.etag.as_str(), ABSENT_RESTRICTION_TAG);
 
     let set = h
-        .service
         .set(
             &conn,
             &root,
@@ -109,34 +146,31 @@ async fn set_read_and_clear_round_trip_with_their_tags_and_records() {
 
     // A stale or missing tag stores nothing.
     assert!(matches!(
-        h.service
-            .set(
-                &conn,
-                &root,
-                &h.key("strict"),
-                t.a,
-                TenantAccess::ReadOnly,
-                Some(ABSENT_RESTRICTION_TAG)
-            )
-            .await,
+        h.set(
+            &conn,
+            &root,
+            &h.key("strict"),
+            t.a,
+            TenantAccess::ReadOnly,
+            Some(ABSENT_RESTRICTION_TAG)
+        )
+        .await,
         Err(DomainError::PreconditionFailed { .. })
     ));
     assert!(matches!(
-        h.service
-            .set(
-                &conn,
-                &root,
-                &h.key("strict"),
-                t.a,
-                TenantAccess::ReadOnly,
-                None
-            )
-            .await,
+        h.set(
+            &conn,
+            &root,
+            &h.key("strict"),
+            t.a,
+            TenantAccess::ReadOnly,
+            None
+        )
+        .await,
         Err(DomainError::PreconditionRequired { .. })
     ));
 
     let cleared = h
-        .service
         .clear(&conn, &root, &h.key("strict"), t.a, Some(set.etag.as_str()))
         .await
         .expect("clears");
@@ -145,16 +179,15 @@ async fn set_read_and_clear_round_trip_with_their_tags_and_records() {
     assert_eq!(cleared.etag.as_str(), ABSENT_RESTRICTION_TAG);
     // Clearing again is a no-op that still needs the absent-state tag.
     assert!(
-        h.service
-            .clear(
-                &conn,
-                &root,
-                &h.key("strict"),
-                t.a,
-                Some(ABSENT_RESTRICTION_TAG)
-            )
-            .await
-            .is_ok()
+        h.clear(
+            &conn,
+            &root,
+            &h.key("strict"),
+            t.a,
+            Some(ABSENT_RESTRICTION_TAG)
+        )
+        .await
+        .is_ok()
     );
     assert_eq!(h.audit.operations(), vec!["create", "remove"]);
 }
@@ -175,7 +208,6 @@ async fn a_restrictions_audit_images_carry_the_pair_and_its_access_not_the_sette
     let key = h.key("strict");
 
     let set = h
-        .service
         .set(
             &conn,
             &root,
@@ -187,7 +219,6 @@ async fn a_restrictions_audit_images_carry_the_pair_and_its_access_not_the_sette
         .await
         .expect("sets");
     let changed = h
-        .service
         .set(
             &conn,
             &root,
@@ -198,8 +229,7 @@ async fn a_restrictions_audit_images_carry_the_pair_and_its_access_not_the_sette
         )
         .await
         .expect("changes");
-    h.service
-        .clear(&conn, &root, &key, t.a, Some(changed.etag.as_str()))
+    h.clear(&conn, &root, &key, t.a, Some(changed.etag.as_str()))
         .await
         .expect("clears");
 
@@ -261,22 +291,20 @@ async fn a_declaration_outside_the_callers_domain_is_absent_to_every_permission_
         "read",
     );
     absent(
-        h.service
-            .set(
-                &conn,
-                &outside,
-                &key,
-                t.a,
-                TenantAccess::Hidden,
-                Some(ABSENT_RESTRICTION_TAG),
-            )
-            .await
-            .map(drop),
+        h.set(
+            &conn,
+            &outside,
+            &key,
+            t.a,
+            TenantAccess::Hidden,
+            Some(ABSENT_RESTRICTION_TAG),
+        )
+        .await
+        .map(drop),
         "set",
     );
     absent(
-        h.service
-            .clear(&conn, &outside, &key, t.a, Some(ABSENT_RESTRICTION_TAG))
+        h.clear(&conn, &outside, &key, t.a, Some(ABSENT_RESTRICTION_TAG))
             .await
             .map(drop),
         "clear",
@@ -290,17 +318,16 @@ async fn a_declaration_outside_the_callers_domain_is_absent_to_every_permission_
     // Inside the domain it is there, and an undomained declaration is there
     // for every restricted caller.
     let inside = within("infrastructure");
-    h.service
-        .set(
-            &conn,
-            &inside,
-            &key,
-            t.a,
-            TenantAccess::Hidden,
-            Some(ABSENT_RESTRICTION_TAG),
-        )
-        .await
-        .expect("inside the domain");
+    h.set(
+        &conn,
+        &inside,
+        &key,
+        t.a,
+        TenantAccess::Hidden,
+        Some(ABSENT_RESTRICTION_TAG),
+    )
+    .await
+    .expect("inside the domain");
     h.service
         .read(&conn, &outside, &h.key("open"), t.a)
         .await
@@ -322,7 +349,6 @@ async fn a_retired_declaration_keeps_its_restrictions_readable_but_takes_no_new_
     let root = actor(t.root);
     let key = h.key("strict");
     let set = h
-        .service
         .set(
             &conn,
             &root,
@@ -358,21 +384,19 @@ async fn a_retired_declaration_keeps_its_restrictions_readable_but_takes_no_new_
         );
     };
     retired(
-        h.service
-            .set(
-                &conn,
-                &root,
-                &key,
-                t.a,
-                TenantAccess::ReadOnly,
-                Some(set.etag.as_str()),
-            )
-            .await,
+        h.set(
+            &conn,
+            &root,
+            &key,
+            t.a,
+            TenantAccess::ReadOnly,
+            Some(set.etag.as_str()),
+        )
+        .await,
         "set",
     );
     retired(
-        h.service
-            .clear(&conn, &root, &key, t.a, Some(set.etag.as_str()))
+        h.clear(&conn, &root, &key, t.a, Some(set.etag.as_str()))
             .await,
         "clear",
     );
@@ -394,32 +418,30 @@ async fn only_a_reachable_strict_descendant_can_be_restricted_and_overridable_is
     for (caller, target) in [(t.a, t.a), (t.b, t.a), (t.a, t.c), (t.a, t.s)] {
         assert!(
             matches!(
-                h.service
-                    .set(
-                        &conn,
-                        &actor(caller),
-                        &h.key("strict"),
-                        target,
-                        TenantAccess::ReadOnly,
-                        Some(ABSENT_RESTRICTION_TAG)
-                    )
-                    .await,
+                h.set(
+                    &conn,
+                    &actor(caller),
+                    &h.key("strict"),
+                    target,
+                    TenantAccess::ReadOnly,
+                    Some(ABSENT_RESTRICTION_TAG)
+                )
+                .await,
                 Err(DomainError::Unauthorized { .. })
             ),
             "{caller} -> {target}"
         );
     }
     assert!(matches!(
-        h.service
-            .set(
-                &conn,
-                &actor(t.root),
-                &h.key("strict"),
-                t.a,
-                TenantAccess::Overridable,
-                Some(ABSENT_RESTRICTION_TAG)
-            )
-            .await,
+        h.set(
+            &conn,
+            &actor(t.root),
+            &h.key("strict"),
+            t.a,
+            TenantAccess::Overridable,
+            Some(ABSENT_RESTRICTION_TAG)
+        )
+        .await,
         Err(DomainError::Validation { .. })
     ));
     assert!(matches!(
@@ -447,17 +469,16 @@ async fn a_hidden_caller_sees_nothing_and_a_restriction_evicts_the_subtree() {
             .expect("cached");
     }
 
-    h.service
-        .set(
-            &conn,
-            &actor(t.root),
-            &h.key("strict"),
-            t.a,
-            TenantAccess::Hidden,
-            Some(ABSENT_RESTRICTION_TAG),
-        )
-        .await
-        .expect("sets");
+    h.set(
+        &conn,
+        &actor(t.root),
+        &h.key("strict"),
+        t.a,
+        TenantAccess::Hidden,
+        Some(ABSENT_RESTRICTION_TAG),
+    )
+    .await
+    .expect("sets");
     h.service
         .evict(&h.key("strict"), t.a)
         .await
@@ -500,17 +521,16 @@ async fn the_list_covers_the_callers_subtree_without_standalone_branches() {
     let conn = h.base.db.conn().expect("connection");
     let root = actor(t.root);
     for tenant in [t.a, t.b, t.c] {
-        h.service
-            .set(
-                &conn,
-                &root,
-                &h.key("strict"),
-                tenant,
-                TenantAccess::ReadOnly,
-                Some(ABSENT_RESTRICTION_TAG),
-            )
-            .await
-            .expect("sets");
+        h.set(
+            &conn,
+            &root,
+            &h.key("strict"),
+            tenant,
+            TenantAccess::ReadOnly,
+            Some(ABSENT_RESTRICTION_TAG),
+        )
+        .await
+        .expect("sets");
     }
     // `s` is standalone: root cannot restrict it, so no row can exist for it.
     let all: Vec<Uuid> = h
@@ -551,19 +571,17 @@ async fn a_row_below_a_hidden_tenant_is_stored_and_takes_effect_when_the_ancesto
 
     // `a` is hidden, and `b` below it is recorded `read_only` anyway. The
     // stricter ancestor dominates, so `b` reads `hidden` and its own row waits.
-    h.service
-        .set(
-            &conn,
-            &root,
-            &h.key("strict"),
-            t.a,
-            TenantAccess::Hidden,
-            Some(ABSENT_RESTRICTION_TAG),
-        )
-        .await
-        .expect("the ancestor");
+    h.set(
+        &conn,
+        &root,
+        &h.key("strict"),
+        t.a,
+        TenantAccess::Hidden,
+        Some(ABSENT_RESTRICTION_TAG),
+    )
+    .await
+    .expect("the ancestor");
     let below = h
-        .service
         .set(
             &conn,
             &root,
@@ -589,16 +607,15 @@ async fn a_row_below_a_hidden_tenant_is_stored_and_takes_effect_when_the_ancesto
         .read(&conn, &root, &h.key("strict"), t.a)
         .await
         .expect("reads");
-    h.service
-        .clear(
-            &conn,
-            &root,
-            &h.key("strict"),
-            t.a,
-            Some(ancestor.etag.as_str()),
-        )
-        .await
-        .expect("cleared");
+    h.clear(
+        &conn,
+        &root,
+        &h.key("strict"),
+        t.a,
+        Some(ancestor.etag.as_str()),
+    )
+    .await
+    .expect("cleared");
     let now = h
         .service
         .read(&conn, &root, &h.key("strict"), t.b)
@@ -619,19 +636,17 @@ async fn clearing_removes_one_row_and_leaves_an_ancestor_s_in_force() {
     let root = actor(t.root);
 
     // Two rows on one chain: `a` read-only, `b` hidden.
-    h.service
-        .set(
-            &conn,
-            &root,
-            &h.key("strict"),
-            t.a,
-            TenantAccess::ReadOnly,
-            Some(ABSENT_RESTRICTION_TAG),
-        )
-        .await
-        .expect("the ancestor");
+    h.set(
+        &conn,
+        &root,
+        &h.key("strict"),
+        t.a,
+        TenantAccess::ReadOnly,
+        Some(ABSENT_RESTRICTION_TAG),
+    )
+    .await
+    .expect("the ancestor");
     let deeper = h
-        .service
         .set(
             &conn,
             &root,
@@ -646,7 +661,6 @@ async fn clearing_removes_one_row_and_leaves_an_ancestor_s_in_force() {
     // Clearing `b`'s row removes that row only; what `a` imposes still reaches
     // `b`, so the pair falls back to the ancestor rather than to overridable.
     let cleared = h
-        .service
         .clear(
             &conn,
             &root,
@@ -673,16 +687,15 @@ async fn clearing_removes_one_row_and_leaves_an_ancestor_s_in_force() {
     );
 
     // Clearing the last row leaves the pair overridable everywhere.
-    h.service
-        .clear(
-            &conn,
-            &root,
-            &h.key("strict"),
-            t.a,
-            Some(ancestor.etag.as_str()),
-        )
-        .await
-        .expect("cleared");
+    h.clear(
+        &conn,
+        &root,
+        &h.key("strict"),
+        t.a,
+        Some(ancestor.etag.as_str()),
+    )
+    .await
+    .expect("cleared");
     let free = h
         .service
         .read(&conn, &root, &h.key("strict"), t.b)
@@ -690,4 +703,89 @@ async fn clearing_removes_one_row_and_leaves_an_ancestor_s_in_force() {
         .expect("reads");
     assert_eq!(free.effective.access, TenantAccess::Overridable);
     assert!(free.effective.supplied_by.is_none());
+}
+
+/// Chains resolved for one caller and target cannot be spent on another pair:
+/// the mutation refuses them before touching storage.
+#[tokio::test]
+async fn chains_resolved_for_another_pair_are_refused_and_store_nothing() {
+    let h = Harness::new().await;
+    h.base
+        .declare("strict", scope_class::CASCADING, json!(false))
+        .await;
+    let t = &h.base.tree;
+    let conn = h.base.db.conn().expect("connection");
+    let root = actor(t.root);
+    let key = h.key("strict");
+    let for_a = h
+        .service
+        .authorized_hierarchy_chains(&root, t.a)
+        .await
+        .expect("resolves");
+
+    // Another target than the chains were resolved for.
+    assert!(matches!(
+        h.service
+            .set(
+                &conn,
+                &root,
+                &for_a,
+                &key,
+                t.b,
+                TenantAccess::ReadOnly,
+                Some(ABSENT_RESTRICTION_TAG),
+            )
+            .await,
+        Err(DomainError::Internal { .. })
+    ));
+    // Another caller than the chains were resolved for.
+    assert!(matches!(
+        h.service
+            .clear(
+                &conn,
+                &actor(t.a),
+                &for_a,
+                &key,
+                t.a,
+                Some(ABSENT_RESTRICTION_TAG),
+            )
+            .await,
+        Err(DomainError::Internal { .. })
+    ));
+    let read = h
+        .service
+        .read(&conn, &root, &key, t.b)
+        .await
+        .expect("reads");
+    assert!(read.stored.is_none());
+    assert!(h.audit.operations().is_empty());
+}
+
+/// Why the chains are resolved before the transaction: with the guard the
+/// database-backed tenant resolver trips installed, a hierarchy lookup from
+/// inside an open transaction fails as unavailable, while the same lookup
+/// outside it succeeds.
+#[tokio::test]
+async fn a_hierarchy_lookup_inside_a_transaction_is_refused_by_the_connection_guard() {
+    use crate::domain::resolution::TenantHierarchy;
+
+    let h = Harness::new().await;
+    let t = &h.base.tree;
+    *h.base.hierarchy.connection_guard.lock().expect("lock") = Some(Arc::clone(&h.base.db));
+    let tenant = t.a;
+
+    let hierarchy = Arc::clone(&h.base.hierarchy);
+    let inside: Result<Vec<Uuid>, DomainError> = h
+        .base
+        .db
+        .db()
+        .transaction_ref_mapped(move |_tx| Box::pin(async move { hierarchy.chain(tenant).await }))
+        .await;
+    assert!(
+        matches!(inside, Err(DomainError::Unavailable { .. })),
+        "{inside:?}"
+    );
+
+    let outside = h.base.hierarchy.chain(tenant).await.expect("resolves");
+    assert_eq!(outside.last(), Some(&tenant));
 }

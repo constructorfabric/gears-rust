@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use parking_lot::Mutex;
 
 use crate::domain::ports::OagwMetricsPort;
-use crate::domain::ports::metric_labels::{CacheEviction, CacheLookup, CacheMap};
+use crate::domain::ports::metric_labels::{CacheEviction, CacheLookup, CacheMap, CacheStale};
 
 #[cfg(feature = "cluster")]
 mod cluster;
@@ -73,6 +73,7 @@ impl OagwMetricsPort for CacheMetrics {
     fn record_rate_limit_sweep(&self, _: u64, _: u64) {}
     fn record_registry_provisioning_failure(&self, _: &str, _: &str) {}
     fn record_registry_provisioning_run(&self, _: &str) {}
+    fn record_credential_withheld(&self, _: &str, _: &'static str) {}
     fn record_proxy_cache_lookup(&self, map: CacheMap, result: CacheLookup) {
         self.add(format!("lookups {} {}", map.as_str(), result.as_str()), 1);
     }
@@ -93,6 +94,9 @@ impl OagwMetricsPort for CacheMetrics {
     }
     fn record_proxy_cache_load_discarded(&self, map: CacheMap) {
         self.add(format!("discarded {}", map.as_str()), 1);
+    }
+    fn record_proxy_cache_stale_served(&self, map: CacheMap, cause: CacheStale) {
+        self.add(format!("stale {} {}", map.as_str(), cause.as_str()), 1);
     }
     fn record_proxy_cache_publish_failures(&self, reason: &str, count: u64) {
         self.add(format!("publish_failures {reason}"), count);

@@ -140,6 +140,13 @@ pub mod permission {
     /// the upstream's CORS `allowed_methods` list.
     pub const CORS_METHOD_NOT_ALLOWED: &str = "CORS_METHOD_NOT_ALLOWED";
 
+    /// The resolved upstream serves the alias on endpoints the owner of its
+    /// enforced auth did not configure, so the credential cannot be sent.
+    /// A tenant above the caller changed its endpoints or switched its auth
+    /// to `enforce` after the caller's tenant bound the alias. Projects to
+    /// [`DenialReason::Unknown`], which keeps the enum unchanged.
+    pub const ENFORCED_AUTH_OTHER_SERVER: &str = "ENFORCED_AUTH_OTHER_SERVER";
+
     use core::fmt;
 
     /// Typed view of the wire `reason` strings emitted alongside

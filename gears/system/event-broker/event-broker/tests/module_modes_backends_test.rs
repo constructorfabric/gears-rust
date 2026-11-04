@@ -64,7 +64,7 @@ async fn only_the_ingest_role_maintains_the_specification_cache() {
         let deadline = Instant::now() + patience;
         let manager = TypesRegistrySpecificationManager::new(Arc::clone(&db));
         let count = loop {
-            let found = manager.list_topics().await.len();
+            let found = manager.list_topics().await.expect("the cache reads").len();
             if found > 0 || Instant::now() >= deadline {
                 break found;
             }

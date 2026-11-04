@@ -69,7 +69,7 @@ pub struct TopicRef(pub String);
 pub struct EventTraits {
     /// Full GTS topic identifier of the stream that events of this type are published to. A topic is an instance, so this never ends in `~`.
     pub topic: TopicRef,
-    /// GTS Type-id patterns describing which subject types an event of this type may declare in subject_type (concrete Type match, wildcard suffix <prefix>.*, or bare base Type <base>~ with implicit derived-type coverage). Enforced at publish time, independent of the subject_type:produce/:consume authorization check.
+    /// GTS Type-id patterns describing which subject types an event of this type may declare in subject_type (concrete Type match, wildcard suffix `<prefix>.*`, or bare base Type `<base>~` with implicit derived-type coverage). Enforced at publish time, independent of the subject_type:produce/:consume authorization check.
     #[serde(default)]
     pub allowed_subject_types: Vec<SubjectTypeRef>,
     /// JSON Pointer naming the member of an event whose value determines its partition. May point into `data`, which a bare field name could not express. Defaults to the event's tenant, so a type declaring nothing partitions per tenant. The broker checks at registration that the pointer names a member this type's resolved schema declares.
@@ -120,11 +120,11 @@ pub struct EventMeta {
     /// Producer registered via POST /v1/producers; bound to the calling principal. Required for chained / monotonic mode publishes. Omit for stateless.
     #[serde(default)]
     pub producer_id: Option<Uuid>,
-    /// Predecessor's sequence for chain dedup. Required and only valid in chained mode. On the first chained-mode publish for a (producer_id, topic, partition), set to 0.
+    /// Predecessor's sequence for chain dedup. Required and only valid in chained mode. On the first chained-mode publish for a (producer_id, topic), set to 0.
     #[serde(default)]
     #[schemars(range(min = 0))]
     pub previous: Option<i64>,
-    /// Producer-assigned monotonic sequence per (producer_id, topic, partition). Required in chained and monotonic modes; omitted in stateless.
+    /// Producer-assigned monotonic sequence per (producer_id, topic). Required in chained and monotonic modes; omitted in stateless.
     #[serde(default)]
     #[schemars(range(min = 1))]
     pub sequence: Option<i64>,

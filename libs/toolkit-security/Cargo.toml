@@ -23,8 +23,9 @@ workspace = true
 ignored = ["rustls-fips-shim"]
 
 [features]
-# JWT decoding keeps jsonwebtoken's claim validation after facade verification.
-jwt = ["dep:jsonwebtoken", "dep:base64", "dep:spki"]
+# JWT decoding keeps jsonwebtoken's claim validation after facade verification;
+# encoding serializes the header and claims the same way jsonwebtoken does.
+jwt = ["dep:jsonwebtoken", "dep:base64", "dep:spki", "dep:serde_json"]
 # Application primitives use the same native backend policy as TLS.
 fips = ["dep:rustls-fips-shim", "dep:rustls-corecrypto-provider", "rustls-corecrypto-provider/fips", "dep:rustls-cng-crypto", "dep:security-framework", "dep:win-crypto-ng"]
 # Enables `internal_auth_cache::CachingInternalAuthenticator`.
@@ -36,6 +37,7 @@ aws-lc-rs = { workspace = true }
 rustls-fips-shim = { workspace = true, optional = true }
 pkcs1 = { version = "0.7", features = ["alloc"] }
 pkcs8 = { workspace = true }
+pem-rfc7468 = { version = "1", default-features = false }
 sec1 = { workspace = true }
 spki = { version = "0.7", optional = true }
 jsonwebtoken = { workspace = true, optional = true }
@@ -65,6 +67,8 @@ rustls-cng-crypto = { workspace = true, optional = true }
 
 [dev-dependencies]
 hex = { workspace = true }
+pem-rfc7468 = { version = "1", features = ["std"] }
+proptest = { workspace = true }
 serde_json = { workspace = true }
 toolkit-gts = { package = "cf-gears-toolkit-gts", path = "../toolkit-gts" }
 trybuild = { workspace = true }

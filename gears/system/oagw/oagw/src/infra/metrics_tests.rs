@@ -735,6 +735,30 @@ fn proxy_cache_discarded_loads_carry_the_map() {
 }
 
 #[test]
+fn proxy_cache_stale_answers_carry_the_map_and_cause() {
+    use crate::domain::ports::metric_labels::{CacheMap, CacheStale};
+
+    let (provider, exporter) = local_provider();
+    let m = make_meter(&provider, "oagw");
+
+    m.record_proxy_cache_stale_served(CacheMap::Alias, CacheStale::Error);
+    m.record_proxy_cache_stale_served(CacheMap::Alias, CacheStale::Error);
+    m.record_proxy_cache_stale_served(CacheMap::Route, CacheStale::Slow);
+    m.record_proxy_cache_stale_served(CacheMap::Route, CacheStale::RetryWindow);
+
+    provider.force_flush().unwrap();
+
+    assert_eq!(
+        counter_points(&exporter, "oagw_proxy_cache_stale_served"),
+        points(&[
+            ("cause=error,map=alias", 2),
+            ("cause=retry_window,map=route", 1),
+            ("cause=slow,map=route", 1),
+        ])
+    );
+}
+
+#[test]
 fn proxy_cache_publish_failures_count_changes_by_reason() {
     use crate::domain::ports::metric_labels::cache_publish_failure as reason;
 

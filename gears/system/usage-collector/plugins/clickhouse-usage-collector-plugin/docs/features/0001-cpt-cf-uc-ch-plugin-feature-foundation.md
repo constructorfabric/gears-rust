@@ -42,7 +42,7 @@ Establish the plugin's runtime substrate and its single public surface — the s
 
 ### 1.2 Purpose
 
-Foundation owns the cross-cutting plumbing every other feature builds on: the Plugin Module lifecycle, the SPI Storage Adapter (the host's only entry point and the owner of backend-error classification and keyset cursor encoding), the idempotent Schema Migrations (fixed 1-year TTL default in DDL plus `ensure_retention_ttl` reconcile), and the pure-persistence / SPI-conformance / TLS-credential-non-disclosure / vendor-isolation guarantees. It performs no record, query, catalog, retention, or metric behavior itself — it exposes the shape those features realize.
+Foundation owns the cross-cutting plumbing every other feature builds on: the Plugin Module lifecycle, the SPI Storage Adapter (the host's only entry point and the owner of backend-error classification and keyset cursor encoding), the idempotent Schema Migrations (one step list for both topologies, configured TTL in DDL plus `ensure_retention_ttl` reconcile), and the pure-persistence / SPI-conformance / TLS-credential-non-disclosure / vendor-isolation guarantees. It performs no record, query, catalog, retention, or metric behavior itself — it exposes the shape those features realize.
 
 **Requirements**: `cpt-cf-uc-ch-plugin-fr-schema-provisioning`, `cpt-cf-uc-ch-plugin-fr-error-classification`, `cpt-cf-uc-ch-plugin-nfr-spi-stability`, `cpt-cf-uc-ch-plugin-nfr-transport-security`, `cpt-cf-uc-ch-plugin-nfr-consistency-profile`
 
@@ -71,7 +71,7 @@ Foundation owns the cross-cutting plumbing every other feature builds on: the Pl
 - Record insert, dedup, compensation, and deactivation semantics — Feature 2 (`cpt-cf-uc-ch-plugin-feature-record-persistence`).
 - Aggregation and keyset raw-list execution and injection-safe translation — Feature 3 (`cpt-cf-uc-ch-plugin-feature-query-aggregation`).
 - Usage-type create / get / list, and the probe-delete-sweep delete protocol — Feature 4 (`cpt-cf-uc-ch-plugin-feature-usage-type-catalog`).
-- `TTL` clause ownership, config, and retention semantics — Feature 5 (`cpt-cf-uc-ch-plugin-feature-retention`); Foundation provides the `apply_migrations` / `ensure_retention_ttl` call sites.
+- `TTL` clause ownership, config, and retention semantics — Feature 5 (`cpt-cf-uc-ch-plugin-feature-retention`); Foundation provides the `run_migrations` / `ensure_retention_ttl` call sites.
 - The `uc_clickhouse_*` metric inventory — Feature 6 (`cpt-cf-uc-ch-plugin-feature-observability`).
 - ClickHouse cluster topology, sizing, HA — operator deployment guide.
 
@@ -96,11 +96,11 @@ Foundation owns the cross-cutting plumbing every other feature builds on: the Pl
 1. [ ] - `p1` - Host process starts with the ClickHouse plugin enabled; ToolKit invokes the gear `init` - `inst-ch-boot-1`
 2. [ ] - `p1` - Load and validate `ClickHousePluginConfig` (database URL, `allow_insecure_http`, `request_timeout_secs`, `async_insert`, `retention_period_secs`, vendor, priority) - `inst-ch-boot-2`
    1. [ ] - `p1` - **IF** the parsed `database_url` scheme is neither `http` nor `https` — **RETURN** gear initialization failure naming the unsupported scheme (the client speaks ClickHouse's HTTP interface only); independent of `allow_insecure_http` - `inst-ch-boot-2a`
-   2. [ ] - `p1` - **IF** `async_insert == true` AND `request_timeout_secs < 2` — **RETURN** gear initialization failure naming both values: `wait_for_async_insert = 1` blocks each `INSERT` until the server flushes its async-insert buffer (`async_insert_busy_timeout_ms`, adaptive 50-200ms), so the request budget must leave room for that wait plus the part commit; the remedy is to raise `request_timeout_secs` or set `async_insert = false` - `inst-ch-boot-2c`
+   2. [ ] - `p1` - **IF** `async_insert == true` AND `request_timeout_secs < 2` — **RETURN** gear initialization failure naming both values: `wait_for_async_insert = 1` blocks each `INSERT` until the server flushes its async-insert buffer (triggered by `async_insert_busy_timeout_ms`, adaptive 50-200ms) and commits the flushed block — on a cluster, on every shard it touches — so the request budget must leave room for all of that; the remedy is to raise `request_timeout_secs` or set `async_insert = false` - `inst-ch-boot-2c`
 3. [ ] - `p1` - **IF** the parsed (lowercase-normalized) `database_url` scheme is plaintext `http` AND `allow_insecure_http == false` - `inst-ch-boot-3`
    1. [ ] - `p1` - **RETURN** gear initialization failure: TLS enforcement violation - `inst-ch-boot-3a`
 4. [ ] - `p1` - Build the `clickhouse::Client` via `build_client` / `ParsedEndpoint` — parse URL into bare base URL + user/password/database, emit `tracing::warn!` if plaintext - `inst-ch-boot-4`
-5. [ ] - `p1` - Run `apply_migrations` (idempotent `CREATE TABLE IF NOT EXISTS` with fixed 1-year TTL default), then `ensure_retention_ttl` to reconcile `retention_period_secs`, then `ensure_insert_dedup_window` to retrofit `non_replicated_deduplication_window` onto a pre-existing table (schema migrations first — fail fast on schema errors) - `inst-ch-boot-5`
+5. [ ] - `p1` - Run `run_migrations`: the unrecorded versioned steps (`m0001_init`, idempotent `CREATE TABLE IF NOT EXISTS` rendered for the topology with the configured TTL; `m0002_insert_dedup_window`, retrofitting `non_replicated_deduplication_window` onto a pre-existing single-node table), then `ensure_retention_ttl` to reconcile `retention_period_secs` (schema migrations first — fail fast on schema errors) - `inst-ch-boot-5`
 6. [ ] - `p1` - **IF** provisioning fails - `inst-ch-boot-7`
    1. [ ] - `p1` - **RETURN** gear initialization failure without registering - `inst-ch-boot-7a`
 7. [ ] - `p1` - Build the `PluginV1<UsageCollectorPluginSpecV1>` registration and publish to `types-registry` - `inst-ch-boot-8`
@@ -119,9 +119,9 @@ Foundation owns the cross-cutting plumbing every other feature builds on: the Pl
 
 **Steps**:
 
-1. [ ] - `p1` - Strip `--` comment lines from the embedded `migrations/0001_init.sql` text to prevent false statement splits on semicolons inside comments - `inst-ch-prov-1`
-2. [ ] - `p1` - Split the remaining text into individual statements, respecting single-quoted string literals - `inst-ch-prov-2`
-3. [ ] - `p1` - For each statement: execute via the ClickHouse client; a `CREATE TABLE IF NOT EXISTS` re-runs as a no-op when the table already exists (DDL bakes a fixed 1-year TTL default) - `inst-ch-prov-3`
+1. [ ] - `p1` - Each migration step declares its logical tables in code (`migrator/mNNNN_*.rs`); the migrator renders them for the topology (`migrator/table.rs`, built with the `ddl` builder) - `inst-ch-prov-1`
+2. [ ] - `p1` - Take the rendered statements as a list, one `CREATE TABLE` per entry, so no SQL text is parsed or split - `inst-ch-prov-2`
+3. [ ] - `p1` - For each statement: execute via the ClickHouse client; a `CREATE TABLE IF NOT EXISTS` re-runs as a no-op when the table already exists (DDL bakes the configured TTL) - `inst-ch-prov-3`
 4. [ ] - `p1` - Call `ensure_retention_ttl` to reconcile the live `usage_records` TTL with `retention_period_secs` - `inst-ch-prov-4`
 5. [ ] - `p1` - **IF** any statement or TTL reconcile returns an error - `inst-ch-prov-5`
    1. [ ] - `p1` - **RETURN** provisioning failure; caller fails `init` - `inst-ch-prov-5a`
@@ -162,9 +162,9 @@ Foundation owns the cross-cutting plumbing every other feature builds on: the Pl
 2. [ ] - `p2` - Build `clickhouse::Client::default().with_url(base_url).with_user(user).with_password(password).with_database(database)` - `inst-ch-client-2`
 3. [ ] - `p2` - Apply `request_timeout_secs` as the ClickHouse server settings `send_timeout` / `receive_timeout`, which bound the server's own socket handling - `inst-ch-client-3`
    1. [ ] - `p2` - Derive a client-side per-request deadline of `request_timeout_secs + 5s` and bound every individual ClickHouse await with it, so a connection that is accepted and then never answered — which the server settings cannot bound because they never reach a server — fails as `Transient` instead of hanging; the 5s margin keeps the server's own descriptive timeout first when the server is responsive - `inst-ch-client-3a`
-4. [ ] - `p2` - **IF** `async_insert == true` — apply `async_insert = 1` and `wait_for_async_insert = 1` **per `INSERT` statement** (`Insert::with_setting`) for single-row `usage_records` writes, never on the shared client, which also serves every `SELECT` - `inst-ch-client-3b`
+4. [ ] - `p2` - **IF** `async_insert == true` — apply `async_insert = 1` and `wait_for_async_insert = 1` **per `INSERT` statement** (`Insert::with_setting`) for the record-create `usage_records` writes — single-row and batch, on a single node and on a cluster alike — never on the shared client, which also serves every `SELECT` - `inst-ch-client-3b`
    1. [ ] - `p2` - Pin `wait_for_async_insert` to `1`; it **MUST NOT** be configurable or set to `0`, because `0` acknowledges an uncommitted record and breaks `create_usage_record`'s dependence on its own dedup pre-read observing a prior insert - `inst-ch-client-3c`
-   2. [ ] - `p2` - Keep multi-row `usage_records` `INSERT`s (`create_usage_records`, the deactivation cascade) and all `usage_type_catalog` writes **synchronous** regardless of `async_insert`: the async buffer does not guarantee that one statement's rows land in a single commit, which the cascade's marker atomicity and the whole-batch write both depend on - `inst-ch-client-3d`
+   2. [ ] - `p2` - Keep deactivation-marker `INSERT`s and all `usage_type_catalog` writes **synchronous** regardless of `async_insert`, sending `async_insert = 0` explicitly so a server settings profile cannot buffer them: the cascade's marker atomicity (per partition) depends on one statement committing its rows together, which a shared buffer flushing on its own schedule does not give - `inst-ch-client-3d`
 5. [ ] - `p2` - **IF** `allow_insecure_http == true` AND scheme is `http://` — emit `tracing::warn!` so operators have a per-startup signal that TLS is disabled - `inst-ch-client-4`
 6. [ ] - `p2` - **RETURN** the configured client handle - `inst-ch-client-5`
 
@@ -178,7 +178,7 @@ Not applicable — Foundation establishes the schema, adapter, and registration 
 
 - [x] `p1` - **ID**: `cpt-cf-uc-ch-plugin-dod-foundation-module`
 
-The system **MUST** implement the `#[toolkit::gear]` `init` that loads and validates `ClickHousePluginConfig`, builds the ClickHouse client via `build_client` / `ParsedEndpoint`, invokes `apply_migrations`, then `ensure_retention_ttl`, then `ensure_insert_dedup_window`, and performs GTS publication plus ClientHub scoped registration. The module **MUST NOT** decide whether it is the active backend and **MUST NOT** implement SPI methods directly.
+The system **MUST** implement the `#[toolkit::gear]` `init` that loads and validates `ClickHousePluginConfig`, builds the ClickHouse client via `build_client` / `ParsedEndpoint`, invokes `run_migrations`, then `ensure_retention_ttl`, and performs GTS publication plus ClientHub scoped registration. The module **MUST NOT** decide whether it is the active backend and **MUST NOT** implement SPI methods directly.
 
 **Implements**: `cpt-cf-uc-ch-plugin-flow-foundation-bind-startup`, `cpt-cf-uc-ch-plugin-algo-foundation-schema-provisioning`
 
@@ -205,7 +205,7 @@ The system **MUST** implement the single `UsageCollectorPluginV1` `StorageAdapte
 
 - [x] `p1` - **ID**: `cpt-cf-uc-ch-plugin-dod-foundation-migrations`
 
-The system **MUST** run `apply_migrations` at `init`, executing each `CREATE TABLE IF NOT EXISTS` statement idempotently (with a fixed 1-year TTL default on `usage_records`), then run `ensure_retention_ttl` to reconcile `retention_period_secs`. The DDL runner **MUST** strip `--` comment lines before splitting statements, split while respecting single-quoted string literals, and execute each statement as a no-op when the object already exists. No external migration-tracking table or framework is used.
+The system **MUST** run `run_migrations` at `init`, executing every migration step not yet recorded in the `usage_collector_migrations` tracking table, in order, and recording each after it succeeds; every step **MUST** be idempotent and safe to run concurrently (there is no lock), and `m0001_init` executes each `CREATE TABLE IF NOT EXISTS` statement idempotently (with the configured TTL on `usage_records`). It then runs `ensure_retention_ttl` to reconcile `retention_period_secs`. The DDL **MUST** be built in code (`schema` / `ddl`) and executed one statement at a time, each a no-op when the object already exists.
 
 **Implements**: `cpt-cf-uc-ch-plugin-algo-foundation-schema-provisioning`
 
@@ -241,7 +241,7 @@ The system **MUST** reject a plaintext `http://` `database_url` at config valida
 
 - [x] `p2` - **ID**: `cpt-cf-uc-ch-plugin-dod-foundation-consistency-profile`
 
-The system **MUST** document, per deployment topology, the plugin's consistency profile: single-node deployments provide effectively immediate read-after-write; replicated deployments are bounded by ClickHouse replication lag (typically sub-second) and require operator-configured `insert_quorum` for strict cross-replica read-your-writes. The profile **MUST** state that every read path resolves `ReplacingMergeTree` versions in SQL (rather than with the `FINAL` modifier) and that the aggregation-latency NFR budget is measured with that resolution included.
+The system **MUST** document, per deployment topology, the plugin's consistency profile: single-node deployments provide effectively immediate read-after-write; replicated deployments are bounded by ClickHouse replication lag (typically sub-second) and require operator-configured `insert_quorum` for strict cross-replica read-your-writes. The profile **MUST** state that every read path resolves `ReplacingMergeTree` versions before it filters, pages or aggregates — point reads in SQL, range reads with `FINAL` — and that the aggregation-latency NFR budget is measured with that resolution included.
 
 **Constraints**: `cpt-cf-uc-ch-plugin-nfr-consistency-profile`
 
@@ -258,7 +258,7 @@ The system **MUST** keep all ClickHouse-specific SQL, schema, and client depende
 ## 6. Acceptance Criteria
 
 - [x] The crate implements the full `UsageCollectorPluginV1` SPI at build time (compile-time SPI conformance), with no dependency on the host `usage-collector` crate.
-- [x] `init` loads config, builds the ClickHouse client via `ParsedEndpoint`, provisions the schema, reconciles `retention_period_secs` via `ensure_retention_ttl` and the insert dedup window via `ensure_insert_dedup_window`, and registers under a GTS instance identifier carrying the configured vendor and priority; the plugin does not self-select as the active backend.
+- [x] `init` loads config, builds the ClickHouse client via `ParsedEndpoint`, provisions the schema, reconciles `retention_period_secs` via `ensure_retention_ttl`, retrofits the insert dedup window through the `m0002_insert_dedup_window` migration step, and registers under a GTS instance identifier carrying the configured vendor and priority; the plugin does not self-select as the active backend.
 - [x] Re-running `init` on restart re-provisions the schema as a no-op (idempotent), with no error and no duplicate objects.
 - [x] A plaintext `http://` URL is refused at config validation time unless `allow_insecure_http = true` is set; the DSN and its embedded credentials never appear in logs, error messages, or `Debug` output.
 - [x] The TLS gate matches the parsed, lowercase-normalized scheme, so a mixed-case `HTTP://` URL is refused too; a `database_url` whose scheme is neither `http` nor `https` is refused at the same point even when `allow_insecure_http = true`.

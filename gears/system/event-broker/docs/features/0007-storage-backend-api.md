@@ -237,7 +237,8 @@ pub trait HeadWatch: Send + Sync {
 ```rust
 pub struct TopicSpec {
     pub topic: GtsInstanceId,
-    /// From the topic's resolved settings; the backend partitions keys into this many.
+    /// The count to create the log with; the backend partitions keys into this many.
+    /// For a log the backend already holds, it is the count the backend reported when it provisioned that log.
     pub partitions: u32,
     /// From the topic's resolved settings; the backend enforces it on its own schedule.
     pub retention: Retention,
@@ -258,6 +259,8 @@ pub enum Replacing {
     Nothing,
     /// The attempt being replaced.
     Log(LogId),
+    /// The log is already held under `new`: apply the settings only, never create.
+    Held,
 }
 
 pub enum Provisioning {
@@ -267,9 +270,9 @@ pub enum Provisioning {
 }
 ```
 
-- `provision` as feature 0006 §2.3. Compare-and-set, for either `Replacing` variant: accepted when nothing is stored for the topic, when the stored id is the one `Log` names, or when it is already `new`; any other stored id is `LogConflict`.
+- `provision` as feature 0006 §2.3. Compare-and-set, for every `Replacing` variant: accepted when the stored id is already `new`, or when it is the one `Log` names; with nothing stored for the topic, `Nothing` and `Log` are accepted and the backend creates the log, while `Held` is `NotProvisioned` and the backend creates nothing; any other stored id is `LogConflict`.
 - The partition count travels with the topic, and `Ready` reports the count the backend holds - a pre-existing log, a Kafka topic created elsewhere, may hold another. The binding records it (feature 0006 §2.2), and ingest and delivery use the recorded count. A configured count that differs from the recorded one does not take effect: the recorded count stays in force and the mismatch is logged at every provisioning check; changing a provisioned topic's count is out of scope (§7).
-- **The bounds travel with the topic.** `provision` hands the backend the topic's retention; when the resolved settings change, the provisioning worker calls `provision` again with the new `TopicSpec` and the same log id (`LogClaim { replacing: Log(L), new: L }`, which the compare-and-set accepts as the same attempt continued), and the backend adopts the new bounds (feature 0006 §4.1).
+- **The bounds travel with the topic.** `provision` hands the backend the topic's retention; when the resolved retention changes or its record is unconfirmed, the specification manager calls `provision` again with the new retention, the recorded partition count and the same log id (`LogClaim { replacing: Held, new: L }`); a backend holding nothing answers `NotProvisioned` and creates nothing, and one holding `L` adopts the new bounds (feature 0006 §4.1).
 - **The backend enforces retention itself.** It removes events past a bound on its own schedule, with its own workers; the gear runs no retention job and never calls into a backend to sweep. Age is the event's `sequence_time`, when the backend stored it, never its `occurred_at`: the producer sets that, and a malfunctioning one may set any time. A backend that runs in several processes (every ingest and delivery process builds every registry entry) coordinates its workers on its own medium.
 - **The contract fixes what is never removed, not how soon.** An event within both bounds is kept, and removal takes the oldest events first, so what remains is a suffix of what was stored. Everything else is the backend's and documented with it: whether it removes single events or whole segments, how often it looks, and how long an event may outlive its bound. A segment store, for one, removes a segment only when all of it is past a bound, keeps at least `max_bytes`, and keeps a segment still being written.
 - `query` keeps its existing meaning.
@@ -396,7 +399,7 @@ match backend.append(AppendRequest(fence, topic, [KeyedEvent(key, event)], flush
     Err(any other)        -> Retry                                # never dead-lettered; alerted
 ```
 
-- **Outbox message.** One event per message (`payload_type` `evbk.ingest.v2`); batching is the outbox's own (its leased batch handler), not the payload's. The fence key packs the group's `outbox_id` with `OutboxMessage.partition_id` (a row id, not an index), and `seq` is `OutboxMessage.seq`, both as delivered; a backend sees only the opaque key.
+- **Outbox message.** One event per message (`payload_type` `application/vnd.event-broker.ingest-event+json;version=1`); batching is the outbox's own (its leased batch handler), not the payload's. The fence key packs the group's `outbox_id` with `OutboxMessage.partition_id` (a row id, not an index), and `seq` is `OutboxMessage.seq`, both as delivered; a backend sees only the opaque key.
 
   ```rust
   struct IngestPayload {
@@ -409,7 +412,7 @@ match backend.append(AppendRequest(fence, topic, [KeyedEvent(key, event)], flush
 - **Outbox groups.** Each topic drains through its outbox group (feature 0005 §2.5), a toolkit-db queue with its own partitions; the ingest partition is `murmur3("{topic}:{key}") % group.partitions`: events of one key reach the backend in publish order, and the backend maps that key to one partition. Ingest never knows the backend partition.
 - **Head-of-line blocking stays inside a group.** A backend answering `Retry` stalls the topics sharing its ingest partitions in that group; a topic that needs isolation gets its own group.
 - **`NotProvisioned` and `LogConflict` at append retry endlessly** for the MVP. They mean a route change for a provisioned topic, or a backend that lost the topic; the operator reaction is ADR-0008's.
-- **No dead-lettering.** Every `append` error is retried, endlessly, and so is a payload that does not decode and a topic the registry does not hold; nothing an ingest outbox holds is dead-lettered or dropped. A message that keeps failing stalls its outbox partition, which the alerts below surface: retries per registry entry and outbox partition (`evbk_ingest_append_retries_total{backend, outbox, partition, error}`; `error` is the `BackendError` kind in snake case, `undecodable_payload` or `unregistered_topic`, and `backend` is `none` when no backend was resolved), and the age of the message each outbox partition is handling (`evbk_ingest_outbox_oldest_age_seconds{outbox, partition}`, 0 once it is acknowledged), alerted past a threshold.
+- **No dead-lettering.** Every `append` error is retried, endlessly, and so is a payload that does not decode, a topic the registry does not hold and a topic lookup that cannot be read; nothing an ingest outbox holds is dead-lettered or dropped. A message that keeps failing stalls its outbox partition, which the alerts below surface: retries per registry entry and outbox partition (`evbk_ingest_append_retries_total{backend, outbox, partition, error}`; `error` is the `BackendError` kind in snake case, `undecodable_payload`, `unregistered_topic` or `specification_unavailable` (the topic lookup could not be read), and `backend` is `none` when no backend was resolved), and the age of the message each outbox partition is handling (`evbk_ingest_outbox_oldest_age_seconds{outbox, partition}`, 0 once it is acknowledged), alerted past a threshold.
 - **Declared dedup.** Ingest logs every registry entry's `dedup()` at startup, `AtLeastOnce` as a warning.
 - **Stored publish.** `Prefer: wait=N` (RFC 7240) asks for an answer once the batch is stored. The trace rides in EB's own outbox payload, since `OutboxMessage` does not carry the trace it was enqueued under (`libs/toolkit-db/src/outbox/handler.rs:12`). A timeout answers `202`, which is retry-safe for chained and monotonic producers. No answer carries a sequence.
 
@@ -474,8 +477,8 @@ Every plugin, whatever its medium:
 |---|---|---|---|
 | Transactional store: events, counters and fence state commit together | `Heads` | `Poll`, or `Native` where the store notifies | `Fenced`: the fence advances in the transaction that stores the events |
 | Partitioned log with transactions across its partitions | `Heads` | `Native` | `Fenced`: a fence record committed with the events |
-| Log with per-producer idempotence, no multi-record transactions | `Heads` or `Accepted` | `Native` | `ProducerSequence`: one producer identity per fence key per target stream |
-| Create-once object or file store | `Heads` or `Accepted` | `Poll` | `CreateOnce`: one object per fence, created only if absent |
+| Log with per-producer idempotence, no multi-record transactions | `Heads` (Sync); `Heads` or `Accepted` (Async) | `Native` | `ProducerSequence`: one producer identity per fence key per target stream |
+| Create-once object or file store | `Heads` (Sync); `Heads` or `Accepted` (Async) | `Poll` | `CreateOnce`: one object per fence, created only if absent |
 | None of the above | as it can | as it can | `AtLeastOnce` |
 
 ## 6. Open Items
@@ -529,7 +532,7 @@ Every plugin, whatever its medium:
 - **watch**: the current head comes first; `Native` yields heads only for the named partitions; `Poll` adapter yields a head per change of `resolve(Latest)` and none without one; an error item leads to a resubscription.
 - **head watch**: one watch per topic over its live partitions; a partition going live reopens it over the new set; a failed watch is reopened after its backoff; a lower head never moves a known one back.
 - **loader**: a tail at the known head issues no fetch; a head moving above it is fetched before the tick; a round that only failed waits out the tick.
-- **ingest handler**: stored-wait payload -> `Flush::Sync`; otherwise `Flush::Async`; any append error, an undecodable payload and an unregistered topic -> `Retry`, counted in `evbk_ingest_append_retries_total`.
+- **ingest handler**: stored-wait payload -> `Flush::Sync`; otherwise `Flush::Async`; any append error, an undecodable payload, an unregistered topic and an unreadable topic lookup -> `Retry`, counted in `evbk_ingest_append_retries_total`.
 - **ingest partition**: `murmur3("{topic}:{key}") % group.partitions` is stable for a given topic and key.
 - **dedup** (per plugin): plain retry -> `Duplicate`; a late copy after a later fence -> nothing stored; gaps in `seq` accepted; distinct fence keys kept apart, however few bits they differ in; state survives a restart.
 

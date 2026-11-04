@@ -20,12 +20,12 @@
 //! - no `tenant_id` label anywhere on the surface
 //!
 //! The proxy configuration cache's labels are typed ([`CacheMap`],
-//! [`CacheLookup`], [`CacheEviction`]) where a method takes two, so they
+//! [`CacheLookup`], [`CacheEviction`], [`CacheStale`]) where a method takes two, so they
 //! cannot be swapped; the rest are `&'static str` constants from
 //! [`super::metric_labels`], so the hot path never copies a label.
 use toolkit_macros::domain_model;
 
-use super::metric_labels::{CacheEviction, CacheLookup, CacheMap};
+use super::metric_labels::{CacheEviction, CacheLookup, CacheMap, CacheStale};
 
 /// Output port for recording OAGW operational metrics.
 pub trait OagwMetricsPort: Send + Sync {
@@ -106,6 +106,13 @@ pub trait OagwMetricsPort: Send + Sync {
     /// [`super::metric_labels::provisioning_outcome`].
     fn record_registry_provisioning_run(&self, outcome: &str);
 
+    /// `{prefix}_credentials_withheld_total` — counter
+    ///
+    /// An ancestor's auth or headers not sent because the resolved upstream
+    /// serves the alias on endpoints their owner did not configure, by
+    /// `outcome` from [`super::metric_labels::withheld_outcome`].
+    fn record_credential_withheld(&self, host: &str, outcome: &'static str);
+
     /// `{prefix}_proxy_cache_lookups_total` — counter
     ///
     /// One key looked up in the proxy configuration cache section `map`
@@ -147,6 +154,12 @@ pub trait OagwMetricsPort: Send + Sync {
     /// change detached the load while it ran.
     fn record_proxy_cache_load_discarded(&self, map: CacheMap);
 
+    /// `{prefix}_proxy_cache_stale_served_total` — counter
+    ///
+    /// One key of section `map` answered with a stale entry instead of its
+    /// reload's result, by `cause` ([`CacheStale`]).
+    fn record_proxy_cache_stale_served(&self, map: CacheMap, cause: CacheStale);
+
     /// `{prefix}_proxy_cache_publish_failures_total` — counter
     ///
     /// `count` configuration changes that did not reach the cluster change
@@ -182,11 +195,13 @@ impl OagwMetricsPort for NoopMetrics {
     fn record_rate_limit_sweep(&self, _: u64, _: u64) {}
     fn record_registry_provisioning_failure(&self, _: &str, _: &str) {}
     fn record_registry_provisioning_run(&self, _: &str) {}
+    fn record_credential_withheld(&self, _: &str, _: &'static str) {}
     fn record_proxy_cache_lookup(&self, _: CacheMap, _: CacheLookup) {}
     fn record_proxy_cache_entries(&self, _: CacheMap, _: u64) {}
     fn record_proxy_cache_evictions(&self, _: CacheMap, _: CacheEviction, _: u64) {}
     fn record_proxy_cache_change(&self, _: &str) {}
     fn record_proxy_cache_flush(&self, _: &str) {}
     fn record_proxy_cache_load_discarded(&self, _: CacheMap) {}
+    fn record_proxy_cache_stale_served(&self, _: CacheMap, _: CacheStale) {}
     fn record_proxy_cache_publish_failures(&self, _: &str, _: u64) {}
 }

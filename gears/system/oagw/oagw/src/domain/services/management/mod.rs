@@ -7,6 +7,7 @@ mod merge;
 mod registry;
 mod resolution;
 mod validation;
+mod withheld;
 
 use std::sync::Arc;
 
@@ -18,6 +19,7 @@ use crate::domain::model::{
     CreateRouteRequest, CreateUpstreamRequest, ListQuery, ManagedBy, Route, UpdateRouteRequest,
     UpdateUpstreamRequest, Upstream,
 };
+use crate::domain::ports::OagwMetricsPort;
 use crate::domain::repo::{
     ProxyConfigReader, RepositoryError, RouteRepository, Tags, UpstreamRepository,
 };
@@ -31,8 +33,10 @@ use alias::{
     enforce_alias_create_derived, enforce_alias_create_with, enforce_alias_update_derived,
     enforce_alias_update_with, normalize_alias,
 };
-use ancestor::closest_ancestor_upstream;
-use bind::{BindOverrides, validate_ancestor_bind, validate_secret_ref_accessible};
+use ancestor::ancestor_upstreams;
+use bind::{
+    BindOverrides, enforced_auth_server, validate_ancestor_bind, validate_secret_ref_accessible,
+};
 use canonical::canonical_tags;
 pub(crate) use canonical::{route_drift, upstream_drift};
 #[cfg(test)]
@@ -73,6 +77,10 @@ pub(crate) struct ControlPlaneServiceImpl {
     credstore: Arc<dyn CredStoreClientV1>,
     ssrf_guard: Arc<SsrfGuard>,
     proxy_reader: Option<Arc<dyn ProxyConfigReader>>,
+    /// Counts withheld ancestor credentials on the proxy path; none in tests
+    /// that do not set it.
+    metrics: Option<Arc<dyn OagwMetricsPort>>,
+    withheld_log: withheld::WithheldLog,
 }
 
 impl ControlPlaneServiceImpl {
@@ -97,7 +105,16 @@ impl ControlPlaneServiceImpl {
             credstore,
             ssrf_guard,
             proxy_reader,
+            metrics: None,
+            withheld_log: withheld::WithheldLog::default(),
         }
+    }
+
+    /// Count withheld ancestor credentials (`credentials_withheld_total`).
+    #[must_use]
+    pub(crate) fn with_metrics(mut self, metrics: Arc<dyn OagwMetricsPort>) -> Self {
+        self.metrics = Some(metrics);
+        self
     }
 }
 
@@ -284,12 +301,15 @@ impl ControlPlaneServiceImpl {
 
         // Check if an ancestor tenant has an upstream with this alias.
         // If so, this is a "bind" operation requiring ancestor bind validation.
-        let ancestor = closest_ancestor_upstream(&*self.upstreams, &tenant_chain, &alias).await?;
+        let ancestors = ancestor_upstreams(&*self.upstreams, &tenant_chain, &alias).await?;
+        let ancestor = ancestors.first().cloned();
         validate_ancestor_bind(
             ctx,
             &self.policy_enforcer,
             ancestor.as_ref(),
+            enforced_auth_server(&ancestors),
             &BindOverrides {
+                server: &req.server,
                 auth: req.auth.as_ref(),
                 rate_limit: req.rate_limit.as_ref(),
                 plugins: req.plugins.as_ref(),
@@ -406,13 +426,16 @@ impl ControlPlaneServiceImpl {
         // allocation against the final state. Even None fields are meaningful —
         // setting rate_limit to None removes the allocation.
         let tenant_chain = self.build_tenant_chain(ctx).await?;
-        let ancestor =
-            closest_ancestor_upstream(&*self.upstreams, &tenant_chain, &existing.alias).await?;
+        let ancestors =
+            ancestor_upstreams(&*self.upstreams, &tenant_chain, &existing.alias).await?;
+        let ancestor = ancestors.first().cloned();
         validate_ancestor_bind(
             ctx,
             &self.policy_enforcer,
             ancestor.as_ref(),
+            enforced_auth_server(&ancestors),
             &BindOverrides {
+                server: &existing.server,
                 auth: req.auth.as_ref(),
                 rate_limit: req.rate_limit.as_ref(),
                 plugins: req.plugins.as_ref(),

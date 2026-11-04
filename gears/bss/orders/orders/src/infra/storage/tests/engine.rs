@@ -1582,14 +1582,26 @@ async fn a_prefetch_store_failure_writes_nothing_and_logs_one_warn() {
     let order = seed(&t, &engine, "seed-pf-2", S::Draft, None).await;
     let before = t.order_row(order).await;
     let (outbox, audits) = (t.outbox().await, t.audits(order).await);
+    // Commit NOLOGIN before killing sessions. In one SQL batch the role change remains
+    // uncommitted while termination runs, letting the pool reconnect and escape the kill.
+    t.env
+        .pg
+        .sql("ALTER ROLE test_runtime NOLOGIN")
+        .await
+        .unwrap();
     t.env
         .pg
         .sql(
-            "ALTER ROLE test_runtime NOLOGIN; \
-             SELECT pg_terminate_backend(pid, 5000) FROM pg_stat_activity WHERE usename = 'test_runtime'",
+            "SELECT pg_terminate_backend(pid, 5000) FROM pg_stat_activity WHERE usename = 'test_runtime'",
         )
         .await
         .unwrap();
+    assert_eq!(
+        t.n("SELECT count(*) AS n FROM pg_stat_activity WHERE usename = 'test_runtime'")
+            .await,
+        0,
+        "the prefetch failure requires all runtime sessions to be gone"
+    );
     let err = engine
         .transition(
             &buyer(),

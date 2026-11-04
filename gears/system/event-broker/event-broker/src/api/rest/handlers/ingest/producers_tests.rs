@@ -498,6 +498,161 @@ async fn reset_producer_not_owner_returns_403() {
     );
 }
 
+// -- reset audit record -----------------------------------------------------
+//
+// `docs/openapi.yaml` promises an audit record per reset: one
+// `event_broker.events` record of `kind = "producer.chain_reset"` per
+// successful reset, whichever way in (REST or the in-process broker), and none
+// for a reset that fails. Each test reads only the records of its own span, and
+// compares a record from its message to the end of the line - every field it
+// carries, in order.
+
+/// The `event_broker.events` records this test emitted, each from the message
+/// to the end of the line (the timestamp and level ahead of it vary).
+fn audit_records(lines: &[&str]) -> Vec<String> {
+    lines
+        .iter()
+        .filter_map(|line| line.split_once("event_broker.events: "))
+        .map(|(_, record)| record.to_owned())
+        .collect()
+}
+
+#[tokio::test]
+#[tracing_test::traced_test]
+async fn reset_producer_over_rest_emits_one_audit_record_naming_the_topic() {
+    let harness = EventBrokerHarness::builder().build().await;
+    let register = harness
+        .api_v1()
+        .post_producers()
+        .with_body(Json(&json!({ "mode": "chained", "client_agent": "a" })))
+        .send()
+        .await;
+    let id = register.json()["id"].as_str().unwrap().to_owned();
+    let ctx = harness.security_context();
+
+    harness
+        .api_v1()
+        .post_producer_reset(&id)
+        .with_body(Json(
+            &json!({ "topic": "gts.cf.core.events.topic.v1~x.eb.t1.topic_a.v1" }),
+        ))
+        .send()
+        .await
+        .assert_status(200);
+
+    let expected = format!(
+        "producer chain reset kind=\"producer.chain_reset\" actor_subject_id={} \
+         actor_subject_type=\"anonymous\" actor_tenant_id={} producer_id={id} \
+         scope=\"topic\" topic=\"gts.cf.core.events.topic.v1~x.eb.t1.topic_a.v1\"",
+        ctx.subject_id(),
+        ctx.subject_tenant_id(),
+    );
+    logs_assert(|lines| {
+        let records = audit_records(lines);
+        if records == [expected.clone()] {
+            Ok(())
+        } else {
+            Err(format!("expected exactly [{expected}], got {records:?}"))
+        }
+    });
+}
+
+#[tokio::test]
+#[tracing_test::traced_test]
+async fn reset_producer_chain_in_process_emits_one_audit_record_for_all_topics() {
+    let harness = EventBrokerHarness::builder().build().await;
+    let ctx = SecurityContext::builder()
+        .subject_tenant_id(Uuid::new_v4())
+        .subject_id(Uuid::new_v4())
+        .subject_type("gts.x.eb.t1.operator.v1~")
+        .build()
+        .expect("valid security context");
+    let registration = harness
+        .ingest()
+        .register_producer(
+            &ctx,
+            ProducerRegistrationInput {
+                mode: ProducerMode::Chained,
+                client_agent: "operator-agent".to_owned(),
+            },
+        )
+        .await
+        .expect("registration must succeed");
+
+    harness
+        .broker()
+        .reset_producer_chain(
+            &ctx,
+            event_broker_sdk::ids::ProducerId(registration.id),
+            event_broker_sdk::models::ResetScope::AllTopics,
+        )
+        .await
+        .expect("the owner's reset must succeed");
+
+    let expected = format!(
+        "producer chain reset kind=\"producer.chain_reset\" actor_subject_id={} \
+         actor_subject_type=\"gts.x.eb.t1.operator.v1~\" actor_tenant_id={} \
+         producer_id={} scope=\"all\" topic=\"*\"",
+        ctx.subject_id(),
+        ctx.subject_tenant_id(),
+        registration.id,
+    );
+    logs_assert(|lines| {
+        let records = audit_records(lines);
+        if records == [expected.clone()] {
+            Ok(())
+        } else {
+            Err(format!("expected exactly [{expected}], got {records:?}"))
+        }
+    });
+}
+
+#[tokio::test]
+#[tracing_test::traced_test]
+async fn a_failed_reset_emits_no_audit_record() {
+    let harness = EventBrokerHarness::builder().build().await;
+    let other_ctx = SecurityContext::builder()
+        .subject_tenant_id(Uuid::new_v4())
+        .subject_id(Uuid::new_v4())
+        .build()
+        .expect("valid security context");
+    let not_owned = harness
+        .ingest()
+        .register_producer(
+            &other_ctx,
+            ProducerRegistrationInput {
+                mode: ProducerMode::Chained,
+                client_agent: "other-agent".to_owned(),
+            },
+        )
+        .await
+        .expect("registration must succeed");
+
+    harness
+        .api_v1()
+        .post_producer_reset(&Uuid::new_v4().to_string())
+        .send()
+        .await
+        .assert_status(404);
+    harness
+        .api_v1()
+        .post_producer_reset(&not_owned.id.to_string())
+        .send()
+        .await
+        .assert_status(403);
+
+    logs_assert(|lines| {
+        let records = audit_records(lines);
+        if records.is_empty() {
+            Ok(())
+        } else {
+            Err(format!(
+                "a failed reset must emit no audit record, got {records:?}"
+            ))
+        }
+    });
+}
+
 // -- client_agent encoding and length -------------------------------------
 //
 // This is the one `client_agent` that persists - into a column documented as

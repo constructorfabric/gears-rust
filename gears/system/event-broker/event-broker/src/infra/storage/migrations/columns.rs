@@ -1,10 +1,11 @@
 //! Column types and index creation shared by this gear's migrations, so every
 //! table maps to `SQLite`, `PostgreSQL` and `MySQL`/`MariaDB` the same way.
 //!
-//! UUIDs and timestamps use the engine's native types, because the entities
-//! bind them as `Uuid` and `DateTime<Utc>` (secure scoping binds tenant
-//! values as `Uuid`). Strings are sized `VARCHAR`s; only an unbounded
-//! document is text.
+//! UUIDs use each engine's UUID type - `uuid` on `PostgreSQL`, `binary(16)` on
+//! `MySQL`/`MariaDB`, `uuid_text` on `SQLite` - and timestamps use the types
+//! [`timestamp`] picks, because the entities bind them as `Uuid` and
+//! `DateTime<Utc>` (secure scoping binds tenant values as `Uuid`). Strings are
+//! sized `VARCHAR`s; only an unbounded document is text.
 
 use sea_orm_migration::prelude::*;
 use sea_orm_migration::sea_orm::DbBackend;
@@ -32,13 +33,16 @@ pub(super) fn gts_id<T: IntoIden>(manager: &SchemaManager<'_>, col: T) -> Column
     def.not_null().to_owned()
 }
 
-/// A UTC timestamp with microseconds. On `MySQL` a timestamp with time zone
-/// becomes `timestamp`, which keeps whole seconds, so it is `timestamp(6)`
-/// there; the driver sets the session time zone to UTC.
+/// A UTC timestamp with microseconds. On `MySQL` it is `datetime(6)`: a
+/// timestamp with time zone would become `timestamp`, which keeps whole
+/// seconds, ends in 2038, and on `MariaDB` before 10.10 gains `ON UPDATE
+/// CURRENT_TIMESTAMP` as a table's first `NOT NULL` timestamp. A `datetime`
+/// is stored as written, never converted by the session time zone; the entity
+/// binds and reads it as UTC.
 pub(super) fn timestamp<T: IntoIden>(manager: &SchemaManager<'_>, col: T) -> ColumnDef {
     let mut def = ColumnDef::new(col);
     if is_mysql(manager) {
-        def.custom(Alias::new("timestamp(6)"));
+        def.custom(Alias::new("datetime(6)"));
     } else {
         def.timestamp_with_time_zone();
     }

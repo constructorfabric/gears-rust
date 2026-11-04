@@ -11,4 +11,4 @@ pub mod specification_refresh;
 
 pub use ingest_outbox::IngestOutboxHandler;
 pub use reaper::Reaper;
-pub use specification_refresh::SpecificationRefreshWorker;
+pub use specification_refresh::{ProvisioningWait, SpecificationRefreshWorker};

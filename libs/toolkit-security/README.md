@@ -17,8 +17,9 @@ The `cf-gears-toolkit-security` crate provides:
 Use `crypto::hash::Sha256`, `crypto::mac::HmacSha256`, `crypto::rng::fill`,
 `crypto::constant_time_eq` and `crypto::signature` instead of backend crates.
 The optional `jwt` feature provides `jwt::decode`, preserving jsonwebtoken
-claim validation after verifying signatures through the facade. The explicit TLS
-adapter is `tls::configured_provider`.
+claim validation after verifying signatures through the facade, and `jwt::encode`,
+which signs `ES256` tokens with an `EcdsaP256KeyPair` without constructing a
+jsonwebtoken signer. The explicit TLS adapter is `tls::configured_provider`.
 
 Ordinary builds use AWS-LC. With `fips`, Linux uses AWS-LC FIPS, macOS uses the
 existing corecrypto provider and Windows uses CNG. `toolkit/fips` and
@@ -28,8 +29,11 @@ Call `crypto::initialize()` at startup to handle unavailable providers before
 processing requests; infallible hash methods panic when backend policy cannot be met.
 
 ECDSA P-256/SHA-256 key generation, import, signing and verification use the selected
-backend. Its API accepts PKCS#8 DER keys with embedded uncompressed SEC1 public
-points, and emits ASN.1 DER signatures. Verification also supports P-384/SHA-384.
+backend. Its API accepts PKCS#8 DER or unencrypted PKCS#8 PEM keys with embedded
+uncompressed SEC1 public points, and emits ASN.1 DER signatures (`sign`) or the
+fixed-width JOSE `r || s` form (`sign_fixed`); `signature::der_to_fixed` and
+`signature::fixed_to_der` convert between the two for P-256 and P-384 widths.
+Verification also supports P-384/SHA-384.
 
 HMAC FIPS keys must be at least 14 bytes. HMAC and RSA/ECDSA messages are limited to
 `u32::MAX` bytes for portable CNG dispatch; SHA-256 and RNG split larger buffers.

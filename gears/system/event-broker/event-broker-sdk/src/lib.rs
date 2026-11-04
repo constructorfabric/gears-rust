@@ -28,6 +28,9 @@ pub mod validate;
 mod api_tests;
 
 #[cfg(test)]
+mod broker_stub;
+
+#[cfg(test)]
 mod gts_tests;
 
 #[cfg(test)]
