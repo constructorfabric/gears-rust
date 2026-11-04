@@ -20,8 +20,9 @@ use toolkit_odata::{Page as OdataPage, SortDir};
 use uuid::Uuid;
 
 use crate::infra::projections::{
-    EdgeHop, NodeIdent, NodeTyped, TypeName, TypeTraits, edge_hop_columns, node_ident_columns,
-    node_typed_columns, type_name_columns, type_traits_columns,
+    EdgeHop, NodeIdent, NodeRowId, NodeTyped, TypeName, TypeTraits, edge_hop_columns,
+    node_id_columns, node_ident_columns, node_typed_columns, type_name_columns,
+    type_traits_columns,
 };
 use crate::infra::storage::entity::{edge, graph_meta, gts_type, node};
 use crate::infra::storage::odata_mapper::NodeODataMapper;
@@ -706,7 +707,9 @@ pub async fn project_table(
 /// -- so the count cannot disagree with the pages. It reads the matching
 /// rows' ids, at most `max + 1`, rather than `COUNT(*)`: the bound is what
 /// makes its cost a function of configuration rather than of the tenant's
-/// size, and the secure ORM's count drops a `LIMIT`.
+/// size. The id alone, not the key: eight bytes a row, so even the largest
+/// `projection_count_max` holds a few megabytes, not the keys' length times
+/// the count.
 pub async fn count_table(
     store: &PgGraphStore,
     ctx: &StoreCtx<'_>,
@@ -741,7 +744,7 @@ pub async fn count_table(
     let ids = select
         .limit(max.saturating_add(1))
         .project_all(&conn, |query| {
-            node_ident_columns(query).into_model::<NodeIdent>()
+            node_id_columns(query).into_model::<NodeRowId>()
         })
         .await
         .map_err(map_scope_err)?;
