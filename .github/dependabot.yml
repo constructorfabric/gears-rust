@@ -25,6 +25,15 @@ updates:
     open-pull-requests-limit: 5
     commit-message:
       prefix: "chore(deps)"
+    # rdkafka-sys is pinned to =4.9.0 on purpose (see the comment in Cargo.toml):
+    # librdkafka 2.12.1 in 4.10 includes <curl/curl.h> even with curl off, so the
+    # build fails (#5616). rdkafka 0.39 requires rdkafka-sys 4.10. Only these
+    # releases are skipped, so a later fixed release still gets proposed.
+    ignore:
+      - dependency-name: "rdkafka-sys"
+        versions: [">= 4.10.0, < 4.11.0"]
+      - dependency-name: "rdkafka"
+        versions: [">= 0.39.0, < 0.40.0"]
     groups:
       # apalis crates are pinned with `=` and must move in lockstep: #5543 bumped
       # apalis-core/apalis-postgres to 1.0.0 via cargo-patch but left apalis on
