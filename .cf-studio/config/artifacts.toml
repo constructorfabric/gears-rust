@@ -6,6 +6,10 @@ patterns = [
 ]
 
 [[ignore]]
+reason = "Ignore task-engine design proposals — review documents for changes not yet applied to PRD/DESIGN/ADR; each is removed once applied, not a Constructor Studio SDLC artifact."
+patterns = ["gears/task-engine/docs/proposals", "gears/task-engine/docs/proposals/*"]
+
+[[ignore]]
 reason = "Ignore rust-traits.md — reference document for planned Rust SDK contracts, not a Constructor Studio SDLC artifact."
 patterns = ["gears/system/resource-group/docs/rust-traits.md"]
 
