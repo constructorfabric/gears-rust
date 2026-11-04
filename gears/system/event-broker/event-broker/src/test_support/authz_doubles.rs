@@ -10,18 +10,20 @@
 //! to fake here.
 
 use async_trait::async_trait;
+use authz_resolver_sdk::constraints::{Constraint, InPredicate, Predicate};
 use authz_resolver_sdk::{
     AuthZResolverApi, EvaluationRequest, EvaluationResponse, EvaluationResponseContext,
 };
 use toolkit_canonical_errors::CanonicalError;
-use toolkit_security::PlatformSecurityContext;
+use toolkit_security::{PlatformSecurityContext, pep_properties};
+use uuid::Uuid;
 
-/// Grants every `evaluate` call - `IngestServiceImpl`/`DeliveryServiceImpl`'s
-/// `PolicyEnforcer::access_scope_with` calls only ever inspect
-/// `EvaluationResponse::decision`/`context.deny_reason` (`require_constraints(false)`
-/// means `context.constraints` is always empty regardless), so an
-/// unconditional allow with an empty context is a faithful "no PEP configured"
-/// stand-in.
+/// Grants every `evaluate` call with an empty context: an unconstrained
+/// allow, the "no PEP configured" stand-in.
+///
+/// `require_constraints(false)` does not stop a PDP from returning
+/// constraints, and the in-repo plugins do return them for tenant-bearing
+/// requests. [`TenantScopedAuthZ`] models that shape.
 pub struct AllowAllAuthZ;
 
 #[async_trait]
@@ -61,6 +63,51 @@ where
         Ok(EvaluationResponse {
             decision: !(self.deny_if)(&request),
             context: EvaluationResponseContext::default(),
+        })
+    }
+}
+
+/// Allows every `evaluate` call, scoping each tenant-bearing one to `tenants`.
+///
+/// A request that carries `owner_tenant_id` is answered `decision: true` with
+/// one `In(owner_tenant_id, tenants)` constraint, the shape a PDP that scopes by
+/// constraint returns when no resource id is given, whatever tenant was
+/// requested. Other requests (named groups, `define`) get an unconstrained
+/// allow, since their resources declare no tenant property to constrain.
+///
+/// The broker must deny a target outside `tenants`; treating the allow as
+/// unconditional would let a grant in one tenant reach another.
+pub struct TenantScopedAuthZ {
+    pub tenants: Vec<Uuid>,
+}
+
+#[async_trait]
+impl AuthZResolverApi for TenantScopedAuthZ {
+    async fn evaluate(
+        &self,
+        _ctx: PlatformSecurityContext,
+        request: EvaluationRequest,
+    ) -> Result<EvaluationResponse, CanonicalError> {
+        let constraints = if request
+            .resource
+            .properties
+            .contains_key(pep_properties::OWNER_TENANT_ID)
+        {
+            vec![Constraint {
+                predicates: vec![Predicate::In(InPredicate::new(
+                    pep_properties::OWNER_TENANT_ID,
+                    self.tenants.iter().copied(),
+                ))],
+            }]
+        } else {
+            Vec::new()
+        };
+        Ok(EvaluationResponse {
+            decision: true,
+            context: EvaluationResponseContext {
+                constraints,
+                ..EvaluationResponseContext::default()
+            },
         })
     }
 }

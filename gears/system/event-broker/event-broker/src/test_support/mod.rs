@@ -52,7 +52,7 @@ pub mod response;
 pub mod single_backend;
 pub mod type_registry;
 
-pub use authz_doubles::DenyingAuthZ;
+pub use authz_doubles::{DenyingAuthZ, TenantScopedAuthZ};
 #[allow(
     unused_imports,
     reason = "general-purpose harness API surface, not all of it exercised yet"
@@ -66,7 +66,7 @@ pub use gear_db::GearDb;
     reason = "general-purpose harness API surface, not all of it exercised yet"
 )]
 pub use harness::{EventBrokerHarness, EventBrokerHarnessBuilder};
-pub use outbox_rows::outbox_queue_partitions;
+pub use outbox_rows::{outbox_body_rows, outbox_queue_partitions};
 pub use pause::PausePoint;
 #[allow(
     unused_imports,

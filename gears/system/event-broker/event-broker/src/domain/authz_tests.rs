@@ -82,6 +82,9 @@ fn publishing_a_type_that_is_not_an_event_type_is_refused_before_the_pep() {
     );
 }
 
+/// Declaring the property lets the SDK compile a PDP's tenant constraint
+/// instead of failing closed; [`super::authorize_in_tenant`] then checks the
+/// compiled scope against the concrete tenant (see the tests below).
 #[test]
 fn event_and_topic_resources_advertise_the_target_tenant_property() {
     use toolkit_security::pep_properties::OWNER_TENANT_ID;
@@ -96,4 +99,92 @@ fn event_and_topic_resources_advertise_the_target_tenant_property() {
     ] {
         assert!(resource.supported_properties().contains(&OWNER_TENANT_ID));
     }
+}
+
+fn caller() -> toolkit_security::SecurityContext {
+    toolkit_security::SecurityContext::builder()
+        .subject_tenant_id(uuid::Uuid::new_v4())
+        .subject_id(uuid::Uuid::new_v4())
+        .build()
+        .expect("valid caller")
+}
+
+/// A PDP that allows only within some tenants, by returning an
+/// `In(owner_tenant_id, ..)` constraint, must not authorize another tenant:
+/// the broker never applies the scope as a query predicate, so it decides the
+/// point itself.
+#[tokio::test]
+async fn a_constrained_allow_covers_only_the_tenants_it_names() {
+    use crate::test_support::TenantScopedAuthZ;
+    use authz_resolver_sdk::{AccessRequest, EnforcerError, PolicyEnforcer};
+    use std::sync::Arc;
+
+    let granted = uuid::Uuid::new_v4();
+    let foreign = uuid::Uuid::new_v4();
+    let policy = PolicyEnforcer::new(Arc::new(TenantScopedAuthZ {
+        tenants: vec![granted],
+    }));
+    let topic =
+        toolkit_gts::GtsInstanceId::try_new("gts.cf.core.events.topic.v1~x.eb.orders.acme.v1")
+            .unwrap();
+    let ctx = caller();
+    for resource in [
+        super::topic_resource(&topic),
+        event_type_resource(&GtsTypeId::new(EVENT_BASE)).unwrap(),
+        event_type_interest_resource(&pattern("gts.cf.core.events.*")).unwrap(),
+        super::TENANT_SCOPE_RESOURCE,
+    ] {
+        let name = resource.name().to_owned();
+        super::authorize_in_tenant(
+            &ctx,
+            &policy,
+            &resource,
+            "consume",
+            AccessRequest::new(),
+            granted,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{name}: the named tenant is covered: {e}"));
+        let denial = super::authorize_in_tenant(
+            &ctx,
+            &policy,
+            &resource,
+            "consume",
+            AccessRequest::new(),
+            foreign,
+        )
+        .await;
+        assert!(
+            matches!(
+                &denial,
+                Err(EnforcerError::Denied { deny_reason: Some(reason) })
+                    if reason.error_code == super::TENANT_OUTSIDE_SCOPE
+            ),
+            "{name}: another tenant must be denied, got {denial:?}"
+        );
+    }
+}
+
+/// The tenant-scope gate maps a foreign tenant to its own denial code.
+#[tokio::test]
+async fn the_tenant_gate_denies_a_tenant_outside_a_constrained_allow() {
+    use crate::test_support::TenantScopedAuthZ;
+    use authz_resolver_sdk::PolicyEnforcer;
+    use std::sync::Arc;
+
+    let granted = uuid::Uuid::new_v4();
+    let policy = PolicyEnforcer::new(Arc::new(TenantScopedAuthZ {
+        tenants: vec![granted],
+    }));
+    let ctx = caller();
+    super::tenant_authorized(&ctx, &policy, "produce", granted)
+        .await
+        .expect("the named tenant is covered");
+    assert!(matches!(
+        super::tenant_authorized(&ctx, &policy, "produce", uuid::Uuid::new_v4()).await,
+        Err(DomainError::Forbidden {
+            code: ErrorCode::TenantIdNotAuthorized,
+            ..
+        })
+    ));
 }

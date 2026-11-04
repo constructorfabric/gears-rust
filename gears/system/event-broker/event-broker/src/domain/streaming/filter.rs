@@ -17,12 +17,14 @@ use std::collections::HashMap;
 use async_trait::async_trait;
 use authz_resolver_sdk::{AccessRequest, EnforcerError, PolicyEnforcer};
 use toolkit::domain_model;
-use toolkit_security::{SecurityContext, pep_properties};
+use toolkit_security::SecurityContext;
 
 use gts::{GtsId, GtsIdPattern};
 use uuid::Uuid;
 
-use crate::domain::authz::{TENANT_SCOPE_RESOURCE, event_type_resource, topic_resource};
+use crate::domain::authz::{
+    TENANT_SCOPE_RESOURCE, authorize_in_tenant, event_type_resource, topic_resource,
+};
 use crate::domain::error::DomainError;
 use crate::domain::model::{Event, FilterSpec, Interest};
 
@@ -80,36 +82,57 @@ impl EventFilter for AuthorizedInterestFilter {
             return Ok(false);
         }
         // JOIN authorizes the requested interests, not an enduring grant. All
-        // three independent decisions use the stored event's tenant, so an
-        // allow in the caller's tenant cannot authorize another tenant's event.
-        let tenant_request = AccessRequest::new()
-            .resource_property(pep_properties::OWNER_TENANT_ID, event.tenant_id)
-            .require_constraints(false);
-        let checks = [
-            (TENANT_SCOPE_RESOURCE, tenant_request.clone()),
-            (
-                topic_resource(&event.topic),
-                tenant_request
-                    .clone()
-                    .resource_property("topic_id", event.topic.as_ref()),
+        // three independent decisions use the stored event's tenant, and each
+        // returned scope must cover that tenant, so an allow in the caller's
+        // tenant cannot authorize another tenant's event.
+        //
+        // The gates are independent, so they are evaluated concurrently: one
+        // matching event costs one PDP round-trip of latency, not three.
+        let tenant = event.tenant_id;
+        let event_type = event_type_resource(&event.r#type)?;
+        let topic = topic_resource(&event.topic);
+        // Bound to a local: the futures below outlive a const's temporary.
+        let tenant_scope = TENANT_SCOPE_RESOURCE;
+        let (tenant_gate, topic_gate, type_gate) = tokio::join!(
+            authorize_in_tenant(
+                &self.ctx,
+                &self.policy_enforcer,
+                &tenant_scope,
+                "consume",
+                AccessRequest::new(),
+                tenant,
             ),
-            (
-                event_type_resource(&event.r#type)?,
-                tenant_request.resource_property("event_type_id", event.r#type.as_ref()),
+            authorize_in_tenant(
+                &self.ctx,
+                &self.policy_enforcer,
+                &topic,
+                "consume",
+                AccessRequest::new().resource_property("topic_id", event.topic.as_ref()),
+                tenant,
             ),
-        ];
-        for (resource, request) in checks {
-            match self
-                .policy_enforcer
-                .access_scope_with(&self.ctx, &resource, "consume", None, &request)
-                .await
-            {
-                Ok(_) => {}
-                Err(EnforcerError::Denied { .. }) => return Ok(false),
-                // An outage must terminate the batch without advancing progress;
-                // treating it as a denial would silently skip unread events.
+            authorize_in_tenant(
+                &self.ctx,
+                &self.policy_enforcer,
+                &event_type,
+                "consume",
+                AccessRequest::new().resource_property("event_type_id", event.r#type.as_ref()),
+                tenant,
+            ),
+        );
+        let gates = [tenant_gate, topic_gate, type_gate];
+        // An outage at any gate must terminate the batch without advancing
+        // progress, even when another gate denied: treating it as a denial
+        // would silently skip an event that may be authorized.
+        let mut denied = false;
+        for gate in gates {
+            match gate {
+                Ok(()) => {}
+                Err(EnforcerError::Denied { .. }) => denied = true,
                 Err(error) => return Err(error.into()),
             }
+        }
+        if denied {
+            return Ok(false);
         }
         Ok(true)
     }

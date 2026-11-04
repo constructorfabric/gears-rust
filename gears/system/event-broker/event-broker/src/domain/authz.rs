@@ -4,14 +4,20 @@
 //! (`docs/DESIGN.md` §3.3). The id is also sent as a resource property.
 //! Event and topic decisions carry the target tenant as `owner_tenant_id`;
 //! tenant authority is also checked independently through the deployed policy.
+//!
+//! Every tenant-bearing decision goes through [`authorize_in_tenant`], which
+//! checks the returned scope against the concrete tenant. These are point
+//! decisions: nothing downstream applies the scope as a query predicate, so an
+//! allow whose constraints name other tenants must be treated as a denial.
 
 use std::sync::LazyLock;
 
-use authz_resolver_sdk::{AccessRequest, PolicyEnforcer, ResourceType};
+use authz_resolver_sdk::models::DenyReason;
+use authz_resolver_sdk::{AccessRequest, EnforcerError, PolicyEnforcer, ResourceType};
 use event_broker_sdk::gts::{CONSUMER_GROUP_RESOURCE_TYPE, EventV1, REQUEST_RESOURCE_TYPE};
 use gts::{GtsId, GtsIdPattern, GtsIdPatternSegment, GtsTypeId};
 use toolkit_gts::{GtsInstanceId, GtsSchema};
-use toolkit_security::{SecurityContext, pep_properties};
+use toolkit_security::{AccessScope, SecurityContext, pep_properties};
 use uuid::Uuid;
 
 use crate::domain::error::{DomainError, ErrorCode};
@@ -136,12 +142,75 @@ pub fn with_forbidden_code(mut err: DomainError, code: ErrorCode) -> DomainError
     err
 }
 
+/// Machine-readable code on the denial [`authorize_in_tenant`] synthesizes
+/// when the PDP allowed, but only for tenants other than the target.
+pub const TENANT_OUTSIDE_SCOPE: &str = "tenant_outside_decision_scope";
+
+/// Whether an allowed decision's scope covers the concrete `tenant`.
+///
+/// An unconstrained scope covers every tenant. Otherwise some constraint (the
+/// constraints are OR-ed) must consist only of `owner_tenant_id` filters that
+/// list `tenant`, since a constraint's filters are AND-ed and a filter on any
+/// other property cannot be decided for an event or topic. Subquery filters
+/// (for example a tenant subtree) cannot be decided in memory either, so they
+/// never admit: the broker fails closed rather than guess at the hierarchy.
+#[must_use]
+pub fn scope_admits_tenant(scope: &AccessScope, tenant: Uuid) -> bool {
+    scope.is_unconstrained()
+        || scope.constraints().iter().any(|constraint| {
+            constraint.filters().iter().all(|filter| {
+                filter.property() == pep_properties::OWNER_TENANT_ID
+                    && filter.is_representable_in_memory()
+                    && filter.uuid_values().contains(&tenant)
+            })
+        })
+}
+
+/// One tenant-bearing point decision: evaluates `action` on `resource` with
+/// `tenant` sent as `owner_tenant_id`, then requires the returned scope to
+/// cover `tenant` (see [`scope_admits_tenant`]).
+///
+/// The tenant is added here rather than by the caller, so the property the
+/// PDP sees and the tenant the scope is checked against cannot diverge.
+///
+/// # Errors
+/// `EnforcerError::Denied` when the PDP denies or its scope excludes `tenant`
+/// (code [`TENANT_OUTSIDE_SCOPE`]); any other `EnforcerError` unchanged.
+pub async fn authorize_in_tenant(
+    ctx: &SecurityContext,
+    policy_enforcer: &PolicyEnforcer,
+    resource: &ResourceType,
+    action: &str,
+    request: AccessRequest,
+    tenant: Uuid,
+) -> Result<(), EnforcerError> {
+    let request = request
+        .resource_property(pep_properties::OWNER_TENANT_ID, tenant)
+        .require_constraints(false);
+    let scope = policy_enforcer
+        .access_scope_with(ctx, resource, action, None, &request)
+        .await?;
+    if scope_admits_tenant(&scope, tenant) {
+        Ok(())
+    } else {
+        Err(EnforcerError::Denied {
+            deny_reason: Some(DenyReason {
+                error_code: TENANT_OUTSIDE_SCOPE.to_owned(),
+                details: Some(format!(
+                    "the decision for '{}' does not cover tenant '{tenant}'",
+                    resource.name()
+                )),
+            }),
+        })
+    }
+}
+
 /// Confirms the calling principal is authorized to act as `target` tenant -
 /// a dedicated `PolicyEnforcer` check against `TENANT_SCOPE_RESOURCE`
 /// (`pep_properties::OWNER_TENANT_ID` set to `target`), not a
-/// `tenant-resolver-sdk` call. Whether this actually enforces tenant
-/// hierarchy (vs. e.g. always allowing) is entirely the deployed
-/// authz-resolver plugin/policy's concern.
+/// `tenant-resolver-sdk` call. The returned scope must cover `target`
+/// ([`authorize_in_tenant`]); whether the PDP itself enforces tenant hierarchy
+/// remains the deployed authz-resolver plugin/policy's concern.
 ///
 /// # Errors
 /// Returns `DomainError::Forbidden { code: "TenantIdNotAuthorized", .. }` if
@@ -152,19 +221,16 @@ pub async fn tenant_authorized(
     action: &'static str,
     target: Uuid,
 ) -> Result<(), DomainError> {
-    policy_enforcer
-        .access_scope_with(
-            ctx,
-            &TENANT_SCOPE_RESOURCE,
-            action,
-            None,
-            &AccessRequest::new()
-                .resource_property(pep_properties::OWNER_TENANT_ID, target)
-                .require_constraints(false),
-        )
-        .await
-        .map_err(|e| with_forbidden_code(e.into(), ErrorCode::TenantIdNotAuthorized))?;
-    Ok(())
+    authorize_in_tenant(
+        ctx,
+        policy_enforcer,
+        &TENANT_SCOPE_RESOURCE,
+        action,
+        AccessRequest::new(),
+        target,
+    )
+    .await
+    .map_err(|e| with_forbidden_code(e.into(), ErrorCode::TenantIdNotAuthorized))
 }
 
 #[cfg(test)]

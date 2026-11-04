@@ -20,3 +20,21 @@ pub async fn outbox_queue_partitions(dsn: &str) -> i64 {
     .try_get::<i64>("", "n")
     .expect("a count")
 }
+
+/// How many message bodies the `default` outbox group holds in the database
+/// at `dsn`. Every enqueue writes one, and only a later vacuum removes it, so
+/// a publish that reached the outbox is visible here even after the ingest
+/// workers have moved the event on.
+pub async fn outbox_body_rows(dsn: &str) -> i64 {
+    let conn = sea_orm::Database::connect(dsn).await.expect("connect");
+    conn.query_one(
+        Query::select()
+            .expr_as(Expr::col(Alias::new("id")).count(), "n")
+            .from(Alias::new(format!("{OUTBOX_TABLE_PREFIX}_body"))),
+    )
+    .await
+    .expect("read the outbox bodies")
+    .expect("a count row")
+    .try_get::<i64>("", "n")
+    .expect("a count")
+}
