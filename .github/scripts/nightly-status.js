@@ -24,28 +24,45 @@ function mark(run) {
   return '⚪';
 }
 
-function row(label, url, runs) {
+function dateOf(run) {
+  return new Date(run.run_started_at || run.created_at).toISOString().slice(0, 10);
+}
+
+// The UTC date `n` days before the given YYYY-MM-DD date.
+function daysBefore(date, n) {
+  return new Date(Date.parse(date) - n * 86400000).toISOString().slice(0, 10);
+}
+
+// `byDate` maps a UTC date to the newest run of that date. `window` lists the
+// NIGHTS dates to show, oldest first.
+function row(label, url, byDate, window) {
   const name = `[${label}](${url})`;
-  if (runs.length === 0) return `| ${name} | — | — | — | — | — |`;
+  const history = window.map((d) => (byDate.has(d) ? mark(byDate.get(d)) : '➖')).join('');
+  const newestDate = [...window].reverse().find((d) => byDate.has(d));
+  if (!newestDate) return `| ${name} | — | — | — | — | ${history} |`;
 
-  const newest = runs[0];
+  const newest = byDate.get(newestDate);
   const last = `${mark(newest)} ${newest.status === 'completed' ? newest.conclusion : 'running'}`;
-  const date = new Date(newest.run_started_at || newest.created_at).toISOString().slice(0, 10);
 
-  // Count red nights from the newest finished run. A run still going has no
-  // result yet, so it is skipped.
-  const done = runs.filter((x) => x.status === 'completed');
+  // Walk the window from the newest night. Nights with no run are skipped: a
+  // dropped night is no evidence of a fix. A run still going has no result
+  // yet, so it is skipped too. Count red nights until the first finished
+  // non-red run. If the walk reaches the window start without one, the streak
+  // may be longer, so show it as "14+".
   let streak = 0;
-  for (const r of done) {
-    if (mark(r) !== '❌') break;
+  let broken = false;
+  for (const d of [...window].reverse()) {
+    const r = byDate.get(d);
+    if (!r || r.status !== 'completed') continue;
+    if (mark(r) !== '❌') {
+      broken = true;
+      break;
+    }
     streak += 1;
   }
-  // Only NIGHTS runs are fetched. If all of them are red, the streak may be
-  // longer than that, so show it as "14+".
-  if (streak > 0 && streak === done.length && runs.length === NIGHTS) streak = `${streak}+`;
+  if (streak > 0 && !broken) streak = `${streak}+`;
 
-  const history = runs.map(mark).reverse().join('');
-  return `| ${name} | ${last} | ${date} | [#${newest.run_number}](${newest.html_url}) | ${streak} | ${history} |`;
+  return `| ${name} | ${last} | ${newestDate} | [#${newest.run_number}](${newest.html_url}) | ${streak} | ${history} |`;
 }
 
 module.exports = async ({ github, context, core }) => {
@@ -55,12 +72,22 @@ module.exports = async ({ github, context, core }) => {
 
   const rows = [];
   for (const { file, label } of WORKFLOWS) {
+    const today = new Date().toISOString().slice(0, 10);
     const res = await github.rest.actions.listWorkflowRuns({
-      owner, repo, workflow_id: file, event: 'schedule', per_page: NIGHTS,
+      owner, repo, workflow_id: file, event: 'schedule',
+      created: `>=${daysBefore(today, NIGHTS + 1)}`, per_page: 100,
     });
-    // Runs come newest first.
-    const runs = res.data.workflow_runs.slice(0, NIGHTS);
-    rows.push(row(label, `${repoUrl}/actions/workflows/${file}?query=event%3Aschedule`, runs));
+    // Runs come newest first, so the first run seen for a date is the newest.
+    const byDate = new Map();
+    for (const run of res.data.workflow_runs) {
+      const d = dateOf(run);
+      if (!byDate.has(d)) byDate.set(d, run);
+    }
+    // The nightly fires late morning UTC, so "no run yet today" is not a gap.
+    const end = byDate.has(today) ? today : daysBefore(today, 1);
+    const window = [];
+    for (let i = NIGHTS - 1; i >= 0; i--) window.push(daysBefore(end, i));
+    rows.push(row(label, `${repoUrl}/actions/workflows/${file}?query=event%3Aschedule`, byDate, window));
   }
 
   const body = [
@@ -71,7 +98,7 @@ module.exports = async ({ github, context, core }) => {
     '|---|---|---|---|---|---|',
     ...rows,
     '',
-    '✅ passed · ❌ failed, cancelled or timed out · ⚪ skipped or still running',
+    '✅ passed · ❌ failed, cancelled or timed out · ⚪ skipped or still running · ➖ no scheduled run that night',
     '',
     `Open nightly issues (failures and this one): ${repoUrl}/issues?q=is%3Aissue%20is%3Aopen%20label%3Anightly`,
     `Updated ${new Date().toISOString()} by [this run](${repoUrl}/actions/runs/${context.runId}).`,
