@@ -53,7 +53,7 @@ function row(label, url, byDate, window) {
   let broken = false;
   for (const d of [...window].reverse()) {
     const r = byDate.get(d);
-    if (!r || r.status !== 'completed') continue;
+    if (r?.status !== 'completed') continue;
     if (mark(r) !== '❌') {
       broken = true;
       break;
@@ -65,14 +65,17 @@ function row(label, url, byDate, window) {
   return `| ${name} | ${last} | ${newestDate} | [#${newest.run_number}](${newest.html_url}) | ${streak} | ${history} |`;
 }
 
-module.exports = async ({ github, context, core }) => {
+module.exports = async function updateNightlyStatus({ github, context, core }) {
   const { owner, repo } = context.repo;
   const repoUrl = `${context.serverUrl}/${owner}/${repo}`;
   const dryRun = process.env.NIGHTLY_STATUS_DRY_RUN === '1';
 
-  const rows = [];
-  for (const { file, label } of WORKFLOWS) {
-    const today = new Date().toISOString().slice(0, 10);
+  // Computed once, so every row covers the same nights even if the job runs
+  // across midnight UTC.
+  const today = new Date().toISOString().slice(0, 10);
+  // The lookups are independent, so they run in parallel. Promise.all keeps
+  // the rows in WORKFLOWS order.
+  const rows = await Promise.all(WORKFLOWS.map(async ({ file, label }) => {
     const res = await github.rest.actions.listWorkflowRuns({
       owner, repo, workflow_id: file, event: 'schedule',
       created: `>=${daysBefore(today, NIGHTS + 1)}`, per_page: 100,
@@ -87,8 +90,8 @@ module.exports = async ({ github, context, core }) => {
     const end = byDate.has(today) ? today : daysBefore(today, 1);
     const window = [];
     for (let i = NIGHTS - 1; i >= 0; i--) window.push(daysBefore(end, i));
-    rows.push(row(label, `${repoUrl}/actions/workflows/${file}?query=event%3Aschedule`, byDate, window));
-  }
+    return row(label, `${repoUrl}/actions/workflows/${file}?query=event%3Aschedule`, byDate, window);
+  }));
 
   const body = [
     '<!-- nightly-status: generated, edits are overwritten -->',
