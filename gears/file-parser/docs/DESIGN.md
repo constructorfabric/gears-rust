@@ -153,7 +153,7 @@ Core types (all in `src/domain/`):
 | `ParsedDocument` | Top-level result: `id: Option<Uuid>`, `title: Option<String>`, `language: Option<String>` (BCP 47), `meta: ParsedMetadata`, `blocks: Vec<ParsedBlock>` |
 | `ParsedMetadata` | `source: ParsedSource`, `original_filename`, `content_type`, `created_at`, `modified_at`, `is_stub: bool` |
 | `ParsedSource` | `LocalPath(String)` or `Uploaded { original_name: String }` |
-| `ParsedBlock` | Enum: `Heading { level: u8, inlines }`, `Paragraph { inlines }`, `ListItem { level: u8, ordered: bool, blocks }`, `CodeBlock { language, code }`, `Table(TableBlock)`, `Quote { blocks }`, `HorizontalRule`, `Image { alt, title, src }`, `PageBreak` |
+| `ParsedBlock` | Enum: `Heading { level: u8, inlines }`, `Paragraph { inlines }`, `ListItem { level: u8, ordered: bool, blocks }`, `CodeBlock { language, code }`, `Table(TableBlock)`, `Quote { blocks }`, `HorizontalRule`, `Image { alt, title, src }`, `PageBreak`. An `Image` block is emitted only when the source provides a non-empty `src`; image nodes without one (for example embedded DOCX images extracted by kreuzberg) are dropped, for every kreuzberg-backed format |
 | `TableBlock` | `rows: Vec<TableRow>` |
 | `TableRow` | `is_header: bool`, `cells: Vec<TableCell>` |
 | `TableCell` | `blocks: Vec<ParsedBlock>` (cells may contain nested block content) |
@@ -242,8 +242,7 @@ Example `/info` response:
 {
   "supported_extensions": {
     "plain_text": ["txt", "log", "md"],
-    "kreuzberg": ["pdf", "html", "htm", "xlsx", "xls", "xlsm", "xlsb", "pptx"],
-    "docx": ["docx"],
+    "kreuzberg": ["pdf", "html", "htm", "docx", "xlsx", "xls", "xlsm", "xlsb", "pptx"],
     "image": ["png", "jpg", "jpeg", "webp", "gif"],
     "generic_stub": ["doc", "rtf", "odt", "xls", "xlsx", "ppt", "pptx"]
   }
