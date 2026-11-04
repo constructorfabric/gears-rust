@@ -432,7 +432,7 @@ jobs:
                 repo,
                 title,
                 body,
-                labels: ["bug", "e2e-nightly", "ci"],
+                labels: ["bug", "e2e-nightly", "ci", "nightly"],
               });
               await tryAssign(created.data.number);
             }
