@@ -756,7 +756,7 @@ pub async fn run_oop_with_options(opts: OopRunOptions) -> Result<()> {
     // OS process owning its own global providers, so the in-process host's
     // flush in `bootstrap::run` does not cover it.
     #[cfg(feature = "otel")]
-    crate::bootstrap::run::tracing_shutdown().await;
+    super::telemetry::tracing_shutdown().await;
 
     result
 }

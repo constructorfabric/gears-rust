@@ -19,6 +19,8 @@ mod crypto;
 pub mod host;
 
 pub mod oop;
+#[cfg(feature = "otel")]
+mod telemetry;
 
 // Re-export commonly used config types at crate root for convenience
 pub use config::{

@@ -4,7 +4,7 @@
 use toolkit_canonical_errors::{CanonicalError, InvalidArgument};
 use uuid::Uuid;
 
-use super::{Outcomes, ReconcileOutcome, ReconcilePendingCause, ReconcileStop};
+use super::outcome::{Outcomes, ReconcileOutcome, ReconcilePendingCause, ReconcileStop};
 use crate::gts::OPERATION_RESOURCE_TYPE;
 use crate::item_failure::{AdmissionFailure, context};
 

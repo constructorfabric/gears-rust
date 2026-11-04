@@ -3,7 +3,7 @@ use std::fmt;
 
 use toolkit_canonical_errors::{CanonicalError, Problem};
 
-use super::{ReconcileOutcome, ReconcilePendingCause, ReconcileStop};
+use super::outcome::{ReconcileOutcome, ReconcilePendingCause, ReconcileStop};
 use crate::GtsId;
 use crate::gts::{OPERATION_RESOURCE_TYPE, OperationResource};
 use crate::precondition::RECONCILIATION_INCOMPLETE;
