@@ -96,8 +96,10 @@ $p"
         echo "hook: note: uncommitted Rust/Cargo changes; clippy and dylint check the working tree, not exactly the pushed commit"
     fi
 
-    # Changed packages plus their workspace dependents, from one `cargo metadata` call. Packages outside
-    # the workspace (e.g. tools/fuzz) are dropped. Without jq or metadata: whole workspace (slower, correct).
+    # Changed packages plus their workspace dependents, from one `cargo metadata` call. --all-features, as
+    # clippy below: without it the graph lacks optional dependencies (example-server -> oagw via feature
+    # `oagw`). Packages outside the workspace (e.g. tools/fuzz) are dropped. Without jq or metadata: whole
+    # workspace (slower, correct).
     sel=""
     nsel=0
     nchg=0
@@ -106,7 +108,7 @@ $p"
         reason=""
         if ! have jq; then
             reason="jq not found (install: brew install jq / apt install jq)"
-        elif ! meta=$(cargo metadata --format-version 1 --locked --offline 2>/dev/null) ||
+        elif ! meta=$(cargo metadata --format-version 1 --locked --offline --all-features 2>/dev/null) ||
             ! out=$(printf '%s\n' "$meta" | jq -r --arg names "$pkgs" "$SELECT_JQ"); then
             reason="cargo metadata failed"
         fi

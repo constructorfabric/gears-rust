@@ -11,7 +11,7 @@ trap 'chmod -R u+rwx "$T" 2>/dev/null; rm -rf "$T"' EXIT INT TERM
 export RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}" CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
 mkdir "$T/home"; HOME="$T/home"; export HOME
 export GIT_CONFIG_GLOBAL="$T/gitconfig" GIT_CONFIG_NOSYSTEM=1 STUB_LOG="$T/stub.log"
-unset CI GEARS_NO_HOOKS FAIL_CLIPPY STUB_METADATA_FAIL STUB_DRAIN GEARS_HOOKS_BASE
+unset CI GEARS_NO_HOOKS FAIL_CLIPPY STUB_METADATA_FAIL STUB_DRAIN GEARS_HOOKS_BASE STUB_REAL_CARGO
 export STUB_METADATA="$T/metadata.json"
 git config --global user.name hooktests
 git config --global user.email hooktests@example.com
@@ -35,7 +35,11 @@ cat > "$T/stubs/cargo" <<'STUB'
 #!/bin/sh
 if [ "$1 $2" = "clippy --version" ]; then [ -z "${FAIL_CLIPPY:-}" ]; exit; fi
 [ -z "${STUB_DRAIN:-}" ] || cat > /dev/null
-if [ "$1" = metadata ]; then [ -z "${STUB_METADATA_FAIL:-}" ] || exit 101; cat "$STUB_METADATA"; exit 0; fi
+if [ "$1" = metadata ]; then
+    [ -z "${STUB_METADATA_FAIL:-}" ] || exit 101
+    [ -z "${STUB_REAL_CARGO:-}" ] || exec "$STUB_REAL_CARGO" "$@"
+    cat "$STUB_METADATA"; exit 0
+fi
 echo "cargo $*" >> "$STUB_LOG"
 exit 0
 STUB
@@ -58,6 +62,7 @@ have_rustfmt=""; rustfmt --version >/dev/null 2>&1 && have_rustfmt=1
 # Real tools, as seen before the stubs were put on PATH.
 have_bash4=""; PATH=$real_path bash -c '[ "${BASH_VERSINFO[0]}" -ge 4 ]' 2>/dev/null && have_bash4=1
 have_jq=""; PATH=$real_path command -v jq >/dev/null 2>&1 && have_jq=1
+real_cargo=$(PATH=$real_path command -v cargo 2>/dev/null) && (cd "$T" && "$real_cargo" --version) >/dev/null 2>&1 || real_cargo=""
 have_pcre=""
 { printf 'a\n' | PATH=$real_path grep -qP a || printf 'a\n' | PATH=$real_path ggrep -qP a; } 2>/dev/null && have_pcre=1
 
@@ -374,6 +379,34 @@ else
     on_branch feat-oagw gears/oagw/src/lib.rs
     unset STUB_METADATA_FAIL
     assert "pre-push: unknown package set + oagw files -> cluster dylint" grep -q 'cargo gears lint --dylint -P cf-gears-oagw -F cluster' "$STUB_LOG"
+fi
+
+# optional path dependency: the dependency graph must be the --all-features one clippy compiles.
+# Real `cargo metadata` on a real workspace (the canned JSON above cannot catch a missing flag).
+if [ -z "$have_jq" ] || [ -z "$real_cargo" ]; then
+    skip "pre-push: optional dependency -> dependent checked" "needs jq and cargo"
+else
+    p1=$r
+    mkrepo p2; r="$T/p2"
+    mkdir -p "$r/.github/scripts" "$r/base/src" "$r/app/src"
+    printf '#!/bin/sh\nexit 0\n' > "$r/.github/scripts/check-forbidden-words.sh"
+    chmod +x "$r/.github/scripts/check-forbidden-words.sh"
+    printf '[workspace]\nmembers = ["base", "app"]\nresolver = "2"\n' > "$r/Cargo.toml"
+    printf '[package]\nname = "base"\nversion = "0.1.0"\nedition = "2021"\n' > "$r/base/Cargo.toml"
+    # app reaches base only through feature x; default features do not pull it in
+    printf '[package]\nname = "app"\nversion = "0.1.0"\nedition = "2021"\n\n[dependencies]\nbase = { path = "../base", optional = true }\n\n[features]\ndefault = []\nx = ["dep:base"]\n' > "$r/app/Cargo.toml"
+    echo 'pub fn a() {}' > "$r/base/src/lib.rs"; echo 'pub fn a() {}' > "$r/app/src/lib.rs"
+    (cd "$r" && "$real_cargo" generate-lockfile --offline) > "$T/out" 2>&1
+    git -C "$r" add -A; git -C "$r" commit -qm base
+    git -C "$r" branch -M main; git -C "$r" config --local gears.hooks true
+    git -C "$r" checkout -qb feat
+    echo 'pub fn b() {}' >> "$r/base/src/lib.rs"; git -C "$r" commit -qam c1
+    STUB_REAL_CARGO=$real_cargo; export STUB_REAL_CARGO
+    push "$(head_sha)"
+    unset STUB_REAL_CARGO
+    assert "pre-push: optional dependency -> dependent checked" grep -q 'cargo clippy .*-p app ' "$STUB_LOG"
+    assert "pre-push: optional dependency -> summary" grep -q 'clippy: 2 package(s): 1 changed + 1 dependent(s)' "$T/out"
+    r=$p1
 fi
 
 # base ref: upstream/main beats origin/main; GEARS_HOOKS_BASE overrides; an unknown override skips
