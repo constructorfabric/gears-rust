@@ -79,7 +79,7 @@ that barrier. `am-host publish-gts --registry <url>` publishes the same
 GTS Type Schemas and Instances as a deployment step. RG's sealed local
 `ResourceGroupTypeBootstrap` is unchanged. The composition is
 `apps/cf-gears-am-host` with flight-control as the remote registry (`config/am-remote-*.yaml`,
-`make e2e-am-remote`); see the [current execution slice](../docs/p0/todo.md).
+`make e2e-am-remote`).
 
 ## Publishing from a gear
 

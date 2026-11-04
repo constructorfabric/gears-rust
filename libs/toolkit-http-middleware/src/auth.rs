@@ -130,16 +130,6 @@ impl RouteAuthPolicy {
         methods
     }
 
-    /// This policy without its [`RouteAuth::Authenticated`] (tenant-plane) routes.
-    #[must_use]
-    pub fn without_tenant_routes(&self) -> Self {
-        let mut routes = self.routes.clone();
-        for paths in routes.values_mut() {
-            paths.retain(|_, auth| *auth != RouteAuth::Authenticated);
-        }
-        Self { routes }
-    }
-
     /// `METHOD path` of every [`RouteAuth::Platform`] route, sorted.
     #[must_use]
     pub fn platform_routes(&self) -> Vec<String> {

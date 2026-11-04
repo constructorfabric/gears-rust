@@ -481,7 +481,9 @@ mod publish_gts_tests {
                 (
                     "late",
                     GtsDeploymentOutcome::DeadlineExceeded {
-                        unconfirmed: vec!["gts.cf.test.late.v1~".to_owned()],
+                        unconfirmed: vec![
+                            toolkit_gts::gts_id!("cf.test.publication.late.v1~").to_owned(),
+                        ],
                     },
                 ),
             ],
@@ -489,7 +491,8 @@ mod publish_gts_tests {
         let err = publication_result(&failed).unwrap_err();
         let message = format!("{err:#}");
         assert!(
-            message.contains("late: deadline exceeded") && message.contains("gts.cf.test.late.v1~"),
+            message.contains("late: deadline exceeded")
+                && message.contains(toolkit_gts::gts_id!("cf.test.publication.late.v1~")),
             "{message}"
         );
 

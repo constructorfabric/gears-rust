@@ -903,7 +903,7 @@ impl OopHttpServer {
         // even with `auth_disabled`; install tenant auth with the final routes.
         let authenticated = layer_route_auth_with(
             gear_router,
-            route_auth.without_tenant_routes(),
+            route_auth.clone(),
             TenantPlane::Absent,
             self.options.internal_authenticator.clone(),
         );
