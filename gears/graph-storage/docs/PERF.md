@@ -20,15 +20,18 @@ embedded by the deterministic fake provider. The graph is seeded through
 `ingest`, and the seeding's wall clock is printed — it is the cost of the lane,
 not a criterion.
 
-**Layer.** The store and engine ports, called directly under the same admission
-bounds the service applies. REST, the PDP round trip and JSON serialization are
-excluded: they belong to a deployment's budget.
+**Layer.** The store and engine ports, called directly. The bounds are the ones
+each scenario names below, not the service's defaults: a hop here is capped at a
+frontier of 1 000 and 50 000 edges scanned, where the service defaults to 10 000
+and 100 000, so a traversal number speaks for that budget only. REST, the PDP
+round trip and JSON serialization are excluded: they belong to a deployment's
+budget.
 
 **Scenarios**, all on the one seeded graph:
 
 | Scenario | What it does | Criterion |
 | --- | --- | --- |
-| One round trip | `revision` read, one statement. A control: what the stand and the pool cost before the gear does any work; it also calibrates the added round-trip time | — |
+| One round trip | `revision` read, one statement — one network round trip without the pool ping, two with it (see **Pool ping**). A control: what the stand and the pool cost before the gear does any work; it also calibrates the added round-trip time | — |
 | Hybrid search | lexical + vector arms, arm limit 50, query embedded outside the loop | `nfr-search-latency`: p95 ≤ 500 ms |
 | Criteria table | filter on an indexed payload path, ordered, page of 50 | — |
 | Typed traversal | depth 3 from 8 seeds over one edge type; frontier ≤ 1 000, edge budget 50 000 per hop | p95 ≤ 1 s |
@@ -61,7 +64,8 @@ database it costs 0–4%.
 ## Running it
 
 From the repository root, on an otherwise idle machine. In Bash with
-`pipefail`, so a failed run does not exit with `tee`'s success:
+`pipefail`, so a failed run does not exit with `tee`'s success, and the summary
+runs only after a run that passed:
 
 ```bash
 set -o pipefail
@@ -70,9 +74,8 @@ GEARS_TEST_PG_GRAPH_IMAGE=pgvector/pgvector:0.8.7-pg18 \
 GEARS_GRAPH_PERF_REPEAT=5 \
 GEARS_GRAPH_PERF_RTT_MS=0,0.5,1,2 \
   cargo test --release -p cf-gears-graph-storage --test perf \
-  -- --nocapture the_retrieval_scenarios 2>&1 | tee perf.log
-
-python3 gears/graph-storage/scripts/perf_summary.py < perf.log
+  -- --nocapture the_retrieval_scenarios 2>&1 | tee perf.log \
+  && python3 gears/graph-storage/scripts/perf_summary.py < perf.log
 ```
 
 Seeding takes 13–18 minutes on a laptop; the matrix above adds a few minutes.
@@ -118,6 +121,9 @@ gears-rust#5517:
 - a scale curve — the same scenarios at 0.1×, 1× and 10× the reference graph;
 - a consumer-shaped query — resolve a node, one typed hop, filter and page the
   far nodes by a payload path;
-- ingest throughput as a measured scenario (gears-rust#5040);
+- ingest throughput in the command above: the same file asserts
+  `nfr-ingest-throughput` in `a_producer_sized_batch_lands_inside_its_budget`,
+  but the command runs the retrieval scenarios only, and the ingest test
+  reports no `RESULT` lines for the summary (gears-rust#5040);
 - many tenants in one database, a database on a separate host, and the request
   end to end through REST and the PDP.
