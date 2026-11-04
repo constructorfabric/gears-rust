@@ -1,0 +1,7 @@
+error: ready_warn_after requires await_ready (it bounds the readiness signal, which only applies when await_ready is set)
+ --> tests/ui/fail/lifecycle_ready_warn_after_without_await_ready.rs:6:1
+  |
+6 | #[gear(name="x", capabilities=[stateful], lifecycle(entry="serve", ready_warn_after="90s"))]
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: this error originates in the attribute macro `gear` (in Nightly builds, run with -Z macro-backtrace for more info)

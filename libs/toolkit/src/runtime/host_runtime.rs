@@ -126,6 +126,74 @@ fn startup_failure(outcome: AppStartup) -> Option<RegistryError> {
     }
 }
 
+/// Default per-gear init deadline (10 minutes); see [`HostRuntime::with_init_deadline`].
+pub const DEFAULT_INIT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Verdict of a force-exit watchdog's wait, kept free of `process::exit` so the
+/// decision is unit-testable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WatchdogVerdict {
+    /// Disarmed in time: the guarded work finished or its future was dropped.
+    Disarmed,
+    /// The deadline elapsed first; the caller must force-exit.
+    TimedOut,
+}
+
+/// Block until the watchdog is disarmed (`disarm_rx` signalled or dropped) or
+/// `deadline` elapses. Runs on an OS thread (see [`arm_force_exit_watchdog`]) so
+/// the bound holds even when the guarded code blocks a runtime worker
+/// synchronously, which an async timer cannot observe.
+fn watchdog_verdict(
+    disarm_rx: &std::sync::mpsc::Receiver<()>,
+    deadline: std::time::Duration,
+) -> WatchdogVerdict {
+    match disarm_rx.recv_timeout(deadline) {
+        Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => WatchdogVerdict::Disarmed,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => WatchdogVerdict::TimedOut,
+    }
+}
+
+/// Grace the force-exit diagnostic gets before the process exits regardless.
+const FORCE_EXIT_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Log a force-exit diagnostic and terminate the process with code 1.
+///
+/// A backstop timer is armed *first* so a wedged writer (e.g. a full `stderr`
+/// pipe) can delay the message but not the exit. `message` is mirrored to
+/// `stderr` so it survives tracing being off or unflushed.
+fn force_exit(message: &str) -> ! {
+    std::thread::spawn(|| {
+        std::thread::sleep(FORCE_EXIT_GRACE);
+        std::process::exit(1);
+    });
+
+    tracing::error!("{message}");
+    {
+        use std::io::Write as _;
+        _ = writeln!(std::io::stderr().lock(), "ERROR {message}");
+    }
+
+    std::process::exit(1);
+}
+
+/// Arm a thread that [`force_exit`]s unless the returned sender is dropped within
+/// `deadline`. Dropping it (normal completion *or* the guarded future being
+/// cancelled) disarms the watchdog, so a cancelled phase never force-exits.
+/// Shared by the init and stop phases.
+#[must_use = "bind the returned sender for the guarded region; dropping it disarms the watchdog"]
+fn arm_force_exit_watchdog(
+    deadline: std::time::Duration,
+    message: String,
+) -> std::sync::mpsc::Sender<()> {
+    let (disarm_tx, disarm_rx) = std::sync::mpsc::channel::<()>();
+    std::thread::spawn(move || {
+        if watchdog_verdict(&disarm_rx, deadline) == WatchdogVerdict::TimedOut {
+            force_exit(&message);
+        }
+    });
+    disarm_tx
+}
+
 /// Owns the lifecycle orchestration for `ToolKit`: encapsulates all runtime
 /// state and drives gears through the full lifecycle (see gear docs).
 pub struct HostRuntime {
@@ -173,6 +241,9 @@ pub struct HostRuntime {
     oop_options: Option<OopSpawnOptions>,
     /// Maximum time allowed for graceful shutdown before hard-stop signal is sent.
     shutdown_deadline: std::time::Duration,
+    /// Per-gear deadline for context construction and [`Gear::init`](crate::contracts::Gear::init).
+    /// Expiry force-exits the process (see [`DEFAULT_INIT_DEADLINE`]).
+    init_deadline: std::time::Duration,
 }
 
 impl HostRuntime {
@@ -237,7 +308,23 @@ impl HostRuntime {
             db_options,
             oop_options,
             shutdown_deadline: DEFAULT_SHUTDOWN_DEADLINE,
+            init_deadline: DEFAULT_INIT_DEADLINE,
         }
+    }
+
+    /// Set the per-gear deadline for context construction and [`Gear::init`](crate::contracts::Gear::init).
+    ///
+    /// A stuck `.await` returns [`RegistryError::InitTimeout`]; a synchronous
+    /// block force-exits the process. Defaults to [`DEFAULT_INIT_DEADLINE`].
+    #[must_use]
+    pub fn with_init_deadline(mut self, deadline: std::time::Duration) -> Self {
+        self.init_deadline = deadline;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn init_deadline(&self) -> std::time::Duration {
+        self.init_deadline
     }
 
     /// Set a custom shutdown deadline for graceful gear stop.
@@ -504,6 +591,9 @@ impl HostRuntime {
     }
 
     /// INIT phase: initialize `entries` in the given order.
+    ///
+    /// Each gear's context construction and [`Gear::init`] share a force-exit
+    /// watchdog bounded by [`Self::init_deadline`] (see [`Self::init_gear`]).
     async fn run_init_phase_for(&self, entries: &[&GearEntry]) -> Result<(), RegistryError> {
         tracing::info!(gears = entries.len(), "Phase: init");
 
@@ -512,27 +602,70 @@ impl HostRuntime {
                 tracing::warn!("Init phase cancelled by signal");
                 return Err(RegistryError::Cancelled);
             }
-            let ctx =
-                self.ctx_builder
-                    .for_gear(entry.name)
-                    .await
-                    .map_err(|e| RegistryError::Init {
-                        gear: entry.name,
-                        source: e,
-                    })?;
             tracing::info!(gear = entry.name, "Initializing a gear...");
-            entry
-                .core
-                .init(&ctx)
-                .await
-                .map_err(|e| RegistryError::Init {
-                    gear: entry.name,
-                    source: e,
-                })?;
+            self.init_gear(entry).await?;
             tracing::info!(gear = entry.name, "Initialized a gear.");
         }
 
         Ok(())
+    }
+
+    /// Run a single gear's context construction and `init()` under a two-tier
+    /// bound on [`Self::init_deadline`]:
+    ///
+    /// - An async `tokio::time::timeout` catches the common case (a stuck
+    ///   `.await`) and returns a recoverable [`RegistryError::InitTimeout`].
+    /// - An OS-thread force-exit watchdog, armed at a *longer* deadline, is the
+    ///   only thing that can catch init blocking a worker *synchronously* (where
+    ///   the async timer can never fire); it disarms when init finishes or this
+    ///   future is dropped.
+    async fn init_gear(&self, entry: &GearEntry) -> Result<(), RegistryError> {
+        let gear_name = entry.name;
+        let deadline = self.init_deadline;
+        // Longer than the async bound so the recoverable path wins when the timer
+        // can actually fire.
+        let backstop = deadline.saturating_mul(2);
+        let _watchdog = arm_force_exit_watchdog(
+            backstop,
+            format!(
+                "init timed out; the gear appears hung, force exiting gear={gear_name} timeout_secs={}",
+                backstop.as_secs()
+            ),
+        );
+
+        let init =
+            async {
+                let ctx = self.ctx_builder.for_gear(entry.name).await.map_err(|e| {
+                    RegistryError::Init {
+                        gear: entry.name,
+                        source: e,
+                    }
+                })?;
+
+                entry
+                    .core
+                    .init(&ctx)
+                    .await
+                    .map_err(|e| RegistryError::Init {
+                        gear: entry.name,
+                        source: e,
+                    })
+            };
+
+        match tokio::time::timeout(deadline, init).await {
+            Ok(result) => result,
+            Err(_elapsed) => {
+                tracing::error!(
+                    gear = gear_name,
+                    timeout_secs = deadline.as_secs(),
+                    "init timed out waiting on the gear; returning an error"
+                );
+                Err(RegistryError::InitTimeout {
+                    gear: gear_name,
+                    timeout: deadline,
+                })
+            }
+        }
     }
 
     /// Consumer proxy-wiring phase (eventual readiness).
@@ -1527,10 +1660,9 @@ impl HostRuntime {
         Ok(())
     }
 
-    /// Run the stop phase with a watchdog that force-exits the process if the
-    /// stop phase hangs on a blocking syscall. The watchdog is disarmed whether
-    /// the stop phase succeeds or fails, so a failing stop phase does not leave
-    /// the watchdog active and eventually force-exit the process.
+    /// Run the stop phase under a force-exit watchdog so a stop that hangs on a
+    /// blocking syscall cannot wedge shutdown. The watchdog disarms when the
+    /// phase returns (success or failure) or if this future is dropped.
     async fn run_stop_phase_guarded(&self) -> Result<(), RegistryError> {
         let gear_count = u32::try_from(self.registry.gears().len().max(1)).unwrap_or(1);
         let stop_timeout = self
@@ -1539,32 +1671,15 @@ impl HostRuntime {
             .and_then(|d| d.checked_add(std::time::Duration::from_secs(5)))
             .unwrap_or(self.shutdown_deadline);
 
-        // Use a channel to arm/disarm the watchdog. If the lifecycle future is
-        // dropped before the stop phase finishes (e.g. an outer timeout), the
-        // sender is dropped and the watchdog exits without killing the process.
-        let (disarm_tx, disarm_rx) = std::sync::mpsc::channel::<()>();
-        std::thread::spawn(move || {
-            match disarm_rx.recv_timeout(stop_timeout) {
-                Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                    // Stop phase completed, or the lifecycle future was cancelled.
-                }
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                    tracing::warn!(
-                        timeout_secs = stop_timeout.as_secs(),
-                        "shutdown: stop phase timed out, force exiting"
-                    );
-                    std::process::exit(1);
-                }
-            }
-        });
+        let _watchdog = arm_force_exit_watchdog(
+            stop_timeout,
+            format!(
+                "shutdown: stop phase timed out, force exiting timeout_secs={}",
+                stop_timeout.as_secs()
+            ),
+        );
 
-        let stop_result = self.run_stop_phase().await;
-        // Disarm the watchdog before propagating the stop-phase result. This runs
-        // for both success and failure so a failing stop phase does not leave the
-        // watchdog armed and eventually force-exit the process.
-        let _ = disarm_tx.send(()).ok();
-
-        stop_result
+        self.run_stop_phase().await
     }
 
     /// End a pending preparation, the runtime's own tasks and the gRPC
@@ -3378,6 +3493,249 @@ mod tests {
                 "post_init:user_b",
                 "post_init:user_c",
             ]
+        );
+    }
+
+    /// The force-exit watchdog (shared by init and stop) fires only when it is
+    /// never disarmed within the deadline. The decision is split from
+    /// `process::exit` into `watchdog_verdict` so it is unit-testable without
+    /// killing the test process; these cover the hung case and both disarm cases.
+    #[test]
+    fn watchdog_times_out_when_not_disarmed() {
+        let (_tx, rx) = std::sync::mpsc::channel::<()>();
+        // Hold the sender; never signal → the deadline elapses → TimedOut.
+        assert_eq!(
+            watchdog_verdict(&rx, std::time::Duration::from_millis(20)),
+            WatchdogVerdict::TimedOut
+        );
+    }
+
+    #[test]
+    fn init_watchdog_subprocess() {
+        const CHILD_MODE: &str = "TOOLKIT_INIT_WATCHDOG_TEST_MODE";
+        struct WatchdogGear(String);
+
+        #[async_trait::async_trait]
+        impl Gear for WatchdogGear {
+            async fn init(&self, _ctx: &GearCtx) -> anyhow::Result<()> {
+                match self.0.as_str() {
+                    "success" => (),
+                    // Async hang: the async timeout observes it → recoverable error.
+                    "async-hang" | "cancelled" => {
+                        std::future::pending::<()>().await;
+                    }
+                    // Synchronous block: no async timer can fire; only the
+                    // OS-thread watchdog catches it → force-exit.
+                    "blocking" | "blocking-no-tracing" => {
+                        std::thread::sleep(std::time::Duration::from_secs(3600));
+                    }
+                    "error" => anyhow::bail!("init failed"),
+                    other => panic!("unexpected watchdog test mode: {other}"),
+                }
+                Ok(())
+            }
+        }
+
+        let Ok(mode) = std::env::var(CHILD_MODE) else {
+            for (mode, expected_code) in [
+                ("success", 0),
+                ("async-hang", 0),
+                ("blocking", 1),
+                ("blocking-no-tracing", 1),
+                ("error", 0),
+                ("cancelled", 0),
+            ] {
+                let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "runtime::host_runtime::tests::init_watchdog_subprocess",
+                        "--nocapture",
+                    ])
+                    .env(CHILD_MODE, mode)
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
+                    .spawn()
+                    .unwrap();
+                let limit = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                while child.try_wait().unwrap().is_none() {
+                    if std::time::Instant::now() >= limit {
+                        child.kill().unwrap();
+                        let output = child.wait_with_output().unwrap();
+                        panic!("watchdog subprocess {mode} hung: {output:?}");
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                let output = child.wait_with_output().unwrap();
+                assert_eq!(
+                    output.status.code(),
+                    Some(expected_code),
+                    "{mode}: {output:?}"
+                );
+                if mode.starts_with("blocking") {
+                    // One line must carry ERROR + message + gear name (holds even
+                    // with tracing OFF, where only the stderr fallback is emitted).
+                    let logs = String::from_utf8_lossy(&output.stderr);
+                    assert!(
+                        logs.lines().any(|line| line.contains("ERROR")
+                            && line.contains("init timed out")
+                            && line.contains("watchdog-test")),
+                        "{logs}"
+                    );
+                }
+            }
+            return;
+        };
+
+        tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(if mode == "blocking-no-tracing" {
+                tracing::level_filters::LevelFilter::OFF
+            } else {
+                tracing::level_filters::LevelFilter::INFO
+            })
+            .with_writer(std::io::stderr)
+            .try_init()
+            .unwrap();
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let mut builder = RegistryBuilder::default();
+                builder.register_core_with_meta(
+                    "watchdog-test",
+                    &[],
+                    Arc::new(WatchdogGear(mode.clone())) as Arc<dyn Gear>,
+                );
+                let runtime = HostRuntime::new(
+                    builder.build_topo_sorted().unwrap(),
+                    Arc::new(EmptyConfigProvider) as Arc<dyn ConfigProvider>,
+                    DbOptions::None,
+                    Arc::new(ClientHub::new()),
+                    CancellationToken::new(),
+                    Uuid::new_v4(),
+                    None,
+                )
+                .with_init_deadline(std::time::Duration::from_millis(200));
+
+                #[allow(
+                    clippy::match_same_arms,
+                    reason = "`success` returns normally; in `blocking*` the same call never returns and the watchdog force-exits"
+                )]
+                match mode.as_str() {
+                    "cancelled" => {
+                        // Dropping the phase future disarms the watchdog: no exit.
+                        assert!(
+                            tokio::time::timeout(
+                                std::time::Duration::from_millis(20),
+                                runtime.run_init_phase(),
+                            )
+                            .await
+                            .is_err()
+                        );
+                    }
+                    "success" => {
+                        runtime.run_init_phase().await.unwrap();
+                    }
+                    "async-hang" => {
+                        // Recoverable error, not a force-exit.
+                        let err = runtime.run_init_phase().await.unwrap_err();
+                        assert!(matches!(
+                            err,
+                            RegistryError::InitTimeout {
+                                gear: "watchdog-test",
+                                ..
+                            }
+                        ));
+                    }
+                    "error" => {
+                        let err = runtime.run_init_phase().await.unwrap_err();
+                        assert!(matches!(
+                            err,
+                            RegistryError::Init {
+                                gear: "watchdog-test",
+                                ..
+                            }
+                        ));
+                    }
+                    // Never returns; the OS-thread watchdog force-exits instead.
+                    "blocking" | "blocking-no-tracing" => {
+                        runtime.run_init_phase().await.unwrap();
+                    }
+                    other => panic!("unexpected watchdog test mode: {other}"),
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+            });
+    }
+
+    #[test]
+    fn watchdog_disarms_when_signalled() {
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        tx.send(()).unwrap();
+        // A generous deadline proves we return on the signal, not by timing out.
+        assert_eq!(
+            watchdog_verdict(&rx, std::time::Duration::from_secs(30)),
+            WatchdogVerdict::Disarmed
+        );
+    }
+
+    #[test]
+    fn watchdog_disarms_when_sender_is_dropped() {
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        drop(tx); // guarded future dropped before it finished
+        assert_eq!(
+            watchdog_verdict(&rx, std::time::Duration::from_secs(30)),
+            WatchdogVerdict::Disarmed
+        );
+    }
+
+    /// When `GearContextBuilder::for_gear` fails (here: the gear's database
+    /// config references a global server that does not exist), the init phase
+    /// must surface it as `RegistryError::Init` naming the gear — not hang or
+    /// force-exit.
+    #[cfg(feature = "db")]
+    #[tokio::test]
+    async fn init_ctx_failure_surfaces_as_init_error() {
+        use figment::{Figment, providers::Serialized};
+
+        struct NeedsDbGear;
+
+        #[async_trait::async_trait]
+        impl Gear for NeedsDbGear {
+            async fn init(&self, _ctx: &GearCtx) -> anyhow::Result<()> {
+                Ok(())
+            }
+        }
+
+        let mut builder = RegistryBuilder::default();
+        builder.register_core_with_meta("needsdb", &[], Arc::new(NeedsDbGear) as Arc<dyn Gear>);
+        let registry = builder.build_topo_sorted().unwrap();
+
+        let figment = Figment::new().merge(Serialized::defaults(serde_json::json!({
+            "gears": {
+                "needsdb": {
+                    "database": { "server": "does-not-exist" }
+                }
+            }
+        })));
+        let db_manager =
+            toolkit_db::DbManager::from_figment(figment, std::path::PathBuf::from("/tmp/test"))
+                .unwrap();
+
+        let runtime = HostRuntime::new(
+            registry,
+            Arc::new(EmptyConfigProvider) as Arc<dyn ConfigProvider>,
+            DbOptions::Manager(Arc::new(db_manager)),
+            Arc::new(ClientHub::new()),
+            CancellationToken::new(),
+            Uuid::new_v4(),
+            None,
+        );
+
+        let err = runtime.run_init_phase().await.unwrap_err();
+        assert!(
+            matches!(err, RegistryError::Init { gear, .. } if gear == "needsdb"),
+            "expected RegistryError::Init for needsdb, got {err:?}"
         );
     }
 

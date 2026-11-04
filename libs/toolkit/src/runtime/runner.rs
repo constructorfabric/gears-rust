@@ -135,6 +135,10 @@ pub struct RunOptions {
     /// See `HostRuntime::with_shutdown_deadline` for details on the relationship
     /// with `WithLifecycle::stop_timeout`.
     pub shutdown_deadline: Option<std::time::Duration>,
+    /// Per-gear deadline for context construction and [`Gear::init`](crate::contracts::Gear::init).
+    /// `None` uses [`DEFAULT_INIT_DEADLINE`](crate::runtime::DEFAULT_INIT_DEADLINE); see
+    /// `HostRuntime::with_init_deadline` for the two-tier (error / force-exit) behavior.
+    pub init_deadline: Option<std::time::Duration>,
     /// Process-wide platform-plane credential source (the selected
     /// `InternalCredential`), threaded into every [`GearCtx`] so
     /// `#[toolkit::provides]`-generated clients attach `X-ToolKit-Internal-Token`
@@ -163,6 +167,7 @@ impl RunOptions {
             instance_id,
             oop: None,
             shutdown_deadline: None,
+            init_deadline: None,
             internal_token_provider: None,
         }
     }
@@ -185,6 +190,13 @@ impl RunOptions {
     #[must_use]
     pub fn with_shutdown_deadline(mut self, deadline: Option<std::time::Duration>) -> Self {
         self.shutdown_deadline = deadline;
+        self
+    }
+
+    /// Override the per-gear `init()` deadline.
+    #[must_use]
+    pub fn with_init_deadline(mut self, deadline: Option<std::time::Duration>) -> Self {
+        self.init_deadline = deadline;
         self
     }
 
@@ -267,6 +279,9 @@ fn build_host_runtime(opts: RunOptions) -> anyhow::Result<HostRuntime> {
     if let Some(deadline) = opts.shutdown_deadline {
         host = host.with_shutdown_deadline(deadline);
     }
+    if let Some(deadline) = opts.init_deadline {
+        host = host.with_init_deadline(deadline);
+    }
     host = host.with_internal_token_provider(opts.internal_token_provider);
 
     Ok(host)
@@ -298,4 +313,37 @@ pub async fn run_oop_serving(
 ) -> anyhow::Result<()> {
     let host = build_host_runtime(opts)?;
     host.run_oop_serving(serve).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct EmptyConfigProvider;
+    impl ConfigProvider for EmptyConfigProvider {
+        fn get_gear_config(&self, _gear_name: &str) -> Option<&serde_json::Value> {
+            None
+        }
+    }
+
+    fn opts() -> RunOptions {
+        RunOptions::new(
+            Arc::new(EmptyConfigProvider),
+            DbOptions::None,
+            ShutdownOptions::Token(CancellationToken::new()),
+            Uuid::new_v4(),
+        )
+    }
+
+    #[test]
+    fn build_host_runtime_applies_the_init_deadline() {
+        // `Some` must reach `HostRuntime::with_init_deadline`; `None` leaves the
+        // `DEFAULT_INIT_DEADLINE` in place.
+        let deadline = std::time::Duration::from_secs(7);
+        let host = build_host_runtime(opts().with_init_deadline(Some(deadline))).unwrap();
+        assert_eq!(host.init_deadline(), deadline);
+
+        let host = build_host_runtime(opts()).unwrap();
+        assert_eq!(host.init_deadline(), crate::runtime::DEFAULT_INIT_DEADLINE);
+    }
 }

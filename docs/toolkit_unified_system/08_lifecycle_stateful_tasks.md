@@ -121,6 +121,31 @@ pub struct ApiGateway {
 - `stop_timeout`: Graceful shutdown timeout (e.g., "30s", "1m")
 - `stop_timeout_fn`: Method name returning `Duration` from `&self`, evaluated at stop after initialization. Mutually exclusive with `stop_timeout`. Available in `#[gear(..., lifecycle(...))]` and `#[lifecycle(...)]`.
 - `await_ready`: Wait for ready signal before marking as Running
+- `ready_warn_after`: Non-fatal readiness **warning** period (e.g., "90s"); requires `await_ready`. See the deadline table below.
+
+## Runtime deadlines
+
+Three bounds protect startup and shutdown — two fatal, one a warning:
+
+| Deadline | Default | Scope | On expiry |
+| --- | --- | --- | --- |
+| `init_deadline` | 10m (`DEFAULT_INIT_DEADLINE`) | per-gear context build + `init()` | A stuck `.await` returns `RegistryError::InitTimeout` (recoverable); a *synchronous* worker block is caught by an OS-thread watchdog (longer backstop) that force-exits with code 1. |
+| `shutdown_deadline` | 35s (`DEFAULT_SHUTDOWN_DEADLINE`) | per-gear graceful stop | Set each gear's `stop_timeout` *below* this; if the stop phase wedges, the watchdog force-exits with code 1. |
+| `ready_warn_after` | 60s (`DEFAULT_READY_WARN_AFTER`) | readiness signal (ready-mode only) | **Warning only:** logs an error; the gear stays `Starting` and a late `notify()` still promotes it. |
+
+Force-exit diagnostics are logged at `error` and mirrored to `stderr`, with a grace timer guaranteeing the exit even if that write blocks.
+
+### Configuring the deadlines
+
+`init_deadline` and `shutdown_deadline` are set under the `server` section of the app config (both optional; absent fields keep the defaults) and threaded into `RunOptions` by both bootstrap entry points:
+
+```yaml
+server:
+  init_deadline_secs: 600
+  shutdown_deadline_secs: 35
+```
+
+`ready_warn_after` is configured per-gear via the `lifecycle(..., ready_warn_after = "...")` macro attribute, not through config.
 
 ## WithLifecycle states and transitions
 

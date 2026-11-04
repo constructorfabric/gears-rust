@@ -94,6 +94,10 @@ pub async fn run_server(config: AppConfig) -> Result<()> {
         None => None,
     };
 
+    // Apply configured lifecycle deadlines (absent fields keep framework defaults).
+    let init_deadline = config.server.init_deadline();
+    let shutdown_deadline = config.server.shutdown_deadline();
+
     // Run the ToolKit runtime with the root cancellation token.
     // Shutdown is driven by the signal handler spawned above, not by ShutdownOptions::Signals.
     // OoP gears are spawned after parent publication, application startup and
@@ -105,7 +109,9 @@ pub async fn run_server(config: AppConfig) -> Result<()> {
         instance_id,
     )
     .with_oop(oop_options)
-    .with_internal_token_provider(internal_token_provider);
+    .with_internal_token_provider(internal_token_provider)
+    .with_init_deadline(init_deadline)
+    .with_shutdown_deadline(shutdown_deadline);
 
     let result = run(run_options).await;
 
