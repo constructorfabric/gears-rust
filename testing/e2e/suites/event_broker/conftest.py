@@ -116,15 +116,26 @@ PREFILL_INGEST_TIMEOUT = 30.0
 # the session. RETENTION_SEGMENT_EVENTS old events fill exactly one storage
 # segment on the backends that expire whole segments (the backend block below
 # sets their segment size to it), so every backend removes exactly those.
+# Its age bound, TOPIC_RETENTION_AGE_S, is longer than the other age-bounded
+# topics' RETENTION_DURATION_S: its test reads one event after the old ones
+# aged out, and that read needs room before the event ages out too.
 TOPIC_RETENTION = "gts.cf.core.events.topic.v1~cf.e2e.event_broker.retention.v1"
 EVENT_TYPE_RETENTION = "gts.cf.core.events.event.v1~cf.e2e.event_broker.retention.v1~"
 RETENTION_DURATION_S = 8
+TOPIC_RETENTION_AGE_S = 12
 RETENTION_SEGMENT_EVENTS = 1000
 
-# Drained topic: the same age bound as TOPIC_RETENTION, for the test that lets
-# every stored event age out and checks "latest" still names the last one.
+# Drained topic: RETENTION_DURATION_S, for the test that lets every stored
+# event age out and checks "latest" still names the last one.
 TOPIC_DRAIN = "gts.cf.core.events.topic.v1~cf.e2e.event_broker.drain.v1"
 EVENT_TYPE_DRAIN = "gts.cf.core.events.event.v1~cf.e2e.event_broker.drain.v1~"
+
+# Slow-publish topic: RETENTION_DURATION_S, for the test that publishes one
+# batch for longer than that and reads it back whole. A topic of its own: a
+# stream seeked to "earliest" on a topic holding other tests' events is sent
+# `control:progress` frames for them.
+TOPIC_SLOW_PUBLISH = "gts.cf.core.events.topic.v1~cf.e2e.event_broker.slow_publish.v1"
+EVENT_TYPE_SLOW_PUBLISH = "gts.cf.core.events.event.v1~cf.e2e.event_broker.slow_publish.v1~"
 
 # Byte-bounded topic: RETENTION_BYTES per partition and the default age, so
 # only the byte bound removes anything during the session.
@@ -167,14 +178,16 @@ _TOPIC_PARTITIONS = {
     TOPIC_FRESH: 1,
     TOPIC_RETENTION: 1,
     TOPIC_DRAIN: 1,
+    TOPIC_SLOW_PUBLISH: 1,
     TOPIC_BYTES: 1,
     TOPIC_PROGRESS: 1,
 }
 
 # Topics bounded tighter than the default retention: their `retention` block.
 _TOPIC_RETENTION = {
-    TOPIC_RETENTION: {"duration": f"{RETENTION_DURATION_S}s"},
+    TOPIC_RETENTION: {"duration": f"{TOPIC_RETENTION_AGE_S}s"},
     TOPIC_DRAIN: {"duration": f"{RETENTION_DURATION_S}s"},
+    TOPIC_SLOW_PUBLISH: {"duration": f"{RETENTION_DURATION_S}s"},
     TOPIC_BYTES: {"size_bytes": RETENTION_BYTES},
 }
 
@@ -272,6 +285,8 @@ _EXTRA_ENTITIES = [
     _derived_event_type(EVENT_TYPE_RETENTION, TOPIC_RETENTION),
     _topic_instance(TOPIC_DRAIN),
     _derived_event_type(EVENT_TYPE_DRAIN, TOPIC_DRAIN),
+    _topic_instance(TOPIC_SLOW_PUBLISH),
+    _derived_event_type(EVENT_TYPE_SLOW_PUBLISH, TOPIC_SLOW_PUBLISH),
     _topic_instance(TOPIC_BYTES),
     _derived_event_type(EVENT_TYPE_BYTES, TOPIC_BYTES),
     _topic_instance(TOPIC_PROGRESS),
@@ -558,6 +573,7 @@ _TOPIC_EVENT_TYPES = {
     TOPIC_FRESH: EVENT_TYPE_FRESH,
     TOPIC_RETENTION: EVENT_TYPE_RETENTION,
     TOPIC_DRAIN: EVENT_TYPE_DRAIN,
+    TOPIC_SLOW_PUBLISH: EVENT_TYPE_SLOW_PUBLISH,
     TOPIC_BYTES: EVENT_TYPE_BYTES,
     TOPIC_PROGRESS: EVENT_TYPE_PROGRESS,
 }
