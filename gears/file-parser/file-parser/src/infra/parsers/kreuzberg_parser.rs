@@ -95,8 +95,9 @@ impl FileParserBackend for KreuzbergParser {
         let config = Self::config();
         let owned_path = PathBuf::from(path_str);
         let owned_mime = mime.map(str::to_owned);
-        // Kreuzberg only offloads DOCX parsing in batch mode, so run extraction
-        // and IR conversion on the blocking pool to keep the executor free.
+        // Extraction for every kreuzberg format (PDF/PPTX/XLSX/DOCX) is CPU-bound
+        // and kreuzberg only offloads DOCX in batch mode, so run extraction and
+        // IR conversion on the blocking pool to keep the executor free.
         let handle = tokio::runtime::Handle::current();
         let (result, blocks) = tokio::task::spawn_blocking(move || {
             let result = handle
@@ -108,7 +109,10 @@ impl FileParserBackend for KreuzbergParser {
             Ok::<_, DomainError>((result, blocks))
         })
         .await
-        .map_err(|e| DomainError::parse_error(format!("Kreuzberg extraction failed: {e}")))??;
+        .map_err(|e| {
+            tracing::error!(error = %e, "kreuzberg extraction task failed");
+            DomainError::io_error(format!("Kreuzberg extraction task failed: {e}"))
+        })??;
         // Prefer the MIME type Kreuzberg detected over the hint we passed in;
         // leave content_type unset if neither Kreuzberg nor the hint has a value.
         let content_type = {
@@ -182,7 +186,10 @@ impl FileParserBackend for KreuzbergParser {
             Ok::<_, DomainError>((result, blocks))
         })
         .await
-        .map_err(|e| DomainError::parse_error(format!("Kreuzberg extraction failed: {e}")))??;
+        .map_err(|e| {
+            tracing::error!(error = %e, "kreuzberg extraction task failed");
+            DomainError::io_error(format!("Kreuzberg extraction task failed: {e}"))
+        })??;
         let filename = filename_hint.unwrap_or("unknown");
 
         // Prefer the MIME type Kreuzberg detected; leave content_type unset if
@@ -273,5 +280,19 @@ mod tests {
     fn test_mime_for_ext_filters_by_supported_extensions() {
         assert!(crate::domain::mime_table::mime_for_extension("png").is_some());
         assert_eq!(KreuzbergParser::mime_for_ext("png"), None);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_parse_bytes_html_on_multi_thread_runtime() {
+        let parser = KreuzbergParser::new();
+        let doc = parser
+            .parse_bytes(
+                Some("x.html"),
+                Some("text/html"),
+                bytes::Bytes::from_static(b"<html><body><h1>Hi</h1><p>Body</p></body></html>"),
+            )
+            .await
+            .unwrap();
+        assert!(!doc.blocks.is_empty());
     }
 }
