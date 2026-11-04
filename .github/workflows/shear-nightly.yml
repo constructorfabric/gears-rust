@@ -4,9 +4,9 @@ name: Unused Deps (nightly)
 #
 # `make shear` runs `cargo shear --expand`, which macro-expands the entire
 # workspace on a pinned nightly toolchain. That is effectively a full second
-# build (~1h) with no reusable target cache, which made it the longest job in
-# the PR pipeline while being advisory-only. Unused dependencies are a
-# slow-moving property, so this runs nightly instead.
+# build (~2h, growing with the crate count) with no reusable target cache,
+# which made it the longest job in the PR pipeline while being advisory-only.
+# Unused dependencies are a slow-moving property, so this runs nightly instead.
 #
 # A failure implicates every commit merged that day, but attribution is cheap:
 # cargo-shear names the offending package and dependency, which points at one
@@ -27,8 +27,8 @@ on:
   workflow_dispatch:
 
 # No concurrency group: cron runs are 24h apart and the job caps out well under
-# that, so the only way to overlap is a manual dispatch landing inside the ~1h
-# window a scheduled run is active. Not worth guarding against.
+# that, so the only way to overlap is a manual dispatch landing inside the few
+# hours a scheduled run is active. Not worth guarding against.
 
 permissions:
   contents: read
@@ -56,10 +56,15 @@ jobs:
   shear:
     name: Unused Deps (cargo-shear)
     runs-on: ${{ (vars.GEARS_FORCE_GITHUB_HOSTED == 'true' || github.repository != 'constructorfabric/gears-rust' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && 'ubuntu-latest' || 'gears-large' }}
-    # Measured ~57m. Generous headroom on purpose: a false timeout costs the
-    # only signal of the day and stays invisible for another 24h, while an
-    # over-long cap on a genuinely hung job costs runner minutes once.
-    timeout-minutes: 120
+    # Run time grows with the number of workspace crates: about 0.66 min per
+    # crate on a normal night (77m for 118 crates on 2026-09-25, 104m for 153
+    # on 2026-10-27) and up to 1.2 min per crate on a slow one (2026-11-03).
+    # With 164 crates that is 110-200m, so the old cap of 120 timed out every
+    # night from 2026-10-28. Generous headroom on purpose: a false timeout
+    # costs the only signal of the day and stays invisible for another 24h,
+    # while an over-long cap on a genuinely hung job costs runner minutes once.
+    # Raise it again as the workspace grows.
+    timeout-minutes: 240
     steps:
       - name: Free disk space
         if: runner.environment == 'github-hosted'
