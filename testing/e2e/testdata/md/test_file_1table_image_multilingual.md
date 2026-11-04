@@ -29,8 +29,6 @@ Table1
 Español (Spanish)
  El rápido zorro marrón salta sobre el perro perezoso. Esta frase se utiliza frecuentemente para comprobar cómo se muestran los caracteres y cómo se gestionan los saltos de línea y los acentos.
 
-![]()
-
 Русский (Russian)
  Быстрая коричневая лисица перепрыгнула через ленивую собаку. Эта фраза охватывает многие буквы русского алфавита и подходит для проверки текстовых интерфейсов.
 
