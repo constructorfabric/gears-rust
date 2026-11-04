@@ -110,7 +110,7 @@ impl FileParserBackend for KreuzbergParser {
         })
         .await
         .map_err(|e| {
-            tracing::error!(error = %e, "kreuzberg extraction task failed");
+            tracing::error!(error = %e, path = %path.display(), mime = ?mime, "kreuzberg extraction task failed");
             DomainError::io_error(format!("Kreuzberg extraction task failed: {e}"))
         })??;
         // Prefer the MIME type Kreuzberg detected over the hint we passed in;
@@ -187,7 +187,7 @@ impl FileParserBackend for KreuzbergParser {
         })
         .await
         .map_err(|e| {
-            tracing::error!(error = %e, "kreuzberg extraction task failed");
+            tracing::error!(error = %e, mime, "kreuzberg extraction task failed");
             DomainError::io_error(format!("Kreuzberg extraction task failed: {e}"))
         })??;
         let filename = filename_hint.unwrap_or("unknown");
