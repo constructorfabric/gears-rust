@@ -454,6 +454,40 @@ mod tests {
     }
 
     #[test]
+    fn group_heading_deduped_even_when_child_level_differs() {
+        let doc = group_doc(NodeContent::Heading {
+            level: 3,
+            text: "X".to_owned(),
+        });
+        let blocks = blocks_of(&doc);
+        let headings: Vec<_> = blocks
+            .iter()
+            .filter(|b| matches!(b, ParsedBlock::Heading { .. }))
+            .collect();
+        assert_eq!(headings.len(), 1, "got {blocks:?}");
+        assert_eq!(heading_of(headings[0]), (3, "X".to_owned()));
+    }
+
+    #[test]
+    fn group_with_blank_heading_text_emits_no_group_heading() {
+        let mut doc = DocumentStructure::new();
+        let group = doc.push_node(node(NodeContent::Group {
+            label: None,
+            heading_level: Some(2),
+            heading_text: Some("  ".to_owned()),
+        }));
+        let body = doc.push_node(node(NodeContent::Paragraph {
+            text: "body".to_owned(),
+        }));
+        doc.add_child(group, body);
+        let blocks = blocks_of(&doc);
+        assert!(
+            matches!(blocks.as_slice(), [ParsedBlock::Paragraph { .. }]),
+            "got {blocks:?}"
+        );
+    }
+
+    #[test]
     fn group_heading_not_repeated_when_first_child_is_title() {
         let doc = group_doc(NodeContent::Title {
             text: "X".to_owned(),

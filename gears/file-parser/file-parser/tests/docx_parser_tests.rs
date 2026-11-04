@@ -71,6 +71,21 @@ async fn test_docx_parser_with_working_file() {
 }
 
 #[tokio::test]
+async fn test_docx_parser_parse_bytes_without_any_hint_errors() {
+    let parser = KreuzbergParser::new();
+    let test_file = get_test_file_path("test_file_1table_multilingual.docx");
+    let bytes = bytes::Bytes::from(std::fs::read(&test_file).unwrap());
+
+    let err = parser.parse_bytes(None, None, bytes).await.unwrap_err();
+
+    assert!(matches!(err, DomainError::ParseError { .. }), "got {err:?}");
+    assert!(
+        err.to_string().contains("Cannot determine MIME type"),
+        "got {err}"
+    );
+}
+
+#[tokio::test]
 async fn test_docx_parser_with_two_page_file() {
     let parser = KreuzbergParser::new();
     let test_file = get_test_file_path("test_file_2pages_multilingual.docx");
