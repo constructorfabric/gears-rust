@@ -633,11 +633,14 @@ async fn the_retrieval_scenarios_answer_within_their_budgets() {
     // Filtered on a declared payload path and ordered, which is the shape
     // the criteria table describes -- an unfiltered first page would measure
     // the table's ceiling, not the query behind it.
-    let table_request = conformance::projection(
+    let mut table_request = conformance::projection(
         &[conformance::OWNED],
         "payload/severity eq 'critical'",
         &[("node_key", toolkit_odata::SortDir::Asc)],
     );
+    // The page the scenario names; without it the configured default page
+    // (`projection_max_page`) is what gets measured.
+    table_request.query = table_request.query.with_limit(50);
     let seeds: Vec<String> = (0..8).map(|i| format!("perf-{}", i * 977)).collect();
     let seed_ids: Vec<graph_storage_sdk::models::NodeId> = store
         .resolve_node_ids(&ctx, &seeds)
@@ -715,6 +718,7 @@ async fn the_retrieval_scenarios_answer_within_their_budgets() {
                         .await
                         .expect("the projection answers");
                     assert!(!page.items.is_empty(), "the filter must match something");
+                    assert!(page.items.len() <= 50, "the scenario reads one page of 50");
                 }
             })
             .await;
