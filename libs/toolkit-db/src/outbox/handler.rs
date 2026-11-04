@@ -17,6 +17,7 @@ pub struct OutboxMessage {
     pub created_at: chrono::DateTime<chrono::Utc>,
     /// How many times this message has been retried (0 on first attempt).
     /// The handler uses this to decide when to give up and return Reject.
+    /// Stops growing just short of `i16::MAX` rather than overflowing.
     pub attempts: i16,
 }
 
