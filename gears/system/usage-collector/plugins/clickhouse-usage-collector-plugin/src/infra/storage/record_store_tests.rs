@@ -368,16 +368,14 @@ fn metadata_filter_binds_key_and_every_value() {
     assert!(matches!(&ctx.binds[0], SqlBind::Str(s) if s == "region"));
 }
 
-/// The version-invariant half of a caller `$filter` is translated into the
-/// inner scan and the `status` half above the resolution step, with the binds
-/// landing in that same order.
+/// A caller `$filter` is translated conjunct by conjunct into the single
+/// `WHERE`, `status` included, with the binds landing in that same order.
 ///
-/// Bind order is the sharp edge: `ClickHouse` `?` is positional, and the inner
-/// `WHERE` precedes the outer one in the emitted text. Translating the outer
-/// half first would still produce valid SQL — with the tenant UUID bound to the
-/// status placeholder.
+/// Bind order is the sharp edge: `ClickHouse` `?` is positional, so a clause
+/// translated out of text order would still produce valid SQL — with the
+/// tenant UUID bound to the status placeholder.
 #[test]
-fn push_split_filter_pushes_the_time_window_into_the_inner_scan() {
+fn push_filter_appends_every_conjunct_in_order_with_its_binds() {
     use toolkit_odata::filter::{FilterField, FilterNode, FilterOp, ODataValue};
     use usage_collector_sdk::UsageRecordFilterField;
 
@@ -404,45 +402,51 @@ fn push_split_filter_pushes_the_time_window_into_the_inner_scan() {
         ),
     ]);
 
-    // The metadata side-channel already occupies the inner context, exactly as
-    // it does at the call sites.
-    let mut inner_ctx = SqlCtx::new();
-    let mut inner_clauses = vec!["gts_id = ?".to_owned()];
-    let mut outer_ctx = SqlCtx::new();
-    let mut outer_clauses = vec!["status = 'active'".to_owned()];
+    // The metadata side-channel already occupies the context, exactly as it
+    // does at the call sites.
+    let mut ctx = SqlCtx::new();
+    ctx.push(SqlBind::Str("region".to_owned()));
+    let mut clauses = vec!["gts_id = ?".to_owned(), "metadata[?] IN (?)".to_owned()];
+    ctx.push(SqlBind::Str("eu".to_owned()));
 
-    ChRecordStore::push_split_filter(
-        &node,
-        &mut inner_ctx,
-        &mut inner_clauses,
-        &mut outer_ctx,
-        &mut outer_clauses,
-    )
-    .expect("filter translates");
+    ChRecordStore::push_filter(&node, &mut ctx, &mut clauses).expect("filter translates");
 
     assert_eq!(
-        inner_clauses,
+        clauses,
         vec![
             "gts_id = ?".to_owned(),
+            "metadata[?] IN (?)".to_owned(),
             "tenant_id = ?".to_owned(),
             "created_at >= fromUnixTimestamp64Micro(?)".to_owned(),
+            "status = ?".to_owned(),
         ],
-        "tenant_id and created_at are key-prefix columns and must prune the scan"
-    );
-    assert_eq!(
-        outer_clauses,
-        vec!["status = 'active'".to_owned(), "status = ?".to_owned()],
-        "status must stay above the version-resolution step"
+        "every conjunct lands in the one WHERE, after what was already there"
     );
 
-    assert!(matches!(&inner_ctx.binds[0], SqlBind::Uuid(u) if *u == tenant));
+    assert_eq!(ctx.binds.len(), 5);
+    assert!(matches!(&ctx.binds[2], SqlBind::Uuid(u) if *u == tenant));
     assert!(matches!(
-        &inner_ctx.binds[1],
+        &ctx.binds[3],
         SqlBind::DateTime64Micros(1_767_225_600_000_000)
     ));
-    assert_eq!(inner_ctx.binds.len(), 2);
-    assert_eq!(outer_ctx.binds.len(), 1);
-    assert!(matches!(&outer_ctx.binds[0], SqlBind::Str(s) if s == "active"));
+    assert!(matches!(&ctx.binds[4], SqlBind::Str(s) if s == "active"));
+}
+
+/// An empty `AND` — which the gateway can send — adds no clause and no bind,
+/// so the emitted `WHERE` cannot contain a bare `()`.
+#[test]
+fn push_filter_of_an_empty_and_adds_nothing() {
+    use toolkit_odata::filter::FilterNode;
+    use usage_collector_sdk::UsageRecordFilterField;
+
+    use crate::infra::storage::query::translate::SqlCtx;
+
+    let node: FilterNode<UsageRecordFilterField> = FilterNode::and(Vec::new());
+    let mut ctx = SqlCtx::new();
+    let mut clauses = vec!["gts_id = ?".to_owned()];
+    ChRecordStore::push_filter(&node, &mut ctx, &mut clauses).expect("translates");
+    assert_eq!(clauses, vec!["gts_id = ?".to_owned()]);
+    assert!(ctx.binds.is_empty());
 }
 
 // ── Offline store ─────────────────────────────────────────────────────────────
@@ -1061,33 +1065,30 @@ fn aggregate_response_stream_parses_across_chunk_boundaries() {
 
 // ── build_aggregate_sql / build_list_sql ──────────────────────────────────────
 
-/// The realistic scan clause set: `gts_id` is always pinned, and non-`SUM` ops
-/// add the `corrects_id` partition.
-fn inner() -> Vec<String> {
-    vec!["gts_id = ?".to_owned(), "corrects_id IS NULL".to_owned()]
+/// The realistic aggregate clause set, in push order: `gts_id` is always
+/// pinned, non-`SUM` ops add the `corrects_id` partition, then liveness.
+fn clauses() -> Vec<String> {
+    vec![
+        "gts_id = ?".to_owned(),
+        "corrects_id IS NULL".to_owned(),
+        "status = 'active'".to_owned(),
+    ]
 }
 
-/// The exact survivor predicate the aggregate must emit for [`inner`]: raw
-/// active rows whose id carries no marker, with the scan text repeated inside
-/// the marker subquery so it prunes on the same key range.
-const AGG_SURVIVORS: &str = "status = 'active' AND id NOT IN \
-     (SELECT id FROM usage_records WHERE gts_id = ? AND corrects_id IS NULL \
-     AND status = 'inactive')";
-
-/// The aggregate has no version-resolving level: no `GROUP BY` on the sort key,
-/// no `HAVING`, no `LIMIT 1 BY`, no `argMax`, and no nested `SELECT` other than
-/// the marker subquery. Deactivation is handled by the survivor predicate.
+/// The aggregate is one level over `FINAL`-resolved rows: `FINAL` on the table
+/// expression, one `SELECT`, one `WHERE`, and no resolution construct of its
+/// own — no marker subquery, no `LIMIT 1 BY`, no `argMax`, no `HAVING`, no
+/// `GROUP BY` on the sort key, no `version`.
 #[test]
-fn aggregate_sql_is_a_single_level_scan_with_the_marker_anti_join() {
-    let sql = ChRecordStore::build_aggregate_sql("SUM(value) AS agg", &inner(), &[], "", "");
+fn aggregate_sql_reads_final_with_a_single_where() {
+    let sql = ChRecordStore::build_aggregate_sql("SUM(value) AS agg", &clauses(), "", "");
     assert_eq!(
         sql,
-        format!(
-            "SELECT SUM(value) AS agg FROM usage_records \
-             WHERE gts_id = ? AND corrects_id IS NULL AND {AGG_SURVIVORS}"
-        )
+        "SELECT SUM(value) AS agg FROM usage_records FINAL \
+         WHERE gts_id = ? AND corrects_id IS NULL AND status = 'active'"
     );
     for forbidden in [
+        "NOT IN",
         "HAVING",
         "LIMIT 1 BY",
         "argMax",
@@ -1099,77 +1100,72 @@ fn aggregate_sql_is_a_single_level_scan_with_the_marker_anti_join() {
             "no resolution construct may remain (`{forbidden}`): {sql}"
         );
     }
-    assert_eq!(
-        sql.matches("SELECT").count(),
-        2,
-        "the marker subquery is the only nested SELECT: {sql}"
-    );
+    assert_eq!(sql.matches("SELECT").count(), 1, "one level: {sql}");
+    assert_eq!(sql.matches("WHERE").count(), 1, "one WHERE: {sql}");
 }
 
-/// Every scan predicate is repeated verbatim inside the marker subquery, so the
-/// caller binds the scan values twice — the placeholder count pins that
-/// contract, and a scan clause with its own `?` must be doubled too.
+/// Bind contract: every `?` in the clauses appears exactly once in the text,
+/// in clause order, so the caller binds `gts_id` and then each clause bind
+/// once.
 #[test]
-fn aggregate_sql_repeats_every_scan_predicate_inside_the_marker_subquery() {
-    let mut scan = inner();
+fn aggregate_sql_binds_every_placeholder_once() {
+    let mut scan = clauses();
     scan.push("created_at >= fromUnixTimestamp64Micro(?)".to_owned());
     scan.push("metadata[?] IN (?, ?)".to_owned());
-    let scan_placeholders: usize = scan.iter().map(|c| c.matches('?').count()).sum();
-    let sql = ChRecordStore::build_aggregate_sql("SUM(value) AS agg", &scan, &[], "", "");
+    let placeholders: usize = scan.iter().map(|c| c.matches('?').count()).sum();
+    let sql = ChRecordStore::build_aggregate_sql("SUM(value) AS agg", &scan, "", "");
     assert_eq!(
         sql.matches('?').count(),
-        2 * scan_placeholders,
-        "scan binds are applied twice, once per copy of the scan text: {sql}"
+        placeholders,
+        "each clause bind is applied once: {sql}"
     );
-    let scan_text = scan.join(" AND ");
+    let text = scan.join(" AND ");
     assert_eq!(
-        sql.matches(scan_text.as_str()).count(),
-        2,
-        "the scan text must appear as the scan predicate and inside the subquery: {sql}"
+        sql.matches(text.as_str()).count(),
+        1,
+        "the clauses appear once, in push order: {sql}"
     );
 }
 
-/// The `status`-naming half of `$filter` trails the survivor predicate in the
-/// same `WHERE`, so its binds come after both copies of the scan binds.
+/// A caller `status` conjunct sits in the same single `WHERE` as the liveness
+/// predicate: after `FINAL` both read the resolved status.
 #[test]
-fn aggregate_sql_appends_version_dependent_filters_after_the_survivor_predicate() {
+fn aggregate_sql_keeps_a_caller_status_filter_in_the_single_where() {
+    let mut scan = clauses();
+    scan.push("status = ?".to_owned());
     let sql = ChRecordStore::build_aggregate_sql(
         "SUM(value) AS agg",
-        &inner(),
-        &["status = ?".to_owned()],
+        &scan,
         " GROUP BY 1",
         " LIMIT 100001",
     );
     assert!(
-        sql.contains(&format!(
-            "{AGG_SURVIVORS} AND status = ? GROUP BY 1 LIMIT 100001"
-        )),
-        "the trailing conjunct must follow the survivor predicate: {sql}"
+        sql.contains("AND status = 'active' AND status = ? GROUP BY 1 LIMIT 100001"),
+        "the caller conjunct follows liveness, then grouping and the cap: {sql}"
     );
-    assert_eq!(
-        sql.matches("WHERE").count(),
-        2,
-        "one WHERE for the query, one inside the marker subquery: {sql}"
-    );
+    assert_eq!(sql.matches("WHERE").count(), 1, "one WHERE: {sql}");
 }
 
 /// The syntax-error guard stated as a property rather than as literal strings,
 /// across every combination of the branches that vary.
 #[test]
 fn aggregate_sql_never_emits_an_empty_clause_or_a_double_space() {
-    let outer_variants: [Vec<String>; 2] = [vec![], vec!["status = ?".to_owned()]];
+    let clause_variants: [Vec<String>; 2] = [clauses(), {
+        let mut c = clauses();
+        c.push("status = ?".to_owned());
+        c
+    }];
     let grouping_variants = [("", ""), (" GROUP BY 1", " LIMIT 100001")];
 
-    for outer in &outer_variants {
+    for scan in &clause_variants {
         for (group_by, limit_clause) in grouping_variants {
             let sql = ChRecordStore::build_aggregate_sql(
                 "SUM(value) AS agg",
-                &inner(),
-                outer,
+                scan,
                 group_by,
                 limit_clause,
             );
-            let ctx = format!("outer={outer:?} group_by={group_by:?} sql={sql}");
+            let ctx = format!("clauses={scan:?} group_by={group_by:?} sql={sql}");
             assert!(!sql.contains("  "), "double space: {ctx}");
             assert!(!sql.contains("WHERE )"), "empty WHERE before close: {ctx}");
             assert!(!sql.contains("WHERE GROUP BY"), "empty WHERE: {ctx}");
@@ -1182,94 +1178,94 @@ fn aggregate_sql_never_emits_an_empty_clause_or_a_double_space() {
     }
 }
 
-/// The ungrouped shape (`dim_count == 0`) appends nothing after the survivor
-/// predicate. The gateway depends on this call producing exactly one bucket, so
+/// The ungrouped shape (`dim_count == 0`) appends nothing after the last
+/// clause. The gateway depends on this call producing exactly one bucket, so
 /// the text must not gain a stray clause that could filter it away.
 #[test]
-fn aggregate_sql_ungrouped_ends_at_the_survivor_predicate() {
-    let sql = ChRecordStore::build_aggregate_sql("SUM(value) AS agg", &inner(), &[], "", "");
+fn aggregate_sql_ungrouped_ends_at_the_last_clause() {
+    let sql = ChRecordStore::build_aggregate_sql("SUM(value) AS agg", &clauses(), "", "");
     assert!(
-        sql.ends_with("AND status = 'inactive')"),
+        sql.ends_with("AND status = 'active'"),
         "no grouping and no trailing filter means nothing follows: {sql}"
     );
 }
 
-/// The scan keeps every version-invariant predicate, where it prunes.
-/// `tenant_id` and `created_at` reach `aggregate` only through `$filter`, and
-/// with `gts_id` they are the whole sort-key prefix.
+/// `FINAL` is on the table expression itself — the one place it resolves the
+/// rows every later clause reads — and the key-prefix predicates follow it in
+/// the single `WHERE`, where `ClickHouse` still pushes them into the read.
 #[test]
-fn aggregate_sql_keeps_invariant_predicates_in_the_scan() {
-    let mut scan = inner();
+fn aggregate_sql_places_final_on_the_table_expression() {
+    let mut scan = clauses();
     scan.push("created_at >= fromUnixTimestamp64Micro(?)".to_owned());
-    let sql = ChRecordStore::build_aggregate_sql("SUM(value) AS agg", &scan, &[], "", "");
+    let sql = ChRecordStore::build_aggregate_sql("SUM(value) AS agg", &scan, "", "");
     assert!(
         sql.starts_with(
-            "SELECT SUM(value) AS agg FROM usage_records WHERE gts_id = ? AND corrects_id IS NULL \
-             AND created_at >= fromUnixTimestamp64Micro(?) AND status = 'active'"
+            "SELECT SUM(value) AS agg FROM usage_records FINAL WHERE gts_id = ? \
+             AND corrects_id IS NULL AND status = 'active' \
+             AND created_at >= fromUnixTimestamp64Micro(?)"
         ),
-        "invariant conjuncts belong on the scan, ahead of the survivor predicate: {sql}"
+        "FINAL on the table, then the clauses in push order: {sql}"
     );
 }
 
-/// `list` is likewise single-level: no version sort, no `LIMIT 1 BY`, the
-/// caller's `ORDER BY` and look-ahead `LIMIT` applied once, after every
-/// predicate. Its survivor predicate keeps markers (they *are* the resolved
-/// inactive rows) and drops only the active rows a marker supersedes.
+/// `list` is likewise one level over `FINAL`: no version sort, no `LIMIT 1
+/// BY`, no marker subquery; the caller's `ORDER BY` and look-ahead `LIMIT`
+/// applied once, after resolution and every predicate. No liveness predicate
+/// of its own — a deactivated record is returned as its resolved marker row.
 #[test]
-fn list_sql_is_a_single_level_scan_with_the_resolved_survivors() {
+fn list_sql_reads_final_with_a_single_where() {
     let scan = vec!["gts_id = ?".to_owned()];
-    let sql = ChRecordStore::build_list_sql(&scan, &[], "created_at ASC, id ASC", 101);
+    let sql = ChRecordStore::build_list_sql(&scan, "created_at ASC, id ASC", 101);
     assert_eq!(
         sql,
         format!(
-            "SELECT {} FROM usage_records WHERE gts_id = ? AND (status = 'inactive' OR id NOT IN \
-             (SELECT id FROM usage_records WHERE gts_id = ? AND status = 'inactive')) \
+            "SELECT {} FROM usage_records FINAL WHERE gts_id = ? \
              ORDER BY created_at ASC, id ASC LIMIT 101",
             super::RECORD_COLUMNS
         )
     );
-    for forbidden in ["LIMIT 1 BY", "version DESC", "argMax", "GROUP BY"] {
+    for forbidden in [
+        "NOT IN",
+        "LIMIT 1 BY",
+        "version DESC",
+        "argMax",
+        "GROUP BY",
+        "status = 'inactive'",
+    ] {
         assert!(
             !sql.contains(forbidden),
             "no resolution construct may remain (`{forbidden}`): {sql}"
         );
     }
+    assert_eq!(sql.matches("SELECT").count(), 1, "one level: {sql}");
 }
 
-/// Bind contract for `list`: scan binds twice, then the trailing binds (the
-/// `status` half of `$filter`, then the keyset tuple) in that order.
+/// Bind contract for `list`: every clause bind once, in clause order — the
+/// metadata side-channel, the caller `$filter` (`status` included), then the
+/// keyset tuple — ahead of `ORDER BY` / `LIMIT`.
 #[test]
-fn list_sql_places_trailing_predicates_after_the_survivors_and_before_order_by() {
+fn list_sql_binds_every_placeholder_once_in_clause_order() {
     let scan = vec![
         "gts_id = ?".to_owned(),
         "tenant_id = ?".to_owned(),
         "metadata[?] IN (?)".to_owned(),
-    ];
-    let outer = vec![
         "status = ?".to_owned(),
         "(created_at, id) > (fromUnixTimestamp64Micro(?), ?)".to_owned(),
     ];
-    let sql = ChRecordStore::build_list_sql(&scan, &outer, "created_at ASC, id ASC", 51);
-    let scan_placeholders: usize = scan.iter().map(|c| c.matches('?').count()).sum();
-    let outer_placeholders: usize = outer.iter().map(|c| c.matches('?').count()).sum();
+    let sql = ChRecordStore::build_list_sql(&scan, "created_at ASC, id ASC", 51);
+    let placeholders: usize = scan.iter().map(|c| c.matches('?').count()).sum();
     assert_eq!(
         sql.matches('?').count(),
-        2 * scan_placeholders + outer_placeholders,
-        "scan binds twice, trailing binds once: {sql}"
+        placeholders,
+        "each clause bind is applied once: {sql}"
     );
     assert!(
-        sql.contains(
-            "AND status = 'inactive')) AND status = ? \
+        sql.ends_with(
+            "AND metadata[?] IN (?) AND status = ? \
              AND (created_at, id) > (fromUnixTimestamp64Micro(?), ?) \
              ORDER BY created_at ASC, id ASC LIMIT 51"
         ),
-        "status half, then keyset, then ORDER BY / LIMIT: {sql}"
-    );
-    let subquery_start = sql.find("(SELECT id").expect("marker subquery present");
-    let keyset_start = sql.find("(created_at, id) >").expect("keyset present");
-    assert!(
-        keyset_start > subquery_start,
-        "the keyset predicate must follow the survivor predicate: {sql}"
+        "clauses in push order, then ORDER BY / LIMIT: {sql}"
     );
 }
 
@@ -2100,4 +2096,100 @@ async fn create_batch_of_only_unrepresentable_values_issues_no_statement() {
         .as_ref()
         .expect_err("the only record is refused");
     assert_decimal_rejection(err, "the only slot");
+}
+
+// ── Mocked backend: an insert failure reaches the caller ─────────────────────
+//
+// With `async_insert = 1` and `wait_for_async_insert = 1` the INSERT's own
+// response *is* the flush's outcome: a buffer flush that fails server-side
+// fails the request. The mock stands in for that response, so these tests pin
+// that the store hands the failure to the caller instead of reporting the
+// record(s) as created.
+
+mod mocked {
+    use std::sync::Arc;
+
+    use clickhouse::test::Mock;
+    use uuid::Uuid;
+
+    use super::{VCPU_GTS, make_record};
+    use crate::domain::ports::RecordStore;
+    use crate::infra::metrics::Metrics;
+    use crate::infra::storage::entity::UsageRecordRow;
+    use crate::infra::storage::record_store::ChRecordStore;
+    use crate::infra::storage::test_mock::{client, fail, rows};
+    use usage_collector_sdk::UsageCollectorPluginError;
+
+    /// A store over the mock, with the shipped `async_insert = true`.
+    fn store(mock: &Mock) -> ChRecordStore {
+        ChRecordStore::new(
+            client(mock),
+            Arc::new(Metrics::new()),
+            std::time::Duration::from_secs(5),
+            true,
+        )
+    }
+
+    /// A single create whose INSERT (i.e. its async flush) fails returns the
+    /// error; nothing is reported as created.
+    #[tokio::test]
+    async fn a_failed_insert_fails_the_create() {
+        let mock = Mock::new();
+        // The catalog existence check finds the type …
+        rows(&mock, [VCPU_GTS.to_owned()]);
+        // … the dedup pre-read finds no earlier row …
+        rows(&mock, Vec::<UsageRecordRow>::new());
+        // … and the INSERT fails.
+        fail(&mock);
+
+        let err = store(&mock)
+            .create(make_record(
+                Uuid::from_u128(1),
+                Uuid::from_u128(2),
+                1_700_000_000_000_000,
+            ))
+            .await
+            .expect_err("a failed flush must not be acknowledged");
+        assert!(
+            matches!(err, UsageCollectorPluginError::Internal(_)),
+            "an HTTP 500 is not retryable by classification: {err:?}"
+        );
+    }
+
+    /// A batch whose INSERT fails reports the failure on every slot that was
+    /// to be inserted — the per-slot outcome vector keeps its input order.
+    #[tokio::test]
+    async fn a_failed_batch_insert_fails_every_inserted_slot() {
+        let mock = Mock::new();
+        // The batch catalog lookup finds the type …
+        rows(&mock, [VCPU_GTS.to_owned()]);
+        // … the batch dedup pre-read finds nothing …
+        rows(&mock, Vec::<UsageRecordRow>::new());
+        // … and the INSERT fails.
+        fail(&mock);
+
+        let batch = vec![
+            make_record(
+                Uuid::from_u128(1),
+                Uuid::from_u128(2),
+                1_700_000_000_000_000,
+            ),
+            make_record(
+                Uuid::from_u128(3),
+                Uuid::from_u128(2),
+                1_700_000_001_000_000,
+            ),
+        ];
+        let outcomes = store(&mock)
+            .create_batch(batch)
+            .await
+            .expect("a failed insert is reported per slot, not as a batch error");
+        assert_eq!(outcomes.len(), 2);
+        for (i, outcome) in outcomes.iter().enumerate() {
+            assert!(
+                matches!(outcome, Err(UsageCollectorPluginError::Internal(_))),
+                "slot {i} must carry the insert failure: {outcome:?}"
+            );
+        }
+    }
 }

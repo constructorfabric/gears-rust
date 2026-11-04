@@ -9,7 +9,8 @@
 use async_trait::async_trait;
 use time::OffsetDateTime;
 use toolkit_db::DbTx;
-use toolkit_db::secure::ScopeError;
+use toolkit_db::secure::{AccessScope, ScopeError};
+use uuid::Uuid;
 
 use crate::infra::events::{EventEnqueueError, EventKind, OrderSummary, TxEvents};
 use crate::infra::storage::entity;
@@ -111,21 +112,25 @@ impl<'l, 'a> ChildDocuments<'l, 'a> {
             .into_iter()
             .find(|row| row.line_id == line_id))
     }
+    /// One batch for a submit version's line rows (n107).
+    ///
     /// # Errors
-    /// Foreign parent, scope or store failure.
-    pub async fn insert_order_line(
+    /// Foreign parent, scope or store failure; a refused row inserts nothing.
+    pub async fn insert_order_lines(
         &self,
-        row: entity::order_line::Model,
-    ) -> Result<entity::order_line::Model, ScopeError> {
-        self.locked.insert_order_line(row).await
+        rows: Vec<entity::order_line::Model>,
+    ) -> Result<(), ScopeError> {
+        self.locked.insert_order_lines(rows).await
     }
+    /// One batch for a submit version's totals rows (n107).
+    ///
     /// # Errors
-    /// Foreign parent, scope or store failure.
-    pub async fn insert_resolved_total(
+    /// Foreign parent, scope or store failure; a refused row inserts nothing.
+    pub async fn insert_resolved_totals(
         &self,
-        row: entity::resolved_total::Model,
-    ) -> Result<entity::resolved_total::Model, ScopeError> {
-        self.locked.insert_resolved_total(row).await
+        rows: Vec<entity::resolved_total::Model>,
+    ) -> Result<(), ScopeError> {
+        self.locked.insert_resolved_totals(rows).await
     }
     /// # Errors
     /// Foreign parent, scope or store failure.
@@ -222,6 +227,66 @@ pub trait DocumentWriter: Send + Sync {
     async fn write(&self, documents: &ChildDocuments<'_, '_>) -> Result<(), ScopeError>;
 }
 
+/// What the engine settled when it writes a gate diagnostic run (M2-2): the locked order, the
+/// version the transition admitted, the audit entry it appends, its transition time and the
+/// caller's subject identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiagnosticsSettled {
+    /// Authoritative step-17 collision, replacing the advisory predicate-9 rows.
+    pub overlap_conflict: Option<crate::domain::overlap::OverlapConflict>,
+    /// The locked order the assessment gated.
+    pub order_id: Uuid,
+    /// The version the transition admitted: the appended candidate, or the locked current
+    /// version for a row that appends none; `None` on a refusal.
+    pub version: Option<i32>,
+    /// The audit entry this transition appends (committed on admission, resolved refusal
+    /// otherwise).
+    pub audit_id: Uuid,
+    /// The engine's single transition timestamp `t`.
+    pub transition_time: OffsetDateTime,
+    /// The caller's home tenant, from the attempt's `SecurityContext`: the scoping tenant of
+    /// every row.
+    pub subject_tenant_id: Uuid,
+    /// The caller's opaque principal, from the attempt's `SecurityContext`.
+    pub subject_id: String,
+}
+
+/// A slice's gate diagnostic run (M2-2; Foundation §3.6; DESIGN `#contract-03-3-7` "Submit and
+/// amendment reuse the engine transaction"), written by the engine inside the transition
+/// transaction before settlement: on a composite-gate refusal and an overlap conflict before the
+/// refusal audit, and on admission after the step-19 child documents and before the aggregate
+/// write. Engine-only refusals (state, version, draft revision, date basis) never call it. The
+/// engine never inspects the rows.
+///
+/// The engine is the only source of the run's subject identity: it supplies the caller's
+/// `subject_tenant_id`/`subject_id` from the attempt's `SecurityContext` in
+/// [`DiagnosticsSettled`] and the matching subject-tenant `scope`; an implementation carries
+/// neither and writes every row under that `scope`, as a Preview run does.
+#[async_trait]
+pub trait DiagnosticsContribution: Send + Sync {
+    /// The report after applying an authoritative collision, when this is a gate run.
+    /// # Errors
+    /// Invalid replacement or report serialization.
+    fn collision_report(
+        &self,
+        _conflict: &crate::domain::overlap::OverlapConflict,
+    ) -> Result<Option<serde_json::Value>, ScopeError> {
+        Ok(None)
+    }
+
+    /// Persist the run on `tx`; `scope` is the caller's subject-tenant scope
+    /// (`AccessScope::for_tenant(settled.subject_tenant_id)`), never the order write scope.
+    ///
+    /// # Errors
+    /// Any store failure; the engine aborts the whole attempt (no settlement, no audit).
+    async fn write(
+        &self,
+        tx: &DbTx<'_>,
+        scope: &AccessScope,
+        settled: &DiagnosticsSettled,
+    ) -> Result<u64, ScopeError>;
+}
+
 /// The row's one typed event (step 24), built from the engine's committed post-state summary.
 ///
 /// A detail receives only a sealed [`EventEnqueue`] handle: it supplies the payload, and the
@@ -265,14 +330,6 @@ impl<'l, 'a> EventEnqueue<'l, 'a> {
 }
 
 /// Any concrete event payload as an [`EventSpec`].
-#[cfg_attr(
-    any(not(test), not(orders_event_broker_test_support)),
-    expect(
-        dead_code,
-        reason = "no delivered draft row emits an event; submit (S3-12) and the later rows build it, as \
-                  the engine tests do (compiled only with #5381, D-229)"
-    )
-)]
 pub struct EventDetail<K>(
     /// The concrete event payload.
     pub K,

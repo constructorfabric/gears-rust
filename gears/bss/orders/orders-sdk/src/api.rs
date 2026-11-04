@@ -4,6 +4,7 @@ use crate::{
     OrdersError,
     authoring::{AddLine, CreateMeta, CreateOrder, HeaderPatch, LinePatch, OrderView},
     models::{CallMeta, DraftRevision, TransitionResult},
+    preview::{PreviewBasket, PreviewResult},
     reads::{LineList, LinePage, ListOrders, OrderPage, ReadMeta},
 };
 use async_trait::async_trait;
@@ -136,4 +137,18 @@ pub trait OrdersV1: Send + Sync {
         expected_draft_revision: DraftRevision,
         meta: CallMeta,
     ) -> Result<TransitionResult, OrdersError>;
+
+    /// Assess a basket without storing anything (F03 §2.2): the nonbinding Pricing assessment,
+    /// gate report, indicative total and tax. No idempotency key (catalog: none), no receipt,
+    /// hold or attempt, and never the submit phase-B check.
+    ///
+    /// # Errors
+    /// `request-invalid` for a basket over the line limit or a line breaking the draft-line
+    /// rules, the untargeted denial reasons, or a sanitized unavailable/integration failure.
+    async fn preview(
+        &self,
+        ctx: &SecurityContext,
+        basket: PreviewBasket,
+        meta: ReadMeta,
+    ) -> Result<PreviewResult, OrdersError>;
 }

@@ -1,4 +1,4 @@
-<!-- Updated: 2026-10-06 by Constructor Tech -->
+<!-- Updated: 2026-10-16 by Constructor Tech -->
 
 # OAGW e2e suite
 
@@ -83,6 +83,10 @@ make e2e-oagw-sqlite
 # The same map without a server; outcomes show "not run".
 .venv/bin/python -m pytest testing/e2e/suites/oagw --collect-only -q --oagw-scenario-map
 ```
+
+Both profiles (and the shared server) build with `oagw-embedded` and run the
+cluster gear with a standalone `oagw` profile (`config/e2e-local.yaml`). On
+SQLite it carries the proxy configuration cache's change log (ADR-0020).
 
 Both profiles run every other test. The default keeps OAGW in memory. The
 sqlite profile's database is `~/.cf-gears/oagw/oagw.db` and survives between

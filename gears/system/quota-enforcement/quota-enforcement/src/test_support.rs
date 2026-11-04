@@ -68,7 +68,7 @@ use crate::domain::ports::metric_registry::{
     Classified, Freshness, MetricDescriptor, MetricMode, MetricRegistry,
 };
 use crate::domain::ports::metrics::{
-    DenialReason, MetricLabel, QeMetrics, ValidationReason, ValidationSurface,
+    DenialReason, MetricLabel, QeMetrics, SinkLabel, ValidationReason, ValidationSurface,
 };
 use crate::infra::cluster_coordination::QuotaEnforcementProfile;
 use crate::infra::metric_registry::contract as metric_contract;
@@ -190,6 +190,88 @@ impl AuthZResolverApi for TupleMatchingPdp {
                     constraints: Vec::new(),
                     deny_reason: Some(DenyReason {
                         error_code: "TUPLE_NOT_AUTHORIZED".to_owned(),
+                        details: None,
+                    }),
+                },
+            });
+        }
+        Ok(EvaluationResponse {
+            decision: true,
+            context: EvaluationResponseContext {
+                constraints: vec![Constraint {
+                    predicates: vec![Predicate::In(InPredicate::new(
+                        pep_properties::OWNER_TENANT_ID,
+                        self.tenants.clone(),
+                    ))],
+                }],
+                ..EvaluationResponseContext::default()
+            },
+        })
+    }
+}
+
+/// A snapshot policy that inspects every target: it permits only when the
+/// target tenant is one of `tenants` and each `{kind, id, metric}` of the
+/// `filters` property is on its allow list, so one target outside the grant
+/// denies the whole request.
+pub struct PermitFiltersPdp {
+    allowed: Vec<Value>,
+    tenants: Vec<Uuid>,
+    calls: AtomicUsize,
+}
+
+impl PermitFiltersPdp {
+    /// Permit exactly the `(kind, id, metric)` targets in `allowed`.
+    pub fn new(allowed: &[(&str, &str, &str)], tenants: Vec<Uuid>) -> Self {
+        Self {
+            allowed: allowed
+                .iter()
+                .map(|(kind, id, metric)| serde_json::json!({ "kind": kind, "id": id, "metric": metric }))
+                .collect(),
+            tenants,
+            calls: AtomicUsize::new(0),
+        }
+    }
+
+    pub fn calls(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl AuthZResolverApi for PermitFiltersPdp {
+    async fn evaluate(
+        &self,
+        _ctx: PlatformSecurityContext,
+        request: EvaluationRequest,
+    ) -> Result<EvaluationResponse, CanonicalError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let tenant_allowed = request
+            .resource
+            .properties
+            .get(pep_properties::OWNER_TENANT_ID)
+            .is_some_and(|owner| {
+                self.tenants
+                    .iter()
+                    .any(|tenant| serde_json::to_value(tenant).ok().as_ref() == Some(owner))
+            });
+        let every_target_allowed = tenant_allowed
+            && request
+                .resource
+                .properties
+                .get(crate::domain::pep::properties::FILTERS)
+                .and_then(Value::as_array)
+                .is_some_and(|filters| {
+                    !filters.is_empty()
+                        && filters.iter().all(|filter| self.allowed.contains(filter))
+                });
+        if !every_target_allowed {
+            return Ok(EvaluationResponse {
+                decision: false,
+                context: EvaluationResponseContext {
+                    constraints: Vec::new(),
+                    deny_reason: Some(DenyReason {
+                        error_code: "TARGET_NOT_AUTHORIZED".to_owned(),
                         details: None,
                     }),
                 },
@@ -346,9 +428,21 @@ pub struct RecordingMetrics {
     lease_waits: Mutex<Vec<String>>,
     lease_contention: Mutex<Vec<String>>,
     lease_cap: Mutex<Vec<String>>,
+    dispatch_failures: Mutex<Vec<(String, quota_enforcement_sdk::NotificationEventKind)>>,
+    outbox_rejections: Mutex<u64>,
 }
 
 impl RecordingMetrics {
+    /// `notification_dispatch_failures_total` emissions as `(sink_id, kind)`.
+    pub fn dispatch_failures(&self) -> Vec<(String, quota_enforcement_sdk::NotificationEventKind)> {
+        self.dispatch_failures.lock().expect("lock").clone()
+    }
+
+    /// `outbox_rejections_total` so far.
+    pub fn outbox_rejections(&self) -> u64 {
+        *self.outbox_rejections.lock().expect("lock")
+    }
+
     /// Metrics whose lease acquisition latency was observed, in order.
     pub fn lease_waits(&self) -> Vec<String> {
         self.lease_waits.lock().expect("lock").clone()
@@ -483,6 +577,21 @@ impl QeMetrics for RecordingMetrics {
             .expect("lock")
             .push(metric.as_str().to_owned());
     }
+
+    fn record_notification_dispatch_failure(
+        &self,
+        sink: &SinkLabel,
+        kind: quota_enforcement_sdk::NotificationEventKind,
+    ) {
+        self.dispatch_failures
+            .lock()
+            .expect("lock")
+            .push((sink.as_str().to_owned(), kind));
+    }
+
+    fn record_outbox_rejection(&self) {
+        *self.outbox_rejections.lock().expect("lock") += 1;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -509,7 +618,34 @@ pub fn storage_instance(segment: &str, vendor: &str, priority: i16) -> PluginFix
     }
 }
 
+/// A notification sink plugin instance.
+pub fn sink_instance(segment: &str, vendor: &str) -> PluginFixture {
+    let (id, payload) =
+        PluginV1::<quota_enforcement_sdk::QuotaNotificationSinkSpecV1>::build_registration(
+            segment, vendor, 0,
+        )
+        .expect("registration payload");
+    PluginFixture {
+        instance_id: id.to_string(),
+        entity: make_test_instance(id.as_ref(), payload),
+    }
+}
+
 impl PluginFixture {
+    /// A sink instance whose content is not a plugin spec.
+    pub fn malformed_sink(segment: &str) -> Self {
+        let (id, _) =
+            PluginV1::<quota_enforcement_sdk::QuotaNotificationSinkSpecV1>::build_registration(
+                segment, "acme", 0,
+            )
+            .expect("registration payload");
+        let broken = json!({ "id": id.to_string(), "vendor": 7 });
+        Self {
+            instance_id: id.to_string(),
+            entity: make_test_instance(id.as_ref(), broken),
+        }
+    }
+
     /// A storage instance whose content is not a plugin spec.
     pub fn malformed_storage(segment: &str) -> Self {
         let (id, _) =
@@ -552,6 +688,18 @@ pub fn register_storage(
     hub.register_scoped::<dyn QuotaEnforcementStoragePluginV1>(
         ClientScope::gts_id(&fixture.instance_id),
         api,
+    );
+}
+
+/// Registers `sink` as the scoped client of `fixture`.
+pub fn register_sink(
+    hub: &Arc<ClientHub>,
+    fixture: &PluginFixture,
+    sink: Arc<dyn quota_enforcement_sdk::QuotaNotificationSinkV1>,
+) {
+    hub.register_scoped::<dyn quota_enforcement_sdk::QuotaNotificationSinkV1>(
+        ClientScope::gts_id(&fixture.instance_id),
+        sink,
     );
 }
 
@@ -1547,6 +1695,7 @@ pub fn unbound_service(pdp: Arc<dyn AuthZResolverApi>) -> Arc<crate::domain::Ser
             preparation_max_attempts: std::num::NonZeroU32::new(3).expect("attempts"),
             leases: crate::domain::operations::LeaseLimits::default(),
             batch: crate::domain::operations::BatchLimits::default(),
+            snapshot: crate::domain::operations::SnapshotLimits::default(),
         },
     ))
 }

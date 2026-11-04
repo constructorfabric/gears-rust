@@ -21,6 +21,7 @@ use crate::audit::{ActorTenant, AuditOperation, AuditRecord, AuditSink, AuditVal
 use crate::domain::category::DomainVisibility;
 use crate::domain::declaration::{Declaration, DeclarationRepository};
 use crate::domain::error::DomainError;
+use crate::domain::ports::StepUpOperation;
 use crate::domain::resolution::{EffectiveValue, ScopeTarget};
 use crate::domain::secrets::pending::{
     self as pending, Claim, PendingSecret, PendingSecretRepository,
@@ -180,7 +181,7 @@ impl WriteCoordinator {
         requested: Option<Uuid>,
         change: Change,
         if_match: Option<&str>,
-        operation: &'static str,
+        operation: StepUpOperation,
     ) -> Result<Committed, DomainError> {
         let conn = self.db.conn().map_err(|e| conn_error(&e))?;
         // @cpt-begin:cpt-cf-settings-service-flow-value-writes-set:p1:inst-vw-set-5
@@ -361,7 +362,9 @@ impl WriteCoordinator {
                     resource: settings_service_sdk::gts::VALUE_SCHEMA,
                 });
             }
-            self.writer.verify_step_up(actor, "batch").await?;
+            self.writer
+                .verify_step_up(actor, StepUpOperation::Batch)
+                .await?;
             true
         } else {
             false
@@ -411,7 +414,7 @@ impl WriteCoordinator {
                     &key,
                     tenant,
                     StepUpPolicy::AlreadyVerified,
-                    "batch",
+                    StepUpOperation::Batch,
                 )
                 .await;
             // The gate above trusts the up-front pass (`AlreadyVerified`), so
@@ -419,12 +422,14 @@ impl WriteCoordinator {
             // success covers the rest of the request, a refusal is this
             // entry's and a later gated entry asks again.
             let gated = match gated {
-                Ok(gated) if gated.declaration.requires_step_up && !verified => {
-                    self.writer.verify_step_up(actor, "batch").await.map(|()| {
+                Ok(gated) if gated.declaration.requires_step_up && !verified => self
+                    .writer
+                    .verify_step_up(actor, StepUpOperation::Batch)
+                    .await
+                    .map(|()| {
                         verified = true;
                         gated
-                    })
-                }
+                    }),
                 other => other,
             };
             let outcome = match gated {
@@ -593,7 +598,7 @@ impl WriteCoordinator {
                 key,
                 requested,
                 StepUpPolicy::AlreadyVerified,
-                "stage",
+                StepUpOperation::Stage,
             )
             .await?;
         // @cpt-end:cpt-cf-settings-service-flow-secret-values-stage:p1:inst-sv-stage-1
@@ -668,12 +673,21 @@ impl WriteCoordinator {
             self.writer.discard(&conn, &gated, &staged).await;
             return Err(err);
         }
-        self.pending
+        let Some(row) = self
+            .pending
             .find(&conn, &AccessScope::allow_all(), pending_id)
             .await?
-            .ok_or_else(|| DomainError::Internal {
-                diagnostic: "the intent row of a stage vanished before its answer".to_owned(),
-            })
+        else {
+            // The only thing that removes a fresh intent row is the purge of
+            // its declaration (the cascade), which won the race against this
+            // stage: the entry just stored is released here — `discard`
+            // tolerates the missing row — and the setting is gone.
+            self.writer.discard(&conn, &gated, &staged).await;
+            return Err(DomainError::NotFound {
+                resource: "declaration",
+            });
+        };
+        Ok(row)
         // @cpt-end:cpt-cf-settings-service-flow-secret-values-stage:p1:inst-sv-stage-5
     }
 
@@ -779,7 +793,14 @@ impl WriteCoordinator {
         // @cpt-begin:cpt-cf-settings-service-flow-value-writes-clone:p1:inst-vw-clone-3
         let gated = self
             .writer
-            .gate(&conn, actor, key, to, StepUpPolicy::Verify, "clone")
+            .gate(
+                &conn,
+                actor,
+                key,
+                to,
+                StepUpPolicy::Verify,
+                StepUpOperation::Clone,
+            )
             .await?;
         // @cpt-end:cpt-cf-settings-service-flow-value-writes-clone:p1:inst-vw-clone-3
         // @cpt-begin:cpt-cf-settings-service-flow-value-writes-clone:p1:inst-vw-clone-4

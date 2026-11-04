@@ -1,8 +1,6 @@
 //! The Quota primitives of the storage contract, forwarded to the
-//! [`QuotaStore`] port with the contract's signatures. The eventual
-//! `impl QuotaEnforcementStoragePluginV1 for StoragePlugin` delegates here;
-//! until every primitive of the trait exists the client stays unpublished and
-//! these methods are reached by tests only.
+//! [`QuotaStore`] port with the contract's signatures. The
+//! `impl QuotaEnforcementStoragePluginV1 for StoragePlugin` delegates here.
 //!
 //! The security context contributes the actor of the operation log; the access
 //! scope is what the PDP authorized, re-applied by `SecureORM` on every row.

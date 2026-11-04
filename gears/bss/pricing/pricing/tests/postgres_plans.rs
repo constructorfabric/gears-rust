@@ -1797,8 +1797,8 @@ async fn postgres_a_write_answers_the_instants_its_reads_return() {
     )]);
     assert_eq!(
         clock.handed().len(),
-        3,
-        "the plan submit, the price submit and the approve each read the clock once"
+        4,
+        "the plan submit, the price create, the price submit and the approve each read the clock once"
     );
 }
 

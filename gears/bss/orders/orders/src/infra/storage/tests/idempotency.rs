@@ -1,6 +1,7 @@
 //! S2-05: the authoritative idempotency gate and D-188/D-198 durable execution ownership on
 //! real PostgreSQL, through the restricted runtime role.
 use super::*;
+use crate::domain::gate::commercial::ORDER_MEMBER;
 use crate::domain::idempotency::{
     DraftRevisionInput, ExecutionOwner, Fingerprint, FingerprintAxes, FingerprintInput,
     FingerprintTarget, LeaseDuration, PrincipalScope, RegistryKey, RegistryOperation, Settlement,
@@ -973,7 +974,8 @@ async fn lost_reply_and_advisory_miss_return_the_winning_settlement_once() -> an
             panic!("probe did not replay")
         };
         assert_eq!(again, *replay);
-        // A probe for another order (or another fingerprint) never replays this record.
+        // A probe for another order never replays this record; another fingerprint of this
+        // order's live record is a mismatch, answered by the authoritative gate.
         let other_scope = AccessScope::for_resources(vec![u(2)]);
         assert_eq!(
             reg::probe(
@@ -985,6 +987,18 @@ async fn lost_reply_and_advisory_miss_return_the_winning_settlement_once() -> an
             )
             .await?,
             Probe::Miss
+        );
+        let altered = fp(Trigger::DraftMutate, Some(2), &doc);
+        assert_eq!(
+            reg::probe(
+                &db.conn()?,
+                &private_scope(&k),
+                &k,
+                &altered,
+                Some((u(1), &order_scope))
+            )
+            .await?,
+            Probe::Mismatch
         );
     }
     // An expired settled record is never replayed by the probe, even before the sweep.
@@ -1278,13 +1292,11 @@ async fn commercial_execution_is_fenced_across_remote_calls() -> anyhow::Result<
                 let Gate::Owned(owned) = gate else {
                     anyhow::bail!("{gate:?}")
                 };
-                let (handle, attempt) = reg::begin_commercial_attempt(
-                    owned,
-                    &mut locked,
-                    attempt_inputs(),
-                    |c| json!({"line-a": {"candidate": c.to_string()}}),
-                )
-                .await?;
+                let (handle, attempt) =
+                    reg::begin_commercial_attempt(owned, &mut locked, attempt_inputs(), |c| {
+                        Ok::<_, RegistryError>(json!({"line-a": {"candidate": c.to_string()}}))
+                    })
+                    .await?;
                 assert_eq!(attempt.candidate_version, 2);
                 assert_eq!(attempt.line_requests["line-a"]["candidate"], "2");
                 anyhow::Ok(handle)
@@ -1324,9 +1336,11 @@ async fn commercial_execution_is_fenced_across_remote_calls() -> anyhow::Result<
             Box::pin(async move {
                 let locked = lock(tx, 1).await?;
                 let first =
-                    reg::record_receipt(&locked, &a, "line-a", json!({"receipt": "r1"})).await?;
+                    reg::record_receipt(&locked, &a, "line-a", json!({"receipt": "r1"}), lease())
+                        .await?;
                 let again =
-                    reg::record_receipt(&locked, &a, "line-a", json!({"receipt": "r1"})).await?;
+                    reg::record_receipt(&locked, &a, "line-a", json!({"receipt": "r1"}), lease())
+                        .await?;
                 anyhow::Ok((first, again))
             })
         })
@@ -1337,7 +1351,10 @@ async fn commercial_execution_is_fenced_across_remote_calls() -> anyhow::Result<
         .transaction_ref_mapped(move |tx| {
             Box::pin(async move {
                 let locked = lock(tx, 1).await?;
-                Ok(reg::record_receipt(&locked, &a, "line-a", json!({"receipt": "r2"})).await?)
+                Ok(
+                    reg::record_receipt(&locked, &a, "line-a", json!({"receipt": "r2"}), lease())
+                        .await?,
+                )
             })
         })
         .await;
@@ -1406,8 +1423,14 @@ async fn commercial_execution_is_fenced_across_remote_calls() -> anyhow::Result<
                         )
                         .await?;
                     } else {
-                        reg::record_receipt(&locked, &a, "line-b", json!({"receipt": "late"}))
-                            .await?;
+                        reg::record_receipt(
+                            &locked,
+                            &a,
+                            "line-b",
+                            json!({"receipt": "late"}),
+                            lease(),
+                        )
+                        .await?;
                     }
                     anyhow::Ok(())
                 })
@@ -1606,13 +1629,11 @@ async fn unresolved_attempts_outlive_key_expiry_and_reused_keys_get_fresh_execut
                     anyhow::bail!("{gate:?}")
                 };
                 assert_eq!(owned.origin(), ClaimOrigin::ReplacedExpired);
-                let (handle, attempt) = reg::begin_commercial_attempt(
-                    owned,
-                    &mut locked,
-                    attempt_inputs(),
-                    |c| json!({"line-a": {"candidate": c.to_string()}}),
-                )
-                .await?;
+                let (handle, attempt) =
+                    reg::begin_commercial_attempt(owned, &mut locked, attempt_inputs(), |c| {
+                        Ok::<_, RegistryError>(json!({"line-a": {"candidate": c.to_string()}}))
+                    })
+                    .await?;
                 anyhow::Ok((handle, attempt.candidate_version))
             })
         })
@@ -1637,7 +1658,14 @@ async fn unresolved_attempts_outlive_key_expiry_and_reused_keys_get_fresh_execut
         .transaction_ref_mapped(move |tx| {
             Box::pin(async move {
                 let locked = lock(tx, 2).await?;
-                reg::record_receipt(&locked, &late, "line-a", json!({"receipt": "late"})).await?;
+                reg::record_receipt(
+                    &locked,
+                    &late,
+                    "line-a",
+                    json!({"receipt": "late"}),
+                    lease(),
+                )
+                .await?;
                 anyhow::Ok(())
             })
         })
@@ -2209,13 +2237,12 @@ async fn unlinked_durable_marker_is_reclaimed_into_one_fenced_attempt() -> anyho
                 };
                 assert_eq!(owned.origin(), ClaimOrigin::Reclaimed);
                 assert!(owned.durable()?.is_none(), "nothing was linked");
-                Ok(reg::begin_commercial_attempt(
-                    owned,
-                    &mut locked,
-                    attempt_inputs(),
-                    |c| json!({"line-a": {"candidate": c.to_string()}}),
+                Ok(
+                    reg::begin_commercial_attempt(owned, &mut locked, attempt_inputs(), |c| {
+                        Ok::<_, RegistryError>(json!({"line-a": {"candidate": c.to_string()}}))
+                    })
+                    .await?,
                 )
-                .await?)
             })
         })
         .await?;
@@ -2253,10 +2280,14 @@ async fn unlinked_durable_marker_is_reclaimed_into_one_fenced_attempt() -> anyho
         .transaction_ref_mapped(move |tx| {
             Box::pin(async move {
                 let locked = lock(tx, 1).await?;
-                Ok(
-                    reg::record_receipt(&locked, &stale, "line-a", json!({"receipt": "late"}))
-                        .await?,
+                Ok(reg::record_receipt(
+                    &locked,
+                    &stale,
+                    "line-a",
+                    json!({"receipt": "late"}),
+                    lease(),
                 )
+                .await?)
             })
         })
         .await;
@@ -2284,13 +2315,12 @@ async fn unlinked_durable_marker_is_reclaimed_into_one_fenced_attempt() -> anyho
                     anyhow::bail!("{gate:?}")
                 };
                 assert_eq!(owned.origin(), ClaimOrigin::Reclaimed);
-                Ok(reg::begin_commercial_attempt(
-                    owned,
-                    &mut locked,
-                    attempt_inputs(),
-                    |c| json!({"line-a": {"candidate": c.to_string()}}),
+                Ok(
+                    reg::begin_commercial_attempt(owned, &mut locked, attempt_inputs(), |c| {
+                        Ok::<_, RegistryError>(json!({"line-a": {"candidate": c.to_string()}}))
+                    })
+                    .await?,
                 )
-                .await?)
             })
         })
         .await;
@@ -2304,6 +2334,141 @@ async fn unlinked_durable_marker_is_reclaimed_into_one_fenced_attempt() -> anyho
             .await?,
         2,
         "no second candidate"
+    );
+    Ok(())
+}
+
+/// n91: `record_receipt` only accepts a line the attempt froze. The reserved order member
+/// (`ORDER_MEMBER`, "order") is a `line_requests` entry but never a line, and a key the attempt
+/// did not freeze has no result slot; both are refused with `UnfrozenLine` before anything is
+/// written, so the committed `receipt_results` and both lease columns are unchanged. The engine's
+/// `UnfrozenLine` to `Abort::Integration` mapping (`infra/engine/mod.rs`) is a one-arm match
+/// inside a database transaction closure, not reachable from a lib test without Docker, so it
+/// is not tested separately.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn record_receipt_refuses_the_order_member_and_an_unfrozen_line() -> anyhow::Result<()> {
+    let pg = Pg::new().await?;
+    let (db, _) = pg.role("runtime").await?;
+    create(&db, 1).await?;
+    let doc = json!({"lines": ["line-a"]});
+    let k = key(Trigger::Submit, 40, "unfrozen-line");
+    let f = fp(Trigger::Submit, Some(1), &doc);
+    let (k1, f1) = (k.clone(), f.clone());
+    let worker: DurableExecution = db
+        .transaction_ref_mapped(move |tx| {
+            Box::pin(async move {
+                let mut locked = lock(tx, 1).await?;
+                let gate = reg::resolve(
+                    GateTarget::Order(&locked),
+                    &private_scope(&k1),
+                    &request(&k1, &f1, Durability::Durable, None),
+                )
+                .await?;
+                let Gate::Owned(owned) = gate else {
+                    anyhow::bail!("{gate:?}")
+                };
+                let (handle, _) =
+                    reg::begin_commercial_attempt(owned, &mut locked, attempt_inputs(), |c| {
+                        Ok::<_, RegistryError>(json!({"line-a": {"candidate": c.to_string()}}))
+                    })
+                    .await?;
+                anyhow::Ok(handle)
+            })
+        })
+        .await?;
+    // Fingerprints of the three columns the refusal must leave alone.
+    let receipts = "SELECT ('x' || substr(md5(receipt_results::text), 1, 15))::bit(60)::bigint AS n FROM bss_orders__commercial_attempt";
+    let marker_lease = "SELECT (extract(epoch FROM lease_expires_at) * 1000000)::bigint AS n FROM bss_orders__idempotency";
+    let attempt_lease = "SELECT (extract(epoch FROM lease_until) * 1000000)::bigint AS n FROM bss_orders__commercial_attempt";
+    let before = (
+        pg.scalar(receipts).await?,
+        pg.scalar(marker_lease).await?,
+        pg.scalar(attempt_lease).await?,
+    );
+    for line_key in [ORDER_MEMBER, "line-zz"] {
+        let a = worker.clone();
+        // The closure returns `Ok` carrying the refusal, so the transaction commits whatever
+        // `record_receipt` wrote before refusing; the check below reads committed state.
+        let refused = db
+            .transaction_ref_mapped(move |tx| {
+                Box::pin(async move {
+                    let locked = lock(tx, 1).await?;
+                    anyhow::Ok(
+                        reg::record_receipt(
+                            &locked,
+                            &a,
+                            line_key,
+                            json!({"receipt": "r1"}),
+                            lease(),
+                        )
+                        .await,
+                    )
+                })
+            })
+            .await?;
+        assert!(
+            matches!(refused, Err(RegistryError::UnfrozenLine)),
+            "{line_key:?} must be refused with UnfrozenLine"
+        );
+    }
+    let after = (
+        pg.scalar(receipts).await?,
+        pg.scalar(marker_lease).await?,
+        pg.scalar(attempt_lease).await?,
+    );
+    assert_eq!(after, before, "a refused receipt changes nothing");
+    Ok(())
+}
+
+/// n17: a line-requests snapshot that fails aborts `begin_commercial_attempt` before the
+/// attempt insert. No placeholder row is written, the snapshot's own error comes back, and the
+/// rolled-back transaction leaves no attempt and no allocated candidate.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_failed_line_snapshot_inserts_no_attempt_and_allocates_nothing() -> anyhow::Result<()> {
+    let pg = Pg::new().await?;
+    let (db, _) = pg.role("runtime").await?;
+    create(&db, 1).await?;
+    let doc = json!({"lines": ["line-a"]});
+    let k = key(Trigger::Submit, 40, "snapshot-fails");
+    let f = fp(Trigger::Submit, Some(1), &doc);
+    let before = pg
+        .scalar("SELECT version_allocation_high_water::bigint AS n FROM bss_orders__order")
+        .await?;
+    let (k1, f1) = (k.clone(), f.clone());
+    let outcome = db
+        .transaction_ref_mapped(move |tx| {
+            Box::pin(async move {
+                let mut locked = lock(tx, 1).await?;
+                let gate = reg::resolve(
+                    GateTarget::Order(&locked),
+                    &private_scope(&k1),
+                    &request(&k1, &f1, Durability::Durable, None),
+                )
+                .await?;
+                let Gate::Owned(owned) = gate else {
+                    anyhow::bail!("{gate:?}")
+                };
+                Ok(
+                    reg::begin_commercial_attempt(owned, &mut locked, attempt_inputs(), |_| {
+                        Err::<Value, _>(RegistryError::UnfrozenLine)
+                    })
+                    .await?,
+                )
+            })
+        })
+        .await;
+    match outcome.map_err(anyhow::Error::downcast::<RegistryError>) {
+        Err(Ok(RegistryError::UnfrozenLine)) => {}
+        other => panic!("the snapshot's own error must abort the call, got {other:?}"),
+    }
+    assert_eq!(count(&pg, "commercial_attempt").await, 0);
+    assert_eq!(
+        pg.scalar("SELECT version_allocation_high_water::bigint AS n FROM bss_orders__order")
+            .await?,
+        before,
+        "the rolled-back transaction allocates no candidate"
     );
     Ok(())
 }

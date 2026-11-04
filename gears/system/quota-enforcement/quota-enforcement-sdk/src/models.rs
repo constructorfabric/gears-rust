@@ -13,13 +13,13 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::str::FromStr;
 
-use aws_lc_rs::digest::{Context, SHA256};
 use gts::{GtsId, GtsIdError, GtsInstanceId, GtsTypeId};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use time::OffsetDateTime;
 use time::serde::rfc3339;
 use toolkit_gts::gts_id;
+use toolkit_security::crypto::hash::Sha256;
 use uuid::Uuid;
 
 use crate::gts::{SCOPE_TENANT, SCOPE_TYPE, SCOPE_USER};
@@ -304,14 +304,14 @@ fn canonical_json(value: &Value) -> Value {
 fn hash_canonical<T: Serialize>(payload: &T) -> Result<[u8; 32], serde_json::Error> {
     let value = canonical_json(&serde_json::to_value(payload)?);
     let bytes = serde_json::to_vec(&value)?;
-    let mut hasher = Context::new(&SHA256);
+    let mut hasher = Sha256::new();
     hasher.update(&bytes);
     Ok(finish(hasher))
 }
 
 /// The 32 digest bytes, as an array rather than the slice `finish` returns.
-fn finish(hasher: Context) -> [u8; 32] {
-    let digest = hasher.finish();
+fn finish(hasher: Sha256) -> [u8; 32] {
+    let digest = hasher.finalize();
     let mut bytes = [0; 32];
     bytes.copy_from_slice(digest.as_ref());
     bytes
@@ -358,13 +358,13 @@ impl IdempotencySubjectKey {
                 )
             })
             .collect();
-        let mut hasher = Context::new(&SHA256);
+        let mut hasher = Sha256::new();
         for (projection_type, subject_id) in pairs {
             for field in [projection_type, subject_id] {
                 // Catalogue limits keep lengths within `u32`; saturation remains
                 // deterministic for defensive callers.
                 let len = u32::try_from(field.len()).unwrap_or(u32::MAX);
-                hasher.update(&len.to_be_bytes());
+                hasher.update(len.to_be_bytes());
                 hasher.update(field.as_bytes());
             }
         }
@@ -612,6 +612,7 @@ impl RollbackableOperation {
 }
 
 /// Closed notification event catalog (PRD section 5.15).
+// @cpt-dod:cpt-cf-quota-enforcement-dod-event-catalog:p1
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum NotificationEventKind {
@@ -2138,6 +2139,52 @@ pub struct QuotaSnapshot {
     pub validity_window: Option<ValidityWindow>,
     /// Server-computed: the snapshot time lies within the validity window.
     pub currently_within_window: bool,
+}
+
+/// One target of a snapshot read: a subject scope, its identifier, and a
+/// metric, all as text. The gear maps `(metric, kind)` to the owner
+/// projection; callers never name a projection.
+///
+/// A filter describes a target, not an evaluation claim. A non-tenant kind
+/// (for example [`SCOPE_USER`]) selects the active Quotas on the metric whose
+/// subject is that subject or the request's tenant. The tenant kind
+/// ([`SCOPE_TENANT`]) is a tenant-only filter: its `id` must equal the
+/// request's `tenant_id`, and it selects the tenant's own Quotas only.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SnapshotSubject {
+    /// A well-known instance of the scope-discriminator type, as text.
+    pub kind: String,
+    /// Opaque, non-empty subject identifier.
+    pub id: String,
+    /// The metric, as text: a registered instance of the platform metric base.
+    pub metric: String,
+}
+
+/// Read the per-Quota state of `1..N` explicit targets in one tenant.
+///
+/// Single and bulk reads are one request shape: one subject is the single
+/// read. The PDP authorizes the complete target, every filter included, before
+/// anything is mapped or read, so a deployment's `snapshot`/`read` policy must
+/// inspect each filter: one filter outside the caller's grant denies the whole
+/// request. The union of the filters returns each active Quota once, ordered
+/// by `quota_id`, including Quotas outside their validity window.
+///
+/// Refused with `InvalidArgument` before the PDP: no subjects
+/// (`SNAPSHOT_SUBJECTS_REQUIRED`), more than the operator allows
+/// (`SNAPSHOT_TOO_MANY_SUBJECTS`), a `limit` outside `1..=page_size`
+/// (`SNAPSHOT_LIMIT_OUT_OF_RANGE`), or a `tenant` filter naming another tenant
+/// (`SNAPSHOT_TENANT_MISMATCH`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotRequest {
+    /// Target tenant.
+    pub tenant_id: TenantId,
+    /// The targets.
+    pub subjects: Vec<SnapshotSubject>,
+    /// Page size; the operator's page size when absent, and never above it.
+    pub limit: Option<u32>,
+    /// Continuation cursor from the previous page.
+    pub cursor: Option<String>,
 }
 
 /// Outcome of a Quota deactivation.

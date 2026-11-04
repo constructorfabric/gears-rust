@@ -19,6 +19,7 @@ use toolkit::runtime::{GearManager, GrpcInstallerStore, SystemContext};
 use toolkit::{ClientHub, ConfigProvider, GearCtx};
 use toolkit_canonical_errors::CanonicalError;
 use toolkit_db::{DBProvider, Db};
+use toolkit_security::SecurityContext;
 use tracing_test::traced_test;
 use types_registry_sdk::testing::{MockTypesRegistryClient, make_test_instance};
 use types_registry_sdk::{
@@ -27,18 +28,29 @@ use types_registry_sdk::{
 use uuid::Uuid;
 
 use super::*;
+use crate::domain::error::DomainError;
 use crate::domain::model::ManagedBy;
+use crate::domain::repo::Tags;
+#[cfg(feature = "cluster")]
+use crate::domain::services::registry_reconcile::Tally;
+use crate::domain::services::registry_reconcile::provisioning_ctx;
+#[cfg(feature = "cluster")]
 use crate::domain::services::registry_reconcile::tests::{
-    CREATED_ALL, NONE, UNCHANGED_ALL, registry_instances, set_path, sibling_route,
+    CREATED_ALL, NONE, UNCHANGED_ALL, registry_instances, set_path, sibling_route, upstream_at,
 };
+#[cfg(feature = "cluster")]
 use crate::domain::services::registry_reconcile::{
-    ProvisioningCounts, Tally, Unattended, provisioning_ctx, reconcile_registry,
+    ProvisioningCounts, Unattended, reconcile_registry,
 };
+#[cfg(feature = "cluster")]
+use crate::domain::test_support::ProvisioningMetrics;
 use crate::domain::test_support::{
     CapturingAuthZResolverClient, MockCredStoreClient, MockTenantResolverClient,
-    ProvisioningMetrics,
 };
+#[cfg(feature = "cluster")]
 use crate::domain::type_provisioning::{ProvisionedRoute, ProvisionedUpstream};
+#[cfg(feature = "cluster")]
+use crate::infra::proxy_cache::testing::{ClusterFixture, ScriptedCache, facade, read_log, until};
 use crate::infra::storage::testing::SqliteFile;
 use toolkit::contracts::RunnableCapability;
 
@@ -386,6 +398,7 @@ async fn health(gear: &OutboundApiGatewayGear, ctx: &GearCtx) -> toolkit::Health
 }
 
 /// The stable code of the registry provisioning healthcheck, if any.
+#[cfg(feature = "cluster")]
 async fn health_code(gear: &OutboundApiGatewayGear, ctx: &GearCtx) -> Option<String> {
     health_result(gear, ctx).await.code
 }
@@ -403,6 +416,7 @@ async fn health_result(gear: &OutboundApiGatewayGear, ctx: &GearCtx) -> toolkit:
 /// the task.
 ///
 /// ADR-0018: PERS-LOOP-007, PERS-LOOP-008.
+#[cfg(feature = "cluster")]
 #[tokio::test]
 async fn on_a_database_start_reconciles_in_the_background() {
     use toolkit::HealthcheckStatus;
@@ -414,6 +428,7 @@ async fn on_a_database_start_reconciles_in_the_background() {
         MockTenantResolverClient::with_siblings(TenantId(root), vec![]),
         one_upstream_registry(upstream_id, route_id),
     );
+    let cluster = ClusterFixture::standalone(&hub);
     let ctx = context(database_section(), Some(file.open().await), hub);
     let gear = init(&ctx).await.expect("init");
     gear.post_init(&system_context()).await.expect("post_init");
@@ -457,6 +472,8 @@ async fn on_a_database_start_reconciles_in_the_background() {
     .expect("stop ends the task")
     .expect("stop");
     assert!(gear.registry_task.lock().is_none());
+    assert!(gear.change_feed.lock().is_none());
+    cluster.stop().await;
 }
 
 /// A registry lease another pod holds never delays startup: `post_init`
@@ -464,6 +481,7 @@ async fn on_a_database_start_reconciles_in_the_background() {
 /// waiting task.
 ///
 /// ADR-0018: PERS-LOOP-008.
+#[cfg(feature = "cluster")]
 #[tokio::test]
 async fn a_held_lease_delays_neither_startup_nor_shutdown() {
     use crate::domain::repo::RegistryStateStore;
@@ -484,6 +502,7 @@ async fn a_held_lease_delays_neither_startup_nor_shutdown() {
         MockTenantResolverClient::with_siblings(TenantId(root), vec![]),
         one_upstream_registry(upstream_id, Uuid::new_v4()),
     );
+    let cluster = ClusterFixture::standalone(&hub);
     let ctx = context(database_section(), Some(db), hub);
     let gear = init(&ctx).await.expect("init");
     gear.post_init(&system_context()).await.expect("post_init");
@@ -491,9 +510,12 @@ async fn a_held_lease_delays_neither_startup_nor_shutdown() {
         .await
         .expect("start");
     tokio::time::sleep(std::time::Duration::from_millis(1_500)).await;
-    assert_eq!(health(&gear, &ctx).await, HealthcheckStatus::Degraded);
+    // The provisioning part alone: the cluster part reads the cluster SDK's
+    // process-global readiness, which other tests in the process share.
+    let provisioning = ProvisioningHealth(gear.provisioning.clone()).check().await;
+    assert_eq!(provisioning.status, HealthcheckStatus::Degraded);
     assert_eq!(
-        health_code(&gear, &ctx).await.as_deref(),
+        provisioning.code.as_deref(),
         Some("registry_provisioning_pending"),
         "waiting on the lease, not failed"
     );
@@ -511,6 +533,7 @@ async fn a_held_lease_delays_neither_startup_nor_shutdown() {
     .await
     .expect("stop ends the waiting task")
     .expect("stop");
+    cluster.stop().await;
 }
 
 /// In memory there is nothing to wait for: `post_init` reconciles before
@@ -542,6 +565,7 @@ async fn in_memory_post_init_reconciles_and_start_spawns_nothing() {
 // ---------------------------------------------------------------------------
 
 /// ADR-0018: PERS-BOOT-004.
+#[cfg(feature = "cluster")]
 #[tokio::test]
 async fn upstreams_and_routes_survive_a_restart_on_a_database() {
     let file = SqliteFile::new();
@@ -628,6 +652,7 @@ async fn upstreams_and_routes_survive_a_restart_on_a_database() {
 }
 
 /// ADR-0018: PERS-BOOT-005.
+#[cfg(feature = "cluster")]
 #[tokio::test]
 #[traced_test]
 async fn provisioning_after_a_restart_leaves_what_the_database_holds() {
@@ -681,11 +706,11 @@ async fn provisioning_after_a_restart_leaves_what_the_database_holds() {
 /// field for field.
 ///
 /// ADR-0018: PERS-BOOT-005.
+#[cfg(feature = "cluster")]
 #[tokio::test]
 #[traced_test]
 async fn booting_twice_through_the_lifecycle_leaves_the_rows_unchanged() {
     use crate::domain::model::ListQuery;
-    use toolkit::HealthcheckStatus;
 
     let file = SqliteFile::new();
     let root = Uuid::new_v4();
@@ -697,6 +722,7 @@ async fn booting_twice_through_the_lifecycle_leaves_the_rows_unchanged() {
             MockTenantResolverClient::with_siblings(TenantId(root), vec![]),
             one_upstream_registry(upstream_id, route_id),
         );
+        let cluster = ClusterFixture::standalone(&hub);
         let ctx = context(database_section(), Some(file.open().await), hub);
         let gear = init(&ctx).await.expect("init");
         gear.post_init(&system_context()).await.expect("post_init");
@@ -704,7 +730,7 @@ async fn booting_twice_through_the_lifecycle_leaves_the_rows_unchanged() {
             .await
             .expect("start");
         eventually("the first run settles", || async {
-            health(&gear, &ctx).await == HealthcheckStatus::Healthy
+            gear.provisioning.get() == ProvisioningStatus::Settled
         })
         .await;
         let cp = control_plane(&gear);
@@ -715,6 +741,7 @@ async fn booting_twice_through_the_lifecycle_leaves_the_rows_unchanged() {
         gear.stop(tokio_util::sync::CancellationToken::new())
             .await
             .expect("stop");
+        cluster.stop().await;
         rows
     };
 
@@ -741,6 +768,7 @@ async fn booting_twice_through_the_lifecycle_leaves_the_rows_unchanged() {
 /// The reconcile's write order on a database, one gear per boot: a path
 /// hands over between two routes, then their upstream is replaced by one
 /// with the same alias.
+#[cfg(feature = "cluster")]
 #[tokio::test]
 async fn provisioning_hands_over_and_moves_routes_on_a_database() {
     let file = SqliteFile::new();
@@ -804,6 +832,7 @@ async fn provisioning_hands_over_and_moves_routes_on_a_database() {
 }
 
 /// One reconcile run over the registry write path `init` built.
+#[cfg(feature = "cluster")]
 async fn reconcile(
     gear: &OutboundApiGatewayGear,
     upstreams: &[ProvisionedUpstream],
@@ -822,6 +851,7 @@ async fn reconcile(
 }
 
 /// The registry write path `init` built.
+#[cfg(feature = "cluster")]
 fn provisioner(gear: &OutboundApiGatewayGear) -> Arc<dyn RegistryProvisioner> {
     gear.registry_provisioner
         .get()
@@ -846,10 +876,10 @@ where
 /// a live one, and its task reconciles again.
 ///
 /// ADR-0018: PERS-LOOP-007.
+#[cfg(feature = "cluster")]
 #[tokio::test]
 async fn a_second_start_after_stop_reconciles_again() {
     use crate::domain::repo::RegistryStateStore;
-    use toolkit::HealthcheckStatus;
 
     let file = SqliteFile::new();
     let db = file.open().await;
@@ -859,6 +889,7 @@ async fn a_second_start_after_stop_reconciles_again() {
         MockTenantResolverClient::with_siblings(TenantId(root), vec![]),
         one_upstream_registry(upstream_id, route_id),
     );
+    let cluster = ClusterFixture::standalone(&hub);
     let ctx = context(database_section(), Some(db.clone()), hub);
     let gear = init(&ctx).await.expect("init");
     gear.post_init(&system_context()).await.expect("post_init");
@@ -868,7 +899,7 @@ async fn a_second_start_after_stop_reconciles_again() {
 
     gear.start(root_token.clone()).await.expect("start");
     eventually("the first task reconciles", || async {
-        health(&gear, &ctx).await == HealthcheckStatus::Healthy
+        gear.provisioning.get() == ProvisioningStatus::Settled
     })
     .await;
     gear.stop(tokio_util::sync::CancellationToken::new())
@@ -899,12 +930,14 @@ async fn a_second_start_after_stop_reconciles_again() {
     gear.stop(tokio_util::sync::CancellationToken::new())
         .await
         .expect("stop");
+    cluster.stop().await;
 }
 
 /// The task hangs off the token `start` receives: a runtime shutdown that
 /// never reaches the stop phase still ends it.
 ///
 /// ADR-0018: PERS-LOOP-007.
+#[cfg(feature = "cluster")]
 #[tokio::test]
 async fn cancelling_the_start_token_ends_the_task() {
     let file = SqliteFile::new();
@@ -913,6 +946,7 @@ async fn cancelling_the_start_token_ends_the_task() {
         MockTenantResolverClient::with_siblings(TenantId(root), vec![]),
         one_upstream_registry(Uuid::new_v4(), Uuid::new_v4()),
     );
+    let cluster = ClusterFixture::standalone(&hub);
     let ctx = context(database_section(), Some(file.open().await), hub);
     let gear = init(&ctx).await.expect("init");
     gear.post_init(&system_context()).await.expect("post_init");
@@ -925,6 +959,12 @@ async fn cancelling_the_start_token_ends_the_task() {
         .await
         .expect("the task ends with the runtime token")
         .expect("no panic");
+    let feed = gear.change_feed.lock().take().expect("a running feed");
+    until("the change feed ends with the runtime token", || {
+        feed.is_finished()
+    })
+    .await;
+    cluster.stop().await;
 }
 
 /// Sets its flag when dropped: dropped inside a task, it shows the task
@@ -980,4 +1020,899 @@ async fn stop_logs_a_panicked_task() {
     .await
     .expect("stop returns once the task ends");
     assert!(logs_contain("Registry task panicked"));
+}
+
+// ---------------------------------------------------------------------------
+// The proxy configuration cache (ADR-0020)
+// ---------------------------------------------------------------------------
+
+/// An upstream `api.example.com` with one `POST /v1/things` route, created
+/// through the SDK in `ctx`'s tenant, and the server it was created with.
+async fn served_upstream(
+    gw: &dyn ServiceGatewayClientV1,
+    ctx: SecurityContext,
+) -> (oagw_sdk::Upstream, oagw_sdk::Route, oagw_sdk::Server) {
+    let server = oagw_sdk::Server {
+        endpoints: vec![oagw_sdk::Endpoint {
+            scheme: oagw_sdk::Scheme::Https,
+            host: "api.example.com".into(),
+            port: 443,
+        }],
+    };
+    let upstream = gw
+        .create_upstream(
+            ctx.clone(),
+            oagw_sdk::CreateUpstreamRequest::builder(server.clone(), oagw_sdk::HTTP_PROTOCOL_ID)
+                .build(),
+        )
+        .await
+        .expect("create upstream");
+    let route = gw
+        .create_route(
+            ctx,
+            oagw_sdk::CreateRouteRequest::builder(
+                upstream.id,
+                oagw_sdk::MatchRules {
+                    http: Some(oagw_sdk::HttpMatch {
+                        methods: vec![oagw_sdk::HttpMethod::Post],
+                        path: "/v1/things".into(),
+                        query_allowlist: vec![],
+                        path_suffix_mode: oagw_sdk::PathSuffixMode::Append,
+                    }),
+                    grpc: None,
+                },
+            )
+            .build(),
+        )
+        .await
+        .expect("create route");
+    (upstream, route, server)
+}
+
+/// What `cp` resolves `api.example.com` to for `ctx`, without tags.
+async fn resolve_served(
+    cp: &dyn ControlPlaneService,
+    ctx: &SecurityContext,
+) -> Result<(Uuid, Uuid), DomainError> {
+    cp.resolve_proxy_target(ctx, "api.example.com", "POST", "/v1/things", Tags::Skip)
+        .await
+        .map(|(upstream, route)| (upstream.id, route.id))
+}
+
+/// Disable `tenant`'s upstream `id` in `db`, behind the gear's back.
+#[cfg(feature = "cluster")]
+async fn disable_behind(db: Db, tenant: Uuid, id: Uuid) {
+    let behind = DbUpstreamRepo::new(DBProvider::<RepositoryError>::new(db));
+    let mut row = behind.get_by_id(tenant, id).await.unwrap();
+    row.enabled = false;
+    behind.update(row).await.unwrap();
+}
+
+/// On a database the gear resolves proxy targets through the cache, and
+/// the writes of the SDK and of the registry provisioner evict it: a change
+/// made in the database behind the gear stays unseen until one of them
+/// writes. (The Management API's handlers share the SDK's Control Plane.)
+///
+/// ADR-0020: CACHE-FRESH-002.
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn on_a_database_proxy_reads_are_cached_and_writes_evict() {
+    let file = SqliteFile::new();
+    let db = file.open().await;
+    let hub = wired_hub();
+    let gear = init(&context(
+        database_section(),
+        Some(db.clone()),
+        Arc::clone(&hub),
+    ))
+    .await
+    .expect("init");
+    let tenant = Uuid::new_v4();
+    let ctx = || provisioning_ctx(tenant).expect("security context");
+    let gw = hub
+        .get::<dyn ServiceGatewayClientV1>()
+        .expect("init registers the client");
+    let cp = control_plane(&gear);
+    let resolve = async |alias: &str| {
+        cp.resolve_proxy_target(&ctx(), alias, "POST", "/v1/things", Tags::Skip)
+            .await
+            .map(|(upstream, route)| (upstream.id, route.id))
+    };
+
+    let (upstream, route, server) = served_upstream(&*gw, ctx()).await;
+    let served = (upstream.id, route.id);
+    assert_eq!(resolve("api.example.com").await.expect("served"), served);
+
+    // Disabled behind the gear: the cached answer stands.
+    disable_behind(db, tenant, upstream.id).await;
+    assert_eq!(
+        resolve("api.example.com").await.expect("cached"),
+        served,
+        "cached"
+    );
+
+    // An SDK write keeping what it read evicts, and the change shows.
+    let stored = gw.get_upstream(ctx(), upstream.id).await.unwrap();
+    assert!(!stored.enabled);
+    gw.update_upstream(
+        ctx(),
+        upstream.id,
+        oagw_sdk::UpdateUpstreamRequest::builder(server, oagw_sdk::HTTP_PROTOCOL_ID)
+            .enabled(stored.enabled)
+            .build(),
+    )
+    .await
+    .expect("update upstream");
+    let disabled = resolve("api.example.com").await.unwrap_err();
+    assert!(
+        matches!(disabled, DomainError::UpstreamDisabled { .. }),
+        "{disabled:?}"
+    );
+
+    // The registry provisioner's writes, including its own delete.
+    let provisioner = gear.registry_provisioner.get().unwrap().clone();
+    let registry = provisioner
+        .create_registry_upstream(&ctx(), upstream_at(tenant, "registry.example.com").request)
+        .await
+        .expect("registry upstream");
+    let unrouted = resolve(&registry.alias).await.unwrap_err();
+    assert!(
+        matches!(
+            unrouted,
+            DomainError::NotFound {
+                entity: "route",
+                ..
+            }
+        ),
+        "{unrouted:?}"
+    );
+    provisioner
+        .delete_registry_upstream_if_unused(&ctx(), registry.id)
+        .await
+        .expect("registry delete");
+    let gone = resolve(&registry.alias).await.unwrap_err();
+    assert!(
+        matches!(
+            gone,
+            DomainError::NotFound {
+                entity: "upstream",
+                ..
+            }
+        ),
+        "{gone:?}"
+    );
+}
+
+/// On a database, `start` connects the cache to the cluster change log:
+/// this replica's writes are logged as its own, and another replica's
+/// logged change evicts here. After `stop`, writes are no longer logged.
+///
+/// ADR-0020: CACHE-FRESH-003.
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn on_a_database_start_connects_the_cache_to_the_cluster_change_log() {
+    let file = SqliteFile::new();
+    let db = file.open().await;
+    let hub = wired_hub();
+    let cluster = ClusterFixture::standalone(&hub);
+    let ctx = context(database_section(), Some(db.clone()), Arc::clone(&hub));
+    let gear = init(&ctx).await.expect("init");
+    gear.post_init(&system_context()).await.expect("post_init");
+    gear.start(tokio_util::sync::CancellationToken::new())
+        .await
+        .expect("start");
+    let log_store = facade(&hub).await;
+    let tenant = Uuid::new_v4();
+    let sctx = || provisioning_ctx(tenant).expect("security context");
+    let gw = hub.get::<dyn ServiceGatewayClientV1>().unwrap();
+    let cp = control_plane(&gear);
+
+    let (upstream, route, _) = served_upstream(&*gw, sctx()).await;
+    let log = read_log(&log_store).await.expect("the writes are logged");
+    assert_eq!(log.seq(), 2);
+    assert!(log.changes().all(|logged| logged.origin == gear.owner));
+
+    // Cached here; another replica disables the upstream and logs it.
+    let served = (upstream.id, route.id);
+    assert_eq!(resolve_served(&*cp, &sctx()).await.expect("served"), served);
+    disable_behind(db, tenant, upstream.id).await;
+    assert_eq!(
+        resolve_served(&*cp, &sctx()).await.expect("cached"),
+        served,
+        "cached"
+    );
+    let (other, stop_other) =
+        crate::infra::proxy_cache::testing::publisher(&hub, Uuid::new_v4()).await;
+    other
+        .submit(
+            crate::infra::proxy_cache::Change::Upstream {
+                tenant_id: tenant,
+                id: upstream.id,
+                alias: upstream.alias.clone(),
+            },
+            None,
+        )
+        .expect("the other replica's publisher runs");
+    eventually("the other replica's change evicts here", || async {
+        matches!(
+            resolve_served(&*cp, &sctx()).await,
+            Err(DomainError::UpstreamDisabled { .. })
+        )
+    })
+    .await;
+    stop_other.cancel();
+
+    gear.stop(tokio_util::sync::CancellationToken::new())
+        .await
+        .expect("stop");
+    assert!(gear.change_feed.lock().is_none());
+    gw.delete_route(sctx(), route.id)
+        .await
+        .expect("delete route");
+    assert_eq!(read_log(&log_store).await.unwrap().seq(), 3, "not logged");
+    cluster.stop().await;
+}
+
+/// A profile the gear never resolves.
+#[cfg(feature = "cluster")]
+#[derive(Debug, Clone, Copy)]
+struct OtherProfile;
+
+#[cfg(feature = "cluster")]
+impl cluster_sdk::ClusterProfile for OtherProfile {
+    const NAME: &'static str = "other";
+}
+
+/// Boot a gear on a database with the cluster `wire` puts in its hub, and
+/// return why `start` fails; nothing runs after it.
+#[cfg(feature = "cluster")]
+async fn start_error(wire: impl FnOnce(&Arc<ClientHub>) -> ClusterFixture) -> anyhow::Error {
+    let file = SqliteFile::new();
+    let hub = wired_hub();
+    let cluster = wire(&hub);
+    let ctx = context(database_section(), Some(file.open().await), hub);
+    let gear = init(&ctx).await.expect("init");
+    gear.post_init(&system_context()).await.expect("post_init");
+    let err = gear
+        .start(tokio_util::sync::CancellationToken::new())
+        .await
+        .expect_err("start fails");
+    assert!(gear.change_feed.lock().is_none());
+    assert!(gear.registry_task.lock().is_none(), "no reconcile either");
+    cluster.stop().await;
+    err
+}
+
+/// On a database, `start` fails when the cluster binds no `oagw` profile,
+/// or binds one whose cache cannot watch.
+///
+/// ADR-0020: CACHE-CONF-001.
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn on_a_database_start_needs_a_watchable_oagw_cluster_profile() {
+    let unbound = start_error(|hub| ClusterFixture::with(hub, OtherProfile, |cache| cache)).await;
+    let message = format!("{unbound:#}");
+    assert!(
+        message.contains("no backend bound for profile `oagw`"),
+        "{message}"
+    );
+    assert!(
+        unbound
+            .downcast_ref::<cluster_sdk::ClusterError>()
+            .is_some(),
+        "the cluster error is kept as the source: {unbound:?}"
+    );
+
+    let unwatchable =
+        start_error(|hub| ClusterFixture::scripted(hub, ScriptedCache::without_watch).0).await;
+    let message = format!("{unwatchable:#}");
+    assert!(message.contains("required `Watch`"), "{message}");
+}
+
+/// The `gears.oagw` section with a database and this proxy cache config.
+fn database_section_with_cache(proxy_cache: Value) -> Value {
+    json!({
+        "config": { "proxy_cache": proxy_cache },
+        "database": { "server": "sqlite_users", "file": "oagw.db" },
+    })
+}
+
+/// A hub whose registry reconcile settles: root tenant `root`, an empty
+/// registry.
+fn settling_hub(root: Uuid) -> Arc<ClientHub> {
+    hub_over(
+        MockTenantResolverClient::with_siblings(TenantId(root), vec![]),
+        MockTypesRegistryClient::new(),
+    )
+}
+
+/// `post_init` and `start` (returning at once) on `gear`.
+async fn boot(gear: &OutboundApiGatewayGear) {
+    gear.post_init(&system_context()).await.expect("post_init");
+    tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        gear.start(tokio_util::sync::CancellationToken::new()),
+    )
+    .await
+    .expect("start returns at once")
+    .expect("start");
+}
+
+/// With a database and `proxy_cache.enabled: false` there is no cache and
+/// no change log: OAGW needs no cluster (none is in the hub, in either
+/// build), every lookup reads the database, and the healthcheck has no
+/// cache part.
+///
+/// ADR-0020: CACHE-CONF-002.
+#[tokio::test]
+async fn with_the_cache_disabled_every_lookup_reads_and_no_cluster_is_needed() {
+    use toolkit_db::test_support::QueryKind;
+
+    let (db, recorder) = crate::infra::storage::testing::recorded_sqlite().await;
+    let tenant = Uuid::new_v4();
+    let hub = settling_hub(tenant);
+    let ctx = context(
+        database_section_with_cache(json!({ "enabled": false })),
+        Some(db),
+        Arc::clone(&hub),
+    );
+    let gear = init(&ctx).await.expect("init");
+    #[cfg(feature = "cluster")]
+    assert!(matches!(gear.cache_sync.get(), Some(None)), "no cache");
+    boot(&gear).await;
+    #[cfg(feature = "cluster")]
+    assert!(gear.change_feed.lock().is_none(), "no change feed");
+    let sctx = || provisioning_ctx(tenant).expect("security context");
+    let gw = hub.get::<dyn ServiceGatewayClientV1>().unwrap();
+    let cp = control_plane(&gear);
+
+    let (upstream, route, _) = served_upstream(&*gw, sctx()).await;
+    let served = (upstream.id, route.id);
+    assert_eq!(resolve_served(&*cp, &sctx()).await.expect("served"), served);
+    recorder.clear();
+    assert_eq!(resolve_served(&*cp, &sctx()).await.expect("served"), served);
+    let selects = recorder
+        .events()
+        .iter()
+        .filter(|e| e.kind == QueryKind::Select)
+        .count();
+    assert!(selects > 0, "a repeated lookup reads the database");
+
+    eventually("healthy without a cluster", || async {
+        health(&gear, &ctx).await == toolkit::HealthcheckStatus::Healthy
+    })
+    .await;
+    gear.stop(tokio_util::sync::CancellationToken::new())
+        .await
+        .expect("stop");
+}
+
+/// Without a database there is no cache: a lookup after a write reads what
+/// the write stored, with nothing to evict.
+///
+/// ADR-0020: CACHE-CONF-002.
+#[tokio::test]
+async fn without_a_database_every_lookup_reads_the_store() {
+    let hub = wired_hub();
+    let ctx = context(json!({ "config": {} }), None, Arc::clone(&hub));
+    let gear = init(&ctx).await.expect("init");
+    #[cfg(feature = "cluster")]
+    assert!(matches!(gear.cache_sync.get(), Some(None)), "no cache");
+    let tenant = Uuid::new_v4();
+    let sctx = || provisioning_ctx(tenant).expect("security context");
+    let gw = hub.get::<dyn ServiceGatewayClientV1>().unwrap();
+    let cp = control_plane(&gear);
+
+    let (upstream, route, server) = served_upstream(&*gw, sctx()).await;
+    assert_eq!(
+        resolve_served(&*cp, &sctx()).await.expect("served"),
+        (upstream.id, route.id)
+    );
+    gw.update_upstream(
+        sctx(),
+        upstream.id,
+        oagw_sdk::UpdateUpstreamRequest::builder(server, oagw_sdk::HTTP_PROTOCOL_ID)
+            .enabled(false)
+            .build(),
+    )
+    .await
+    .expect("update upstream");
+    let disabled = resolve_served(&*cp, &sctx()).await.unwrap_err();
+    assert!(
+        matches!(disabled, DomainError::UpstreamDisabled { .. }),
+        "{disabled:?}"
+    );
+}
+
+/// A remote cluster unreachable at startup: `start` returns at once, the
+/// gear reports the watch connecting (Degraded) while the watch is retried,
+/// is healthy once it succeeds, and reports the watch down once stopped.
+///
+/// ADR-0020: CACHE-CONF-004.
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn an_unreachable_cluster_at_startup_leaves_the_gear_degraded_until_the_watch_succeeds() {
+    use crate::infra::proxy_cache::WatchState;
+    use toolkit::HealthcheckStatus;
+
+    let file = SqliteFile::new();
+    let hub = settling_hub(Uuid::new_v4());
+    let (cluster, scripted) = ClusterFixture::scripted(&hub, |cache| {
+        cache.fail_watches(usize::MAX);
+        cache
+    });
+    let ctx = context(database_section(), Some(file.open().await), hub);
+    let gear = init(&ctx).await.expect("init");
+    boot(&gear).await;
+
+    eventually(
+        "provisioning settles, and only the watch is connecting",
+        || async {
+            health_code(&gear, &ctx).await.as_deref() == Some("proxy_cache_watch_connecting")
+        },
+    )
+    .await;
+    assert_eq!(health(&gear, &ctx).await, HealthcheckStatus::Degraded);
+    assert!(scripted.watch_calls() >= 1);
+
+    // The registry task now sleeps until its recheck, so no statement runs
+    // while the clock is paused through the watch's backoff.
+    tokio::time::pause();
+    scripted.fail_watches(0);
+    eventually("the watch succeeds", || async {
+        gear.cache_sync
+            .get()
+            .and_then(Option::as_ref)
+            .is_some_and(|sync| sync.watch.get() == WatchState::Up)
+    })
+    .await;
+    tokio::time::resume();
+
+    gear.stop(tokio_util::sync::CancellationToken::new())
+        .await
+        .expect("stop");
+    assert_eq!(
+        health_code(&gear, &ctx).await.as_deref(),
+        Some("proxy_cache_watch_down")
+    );
+    cluster.stop().await;
+}
+
+/// Without a database the gear initializes, starts and is ready with no
+/// cluster client and no `oagw` profile in the hub, and the process's
+/// cluster readiness is no part of its health.
+///
+/// ADR-0020: CACHE-CONF-005.
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn without_a_database_the_gear_starts_and_is_ready_without_a_cluster() {
+    use toolkit::HealthcheckStatus;
+
+    let hub = settling_hub(Uuid::new_v4());
+    let ctx = context(json!({ "config": {} }), None, Arc::clone(&hub));
+    let gear = init(&ctx).await.expect("init");
+    boot(&gear).await;
+    assert!(gear.change_feed.lock().is_none());
+    assert_eq!(health(&gear, &ctx).await, HealthcheckStatus::Healthy);
+
+    // A resolve with no client makes this process's cluster readiness
+    // unready; OAGW in memory does not report it.
+    cluster_sdk::ClusterCacheV1::resolver(&ClientHub::new())
+        .profile(OtherProfile)
+        .resolve()
+        .await
+        .expect("an unbound facade");
+    let readiness = cluster_sdk::cluster_readiness(Arc::clone(&hub))
+        .check()
+        .await;
+    assert_eq!(readiness.status, HealthcheckStatus::Unhealthy);
+    assert_eq!(health(&gear, &ctx).await, HealthcheckStatus::Healthy);
+
+    gear.stop(tokio_util::sync::CancellationToken::new())
+        .await
+        .expect("stop");
+}
+
+/// Without the `cluster` feature a database with the cache enabled (the
+/// default) is refused at `init`: the proxy configuration cache on a
+/// database needs the cluster change log. The error names the feature,
+/// `proxy_cache.enabled: false` and ADR-0020, and the gear registers no
+/// client.
+///
+/// ADR-0020: CACHE-CONF-005.
+#[cfg(not(feature = "cluster"))]
+#[tokio::test]
+async fn without_the_cluster_feature_a_database_is_refused_at_init() {
+    let file = SqliteFile::new();
+    let hub = wired_hub();
+    let ctx = context(
+        database_section(),
+        Some(file.open().await),
+        Arc::clone(&hub),
+    );
+    let gear = OutboundApiGatewayGear::default();
+    let err = gear.init(&ctx).await.expect_err("a database is refused");
+    let message = err.to_string();
+    assert!(message.contains("no `cluster` feature"), "{message}");
+    assert!(message.contains("proxy_cache.enabled: false"), "{message}");
+    assert!(message.contains("ADR-0020"), "{message}");
+    assert!(gear.state.load().is_none(), "no state");
+    assert!(
+        hub.get::<dyn ServiceGatewayClientV1>().is_err(),
+        "no client registered"
+    );
+}
+
+/// Without the `cluster` feature OAGW runs in memory: it initializes,
+/// starts, is ready and stops, with no cluster in the process.
+///
+/// ADR-0020: CACHE-CONF-005.
+#[cfg(not(feature = "cluster"))]
+#[tokio::test]
+async fn without_the_cluster_feature_the_gear_runs_in_memory() {
+    use toolkit::HealthcheckStatus;
+
+    let hub = settling_hub(Uuid::new_v4());
+    let ctx = context(json!({ "config": {} }), None, Arc::clone(&hub));
+    let gear = init(&ctx).await.expect("init");
+    boot(&gear).await;
+    let result = health_result(&gear, &ctx).await;
+    assert_eq!(result.status, HealthcheckStatus::Healthy, "{result:?}");
+    assert!(hub.get::<dyn ServiceGatewayClientV1>().is_ok());
+    gear.stop(tokio_util::sync::CancellationToken::new())
+        .await
+        .expect("stop");
+}
+
+/// A healthcheck part that answers `result`.
+struct FixedHealth(toolkit::HealthcheckResult);
+
+#[async_trait]
+impl toolkit::Healthcheck for FixedHealth {
+    fn name(&self) -> &'static str {
+        "fixed"
+    }
+
+    async fn check(&self) -> toolkit::HealthcheckResult {
+        self.0.clone()
+    }
+}
+
+/// What `ClusterHealth` makes of the cluster requirements' `result`.
+#[cfg(feature = "cluster")]
+async fn cluster_part(result: toolkit::HealthcheckResult) -> toolkit::HealthcheckResult {
+    ClusterHealth::new(Arc::new(FixedHealth(result)))
+        .check()
+        .await
+}
+
+/// A cluster still starting, or a profile whose backend is degraded, leaves
+/// OAGW Degraded with the SDK's message and code: the TTL bounds staleness
+/// and proxying continues. A misconfiguration stays Unhealthy.
+///
+/// ADR-0020: CACHE-CONF-004.
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn the_cluster_requirements_degrade_oagw_unless_misconfigured() {
+    use cluster_sdk::requirements::{CODE_MISCONFIGURED, CODE_PROFILE_DEGRADED, CODE_STARTING};
+    use toolkit::{HealthcheckResult, HealthcheckStatus};
+
+    for code in [CODE_STARTING, CODE_PROFILE_DEGRADED] {
+        let result = cluster_part(HealthcheckResult::unhealthy("cause").with_code(code)).await;
+        assert_eq!(result.status, HealthcheckStatus::Degraded, "{code}");
+        assert_eq!(result.code.as_deref(), Some(code));
+        assert_eq!(result.message.as_deref(), Some("cause"));
+    }
+    let misconfigured =
+        cluster_part(HealthcheckResult::unhealthy("cause").with_code(CODE_MISCONFIGURED)).await;
+    assert_eq!(misconfigured.status, HealthcheckStatus::Unhealthy);
+    assert_eq!(misconfigured.code.as_deref(), Some(CODE_MISCONFIGURED));
+    let ready = cluster_part(HealthcheckResult::healthy()).await;
+    assert_eq!(ready.status, HealthcheckStatus::Healthy);
+}
+
+/// A cluster readiness check that answers `result` after `delay`, or
+/// panics, counting its runs.
+#[cfg(feature = "cluster")]
+struct ScriptedHealth {
+    delay: parking_lot::Mutex<std::time::Duration>,
+    result: toolkit::HealthcheckResult,
+    panics: std::sync::atomic::AtomicBool,
+    runs: std::sync::atomic::AtomicUsize,
+}
+
+#[cfg(feature = "cluster")]
+impl ScriptedHealth {
+    fn new(delay: std::time::Duration, result: toolkit::HealthcheckResult) -> Arc<Self> {
+        Arc::new(Self {
+            delay: parking_lot::Mutex::new(delay),
+            result,
+            panics: std::sync::atomic::AtomicBool::new(false),
+            runs: std::sync::atomic::AtomicUsize::new(0),
+        })
+    }
+
+    fn runs(&self) -> usize {
+        self.runs.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+#[cfg(feature = "cluster")]
+#[async_trait]
+impl toolkit::Healthcheck for ScriptedHealth {
+    fn name(&self) -> &'static str {
+        "scripted"
+    }
+
+    async fn check(&self) -> toolkit::HealthcheckResult {
+        self.runs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let delay = *self.delay.lock();
+        tokio::time::sleep(delay).await;
+        assert!(
+            !self.panics.load(std::sync::atomic::Ordering::SeqCst),
+            "scripted panic"
+        );
+        self.result.clone()
+    }
+}
+
+/// A cluster readiness check slower than OAGW's budget does not hold up
+/// OAGW's healthcheck: it answers within 250 ms, Degraded
+/// `cluster_readiness_slow`, while the check runs on; once it ends, the
+/// next call answers with its result, mapped.
+///
+/// ADR-0020: CACHE-CONF-004.
+#[cfg(feature = "cluster")]
+#[tokio::test(start_paused = true)]
+async fn a_slow_cluster_check_does_not_hold_up_the_gear_health() {
+    use cluster_sdk::requirements::CODE_STARTING;
+    use toolkit::{HealthcheckResult, HealthcheckStatus};
+
+    let sdk = ScriptedHealth::new(
+        std::time::Duration::from_secs(2),
+        HealthcheckResult::unhealthy("starting").with_code(CODE_STARTING),
+    );
+    let health = OagwHealth(vec![Arc::new(ClusterHealth::new(sdk.clone()))]);
+
+    let started = tokio::time::Instant::now();
+    let slow = health.check().await;
+    assert!(
+        started.elapsed() <= CLUSTER_CHECK_BUDGET,
+        "{:?}",
+        started.elapsed()
+    );
+    assert_eq!(slow.status, HealthcheckStatus::Degraded);
+    assert_eq!(slow.code.as_deref(), Some(CODE_CLUSTER_READINESS_SLOW));
+
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    let ended = health.check().await;
+    assert_eq!(ended.status, HealthcheckStatus::Degraded);
+    assert_eq!(ended.code.as_deref(), Some(CODE_STARTING));
+    assert_eq!(sdk.runs(), 1, "the same check, waited for again");
+}
+
+/// While a check runs past the budget, OAGW answers with the last result,
+/// for up to 10 s after the check began; then `cluster_readiness_slow`.
+///
+/// ADR-0020: CACHE-CONF-004.
+#[cfg(feature = "cluster")]
+#[tokio::test(start_paused = true)]
+async fn a_slow_cluster_check_reuses_the_last_result_for_ten_seconds() {
+    use toolkit::{HealthcheckResult, HealthcheckStatus};
+
+    let sdk = ScriptedHealth::new(std::time::Duration::ZERO, HealthcheckResult::healthy());
+    let health = ClusterHealth::new(sdk.clone());
+    assert_eq!(health.check().await.status, HealthcheckStatus::Healthy);
+
+    *sdk.delay.lock() = std::time::Duration::from_secs(60);
+    assert_eq!(health.check().await.status, HealthcheckStatus::Healthy);
+    tokio::time::sleep(CLUSTER_CHECK_STALE - std::time::Duration::from_secs(1)).await;
+    assert_eq!(health.check().await.status, HealthcheckStatus::Healthy);
+
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    let slow = health.check().await;
+    assert_eq!(slow.status, HealthcheckStatus::Degraded);
+    assert_eq!(slow.code.as_deref(), Some(CODE_CLUSTER_READINESS_SLOW));
+    assert_eq!(sdk.runs(), 2, "one check runs at a time");
+}
+
+/// A cluster readiness check that panics leaves OAGW Degraded with the
+/// panic in the message, and the next call runs a new check.
+///
+/// ADR-0020: CACHE-CONF-004.
+#[cfg(feature = "cluster")]
+#[tokio::test(start_paused = true)]
+async fn a_panicking_cluster_check_is_degraded_and_run_again() {
+    use toolkit::{HealthcheckResult, HealthcheckStatus};
+
+    let sdk = ScriptedHealth::new(std::time::Duration::ZERO, HealthcheckResult::healthy());
+    sdk.panics.store(true, std::sync::atomic::Ordering::SeqCst);
+    let health = ClusterHealth::new(sdk.clone());
+    let panicked = health.check().await;
+    assert_eq!(panicked.status, HealthcheckStatus::Degraded);
+    assert_eq!(panicked.code.as_deref(), Some(CODE_CLUSTER_READINESS_SLOW));
+    let message = panicked.message.unwrap_or_default();
+    assert!(message.contains("panic"), "{message}");
+
+    sdk.panics.store(false, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(health.check().await.status, HealthcheckStatus::Healthy);
+    assert_eq!(sdk.runs(), 2);
+}
+
+/// On a tie the cache's parts come before provisioning: with provisioning
+/// not clean and the change log watch down, both Degraded, the code is the
+/// watch's, and the message names both.
+///
+/// ADR-0020: CACHE-CONF-004.
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn on_a_tie_the_watch_code_wins_over_provisioning() {
+    use crate::infra::proxy_cache::WatchState;
+    use toolkit::HealthcheckStatus;
+
+    let file = SqliteFile::new();
+    let ctx = context(database_section(), Some(file.open().await), wired_hub());
+    let gear = init(&ctx).await.expect("init");
+    gear.provisioning.set(ProvisioningStatus::NotClean);
+    let Some(Some(sync)) = gear.cache_sync.get() else {
+        panic!("a database connects the cache to the cluster");
+    };
+    sync.watch.set(WatchState::Down);
+
+    let result = health_result(&gear, &ctx).await;
+    assert_eq!(result.status, HealthcheckStatus::Degraded);
+    assert_eq!(result.code.as_deref(), Some("proxy_cache_watch_down"));
+    let message = result.message.unwrap_or_default();
+    assert!(message.contains("watch is down"), "{message}");
+    assert!(message.contains("registry provisioning"), "{message}");
+}
+
+/// The worst part decides the status and the code (the earlier on a tie);
+/// the message names every part that is not healthy, in order.
+#[tokio::test]
+async fn the_gear_health_names_every_part_that_is_not_healthy() {
+    use toolkit::{HealthcheckResult, HealthcheckStatus};
+
+    let parts = |results: Vec<HealthcheckResult>| {
+        OagwHealth(
+            results
+                .into_iter()
+                .map(|r| Arc::new(FixedHealth(r)) as Arc<dyn Healthcheck>)
+                .collect(),
+        )
+    };
+    let two_degraded = parts(vec![
+        HealthcheckResult::degraded("first").with_code("a"),
+        HealthcheckResult::healthy(),
+        HealthcheckResult::degraded("second").with_code("b"),
+    ])
+    .check()
+    .await;
+    assert_eq!(two_degraded.status, HealthcheckStatus::Degraded);
+    assert_eq!(two_degraded.code.as_deref(), Some("a"));
+    assert_eq!(two_degraded.message.as_deref(), Some("first; second"));
+
+    let worst_later = parts(vec![
+        HealthcheckResult::degraded("first").with_code("a"),
+        HealthcheckResult::unhealthy("second").with_code("b"),
+    ])
+    .check()
+    .await;
+    assert_eq!(worst_later.status, HealthcheckStatus::Unhealthy);
+    assert_eq!(worst_later.code.as_deref(), Some("b"));
+    assert_eq!(worst_later.message.as_deref(), Some("first; second"));
+
+    let one = parts(vec![
+        HealthcheckResult::healthy(),
+        HealthcheckResult::degraded("only").with_code("a"),
+    ])
+    .check()
+    .await;
+    assert_eq!(one.message.as_deref(), Some("only"));
+}
+
+/// A second `start` without a `stop` ends the change feed and the registry
+/// task the first began before it starts new ones.
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn a_second_start_stops_what_the_first_began() {
+    let file = SqliteFile::new();
+    let hub = settling_hub(Uuid::new_v4());
+    let cluster = ClusterFixture::standalone(&hub);
+    let ctx = context(database_section(), Some(file.open().await), hub);
+    let gear = init(&ctx).await.expect("init");
+    boot(&gear).await;
+    let first_feed = gear
+        .change_feed
+        .lock()
+        .as_ref()
+        .expect("a feed")
+        .cancel_token();
+    let first_task = gear
+        .registry_task
+        .lock()
+        .as_ref()
+        .expect("a registry task")
+        .0
+        .clone();
+
+    gear.start(tokio_util::sync::CancellationToken::new())
+        .await
+        .expect("start again");
+    assert!(first_feed.is_cancelled(), "the first feed is stopped");
+    assert!(
+        first_task.is_cancelled(),
+        "the first registry task is stopped"
+    );
+    let feed = gear
+        .change_feed
+        .lock()
+        .as_ref()
+        .expect("a feed")
+        .cancel_token();
+    assert!(!feed.is_cancelled(), "a new feed runs");
+    let task = gear
+        .registry_task
+        .lock()
+        .as_ref()
+        .expect("a task")
+        .0
+        .clone();
+    assert!(!task.is_cancelled(), "a new registry task runs");
+
+    gear.stop(tokio_util::sync::CancellationToken::new())
+        .await
+        .expect("stop");
+    cluster.stop().await;
+}
+
+/// The gear builds the cache from `proxy_cache`: with `max_entries: 1` a
+/// second alias evicts the first, and with `ttl: 1s` an entry is read again
+/// after a second.
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn the_cache_takes_its_ttl_and_size_from_the_config() {
+    use toolkit_db::test_support::QueryKind;
+
+    let (db, recorder) = crate::infra::storage::testing::recorded_sqlite().await;
+    let tenant = Uuid::new_v4();
+    let hub = settling_hub(tenant);
+    let ctx = context(
+        database_section_with_cache(json!({ "ttl": "1s", "max_entries": 1 })),
+        Some(db),
+        Arc::clone(&hub),
+    );
+    let gear = init(&ctx).await.expect("init");
+    let sctx = || provisioning_ctx(tenant).expect("security context");
+    let gw = hub.get::<dyn ServiceGatewayClientV1>().unwrap();
+    let cp = control_plane(&gear);
+    let (upstream, route, _) = served_upstream(&*gw, sctx()).await;
+    let served = (upstream.id, route.id);
+    let selects_of = async |alias: &str| {
+        recorder.clear();
+        let _ = cp
+            .resolve_proxy_target(&sctx(), alias, "POST", "/v1/things", Tags::Skip)
+            .await;
+        recorder
+            .events()
+            .iter()
+            .filter(|e| e.kind == QueryKind::Select)
+            .count()
+    };
+
+    assert_eq!(resolve_served(&*cp, &sctx()).await.expect("served"), served);
+    assert_eq!(selects_of("api.example.com").await, 0, "cached");
+    assert!(selects_of("other.example.com").await > 0);
+    assert_eq!(selects_of("other.example.com").await, 0, "cached");
+    assert!(
+        selects_of("api.example.com").await > 0,
+        "evicted: one entry per section"
+    );
+
+    assert_eq!(selects_of("api.example.com").await, 0, "cached");
+    // No statement runs while the clock is paused.
+    tokio::time::pause();
+    tokio::time::advance(std::time::Duration::from_secs(1)).await;
+    tokio::time::resume();
+    assert!(selects_of("api.example.com").await > 0, "expired");
 }

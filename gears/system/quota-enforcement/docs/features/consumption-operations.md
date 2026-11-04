@@ -241,7 +241,7 @@ Realises `cpt-cf-quota-enforcement-seq-evaluate-preview`.
 1. [x] - `p1` - Caller sends `POST /v1/quota-enforcement/operations/preview` with the same attribution, metric, amount, metadata, and optional resource as the corresponding write but no idempotency key; preview requires the same PDP authorization as the corresponding write (`cpt-cf-quota-enforcement-fr-evaluate-preview`) - `inst-prv-request`
 2. [x] - `p1` - Consume the PDP-authorized, catalogue-mapped subject set (`cpt-cf-quota-enforcement-algo-subject-resolution`), then DB: `read_quota_snapshot` as a transactional snapshot read of current counter state with no read-modify hold and no contention against concurrent debits (I3) - `inst-prv-read`
 3. [x] - `p1` - DB: `read_policy(scope)`; invoke the Engine boundary (`cpt-cf-quota-enforcement-algo-engine-boundary`) unchanged: an invariant violation on the returned Decision surfaces the same canonical `Internal` error as the corresponding write (fail-closed) and increments `debit_plan_invariant_violations_total` per the engine boundary - `inst-prv-engine`
-4. [x] - `p1` - Persist nothing: no counter mutation, no held capacity, no idempotency record, no operation-log entry, and no outbox event; only ephemeral telemetry counters move; the single permitted persisted side effect is the I3 lazy materialization of a fresh period row with `consumed = 0`, which is not a counter mutation - `inst-prv-nopersist`
+4. [x] - `p1` - Persist nothing: no counter mutation, no held capacity, no idempotency record, no operation-log entry, and no outbox event, and no period row even across a boundary; only ephemeral telemetry counters move - `inst-prv-nopersist`
 5. [x] - `p1` - **RETURN** `DecisionPreview` carrying the full Decision shape plus `preview: true`, with `policy_id` and `policy_version` in diagnostics; the SDK path is `QuotaEnforcementClientV1::evaluate_preview(req)`; the verdict can be invalidated by concurrent debits, and callers that need held capacity use the lease flow instead (lease-operations feature) - `inst-prv-return`
 
 ## 3. Processes / Business Logic (CDSL)
@@ -306,7 +306,7 @@ period
 **Steps**:
 1. [x] - `p1` - Periods are drawn from the five GTS instances under `gts.cf.core.qe.period_type.v1~` (`day`, `week`, `month`, `year`, `one_time`), all UTC and calendar-aligned by default; the current period boundary timestamp is persisted with each consumption counter for deterministic detection (`cpt-cf-quota-enforcement-fr-period-semantics`) - `inst-per-spec`
 2. [x] - `p1` - Attribute every single-shot mutation to the period whose half-open interval `[start, end)` contains the mutation transaction's commit timestamp; a debit committing at exactly `boundary_at` is accounted to period `P+1`; leases are attributed to their acquisition period, per the lease-operations feature and I5 - `inst-per-attr`
-3. [x] - `p1` - **IF** any evaluate observes `now() >= period_end` for a consumption Quota (lazy detection; the single permitted I3 exception) - `inst-per-lazy-if`
+3. [x] - `p1` - **IF** any mutating operation observes `now() >= period_end` for a consumption Quota (lazy detection) - `inst-per-lazy-if`
    1. [x] - `p1` - DB: atomically materialize the new `quota_consumption_counters` row with `consumed = 0` and `highest_crossed_threshold_pct = NULL` (I13), so `threshold-crossed` notifications can fire again in the new period per the notifications feature's emission rule - `inst-per-lazy`
 4. [x] - `p1` - Mark the closing-period row settled only after every active lease with the closing acquisition period has resolved, and enqueue the `period-rollover` event carrying the closing-period consumed amount, the closing-period cap, and the new period boundary; the event is emitted strictly after the last commit attributed to the closing period, so it signals settlement completion, not the calendar transition, and may lag the boundary by up to `max_lease_ttl` - `inst-per-settle`
 5. [x] - `p1` - During the settlement window, cross-period lease commits and releases mutate the closing-period counter and emit no `quota-counter-adjusted` or `threshold-crossed` events (`cpt-cf-quota-enforcement-adr-settlement-window-emit`) - `inst-per-window`
@@ -336,10 +336,10 @@ operation-log retention setting (default 30 days), the coordination adapter's `r
 
 **States**: Absent, Current, SettlementWindow, Settled
 
-**Initial State**: Absent (consumption counter rows are created lazily on first evaluate)
+**Initial State**: Absent (consumption counter rows are created lazily by the first mutating operation)
 
 **Transitions**:
-1. [x] - `p1` - **FROM** Absent **TO** Current **WHEN** the first evaluate touching the Quota in the period materializes the row with `consumed = 0` and `highest_crossed_threshold_pct = NULL` (I13) - `inst-perst-create`
+1. [x] - `p1` - **FROM** Absent **TO** Current **WHEN** the first mutating operation touching the Quota in the period materializes the row with `consumed = 0` and `highest_crossed_threshold_pct = NULL` (I13) - `inst-perst-create`
 2. [x] - `p1` - **FROM** Current **TO** SettlementWindow **WHEN** the calendar boundary passes (`now() >= period_end`); new single-shot mutations attribute to the successor period, credits against this period are rejected with `PERIOD_CLOSED` (calendar-keyed), while cross-period lease commits and rollbacks still land against this period's counter - `inst-perst-boundary`
 3. [x] - `p1` - **FROM** SettlementWindow **TO** Settled **WHEN** every active lease acquired in the period has resolved and the `period-rollover` event is enqueued; the closing consumed amount is final and rollbacks against the period are rejected with `PERIOD_CLOSED` (settlement-keyed) - `inst-perst-settle`
 
@@ -460,9 +460,9 @@ consumption Quotas keep a per-period consumed counter (increased by debit, decre
 and reversed exactly by rollback against the debit's attribution period) that resets to zero at every period
 boundary. Periods **MUST** be the five GTS instances under `gts.cf.core.qe.period_type.v1~`, UTC and
 calendar-aligned, with the current boundary timestamp persisted per counter; consumption rows are materialized lazily
-on first evaluate; rollover **MUST** be atomic with respect to in-flight operations, attribute mutations by the
-half-open `[start, end)` commit-time rule, set `highest_crossed_threshold_pct = NULL` on every new row (I13), emit the
-`period-rollover` event strictly after the last commit attributed to the closing period, and suppress
+by the first mutating operation; rollover **MUST** be atomic with respect to in-flight operations, attribute
+mutations by the half-open `[start, end)` commit-time rule, set `highest_crossed_threshold_pct = NULL` on every new
+row (I13), emit the `period-rollover` event strictly after the last commit attributed to the closing period, and suppress
 `quota-counter-adjusted` and `threshold-crossed` emission for settlement-window mutations (ADR-0004). All events are
 enqueued in the same transaction as the counter mutation (I11); emission rules for `threshold-crossed` and all
 dispatch belong to the notifications feature.
@@ -562,7 +562,7 @@ retry storm at 10x normal RPS with a 5% retry rate showing zero double-count eve
   exactly like the corresponding write
 - [ ] Decision-shaped fields injected into any request body are silently ignored on both fresh and replay paths
   (adversarial integration test of the PRD §3.4 trust boundary)
-- [ ] The first evaluate after a period boundary materializes the new consumption row with `consumed = 0` and
+- [ ] The first mutating operation after a period boundary materializes the new consumption row with `consumed = 0` and
   `highest_crossed_threshold_pct = NULL`; a debit committing at exactly `boundary_at` lands in the new period; the
   `period-rollover` event carries the closing consumed amount, closing cap, and new boundary, and is observed
   strictly after the last commit attributed to the closing period

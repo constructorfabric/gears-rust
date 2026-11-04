@@ -207,12 +207,66 @@ pub trait ChangePublisher: Send + Sync {
     async fn publish(&self, event: ValueEvent);
 }
 
+/// The step-up-gated operations `settings_step_up_total` counts under.
+#[domain_model]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StepUpOperation {
+    /// A value set.
+    Set,
+    /// A value reverted to its fallback.
+    Revert,
+    /// A value removed.
+    Remove,
+    /// A batch of value changes.
+    Batch,
+    /// A secret staged.
+    Stage,
+    /// Values cloned from one tenant to another.
+    Clone,
+    /// A declaration retired.
+    Retire,
+    /// A retired declaration reactivated.
+    Reactivate,
+    /// A declaration evolved to a successor key.
+    Evolve,
+    /// A declaration's behavior-affecting metadata updated.
+    Update,
+    /// A retired declaration purged.
+    Purge,
+}
+
+impl StepUpOperation {
+    /// The `operation` label value.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Set => "set",
+            Self::Revert => "revert",
+            Self::Remove => "remove",
+            Self::Batch => "batch",
+            Self::Stage => "stage",
+            Self::Clone => "clone",
+            Self::Retire => "retire",
+            Self::Reactivate => "reactivate",
+            Self::Evolve => "evolve",
+            Self::Update => "update",
+            Self::Purge => "purge",
+        }
+    }
+}
+
 /// Counters the write path reports.
 pub trait WriteMetrics: Send + Sync {
     /// `settings_value_writes_total` by result.
     fn value_write(&self, result: &'static str);
     /// `settings_step_up_total` by operation and result.
-    fn step_up(&self, operation: &'static str, result: &'static str);
+    fn step_up(&self, operation: StepUpOperation, result: &'static str);
+    /// `settings_declaration_purge_secret_releases_total{result=ok}`: one
+    /// Credential Store entry released after a declaration purge.
+    fn purge_released(&self);
+    /// `settings_declaration_purge_secret_releases_total{result=failed}`: one
+    /// Credential Store entry a purge could not release.
+    fn purge_release_failed(&self);
 }
 
 /// What the managed lifecycle's passes report.
@@ -227,11 +281,29 @@ pub trait LifecycleMetrics: Send + Sync {
     fn retention_pass(&self, result: &'static str, pruned: u64);
 }
 
+/// What the actor name lookup of a history page reports.
+pub trait ActorNameMetrics: Send + Sync {
+    /// One lookup pass: `settings_actor_name_lookups_total` and
+    /// `settings_actor_name_lookup_duration_seconds` by `result` (`ok`,
+    /// `degraded` or `skipped`). No actor identifier is ever a label.
+    fn pass(&self, result: &'static str, duration: std::time::Duration);
+}
+
+/// Reports nothing; the test binding.
+#[domain_model]
+pub struct NoActorNameMetrics;
+
+impl ActorNameMetrics for NoActorNameMetrics {
+    fn pass(&self, _result: &'static str, _duration: std::time::Duration) {}
+}
+
 /// Counts nothing; the test binding.
 #[domain_model]
 pub struct NoMetrics;
 
 impl WriteMetrics for NoMetrics {
     fn value_write(&self, _result: &'static str) {}
-    fn step_up(&self, _operation: &'static str, _result: &'static str) {}
+    fn step_up(&self, _operation: StepUpOperation, _result: &'static str) {}
+    fn purge_released(&self) {}
+    fn purge_release_failed(&self) {}
 }

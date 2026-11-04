@@ -36,11 +36,11 @@
 
 ### 1.1 Overview
 
-Provide the backend read plane, pushing aggregation into ClickHouse's vectorized execution and paginating raw reads via keyset seeking — both as single-level scans over raw rows that anti-join the deactivation-marker id set instead of resolving `ReplacingMergeTree` versions, so deactivation is exact before any merge at one hash probe per row. This is the allocation target for the aggregation query-latency NFR and the workload-isolation NFR.
+Provide the backend read plane, pushing aggregation into ClickHouse's vectorized execution and paginating raw reads via keyset seeking — both as single-level scans over `usage_records FINAL`, so the engine resolves `ReplacingMergeTree` versions before the `WHERE`, `LIMIT` and `GROUP BY` run and deactivation and duplicate creates are exact before any merge. This is the allocation target for the aggregation query-latency NFR and the workload-isolation NFR.
 
 ### 1.2 Purpose
 
-Query & Aggregation owns: OData `$filter`/`$orderby`/cursor → parameterized ClickHouse SQL translation (injection-safe); pushed-down single-level aggregate over the marker-anti-joined active rows with server-side `LIMIT MAX_AGGREGATION_BUCKETS + 1` cap; single-level keyset-paginated raw list over the marker-anti-joined rows with one-row look-ahead and forward-only cursor enforcement; and the operator-facing workload-isolation posture documentation (shared client/pool, the absence of any pool-size config knob, accepted contention analysis, and operational mitigation guidance).
+Query & Aggregation owns: OData `$filter`/`$orderby`/cursor → parameterized ClickHouse SQL translation (injection-safe); pushed-down single-level aggregate over the `FINAL`-resolved active rows with server-side `LIMIT MAX_AGGREGATION_BUCKETS + 1` cap; single-level keyset-paginated list over the `FINAL`-resolved rows with one-row look-ahead and forward-only cursor enforcement; and the operator-facing workload-isolation posture documentation (shared client/pool, the absence of any pool-size config knob, accepted contention analysis, and operational mitigation guidance).
 
 **Requirements**: `cpt-cf-uc-ch-plugin-nfr-query-latency`, `cpt-cf-uc-ch-plugin-nfr-workload-isolation`
 
@@ -89,11 +89,11 @@ Query & Aggregation owns: OData `$filter`/`$orderby`/cursor → parameterized Cl
 **Steps**:
 
 1. [ ] - `p1` - Translate the `AggregationSpec` (dimensions, operations, filters, metadata filters) to a parameterized ClickHouse `SELECT` using the Query Translator (`cpt-cf-uc-ch-plugin-algo-query-translator`) - `inst-ch-agg-1`
-2. [ ] - `p1` - Apply `SUM`-nets-compensations rule (`corrects_id IS NOT NULL` excluded for non-SUM ops); apply the survivor predicate `status = 'active' AND id NOT IN (SELECT id FROM usage_records WHERE <scan> AND status = 'inactive')` (`dedup::active_survivors`), so markers and the active rows they supersede never reach the aggregate - `inst-ch-agg-2`
+2. [ ] - `p1` - Apply `SUM`-nets-compensations rule (`corrects_id IS NOT NULL` excluded for non-SUM ops); apply the liveness predicate `status = 'active'` (`dedup::ACTIVE_ONLY`) over the `FINAL`-resolved rows, so a deactivated record (resolved to its marker) never reaches the aggregate - `inst-ch-agg-2`
 3. [ ] - `p1` - Append `LIMIT {MAX_AGGREGATION_BUCKETS + 1}` (100,001) to the generated SQL to cap server-side materialization - `inst-ch-agg-3`
-4. [ ] - `p1` - Execute as a single-level query over raw `usage_records` rows: every version-invariant `$filter` conjunct joins the scan predicate, which is rendered twice — as the scan `WHERE` and verbatim inside the marker subquery — so `tenant_id` and `created_at` prune both on the sorting-key prefix; no version-resolving `GROUP BY`, `LIMIT 1 BY` or `FINAL` - `inst-ch-agg-4`
-   1. [ ] - `p1` - Append the `$filter`'s `status`-naming conjuncts after the survivor predicate in the same `WHERE`; they read the raw `status`, which on every surviving row equals the resolved status - `inst-ch-agg-4a`
-   2. [ ] - `p1` - Bind `gts_id` and the scan binds twice (once per copy of the scan text), then the trailing binds, matching the left-to-right `?` order - `inst-ch-agg-4b`
+4. [ ] - `p1` - Execute as a single-level query over `usage_records FINAL` with `do_not_merge_across_partitions_select_final = 1` and `optimize_move_to_prewhere_if_final = 0` attached per query: every `$filter` conjunct joins the single `WHERE`, so `tenant_id` and `created_at` prune the read on the sorting-key prefix; no version-resolving `GROUP BY` or `LIMIT 1 BY` of the store's own - `inst-ch-agg-4`
+   1. [ ] - `p1` - The `$filter`'s `status`-naming conjuncts sit in the same `WHERE` after the liveness predicate; under `FINAL` they read the resolved status - `inst-ch-agg-4a`
+   2. [ ] - `p1` - Bind `gts_id`, then every clause bind once, matching the left-to-right `?` order - `inst-ch-agg-4b`
 5. [ ] - `p1` - **RETURN** the result rows (caller — the gateway — inspects `len() > MAX_AGGREGATION_BUCKETS` to apply the over-bucket error) - `inst-ch-agg-5`
 
 ### List Usage Records (Keyset Paginated)
@@ -115,7 +115,7 @@ Query & Aggregation owns: OData `$filter`/`$orderby`/cursor → parameterized Cl
 
 1. [ ] - `p1` - Translate the OData `$filter`, `$orderby`, and keyset cursor to parameterized ClickHouse `WHERE ... ORDER BY ... LIMIT <n+1>` via the Query Translator - `inst-ch-list-1`
 2. [ ] - `p1` - Enforce forward-only cursor (`ensure_forward_cursor`): reject a cursor whose position is before the current sort-key anchor - `inst-ch-list-2`
-3. [ ] - `p1` - Execute as a single-level query over raw rows with the survivor predicate `(status = 'inactive' OR id NOT IN (SELECT id … WHERE <scan> AND status = 'inactive'))` (`dedup::resolved_survivors`): every version-invariant `$filter` conjunct joins the scan predicate (rendered twice), the keyset predicate and the `$filter`'s `status`-naming conjuncts trail it, and the caller's `ORDER BY … LIMIT n+1` is the only sort - `inst-ch-list-3`
+3. [ ] - `p1` - Execute as a single-level query over `usage_records FINAL` (same per-query settings as the aggregate): every `$filter` conjunct and the keyset predicate join the single `WHERE`, which reads resolved rows, and the caller's `ORDER BY … LIMIT n+1` is the only sort, counting logical rows - `inst-ch-list-3`
 4. [ ] - `p1` - **IF** result contains `n+1` rows — truncate to `n`, encode the `n+1`-th row as the next-cursor - `inst-ch-list-4`
 5. [ ] - `p1` - **RETURN** a `Page` of at most `n` records plus an optional next-cursor - `inst-ch-list-5`
 
@@ -160,13 +160,13 @@ Not applicable — this feature introduces no entity lifecycle state machine. Al
 
 - [x] `p1` - **ID**: `cpt-cf-uc-ch-plugin-dod-query-aggregation-aggregate`
 
-The system **MUST** implement `query_aggregated_usage_records` as a pushed-down single-level aggregate query over raw rows that:
+The system **MUST** implement `query_aggregated_usage_records` as a pushed-down single-level aggregate query over `usage_records FINAL` that:
 - Applies the `SUM`-nets-compensations rule (`corrects_id IS NOT NULL` excluded from non-`SUM` operations).
-- Applies the survivor predicate `status = 'active' AND id NOT IN (<marker ids within the same scan predicate>)` so neither a deactivation marker nor the row it supersedes is aggregated, and appends the `$filter`'s `status`-naming conjuncts after it in the same `WHERE`.
+- Applies the liveness predicate `status = 'active'` to the `FINAL`-resolved rows so neither a deactivation marker nor the row it supersedes is aggregated, with the `$filter`'s `status`-naming conjuncts in the same `WHERE`.
 - Appends `LIMIT {MAX_AGGREGATION_BUCKETS + 1}` (100,001) server-side.
 - Uses only bound parameters for caller-derived values and an allowlisted identifier set for column names.
 - Returns the result rows in order for the gateway to inspect the cap.
-- The aggregation-latency NFR (`≤500ms p95`, 30-day single-tenant aggregation) **MUST** be measured with the marker anti-join included.
+- The aggregation-latency NFR (`≤500ms p95`, 30-day single-tenant aggregation) **MUST** be measured with `FINAL` included.
 
 **Implements**: `cpt-cf-uc-ch-plugin-algo-aggregation-cap`, `cpt-cf-uc-ch-plugin-flow-query-aggregation-aggregate`
 
@@ -181,7 +181,7 @@ The system **MUST** implement `query_aggregated_usage_records` as a pushed-down 
 
 - [x] `p1` - **ID**: `cpt-cf-uc-ch-plugin-dod-query-aggregation-list`
 
-The system **MUST** implement `list_usage_records` as a single-level keyset-paginated list over the marker-anti-joined rows (one physical row per logical row, at its resolved status, before any merge) that:
+The system **MUST** implement `list_usage_records` as a single-level keyset-paginated list over `usage_records FINAL` (one resolved row per logical row, at its resolved status, before any merge) that:
 - Enforces forward-only cursor (`ensure_forward_cursor`).
 - Uses a `n+1` look-ahead row to determine if a next-cursor exists.
 - Returns at most `n` records (wire-level cap ≤ 1,000) with an opaque next-cursor when available.
@@ -215,9 +215,9 @@ The system **MUST** document in the plugin README that v1 uses one `clickhouse::
 
 ## 6. Acceptance Criteria
 
-- [x] `query_aggregated_usage_records` is a single-level scan: it applies `status = 'active' AND id NOT IN (<marker ids>)` with the `$filter`'s version-invariant conjuncts in both the scan and the marker subquery and its `status`-naming conjuncts trailing, carries no version-resolving `GROUP BY`/`LIMIT 1 BY`/`FINAL` (`EXPLAIN PIPELINE` shows at most the caller's own `Aggregating` step), applies `LIMIT 100001` server-side, and correctly applies the `SUM`-nets-compensations vs. other-ops-exclude-compensations rule. Every aggregation op (`SUM`, `COUNT`, `MIN`, `MAX`, `AVG`) excludes a deactivated record, and a group whose only record is deactivated disappears rather than surfacing as a zero-valued bucket.
-- [x] The aggregation-latency NFR budget is verified with the marker anti-join included (not measured around it).
-- [x] `list_usage_records` is a single-level scan with the `(status = 'inactive' OR id NOT IN (<marker ids>))` survivor predicate: a deactivated record appears exactly once, as inactive, before any merge; the keyset predicate and the `$filter`'s `status`-naming conjuncts trail the survivor predicate and the rest of the `$filter` prunes both scan copies; the caller's `ORDER BY … LIMIT` is the only sort (`EXPLAIN PIPELINE` shows one `Sorting` step and no `LimitBy`); uses the `n+1` look-ahead cursor pattern, and enforces forward-only cursor — a backward cursor returns `InvalidCursor`.
+- [x] `query_aggregated_usage_records` is a single-level scan over `usage_records FINAL`: it applies `status = 'active'` and every `$filter` conjunct in one `WHERE` over resolved rows, binds each placeholder once, carries no version-resolving `GROUP BY`/`LIMIT 1 BY` of its own (`EXPLAIN PIPELINE` shows the engine's `ReplacingSorted` step and at most the caller's own `Aggregating` step), attaches `do_not_merge_across_partitions_select_final = 1` and `optimize_move_to_prewhere_if_final = 0`, applies `LIMIT 100001` server-side, and correctly applies the `SUM`-nets-compensations vs. other-ops-exclude-compensations rule. Every aggregation op (`SUM`, `COUNT`, `MIN`, `MAX`, `AVG`) excludes a deactivated record, a group whose only record is deactivated disappears rather than surfacing as a zero-valued bucket, and a duplicate physical row is counted once.
+- [x] The aggregation-latency NFR budget is verified with `FINAL` included (not measured around it).
+- [x] `list_usage_records` is a single-level scan over `usage_records FINAL`: a deactivated record appears exactly once, as inactive, before any merge; a duplicate physical row appears once and on one page; the keyset predicate and every `$filter` conjunct sit in the single `WHERE` over resolved rows; the caller's `ORDER BY … LIMIT` is the only sort (`EXPLAIN PIPELINE` shows the `ReplacingSorted` step, no `LimitBy` and no full sort); uses the `n+1` look-ahead cursor pattern, and enforces forward-only cursor — a backward cursor returns `InvalidCursor`.
 - [x] The Query Translator uses bound parameters for all caller-derived values; no caller-controlled identifier is interpolated into query text; only allowlisted column names are accepted.
 - [x] Aggregation results contain only rows with `status='active'` (deactivated records are excluded from active aggregation). Raw `list_usage_records` results are deliberately **status-agnostic**: `deactivate_usage_record` (`../../../../usage-collector-sdk/src/plugin_api.rs`) does not return the set of cascade-flipped ids and directs callers to enumerate a deactivation cascade through a follow-up list filtered on `status` / `corrects_id`, so the list path applies no `status` predicate of its own (matching the reference plugin).
 - [x] The plugin README documents the shared-client workload-isolation posture and the two-instance operational mitigation.

@@ -21,14 +21,11 @@
 //!
 //! # The digest
 //!
-//! [`content_digest`] is `SHA-256` through `aws-lc-rs`, the platform's
-//! `FIPS`-validated provider, reached with the same call the pricing gear
-//! uses. `sha2`, `sha1` and `md5` are refused outright by architecture lint
-//! `DE0708` (`docs/security/SECURITY.md`), which allow-lists direct imports
-//! of those crates and does not reach `aws-lc-rs`.
+//! [`content_digest`] is `SHA-256` through the toolkit-security facade,
+//! shared with pricing and routed to this build's platform/FIPS backend.
 
-use aws_lc_rs::digest::{SHA256, digest as sha256};
 use serde_json::{Number, Value as JsonValue};
+use toolkit_security::crypto::hash::Sha256;
 
 /// The `SHA-256` digest of a canonical rendering, as the 32 raw bytes a
 /// `bytea`/`blob` column stores.
@@ -47,7 +44,7 @@ use serde_json::{Number, Value as JsonValue};
 /// "short digest" branch that cannot happen.
 #[must_use]
 pub fn content_digest(canonical: &str) -> [u8; 32] {
-    let digest = sha256(&SHA256, canonical.as_bytes());
+    let digest = Sha256::digest(canonical.as_bytes());
     let mut out = [0_u8; 32];
     for (slot, byte) in out.iter_mut().zip(digest.as_ref()) {
         *slot = *byte;

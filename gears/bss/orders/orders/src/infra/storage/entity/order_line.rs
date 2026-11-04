@@ -52,8 +52,12 @@ pub struct Model {
     pub billing_cycle: String,
     /// Versioned immutable `OrderPin` with the Pricing receipt; NULL only on the draft version.
     pub order_pin: Option<Json>,
-    /// Subscriptions' `catalogSubscriptionProductKey` for the line, stored as received.
+    /// Subscriptions' overlap scope for the line, stored as received.
     pub overlap_scope_key: Option<String>,
+    /// Complete proposed `item_keys_v1` evidence; NULL is legacy, [] proven keyless.
+    pub overlap_item_keys: Option<Json>,
+    /// Subscriptions' independent catalog product identity, absent for legacy/keyless lines.
+    pub catalog_subscription_product_key: Option<String>,
     /// Snapshot of the effective date policy (switches, source scope, revision) used at capture.
     pub date_policy_switch_state: Json,
 }

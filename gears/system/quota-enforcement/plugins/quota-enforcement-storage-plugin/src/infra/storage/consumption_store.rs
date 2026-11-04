@@ -19,16 +19,16 @@ use quota_enforcement_sdk::{
     Decision, DecisionResult, EvaluatedDebit, EvaluatedMutation, EvaluationContext,
     EvaluationFailure, EvaluationQuota, IdempotencyRecord, IdempotencyScope, IdempotencySubjectKey,
     IdempotencyWrite, MutationResult, NO_APPLICABLE_QUOTA, NotificationEvent,
-    NotificationEventKind, NotificationScope, OperationType, PartialIdempotencyWrite, PayloadHash,
-    PeriodId, PeriodType, PeriodWindow, PolicyScope, PolicyVersion, Quota, QuotaId, QuotaScopeTier,
-    QuotaSnapshot, QuotaStatus, QuotaType, Retention, RollbackTarget, StorageError, TenantId,
-    ThresholdCrossing, TransitionOutcome, threshold_crossings,
+    NotificationEventKind, NotificationScope, OperationType, PageRequest, PageResult,
+    PartialIdempotencyWrite, PayloadHash, PeriodId, PeriodType, PeriodWindow, PolicyScope,
+    PolicyVersion, Quota, QuotaId, QuotaScopeTier, QuotaSnapshot, QuotaStatus, QuotaType,
+    Retention, RollbackTarget, StorageError, TenantId, ThresholdCrossing, TransitionOutcome,
+    threshold_crossings,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use time::OffsetDateTime;
 use toolkit_db::secure::{DBRunner, ScopeError};
-use toolkit_db::secure::{TxAccessMode, TxConfig, TxIsolationLevel};
 use toolkit_db::{Db, DbError};
 use toolkit_security::{AccessScope, SecurityContext};
 use uuid::Uuid;
@@ -43,7 +43,9 @@ use super::repo::{
     lease_repo, operation_log_repo, policy_repo, quota_repo,
 };
 use crate::domain::ports::Actor;
-use crate::infra::outbox::{EnqueueError, NotificationEnqueuer};
+use crate::infra::outbox::{
+    AttemptWakes, EnqueueError, NotificationEnqueuer, NotificationOutbox, settling,
+};
 
 const LOG_TARGET: &str = "qe.storage";
 
@@ -74,7 +76,7 @@ pub type Clock = Arc<dyn Fn() -> OffsetDateTime + Send + Sync>;
 #[derive(Clone)]
 pub struct SqlConsumptionStore {
     pub(super) db: Db,
-    pub(super) enqueuer: Arc<dyn NotificationEnqueuer>,
+    pub(super) enqueuer: Arc<dyn NotificationOutbox>,
     pub(super) clock: Clock,
 }
 
@@ -810,7 +812,7 @@ fn record_to_model(row: idempotency_row::Model) -> Result<IdempotencyRecord, TxE
 impl SqlConsumptionStore {
     /// Bind the database and the same-transaction event enqueuer.
     #[must_use]
-    pub fn new(db: Db, enqueuer: Arc<dyn NotificationEnqueuer>) -> Self {
+    pub fn new(db: Db, enqueuer: Arc<dyn NotificationOutbox>) -> Self {
         Self {
             db,
             enqueuer,
@@ -821,7 +823,7 @@ impl SqlConsumptionStore {
     /// The same store on a caller-driven clock. Tests move period boundaries
     /// and retention deadlines this way instead of waiting for them.
     #[must_use]
-    pub fn with_clock(db: Db, enqueuer: Arc<dyn NotificationEnqueuer>, clock: Clock) -> Self {
+    pub fn with_clock(db: Db, enqueuer: Arc<dyn NotificationOutbox>, clock: Clock) -> Self {
         Self {
             db,
             enqueuer,
@@ -1066,7 +1068,7 @@ pub(super) struct LockedCounter {
 }
 
 impl LockedCounter {
-    fn consumption(
+    pub(super) fn consumption(
         quota: &Quota,
         latest: Option<quota_consumption_counter::Model>,
         now: OffsetDateTime,
@@ -1081,12 +1083,18 @@ impl LockedCounter {
         }
     }
 
-    fn allocation(in_flight: Option<i64>) -> Self {
+    pub(super) fn allocation(in_flight: Option<i64>) -> Self {
         Self {
             stored: in_flight.map_or(0, |value| u64::try_from(value).unwrap_or(0)),
             period_id: None,
             window: None,
         }
+    }
+
+    /// The current period row this counter reads, `None` for an allocation
+    /// row or a period with no row yet.
+    pub(super) fn period_id(&self) -> Option<Uuid> {
+        self.period_id
     }
 }
 
@@ -1116,7 +1124,7 @@ pub(super) async fn lock_counters_of(
 }
 
 /// The snapshot of `quota` from its `counter`, less the expired holds nobody
-/// has returned yet.
+/// has returned yet: the per-Quota state every evaluation sees.
 pub(super) async fn snapshot_of_locked(
     tx: &impl DBRunner,
     scope: &AccessScope,
@@ -1124,24 +1132,81 @@ pub(super) async fn snapshot_of_locked(
     counter: &LockedCounter,
     now: OffsetDateTime,
 ) -> Result<QuotaSnapshot, TxError> {
-    // @cpt-begin:cpt-cf-quota-enforcement-algo-lazy-expiry:p1:inst-lzy-capacity
     let owed = unreturned_expired(tx, scope, quota.id.as_uuid(), counter.period_id, now).await?;
+    Ok(snapshot_from(quota, counter, owed, now))
+}
+
+/// The snapshot of `quota` from its `counter`, less `owed`, what its expired
+/// holds still occupy: the per-Quota state every snapshot read returns.
+// @cpt-algo:cpt-cf-quota-enforcement-algo-snapshot-state:p1
+// @cpt-dod:cpt-cf-quota-enforcement-dod-snapshot-state-contract:p1
+pub(super) fn snapshot_from(
+    quota: &Quota,
+    counter: &LockedCounter,
+    owed: u64,
+    now: OffsetDateTime,
+) -> QuotaSnapshot {
+    // @cpt-begin:cpt-cf-quota-enforcement-algo-snapshot-state:p1:inst-sst-identity
+    let (quota_id, subject, metric, quota_type) = (
+        quota.id,
+        quota.subject.clone(),
+        quota.metric.clone(),
+        quota.quota_type,
+    );
+    // @cpt-end:cpt-cf-quota-enforcement-algo-snapshot-state:p1:inst-sst-identity
+    // @cpt-begin:cpt-cf-quota-enforcement-algo-snapshot-state:p1:inst-sst-amounts
+    // @cpt-begin:cpt-cf-quota-enforcement-algo-lazy-expiry:p1:inst-lzy-capacity
     let consumed = counter.stored.saturating_sub(owed);
     // @cpt-end:cpt-cf-quota-enforcement-algo-lazy-expiry:p1:inst-lzy-capacity
-    Ok(QuotaSnapshot {
-        quota_id: quota.id,
-        subject: quota.subject.clone(),
-        metric: quota.metric.clone(),
-        quota_type: quota.quota_type,
-        enforcement_mode: quota.enforcement_mode,
+    let remaining = quota.cap.map(|cap| cap.saturating_sub(consumed));
+    // @cpt-end:cpt-cf-quota-enforcement-algo-snapshot-state:p1:inst-sst-amounts
+    // @cpt-begin:cpt-cf-quota-enforcement-algo-snapshot-state:p1:inst-sst-mode
+    let enforcement_mode = quota.enforcement_mode;
+    // @cpt-end:cpt-cf-quota-enforcement-algo-snapshot-state:p1:inst-sst-mode
+    // @cpt-begin:cpt-cf-quota-enforcement-algo-snapshot-state:p1:inst-sst-period-if
+    let period = if quota_type == QuotaType::Consumption {
+        // @cpt-begin:cpt-cf-quota-enforcement-algo-snapshot-state:p1:inst-sst-period
+        // The current window: its row's bounds when the row exists, the same
+        // bounds computed from the period type when it does not yet.
+        counter.window
+        // @cpt-end:cpt-cf-quota-enforcement-algo-snapshot-state:p1:inst-sst-period
+    } else {
+        // @cpt-begin:cpt-cf-quota-enforcement-algo-snapshot-state:p1:inst-sst-noperiod-else
+        // @cpt-begin:cpt-cf-quota-enforcement-algo-snapshot-state:p1:inst-sst-noperiod
+        None
+        // @cpt-end:cpt-cf-quota-enforcement-algo-snapshot-state:p1:inst-sst-noperiod
+        // @cpt-end:cpt-cf-quota-enforcement-algo-snapshot-state:p1:inst-sst-noperiod-else
+    };
+    // @cpt-end:cpt-cf-quota-enforcement-algo-snapshot-state:p1:inst-sst-period-if
+    // @cpt-begin:cpt-cf-quota-enforcement-algo-snapshot-state:p1:inst-sst-metadata
+    let metadata = quota.metadata.clone();
+    // @cpt-end:cpt-cf-quota-enforcement-algo-snapshot-state:p1:inst-sst-metadata
+    // @cpt-begin:cpt-cf-quota-enforcement-algo-snapshot-state:p1:inst-sst-window
+    let validity_window = quota.validity_window;
+    let currently_within_window = validity_window.is_none_or(|window| window.contains(now));
+    // @cpt-end:cpt-cf-quota-enforcement-algo-snapshot-state:p1:inst-sst-window
+    // @cpt-begin:cpt-cf-quota-enforcement-algo-snapshot-state:p1:inst-sst-noattr
+    // @cpt-begin:cpt-cf-quota-enforcement-algo-snapshot-state:p1:inst-sst-noheadline
+    // @cpt-begin:cpt-cf-quota-enforcement-algo-snapshot-state:p1:inst-sst-return
+    // One Quota's own state: the type has no field for policy attribution
+    // and nothing here sums across Quotas.
+    QuotaSnapshot {
+        quota_id,
+        subject,
+        metric,
+        quota_type,
+        enforcement_mode,
         cap: quota.cap,
         consumed,
-        remaining: quota.cap.map(|cap| cap.saturating_sub(consumed)),
-        period: counter.window,
-        metadata: quota.metadata.clone(),
-        validity_window: quota.validity_window,
-        currently_within_window: quota.validity_window.is_none_or(|w| w.contains(now)),
-    })
+        remaining,
+        period,
+        metadata,
+        validity_window,
+        currently_within_window,
+    }
+    // @cpt-end:cpt-cf-quota-enforcement-algo-snapshot-state:p1:inst-sst-return
+    // @cpt-end:cpt-cf-quota-enforcement-algo-snapshot-state:p1:inst-sst-noheadline
+    // @cpt-end:cpt-cf-quota-enforcement-algo-snapshot-state:p1:inst-sst-noattr
 }
 
 pub(super) fn counters_of(entries: &[AppliedEntry]) -> Vec<CounterSnapshot> {
@@ -1563,18 +1628,24 @@ impl crate::domain::ports::ConsumptionStore for SqlConsumptionStore {
             // A refused lock rolls this transaction back and runs it
             // again under the budget; a race goes to the arbiter below.
             let result = with_budget(budget, || {
-                let enqueuer = Arc::clone(&self.enqueuer);
+                let wakes = AttemptWakes::begin(&self.enqueuer);
+                let enqueuer = wakes.enqueuer();
                 let clock = Arc::clone(&self.clock);
                 let actor = actor.clone();
                 let scope = scope.clone();
                 let events = events.to_vec();
                 let mutation = OwnedMutation::of(mutation);
-                self.db.transaction_ref_mapped(move |tx| {
-                    Box::pin(async move {
-                        Self::debit_in_tx(tx, &scope, &mutation, &events, &actor, &clock, &enqueuer)
+                settling(
+                    wakes,
+                    self.db.transaction_ref_mapped(move |tx| {
+                        Box::pin(async move {
+                            Self::debit_in_tx(
+                                tx, &scope, &mutation, &events, &actor, &clock, &enqueuer,
+                            )
                             .await
-                    })
-                })
+                        })
+                    }),
+                )
             })
             .await;
             match result {
@@ -1638,162 +1709,173 @@ impl crate::domain::ports::ConsumptionStore for SqlConsumptionStore {
             // again under the budget; a race goes to the arbiter below.
             let result = with_budget(budget, || {
                 let actor = actor.clone();
-                let enqueuer = Arc::clone(&self.enqueuer);
+                let wakes = AttemptWakes::begin(&self.enqueuer);
+                let enqueuer = wakes.enqueuer();
                 let clock = Arc::clone(&self.clock);
                 let scope = scope.clone();
                 let events = events.to_vec();
                 let idempotency = idempotency.clone();
-                self.db.transaction_ref_mapped(move |tx| {
-                    Box::pin(async move {
-                        let scope = &scope;
-                        let events: &[NotificationEvent] = &events;
-                        // Check replay before guards that apply only to fresh credits.
-                        // @cpt-begin:cpt-cf-quota-enforcement-flow-credit:p1:inst-cre-lock
-                        let row = quota_repo::find_by_id(
-                            tx,
-                            scope,
-                            quota_id.as_uuid(),
-                            Some(RowWait::Nowait),
-                        )
-                        .await?
-                        .ok_or(StorageError::QuotaNotFound { id: quota_id })?;
-                        let quota = quota_mapping::row_to_quota(row)?;
-                        // @cpt-end:cpt-cf-quota-enforcement-flow-credit:p1:inst-cre-lock
-                        // The row is locked now, so this is the instant the period
-                        // guard and the record's retention are both keyed on.
-                        let now = clock();
-                        if quota.tenant_id != TenantId::new(idempotency.tenant_id.as_uuid()) {
-                            return Err(StorageError::SubjectOutOfScope.into());
-                        }
-                        let write = idempotency.clone().complete(
-                            IdempotencySubjectKey::of(std::slice::from_ref(&quota.subject)),
-                            OperationType::Credit,
-                        );
-                        // Rank 2: the scope's stripe (I8).
-                        lock_scopes(tx, &[&write.scope]).await?;
-                        // @cpt-begin:cpt-cf-quota-enforcement-flow-credit:p1:inst-cre-idem
-                        if let Replay::Stored(stored) =
-                            replay_of(tx, scope, &write, now, Some(RowWait::Nowait)).await?
-                        {
-                            return Ok(TransitionOutcome::NoOp(AppliedMutation {
-                                decision: decision_of(&stored.decision_blob)?,
-                                mutation: MutationResult::default(),
-                                expires_at: stored.expires_at,
-                            }));
-                        }
-                        // @cpt-end:cpt-cf-quota-enforcement-flow-credit:p1:inst-cre-idem
-                        // @cpt-begin:cpt-cf-quota-enforcement-flow-credit:p1:inst-cre-guard-if
-                        // @cpt-begin:cpt-cf-quota-enforcement-flow-credit:p1:inst-cre-guard
-                        if quota.status == QuotaStatus::Deactivated {
-                            return Err(StorageError::QuotaDeactivated { id: quota_id }.into());
-                        }
-                        let period_id = if quota.quota_type == QuotaType::Consumption {
-                            // Credit uses calendar closure; materialize an absent
-                            // current row.
-                            let latest = counter_repo::find_latest_for_update(
+                settling(
+                    wakes,
+                    self.db.transaction_ref_mapped(move |tx| {
+                        Box::pin(async move {
+                            let scope = &scope;
+                            let events: &[NotificationEvent] = &events;
+                            // Check replay before guards that apply only to fresh credits.
+                            // @cpt-begin:cpt-cf-quota-enforcement-flow-credit:p1:inst-cre-lock
+                            let row = quota_repo::find_by_id(
                                 tx,
                                 scope,
                                 quota_id.as_uuid(),
+                                Some(RowWait::Nowait),
+                            )
+                            .await?
+                            .ok_or(StorageError::QuotaNotFound { id: quota_id })?;
+                            let quota = quota_mapping::row_to_quota(row)?;
+                            // @cpt-end:cpt-cf-quota-enforcement-flow-credit:p1:inst-cre-lock
+                            // The row is locked now, so this is the instant the period
+                            // guard and the record's retention are both keyed on.
+                            let now = clock();
+                            if quota.tenant_id != TenantId::new(idempotency.tenant_id.as_uuid()) {
+                                return Err(StorageError::SubjectOutOfScope.into());
+                            }
+                            let write = idempotency.clone().complete(
+                                IdempotencySubjectKey::of(std::slice::from_ref(&quota.subject)),
+                                OperationType::Credit,
+                            );
+                            // Rank 2: the scope's stripe (I8).
+                            lock_scopes(tx, &[&write.scope]).await?;
+                            // @cpt-begin:cpt-cf-quota-enforcement-flow-credit:p1:inst-cre-idem
+                            if let Replay::Stored(stored) =
+                                replay_of(tx, scope, &write, now, Some(RowWait::Nowait)).await?
+                            {
+                                return Ok(TransitionOutcome::NoOp(AppliedMutation {
+                                    decision: decision_of(&stored.decision_blob)?,
+                                    mutation: MutationResult::default(),
+                                    expires_at: stored.expires_at,
+                                }));
+                            }
+                            // @cpt-end:cpt-cf-quota-enforcement-flow-credit:p1:inst-cre-idem
+                            // @cpt-begin:cpt-cf-quota-enforcement-flow-credit:p1:inst-cre-guard-if
+                            // @cpt-begin:cpt-cf-quota-enforcement-flow-credit:p1:inst-cre-guard
+                            if quota.status == QuotaStatus::Deactivated {
+                                return Err(StorageError::QuotaDeactivated { id: quota_id }.into());
+                            }
+                            let period_id = if quota.quota_type == QuotaType::Consumption {
+                                // Credit uses calendar closure; materialize an absent
+                                // current row.
+                                let latest = counter_repo::find_latest_for_update(
+                                    tx,
+                                    scope,
+                                    quota_id.as_uuid(),
+                                    RowWait::Nowait,
+                                )
+                                .await?;
+                                if latest.is_some_and(|row| now >= row.period_end) {
+                                    return Err(StorageError::PeriodClosed.into());
+                                }
+                                // @cpt-end:cpt-cf-quota-enforcement-flow-credit:p1:inst-cre-guard
+                                // @cpt-end:cpt-cf-quota-enforcement-flow-credit:p1:inst-cre-guard-if
+                                let row =
+                                    ensure_current_period(tx, scope, &quota, now, RowWait::Nowait)
+                                        .await?;
+                                settle_elapsed_rows(
+                                    tx,
+                                    scope,
+                                    &quota,
+                                    now,
+                                    &enqueuer,
+                                    RowWait::Nowait,
+                                )
+                                .await?;
+                                Some(row.period_id)
+                            } else {
+                                None
+                            };
+                            // @cpt-begin:cpt-cf-quota-enforcement-flow-credit:p1:inst-cre-apply
+                            let value = credit_counter(
+                                tx,
+                                scope,
+                                quota_id.as_uuid(),
+                                period_id,
+                                amount,
+                                now,
                                 RowWait::Nowait,
                             )
                             .await?;
-                            if latest.is_some_and(|row| now >= row.period_end) {
-                                return Err(StorageError::PeriodClosed.into());
-                            }
-                            // @cpt-end:cpt-cf-quota-enforcement-flow-credit:p1:inst-cre-guard
-                            // @cpt-end:cpt-cf-quota-enforcement-flow-credit:p1:inst-cre-guard-if
-                            let row =
-                                ensure_current_period(tx, scope, &quota, now, RowWait::Nowait)
-                                    .await?;
-                            settle_elapsed_rows(tx, scope, &quota, now, &enqueuer, RowWait::Nowait)
-                                .await?;
-                            Some(row.period_id)
-                        } else {
-                            None
-                        };
-                        // @cpt-begin:cpt-cf-quota-enforcement-flow-credit:p1:inst-cre-apply
-                        let value = credit_counter(
-                            tx,
-                            scope,
-                            quota_id.as_uuid(),
-                            period_id,
-                            amount,
-                            now,
-                            RowWait::Nowait,
-                        )
-                        .await?;
-                        let entry = AppliedEntry {
-                            quota_id: quota_id.as_uuid(),
-                            period_id,
-                            amount,
-                            value,
-                        };
-                        let decision = Decision::allowed_with_plan(
-                            [(quota_id, quota_enforcement_sdk::QuotaDebitPlan { amount })]
-                                .into_iter()
-                                .collect(),
-                        );
-                        let expires_at =
-                            expires_at(tx, quota.tenant_id, quota.metric.as_str(), now).await?;
-                        // A credit evaluates no policy, so its record carries
-                        // neither engine attribution nor a reversible movement.
-                        write_record(
-                            tx,
-                            scope,
-                            &RecordWrite {
-                                write: &write,
-                                blob: RecordBlob::Decision(&decision),
-                                entries: None,
-                                authorized: None,
-                                policy: None,
-                                expires_at,
-                                now,
-                            },
-                        )
-                        .await?;
-                        operation_log_repo::append(
-                            tx,
-                            scope,
-                            Entry {
-                                tenant_id: quota.tenant_id.as_uuid(),
+                            let entry = AppliedEntry {
                                 quota_id: quota_id.as_uuid(),
-                                operation: operation_log_repo::OP_CREDIT,
-                                actor: &actor,
-                                record_version: 1,
-                                detail: String::new(),
-                                occurred_at: now,
-                            },
-                        )
-                        .await?;
-                        let adjusted = quota_event(
-                            &quota,
-                            NotificationEventKind::QuotaCounterAdjusted,
-                            // The consumer identity the operation was authorized
-                            // under travels with the event, not only to the log:
-                            // a sink has to answer who adjusted the counter.
-                            json!({
-                                "credited_amount": amount,
-                                "quota_id": quota_id,
-                                "principal": actor.subject_id,
-                            }),
-                            now,
-                        );
-                        enqueuer
-                            .enqueue_all(tx, std::slice::from_ref(&adjusted))
+                                period_id,
+                                amount,
+                                value,
+                            };
+                            let decision = Decision::allowed_with_plan(
+                                [(quota_id, quota_enforcement_sdk::QuotaDebitPlan { amount })]
+                                    .into_iter()
+                                    .collect(),
+                            );
+                            let expires_at =
+                                expires_at(tx, quota.tenant_id, quota.metric.as_str(), now).await?;
+                            // A credit evaluates no policy, so its record carries
+                            // neither engine attribution nor a reversible movement.
+                            write_record(
+                                tx,
+                                scope,
+                                &RecordWrite {
+                                    write: &write,
+                                    blob: RecordBlob::Decision(&decision),
+                                    entries: None,
+                                    authorized: None,
+                                    policy: None,
+                                    expires_at,
+                                    now,
+                                },
+                            )
                             .await?;
-                        enqueuer.enqueue_all(tx, events).await?;
-                        // @cpt-end:cpt-cf-quota-enforcement-flow-credit:p1:inst-cre-apply
-                        Ok::<_, TxError>(TransitionOutcome::Applied(AppliedMutation {
-                            decision,
-                            mutation: MutationResult {
-                                counters: counters_of(std::slice::from_ref(&entry)),
-                                threshold_crossings: Vec::new(),
-                                event_ids: events.iter().map(|e| e.event_id).collect(),
-                            },
-                            expires_at,
-                        }))
-                    })
-                })
+                            operation_log_repo::append(
+                                tx,
+                                scope,
+                                Entry {
+                                    tenant_id: quota.tenant_id.as_uuid(),
+                                    quota_id: quota_id.as_uuid(),
+                                    operation: operation_log_repo::OP_CREDIT,
+                                    actor: &actor,
+                                    record_version: 1,
+                                    detail: String::new(),
+                                    occurred_at: now,
+                                },
+                            )
+                            .await?;
+                            let adjusted = quota_event(
+                                &quota,
+                                NotificationEventKind::QuotaCounterAdjusted,
+                                // The consumer identity the operation was authorized
+                                // under travels with the event, not only to the log:
+                                // a sink has to answer who adjusted the counter.
+                                json!({
+                                    "credited_amount": amount,
+                                    "quota_id": quota_id,
+                                    "principal": actor.subject_id,
+                                }),
+                                now,
+                            );
+                            enqueuer
+                                .enqueue_all(tx, std::slice::from_ref(&adjusted))
+                                .await?;
+                            enqueuer.enqueue_all(tx, events).await?;
+                            // @cpt-end:cpt-cf-quota-enforcement-flow-credit:p1:inst-cre-apply
+                            Ok::<_, TxError>(TransitionOutcome::Applied(AppliedMutation {
+                                decision,
+                                mutation: MutationResult {
+                                    counters: counters_of(std::slice::from_ref(&entry)),
+                                    threshold_crossings: Vec::new(),
+                                    event_ids: events.iter().map(|e| e.event_id).collect(),
+                                },
+                                expires_at,
+                            }))
+                        })
+                    }),
+                )
             })
             .await;
             match result {
@@ -1866,32 +1948,36 @@ impl crate::domain::ports::ConsumptionStore for SqlConsumptionStore {
             // again under the budget; a race goes to the arbiter below.
             let result = with_budget(budget, || {
                 let actor = actor.clone();
-                let enqueuer = Arc::clone(&self.enqueuer);
+                let wakes = AttemptWakes::begin(&self.enqueuer);
+                let enqueuer = wakes.enqueuer();
                 let clock = Arc::clone(&self.clock);
                 let scope = scope.clone();
                 let events = events.to_vec();
                 let idempotency = idempotency.clone();
                 let target = target.clone();
                 let discovered = discovered.clone();
-                self.db.transaction_ref_mapped(move |tx| {
-                    Box::pin(async move {
-                        let env = RollbackEnv {
-                            actor: &actor,
-                            clock: &clock,
-                            enqueuer: &enqueuer,
-                        };
-                        Self::rollback_in_tx(
-                            tx,
-                            &scope,
-                            &target,
-                            &idempotency,
-                            &events,
-                            &discovered,
-                            &env,
-                        )
-                        .await
-                    })
-                })
+                settling(
+                    wakes,
+                    self.db.transaction_ref_mapped(move |tx| {
+                        Box::pin(async move {
+                            let env = RollbackEnv {
+                                actor: &actor,
+                                clock: &clock,
+                                enqueuer: &enqueuer,
+                            };
+                            Self::rollback_in_tx(
+                                tx,
+                                &scope,
+                                &target,
+                                &idempotency,
+                                &events,
+                                &discovered,
+                                &env,
+                            )
+                            .await
+                        })
+                    }),
+                )
             })
             .await;
             match result {
@@ -1933,83 +2019,17 @@ impl crate::domain::ports::ConsumptionStore for SqlConsumptionStore {
         scope: &AccessScope,
         applicable: &ApplicableQuotas,
     ) -> Result<Vec<QuotaSnapshot>, StorageError> {
-        const OPERATION: &str = "read quota snapshot";
-        let now = self.now();
-        let subjects: Vec<(String, String)> = applicable
-            .subjects
-            .iter()
-            .map(|s| (s.projection_type.to_string(), s.subject_id.clone()))
-            .collect();
-        let conn = self
-            .db
-            .conn()
-            .map_err(|error| unavailable(OPERATION, "connection", &error))?;
-        let ids = quota_repo::find_applicable_ids(
-            &conn,
-            scope,
-            applicable.tenant_id.as_uuid(),
-            applicable.metric.as_str(),
-            &subjects,
-        )
-        .await
-        .map_err(|error| lift(OPERATION, error.into()))?;
-        let mut snapshots = Vec::with_capacity(ids.len());
-        for id in ids {
-            let Some(row) = quota_repo::find_by_id(&conn, scope, id, None)
-                .await
-                .map_err(|error| lift(OPERATION, error.into()))?
-            else {
-                continue;
-            };
-            let quota =
-                quota_mapping::row_to_quota(row).map_err(|error| lift(OPERATION, error.into()))?;
-            // I3 permits materializing only the row being read, without
-            // settlement or outbox events.
-            if quota.quota_type == QuotaType::Consumption {
-                let quota = quota.clone();
-                let scope = scope.clone();
-                let clock = Arc::clone(&self.clock);
-                self.db
-                    .transaction_ref_mapped(move |tx| {
-                        Box::pin(async move {
-                            // Read under the lock this transaction takes, so a
-                            // read that waited out a boundary materializes the
-                            // period it is actually in.
-                            // The read path is outside I8: it queues.
-                            ensure_current_period(tx, &scope, &quota, clock(), RowWait::Wait)
-                                .await?;
-                            Ok::<_, TxError>(())
-                        })
-                    })
-                    .await
-                    .map_err(|error| lift(OPERATION, error))?;
-            }
-            // The counter and the expired holds that correct it are two
-            // statements, so they run under one repeatable-read snapshot: at
-            // read-committed a sweeper committing between them would pair a
-            // pre-return counter with a post-return correction and over-report
-            // usage, denying work that actually fits. Read-only, so this
-            // remains the I3 read path.
-            let quota_for_read = quota.clone();
-            let scope_for_read = scope.clone();
-            let snapshot = self
-                .db
-                .transaction_ref_mapped_with_config(
-                    TxConfig {
-                        isolation: Some(TxIsolationLevel::RepeatableRead),
-                        access_mode: Some(TxAccessMode::ReadOnly),
-                    },
-                    move |tx| {
-                        Box::pin(async move {
-                            snapshot_of(tx, &scope_for_read, &quota_for_read, now).await
-                        })
-                    },
-                )
-                .await
-                .map_err(|error| lift(OPERATION, error))?;
-            snapshots.push(snapshot);
-        }
-        Ok(snapshots)
+        self.read_quota_snapshot_impl(scope, applicable).await
+    }
+
+    async fn bulk_read_quota_snapshot(
+        &self,
+        _ctx: &SecurityContext,
+        scope: &AccessScope,
+        pairs: &[ApplicableQuotas],
+        page: PageRequest,
+    ) -> Result<PageResult<QuotaSnapshot>, StorageError> {
+        self.bulk_read_quota_snapshot_impl(scope, pairs, page).await
     }
 
     async fn lookup_idempotency(

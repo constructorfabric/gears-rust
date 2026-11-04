@@ -24,15 +24,14 @@
 //! placeholders are strictly left-to-right in the assembled SQL, and the
 //! SELECT list precedes the WHERE clause.
 //!
-//! The aggregate is a **single-level** query over raw rows: it does not resolve
-//! `ReplacingMergeTree` versions. The rows it aggregates are selected by
-//! `super::dedup::active_survivors` — raw `status = 'active'` rows whose `id`
-//! carries no deactivation marker — so the only `GROUP BY` in the text is the
-//! caller's dimension grouping. Because there is one level, every alias is
-//! `d<i>` or `agg` and cannot shadow a filtered column (`ClickHouse` resolves a
-//! `WHERE` identifier to a same-level SELECT alias in preference to the column,
-//! which is what made the former version-resolving subquery need a further
-//! nested scan).
+//! The aggregate is a **single-level** query over `usage_records FINAL`: the
+//! engine resolves `ReplacingMergeTree` versions before the `WHERE`, whose
+//! `super::dedup::ACTIVE_ONLY` conjunct then keeps exactly the active logical
+//! rows (a deactivated record resolves to its marker and is dropped), so the
+//! only `GROUP BY` in the text is the caller's dimension grouping. Because
+//! there is one level, every alias is `d<i>` or `agg` and cannot shadow a
+//! filtered column (`ClickHouse` resolves a `WHERE` identifier to a same-level
+//! SELECT alias in preference to the column).
 
 use usage_collector_sdk::{AggregationDimension, AggregationOp, MAX_AGGREGATION_BUCKETS};
 

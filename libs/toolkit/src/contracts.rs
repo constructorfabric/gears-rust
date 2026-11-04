@@ -32,7 +32,15 @@ pub trait SystemCapability: Send + Sync {
     }
 }
 
-/// Core gear: DI/wiring; do not rely on migrated schema here.
+/// Core gear: DI/wiring.
+///
+/// For a gear with a configured database handle, DB migrations have already
+/// run, so such a gear may rely on its own migrated schema here. Gears without
+/// a configured database get no such guarantee. Use `init` to build the gear's
+/// own state and register its own
+/// client(s). Do **not** call other gears here: consumed-contract clients are
+/// wired *after* all `init`s complete, so resolve them lazily on first use or in
+/// a later phase.
 #[async_trait]
 pub trait Gear: Send + Sync + 'static {
     async fn init(&self, ctx: &crate::context::GearCtx) -> anyhow::Result<()>;

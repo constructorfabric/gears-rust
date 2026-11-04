@@ -31,8 +31,8 @@ fn step_up_param() -> ParamSpec {
         .description(
             "A fresh token from the identity provider proving the caller \
          re-authenticated just now; absent, the bearer token itself is checked. \
-         Required by a retire, a revive, and any edit that loosens a gate or a \
-         classification.",
+         Required by a retire, a revive, a purge, and any edit that loosens a \
+         gate or a classification.",
         )
 }
 
@@ -258,7 +258,7 @@ pub fn register_routes(
         .error_503(openapi)
         .register(router, openapi);
 
-    let router = register_revival(router, openapi);
+    let router = register_purge(register_revival(router, openapi), openapi);
 
     let router = OperationBuilder::patch("/settings-service/v1/declarations/{id}")
         .operation_id("settings_service.update_declaration")
@@ -358,6 +358,50 @@ pub fn register_routes(
         .layer(axum::Extension(resolver))
         .layer(axum::Extension(db))
         .layer(axum::Extension(enforcer))
+}
+
+/// The purge route, apart from the rest only to keep the registration short.
+fn register_purge(router: Router, openapi: &dyn OpenApiRegistry) -> Router {
+    OperationBuilder::post("/settings-service/v1/declarations/{id}/purge")
+        .operation_id("settings_service.purge_declaration")
+        .summary("Purge a retired setting declaration")
+        .description(
+            "Purge a retired, admin-authored declaration: the row is deleted and, with \
+             it, every value, tenant restriction and staged secret filed under it. \
+             Irreversible, and it frees the key and its category. Only a retired \
+             declaration is purged (`409` otherwise, and never retired by the purge); a \
+             gear's contributed declaration is refused with a conflict. The Credential \
+             Store entries held for the setting alone (its secret values and staged \
+             secrets; an entry another declaration still holds is kept) are released \
+             after the commit, best-effort: a refused release does not undo the \
+             purge. Requires step-up and `If-Match`; answers `204`.",
+        )
+        .tag(TAG)
+        .authenticated()
+        .no_license_required()
+        .path_param("id", "Declaration UUID")
+        .param(if_match_param())
+        .param(step_up_param())
+        .handler(handlers::purge_declaration)
+        .no_content_response(StatusCode::NO_CONTENT, "The retired declaration was purged")
+        .error_400(openapi)
+        .error_401(openapi)
+        .error_403(openapi)
+        .error_404(openapi)
+        .error_409(openapi)
+        .problem_response(
+            openapi,
+            StatusCode::PRECONDITION_FAILED,
+            "The supplied If-Match is stale: re-read and retry",
+        )
+        .problem_response(
+            openapi,
+            StatusCode::PRECONDITION_REQUIRED,
+            "If-Match is required on a conditional write",
+        )
+        .error_500(openapi)
+        .error_503(openapi)
+        .register(router, openapi)
 }
 
 #[cfg(test)]

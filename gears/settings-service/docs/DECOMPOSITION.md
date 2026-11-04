@@ -222,6 +222,7 @@ One requirement is counted as covered while being split across releases: `cpt-cf
   - The two people-gating flags: `requires_step_up`, defaulting to the protective `true`, and `anonymous_exposable`, defaulting to `false` and refused — in the handler and by a schema check — on a `secret` or `pii` classification
   - The mutation-class discipline: descriptive metadata immediate under `update` plus `If-Match`; behavior-affecting fields (`default_value`, value type, `scope_class`) immutable and rejected with `400`; retire and reactivate immediate but step-up gated through the port delivered in 2.1 and bound in 2.8; classification tightening immediate, loosening step-up gated; clearing `requires_step_up` or enabling `anonymous_exposable` step-up gated whatever the flag currently says
   - Retire as soft-delete setting `status = retired`, retaining values in `setting_values` while excluding them from resolution, with re-declare-to-revive recovery, a read-only report of the retained values a revive would bring back, and evolve-by-re-declaring to the next free major on the same version-stripped path
+  - Purge of a retired admin-authored declaration: step-up and `If-Match` gated, one transaction that takes the row for update and hard-deletes it with its values, tenant permissions and staged secrets by `ON DELETE CASCADE`, then releases their Credential Store entries after commit through the Secret Manager port, best-effort (`cpt-cf-settings-service-seq-declaration-purge`)
   - Dependency Group and cross-setting constraint **declaration**
   - Declaration REST surface, visibility- and domain-gated with the predicate applied inside the query, returning the `key`, its `value_type_id`, and resolved traits for client rendering, and leaving the seam through which the licence predicate joins in R2
 
@@ -236,6 +237,7 @@ One requirement is counted as covered while being split across releases: `cpt-cf
 
   - [x] `p1` - `cpt-cf-settings-service-fr-setting-scope-class`
   - [ ] `p3` - `cpt-cf-settings-service-fr-dependency-group-declaration`
+  - [ ] `p2` - `cpt-cf-settings-service-fr-declaration-purge`
   - [ ] `p2` - `cpt-cf-settings-service-nfr-versatility-gts-scope-class`
 
 - **Design Principles Covered**:
@@ -263,6 +265,7 @@ One requirement is counted as covered while being split across releases: `cpt-cf
   - GET /settings-service/v1/declarations/{id}
   - PATCH /settings-service/v1/declarations/{id}
   - DELETE /settings-service/v1/declarations/{id}
+  - POST /settings-service/v1/declarations/{id}/purge
 
 - **Data**:
   - `setting_declarations` table with `uq_declaration_key`, the partial `uq_declaration_category_slug`, the `categories` foreign key `ON DELETE RESTRICT`, the `ck_declaration_exposable_not_sensitive` and secret-equivalence checks, and the partial active-status index
@@ -704,7 +707,7 @@ cpt-cf-settings-service-feature-typed-value-validation ─→ cpt-cf-settings-se
 
 - `cpt-cf-settings-service-feature-gear-foundation` has no dependency and is the only feature that could start against an empty crate tree.
 - `cpt-cf-settings-service-feature-category-management` requires the foundation: it is the first domain entity and needs persistence, REST and OData infrastructure, the `PolicyEnforcer` PEP, error mapping, and the root tenant's id for its audit scope before it can expose an endpoint.
-- `cpt-cf-settings-service-feature-setting-declarations` requires categories: a declaration carries a non-null `category_id`, and its key embeds the category slug as the third token of the derived half. The dependency runs the other way too in one respect worth planning around — the foreign key that makes 2.2's no-orphan rule enforceable at the database level is created here, so the no-orphan behaviour cannot be end-to-end tested until 2.3 lands.
+- `cpt-cf-settings-service-feature-setting-declarations` requires categories: a declaration carries a non-null `category_id`, and its key embeds the category slug as the third token of the derived half. The dependency runs the other way too in one respect worth planning around — the foreign key that makes 2.2's no-orphan rule enforceable at the database level is created here, so the no-orphan behaviour cannot be end-to-end tested until 2.3 lands. The purge of a retired declaration is the one part of 2.3 that waits for later entries: it collects from `setting_values` (2.4), its cascade removes rows of `tenant_permissions` (2.7) and `pending_secrets` (2.9), and it releases Credential Store entries through the Secret Manager port 2.9 delivers, so it is built after 2.9 and its acceptance criteria run from then on.
 - `cpt-cf-settings-service-feature-typed-value-validation` requires declarations: the value type is named by the declaration's `value_type_id`, so there is nothing to validate against until declarations exist. Declaration creation in turn calls the validator for its Schema Default, which is why the two are adjacent rather than independent.
 - `cpt-cf-settings-service-feature-value-resolution` requires typed value validation: the resolution chain terminates in the Schema Default, and every value it walks must already be a validated typed value stored in `setting_values`.
 - `cpt-cf-settings-service-feature-audit-store` requires declarations: the history read and the `declaration_key` column are keyed by a setting key, and the store must exist before any path that fails closed on it is built. It does not wait on resolution, so it can proceed alongside 2.4 and 2.5.

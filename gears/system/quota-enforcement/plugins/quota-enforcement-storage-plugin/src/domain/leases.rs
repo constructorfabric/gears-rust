@@ -1,9 +1,8 @@
 //! The lease primitives of the storage contract, forwarded to the
 //! [`LeaseStore`] port with the contract's own signatures.
 //!
-//! Inherent methods for the reason the consumption primitives are: the
-//! `ClientHub` client stays unpublished until every primitive of the contract
-//! exists.
+//! Inherent methods, like the consumption primitives; the contract's trait
+//! implementation delegates to them.
 
 use quota_enforcement_sdk::{
     AppliedMutation, EvaluatedLease, EvaluatedMutation, ExpiredLease, LeaseToken, MetricId,

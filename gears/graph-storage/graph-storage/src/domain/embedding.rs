@@ -13,13 +13,13 @@
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use aws_lc_rs::digest::{SHA256, digest as sha256};
 use graph_storage_sdk::models::{EmbeddingSpaceId, NodeSpec, RemainingBudget, TypeRecord};
 use graph_storage_sdk::plugin_api::{
     EmbedRequest, EmbeddingProviderError, EmbeddingProviderV1, EmbeddingState, NodeEmbedding,
 };
 use tokio_util::sync::CancellationToken;
 use toolkit_macros::domain_model;
+use toolkit_security::crypto::hash::Sha256;
 
 use crate::domain::error::DomainError;
 
@@ -449,7 +449,7 @@ pub fn decide_vector(
 /// between a *preserved* vector and a *stale* one.
 #[must_use]
 pub fn input_hash(input: &str) -> String {
-    hex::encode(sha256(&SHA256, input.as_bytes()))
+    hex::encode(Sha256::digest(input.as_bytes()))
 }
 
 /// Compose what a node embeds from: its name, then the payload values at the

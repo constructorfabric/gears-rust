@@ -658,6 +658,7 @@ pub(super) fn translate_provider_event(
                         tool_use_id: call_id.clone(),
                         name: name.clone(),
                         input,
+                        usage: response.usage.to_usage(),
                     });
                 }
             }

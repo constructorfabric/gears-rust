@@ -169,7 +169,7 @@ impl Harness {
         let reader = Arc::clone(&clock);
         let store = SqlConsumptionStore::with_clock(
             db.clone(),
-            Arc::clone(&enqueuer) as Arc<dyn crate::infra::outbox::NotificationEnqueuer>,
+            Arc::clone(&enqueuer) as Arc<dyn crate::infra::outbox::NotificationOutbox>,
             Arc::new(move || *reader.lock().expect("clock")),
         );
         let policies = SqlPolicyStore::new(db.clone(), Arc::clone(&enqueuer) as _);
@@ -550,7 +550,7 @@ async fn thresholds_fire_upward_once_and_a_credit_does_not_rearm_them() {
 }
 
 #[tokio::test]
-async fn a_snapshot_read_materializes_the_current_row_and_settles_nothing() {
+async fn a_snapshot_read_emits_nothing_and_the_next_mutation_settles() {
     let h = Harness::up().await;
     let id = h.consumption_quota("u1", Some(100), Vec::new()).await;
     h.debit("u1", 10, &write(OperationType::Debit, "k1", 1))
@@ -1195,6 +1195,45 @@ async fn an_expired_hold_stops_counting_against_capacity_before_any_sweep() {
         "an unreclaimed expired hold blocks nothing"
     );
     assert_eq!(h.consumed("u1", id).await, 100, "only the debit counts");
+    h.down().await;
+}
+
+#[tokio::test]
+async fn a_read_subtracts_only_expired_holds_from_both_kinds_of_quota() {
+    let h = Harness::up().await;
+    let allocation = h.allocation_quota("u1", Some(100)).await;
+    let consumption = h.consumption_quota("u2", Some(100), Vec::new()).await;
+
+    for (subject, key) in [("u1", "r1"), ("u2", "r2")] {
+        h.acquire(subject, 30, TTL, &write(OperationType::Reserve, key, 1))
+            .await
+            .expect("the first hold");
+    }
+    h.set_now(DAY_ONE + time::Duration::minutes(30));
+    for (subject, key) in [("u1", "r3"), ("u2", "r4")] {
+        h.acquire(subject, 20, TTL, &write(OperationType::Reserve, key, 2))
+            .await
+            .expect("the second hold");
+    }
+    // The first holds have expired, the second have not.
+    h.set_now(DAY_ONE + time::Duration::minutes(80));
+
+    let both = ApplicableQuotas {
+        subjects: vec![user("u1"), user("u2")],
+        ..applicable("u1")
+    };
+    let page = h
+        .store
+        .read_quota_snapshot(&ctx(), &scope_for(tenant()), &both)
+        .await
+        .expect("snapshot");
+    let consumed = |id| {
+        page.iter()
+            .find(|snapshot| snapshot.quota_id == id)
+            .map(|snapshot| snapshot.consumed)
+    };
+    assert_eq!(consumed(allocation), Some(20));
+    assert_eq!(consumed(consumption), Some(20));
     h.down().await;
 }
 

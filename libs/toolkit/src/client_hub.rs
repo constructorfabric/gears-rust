@@ -149,11 +149,15 @@ impl ClientHub {
 impl ClientHub {
     /// Register a client under the interface type `T`.
     /// `T` can be a trait object like `dyn my_gear::api::MyClient`.
+    ///
+    /// Clears any remote-proxy mark for `T`, so a local impl registered after a
+    /// directory proxy wins in [`Self::try_get_local`] rather than being shadowed.
     pub fn register<T>(&self, client: Arc<T>)
     where
         T: ?Sized + Send + Sync + 'static,
     {
         let type_key = TypeKey::of::<T>();
+        self.remote_proxies.write().remove(&type_key);
         let mut w = self.map.write();
         w.insert(type_key, Box::new(client));
     }
@@ -421,6 +425,24 @@ mod tests {
 
         assert!(hub.try_get_local::<dyn TestApi>().is_some());
         assert!(!hub.has_remote_proxy::<dyn TestApi>());
+    }
+
+    #[tokio::test]
+    async fn a_late_local_registration_clears_the_remote_mark_and_wins() {
+        // A consumer wires a directory proxy under the contract first...
+        let hub = ClientHub::new();
+        hub.register_remote_proxy::<dyn TestApi>(Arc::new(ImplA(1)));
+        assert!(hub.has_remote_proxy::<dyn TestApi>());
+        assert!(hub.try_get_local::<dyn TestApi>().is_none());
+
+        // ...then the real in-process provider registers its local impl. It must
+        // win: the remote mark is cleared and `try_get_local` now sees the impl.
+        hub.register::<dyn TestApi>(Arc::new(ImplA(2)));
+        assert!(!hub.has_remote_proxy::<dyn TestApi>());
+        let local = hub
+            .try_get_local::<dyn TestApi>()
+            .expect("the late local registration must be visible as local");
+        assert_eq!(local.id().await, 2);
     }
 
     #[tokio::test]

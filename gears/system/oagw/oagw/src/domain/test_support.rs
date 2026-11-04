@@ -179,13 +179,16 @@ pub use credstore_sdk::test_util::MockCredStoreClient;
 pub use MockCredStoreClient as TestCredStoreClient;
 
 #[cfg(test)]
-/// Metrics that keep only what the registry reconcile records.
+/// Metrics that keep only what the registry reconcile and the Control Plane
+/// record.
 #[derive(Default)]
 pub struct ProvisioningMetrics {
     /// `(kind, reason)` per skipped or kept instance, in order.
     pub failures: std::sync::Mutex<Vec<(String, String)>>,
     /// Run outcomes, in order.
     pub runs: std::sync::Mutex<Vec<String>>,
+    /// `(alias, outcome)` per withheld ancestor credential, in order.
+    pub withheld: std::sync::Mutex<Vec<(String, &'static str)>>,
 }
 
 #[cfg(test)]
@@ -220,6 +223,31 @@ impl crate::domain::ports::OagwMetricsPort for ProvisioningMetrics {
     fn record_registry_provisioning_run(&self, outcome: &str) {
         self.runs.lock().unwrap().push(outcome.to_owned());
     }
+    fn record_credential_withheld(&self, host: &str, outcome: &'static str) {
+        self.withheld
+            .lock()
+            .unwrap()
+            .push((host.to_owned(), outcome));
+    }
+    fn record_proxy_cache_lookup(
+        &self,
+        _: crate::domain::ports::metric_labels::CacheMap,
+        _: crate::domain::ports::metric_labels::CacheLookup,
+    ) {
+    }
+    fn record_proxy_cache_entries(&self, _: crate::domain::ports::metric_labels::CacheMap, _: u64) {
+    }
+    fn record_proxy_cache_evictions(
+        &self,
+        _: crate::domain::ports::metric_labels::CacheMap,
+        _: crate::domain::ports::metric_labels::CacheEviction,
+        _: u64,
+    ) {
+    }
+    fn record_proxy_cache_change(&self, _: &str) {}
+    fn record_proxy_cache_flush(&self, _: &str) {}
+    fn record_proxy_cache_load_discarded(&self, _: crate::domain::ports::metric_labels::CacheMap) {}
+    fn record_proxy_cache_publish_failures(&self, _: &str, _: u64) {}
 }
 
 #[cfg(test)]
@@ -641,6 +669,7 @@ impl TestCpBuilder {
             allow_all_enforcer(),
             credstore,
             Arc::new(SsrfGuard::disabled()),
+            None,
         ));
 
         cp
@@ -913,7 +942,7 @@ mod unavailable {
 
     use crate::domain::model::{ListQuery, Route, Upstream};
     use crate::domain::repo::{
-        DeleteOutcome, RegistryRowRepository, RepositoryError, RouteRepository, Tags,
+        DeleteOutcome, RegistryRowRepository, RepositoryError, RouteRepository, RowKey, Tags,
         UpstreamRepository,
     };
 
@@ -992,6 +1021,12 @@ mod unavailable {
             _: &str,
             _: Tags,
         ) -> Result<Route, RepositoryError> {
+            Err(unavailable())
+        }
+        async fn list_proxy_routes(
+            &self,
+            _: &[RowKey],
+        ) -> Result<Vec<(RowKey, Vec<Route>)>, RepositoryError> {
             Err(unavailable())
         }
         async fn update(&self, _: Route) -> Result<Route, RepositoryError> {

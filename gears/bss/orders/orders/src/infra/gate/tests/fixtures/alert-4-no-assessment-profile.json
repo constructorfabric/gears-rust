@@ -1,0 +1,119 @@
+{
+  "payer_profiles": {
+    "00000000-0000-0000-0000-0000000000a1": {
+      "axes_valid": true,
+      "currency": "USD",
+      "region": "US",
+      "in_relationship_with_seller": true,
+      "in_relationship_with_resource": true,
+      "profile_version": "dev-stub-1"
+    }
+  },
+  "contracts": {
+    "00000000-0000-0000-0000-0000000000c1": {
+      "status": "active",
+      "payer_eligible": true,
+      "version": "dev-stub-1"
+    }
+  },
+  "overlap_keys": {
+    "00000000-0000-0000-0000-0000000000d1": "dev-stub-scope"
+  },
+  "occupancy": {
+    "dev-stub-scope": {
+      "active_count": 0,
+      "count_scope": "per_payer",
+      "max_concurrent_active": 1,
+      "provenance": "catalog"
+    }
+  },
+  "terms": {
+    "00000000-0000-0000-0000-0000000000e1": {
+      "line_id": "00000000-0000-0000-0000-000000000000",
+      "billing_terms": { "digest": "2f939960f6fd2ec3e35f778d4cbf241af55590412366c0eaba122d50553258f3" },
+      "term": "rolling",
+      "provenance": "explicit_order",
+      "snapshot": {
+        "schema_version": 1,
+        "cycle": "month",
+        "anchor": "subscription_start",
+        "anchor_at": "2026-01-01T00:00:00Z",
+        "timezone": "UTC",
+        "source": { "kind": "explicit_order" }
+      }
+    }
+  },
+  "acceptance_policy": { "version": "1", "hold_seconds": 600 },
+  "evaluation": {
+    "00000000-0000-0000-0000-0000000000e1": {
+      "line_id": "00000000-0000-0000-0000-000000000000",
+      "totals": {
+        "gross": {
+          "exact": { "numerator": "21", "denominator": "2", "currency": "USD", "currency_scale": 2 },
+          "display": "10.50"
+        },
+        "net": {
+          "exact": { "numerator": "21", "denominator": "2", "currency": "USD", "currency_scale": 2 },
+          "display": "10.50"
+        },
+        "discount": { "status": "unavailable" }
+      },
+      "usage_flagged": false,
+      "declaration": {
+        "charge_kind": "recurring",
+        "amount_basis": "rolling_annualized",
+        "period_evidence": { "cycle": "month", "term": "rolling", "source": "dev-stub" },
+        "item_breakdown": [],
+        "recurring_by_cycle": { "month": "10.5" },
+        "exclusions": {}
+      }
+    }
+  },
+  "evaluation_totals": {
+    "currency": "USD",
+    "currency_scale": 2,
+    "order_totals": {
+      "gross": {
+        "exact": { "numerator": "21", "denominator": "2", "currency": "USD", "currency_scale": 2 },
+        "display": "10.50"
+      },
+      "net": {
+        "exact": { "numerator": "21", "denominator": "2", "currency": "USD", "currency_scale": 2 },
+        "display": "10.50"
+      },
+      "discount": { "status": "unavailable" }
+    },
+    "promotion_status": { "status": "unavailable" },
+    "order_declaration": {
+      "charge_kind": "recurring",
+      "amount_basis": "rolling_annualized",
+      "period_evidence": { "cycle": "month", "term": "rolling", "source": "dev-stub" },
+      "item_breakdown": [],
+      "recurring_by_cycle": { "month": "10.5" },
+      "exclusions": {}
+    }
+  },
+  "tcv": {
+    "exact": { "numerator": "126", "denominator": "1", "currency": "USD", "currency_scale": 2 },
+    "display": "126.00",
+    "posting_estimate": "126.00",
+    "basis": "rolling_annualized",
+    "evidence": { "lines": "rolling_annualized", "policy_version": "dev-stub-1" }
+  },
+  "tax": {
+    "per_line": [
+      {
+        "line_id": "00000000-0000-0000-0000-0000000000f1",
+        "amount": {
+          "exact": { "numerator": "2", "denominator": "1", "currency": "USD", "currency_scale": 2 },
+          "display": "2.00"
+        }
+      }
+    ],
+    "total": {
+      "exact": { "numerator": "2", "denominator": "1", "currency": "USD", "currency_scale": 2 },
+      "display": "2.00"
+    },
+    "explicit_no_tax": false
+  }
+}

@@ -216,10 +216,10 @@ async fn the_gateway_caller_zone_rejects_before_the_engine_and_counts_retries() 
             .await,
         audits + 1
     );
-    // The D-185 zone values (3/s, burst 20) bind the same operations: the gateway's startup
-    // validation accepts them and a fresh instance admits the next write into the engine.
-    let d185 = gateway_router(&t, baseline(), &gateway_config("3/s", 20));
-    let admitted = add_line(&d185, Uuid::parse_str(&order).unwrap(), "g-4", 1).await;
+    // The configured E2E zone (3/s, burst 20) binds the same operations: its startup validation
+    // accepts them and a fresh instance admits the next write into the engine.
+    let e2e = gateway_router(&t, baseline(), &gateway_config("3/s", 20));
+    let admitted = add_line(&e2e, Uuid::parse_str(&order).unwrap(), "g-4", 1).await;
     assert_eq!(admitted.0, 200, "{:?}", admitted.2);
     assert!(admitted.1.contains_key("ratelimit-remaining"));
     assert_eq!(t.registry().await, registry + 2);

@@ -24,7 +24,7 @@ use crate::domain::model::{
     UpdateUpstreamRequest, Upstream,
 };
 use crate::domain::repo::{
-    RegistryRowRepository, RepositoryError, RouteRepository, Tags, UpstreamRepository,
+    RegistryRowRepository, RepositoryError, RouteRepository, RowKey, Tags, UpstreamRepository,
 };
 use crate::domain::services::ControlPlaneService;
 use crate::domain::services::management::{ControlPlaneServiceImpl, RegistryProvisionerImpl};
@@ -230,6 +230,49 @@ async fn resolution_with_tags_is_five_selects_at_any_depth() {
     assert_eq!((depth_1, depth_5), (5, 5));
 }
 
+/// The proxy configuration cache's route load (ADR-0020) for `count`
+/// upstreams in as many tenants, each with two routes that bind a plugin and
+/// allow two methods: its `SELECT` count. Outside any transaction.
+async fn proxy_routes_selects(count: usize) -> usize {
+    let r = repos().await;
+    let mut keys = Vec::new();
+    for _ in 0..count {
+        let tenant = Uuid::new_v4();
+        let up = r.upstreams.create(upstream(tenant, "api")).await.unwrap();
+        for path in ["/v1", "/v2"] {
+            r.routes.create(route(tenant, up.id, path)).await.unwrap();
+        }
+        keys.push(RowKey {
+            tenant_id: tenant,
+            id: up.id,
+        });
+    }
+    r.recorder.clear();
+
+    let loaded = r.routes.list_proxy_routes(&keys).await.unwrap();
+    assert_eq!(loaded.len(), count);
+    assert!(
+        loaded.iter().all(|(_, routes)| routes.len() == 2
+            && routes.iter().all(|route| route.plugins == Some(plugins()))),
+        "{loaded:?}"
+    );
+    assert!(
+        r.recorder.events().iter().all(|e| !e.in_tx),
+        "{}",
+        r.recorder.dump()
+    );
+    take_selects(&r.recorder)
+}
+
+/// One `SELECT` loads the routes of any number of upstreams, with their
+/// methods and plugins joined in.
+#[tokio::test]
+async fn proxy_route_load_is_one_select_for_any_number_of_upstreams() {
+    let one = proxy_routes_selects(1).await;
+    let many = proxy_routes_selects(20).await;
+    assert_eq!((one, many), (1, 1));
+}
+
 /// `resolve_proxy_target` through the Control Plane for one tenant: its
 /// `SELECT` count, its tag-table reads, and the effective upstream's and the
 /// route's tags.
@@ -247,6 +290,7 @@ async fn service_resolution(tags: Tags) -> (usize, usize, Vec<String>, Vec<Strin
         allow_all_enforcer(),
         Arc::new(MockCredStoreClient::empty()),
         Arc::new(SsrfGuard::disabled()),
+        None,
     );
     let ctx = SecurityContext::builder()
         .subject_tenant_id(tenant)
@@ -539,6 +583,7 @@ async fn delete_upstream_is_one_statement() {
         allow_all_enforcer(),
         Arc::new(MockCredStoreClient::empty()),
         Arc::new(SsrfGuard::disabled()),
+        None,
     );
     let ctx = SecurityContext::builder()
         .subject_tenant_id(tenant)
@@ -591,6 +636,7 @@ async fn create_and_update_upstream_selects(ancestors: usize) -> (usize, usize) 
         allow_all_enforcer(),
         Arc::new(MockCredStoreClient::empty()),
         Arc::new(SsrfGuard::disabled()),
+        None,
     );
     let request = CreateUpstreamRequest {
         id: None,
@@ -684,6 +730,7 @@ fn registry_cp(r: &Repos) -> (Arc<ControlPlaneServiceImpl>, RegistryProvisionerI
         allow_all_enforcer(),
         Arc::new(MockCredStoreClient::empty()),
         Arc::new(SsrfGuard::disabled()),
+        None,
     ));
     let provisioner = RegistryProvisionerImpl::new(cp.clone(), r.registry_rows.clone());
     (cp, provisioner)

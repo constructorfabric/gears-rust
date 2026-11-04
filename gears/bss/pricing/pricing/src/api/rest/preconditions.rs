@@ -258,7 +258,7 @@ pub fn canonical(value: &serde_json::Value) -> String {
 /// Hash canonical payload bytes with the existing SHA-256 provider.
 #[must_use]
 pub fn payload_hash(canonical: &str) -> Vec<u8> {
-    aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, canonical.as_bytes())
+    toolkit_security::crypto::hash::Sha256::digest(canonical.as_bytes())
         .as_ref()
         .to_vec()
 }

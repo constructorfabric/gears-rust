@@ -623,6 +623,7 @@ pub struct AuditRecordDto {
     /// The scope the record is about, or `null` for a record about the
     /// setting's definition — the declaration created, changed, retired —
     /// which belongs to no tenant and appears in every scope's history.
+    #[schema(required)]
     pub tenant_id: Option<Uuid>,
     /// `create`, `change`, `revert`, `remove`, `clone`, `secret_use` or `stage`.
     pub operation: String,
@@ -637,6 +638,11 @@ pub struct AuditRecordDto {
     /// the record's.
     #[serde(default, skip_serializing_if = "is_false")]
     pub actor_withheld: bool,
+    /// The actor's name as the Actor Name Resolver reads it: a user's current
+    /// name, `"System"` for the nil id, or `null` when the actor is masked or
+    /// withheld, a module, or no name could be had.
+    #[schema(required)]
+    pub actor_name: Option<String>,
     /// The value before, as recorded; a secret was recorded masked.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pre_value: Option<Value>,
@@ -713,6 +719,7 @@ pub fn render_record(
         },
         actor_masked,
         actor_withheld,
+        actor_name: None,
         pre_value: recorded(record.pre_image.as_ref(), values_are_pii, may_read_pii),
         post_value: recorded(record.post_image.as_ref(), values_are_pii, may_read_pii),
         values_masked,
