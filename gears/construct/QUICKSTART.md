@@ -53,6 +53,7 @@ The gear is in this repository under `gears/construct`, and it is not built into
 
    ```yaml
    pg_graph:
+     engine: "postgres"
      host: "localhost"
      port: 5432
      user: "postgres"
