@@ -1,0 +1,48 @@
+name: Nightly status
+
+# Keeps one issue, "Nightly status", with a table of the four nightly
+# workflows. It is updated after every scheduled run of any of them, so a red
+# or cancelled nightly is visible without opening Actions.
+#
+# To refresh it by hand: Actions > Nightly status > Run workflow.
+on:
+  workflow_run:
+    workflows:
+      - e2e
+      - Clippy (full feature matrix)
+      - macOS and Windows tests
+      - Unused Deps (nightly)
+    types: [completed]
+  workflow_dispatch:
+
+# Runs queue up one by one, so two updates don't race on the issue body.
+concurrency:
+  group: nightly-status
+  cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+  update:
+    name: Update status issue
+    # e2e also runs on pull requests. Those must not touch the issue.
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.event == 'schedule' }}
+    runs-on: ${{ (vars.GEARS_FORCE_GITHUB_HOSTED == 'true' || github.repository != 'constructorfabric/gears-rust' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && 'ubuntu-latest' || 'gears-small' }}
+    timeout-minutes: 5
+    permissions:
+      actions: read   # to list the nightly runs
+      contents: read  # to check out the script
+      issues: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: .github/scripts
+
+      - name: Update status issue
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const run = require('./.github/scripts/nightly-status.js');
+            await run({ github, context, core });
