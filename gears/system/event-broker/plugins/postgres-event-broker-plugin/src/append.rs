@@ -4,6 +4,7 @@
 //! (`head_notify`).
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use event_broker_sdk::Sequence;
@@ -12,6 +13,7 @@ use event_broker_sdk::backend::{
     AppendRequest, Appended, BackendError, Head, KeyedEvent, Partition, TopicPartition,
 };
 use sqlx::AssertSqlSafe;
+use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 use crate::error::Operation;
@@ -27,7 +29,7 @@ const OP: Operation = Operation::Append;
 /// Appends a batch in one transaction, or reports it a duplicate when the fence
 /// has already passed its sequence.
 pub async fn append(
-    shared: &Shared,
+    shared: &Arc<Shared>,
     request: &AppendRequest<'_>,
 ) -> Result<Appended, BackendError> {
     if request.events.len() > MAX_EVENTS_PER_APPEND {
@@ -110,28 +112,60 @@ pub async fn append(
         });
     }
 
-    // (5) Wake the other instances' watchers: every head in one statement.
+    // (5) Wake the other instances' watchers: every head in one statement,
+    // in the transaction or after its commit.
     let notified: Vec<(Uuid, Partition, i64)> = heads
         .iter()
         .map(|head| (topic, head.at.partition, head.sequence.as_i64()))
         .collect();
-    match shared.settings.head_notify {
-        // Delivered on commit, in commit order.
-        HeadNotify::InTransaction => notify::send(&mut *tx, &notified).await.map_err(map)?,
-        HeadNotify::AfterCommit => {}
-    }
-    tx.commit().await.map_err(map)?;
-
-    for &(topic, partition, sequence) in &notified {
-        if shared.settings.head_notify == HeadNotify::AfterCommit {
-            shared.heads_to_notify.offer(topic, partition, sequence);
+    let head_notify = shared.settings.head_notify;
+    let commit = {
+        let notified = notified.clone();
+        async move {
+            if head_notify == HeadNotify::InTransaction {
+                // Delivered on commit, in commit order.
+                notify::send(&mut *tx, &notified).await?;
+            }
+            tx.commit().await
         }
-        shared.maintenance.appended((topic, partition), sequence);
-    }
-    for head in &heads {
-        shared.heads.publish(head.clone());
-    }
+    };
+    let publish = {
+        let shared = Arc::clone(shared);
+        let heads = heads.clone();
+        move || {
+            for &(topic, partition, sequence) in &notified {
+                if head_notify == HeadNotify::AfterCommit {
+                    shared.heads_to_notify.offer(topic, partition, sequence);
+                }
+                shared.maintenance.appended((topic, partition), sequence);
+            }
+            for head in heads {
+                shared.heads.publish(head);
+            }
+        }
+    };
+    finish(commit, publish)
+        .await
+        .map_err(|_| BackendError::Internal(format!("{OP}: the commit task ended abnormally")))?
+        .map_err(map)?;
     Ok(Appended::Heads(heads))
+}
+
+/// Runs `commit` and then, once it has landed, `publish`, in a task of its
+/// own started at once: a caller that goes away once the commit is issued
+/// leaves it running, so a commit that lands always has its heads published
+/// to the local hub and, under `after_commit`, offered to the notify worker -
+/// else a quiet partition would wait for its next append.
+pub fn finish<C, P>(commit: C, publish: P) -> JoinHandle<Result<(), sqlx::Error>>
+where
+    C: Future<Output = Result<(), sqlx::Error>> + Send + 'static,
+    P: FnOnce() + Send + 'static,
+{
+    tokio::spawn(async move {
+        commit.await?;
+        publish();
+        Ok(())
+    })
 }
 
 async fn insert(

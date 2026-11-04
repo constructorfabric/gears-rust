@@ -25,7 +25,7 @@ impl MigrationTrait for CreateProducerRegistrationSchema {
                         queue VARCHAR(255) NOT NULL,
                         outbox_partition BIGINT NOT NULL,
                         producer_id UUID NOT NULL,
-                        mode VARCHAR(32) NOT NULL,
+                        mode VARCHAR(9) NOT NULL,
                         client_agent VARCHAR(256) NOT NULL,
                         generation BIGINT NOT NULL,
                         created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -39,7 +39,7 @@ impl MigrationTrait for CreateProducerRegistrationSchema {
                         queue TEXT NOT NULL,
                         outbox_partition INTEGER NOT NULL,
                         producer_id TEXT NOT NULL,
-                        mode TEXT NOT NULL,
+                        mode VARCHAR(9) NOT NULL,
                         client_agent TEXT NOT NULL,
                         generation INTEGER NOT NULL,
                         created_at TEXT NOT NULL DEFAULT (datetime('now')),
@@ -47,17 +47,19 @@ impl MigrationTrait for CreateProducerRegistrationSchema {
                         PRIMARY KEY (registration_key, queue, outbox_partition)
                     )"
                 }
+                // The column defaults are only a fallback: the SDK writes
+                // `created_at`/`updated_at` itself, in UTC.
                 DatabaseBackend::MySql => {
                     "CREATE TABLE IF NOT EXISTS event_broker_producer_registrations (
-                        registration_key VARCHAR(255) NOT NULL,
-                        queue VARCHAR(255) NOT NULL,
+                        registration_key VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,
+                        queue VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,
                         outbox_partition BIGINT NOT NULL,
-                        producer_id CHAR(36) NOT NULL,
-                        mode VARCHAR(32) NOT NULL,
+                        producer_id BINARY(16) NOT NULL,
+                        mode VARCHAR(9) NOT NULL,
                         client_agent VARCHAR(256) NOT NULL,
                         generation BIGINT NOT NULL,
-                        created_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-                        updated_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+                        created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+                        updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
                         PRIMARY KEY (registration_key, queue, outbox_partition)
                     )"
                 }
@@ -89,3 +91,7 @@ impl MigrationTrait for CreateProducerRegistrationSchema {
 pub fn producer_registration_migrations() -> Vec<Box<dyn MigrationTrait>> {
     vec![Box::new(CreateProducerRegistrationSchema)]
 }
+
+#[cfg(test)]
+#[path = "migrations_tests.rs"]
+mod tests;

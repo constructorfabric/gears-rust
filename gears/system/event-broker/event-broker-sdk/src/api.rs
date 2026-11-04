@@ -431,12 +431,10 @@ pub trait EventBrokerApi: Send + Sync {
         event: &Event,
     ) -> Result<IngestOutcome, EventBrokerError>;
 
-    /// Persist-confirming publish: awaits the backend durable write and returns
-    /// `IngestOutcome::Persisted` on success (vs. `Accepted` for the async path).
-    /// A `Duplicate` is still reported as `Duplicate`.
-    ///
-    /// Default impl falls back to [`publish`] for backends that don't model
-    /// persist confirmation; the mock overrides it.
+    /// Publishes and, where the implementation can confirm the backend durable
+    /// write, awaits it and returns `Persisted`. The default delegates to
+    /// [`publish`](Self::publish) and reports its outcome, `Accepted` or
+    /// `Duplicate` for an asynchronous publish.
     async fn publish_sync(
         &self,
         ctx: &SecurityContext,

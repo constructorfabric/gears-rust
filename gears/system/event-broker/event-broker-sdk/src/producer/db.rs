@@ -1,13 +1,15 @@
 use std::collections::HashMap;
 use std::marker::PhantomData;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex as AsyncMutex, OnceCell};
 use toolkit_security::SecurityContext;
+use tracing::Instrument;
 
 use crate::api::EventBrokerApi;
-use crate::error::EventBrokerError;
 #[cfg(feature = "outbox")]
+use crate::api::ProducerMode;
+use crate::error::EventBrokerError;
 use crate::ids::ProducerId;
 use crate::models::ResetScope;
 use crate::sdk::EventBrokerSdk;
@@ -20,9 +22,19 @@ use super::event_factory::prepare_event;
 use super::outbox::{ProducerOutboxEnvelope, ProducerOutboxQueue};
 #[cfg(feature = "outbox")]
 use super::registration::NewRegistration;
-use super::registration::{ProducerRegistration, ProducerRegistrationStore, RegistrationSlot};
+use super::registration::{
+    ProducerRegistration, ProducerRegistrationStore, RegistrationSlot, Replaced,
+};
 use super::schema_cache::ProducerSchemaCache;
 use super::types::{DbDeduplication, ProducerIdentity, ValidationTiming};
+
+/// One slot's registration: set once per process, by whichever drain first
+/// resolves the slot, and swapped whole when the slot's id is replaced.
+type RegistrationCell = Arc<OnceCell<ProducerRegistration>>;
+
+/// One slot's write lock: held while the slot's id is first stored or
+/// replaced, so this process changes a slot one writer at a time.
+type SlotLock = Arc<AsyncMutex<()>>;
 
 type DbProducerBuilderState<Broker, Db, Ctx, Identity, Dedup, Topics, Patterns> =
     PhantomData<(Broker, Db, Ctx, Identity, Dedup, Topics, Patterns)>;
@@ -250,11 +262,14 @@ impl DbProducerBuilder<Has, Has, Has, Has, Has, Has, Has> {
             deduplication,
             client_agent,
             registrations: Arc::new(Mutex::new(HashMap::new())),
+            slot_locks: Arc::new(Mutex::new(HashMap::new())),
             registration_store,
             topics: self.topics,
             event_type_patterns: self.event_type_patterns,
             validation_timing: self.validation_timing,
             cache,
+            #[cfg(all(test, feature = "outbox"))]
+            unlock_pause: Arc::default(),
         })
     }
 }
@@ -276,17 +291,26 @@ pub struct DbProducer {
     // the outbox does.
     #[cfg_attr(not(feature = "outbox"), allow(dead_code))]
     client_agent: String,
-    /// The producer id of each outbox partition drained so far, by slot.
-    #[cfg_attr(not(feature = "outbox"), allow(dead_code))]
-    registrations: Arc<Mutex<HashMap<RegistrationSlot, ProducerRegistration>>>,
+    /// The producer id of each outbox partition drained or replaced so far,
+    /// by slot. The lock guards only the map: a slot registers inside its own
+    /// cell, so one slot's registration never waits on another's, and a slot
+    /// registers at most once in this process unless its row vanishes.
+    registrations: Arc<Mutex<HashMap<RegistrationSlot, RegistrationCell>>>,
+    /// The write lock of each slot stored or replaced so far. Like
+    /// `registrations`, the outer lock guards only the map.
+    slot_locks: Arc<Mutex<HashMap<RegistrationSlot, SlotLock>>>,
     registration_store: ProducerRegistrationStore,
     topics: Vec<String>,
     event_type_patterns: Vec<String>,
-    // Only the outbox path re-checks the timing at publish time; the direct path
-    // resolves it once in `build_inner`.
+    // Read after `build` only by the outbox path: a lazy producer refuses to
+    // enqueue an event type it has not prepared.
     #[cfg_attr(not(feature = "outbox"), allow(dead_code))]
     validation_timing: ValidationTiming,
     cache: Arc<ProducerSchemaCache>,
+    /// Holds a first registration between releasing its slot's write lock
+    /// and caching what it read, when a test arms it.
+    #[cfg(all(test, feature = "outbox"))]
+    unlock_pause: Arc<tests::UnlockPause>,
 }
 
 impl DbProducer {
@@ -339,11 +363,25 @@ impl DbProducer {
     }
 
     /// Replaces every stored partition id with a newly registered one, under
-    /// the next generation. Messages drained afterwards, including ones
-    /// enqueued before, publish under the new ids.
+    /// the next generation, slot by slot in queue and partition order.
+    /// Messages drained after it returns, including ones enqueued before,
+    /// publish under the new ids. A drain already holding a retired id may
+    /// publish under it once more, which the broker still accepts. A slot
+    /// another writer replaced since it was read keeps that writer's id.
+    ///
+    /// # Errors
+    ///
+    /// [`EventBrokerError::Internal`] on a stateless producer, or when a
+    /// replace task panics; whatever the broker or the registration store
+    /// fail with.
     pub async fn rotate_registration(&self) -> Result<(), EventBrokerError> {
-        for registration in self.stored_registrations("rotate_registration").await? {
-            self.replace(&registration).await?;
+        let mut registrations = self.stored_registrations("rotate_registration").await?;
+        registrations.sort_by(|a, b| {
+            (&a.slot.queue, a.slot.partition).cmp(&(&b.slot.queue, b.slot.partition))
+        });
+        for registration in registrations {
+            self.replace_rejected(registration.slot, registration.producer_id)
+                .await?;
         }
         Ok(())
     }
@@ -381,8 +419,10 @@ impl DbProducer {
     /// cached, else stored, else registered with the broker and stored.
     ///
     /// # Errors
-    /// [`EventBrokerError::Internal`] on a stateless producer; whatever the
-    /// broker or the registration store fail with.
+    ///
+    /// [`EventBrokerError::Internal`] on a stateless producer, or when the
+    /// registration task panics; whatever the broker or the registration
+    /// store fail with.
     #[cfg(feature = "outbox")]
     pub(crate) async fn partition_producer(
         &self,
@@ -399,30 +439,120 @@ impl DbProducer {
             queue: queue.to_owned(),
             partition,
         };
-        let mut registrations = self.registrations.lock().await;
-        if let Some(registration) = registrations.get(&slot) {
+        let cell = self.registration_cell(&slot);
+        if let Some(registration) = cell.get() {
             return Ok(registration.producer_id);
         }
-        let registration = match self.registration_store.load(&slot).await? {
-            Some(registration) => registration,
-            None => {
+        // The registration runs in its own task, so a caller dropped
+        // mid-registration (the outbox cancels a handler at its lease
+        // deadline) leaves it running through the store insert; the next
+        // caller joins the same cell instead of registering a second id.
+        let producer = self.clone();
+        let mode = managed.mode;
+        tokio::spawn(
+            async move {
+                let mut cell = cell;
+                loop {
+                    let producer_id = cell
+                        .get_or_try_init(|| producer.load_or_register(&slot, mode))
+                        .await?
+                        .producer_id;
+                    // A replace that swapped the slot's cell while this one
+                    // filled retired what it read; the current cell holds
+                    // the slot's id.
+                    let current = producer.registration_cell(&slot);
+                    if Arc::ptr_eq(&current, &cell) {
+                        return Ok(producer_id);
+                    }
+                    cell = current;
+                }
+            }
+            .in_current_span(),
+        )
+        .await
+        .map_err(|err| EventBrokerError::Internal(format!("producer registration task: {err}")))?
+    }
+
+    /// The stored registration of `slot`, else a new one registered with the
+    /// broker and stored. Runs under the slot's write lock, so it reads what
+    /// a replace in flight stores rather than the id that replace retires.
+    #[cfg(feature = "outbox")]
+    async fn load_or_register(
+        &self,
+        slot: &RegistrationSlot,
+        mode: ProducerMode,
+    ) -> Result<ProducerRegistration, EventBrokerError> {
+        let lock = self.slot_lock(slot);
+        let registration = {
+            let _writing = lock.lock().await;
+            if let Some(stored) = self.registration_store.load(slot).await? {
+                stored
+            } else {
                 let producer_id = self
                     .broker
-                    .register_producer(&self.ctx, managed.mode, &self.client_agent)
+                    .register_producer(&self.ctx, mode, &self.client_agent)
                     .await?;
                 self.registration_store
                     .insert_new(NewRegistration {
-                        slot: &slot,
+                        slot,
                         producer_id,
-                        mode: managed.mode,
+                        mode,
                         client_agent: &self.client_agent,
                     })
                     .await?
             }
         };
-        let producer_id = registration.producer_id;
-        registrations.insert(slot, registration);
-        Ok(producer_id)
+        #[cfg(test)]
+        self.unlock_pause.pause().await;
+        Ok(registration)
+    }
+
+    /// The cell of `slot`, created empty on first sight.
+    #[cfg(feature = "outbox")]
+    fn registration_cell(&self, slot: &RegistrationSlot) -> RegistrationCell {
+        self.registrations
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .entry(slot.clone())
+            .or_default()
+            .clone()
+    }
+
+    /// The write lock of `slot`, created on first sight.
+    fn slot_lock(&self, slot: &RegistrationSlot) -> SlotLock {
+        self.slot_locks
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .entry(slot.clone())
+            .or_default()
+            .clone()
+    }
+
+    /// Caches `registration` as its slot's id, replacing whatever the slot
+    /// held. A cell that already holds the same id stays, so a first drain
+    /// waiting on it does not retry.
+    fn cache_registration(&self, registration: ProducerRegistration) {
+        let mut registrations = self
+            .registrations
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let unchanged = registrations
+            .get(&registration.slot)
+            .and_then(|cell| cell.get())
+            .is_some_and(|cached| cached.producer_id == registration.producer_id);
+        if !unchanged {
+            let slot = registration.slot.clone();
+            registrations.insert(slot, Arc::new(OnceCell::from(registration)));
+        }
+    }
+
+    /// Drops the cached id of `slot`, so its next drain loads or registers
+    /// afresh.
+    fn forget_registration(&self, slot: &RegistrationSlot) {
+        self.registrations
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(slot);
     }
 
     /// Replaces `rejected`, the id of `partition` of `queue` the broker
@@ -430,7 +560,9 @@ impl DbProducer {
     /// partition already moved on to another id.
     ///
     /// # Errors
-    /// Whatever the broker or the registration store fail with.
+    ///
+    /// [`EventBrokerError::Internal`] when the replace task panics; whatever
+    /// the broker or the registration store fail with.
     #[cfg(feature = "outbox")]
     pub(crate) async fn replace_unknown_producer(
         &self,
@@ -446,30 +578,90 @@ impl DbProducer {
             queue: queue.to_owned(),
             partition,
         };
-        let Some(current) = self.registration_store.load(&slot).await? else {
-            return Ok(());
-        };
-        if current.producer_id != rejected {
-            self.registrations.lock().await.insert(slot, current);
-            return Ok(());
-        }
-        self.replace(&current).await
+        self.replace_rejected(slot, rejected).await
     }
 
-    async fn replace(&self, current: &ProducerRegistration) -> Result<(), EventBrokerError> {
-        let producer_id = self
-            .broker
-            .register_producer(&self.ctx, current.mode, &current.client_agent)
-            .await?;
-        let next = self
-            .registration_store
-            .replace_with_new_generation(current, producer_id)
-            .await?;
-        self.registrations
-            .lock()
-            .await
-            .insert(next.slot.clone(), next);
-        Ok(())
+    /// Moves `slot` off `rejected` to a newly registered id under the next
+    /// generation, and caches what the slot then stores. A no-op, apart from
+    /// caching the stored id, when the slot holds another id. A slot whose row
+    /// is gone, before or during the replace, drops its cached id, so its next
+    /// drain loads or registers afresh.
+    ///
+    /// The replace runs in its own task under the slot's write lock: a caller
+    /// dropped mid-replace leaves it running through the store update, and a
+    /// second caller in this process waits, then finds the new id and
+    /// registers nothing. Across processes the update applies only to the
+    /// generation it read; a writer that loses keeps the stored id, and the
+    /// id it registered stays unused, since the broker has no unregister.
+    ///
+    /// # Errors
+    ///
+    /// [`EventBrokerError::Internal`] when the replace task panics; whatever
+    /// the broker or the registration store fail with.
+    async fn replace_rejected(
+        &self,
+        slot: RegistrationSlot,
+        rejected: ProducerId,
+    ) -> Result<(), EventBrokerError> {
+        let producer = self.clone();
+        tokio::spawn(
+            async move {
+                let lock = producer.slot_lock(&slot);
+                let _writing = lock.lock().await;
+                let Some(current) = producer.registration_store.load(&slot).await? else {
+                    tracing::warn!(
+                        key = %slot.key,
+                        queue = %slot.queue,
+                        partition = slot.partition,
+                        "the producer registration vanished before its replace; \
+                         the slot's next drain loads or registers afresh"
+                    );
+                    producer.forget_registration(&slot);
+                    return Ok(());
+                };
+                if current.producer_id != rejected {
+                    producer.cache_registration(current);
+                    return Ok(());
+                }
+                let producer_id = producer
+                    .broker
+                    .register_producer(&producer.ctx, current.mode, &current.client_agent)
+                    .await?;
+                match producer
+                    .registration_store
+                    .replace_with_new_generation(&current, producer_id)
+                    .await?
+                {
+                    Replaced::Done(next) => producer.cache_registration(next),
+                    Replaced::Lost => {
+                        tracing::debug!(
+                            key = %slot.key,
+                            queue = %slot.queue,
+                            partition = slot.partition,
+                            unused_producer_id = %producer_id.0,
+                            "another process replaced the producer registration first; \
+                             the newly registered id stays unused"
+                        );
+                        if let Some(stored) = producer.registration_store.load(&slot).await? {
+                            producer.cache_registration(stored);
+                        } else {
+                            tracing::warn!(
+                                key = %slot.key,
+                                queue = %slot.queue,
+                                partition = slot.partition,
+                                "the producer registration vanished during its replace; \
+                                 the slot's next drain loads or registers afresh"
+                            );
+                            producer.forget_registration(&slot);
+                        }
+                    }
+                }
+                Ok(())
+            }
+            .in_current_span(),
+        )
+        .await
+        .map_err(|err| EventBrokerError::Internal(format!("producer replace task: {err}")))?
     }
 
     #[doc(hidden)]
@@ -493,8 +685,7 @@ impl DbProducer {
         }
         // Producer metadata is stamped when the message drains, under the id of
         // the partition it drains from; nothing of it is known here.
-        let prepared =
-            prepare_event(&self.cache, &self.identity, &self.ctx, event, |_| None).await?;
+        let prepared = prepare_event(&self.cache, &self.identity, &self.ctx, event).await?;
         let outbox_partition = super::partitioning::producer_outbox_partition(
             &prepared.topic,
             &prepared.key,
@@ -512,3 +703,7 @@ impl DbProducer {
         Ok((outbox_partition, envelope))
     }
 }
+
+#[cfg(all(test, feature = "outbox"))]
+#[path = "db_tests.rs"]
+mod tests;

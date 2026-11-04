@@ -742,6 +742,78 @@ async fn heads_reach_another_instance_in_either_notify_mode() {
     }
 }
 
+/// Under `head_notify: after_commit`, an append whose caller goes away right
+/// after its COMMIT still has its head notified: a watch on another instance
+/// sees it, with no later append to carry it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_head_committed_by_an_append_whose_caller_went_away_is_still_notified() {
+    let server = common::server("a-head-committed-by-a-dropped-append").await;
+    let schema = common::fresh_schema();
+    let watcher = common::backend(&server.url, &schema, serde_json::json!({})).await;
+    let writer = common::backend(
+        &server.url,
+        &schema,
+        serde_json::json!({ "head_notify": "after_commit" }),
+    )
+    .await;
+    let topic = topic();
+    provision(writer.as_ref(), &topic, 1, KEEP).await;
+    let at = TopicPartition::new(topic.clone(), Partition::new(0));
+    let mut heads = match watcher.watch() {
+        event_broker_sdk::backend::Watch::Native(watch) => watch.watch(std::slice::from_ref(&at)),
+        event_broker_sdk::backend::Watch::Poll(_) => {
+            panic!("the postgres backend watches natively")
+        }
+    };
+    let first = heads.next().await.unwrap().unwrap();
+    assert_eq!(
+        (first.at.clone(), first.sequence),
+        (at.clone(), Sequence::NONE)
+    );
+
+    // The append is driven until its commit is visible, then dropped.
+    let pool = control(&server.url).await;
+    let t = topic_uuid(&topic);
+    let committed = async {
+        loop {
+            let hwm: i64 = sqlx::query_scalar(AssertSqlSafe(format!(
+                "SELECT hwm FROM {schema}.evbk__partition WHERE topic_uuid = $1::uuid AND partition = 0"
+            )))
+            .bind(&t)
+            .fetch_one(&pool)
+            .await
+            .expect("partition row");
+            if hwm == 1 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    };
+    let events = [keyed(1)];
+    let mut appending = Box::pin(append(
+        writer.as_ref(),
+        &topic,
+        FenceKey::new(19),
+        1,
+        &events,
+    ));
+    tokio::select! {
+        biased;
+        () = committed => {}
+        appended = &mut appending => {
+            assert!(matches!(appended, Ok(Appended::Heads(_))), "{appended:?}");
+        }
+    }
+    drop(appending);
+
+    let next = tokio::time::timeout(Duration::from_secs(10), heads.next())
+        .await
+        .expect("the head within 10s of the commit")
+        .unwrap()
+        .unwrap();
+    assert_eq!((next.at, next.sequence), (at, Sequence::assigned(1)));
+}
+
 /// `resolve(At)` past a sealed segment: the search starts after it, and the
 /// answer is the same as a scan from the floor. Every table has its
 /// block-range index on `sequence_time`.

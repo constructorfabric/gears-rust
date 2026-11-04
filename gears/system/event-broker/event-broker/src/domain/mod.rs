@@ -1,6 +1,7 @@
 //! Domain layer: business logic, service traits, and repository contracts.
 //! No infra dependencies (`DESIGN.md` §1.3 Architecture Layers).
 
+pub mod audit;
 pub mod authz;
 pub mod backend;
 pub mod cluster;
@@ -15,12 +16,15 @@ pub mod ingest;
 pub mod local_broker;
 pub mod model;
 pub mod outbox;
+pub mod producer_reset;
 pub mod projection;
 pub mod repo;
 pub mod resolution;
 pub mod specification;
 pub mod streaming;
 
+#[cfg(test)]
+mod local_broker_tests;
 #[cfg(test)]
 mod model_tests;
 #[cfg(test)]

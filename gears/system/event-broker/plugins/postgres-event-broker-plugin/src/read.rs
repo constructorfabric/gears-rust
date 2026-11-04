@@ -23,14 +23,14 @@ struct StoredRow {
     body: Vec<u8>,
 }
 
-/// First and last sequence and storage time of a matched range; all `None`
-/// when it matched nothing.
+/// The first and last event of a matched range: sequence and storage time;
+/// no row when it matched nothing.
 #[derive(sqlx::FromRow)]
 struct RangeFigures {
-    first: Option<i64>,
-    last: Option<i64>,
-    start_time: Option<DateTime<Utc>>,
-    end_time: Option<DateTime<Utc>>,
+    first: i64,
+    last: i64,
+    start_time: DateTime<Utc>,
+    end_time: DateTime<Utc>,
 }
 
 /// How often a waiting read re-reads besides being woken: a head from another
@@ -215,22 +215,30 @@ pub async fn query(
     let (topic, table) = partition_of(shared, at, OP).await?;
     let pool = shared.pool()?;
     let map = |e| error::map(OP, &e);
-    let figures: RangeFigures = sqlx::query_as(AssertSqlSafe(format!(
-        "SELECT MIN(sequence) AS first, MAX(sequence) AS last, MIN(sequence_time) AS start_time, \
-         MAX(sequence_time) AS end_time FROM \
+    // Two seeks on the primary key, never a scan of the range: the first
+    // matched event above the floor, and the last at most `limit - 1`
+    // sequences above it. Stored sequences have no gaps - append assigns them
+    // from the head up, retention removes whole segments from the floor up -
+    // so `first + limit - 1` is the `limit`-th matched event.
+    let figures: Option<RangeFigures> = sqlx::query_as(AssertSqlSafe(format!(
+        "SELECT f.sequence AS first, l.sequence AS last, f.sequence_time AS start_time, \
+         l.sequence_time AS end_time FROM \
          (SELECT sequence, sequence_time FROM {table} WHERE sequence <= $2 AND sequence >= \
           GREATEST($1, (SELECT floor + 1 FROM evbk__retention WHERE topic_uuid = $4 AND partition = $5)) \
-          ORDER BY sequence LIMIT $3) AS matched"
+          ORDER BY sequence ASC LIMIT 1) AS f \
+         CROSS JOIN LATERAL \
+         (SELECT sequence, sequence_time FROM {table} WHERE sequence >= f.sequence \
+          AND sequence <= LEAST($2, f.sequence + $3 - 1) ORDER BY sequence DESC LIMIT 1) AS l"
     )))
     .bind(range.start_offset.map_or(i64::MIN, Sequence::as_i64))
     .bind(range.end_offset.map_or(i64::MAX, Sequence::as_i64))
     .bind(i64::from(range.limit))
     .bind(topic)
     .bind(names::partition_column(at.partition))
-    .fetch_one(pool)
+    .fetch_optional(pool)
     .await
     .map_err(map)?;
-    let (Some(first), Some(last)) = (figures.first, figures.last) else {
+    let Some(figures) = figures else {
         return Ok(Vec::new());
     };
     let segments = segments_of(pool, &table)
@@ -242,10 +250,10 @@ pub async fn query(
     Ok(vec![TopicSegment {
         topic: at.topic.to_string(),
         partition: at.partition.value(),
-        start_sequence: Sequence::assigned(first),
-        end_sequence: Sequence::assigned(last),
-        start_time: figures.start_time,
-        end_time: figures.end_time,
+        start_sequence: Sequence::assigned(figures.first),
+        end_sequence: Sequence::assigned(figures.last),
+        start_time: Some(figures.start_time),
+        end_time: Some(figures.end_time),
         segments,
     }])
 }

@@ -17,10 +17,14 @@ use toolkit::{ClientHub, Gear, GearCtx, RestApiCapability};
 use tower::ServiceExt;
 use uuid::Uuid;
 
-use super::EventBrokerModule;
+use super::{BACKEND_STOP_GRACE, EventBrokerModule, start_backends, stop_backends};
 use crate::config::{DeploymentMode, EventBrokerConfig};
 use crate::test_support::module_boot::StaticConfigProvider;
-use event_broker_sdk::backend::Role;
+use event_broker_sdk::backend::{
+    AppendRequest, Appended, Backend, BackendError, Dedup, LogClaim, Provisioning, Role,
+    TopicPartition, TopicSpec, Wait, Watch,
+};
+use event_broker_sdk::{Event, PartitionRange, Position, Sequence, TopicSegment};
 
 struct NoopOpenApiRegistry;
 
@@ -559,4 +563,320 @@ async fn an_unreachable_backend_does_not_stop_the_start_and_its_topics_are_unava
         .await
         .expect("serve task must not panic")
         .expect("serve must return Ok on cancellation");
+}
+
+/// A registry whose list calls never answer, as one that is unreachable
+/// without refusing the connection; every other call is the empty mock's.
+/// The second field is notified once `list_instances` has been entered.
+struct HangingListRegistry(
+    types_registry_sdk::testing::MockTypesRegistryClient,
+    Arc<tokio::sync::Notify>,
+);
+
+#[async_trait::async_trait]
+impl types_registry_sdk::TypesRegistryClient for HangingListRegistry {
+    async fn register(
+        &self,
+        entities: Vec<serde_json::Value>,
+    ) -> Result<Vec<types_registry_sdk::RegisterResult>, toolkit_canonical_errors::CanonicalError>
+    {
+        self.0.register(entities).await
+    }
+
+    async fn register_type_schemas(
+        &self,
+        type_schemas: Vec<serde_json::Value>,
+    ) -> Result<Vec<types_registry_sdk::RegisterResult>, toolkit_canonical_errors::CanonicalError>
+    {
+        self.0.register_type_schemas(type_schemas).await
+    }
+
+    async fn get_type_schema(
+        &self,
+        type_id: &str,
+    ) -> Result<types_registry_sdk::GtsTypeSchema, toolkit_canonical_errors::CanonicalError> {
+        self.0.get_type_schema(type_id).await
+    }
+
+    async fn get_type_schema_by_uuid(
+        &self,
+        type_uuid: Uuid,
+    ) -> Result<types_registry_sdk::GtsTypeSchema, toolkit_canonical_errors::CanonicalError> {
+        self.0.get_type_schema_by_uuid(type_uuid).await
+    }
+
+    async fn get_type_schemas(
+        &self,
+        type_ids: Vec<String>,
+    ) -> std::collections::HashMap<
+        String,
+        Result<types_registry_sdk::GtsTypeSchema, toolkit_canonical_errors::CanonicalError>,
+    > {
+        self.0.get_type_schemas(type_ids).await
+    }
+
+    async fn get_type_schemas_by_uuid(
+        &self,
+        type_uuids: Vec<Uuid>,
+    ) -> std::collections::HashMap<
+        Uuid,
+        Result<types_registry_sdk::GtsTypeSchema, toolkit_canonical_errors::CanonicalError>,
+    > {
+        self.0.get_type_schemas_by_uuid(type_uuids).await
+    }
+
+    async fn list_type_schemas(
+        &self,
+        _query: types_registry_sdk::TypeSchemaQuery,
+    ) -> Result<Vec<types_registry_sdk::GtsTypeSchema>, toolkit_canonical_errors::CanonicalError>
+    {
+        std::future::pending().await
+    }
+
+    async fn register_instances(
+        &self,
+        instances: Vec<serde_json::Value>,
+    ) -> Result<Vec<types_registry_sdk::RegisterResult>, toolkit_canonical_errors::CanonicalError>
+    {
+        self.0.register_instances(instances).await
+    }
+
+    async fn get_instance(
+        &self,
+        id: &str,
+    ) -> Result<types_registry_sdk::GtsInstance, toolkit_canonical_errors::CanonicalError> {
+        self.0.get_instance(id).await
+    }
+
+    async fn get_instance_by_uuid(
+        &self,
+        uuid: Uuid,
+    ) -> Result<types_registry_sdk::GtsInstance, toolkit_canonical_errors::CanonicalError> {
+        self.0.get_instance_by_uuid(uuid).await
+    }
+
+    async fn get_instances(
+        &self,
+        ids: Vec<String>,
+    ) -> std::collections::HashMap<
+        String,
+        Result<types_registry_sdk::GtsInstance, toolkit_canonical_errors::CanonicalError>,
+    > {
+        self.0.get_instances(ids).await
+    }
+
+    async fn get_instances_by_uuid(
+        &self,
+        uuids: Vec<Uuid>,
+    ) -> std::collections::HashMap<
+        Uuid,
+        Result<types_registry_sdk::GtsInstance, toolkit_canonical_errors::CanonicalError>,
+    > {
+        self.0.get_instances_by_uuid(uuids).await
+    }
+
+    async fn list_instances(
+        &self,
+        _query: types_registry_sdk::InstanceQuery,
+    ) -> Result<Vec<types_registry_sdk::GtsInstance>, toolkit_canonical_errors::CanonicalError>
+    {
+        self.1.notify_one();
+        std::future::pending().await
+    }
+}
+
+/// A stop while the startup registry load waits on a registry that never
+/// answers ends the start promptly: a process stopped right after launch
+/// exits instead of hanging on the load.
+#[tokio::test]
+async fn a_stop_during_the_startup_registry_load_ends_the_start_promptly() {
+    let hub = Arc::new(ClientHub::new());
+    let ctx = make_ctx_with_hub("standalone", Arc::clone(&hub)).await;
+    let module = Arc::new(EventBrokerModule::default());
+    module.init(&ctx).await.expect("init must succeed");
+    // After `init`: `serve()` resolves the registry for the startup load.
+    let listing = Arc::new(tokio::sync::Notify::new());
+    hub.register::<dyn types_registry_sdk::TypesRegistryClient>(Arc::new(HangingListRegistry(
+        types_registry_sdk::testing::MockTypesRegistryClient::new(),
+        Arc::clone(&listing),
+    )));
+
+    let cancel = CancellationToken::new();
+    let serve_task = crate::test_support::module_boot::spawn_serve(&module, &cancel);
+    tokio::time::timeout(Duration::from_secs(2), listing.notified())
+        .await
+        .expect("the startup load must reach the registry's list call within 2s");
+    assert!(
+        !serve_task.is_finished(),
+        "the start waits on the registry load until the stop"
+    );
+
+    cancel.cancel();
+    tokio::time::timeout(Duration::from_secs(2), serve_task)
+        .await
+        .expect("serve must return within 2s of the stop")
+        .expect("serve task must not panic")
+        .expect("serve must return Ok on a stop");
+}
+
+/// Bounds each await of the backend start and stop tests, so a stop that
+/// never returns fails the test instead of hanging it.
+const BOUND: Duration = Duration::from_secs(1);
+
+/// A `start` or `stop` a [`LifecycleBackend`] saw, naming the backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Lifecycle {
+    Start(u8),
+    Stop(u8),
+}
+
+type Journal = Arc<std::sync::Mutex<Vec<(Lifecycle, Duration)>>>;
+
+/// Records each `start` and `stop` with the time it returned, measured from
+/// `epoch`. Its `start` fails when `fails_start`; its `stop` returns only once
+/// the deadline is cancelled when `waits_for_deadline`, and at once otherwise.
+struct LifecycleBackend {
+    id: u8,
+    fails_start: bool,
+    waits_for_deadline: bool,
+    epoch: tokio::time::Instant,
+    journal: Journal,
+}
+
+impl LifecycleBackend {
+    fn record(&self, call: Lifecycle) {
+        self.journal
+            .lock()
+            .expect("journal lock")
+            .push((call, self.epoch.elapsed()));
+    }
+}
+
+fn not_called() -> BackendError {
+    BackendError::Internal("only start and stop are called".to_owned())
+}
+
+#[async_trait::async_trait]
+impl Backend for LifecycleBackend {
+    async fn provision(&self, _: &TopicSpec, _: &LogClaim) -> Result<Provisioning, BackendError> {
+        Err(not_called())
+    }
+    async fn append(&self, _: &AppendRequest<'_>) -> Result<Appended, BackendError> {
+        Err(not_called())
+    }
+    fn dedup(&self) -> Dedup {
+        Dedup::Fenced
+    }
+    fn max_events_per_append(&self) -> usize {
+        1
+    }
+    async fn read(
+        &self,
+        _: &TopicPartition,
+        _: Sequence,
+        _: usize,
+        _: Wait,
+    ) -> Result<Vec<Event>, BackendError> {
+        Err(not_called())
+    }
+    async fn resolve(&self, _: &TopicPartition, _: Position) -> Result<Sequence, BackendError> {
+        Err(not_called())
+    }
+    fn watch(&self) -> Watch<'_> {
+        Watch::Poll(Duration::from_secs(1))
+    }
+    async fn query(
+        &self,
+        _: &TopicPartition,
+        _: PartitionRange,
+    ) -> Result<Vec<TopicSegment>, BackendError> {
+        Err(not_called())
+    }
+    async fn start(&self) -> Result<(), BackendError> {
+        self.record(Lifecycle::Start(self.id));
+        if self.fails_start {
+            return Err(BackendError::Internal("the medium refused".to_owned()));
+        }
+        Ok(())
+    }
+    async fn stop(&self, deadline: CancellationToken) {
+        if self.waits_for_deadline {
+            deadline.cancelled().await;
+        }
+        self.record(Lifecycle::Stop(self.id));
+    }
+}
+
+fn lifecycle_backends(ids: &[(u8, bool, bool)], journal: &Journal) -> Vec<Arc<dyn Backend>> {
+    let epoch = tokio::time::Instant::now();
+    ids.iter()
+        .map(|&(id, fails_start, waits_for_deadline)| {
+            Arc::new(LifecycleBackend {
+                id,
+                fails_start,
+                waits_for_deadline,
+                epoch,
+                journal: Arc::clone(journal),
+            }) as Arc<dyn Backend>
+        })
+        .collect()
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_failed_backend_start_stops_the_started_ones_in_reverse() {
+    let journal = Journal::default();
+    let backends = lifecycle_backends(
+        &[(1, false, false), (2, false, false), (3, true, false)],
+        &journal,
+    );
+
+    let result = tokio::time::timeout(BOUND, start_backends(&backends))
+        .await
+        .expect("the start returns in time");
+
+    let Err(error) = result else {
+        panic!("a failed backend start fails the start");
+    };
+    assert_eq!(
+        error.to_string(),
+        "could not start the storage backend: internal: the medium refused"
+    );
+    assert_eq!(
+        *journal.lock().expect("journal lock"),
+        vec![
+            (Lifecycle::Start(1), Duration::ZERO),
+            (Lifecycle::Start(2), Duration::ZERO),
+            (Lifecycle::Start(3), Duration::ZERO),
+            (Lifecycle::Stop(2), Duration::ZERO),
+            (Lifecycle::Stop(1), Duration::ZERO),
+        ]
+    );
+}
+
+/// One grace covers the whole stop: backends stopping later get only what
+/// remains of it, possibly none, before the shared deadline is cancelled.
+#[tokio::test(start_paused = true)]
+async fn stopping_backends_waits_out_one_shared_grace_then_cancels() {
+    let journal = Journal::default();
+    let backends = lifecycle_backends(&[(1, false, true), (2, false, true)], &journal);
+    let epoch = tokio::time::Instant::now();
+
+    tokio::time::timeout(BACKEND_STOP_GRACE + BOUND, stop_backends(&backends))
+        .await
+        .expect("the stop returns once the grace elapses");
+
+    let elapsed = epoch.elapsed();
+    assert!(
+        (BACKEND_STOP_GRACE..BACKEND_STOP_GRACE + Duration::from_millis(1)).contains(&elapsed),
+        "the stop returns when the grace elapses, not before: {elapsed:?}"
+    );
+    let journal = journal.lock().expect("journal lock").clone();
+    let [(Lifecycle::Stop(2), second), (Lifecycle::Stop(1), first)] = journal.as_slice() else {
+        panic!("both backends stop, in reverse: {journal:?}");
+    };
+    assert_eq!(
+        (*second, *first),
+        (elapsed, elapsed),
+        "the cancelled deadline ends every waiting stop at once"
+    );
 }

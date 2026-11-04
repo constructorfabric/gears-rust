@@ -4,7 +4,7 @@
 
 use chrono::Utc;
 use event_broker_sdk::backend::support::topic_uuid;
-use event_broker_sdk::backend::{BackendError, LogClaim, LogId, Provisioning, TopicSpec};
+use event_broker_sdk::backend::{BackendError, LogClaim, LogId, Provisioning, Stored, TopicSpec};
 use uuid::Uuid;
 
 use crate::clock;
@@ -18,7 +18,9 @@ pub const MAX_PARTITIONS: u32 = 9999;
 const OP: Operation = Operation::Provision;
 
 /// Records the topic under `claim`'s log id and the spec's retention;
-/// `LogConflict` when the stored log is one `claim` does not accept.
+/// refused per [`LogClaim::check`] with nothing written. A `Held` claim never
+/// inserts the row, so over a topic this file holds nothing for it answers
+/// `NotProvisioned` and creates nothing.
 pub async fn provision(
     shared: &Shared,
     spec: &TopicSpec,
@@ -47,30 +49,45 @@ pub async fn provision(
         .begin_with("BEGIN IMMEDIATE")
         .await
         .map_err(map)?;
-    sqlx::query(
-        "INSERT INTO evbk__log (topic_uuid, topic_id, log_id, partitions, max_age_ms, max_bytes, provisioned_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) ON CONFLICT (topic_uuid) DO NOTHING",
-    )
-    .bind(topic)
-    .bind(spec.topic.as_ref())
-    .bind(claim.new.uuid())
-    .bind(i64::from(spec.partitions))
-    .bind(max_age_ms)
-    .bind(max_bytes)
-    .bind(clock::micros(Utc::now()))
-    .execute(&mut *tx)
-    .await
-    .map_err(map)?;
-    let (stored, partitions): (Uuid, i64) =
+    if claim.allows_creation() {
+        sqlx::query(
+            "INSERT INTO evbk__log (topic_uuid, topic_id, log_id, partitions, max_age_ms, max_bytes, provisioned_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) ON CONFLICT (topic_uuid) DO NOTHING",
+        )
+        .bind(topic)
+        .bind(spec.topic.as_ref())
+        .bind(claim.new.uuid())
+        .bind(i64::from(spec.partitions))
+        .bind(max_age_ms)
+        .bind(max_bytes)
+        .bind(clock::micros(Utc::now()))
+        .execute(&mut *tx)
+        .await
+        .map_err(map)?;
+    }
+    let stored: Option<(Uuid, i64)> =
         sqlx::query_as("SELECT log_id, partitions FROM evbk__log WHERE topic_uuid = ?1")
             .bind(topic)
-            .fetch_one(&mut *tx)
+            .fetch_optional(&mut *tx)
             .await
             .map_err(map)?;
-    if !claim.accepts(Some(LogId::from_uuid(stored))) {
+    if let Err(refused) = claim.check(
+        OP.name(),
+        stored.map_or(Stored::Nothing, |(log, _)| {
+            Stored::Log(LogId::from_uuid(log))
+        }),
+    ) {
         tx.rollback().await.map_err(map)?;
-        return Err(BackendError::log_conflict(OP.name()));
+        return Err(refused);
     }
+    let Some((_, partitions)) = stored else {
+        // `check` refuses a missing row unless the claim allows creation, and
+        // then the insert above wrote it.
+        tx.rollback().await.map_err(map)?;
+        return Err(BackendError::Internal(format!(
+            "{OP}: evbk__log holds no row after the insert"
+        )));
+    };
     // Fresh, resumed or replacing - either way the row takes the claim's id
     // and the spec's current retention, which the sweep reads on its next pass.
     sqlx::query(

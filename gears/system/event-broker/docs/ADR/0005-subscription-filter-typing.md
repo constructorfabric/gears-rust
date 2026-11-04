@@ -234,10 +234,10 @@ POST /v1/subscriptions { consumer_group, client_agent, session_timeout, interest
   ↓
 1. Authn: SecurityContext present? else 401.
 2. Per-tenant rate cap on JOIN (`cpt-cf-evbk-nfr-tenant-rate-caps`; default 60/min/tenant) else 429.
-3. consumer_group exists in evbk_consumer_group? else 404 ConsumerGroupNotFound.
+3. consumer_group exists in event_broker_consumer_group? else 404 ConsumerGroupNotFound.
 4. interests[] length cap check → 400 TooManyInterests.
 5. For each interest in interests[]:
-   5a. topic exists in evbk_topic? else 404 TopicNotFound.
+   5a. topic exists in the specification cache (`event_broker_spec_cache`)? else 404 TopicNotFound.
    5b. tenant_id authz via platform tenant resolver → 403 TenantIdNotAuthorized.
    5c. topic-level consume authz → 403 TopicNotAuthorized.
    5d. types[] length cap → 400 TooManyTypes.

@@ -67,7 +67,12 @@ pub async fn module_ctx(
         "event-broker": {
             "config": {
                 "mode": mode,
-                "backends": { "main": { "type": "gts.cf.core.events.backend.v1~cf.core.backend.memory.v1~" } },
+                // `single_process` lets the cluster roles build memory: this
+                // test process is the only one; harmless for `standalone`.
+                "backends": { "main": {
+                    "type": "gts.cf.core.events.backend.v1~cf.core.backend.memory.v1~",
+                    "single_process": true,
+                } },
                 "backend_routing": { "gts.cf.core.events.topic.v1~": "main" },
                 // Only load-bearing for cluster_ingest/cluster_delivery
                 // (registration `init`-time validation); harmless for the other

@@ -6,15 +6,16 @@
 //! (`domain/repo.rs`'s doc comment: identical names across traits in scope on
 //! one type are ambiguous at the call site).
 //!
-//! Namespace-to-engine split (design.md D2, corrected mid-design against
-//! DESIGN.md's own "why subscription/group state is ephemeral" invariant):
-//! routing markers -> `ClusterCacheV1` (subscriptions themselves are not
-//! stored here - they live in `ConsumerGroupCoordinator`); `cursor`/
-//! `consumer_group`/`producer_state` -> the gear database (durable;
-//! `SQLite`, `PostgreSQL` or `MySQL`/`MariaDB`). `cursor` and
-//! `producer_sequence` denormalize `tenant_id` from their owning
-//! `consumer_group`/`producer` row at write time, since neither has an
-//! independent tenant of its own.
+//! Namespace-to-engine split: subscription and group-membership state lives
+//! only as long as the consumer session, so none of it is durable. Routing
+//! markers go to `ClusterCacheV1`; subscriptions themselves are not stored
+//! here - they live in `ConsumerGroupCoordinator`. `event_broker_cursor`,
+//! `event_broker_consumer_group`, `event_broker_producer` and
+//! `event_broker_producer_sequence` go to the gear database (durable; `SQLite`,
+//! `PostgreSQL` or `MySQL`/`MariaDB`). `event_broker_cursor` and
+//! `event_broker_producer_sequence` rows denormalize `tenant_id` from their
+//! owning `event_broker_consumer_group` / `event_broker_producer` row at write
+//! time, since neither has an independent tenant of its own.
 
 use crate::domain::model::Sequence;
 use std::sync::{Arc, OnceLock};
@@ -36,14 +37,16 @@ use crate::domain::error::{DomainError, ErrorCode};
 use crate::domain::idempotency::{IdempotencyGuard, ProducerIdempotencyOutcome, PublishEnqueue};
 use crate::domain::ingest::{
     ProducerCursors, ProducerMode, ProducerRecord, ProducerRegistration, ProducerRegistry,
-    ProducerResetScope, ProducerTopicCursors,
+    ProducerTopicCursors,
 };
 use crate::domain::model::{ConsumerGroup, ConsumerGroupKind, Cursor};
+use crate::domain::producer_reset::ProducerResetScope;
 use crate::domain::repo::{ConsumerGroupRepo, CursorRepo, RoutingMarkers};
 use crate::domain::specification::SpecificationManager;
 use crate::infra::storage::entity::{
     consumer_group, cursor, outbox_identity, producer, producer_sequence,
 };
+use crate::infra::storage::producer_chain::Enqueued;
 
 /// Subscription id -> its consumer group.
 fn subscription_marker_key(id: Uuid) -> String {
@@ -145,11 +148,11 @@ pub struct Storage {
     /// This process's instance id - what a group marker names as the group's
     /// owner.
     instance_id: Uuid,
-    /// Where a test holds a chained publish at the last point another writer
-    /// can still commit before it writes - after the producer-head read, or
-    /// before the write lock on `SQLite` - to put a committed writer there.
+    /// Where a test holds a chained publish inside its transaction, to put
+    /// another writer's commit there: before the producer-head reads, or
+    /// after them.
     #[cfg(any(test, feature = "test-utils"))]
-    head_read_pause: crate::test_support::PausePoint,
+    chain_pauses: super::producer_chain::ChainPauses,
 }
 
 impl Storage {
@@ -166,16 +169,28 @@ impl Storage {
             outbox: OnceLock::new(),
             instance_id,
             #[cfg(any(test, feature = "test-utils"))]
-            head_read_pause: crate::test_support::PausePoint::default(),
+            chain_pauses: super::producer_chain::ChainPauses {
+                before_head_read: crate::test_support::PausePoint::default(),
+                after_head_read: crate::test_support::PausePoint::default(),
+            },
         }
     }
 
-    /// The point a chained publish passes right after it read the producer's
-    /// head (on `SQLite`: before it takes the write lock and reads).
+    /// The point a chained publish passes inside its transaction just before
+    /// it reads the producer heads (on `SQLite`: before it takes the write
+    /// lock).
     #[cfg(any(test, feature = "test-utils"))]
     #[must_use]
-    pub fn head_read_pause(&self) -> &crate::test_support::PausePoint {
-        &self.head_read_pause
+    pub fn before_head_read_pause(&self) -> &crate::test_support::PausePoint {
+        &self.chain_pauses.before_head_read
+    }
+
+    /// The point a chained publish passes right after it read the producer
+    /// heads, before it writes anything (on `SQLite`: holding the write lock).
+    #[cfg(any(test, feature = "test-utils"))]
+    #[must_use]
+    pub fn after_head_read_pause(&self) -> &crate::test_support::PausePoint {
+        &self.chain_pauses.after_head_read
     }
 
     /// Wires the routing markers' `ClusterCacheV1` in once
@@ -403,6 +418,67 @@ impl IdempotencyGuard for Storage {
         &self,
         request: PublishEnqueue,
     ) -> Result<ProducerIdempotencyOutcome, DomainError> {
+        match self.run_chain_transaction(vec![request]).await? {
+            Enqueued::Committed { outcomes, wake } => {
+                // Fired only now the transaction has committed, never inside
+                // it: marking a partition dirty before its row is durable lets
+                // a sequencer claim the partition, find nothing, and clear the
+                // flag before the commit lands, leaving the row to the cold
+                // reconciler. A rollback never reaches here, so a wake for rows
+                // nobody wrote is dropped with it. Fired before the outcome
+                // count is checked, since the rows are durable either way.
+                wake.fire();
+                let [outcome] = <[_; 1]>::try_from(outcomes).map_err(|outcomes| {
+                    DomainError::Internal(format!(
+                        "the chain transaction answered {} outcomes for one publish",
+                        outcomes.len()
+                    ))
+                })?;
+                Ok(outcome)
+            }
+            Enqueued::Violation {
+                producer_id,
+                last_sequence,
+                ..
+            } => Ok(ProducerIdempotencyOutcome::SequenceViolation {
+                producer_id,
+                last_sequence,
+            }),
+        }
+    }
+
+    async fn check_and_enqueue_batch(
+        &self,
+        requests: Vec<PublishEnqueue>,
+    ) -> Result<Vec<ProducerIdempotencyOutcome>, DomainError> {
+        match self.run_chain_transaction(requests).await? {
+            Enqueued::Committed { outcomes, wake } => {
+                // After commit, as on the single path.
+                wake.fire();
+                Ok(outcomes)
+            }
+            Enqueued::Violation {
+                index,
+                producer_id,
+                topic,
+                last_sequence,
+            } => Err(DomainError::SequenceViolation {
+                index,
+                producer_id,
+                topic: topic.to_string(),
+                last_sequence,
+            }),
+        }
+    }
+}
+
+impl Storage {
+    /// The producer-chain transaction over `requests`, once the ingest outbox
+    /// pipeline is running.
+    async fn run_chain_transaction(
+        &self,
+        requests: Vec<PublishEnqueue>,
+    ) -> Result<Enqueued, DomainError> {
         // A request must never be able to panic the process, and this one can
         // genuinely arrive before the pipeline exists: the REST listener is up
         // (and `/healthz`, a liveness probe, answers 200) before the gear's
@@ -420,23 +496,14 @@ impl IdempotencyGuard for Storage {
                 source: None,
             });
         };
-        let (outcome, wake) = super::producer_chain::check_and_enqueue(
+        super::producer_chain::check_and_enqueue(
             &self.db.db(),
             Arc::clone(outbox),
-            request,
+            requests,
             #[cfg(any(test, feature = "test-utils"))]
-            self.head_read_pause.clone(),
+            self.chain_pauses.clone(),
         )
-        .await?;
-        // Fired here, never inside the transaction: marking a partition dirty
-        // before its row is durable lets a sequencer claim the partition, find
-        // nothing, and clear the flag before the commit lands, leaving the row
-        // to the cold reconciler. A rollback propagates above instead, so the
-        // wake that would wake a sequencer for rows nobody wrote is dropped
-        // with it. Empty on a duplicate or a violation, where `fire` is a
-        // no-op.
-        wake.fire();
-        Ok(outcome)
+        .await
     }
 }
 
@@ -573,9 +640,7 @@ impl Storage {
             outbox_identity::ActiveModel {
                 name: Set(name.to_owned()),
                 outbox_id: Set(candidate.to_string()),
-                created_at: Set(
-                    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
-                ),
+                created_at: Set(Utc::now()),
             },
             &AccessScope::allow_all(),
             &conn,
@@ -595,15 +660,15 @@ impl Storage {
 }
 
 impl Storage {
-    /// Delete a producer's registration row (`evbk_producer`), cascading to its
-    /// `evbk_producer_state` rows. This is the deletion the registration Reaper
-    /// performs on age-out (`DESIGN.md:1165`; the worker itself is a future
-    /// ticket), and the only path that makes an existing `producer_id` resolve
-    /// to nothing - after it, the next publish naming that id is a
-    /// `404 ProducerNotFound`. There is no client-facing deregister, so this is
-    /// reached only from the reaper and from `test_support` fault injection.
+    /// Delete a producer's registration row (`event_broker_producer`); its
+    /// `event_broker_producer_sequence` chain rows stay. After it, the next
+    /// publish naming that id is a `404 ProducerNotFound`. There is no
+    /// client-facing deregister, and the registration Reaper is not yet
+    /// implemented (tracked in #5651), so only `test_support` fault injection
+    /// reaches this.
     ///
     /// # Errors
+    ///
     /// Returns a `DomainError` if the connection or the delete fails.
     pub async fn delete_producer_registration(&self, producer_id: Uuid) -> Result<(), DomainError> {
         let conn = self.db.conn()?;
@@ -662,7 +727,7 @@ impl RoutingMarkers for Storage {
 
 #[cfg(test)]
 mod tests {
-    use chrono::Utc;
+    use chrono::{DateTime, Utc};
     use toolkit_db::outbox::{LeasedMessageHandler, MessageResult, OutboxMessage, Partitions};
     use types_registry_sdk::testing::{MockTypesRegistryClient, make_test_instance};
 
@@ -1185,7 +1250,10 @@ mod tests {
             .expect("check_and_enqueue must succeed");
         assert_eq!(
             outcome,
-            ProducerIdempotencyOutcome::SequenceViolation { last_sequence: 10 }
+            ProducerIdempotencyOutcome::SequenceViolation {
+                producer_id: registration.id,
+                last_sequence: 10,
+            }
         );
 
         let cursors = storage
@@ -1213,7 +1281,7 @@ mod tests {
 
     /// The identity row of the ingest outbox group `name`, read raw, so a test
     /// sees exactly what was stored.
-    async fn identity_row(dsn: &str, name: &str) -> Option<(String, String, String)> {
+    async fn identity_row(dsn: &str, name: &str) -> Option<(String, String, DateTime<Utc>)> {
         use sea_orm::ConnectionTrait;
         use sea_orm::sea_query::{Alias, Expr, ExprTrait, Query};
 
@@ -1234,14 +1302,15 @@ mod tests {
             (
                 row.try_get::<String>("", "name").expect("name"),
                 row.try_get::<String>("", "outbox_id").expect("outbox_id"),
-                row.try_get::<String>("", "created_at").expect("created_at"),
+                row.try_get::<DateTime<Utc>>("", "created_at")
+                    .expect("created_at"),
             )
         })
     }
 
     /// An outbox group's identity is minted once - 16 lowercase hex digits and
-    /// the RFC 3339 moment it was minted - and every later read, a restart
-    /// included, gets the same one (feature 0005 §2.5).
+    /// the moment it was minted - and every later read, a restart included,
+    /// gets the same one (feature 0005 §2.5).
     #[tokio::test]
     async fn an_outbox_identity_is_minted_once_and_reused() {
         let (db, dsn) = test_db().await;
@@ -1251,7 +1320,9 @@ mod tests {
             TEST_INSTANCE_ID,
         );
 
+        let before = Utc::now();
         let minted = storage.outbox_identity("default").await.expect("minted");
+        let after = Utc::now();
         let (name, outbox_id, created_at) = identity_row(&dsn, "default")
             .await
             .expect("the row is stored");
@@ -1263,9 +1334,10 @@ mod tests {
             crate::domain::outbox::OutboxId::parse(&outbox_id),
             Some(minted)
         );
-        let minted_at = chrono::DateTime::parse_from_rfc3339(&created_at).expect("RFC 3339");
-        assert_eq!(minted_at.offset().local_minus_utc(), 0, "UTC: {created_at}");
-        assert!(created_at.len() <= 32, "fits VARCHAR(32): {created_at}");
+        assert!(
+            before <= created_at && created_at <= after,
+            "minted during the call: {before} <= {created_at} <= {after}"
+        );
 
         let restarted = Storage::new(
             Arc::clone(&db),
@@ -1303,7 +1375,10 @@ mod tests {
                 .values_panic([
                     "default".into(),
                     "0123456789ABCDEF".into(),
-                    "2026-10-28T00:00:00.000Z".into(),
+                    DateTime::parse_from_rfc3339("2026-10-28T00:00:00.000Z")
+                        .expect("RFC 3339")
+                        .with_timezone(&Utc)
+                        .into(),
                 ]),
         )
         .await

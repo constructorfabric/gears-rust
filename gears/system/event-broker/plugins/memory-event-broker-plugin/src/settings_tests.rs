@@ -26,6 +26,7 @@ fn empty_settings_take_the_defaults() {
         MemorySettings {
             store: "default".to_owned(),
             retention_interval: Duration::from_secs(1),
+            single_process: false,
         }
     );
 }
@@ -33,10 +34,16 @@ fn empty_settings_take_the_defaults() {
 #[test]
 fn every_setting_is_read() {
     assert_eq!(
-        parse(json!({ "store": "orders", "retention_interval_ms": 250 })).unwrap(),
+        parse(json!({
+            "store": "orders",
+            "retention_interval_ms": 250,
+            "single_process": true,
+        }))
+        .unwrap(),
         MemorySettings {
             store: "orders".to_owned(),
             retention_interval: Duration::from_millis(250),
+            single_process: true,
         }
     );
 }
@@ -62,5 +69,17 @@ fn a_bad_value_is_refused_without_quoting_it() {
     assert_eq!(
         invalid_config_detail(parse(json!({ "retention_interval_ms": 0 }))),
         "`retention_interval_ms` must be a positive integer"
+    );
+}
+
+#[test]
+fn settings_reject_a_non_boolean_single_process() {
+    assert_eq!(
+        invalid_config_detail(parse(json!({ "single_process": "yes" }))),
+        "`single_process` must be a boolean"
+    );
+    assert_eq!(
+        invalid_config_detail(parse(json!({ "single_process": 1 }))),
+        "`single_process` must be a boolean"
     );
 }

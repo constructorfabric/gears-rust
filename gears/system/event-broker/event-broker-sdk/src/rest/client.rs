@@ -461,6 +461,17 @@ fn topic_from_wire(w: wire::TopicWire) -> Result<Topic, EventBrokerError> {
     })
 }
 
+/// The outcome a publish's success status reports: 200 when the broker
+/// already holds every event, 201 when the write is confirmed durable, and 202
+/// when anything was enqueued.
+fn outcome_from_status(status: u16) -> IngestOutcome {
+    match status {
+        200 => IngestOutcome::Duplicate,
+        201 => IngestOutcome::Persisted,
+        _ => IngestOutcome::Accepted,
+    }
+}
+
 #[async_trait]
 impl EventBrokerApi for RestBroker {
     async fn register_producer(
@@ -498,36 +509,10 @@ impl EventBrokerApi for RestBroker {
     ) -> Result<IngestOutcome, EventBrokerError> {
         let body = wire::PublishEventWire::from_event(event);
         let url = self.url(&format!("{V1}/events"));
-        // 201 = persisted (sync path), 202 = accepted. Duplicate is not carried
-        // on the wire (design - Branch gaps).
         let status = self
             .call_status(ctx, Method::Post, &url, Some(to_value(&body)?))
             .await?;
-        Ok(if status == 201 {
-            IngestOutcome::Persisted
-        } else {
-            IngestOutcome::Accepted
-        })
-    }
-
-    async fn publish_sync(
-        &self,
-        ctx: &SecurityContext,
-        event: &Event,
-    ) -> Result<IngestOutcome, EventBrokerError> {
-        let body = wire::PublishEventWire::from_event(event);
-        // Sync-wait as a query param (`?wait=persisted`) rather than the
-        // `Sync-Wait` header, so it fits the header-less `call` chokepoint; the
-        // server honours either form.
-        let url = self.url(&format!("{V1}/events?wait=persisted"));
-        let status = self
-            .call_status(ctx, Method::Post, &url, Some(to_value(&body)?))
-            .await?;
-        Ok(if status == 201 {
-            IngestOutcome::Persisted
-        } else {
-            IngestOutcome::Accepted
-        })
+        Ok(outcome_from_status(status))
     }
 
     async fn publish_batch(
@@ -542,16 +527,12 @@ impl EventBrokerApi for RestBroker {
                 .collect(),
         };
         let url = self.url(&format!("{V1}/events:batch"));
-        // A batch is all-or-nothing; the wire reports one status for the whole
-        // batch (201 persisted / 202 accepted), no per-event body.
+        // The wire reports one status for the whole batch, no per-event body:
+        // 202 when anything was enqueued, 200 when every event is a duplicate.
         let status = self
             .call_status(ctx, Method::Post, &url, Some(to_value(&body)?))
             .await?;
-        Ok(if status == 201 {
-            IngestOutcome::Persisted
-        } else {
-            IngestOutcome::Accepted
-        })
+        Ok(outcome_from_status(status))
     }
 
     async fn get_producer_cursors(
@@ -797,3 +778,6 @@ impl EventBrokerApi for RestBroker {
         event_type_from_wire(found)
     }
 }
+
+#[cfg(test)]
+mod tests;

@@ -10,20 +10,23 @@
 //! structural.
 //!
 //! Nothing an ingest outbox holds is dead-lettered (feature 0007 §4.1): a
-//! backend error, a payload that does not decode and a topic the registry does
-//! not hold are all retried, so a message that keeps failing stalls its outbox
-//! partition visibly - in `infra::metrics` and the log - instead of being
-//! lost. A retry of a message the backend already stored is answered
-//! `Duplicate` by the fence and acknowledged.
+//! backend error, a payload that does not decode, a topic the registry does
+//! not hold and a topic lookup that cannot be read are all retried, so a
+//! message that keeps failing stalls its outbox partition visibly - in
+//! `infra::metrics` and the log - instead of being lost. A retry of a message
+//! the backend already stored is answered `Duplicate` by the fence and
+//! acknowledged.
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use event_broker_sdk::backend::{AppendRequest, Appended, Fence, FenceSeq, Flush, KeyedEvent};
 use toolkit_db::outbox::{LeasedMessageHandler, MessageResult, OutboxMessage};
+use toolkit_gts::GtsInstanceId;
 use tracing::{error, warn};
 
 use crate::domain::backend::{BackendResolver, to_sdk_event};
+use crate::domain::model::Topic;
 use crate::domain::outbox::{IngestPayload, OutboxId, fence_key};
 use crate::domain::specification::SpecificationManager;
 use crate::infra::metrics::{IngestMetrics, NO_BACKEND, RetryCause};
@@ -56,16 +59,7 @@ impl IngestOutboxHandler {
     /// cause of the retry.
     async fn append(&self, msg: &OutboxMessage) -> Result<(), (String, RetryCause)> {
         let payload = decode(msg)?;
-
-        // `get_topic` returning `None` conflates two cases: the topic was
-        // genuinely deregistered, and the local spec-cache read itself failed
-        // (a transient gear-database error is swallowed into `None` in
-        // `infra::specification`). Both are retried: the second heals by
-        // itself, and the first is the operator's to resolve.
-        let Some(topic) = self.spec_manager.get_topic(&payload.topic).await else {
-            error!(topic = %payload.topic, "ingest outbox payload references a topic that is not registered - will retry");
-            return Err((NO_BACKEND.to_owned(), RetryCause::UnregisteredTopic));
-        };
+        let topic = self.topic(&payload.topic).await?;
 
         let backend = self.backend_resolver.resolve(&topic);
         let events = [KeyedEvent {
@@ -99,6 +93,23 @@ impl IngestOutboxHandler {
                     topic.settings.backend().value().to_string(),
                     RetryCause::Append(e),
                 ))
+            }
+        }
+    }
+
+    /// The payload's topic. A lookup that cannot be read and a topic the
+    /// registry does not hold are retried under causes of their own: the first
+    /// heals by itself, the second is the operator's to resolve.
+    async fn topic(&self, id: &GtsInstanceId) -> Result<Topic, (String, RetryCause)> {
+        match self.spec_manager.get_topic(id).await {
+            Ok(Some(topic)) => Ok(topic),
+            Ok(None) => {
+                error!(topic = %id, "ingest outbox payload references a topic that is not registered - will retry");
+                Err((NO_BACKEND.to_owned(), RetryCause::UnregisteredTopic))
+            }
+            Err(err) => {
+                warn!(topic = %id, error = %err, "ingest outbox topic lookup failed - will retry");
+                Err((NO_BACKEND.to_owned(), RetryCause::SpecificationUnavailable))
             }
         }
     }
@@ -245,7 +256,8 @@ mod tests {
         (key.to_owned(), value.to_owned())
     }
 
-    async fn test_db() -> Arc<DBProvider<toolkit_db::DbError>> {
+    /// A fresh `SQLite` gear database, and a DSN that reaches the same file.
+    async fn test_db() -> (Arc<DBProvider<toolkit_db::DbError>>, String) {
         let mut path = std::env::temp_dir();
         path.push(format!(
             "cf-eb-ingestoutbox-test-{}.db",
@@ -270,7 +282,7 @@ mod tests {
         )
         .await
         .expect("migrations");
-        Arc::new(DBProvider::new(db))
+        (Arc::new(DBProvider::new(db)), dsn)
     }
 
     fn topic() -> toolkit_gts::GtsInstanceId {
@@ -280,7 +292,15 @@ mod tests {
     /// The handler over a registered topic; `provisioned` decides whether the
     /// backend holds the topic's log.
     async fn test_handler(provisioned: bool) -> (IngestOutboxHandler, MemoryBackend, Recorder) {
-        let db = test_db().await;
+        let (handler, backend, recorder, _dsn) = test_handler_with_dsn(provisioned).await;
+        (handler, backend, recorder)
+    }
+
+    /// [`test_handler`], with a DSN that reaches its gear database.
+    async fn test_handler_with_dsn(
+        provisioned: bool,
+    ) -> (IngestOutboxHandler, MemoryBackend, Recorder, String) {
+        let (db, dsn) = test_db().await;
         let instance = make_test_instance(
             TOPIC_ID,
             serde_json::json!({
@@ -322,6 +342,7 @@ mod tests {
             IngestOutboxHandler::new(spec_manager, resolver, OUTBOX, metrics),
             backend,
             recorder,
+            dsn,
         )
     }
 
@@ -473,8 +494,8 @@ mod tests {
         );
     }
 
-    /// A topic the registry does not hold is retried too: a failed registry
-    /// read heals by itself, and a deregistered topic is the operator's call.
+    /// A topic the registry does not hold is retried too: a deregistered topic
+    /// is the operator's call.
     #[tokio::test]
     async fn unregistered_topic_is_retried() {
         let (handler, _backend, recorder) = test_handler(true).await;
@@ -491,6 +512,36 @@ mod tests {
                 vec![
                     label("backend", "none"),
                     label("error", "unregistered_topic"),
+                    label("outbox", "default"),
+                    label("partition", "0"),
+                ],
+                1.0
+            )]
+        );
+        assert_eq!(
+            recorder.points(OLDEST_AGE),
+            vec![(
+                vec![label("outbox", "default"), label("partition", "0")],
+                90.0
+            )]
+        );
+    }
+
+    /// A topic lookup that cannot be read is retried under a cause of its own,
+    /// so an operator can tell a database fault from a deregistered topic.
+    #[tokio::test]
+    async fn an_outbox_append_during_a_spec_cache_fault_retries_as_specification_unavailable() {
+        let (handler, _backend, recorder, dsn) = test_handler_with_dsn(true).await;
+        crate::test_support::tables::drop_table(&dsn, "event_broker_spec_cache").await;
+
+        let result = handler.handle(&test_message(&test_event(1))).await;
+        assert!(matches!(result, MessageResult::Retry), "{result:?}");
+        assert_eq!(
+            recorder.points(RETRIES),
+            vec![(
+                vec![
+                    label("backend", "none"),
+                    label("error", "specification_unavailable"),
                     label("outbox", "default"),
                     label("partition", "0"),
                 ],

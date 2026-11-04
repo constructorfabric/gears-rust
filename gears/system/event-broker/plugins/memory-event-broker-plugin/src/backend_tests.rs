@@ -277,6 +277,157 @@ fn truncate_keeps_the_head() {
     );
 }
 
+/// Ten events on partition 0, sequences 1 to 10, then 1 to 4 truncated: the
+/// front event is 5 and the head 10.
+fn ten_appended_four_truncated(store: &Store, now: DateTime<Utc>) {
+    provisioned(store, Retention::default());
+    let events: Vec<KeyedEvent> = (1..=10).map(|id| keyed("a", id, time(OCCURRED))).collect();
+    append(store, 1, &events, now);
+    store.truncate(&at(0), Sequence::assigned(4)).unwrap();
+}
+
+/// A read starts right after its offset whatever the offset is: below the
+/// front, at it, inside the retained range, at the head and past it.
+#[test]
+fn read_after_truncation_starts_after_the_offset() {
+    let store = Store::default();
+    let now = time(OCCURRED + 5);
+    ten_appended_four_truncated(&store, now);
+    let occurred = time(OCCURRED);
+    let read = |offset: i64| debug(&store.read(&at(0), Sequence::assigned(offset), 3).unwrap());
+
+    assert_eq!(
+        read(0),
+        debug(&[
+            stored(5, occurred, 0, 5, now),
+            stored(6, occurred, 0, 6, now),
+            stored(7, occurred, 0, 7, now),
+        ])
+    );
+    assert_eq!(
+        read(4),
+        debug(&[
+            stored(5, occurred, 0, 5, now),
+            stored(6, occurred, 0, 6, now),
+            stored(7, occurred, 0, 7, now),
+        ])
+    );
+    assert_eq!(
+        read(5),
+        debug(&[
+            stored(6, occurred, 0, 6, now),
+            stored(7, occurred, 0, 7, now),
+            stored(8, occurred, 0, 8, now),
+        ])
+    );
+    assert_eq!(
+        read(7),
+        debug(&[
+            stored(8, occurred, 0, 8, now),
+            stored(9, occurred, 0, 9, now),
+            stored(10, occurred, 0, 10, now),
+        ])
+    );
+    assert_eq!(read(10), debug(&[]));
+    assert_eq!(read(12), debug(&[]));
+    assert_eq!(
+        debug(&store.read(&at(0), Sequence::NONE, 0).unwrap()),
+        debug(&[])
+    );
+}
+
+/// A query matches the retained events inside its bounds, either bound open.
+#[test]
+fn query_after_truncation_matches_the_retained_range() {
+    let store = Store::default();
+    let now = time(OCCURRED + 5);
+    ten_appended_four_truncated(&store, now);
+    let query = |start: Option<i64>, end: Option<i64>| {
+        format!(
+            "{:?}",
+            store
+                .query(
+                    &at(0),
+                    &PartitionRange {
+                        start_offset: start.map(Sequence::assigned),
+                        end_offset: end.map(Sequence::assigned),
+                        limit: 100,
+                    },
+                )
+                .unwrap()
+        )
+    };
+    let segment = |first: i64, last: i64, count: usize| {
+        format!(
+            "{:?}",
+            vec![event_broker_sdk::TopicSegment {
+                topic: topic().to_string(),
+                partition: 0,
+                start_sequence: Sequence::assigned(first),
+                end_sequence: Sequence::assigned(last),
+                start_time: Some(now),
+                end_time: Some(now),
+                segments: vec![serde_json::json!({
+                    "start_sequence": first,
+                    "end_sequence": last,
+                    "event_count": count,
+                })],
+            }]
+        )
+    };
+
+    assert_eq!(query(None, None), segment(5, 10, 6));
+    assert_eq!(query(Some(3), Some(6)), segment(5, 6, 2));
+    assert_eq!(query(Some(6), Some(20)), segment(6, 10, 5));
+    assert_eq!(query(Some(11), None), "[]");
+    assert_eq!(query(Some(8), Some(6)), "[]");
+    assert_eq!(query(Some(1), Some(4)), "[]");
+    assert_eq!(query(None, Some(5)), segment(5, 5, 1));
+    assert_eq!(query(Some(5), Some(7)), segment(5, 7, 3));
+    assert_eq!(
+        format!(
+            "{:?}",
+            store
+                .query(
+                    &at(0),
+                    &PartitionRange {
+                        start_offset: None,
+                        end_offset: None,
+                        limit: 2,
+                    },
+                )
+                .unwrap()
+        ),
+        segment(5, 6, 2)
+    );
+}
+
+/// A partition truncated through its head holds nothing for a query to match.
+#[test]
+fn a_query_over_a_partition_truncated_through_its_head_is_empty() {
+    let store = Store::default();
+    ten_appended_four_truncated(&store, time(OCCURRED + 5));
+
+    store.truncate(&at(0), Sequence::assigned(10)).unwrap();
+
+    assert_eq!(
+        format!(
+            "{:?}",
+            store
+                .query(
+                    &at(0),
+                    &PartitionRange {
+                        start_offset: None,
+                        end_offset: None,
+                        limit: 100,
+                    },
+                )
+                .unwrap()
+        ),
+        "[]"
+    );
+}
+
 /// Age is when the backend stored an event (`sequence_time`), never the
 /// producer's `occurred_at`: an event back-dated by years but stored a moment
 /// ago is kept, and one stored long ago is removed whatever time it claims.
