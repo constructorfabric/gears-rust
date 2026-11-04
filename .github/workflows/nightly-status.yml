@@ -15,11 +15,6 @@ on:
     types: [completed]
   workflow_dispatch:
 
-# Runs queue up one by one, so two updates don't race on the issue body.
-concurrency:
-  group: nightly-status
-  cancel-in-progress: false
-
 permissions: {}
 
 jobs:
@@ -29,6 +24,14 @@ jobs:
     if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.event == 'schedule' }}
     runs-on: ${{ (vars.GEARS_FORCE_GITHUB_HOSTED == 'true' || github.repository != 'constructorfabric/gears-rust' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && 'ubuntu-latest' || 'gears-small' }}
     timeout-minutes: 5
+    # Job level, not workflow level: every e2e run on a PR also triggers this
+    # workflow and is skipped by the `if:` above. A workflow-level group would
+    # let such a skipped run replace a pending scheduled update, so the update
+    # would be lost. A job-level group is only entered after `if:` passes.
+    # Runs queue up one by one, so two updates don't race on the issue body.
+    concurrency:
+      group: nightly-status
+      cancel-in-progress: false
     permissions:
       actions: read   # to list the nightly runs
       contents: read  # to check out the script
