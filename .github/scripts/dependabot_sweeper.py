@@ -5,6 +5,10 @@ The "Protect main" ruleset has no required status checks, so this script's own
 check evaluation is the merge gate and is deliberately strict. Python 3 stdlib
 only; talks to GitHub through the `gh` CLI. Dry-run by default: every mutating
 call goes through write(), which refuses unless --live was given.
+
+A PR is only ever approved or merged when every one of its commits is authored
+by Dependabot, signed by GitHub (web-flow) with a valid signature, and has a
+single parent. Any other commit (human edit, merge commit, unsigned) is skipped.
 """
 import argparse
 import json
@@ -23,6 +27,9 @@ LABELS = {
 MAX_MERGES = 3
 MAX_RECREATES = 3
 STALE_HOURS = 72
+GH_TIMEOUT = 60  # seconds, per gh call
+PR_LIST_LIMIT = 500
+GH_ERRORS = (subprocess.CalledProcessError, subprocess.TimeoutExpired, json.JSONDecodeError)
 
 SAFE_TYPES = {"version-update:semver-patch", "version-update:semver-minor"}
 MINOR = "version-update:semver-minor"
@@ -53,12 +60,16 @@ def ecosystem_from_branch(branch):
     return m.group(1) if m else None
 
 
-def parse_from_versions(title, body):
-    """Map dependency name -> from-version; key None holds the title's single 'from A to B'."""
+def parse_from_versions(headline, body):
+    """Map dependency name -> from-version, read from the signed head commit message.
+
+    The body's "Updates `x` from A to B" lines give one entry per dependency; key None
+    holds the single "from A to B" of the headline (or of the body's "Bumps [x](...) from A to B").
+    """
     out = {}
     for m in re.finditer(r"^Updates `([^`]+)` from (\S+) to (\S+)", body or "", flags=re.M):
         out[m.group(1)] = m.group(2)
-    t = re.search(r"\bfrom (\S+) to (\S+)", title or "")
+    t = re.search(r"\bfrom (\S+) to (\S+)", headline or "")
     if t:
         out[None] = t.group(1)
     return out
@@ -129,10 +140,10 @@ class Budget:
         self.recreates = 0
 
 
-def decide(*, human_commits, eligible, checks, mergeable, labels, age_h, budget):
+def decide(*, untrusted_commits, eligible, checks, mergeable, labels, age_h, budget):
     """Return an action string; consumes budget for merge/recreate."""
-    if human_commits:
-        return "skip: human commits"
+    if untrusted_commits:
+        return "skip: non-Dependabot commit"
     if not eligible:
         return "noop (labelled)" if LABEL_MIGRATION in labels else "label needs-migration"
     if checks == "wait":
@@ -148,6 +159,8 @@ def decide(*, human_commits, eligible, checks, mergeable, labels, age_h, budget)
         return "recreate"
     if mergeable == "CONFLICTING":
         return "skip: conflicting"
+    if mergeable != "MERGEABLE":
+        return "wait: mergeability unknown"
     if budget.merges >= MAX_MERGES:
         return "defer: merge cap"
     budget.merges += 1
@@ -165,21 +178,42 @@ def is_dependabot(login):
     return (login or "").removesuffix("[bot]") == "dependabot"
 
 
-BASE_SYNC = re.compile(
-    r"^Merge (branch '(main|master)'|remote-tracking branch '[^']+/(main|master)') into "
-)
+def is_trusted_commit(c):
+    """Fail-closed: Dependabot-authored, single parent, GitHub-signed and valid.
 
-
-def is_foreign(commit):
-    return any(not is_dependabot(a.get("login")) for a in commit.get("authors", []))
-
-
-def is_human_edit(commit):
-    """A non-Dependabot commit, except a plain sync from the base branch."""
-    return is_foreign(commit) and not BASE_SYNC.match(commit.get("messageHeadline", ""))
+    A maintainer who syncs main into a Dependabot PR now handles that PR by
+    hand; `@dependabot rebase` keeps it bot-only.
+    """
+    nodes = (c.get("authors") or {}).get("nodes") or []
+    if not nodes:
+        return False
+    for node in nodes:
+        user = (node or {}).get("user")
+        if not user or not is_dependabot(user.get("login")):
+            return False
+    if (c.get("parents") or {}).get("totalCount") != 1:
+        return False
+    sig = c.get("signature")
+    return bool(sig and sig.get("isValid") is True and sig.get("wasSignedByGitHub") is True)
 
 
 # ----------------------------------------------------------------------- I/O
+
+def describe(e):
+    if isinstance(e, subprocess.TimeoutExpired):
+        return "timeout"
+    if isinstance(e, subprocess.CalledProcessError):
+        return f"exit {e.returncode}"
+    return "bad JSON"
+
+
+COMMITS_QUERY = (
+    "query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name)"
+    "{pullRequest(number:$number){commits(first:100){totalCount nodes{commit{oid messageHeadline "
+    "messageBody committedDate parents{totalCount} authors(first:10){nodes{user{login}}} "
+    "signature{isValid wasSignedByGitHub}}}}}}}"
+)
+
 
 class Gh:
     def __init__(self, repo, live):
@@ -187,21 +221,60 @@ class Gh:
         self.live = live
 
     def read_json(self, *args):
-        res = subprocess.run(["gh", *args], capture_output=True, text=True, check=True)
+        try:
+            res = subprocess.run(
+                ["gh", *args], capture_output=True, text=True, check=True, timeout=GH_TIMEOUT
+            )
+        except subprocess.CalledProcessError as e:
+            print(e.stderr, file=sys.stderr)
+            raise
         return json.loads(res.stdout or "null")
 
-    def write(self, *args):
-        """The only mutating entry point; refuses outside --live."""
+    def write(self, *args, capture=False):
+        """The only mutating entry point; refuses outside --live.
+
+        With capture=True the JSON written to stdout is parsed and returned.
+        """
         if not self.live:
             raise RuntimeError("write() called in dry-run mode")
-        subprocess.run(["gh", *args], check=True)
+        if not capture:
+            subprocess.run(["gh", *args], check=True, timeout=GH_TIMEOUT)
+            return None
+        res = subprocess.run(
+            ["gh", *args], check=True, timeout=GH_TIMEOUT, capture_output=True, text=True
+        )
+        return json.loads(res.stdout or "null")
 
 
 def ensure_labels(gh):
-    have = {x["name"] for x in gh.read_json("label", "list", "--repo", gh.repo, "--json", "name", "--limit", "200")}
+    """Return False if labels could not be listed or created."""
+    try:
+        have = {x["name"] for x in gh.read_json(
+            "label", "list", "--repo", gh.repo, "--json", "name", "--limit", "200")}
+    except GH_ERRORS as e:
+        print(f"warning: listing labels failed ({describe(e)})", file=sys.stderr)
+        return False
+    ok = True
     for name, (color, desc) in LABELS.items():
         if name not in have and gh.live:
-            gh.write("label", "create", name, "--repo", gh.repo, "--color", color, "--description", desc)
+            try:
+                gh.write("label", "create", name, "--repo", gh.repo, "--color", color,
+                         "--description", desc)
+            except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+                print(f"warning: creating label {name} failed ({describe(e)})", file=sys.stderr)
+                ok = False
+    return ok
+
+
+def fetch_commits(gh, n):
+    """Return (total_count, [commit nodes]) for the first 100 commits of PR n."""
+    owner, name = gh.repo.split("/", 1)
+    data = gh.read_json(
+        "api", "graphql", "-f", f"query={COMMITS_QUERY}",
+        "-F", f"owner={owner}", "-F", f"name={name}", "-F", f"number={n}",
+    )
+    conn = data["data"]["repository"]["pullRequest"]["commits"]
+    return conn["totalCount"], [x["commit"] for x in conn["nodes"]]
 
 
 def add_label(gh, n, label):
@@ -210,26 +283,33 @@ def add_label(gh, n, label):
 
 def process(gh, pr, budget, now):
     n = pr["number"]
-    view = gh.read_json(
-        "pr", "view", str(n), "--repo", gh.repo, "--json",
-        "statusCheckRollup,mergeable,reviews,commits,labels,headRefOid",
-    )
-    commits = view["commits"]
-    human = any(is_human_edit(c) for c in commits)
-    # Metadata lives in Dependabot's own commit; a later "Merge branch 'main'"
-    # commit from a maintainer (#5220) carries none.
-    bot_commits = [c for c in commits if not is_foreign(c)]
-    head = bot_commits[-1] if bot_commits else commits[-1]
-    message = head["messageHeadline"] + "\n\n" + (head.get("messageBody") or "")
     eco = ecosystem_from_branch(pr["headRefName"])
+    title = pr["title"].replace("|", "\\|")
+    try:
+        view = gh.read_json(
+            "pr", "view", str(n), "--repo", gh.repo, "--json",
+            "statusCheckRollup,mergeable,reviews,labels,headRefOid",
+        )
+        total, commits = fetch_commits(gh, n)
+    except GH_ERRORS as e:
+        return [f"#{n}", title, eco or "?", "?", "?", f"read FAILED ({describe(e)})"]
+    head = commits[-1] if commits else {}
+    # The commit list and the view are two reads; a push in between must not
+    # let a commit we never checked become the approved/merged head.
+    untrusted = (
+        total > len(commits) or not commits or head.get("oid") != view.get("headRefOid")
+        or not all(is_trusted_commit(c) for c in commits)
+    )
+    message = head.get("messageHeadline", "") + "\n\n" + (head.get("messageBody") or "")
     ok, reason = eligibility(
-        eco, parse_metadata(message), parse_from_versions(pr["title"], pr.get("body"))
+        eco, parse_metadata(message), parse_from_versions(head.get("messageHeadline", ""), head.get("messageBody"))
     )
     checks = classify_checks(view.get("statusCheckRollup"))
     labels = {x["name"] for x in view.get("labels", [])}
     action = decide(
-        human_commits=human, eligible=ok, checks=checks, mergeable=view.get("mergeable"),
-        labels=labels, age_h=age_hours(head["committedDate"], now), budget=budget,
+        untrusted_commits=untrusted, eligible=ok, checks=checks, mergeable=view.get("mergeable"),
+        labels=labels, age_h=age_hours(head["committedDate"], now) if commits else 0,
+        budget=budget,
     )
     done = action
     if gh.live:
@@ -241,15 +321,41 @@ def process(gh, pr, budget, now):
                 add_label(gh, n, LABEL_RECREATED)
             elif action == "merge":
                 sha = view["headRefOid"]
+                review_id = None
                 if not has_head_approval(view.get("reviews"), sha):
-                    gh.write("pr", "review", str(n), "--repo", gh.repo, "--approve")
-                gh.write("pr", "merge", str(n), "--repo", gh.repo, "--squash", "--match-head-commit", sha)
-        except subprocess.CalledProcessError as e:
-            done = f"{action} FAILED (exit {e.returncode})"
+                    # The approval is tied to the checked SHA; `--match-head-commit` is the
+                    # actual merge gate, and on failure the approval is withdrawn.
+                    review = gh.write("api", f"repos/{gh.repo}/pulls/{n}/reviews", "-f",
+                                      "event=APPROVE", "-f", f"commit_id={sha}", capture=True)
+                    review_id = (review or {}).get("id")
+                try:
+                    gh.write("pr", "merge", str(n), "--repo", gh.repo, "--squash",
+                             "--match-head-commit", sha)
+                except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+                    done = f"merge FAILED ({describe(e)})"
+                    if review_id is not None:
+                        try:
+                            gh.write("api", "-X", "PUT",
+                                     f"repos/{gh.repo}/pulls/{n}/reviews/{review_id}/dismissals",
+                                     "-f", "message=Dependabot sweeper: merge failed, "
+                                     "withdrawing automatic approval", "-f", "event=DISMISS")
+                            done += "; approval dismissed"
+                        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e2:
+                            done += f"; approval dismiss FAILED ({describe(e2)})"
+        except GH_ERRORS as e:
+            done = f"{action} FAILED ({describe(e)})"
     elif action in ("label needs-migration", "recreate", "merge"):
         done = f"{action} (dry-run)"
-    return [f"#{n}", pr["title"].replace("|", "\\|"), eco or "?",
+    return [f"#{n}", title, eco or "?",
             ("yes: " if ok else "no: ") + reason, checks, done]
+
+
+def write_summary(text):
+    print(text)
+    summary = os.environ.get("GITHUB_STEP_SUMMARY")
+    if summary:
+        with open(summary, "a", encoding="utf-8") as f:
+            f.write(text)
 
 
 def main():
@@ -260,23 +366,28 @@ def main():
     if not args.repo:
         ap.error("--repo or $GITHUB_REPOSITORY required")
     gh = Gh(args.repo, args.live)
-    ensure_labels(gh)
-    prs = gh.read_json(
-        "pr", "list", "--repo", args.repo, "--state", "open", "--author", "app/dependabot",
-        "--json", "number,title,headRefName,body", "--limit", "100",
-    )
+    labels_ok = ensure_labels(gh)
+    try:
+        prs = gh.read_json(
+            "pr", "list", "--repo", args.repo, "--state", "open", "--author", "app/dependabot",
+            "--json", "number,title,headRefName", "--limit", str(PR_LIST_LIMIT),
+        )
+    except GH_ERRORS as e:
+        write_summary(f"### Dependabot sweeper: listing PRs FAILED ({describe(e)})\n")
+        return 1
     budget, now, rows = Budget(), datetime.now(timezone.utc), []
     for pr in sorted(prs, key=lambda p: p["number"]):
         rows.append(process(gh, pr, budget, now))
     out = [f"### Dependabot sweeper ({'live' if args.live else 'dry-run'})", "",
            "| PR | Title | Ecosystem | Eligibility | Checks | Action |", "|---|---|---|---|---|---|"]
     out += ["| " + " | ".join(r) + " |" for r in rows]
-    text = "\n".join(out) + "\n"
-    print(text)
-    summary = os.environ.get("GITHUB_STEP_SUMMARY")
-    if summary:
-        with open(summary, "a", encoding="utf-8") as f:
-            f.write(text)
+    truncated = len(prs) >= PR_LIST_LIMIT
+    if truncated:
+        out += ["", f"**Warning:** PR list hit the limit of {PR_LIST_LIMIT}; "
+                    "some PRs were not processed."]
+    write_summary("\n".join(out) + "\n")
+    failed = any("FAILED" in r[-1] for r in rows)
+    return 1 if failed or truncated or not labels_ok else 0
 
 
 if __name__ == "__main__":
