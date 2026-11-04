@@ -32,7 +32,7 @@ pub struct OptionalPublisher;
 impl OptionalPublisher {
     fn nothing(
         _inputs: &GtsPublicationInputs<'_>,
-    ) -> anyhow::Result<Vec<(String, serde_json::Value)>> {
+    ) -> anyhow::Result<Vec<(gts::GtsId, serde_json::Value)>> {
         Ok(Vec::new())
     }
 }

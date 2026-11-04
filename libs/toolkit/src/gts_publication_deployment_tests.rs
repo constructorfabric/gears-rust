@@ -12,8 +12,8 @@ use crate::discovery::{EndpointResolver, WireOutcome};
 use crate::gts_publication::{DeclarationSource, GtsPublicationBackend, GtsPublicationRequest};
 
 const ENDPOINT: &str = "https://registry.example:8443";
-const BASE: &str = "gts.cf.test.base.v1~";
-const DERIVED: &str = "gts.cf.test.base.v1~cf.test.derived.v1~";
+const BASE: &str = "gts.cf.test.publication.base.v1~";
+const DERIVED: &str = "gts.cf.test.publication.base.v1~cf.test.publication.derived.v1~";
 
 /// The remote registry the wire fn binds: it records the endpoint and the
 /// credential it got, and admits `DERIVED` only once `BASE` is admitted.
@@ -68,7 +68,7 @@ fn backend(hub: &ClientHub) -> anyhow::Result<GtsPublicationBackend> {
                     if document.get("refuse").is_some() {
                         anyhow::bail!("{id}: rejected");
                     }
-                    if id == DERIVED {
+                    if id.id() == DERIVED {
                         loop {
                             let base_admitted = registry.base_admitted.notified();
                             if registry.admitted.lock().iter().any(|a| a == BASE) {
@@ -80,8 +80,8 @@ fn backend(hub: &ClientHub) -> anyhow::Result<GtsPublicationBackend> {
                     if document.get("hang").is_some() {
                         std::future::pending::<()>().await;
                     }
-                    registry.admitted.lock().push(id.clone());
-                    if id == BASE {
+                    registry.admitted.lock().push(id.to_string());
+                    if id.id() == BASE {
                         registry.base_admitted.notify_waiters();
                     }
                 }
@@ -109,7 +109,7 @@ fn refused() -> Vec<DeclarationSource> {
     vec![DeclarationSource::new(
         "t",
         vec![(
-            "gts.cf.test.refused.v1~".to_owned(),
+            "gts.cf.test.publication.refused.v1~".to_owned(),
             json!({"refuse": true}).to_string(),
         )],
     )]
@@ -119,7 +119,7 @@ fn hanging() -> Vec<DeclarationSource> {
     vec![DeclarationSource::new(
         "t",
         vec![(
-            "gts.cf.test.hanging.v1~".to_owned(),
+            "gts.cf.test.publication.hanging.v1~".to_owned(),
             json!({"hang": true}).to_string(),
         )],
     )]
@@ -212,7 +212,10 @@ async fn a_refusal_fails_the_job_and_names_the_publisher() {
         panic!("{report}");
     };
     assert_eq!(*gear, "refused-publisher");
-    assert!(message.contains("gts.cf.test.refused.v1~"), "{message}");
+    assert!(
+        message.contains("gts.cf.test.publication.refused.v1~"),
+        "{message}"
+    );
 }
 
 /// The deadline ends what is still pending and names its GTS ids.
@@ -232,7 +235,7 @@ async fn the_deadline_ends_pending_publishers() {
             (
                 "hanging-publisher",
                 GtsDeploymentOutcome::DeadlineExceeded {
-                    unconfirmed: vec!["gts.cf.test.hanging.v1~".to_owned()]
+                    unconfirmed: vec!["gts.cf.test.publication.hanging.v1~".to_owned()]
                 }
             ),
             (
@@ -292,7 +295,7 @@ async fn caller_cancellation_is_not_a_deadline() {
         [(
             "hanging-publisher",
             GtsDeploymentOutcome::Cancelled {
-                unconfirmed: vec!["gts.cf.test.hanging.v1~".to_owned()]
+                unconfirmed: vec!["gts.cf.test.publication.hanging.v1~".to_owned()]
             }
         )]
     );

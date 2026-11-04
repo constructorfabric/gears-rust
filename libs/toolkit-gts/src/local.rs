@@ -29,9 +29,12 @@
 //! a crate without the declaration fails to compile with
 //! "could not find `__toolkit_gts_inventory` in the crate root".
 //!
-//! A gear merges its own crates' declarations with [`merge_declarations`].
+//! A gear merges its own crates' declarations with [`DeclarationMerge`]
+//! ([`merge_declarations`]).
 
 use std::collections::BTreeMap;
+
+use gts::GtsId;
 
 pub use toolkit_gts_macros::{
     local_gts_instance as gts_instance, local_gts_instance_raw as gts_instance_raw,
@@ -92,8 +95,8 @@ pub fn __collect<'a>(
     out
 }
 
-/// One source of declarations for [`merge_declarations`]: a crate's
-/// `gts_declarations()`, or entries the gear builds at runtime.
+/// One source of unparsed declarations for [`DeclarationMerge::add_source`]: a
+/// crate's `gts_declarations()`.
 pub struct DeclarationSource {
     /// Names the source in diagnostics, e.g. the crate name.
     pub origin: String,
@@ -111,54 +114,99 @@ impl DeclarationSource {
     }
 }
 
-/// Merges `sources` into one list of `(GTS id, content)` sorted by id.
+/// Merges declarations into one list of `(GTS id, content)` sorted by id: crate
+/// collectors' `(GTS id, JSON text)` ([`Self::add_source`]) and typed documents a gear
+/// builds at runtime ([`Self::add_documents`]).
 ///
-/// A GTS id declared more than once with the same canonical content (see
-/// [`same_canonical_content`]) is kept once. All failures are reported
-/// together: JSON text that does not parse, and ids declared with different
-/// content, naming both origins.
-///
-/// # Errors
-/// Returns an error listing every unparsable declaration and every
-/// conflicting id.
-pub fn merge_declarations(
-    sources: impl IntoIterator<Item = DeclarationSource>,
-) -> anyhow::Result<Vec<(String, serde_json::Value)>> {
-    let mut merged: BTreeMap<String, (serde_json::Value, String)> = BTreeMap::new();
-    let mut problems: Vec<String> = Vec::new();
-    for source in sources {
+/// Each id is parsed once, where it enters: a [`GtsId`] keeps its spelling and accepts
+/// one spelling per identifier, so ids compare as text. An id declared more than once
+/// with the same canonical content (see [`same_canonical_content`]) is kept once.
+/// [`Self::finish`] reports every problem together: an invalid id or JSON text, naming
+/// its origin, and ids declared with different content, naming both origins.
+#[derive(Debug, Default)]
+pub struct DeclarationMerge {
+    merged: BTreeMap<String, (GtsId, serde_json::Value, String)>,
+    problems: Vec<String>,
+}
+
+impl DeclarationMerge {
+    /// Adds a crate collector's declarations, parsing each id and JSON text.
+    pub fn add_source(&mut self, source: DeclarationSource) -> &mut Self {
         for (id, text) in source.declarations {
-            let content: serde_json::Value = match serde_json::from_str(&text) {
-                Ok(content) => content,
+            let parsed = match GtsId::try_new(&id) {
+                Ok(parsed) => parsed,
                 Err(e) => {
-                    problems.push(format!("{id} from {}: invalid JSON: {e}", source.origin));
+                    self.problems
+                        .push(format!("{id} from {}: invalid GTS id: {e}", source.origin));
                     continue;
                 }
             };
-            match merged.get(&id) {
-                None => {
-                    merged.insert(id, (content, source.origin.clone()));
-                }
-                Some((kept, _)) if same_canonical_content(kept, &content) => {}
-                Some((_, kept_origin)) => {
-                    problems.push(format!(
-                        "{id} is declared with different content by {kept_origin} and {}",
-                        source.origin
-                    ));
-                }
+            match serde_json::from_str(&text) {
+                Ok(content) => self.insert(parsed, content, &source.origin),
+                Err(e) => self
+                    .problems
+                    .push(format!("{id} from {}: invalid JSON: {e}", source.origin)),
             }
         }
+        self
     }
-    if !problems.is_empty() {
-        anyhow::bail!(
-            "conflicting or invalid GTS declarations:\n- {}",
-            problems.join("\n- ")
-        );
+
+    /// Adds documents whose ids are already parsed, e.g. a gear's `entities`.
+    pub fn add_documents(
+        &mut self,
+        origin: &str,
+        documents: impl IntoIterator<Item = (GtsId, serde_json::Value)>,
+    ) -> &mut Self {
+        for (id, content) in documents {
+            self.insert(id, content, origin);
+        }
+        self
     }
-    Ok(merged
-        .into_iter()
-        .map(|(id, (content, _))| (id, content))
-        .collect())
+
+    fn insert(&mut self, id: GtsId, content: serde_json::Value, origin: &str) {
+        match self.merged.get(id.id()) {
+            None => {
+                self.merged
+                    .insert(id.id().to_owned(), (id, content, origin.to_owned()));
+            }
+            Some((_, kept, _)) if same_canonical_content(kept, &content) => {}
+            Some((_, _, kept_origin)) => self.problems.push(format!(
+                "{id} is declared with different content by {kept_origin} and {origin}"
+            )),
+        }
+    }
+
+    /// The merged `(GTS id, content)`, sorted by id.
+    ///
+    /// # Errors
+    /// Lists every invalid id or JSON text and every conflicting id.
+    pub fn finish(self) -> anyhow::Result<Vec<(GtsId, serde_json::Value)>> {
+        if !self.problems.is_empty() {
+            anyhow::bail!(
+                "conflicting or invalid GTS declarations:\n- {}",
+                self.problems.join("\n- ")
+            );
+        }
+        Ok(self
+            .merged
+            .into_values()
+            .map(|(id, content, _)| (id, content))
+            .collect())
+    }
+}
+
+/// Merges `sources` with a [`DeclarationMerge`].
+///
+/// # Errors
+/// As [`DeclarationMerge::finish`].
+pub fn merge_declarations(
+    sources: impl IntoIterator<Item = DeclarationSource>,
+) -> anyhow::Result<Vec<(GtsId, serde_json::Value)>> {
+    let mut merge = DeclarationMerge::default();
+    for source in sources {
+        merge.add_source(source);
+    }
+    merge.finish()
 }
 
 /// Whether two documents have the same canonical content, as types-registry

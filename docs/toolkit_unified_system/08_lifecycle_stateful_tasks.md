@@ -105,9 +105,9 @@ static declarations and `entities` for documents built from configuration:
 pub struct StaticAuthZPlugin { /* ... */ }
 
 impl StaticAuthZPlugin {
-    fn plugin_instance(inputs: &GtsPublicationInputs<'_>) -> anyhow::Result<Vec<(String, Value)>> {
+    fn plugin_instance(inputs: &GtsPublicationInputs<'_>) -> anyhow::Result<Vec<(gts::GtsId, Value)>> {
         let cfg: Config = inputs.config_or_default()?;
-        /* build the instance from cfg */
+        /* build the instance from cfg; parse its id once: gts::GtsId::try_new(..)? */
     }
 }
 
@@ -126,8 +126,20 @@ The default publisher, `types_registry_sdk::publication`, requires `types-regist
 with the `rest-client` feature and wires its registry client automatically. Add `#[toolkit::consumes]` if your own code also uses that contract.
 A gear with no GTS Type Schemas or Instances to publish needs no registry for publication.
 
+The publication policy is configuration, per publishing gear, under `gears.<gear>.config.gts_publication`
+(`timeout`, `retry_backoff`, `retry_backoff_max`, `batch_size`; defaults: no extra timeout cap, so the 120 s
+startup budget or a deployment job's deadline applies, 1 s → 30 s, 100). The runtime reads it before any gear
+runs and hides it from the gear's typed config (`ctx.config()`, `inputs.config()`), so a
+`#[serde(deny_unknown_fields)]` config accepts it. An invalid value fails startup before any publication write.
+A configured `timeout` caps the budget from the start of publication and never extends a deployment deadline.
+The registry client's URL, HTTP timeout and retries stay in `consumer_wiring`; a process shares one remote
+registry client, configured by the `consumer_wiring` of the first consumer that created it (a publisher or a
+`#[toolkit::consumes]` gear).
+
 In `init`, `ctx.gts_publication_manifest()` returns a `GtsManifest`: the publisher name/version
-and authored GTS Type Schemas and Instances, all admitted before `init`. This ToolKit data
+and authored GTS Type Schemas and Instances as `(gts::GtsId, Value)` sorted by id, all admitted
+before `init`. The runtime parses each static declaration's id once, while it builds the manifests:
+an invalid id fails startup, named with its crate, before any publication. This ToolKit data
 structure is available only to gears declaring `gts_publication(...)`. Plugins bind their scoped clients
 from these documents.
 `choose_registered_plugin_instance` selects the best-ranked instance with a bound client;

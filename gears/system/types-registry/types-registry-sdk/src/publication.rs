@@ -1,13 +1,13 @@
 //! Publish a gear's declared documents through reconciliation.
 //!
-//! The runtime wires [`Registry`] from [`PROVIDER`] and calls [`publish_with_deadline`].
-//! This module prepares the publisher and documents, supplies the platform context and
+//! The runtime wires [`Registry`] from [`PROVIDER`] and publishes each manifest with
+//! [`Publication`]. This module prepares the publisher and documents, supplies the platform context and
 //! budget, and formats publication diagnostics. The reconciliation layer owns admission,
 //! progress and retries. This module does not depend on `toolkit`.
 
 use std::error::Error;
 use std::fmt;
-use std::num::NonZeroU32;
+use std::num::{NonZeroU32, NonZeroUsize};
 use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
@@ -16,9 +16,8 @@ use toolkit_security::PlatformSecurityContext;
 
 use crate::reconciliation::error_fields;
 use crate::{
-    EntityKind, GtsId, JsonDocument, PlatformTypesRegistryApi, PlatformTypesRegistryApiExt,
-    PublisherContext, ReconcileOptions, ReconcileOutcome, ReconcilePendingCause, ReconcileReport,
-    Reconciliation, STARTUP_PUBLICATION_DEADLINE,
+    EntityKind, GtsId, JsonDocument, PublisherContext, ReconcileOptions, ReconcileOutcome,
+    ReconcilePendingCause, ReconcileReport, Reconciliation, STARTUP_PUBLICATION_DEADLINE,
 };
 
 /// The registry contract the publication uses: the client-hub key.
@@ -31,166 +30,233 @@ pub const PROVIDER: &str = "types-registry";
 #[cfg(feature = "rest-client")]
 pub use crate::PlatformTypesRegistryApiRestResolvingClient as ResolvingClient;
 
-/// Reconcile `documents` as `publisher_name`/`publisher_version` until every
-/// one is admitted. Retryable conditions (an absent dependency, a conflict, an
-/// unavailable registry) are retried with jittered exponential backoff (1 s up to 30 s) and
-/// reported to `on_pending`, within the shared startup budget. Cancellation ends the wait.
+/// One publisher's documents, reconciled until every one is admitted.
 ///
-/// # Errors
-/// [`GtsPublishError::Input`] for an invalid id or version;
-/// [`GtsPublishError::Publication`] for a terminal refusal or cancellation.
-pub async fn publish(
-    registry: &Registry,
-    publisher_name: &str,
-    publisher_version: &str,
-    documents: &[(String, serde_json::Value)],
-    cancel: &CancellationToken,
-    on_pending: impl FnMut(&str) + Send,
-) -> Result<(), GtsPublishError> {
-    publish_with_deadline(
-        registry,
-        publisher_name,
-        publisher_version,
-        documents,
-        cancel,
-        None,
-        on_pending,
-    )
-    .await
-}
-
-/// Publish within the caller's absolute deadline, or the default startup budget.
-/// The deadline covers every reconciliation pass; it is never renewed on a retry.
+/// The required data — registry, publisher and documents — go to [`Self::new`] or
+/// [`Self::from_manifest`]; the rest is optional. [`Self::publish`] retries retryable
+/// conditions (an absent dependency, a conflict, an unavailable registry) with jittered
+/// exponential backoff, by default from 1 s up to 30 s ([`Self::retry_backoff`]), in
+/// batches of the [`ReconcileOptions`] default size ([`Self::batch_size`]), until the
+/// publication budget ends. It uses the platform outbound marker and runs in the current
+/// task.
 ///
-/// # Errors
-/// Invalid input, a terminal refusal, cancellation, or an expired publication budget.
-pub async fn publish_with_deadline(
-    registry: &Registry,
-    publisher_name: &str,
-    publisher_version: &str,
-    documents: &[(String, serde_json::Value)],
-    cancel: &CancellationToken,
+/// The budget, with `start` the instant `publish` starts, the absolute
+/// [`Self::deadline`] `D` and the [`Self::timeout`] duration `T`:
+///
+/// | `D`  | `T`  | the publication ends at                                    |
+/// |------|------|------------------------------------------------------------|
+/// | none | none | `start + `[`STARTUP_PUBLICATION_DEADLINE`]                 |
+/// | `D`  | none | `D`, even past `start + STARTUP_PUBLICATION_DEADLINE`      |
+/// | none | `T`  | `start + T`                                                |
+/// | `D`  | `T`  | `min(D, start + T)`                                        |
+///
+/// `D` is never renewed; `T` only caps it.
+///
+/// ```ignore
+/// Publication::new(registry, publisher, documents)
+///     .deadline(deadline)
+///     .timeout(Duration::from_secs(60))
+///     .on_pending(|pending| tracing::info!(%pending))
+///     .publish(&cancel)
+///     .await?;
+/// ```
+#[must_use = "a publication does nothing until `publish` is awaited"]
+pub struct Publication<'a, F = fn(&PublicationError)> {
+    registry: &'a Registry,
+    publisher: PublisherContext,
+    documents: Vec<(GtsId, JsonDocument)>,
     deadline: Option<tokio::time::Instant>,
-    mut on_pending: impl FnMut(&str) + Send,
-) -> Result<(), GtsPublishError> {
-    let publisher = PublisherContext {
-        name: publisher_name.to_owned(),
-        version: publisher_version.parse().map_err(|e| {
-            GtsPublishError::Input(format!(
-                "{publisher_name}: publisher version {publisher_version}: {e}"
-            ))
-        })?,
-    };
-    let desired = documents
-        .iter()
-        .map(|(id, document)| {
-            GtsId::try_new(id)
-                .map(|id| (id, document.clone()))
-                .map_err(|e| GtsPublishError::Input(format!("{publisher_name}: GTS id {id}: {e}")))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let options = ReconcileOptions {
-        passes: NonZeroU32::MAX,
-        retry_backoff: Duration::from_secs(1),
-        retry_backoff_max: Duration::from_secs(30),
-        deadline: deadline.map_or(crate::STARTUP_PUBLICATION_DEADLINE, |deadline| {
-            deadline.saturating_duration_since(tokio::time::Instant::now())
-        }),
-        absolute_deadline: deadline,
-        ..ReconcileOptions::default()
-    };
-    crate::reconciliation::reconcile_with_progress(
-        registry,
-        &PlatformSecurityContext::outbound_marker(),
-        &publisher,
-        &desired,
-        &options,
-        cancel,
-        |report| {
-            let error = report
-                .clone()
-                .into_canonical()
-                .unwrap_or_else(|error| error);
-            let error = PublicationError::new(&publisher, &desired, error);
-            tracing::warn!(
-                publisher = %publisher.name,
-                error = %error,
-                "startup publication not admitted yet; retrying"
-            );
-            on_pending(&error.to_string());
-        },
-    )
-    .await
-    .map(drop)
-    .map_err(|error| {
-        GtsPublishError::Publication(PublicationError::new(&publisher, &desired, error))
-    })
+    timeout: Option<Duration>,
+    retry_backoff: Duration,
+    retry_backoff_max: Duration,
+    batch_size: NonZeroUsize,
+    on_pending: F,
 }
 
-/// Why [`publish`] did not succeed.
-#[derive(Debug)]
-pub enum GtsPublishError {
-    /// The manifest has an invalid GTS id or publisher version.
-    Input(String),
-    /// A terminal refusal or cancellation.
-    Publication(PublicationError),
-}
-
-impl fmt::Display for GtsPublishError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Input(message) => f.write_str(message),
-            Self::Publication(error) => fmt::Display::fmt(error, f),
-        }
-    }
-}
-
-impl Error for GtsPublishError {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        match self {
-            Self::Input(_) => None,
-            Self::Publication(error) => Some(error),
-        }
-    }
-}
-
-/// Reconcile a gear's documents and await admission before binding dependent clients.
-///
-/// Uses the platform outbound marker and [`STARTUP_PUBLICATION_DEADLINE`], retrying
-/// within that budget. Batching and backoff use [`ReconcileOptions`] defaults. `Ok` means every identifier is admitted or
-/// already up to date. The publisher's name and version belong to the calling gear.
-///
-/// Runs in the current task, without spawning or changing lifecycle phases. Call only
-/// when the registry client is available; application preparation wires it before `init`.
-/// For custom tuning or a different security context, use
-/// [`crate::PlatformTypesRegistryApiExt::reconcile_entities_and_await`] directly.
-///
-/// # Errors
-/// Returns [`PublicationError`] on refusal, incomplete admission, deadline or
-/// cancellation, preserving the original canonical error and any reconciliation report.
-/// Cancellation or dropping the future does not roll back accepted writes.
-pub async fn publish_startup_entities(
-    registry: &dyn PlatformTypesRegistryApi,
-    publisher: &PublisherContext,
-    desired: &[(GtsId, JsonDocument)],
-    cancel: &CancellationToken,
-) -> Result<Reconciliation, PublicationError> {
-    let options = ReconcileOptions {
-        passes: NonZeroU32::MAX,
-        deadline: STARTUP_PUBLICATION_DEADLINE,
-        ..ReconcileOptions::default()
-    };
-    registry
-        .reconcile_entities_and_await(
-            &PlatformSecurityContext::outbound_marker(),
+impl<'a> Publication<'a> {
+    /// Publish `documents` as `publisher`, the calling gear's own identity.
+    pub fn new(
+        registry: &'a Registry,
+        publisher: PublisherContext,
+        documents: impl Into<Vec<(GtsId, JsonDocument)>>,
+    ) -> Self {
+        Self {
+            registry,
             publisher,
-            desired,
+            documents: documents.into(),
+            deadline: None,
+            timeout: None,
+            retry_backoff: Duration::from_secs(1),
+            retry_backoff_max: Duration::from_secs(30),
+            batch_size: ReconcileOptions::default().batch_size,
+            on_pending: |_| {},
+        }
+    }
+
+    /// Publish a manifest, as the `gts_publication` runtime does: its GTS ids are
+    /// already parsed, the publisher version is not.
+    ///
+    /// # Errors
+    /// [`PublicationInputError`] for an invalid publisher version; nothing is sent to
+    /// the registry.
+    pub fn from_manifest(
+        registry: &'a Registry,
+        publisher_name: &str,
+        publisher_version: &str,
+        documents: &[(GtsId, JsonDocument)],
+    ) -> Result<Self, PublicationInputError> {
+        let publisher = PublisherContext {
+            name: publisher_name.to_owned(),
+            version: publisher_version.parse().map_err(|e| {
+                PublicationInputError(format!(
+                    "{publisher_name}: publisher version {publisher_version}: {e}"
+                ))
+            })?,
+        };
+        Ok(Self::new(registry, publisher, documents.to_vec()))
+    }
+}
+
+impl<'a, F> Publication<'a, F> {
+    /// End the publication at the caller's absolute `deadline` instead of the default
+    /// budget. It covers every pass and may exceed the default; it is never renewed on
+    /// a retry. `None` keeps the default.
+    pub fn deadline(mut self, deadline: impl Into<Option<tokio::time::Instant>>) -> Self {
+        self.deadline = deadline.into();
+        self
+    }
+
+    /// End the publication `timeout` after the start of `publish`, or at the
+    /// [`Self::deadline`] if that comes first: the timeout caps the caller's deadline and
+    /// never extends it. `None` keeps no cap. Without a deadline, a `timeout` no clock can
+    /// represent fails `publish` before any request; with one, the deadline applies.
+    pub fn timeout(mut self, timeout: impl Into<Option<Duration>>) -> Self {
+        self.timeout = timeout.into();
+        self
+    }
+
+    /// Pause `initial` before the first retrying pass, then double the pause with jitter
+    /// up to `max`.
+    ///
+    /// These are the raw reconciliation values: an `initial` above `max` is clamped to
+    /// `max`, and a zero pause retries at once, as often as the budget allows. The
+    /// `gts_publication` runtime configuration rejects both before it gets here.
+    pub fn retry_backoff(mut self, initial: Duration, max: Duration) -> Self {
+        self.retry_backoff = initial;
+        self.retry_backoff_max = max;
+        self
+    }
+
+    /// Submit at most `batch_size` documents per registry call. A batch above the
+    /// registry's limit is refused, which ends the publication.
+    pub fn batch_size(mut self, batch_size: NonZeroUsize) -> Self {
+        self.batch_size = batch_size;
+        self
+    }
+
+    /// Call `on_pending` before each retrying pass with what is not admitted yet.
+    pub fn on_pending<G>(self, on_pending: G) -> Publication<'a, G>
+    where
+        G: FnMut(&PublicationError) + Send,
+    {
+        Publication {
+            registry: self.registry,
+            publisher: self.publisher,
+            documents: self.documents,
+            deadline: self.deadline,
+            timeout: self.timeout,
+            retry_backoff: self.retry_backoff,
+            retry_backoff_max: self.retry_backoff_max,
+            batch_size: self.batch_size,
+            on_pending,
+        }
+    }
+
+    /// Reconcile the documents and await their admission.
+    ///
+    /// `Ok` means every identifier is admitted or already up to date.
+    ///
+    /// # Errors
+    /// [`PublicationError`] on refusal, incomplete admission, the end of the budget or
+    /// cancellation, preserving the original canonical error and any reconciliation
+    /// report. Cancellation or dropping the future does not roll back accepted writes.
+    pub async fn publish(
+        self,
+        cancel: &CancellationToken,
+    ) -> Result<Reconciliation, PublicationError>
+    where
+        F: FnMut(&PublicationError) + Send,
+    {
+        let Self {
+            registry,
+            publisher,
+            documents,
+            deadline,
+            timeout,
+            retry_backoff,
+            retry_backoff_max,
+            batch_size,
+            mut on_pending,
+        } = self;
+        let started = tokio::time::Instant::now();
+        // An absolute end only for a caller's deadline; otherwise reconciliation measures
+        // the budget from its start and refuses one it cannot represent.
+        let (budget, absolute_deadline) = match (deadline, timeout) {
+            (None, None) => (STARTUP_PUBLICATION_DEADLINE, None),
+            (None, Some(timeout)) => (timeout, None),
+            (Some(deadline), timeout) => {
+                let end = timeout
+                    .and_then(|timeout| started.checked_add(timeout))
+                    .map_or(deadline, |capped| capped.min(deadline));
+                (end.saturating_duration_since(started), Some(end))
+            }
+        };
+        let options = ReconcileOptions {
+            batch_size,
+            passes: NonZeroU32::MAX,
+            retry_backoff,
+            retry_backoff_max,
+            deadline: budget,
+            absolute_deadline,
+            ..ReconcileOptions::default()
+        };
+        crate::reconciliation::reconcile_with_progress(
+            registry,
+            &PlatformSecurityContext::outbound_marker(),
+            &publisher,
+            &documents,
             &options,
             cancel,
+            |report| {
+                let error = report
+                    .clone()
+                    .into_canonical()
+                    .unwrap_or_else(|error| error);
+                let error = PublicationError::new(&publisher, &documents, error);
+                tracing::warn!(
+                    publisher = %publisher.name,
+                    error = %error,
+                    "startup publication not admitted yet; retrying"
+                );
+                on_pending(&error);
+            },
         )
         .await
-        .map_err(|error| PublicationError::new(publisher, desired, error))
+        .map_err(|error| PublicationError::new(&publisher, &documents, error))
+    }
 }
+
+/// An invalid publisher version or GTS id in a manifest, found before any request.
+#[derive(Debug)]
+pub struct PublicationInputError(String);
+
+impl fmt::Display for PublicationInputError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl Error for PublicationInputError {}
 
 /// A startup publication failure with the original canonical error as its source.
 ///

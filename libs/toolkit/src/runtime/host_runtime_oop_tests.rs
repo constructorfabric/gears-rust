@@ -649,7 +649,10 @@ fn held_backend(hub: &ClientHub) -> anyhow::Result<crate::gts_publication::GtsPu
 fn publishing_ping_documents() -> Vec<crate::gts_publication::DeclarationSource> {
     vec![crate::gts_publication::DeclarationSource::new(
         "test",
-        vec![("gts.cf.test.ping.v1~".to_owned(), "{}".to_owned())],
+        vec![(
+            "gts.cf.test.publication.ping.v1~".to_owned(),
+            "{}".to_owned(),
+        )],
     )]
 }
 

@@ -8,7 +8,10 @@ use super::*;
 use crate::client_hub::ClientHub;
 use crate::config::ConfigProvider;
 
-const WIDGET: &str = "gts.cf.test.widget.v1~";
+const WIDGET: &str = "gts.cf.test.publication.widget.v1~";
+const A: &str = "gts.cf.test.publication.a.v1~";
+const B: &str = "gts.cf.test.publication.b.v1~";
+const C: &str = "gts.cf.test.publication.c.v1~";
 
 struct Config(Option<serde_json::Value>);
 
@@ -37,18 +40,14 @@ fn a_manifest_sorts_documents_and_keeps_equal_duplicates_once() {
         "gear",
         "1.2.3",
         [
-            source("sdk", &[("b~", json!({"x": 1})), ("a~", json!({}))]),
-            source("crate", &[("b~", json!({"x": 1}))]),
+            source("sdk", &[(B, json!({"x": 1})), (A, json!({}))]),
+            source("crate", &[(B, json!({"x": 1}))]),
         ],
     )
     .unwrap();
 
-    let ids: Vec<_> = manifest
-        .documents()
-        .iter()
-        .map(|(id, _)| id.as_str())
-        .collect();
-    assert_eq!(ids, ["a~", "b~"]);
+    let ids: Vec<_> = manifest.documents().iter().map(|(id, _)| id.id()).collect();
+    assert_eq!(ids, [A, B]);
     assert_eq!(manifest.publisher_name(), "gear");
     assert_eq!(manifest.publisher_version(), "1.2.3");
 }
@@ -59,14 +58,14 @@ fn a_manifest_rejects_an_id_declared_with_different_content() {
         "gear",
         "1.0.0",
         [
-            source("sdk", &[("a~", json!({"x": 1}))]),
-            source("crate", &[("a~", json!({"x": 2}))]),
+            source("sdk", &[(A, json!({"x": 1}))]),
+            source("crate", &[(A, json!({"x": 2}))]),
         ],
     )
     .unwrap_err();
     let message = format!("{err:#}");
     assert!(
-        message.contains("a~") && message.contains("sdk") && message.contains("crate"),
+        message.contains(A) && message.contains("sdk") && message.contains("crate"),
         "{message}"
     );
 }
@@ -80,14 +79,14 @@ fn widget_declarations() -> Vec<DeclarationSource> {
 
 fn vendor_entity(
     inputs: &GtsPublicationInputs<'_>,
-) -> anyhow::Result<Vec<(String, serde_json::Value)>> {
+) -> anyhow::Result<Vec<(gts::GtsId, serde_json::Value)>> {
     #[derive(serde::Deserialize, Default)]
     struct Cfg {
         vendor: String,
     }
     let cfg: Cfg = inputs.config_or_default()?;
     Ok(vec![(
-        format!("{WIDGET}cf.test.{}.v1", cfg.vendor),
+        gts::GtsId::try_new(&format!("{WIDGET}cf.test.publication.{}.v1", cfg.vendor))?,
         json!({ "vendor": cfg.vendor }),
     )])
 }
@@ -96,6 +95,7 @@ fn vendor_entity(
 struct FakeRegistry {
     calls: AtomicUsize,
     mode: Mode,
+    options: parking_lot::Mutex<Vec<GtsPublicationOptions>>,
 }
 
 #[derive(Clone, Copy)]
@@ -110,6 +110,7 @@ impl FakeRegistry {
         Arc::new(Self {
             calls: AtomicUsize::new(0),
             mode,
+            options: parking_lot::Mutex::default(),
         })
     }
 }
@@ -121,6 +122,7 @@ fn fake_backend(hub: &ClientHub) -> anyhow::Result<GtsPublicationBackend> {
             let registry = Arc::clone(&registry);
             async move {
                 registry.calls.fetch_add(1, Ordering::SeqCst);
+                registry.options.lock().push(request.options());
                 request.report_pending("dependency pending");
                 match registry.mode {
                     Mode::Admit => Ok(()),
@@ -171,8 +173,14 @@ fn equal_effective_configuration_gives_an_equal_manifest() {
 
     assert_eq!(one, two);
     assert_ne!(one, other);
-    let ids: Vec<_> = one.documents().iter().map(|(id, _)| id.as_str()).collect();
-    assert_eq!(ids, [WIDGET, "gts.cf.test.widget.v1~cf.test.acme.v1"]);
+    let ids: Vec<_> = one.documents().iter().map(|(id, _)| id.id()).collect();
+    assert_eq!(
+        ids,
+        [
+            WIDGET,
+            "gts.cf.test.publication.widget.v1~cf.test.publication.acme.v1"
+        ]
+    );
 }
 
 #[test]
@@ -382,18 +390,18 @@ fn an_id_in_two_manifests_is_an_ownership_conflict() {
     let one = GtsManifest::build(
         "one",
         "1.0.0",
-        [source("s", &[("a~", json!({})), ("b~", json!({}))])],
+        [source("s", &[(A, json!({})), (B, json!({}))])],
     )
     .unwrap();
-    let two = GtsManifest::build("two", "1.0.0", [source("s", &[("b~", json!({}))])]).unwrap();
-    let three = GtsManifest::build("three", "1.0.0", [source("s", &[("c~", json!({}))])]).unwrap();
+    let two = GtsManifest::build("two", "1.0.0", [source("s", &[(B, json!({}))])]).unwrap();
+    let three = GtsManifest::build("three", "1.0.0", [source("s", &[(C, json!({}))])]).unwrap();
 
     check_ownership([&one, &three]).unwrap();
     let err = check_ownership([&one, &two, &three]).unwrap_err();
 
     assert_eq!(
         err.to_string(),
-        "GTS ids with more than one publisher:\n- b~ is published by one and two"
+        format!("GTS ids with more than one publisher:\n- {B} is published by one and two")
     );
 }
 
@@ -408,4 +416,384 @@ fn no_wire(
     _tuning: toolkit_contract::wiring::ClientTuning,
 ) -> anyhow::Result<crate::discovery::WireOutcome> {
     Ok(crate::discovery::WireOutcome::Local)
+}
+
+// ========== `gears.<gear>.config.gts_publication` ==========
+
+fn options_of(config: &serde_json::Value) -> anyhow::Result<GtsPublicationOptions> {
+    GtsPublicationOptions::from_config("widgets", &Config(Some(json!({ "config": config }))))
+}
+
+#[test]
+fn without_a_section_the_options_are_the_startup_defaults() {
+    for config in [
+        Config(None),
+        Config(Some(json!({}))),
+        Config(Some(json!({ "config": { "vendor": "acme" } }))),
+    ] {
+        let options = GtsPublicationOptions::from_config("widgets", &config).unwrap();
+        assert_eq!(options, GtsPublicationOptions::default());
+        assert_eq!(options.timeout(), None);
+        assert_eq!(options.retry_backoff(), Duration::from_secs(1));
+        assert_eq!(options.retry_backoff_max(), Duration::from_secs(30));
+        assert_eq!(options.batch_size().get(), 100);
+    }
+}
+
+#[test]
+fn the_section_sets_every_field() {
+    let options = options_of(&json!({ "gts_publication": {
+        "timeout": "2m",
+        "retry_backoff": "250ms",
+        "retry_backoff_max": "4s",
+        "batch_size": 7,
+    }}))
+    .unwrap();
+    assert_eq!(options.timeout(), Some(Duration::from_secs(120)));
+    assert_eq!(options.retry_backoff(), Duration::from_millis(250));
+    assert_eq!(options.retry_backoff_max(), Duration::from_secs(4));
+    assert_eq!(options.batch_size().get(), 7);
+}
+
+#[test]
+fn an_absent_field_keeps_its_default() {
+    let options = options_of(&json!({ "gts_publication": { "batch_size": 3 } })).unwrap();
+    assert_eq!(
+        (
+            options.timeout(),
+            options.retry_backoff(),
+            options.retry_backoff_max()
+        ),
+        (None, Duration::from_secs(1), Duration::from_secs(30))
+    );
+    assert_eq!(options.batch_size().get(), 3);
+    // An empty mapping is the default policy.
+    assert_eq!(
+        options_of(&json!({ "gts_publication": {} })).unwrap(),
+        GtsPublicationOptions::default()
+    );
+}
+
+#[test]
+fn an_invalid_section_is_an_error_naming_the_gear_and_the_path() {
+    const PATH: &str = "gears.widgets.config.gts_publication";
+    let cases = [
+        (json!(null), PATH, "expected a mapping"),
+        (json!("120s"), PATH, "expected a mapping"),
+        (json!([]), PATH, "expected a mapping"),
+        (
+            json!({ "retry_backof": "1s" }),
+            "gts_publication.retry_backof",
+            "unknown field",
+        ),
+        (
+            json!({ "timeout": 120 }),
+            "gts_publication.timeout",
+            "expected a duration",
+        ),
+        (
+            json!({ "timeout": null }),
+            "gts_publication.timeout",
+            "expected a duration",
+        ),
+        (
+            json!({ "timeout": "soon" }),
+            "gts_publication.timeout",
+            "expected a duration",
+        ),
+        (
+            json!({ "timeout": "0s" }),
+            "gts_publication.timeout",
+            "greater than zero",
+        ),
+        (
+            json!({ "retry_backoff": "0ms" }),
+            "gts_publication.retry_backoff",
+            "greater than zero",
+        ),
+        (
+            json!({ "retry_backoff_max": "0s" }),
+            "gts_publication.retry_backoff_max",
+            "greater than zero",
+        ),
+        (
+            json!({ "batch_size": 0 }),
+            "gts_publication.batch_size",
+            "positive integer",
+        ),
+        (
+            json!({ "batch_size": -1 }),
+            "gts_publication.batch_size",
+            "positive integer",
+        ),
+        (
+            json!({ "batch_size": 1.5 }),
+            "gts_publication.batch_size",
+            "positive integer",
+        ),
+        (
+            json!({ "batch_size": "100" }),
+            "gts_publication.batch_size",
+            "positive integer",
+        ),
+        (
+            json!({ "batch_size": null }),
+            "gts_publication.batch_size",
+            "positive integer",
+        ),
+        (
+            json!({ "retry_backoff": "10s", "retry_backoff_max": "5s" }),
+            PATH,
+            "retry_backoff_max (5s) is less than retry_backoff (10s)",
+        ),
+        // Checked against the default maximum too: no silent clamp to 30s.
+        (
+            json!({ "retry_backoff": "1m" }),
+            PATH,
+            "retry_backoff_max (30s) is less than retry_backoff (60s)",
+        ),
+        (
+            json!({ "timeout": "500000000000years" }),
+            "gts_publication.timeout",
+            "too large to be a deadline",
+        ),
+    ];
+    for (section, path, reason) in cases {
+        let err = options_of(&json!({ "gts_publication": section.clone() })).unwrap_err();
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("gears.widgets.config.")
+                && message.contains(path)
+                && message.contains(reason),
+            "{section}: {message}"
+        );
+    }
+}
+
+#[test]
+fn the_options_are_not_part_of_the_manifest() {
+    let plain = WIDGETS.build_gts_manifest(&config("acme")).unwrap();
+    let with_policy = WIDGETS
+        .build_gts_manifest(&Config(Some(json!({ "config": {
+            "vendor": "acme",
+            "gts_publication": { "timeout": "5s", "batch_size": 1 },
+        }}))))
+        .unwrap();
+    assert_eq!(plain, with_policy);
+}
+
+/// An `entities` function over a strict gear config, as the real gears have.
+fn strict_vendor_entity(
+    inputs: &GtsPublicationInputs<'_>,
+) -> anyhow::Result<Vec<(gts::GtsId, serde_json::Value)>> {
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Cfg {
+        vendor: String,
+    }
+    let cfg: Cfg = inputs.config()?;
+    Ok(vec![(
+        gts::GtsId::try_new(&format!("{WIDGET}cf.test.publication.{}.v1", cfg.vendor))?,
+        json!({ "vendor": cfg.vendor }),
+    )])
+}
+
+static STRICT_WIDGETS: GtsPublicationDescriptor = GtsPublicationDescriptor {
+    gear: "widgets",
+    publisher_version: "1.0.0",
+    declarations: widget_declarations,
+    entities: Some(strict_vendor_entity),
+    backend: fake_backend,
+    provider: "fake-registry",
+    wire: no_wire,
+};
+
+#[test]
+fn a_strict_entities_config_accepts_the_section_and_rejects_a_business_typo() {
+    let manifest = STRICT_WIDGETS
+        .build_gts_manifest(&Config(Some(json!({ "config": {
+            "vendor": "acme",
+            "gts_publication": { "batch_size": 1 },
+        }}))))
+        .unwrap();
+    assert_eq!(
+        manifest,
+        STRICT_WIDGETS.build_gts_manifest(&config("acme")).unwrap()
+    );
+
+    let err = STRICT_WIDGETS
+        .build_gts_manifest(&Config(Some(json!({ "config": {
+            "vendor": "acme",
+            "gts_publication": { "batch_size": 1 },
+            "vendro": "acme",
+        }}))))
+        .unwrap_err();
+    assert!(
+        format!("{err:#}").contains("unknown field `vendro`"),
+        "{err:#}"
+    );
+}
+
+#[tokio::test]
+async fn the_prepared_options_reach_the_backend() {
+    let registry = FakeRegistry::new(Mode::Admit);
+    let hub = hub_with(&registry);
+    let config = Config(Some(json!({ "config": {
+        "vendor": "acme",
+        "gts_publication": { "timeout": "9s", "retry_backoff": "2s", "batch_size": 4 },
+    }})));
+    let publication = PreparedGtsPublication::prepare(&WIDGETS, &config, &hub).unwrap();
+    let expected = GtsPublicationOptions::from_config("widgets", &config).unwrap();
+    assert_eq!(publication.options(), expected);
+
+    publication
+        .publish(&CancellationToken::new(), progress())
+        .await
+        .unwrap();
+
+    assert_eq!(registry.options.lock().clone(), [expected]);
+    assert_eq!(expected.timeout(), Some(Duration::from_secs(9)));
+    assert_eq!(expected.batch_size().get(), 4);
+}
+
+#[test]
+fn invalid_options_fail_preparation_before_binding() {
+    let err = PreparedGtsPublication::prepare(
+        &WIDGETS,
+        &Config(Some(
+            json!({ "config": { "vendor": "acme", "gts_publication": { "batch_size": 0 } } }),
+        )),
+        // No registry client: the options fail first.
+        &ClientHub::new(),
+    )
+    .err()
+    .unwrap();
+    assert!(
+        matches!(
+            err,
+            GtsPublicationError::Options {
+                gear: "widgets",
+                ..
+            }
+        ),
+        "{err}"
+    );
+    let message = format!("{err:#}");
+    assert!(
+        message.starts_with(
+            "widgets: GTS publication options: gears.widgets.config.gts_publication.batch_size"
+        ),
+        "{message}"
+    );
+}
+
+fn static_and_entity_declarations() -> Vec<DeclarationSource> {
+    vec![
+        source(
+            "test-sdk",
+            &[(C, json!({ "n": 1.0, "k": "v" })), (A, json!({}))],
+        ),
+        source("test-gear", &[(WIDGET, json!({}))]),
+    ]
+}
+
+/// The static content again, keys reordered, and one document of its own.
+fn typed_entities(
+    _inputs: &GtsPublicationInputs<'_>,
+) -> anyhow::Result<Vec<(gts::GtsId, serde_json::Value)>> {
+    Ok(vec![
+        (gts::GtsId::try_new(B)?, json!({ "b": 1 })),
+        (gts::GtsId::try_new(C)?, json!({ "k": "v", "n": 1.0 })),
+    ])
+}
+
+fn conflicting_entities(
+    _inputs: &GtsPublicationInputs<'_>,
+) -> anyhow::Result<Vec<(gts::GtsId, serde_json::Value)>> {
+    Ok(vec![(gts::GtsId::try_new(C)?, json!({ "n": -1.0 }))])
+}
+
+static TYPED: GtsPublicationDescriptor = GtsPublicationDescriptor {
+    gear: "typed",
+    publisher_version: "1.0.0",
+    declarations: static_and_entity_declarations,
+    entities: Some(typed_entities),
+    backend: unreachable_backend,
+    provider: "fake-registry",
+    wire: no_wire,
+};
+
+static CONFLICTING: GtsPublicationDescriptor = GtsPublicationDescriptor {
+    entities: Some(conflicting_entities),
+    ..TYPED
+};
+
+/// Typed `entities` documents merge with the static ones into one sorted manifest,
+/// an equal duplicate kept once; a different content names both origins.
+#[test]
+fn typed_entities_merge_with_the_static_declarations() {
+    let manifest = TYPED.build_gts_manifest(&Config(None)).unwrap();
+
+    assert_eq!(
+        manifest.documents(),
+        [
+            (gts::GtsId::try_new(A).unwrap(), json!({})),
+            (gts::GtsId::try_new(B).unwrap(), json!({ "b": 1 })),
+            (
+                gts::GtsId::try_new(C).unwrap(),
+                json!({ "k": "v", "n": 1.0 })
+            ),
+            (gts::GtsId::try_new(WIDGET).unwrap(), json!({})),
+        ]
+    );
+
+    let message = format!(
+        "{:#}",
+        CONFLICTING.build_gts_manifest(&Config(None)).unwrap_err()
+    );
+    assert!(
+        message.contains(&format!(
+            "{C} is declared with different content by test-sdk and entities"
+        )),
+        "{message}"
+    );
+}
+
+fn misspelled_declarations() -> Vec<DeclarationSource> {
+    vec![
+        source("test-sdk", &[(A, json!({}))]),
+        source("test-gear", &[("gts.cf.test.publication.B.v1~", json!({}))]),
+    ]
+}
+
+static MISSPELLED: GtsPublicationDescriptor = GtsPublicationDescriptor {
+    gear: "misspelled",
+    declarations: misspelled_declarations,
+    entities: None,
+    ..TYPED
+};
+
+/// An invalid static id fails preparation, named with its origin, before the backend
+/// is bound: binding it would fail differently.
+#[test]
+fn an_invalid_static_id_fails_preparation_before_binding() {
+    let err = PreparedGtsPublication::prepare(&MISSPELLED, &Config(None), &ClientHub::new())
+        .err()
+        .unwrap();
+
+    assert!(
+        matches!(
+            err,
+            GtsPublicationError::GtsManifest {
+                gear: "misspelled",
+                ..
+            }
+        ),
+        "{err}"
+    );
+    let message = format!("{err:#}");
+    assert!(
+        message.contains("gts.cf.test.publication.B.v1~ from test-gear: invalid GTS id"),
+        "{message}"
+    );
 }

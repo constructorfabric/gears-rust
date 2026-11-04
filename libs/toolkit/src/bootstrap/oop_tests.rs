@@ -1201,9 +1201,12 @@ mod publication_config_tests {
     /// The gear's whole effective config section, as one document.
     fn config_document(
         inputs: &GtsPublicationInputs<'_>,
-    ) -> anyhow::Result<Vec<(String, serde_json::Value)>> {
+    ) -> anyhow::Result<Vec<(gts::GtsId, serde_json::Value)>> {
         let cfg: serde_json::Value = inputs.config_or_default()?;
-        Ok(vec![("gts.cf.test.config.v1~".to_owned(), cfg)])
+        Ok(vec![(
+            gts::GtsId::try_new("gts.cf.test.publication.config.v1~")?,
+            cfg,
+        )])
     }
 
     fn unused_backend(_: &crate::ClientHub) -> anyhow::Result<GtsPublicationBackend> {

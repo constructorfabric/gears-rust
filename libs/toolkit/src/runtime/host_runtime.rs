@@ -72,7 +72,17 @@ use crate::backends::OopSpawnConfig;
 use crate::client_hub::ClientHub;
 use crate::config::ConfigProvider;
 use crate::context::{GearContextBuilder, GtsAdmittedManifests};
-use crate::gts_publication::{GtsManifest, GtsPublicationDescriptor, PreparedGtsPublication};
+use crate::gts_publication::{
+    GtsManifest, GtsPublicationDescriptor, GtsPublicationOptions, PreparedGtsPublication,
+};
+
+/// A publishing gear's manifest and policy, read once from the configuration before
+/// any gear runs.
+type GtsPublicationPlan = (
+    &'static GtsPublicationDescriptor,
+    Arc<GtsManifest>,
+    GtsPublicationOptions,
+);
 use crate::registry::{
     ApiGatewayCap, GearEntry, GearRegistry, GrpcHubCap, GtsPublicationCap, RegistryError,
     RestApiCap, RunnableCap, SystemCap,
@@ -839,9 +849,7 @@ impl HostRuntime {
     /// configuration and check that no GTS id has two publishers, before any
     /// gear runs. A manifest is never rebuilt afterwards: the admitted one is
     /// what an application `init` reads.
-    fn build_gts_manifests(
-        &self,
-    ) -> Result<Vec<(&'static GtsPublicationDescriptor, Arc<GtsManifest>)>, RegistryError> {
+    fn build_gts_manifests(&self) -> Result<Vec<GtsPublicationPlan>, RegistryError> {
         let mut manifests = Vec::new();
         for entry in self.registry.gears() {
             let Some(publication) = entry.caps.query::<GtsPublicationCap>() else {
@@ -863,14 +871,23 @@ impl HostRuntime {
                     gear: entry.name,
                     source,
                 })?;
-            manifests.push((descriptor, Arc::new(manifest)));
-        }
-        if let Some((first, _)) = manifests.first() {
-            crate::gts_publication::check_ownership(manifests.iter().map(|(_, m)| m.as_ref()))
+            let options = GtsPublicationOptions::from_config(entry.name, self.gears_cfg.as_ref())
                 .map_err(|source| RegistryError::Publication {
-                    gear: first.gear,
+                gear: entry.name,
+                source: crate::gts_publication::GtsPublicationError::Options {
+                    gear: descriptor.gear,
                     source,
-                })?;
+                }
+                .into(),
+            })?;
+            manifests.push((descriptor, Arc::new(manifest), options));
+        }
+        if let Some((first, _, _)) = manifests.first() {
+            crate::gts_publication::check_ownership(manifests.iter().map(|(_, m, _)| m.as_ref()))
+                .map_err(|source| RegistryError::Publication {
+                gear: first.gear,
+                source,
+            })?;
         }
         Ok(manifests)
     }
@@ -890,27 +907,26 @@ impl HostRuntime {
     /// provide the contract locally would make the publication call itself
     /// forever; that is a configuration error (an embedded registry without
     /// its database, say).
-    fn wire_registry_clients(
-        &self,
-        manifests: &[(&'static GtsPublicationDescriptor, Arc<GtsManifest>)],
-    ) -> Result<(), RegistryError> {
+    fn wire_registry_clients(&self, manifests: &[GtsPublicationPlan]) -> Result<(), RegistryError> {
         self.wire_registry_clients_over(manifests, &Self::consumer_registrations())
     }
 
     /// [`Self::wire_registry_clients`] over the given consumer registrations.
     fn wire_registry_clients_over(
         &self,
-        manifests: &[(&'static GtsPublicationDescriptor, Arc<GtsManifest>)],
+        manifests: &[GtsPublicationPlan],
         all: &[&'static crate::discovery::ConsumerRegistration],
     ) -> Result<(), RegistryError> {
         let publications: Vec<crate::discovery::ConsumerRegistration> = manifests
             .iter()
-            .filter(|(_, manifest)| !manifest.is_empty())
-            .map(|(descriptor, _)| crate::discovery::ConsumerRegistration {
-                owner_gear: descriptor.gear,
-                dep_gear: descriptor.provider,
-                wire: descriptor.wire,
-            })
+            .filter(|(_, manifest, _)| !manifest.is_empty())
+            .map(
+                |(descriptor, _, _)| crate::discovery::ConsumerRegistration {
+                    owner_gear: descriptor.gear,
+                    dep_gear: descriptor.provider,
+                    wire: descriptor.wire,
+                },
+            )
             .collect();
         if publications.is_empty() {
             return Ok(());
@@ -967,7 +983,7 @@ impl HostRuntime {
     /// gear, or a non-empty publication to an application gear.
     fn check_wiring_groups(
         &self,
-        manifests: &[(&'static GtsPublicationDescriptor, Arc<GtsManifest>)],
+        manifests: &[GtsPublicationPlan],
         regs: &[&'static crate::discovery::ConsumerRegistration],
     ) -> Result<(), RegistryError> {
         let application = |gear: &str| self.local_group(gear) == Some(false);
@@ -984,7 +1000,7 @@ impl HostRuntime {
                 });
             }
         }
-        for (descriptor, manifest) in manifests {
+        for (descriptor, manifest, _) in manifests {
             if !manifest.is_empty() && application(descriptor.provider) {
                 return Err(RegistryError::Publication {
                     gear: descriptor.gear,
@@ -1092,16 +1108,21 @@ impl HostRuntime {
     /// `init` runs, and the refusal is not retried.
     async fn run_gts_publication_barrier(
         &self,
-        manifests: &[(&'static GtsPublicationDescriptor, Arc<GtsManifest>)],
+        manifests: &[GtsPublicationPlan],
     ) -> Result<AppStartup, RegistryError> {
         let mut prepared = Vec::with_capacity(manifests.len());
-        for (descriptor, manifest) in manifests {
+        for (descriptor, manifest, options) in manifests {
             prepared.push(
-                PreparedGtsPublication::bind(descriptor, Arc::clone(manifest), &self.client_hub)
-                    .map_err(|e| RegistryError::Publication {
-                        gear: descriptor.gear,
-                        source: e.into(),
-                    })?,
+                PreparedGtsPublication::bind(
+                    descriptor,
+                    Arc::clone(manifest),
+                    *options,
+                    &self.client_hub,
+                )
+                .map_err(|e| RegistryError::Publication {
+                    gear: descriptor.gear,
+                    source: e.into(),
+                })?,
             );
         }
         if prepared.iter().any(|p| !p.gts_manifest().is_empty()) {

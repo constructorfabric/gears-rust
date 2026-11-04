@@ -46,7 +46,7 @@ pub use models::{
     RegistrationOutcome, TypeSchema, Validator,
 };
 
-pub use publication::{PublicationError, publish_startup_entities};
+pub use publication::{Publication, PublicationError};
 pub use reconciliation::{
     ReconcileOptions, ReconcileOutcome, ReconcilePendingCause, ReconcileReport, ReconcileStop,
     Reconciliation, STARTUP_PUBLICATION_DEADLINE,

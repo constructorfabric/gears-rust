@@ -21,5 +21,5 @@ fn the_crates_merge_into_one_sorted_list() {
     .expect("no conflict");
 
     assert_eq!(merged.len(), declarations_fixture::DECLARED_IDS.len() + 1);
-    assert!(merged.windows(2).all(|w| w[0].0 < w[1].0));
+    assert!(merged.windows(2).all(|w| w[0].0.id() < w[1].0.id()));
 }

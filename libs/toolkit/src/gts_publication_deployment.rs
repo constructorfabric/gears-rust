@@ -143,7 +143,7 @@ pub async fn publish(
                 plan.gts_manifest()
                     .documents()
                     .iter()
-                    .map(|(id, _)| id.clone())
+                    .map(|(id, _)| id.to_string())
                     .collect()
             };
             let outcome = match result {

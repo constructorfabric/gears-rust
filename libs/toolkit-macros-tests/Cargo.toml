@@ -28,5 +28,6 @@ toolkit = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
+gts = { workspace = true }
 parking_lot = { workspace = true }
 uuid = { workspace = true }

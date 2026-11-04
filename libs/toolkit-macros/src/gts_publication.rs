@@ -23,6 +23,10 @@
 //! contract, wired and readiness-gated like any consumed contract; both wire
 //! the same client, whichever comes first.
 //!
+//! The publication policy is configuration, not an attribute argument: the runtime
+//! reads `gears.<gear>.config.gts_publication` and the expansion forwards it to the
+//! adapter's `timeout`, `retry_backoff` and `batch_size` builders.
+//!
 //! The runtime publishes the manifest and waits for its admission before any
 //! application `init`; a plugin binds its scoped clients in `init` from
 //! `GearCtx::gts_publication_manifest()`. There is no admission callback.
@@ -200,16 +204,24 @@ pub fn expand(cfg: &GtsPublicationCfg, ident: &Ident, name: &LitStr) -> TokenStr
                         let registry = ::std::sync::Arc::clone(&registry);
                         async move {
                             let manifest = request.gts_manifest();
-                            #publisher::publish_with_deadline(
+                            let options = request.options();
+                            #publisher::Publication::from_manifest(
                                 &*registry,
                                 manifest.publisher_name(),
                                 manifest.publisher_version(),
                                 manifest.documents(),
-                                request.cancel(),
-                                request.deadline(),
-                                |detail: &str| request.report_pending(detail),
                             )
+                            .map_err(::anyhow::Error::from)?
+                            .deadline(request.deadline())
+                            .timeout(options.timeout())
+                            .retry_backoff(options.retry_backoff(), options.retry_backoff_max())
+                            .batch_size(options.batch_size())
+                            .on_pending(|pending| {
+                                request.report_pending(&::std::string::ToString::to_string(pending));
+                            })
+                            .publish(request.cancel())
                             .await
+                            .map(|_| ())
                             .map_err(::anyhow::Error::from)
                         }
                     },

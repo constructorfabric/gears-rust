@@ -105,14 +105,20 @@ fn fake_backend(hub: &ClientHub) -> anyhow::Result<GtsPublicationBackend> {
 fn one_document() -> Vec<DeclarationSource> {
     vec![DeclarationSource::new(
         "test",
-        vec![("gts.cf.test.base.v1~".to_owned(), "{}".to_owned())],
+        vec![(
+            "gts.cf.test.publication.base.v1~".to_owned(),
+            "{}".to_owned(),
+        )],
     )]
 }
 
 fn other_document() -> Vec<DeclarationSource> {
     vec![DeclarationSource::new(
         "test",
-        vec![("gts.cf.test.other.v1~".to_owned(), "{}".to_owned())],
+        vec![(
+            "gts.cf.test.publication.other.v1~".to_owned(),
+            "{}".to_owned(),
+        )],
     )]
 }
 
@@ -138,6 +144,8 @@ descriptor!(PUB_A, "a", one_document);
 descriptor!(PUB_B, "b", other_document);
 descriptor!(PUB_DUP, "dup", one_document);
 descriptor!(PUB_NIL, "nil", no_documents);
+
+const CONFLICTING: &str = "gts.cf.test.publication.conflicting.v1~";
 
 /// Records lifecycle events into a shared log.
 pub(super) type Events = Arc<Mutex<Vec<String>>>;
@@ -553,8 +561,14 @@ async fn cancelling_a_pending_barrier_stops_the_system_group() {
 async fn a_manifest_error_fails_startup_before_any_init() {
     fn conflicting() -> Vec<DeclarationSource> {
         vec![
-            DeclarationSource::new("one", vec![("x~".to_owned(), "{\"a\":1}".to_owned())]),
-            DeclarationSource::new("two", vec![("x~".to_owned(), "{\"a\":2}".to_owned())]),
+            DeclarationSource::new(
+                "one",
+                vec![(CONFLICTING.to_owned(), "{\"a\":1}".to_owned())],
+            ),
+            DeclarationSource::new(
+                "two",
+                vec![(CONFLICTING.to_owned(), "{\"a\":2}".to_owned())],
+            ),
         ]
     }
     descriptor!(PUB_BAD, "bad", conflicting);
@@ -572,9 +586,55 @@ async fn a_manifest_error_fails_startup_before_any_init() {
 
     let message = format!("{err:#}");
     assert!(
-        message.contains("bad") && message.contains("x~"),
+        message.contains("bad")
+            && message.contains(&format!(
+                "{CONFLICTING} is declared with different content by one and two"
+            )),
         "{message}"
     );
+    assert!(events.lock().is_empty(), "{:?}", events.lock());
+}
+
+/// An invalid static GTS id fails startup while the manifests are built: named with
+/// its gear and origin, before any gear initializes, any backend is bound or any
+/// publication of a valid neighbour is sent.
+#[tokio::test]
+async fn an_invalid_static_id_fails_startup_before_any_publication() {
+    fn misspelled() -> Vec<DeclarationSource> {
+        vec![DeclarationSource::new(
+            "bad-sdk",
+            vec![(
+                "gts://gts.cf.test.publication.bad.v1~".to_owned(),
+                "{}".to_owned(),
+            )],
+        )]
+    }
+    descriptor!(PUB_MISSPELLED, "misspelled", misspelled);
+    let events: Events = Arc::default();
+    let mut builder = RegistryBuilder::default();
+    register(&mut builder, PubGear::system_gear("registry", &events));
+    register(&mut builder, PubGear::new("a", Some(&PUB_A), &events));
+    register(
+        &mut builder,
+        PubGear::new("misspelled", Some(&PUB_MISSPELLED), &events),
+    );
+    let fake = FakeRegistry::with(&[]);
+    let runtime = runtime(
+        builder.build_topo_sorted().unwrap(),
+        &fake,
+        &CancellationToken::new(),
+    );
+
+    let err = runtime.run_gear_phases().await.unwrap_err();
+
+    let message = format!("{err:#}");
+    assert!(
+        message.contains("misspelled")
+            && message
+                .contains("gts://gts.cf.test.publication.bad.v1~ from bad-sdk: invalid GTS id"),
+        "{message}"
+    );
+    assert!(fake.sent.lock().is_empty(), "nothing was sent");
     assert!(events.lock().is_empty(), "{:?}", events.lock());
 }
 
@@ -597,7 +657,7 @@ async fn two_publishers_of_one_id_fail_startup() {
 
     let message = format!("{err:#}");
     assert!(
-        message.contains("gts.cf.test.base.v1~ is published by a and dup"),
+        message.contains("gts.cf.test.publication.base.v1~ is published by a and dup"),
         "{message}"
     );
     assert!(fake.sent.lock().is_empty(), "nothing was sent");

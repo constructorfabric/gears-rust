@@ -222,11 +222,14 @@ fn is_instance_of<P: gts::GtsSchema>(gts_id: &str) -> bool {
 ///
 /// [`GearCtx::gts_publication_manifest`]: crate::context::GearCtx::gts_publication_manifest
 ///
+/// `documents` are the manifest's `(gts::GtsId, document)` pairs, or any pairs with
+/// an id that is a string.
+///
 /// # Errors
 /// `documents` holds no instance of `P`.
 pub fn bind_plugin_instances<'a, P, C>(
     hub: &ClientHub,
-    documents: impl IntoIterator<Item = &'a (String, serde_json::Value)>,
+    documents: impl IntoIterator<Item = &'a (impl AsRef<str> + 'a, serde_json::Value)>,
     client: &Arc<C>,
 ) -> anyhow::Result<()>
 where
@@ -235,6 +238,7 @@ where
 {
     let mut bound = 0usize;
     for (id, _) in documents {
+        let id = id.as_ref();
         if is_instance_of::<P>(id) {
             hub.register_scoped::<C>(ClientScope::gts_id(id), Arc::clone(client));
             tracing::info!(gts_id = %id, "plugin instance admitted and bound");
@@ -615,9 +619,12 @@ mod tests {
             let (mine, mine_content) = instance("mine", "acme", 1);
             let derived = format!("{spec}vendor.x.derived.plugin.v1~vendor.x.mine.plugin.v1");
             let derived_schema = format!("{spec}vendor.x.derived.plugin.v1~");
-            let other =
-                PluginV1::<OtherPluginSpecV1>::build_registration("vendor.x.o.v1", "acme", 1)
-                    .expect("serializes");
+            let other = PluginV1::<OtherPluginSpecV1>::build_registration(
+                "vendor.x.o.plugin.v1",
+                "acme",
+                1,
+            )
+            .expect("serializes");
             let manifest = [
                 (mine.clone(), mine_content),
                 (derived.clone(), json!({})),
@@ -655,6 +662,22 @@ mod tests {
                 .is_err(),
                 "a manifest without an instance of the spec"
             );
+
+            // A manifest's parsed ids bind the same instances.
+            let typed_hub = ClientHub::new();
+            let typed: Vec<(gts::GtsId, serde_json::Value)> = manifest
+                .iter()
+                .map(|(id, content)| (gts::GtsId::try_new(id).expect("valid"), content.clone()))
+                .collect();
+            bind_plugin_instances::<TestPluginSpecV1, _>(&typed_hub, &typed, &client)
+                .expect("binds");
+            let bound = |id: &str| {
+                typed_hub
+                    .try_get_scoped::<dyn TestClient>(&ClientScope::gts_id(id))
+                    .is_some()
+            };
+            assert!(bound(&mine) && bound(&derived));
+            assert!(!bound(&derived_schema) && !bound(spec) && !bound(other.0.as_ref()));
         }
 
         #[test]

@@ -110,7 +110,7 @@ file-rotate = { workspace = true, optional = true }
 chrono = { workspace = true, optional = true }
 url = { workspace = true, optional = true }
 dsn = { workspace = true, optional = true }
-toolkit-utils = { workspace = true }
+toolkit-utils = { workspace = true, features = ["humantime-serde"] }
 # Shared W3C Trace Context propagation (single source of truth with
 # `cf-gears-toolkit-http`). Not optional: `extract_trace_id` uses the parser on
 # the always-compiled canonical-error path, independent of the `otel` feature.

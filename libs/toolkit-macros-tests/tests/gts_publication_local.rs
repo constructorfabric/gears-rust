@@ -15,11 +15,11 @@ mod fake_publisher;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use fake_publisher::{Config, LocalRegistry, until};
+use fake_publisher::{Config, LocalRegistry, Policy, until};
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
 use toolkit::gts_publication::{
-    GtsPublicationCapability, GtsPublicationInputs, linked_descriptors,
+    GtsPublicationCapability, GtsPublicationInputs, GtsPublicationOptions, linked_descriptors,
 };
 use toolkit::runtime::HostRuntime;
 use toolkit::{ClientHub, DbOptions, DependencyChecker, Gear, GearCtx, GearRegistry};
@@ -28,7 +28,7 @@ use toolkit::{ClientHub, DbOptions, DependencyChecker, Gear, GearCtx, GearRegist
 #[must_use]
 pub fn gts_declarations() -> Vec<(String, String)> {
     vec![(
-        "gts.cf.test.widget.v1~".to_owned(),
+        "gts.cf.test.publication.widget.v1~".to_owned(),
         "{\"type\":\"object\"}".to_owned(),
     )]
 }
@@ -66,14 +66,17 @@ pub struct WidgetPublisher {
 impl WidgetPublisher {
     fn configured(
         inputs: &GtsPublicationInputs<'_>,
-    ) -> anyhow::Result<Vec<(String, serde_json::Value)>> {
+    ) -> anyhow::Result<Vec<(gts::GtsId, serde_json::Value)>> {
         #[derive(serde::Deserialize, Default)]
         struct Cfg {
             vendor: String,
         }
         let cfg: Cfg = inputs.config_or_default()?;
         Ok(vec![(
-            format!("gts.cf.test.widget.v1~cf.test.{}.v1", cfg.vendor),
+            gts::GtsId::try_new(&format!(
+                "gts.cf.test.publication.widget.v1~cf.test.publication.{}.v1",
+                cfg.vendor
+            ))?,
             json!({ "vendor": cfg.vendor }),
         )])
     }
@@ -152,16 +155,12 @@ fn the_generated_descriptor_is_linked_with_the_crate_version() {
 
     let config = Config(json!({ "widget-publisher": { "config": { "vendor": "acme" } } }));
     let manifest = descriptor.build_gts_manifest(&config).unwrap();
-    let ids: Vec<_> = manifest
-        .documents()
-        .iter()
-        .map(|(id, _)| id.as_str())
-        .collect();
+    let ids: Vec<_> = manifest.documents().iter().map(|(id, _)| id.id()).collect();
     assert_eq!(
         ids,
         [
-            "gts.cf.test.widget.v1~",
-            "gts.cf.test.widget.v1~cf.test.acme.v1"
+            "gts.cf.test.publication.widget.v1~",
+            "gts.cf.test.publication.widget.v1~cf.test.publication.acme.v1"
         ]
     );
 }
@@ -184,7 +183,13 @@ async fn the_generated_backend_forwards_the_callers_absolute_deadline() {
         .await
         .unwrap();
 
-    assert_eq!(*registry.deadlines.lock(), [Some(deadline)]);
+    assert_eq!(
+        *registry.policies.lock(),
+        [(
+            "widget-publisher".to_owned(),
+            Policy::of(GtsPublicationOptions::default(), Some(deadline))
+        )]
+    );
     assert_eq!(registry.admitted.lock().len(), 1);
 }
 

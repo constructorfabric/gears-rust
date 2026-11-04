@@ -31,16 +31,34 @@ pub mod adapter {
     }
     impl std::error::Error for Never {}
 
-    pub async fn publish_with_deadline(
-        _: &Registry,
-        _: &str,
-        _: &str,
-        _: &[(String, serde_json::Value)],
-        _: &tokio_util::sync::CancellationToken,
-        _: Option<tokio::time::Instant>,
-        _: impl FnMut(&str) + Send,
-    ) -> Result<(), Never> {
-        Ok(())
+    pub struct Publication<'a>(&'a Registry);
+    impl<'a> Publication<'a> {
+        pub fn from_manifest(
+            registry: &'a Registry,
+            _: &str,
+            _: &str,
+            _: &[(gts::GtsId, serde_json::Value)],
+        ) -> Result<Self, Never> {
+            Ok(Self(registry))
+        }
+        pub fn deadline(self, _: Option<tokio::time::Instant>) -> Self {
+            self
+        }
+        pub fn timeout(self, _: Option<std::time::Duration>) -> Self {
+            self
+        }
+        pub fn retry_backoff(self, _: std::time::Duration, _: std::time::Duration) -> Self {
+            self
+        }
+        pub fn batch_size(self, _: std::num::NonZeroUsize) -> Self {
+            self
+        }
+        pub fn on_pending(self, _: impl FnMut(&Never) + Send) -> Self {
+            self
+        }
+        pub async fn publish(self, _: &tokio_util::sync::CancellationToken) -> Result<(), Never> {
+            Ok(())
+        }
     }
 }
 
