@@ -138,11 +138,16 @@ fn collect_blocks_from_node(
         NodeContent::Image {
             description, src, ..
         } => {
-            out.push(ParsedBlock::Image {
-                alt: description.clone(),
-                title: None,
-                src: src.clone(),
-            });
+            // Images without an addressable source (e.g. embedded DOCX images) would
+            // render as an empty `![]()` link; drop them, matching the pre-kreuzberg
+            // DOCX behaviour of dropping embedded images.
+            if src.as_deref().is_some_and(|s| !s.trim().is_empty()) {
+                out.push(ParsedBlock::Image {
+                    alt: description.clone(),
+                    title: None,
+                    src: src.clone(),
+                });
+            }
         }
         // Container nodes: slide, group — recurse into children
         NodeContent::Slide { title, number } => {
@@ -441,6 +446,39 @@ mod tests {
                     ParsedBlock::Paragraph { .. },
                     ParsedBlock::Paragraph { .. }
                 ]
+            ),
+            "got {blocks:?}"
+        );
+    }
+
+    fn image_blocks(src: Option<&str>) -> Vec<ParsedBlock> {
+        let mut doc = DocumentStructure::new();
+        doc.push_node(node(NodeContent::Image {
+            description: Some("alt".to_owned()),
+            image_index: None,
+            src: src.map(str::to_owned),
+        }));
+        blocks_of(&doc)
+    }
+
+    #[test]
+    fn image_without_src_is_dropped() {
+        assert!(image_blocks(None).is_empty());
+    }
+
+    #[test]
+    fn image_with_blank_src_is_dropped() {
+        assert!(image_blocks(Some("   ")).is_empty());
+    }
+
+    #[test]
+    fn image_with_src_is_kept() {
+        let blocks = image_blocks(Some("pic.png"));
+        assert!(
+            matches!(
+                blocks.as_slice(),
+                [ParsedBlock::Image { src: Some(s), alt: Some(a), .. }]
+                    if s == "pic.png" && a == "alt"
             ),
             "got {blocks:?}"
         );
