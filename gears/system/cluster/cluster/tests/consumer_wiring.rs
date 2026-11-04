@@ -120,8 +120,10 @@ impl toolkit::contracts::RunnableCapability for Reservations {
             Ordering::SeqCst,
         );
         // 2. And it is the *remote* one, because this process hosts no cluster gear.
+        //    cluster-sdk wires it process-wide, so this gear's view reaches it
+        //    through `try_get` and holds no proxy of its own.
         RESOLVE_WAS_A_PROXY.store(
-            hub.has_remote_proxy::<dyn ClusterClient>(),
+            hub.try_get_local::<dyn ClusterClient>().is_none(),
             Ordering::SeqCst,
         );
 

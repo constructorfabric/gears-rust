@@ -155,7 +155,11 @@ pub fn derive_endpoint() -> Result<String, ClusterError> {
 ///
 /// Shared by the wiring closure below and by `binding::process_client`'s
 /// self-construction arm, so the two cannot drift: whichever runs first is the one
-/// that builds the channel, and the other finds it.
+/// that builds the channel, and the other finds it. The wiring closure registers
+/// through the process-wide hub (cluster-sdk is not a gear), so every gear finds
+/// that client. The self-construction arm registers through the calling gear's
+/// view, so when wiring did not run, each gear that resolves builds its own
+/// channel.
 ///
 /// The `try_get` guard is what keeps this from ever overwriting a client that is
 /// already there, local or remote: the hub's `register` is last-write-wins with no

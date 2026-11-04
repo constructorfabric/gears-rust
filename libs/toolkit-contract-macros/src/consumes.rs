@@ -11,6 +11,12 @@
 //!   2. otherwise registers a directory-resolving REST client under the
 //!      contract trait, which lazily resolves the provider endpoint per call.
 //!
+//! The runtime passes the consuming gear's view of the hub
+//! (`ClientHub::for_gear`), so the proxy belongs to that gear and is built from
+//! its own `consumer_wiring.<dep>` settings. Two gears consuming one contract
+//! get two proxies. One gear declaring the same contract twice is a boot error:
+//! it would get one proxy for both.
+//!
 //! **Requirements on the consuming crate.** The emission is unconditional, so
 //! the crate needs a `toolkit` dependency (for `ClientHub`, `discovery` and the
 //! `inventory` re-export) and its contract SDK built with `rest-client`, which
@@ -22,9 +28,10 @@
 //!
 //! **Gear name.** The emitted `owner_gear` is the gear's name, because the
 //! runtime uses it as a config key for the ADR-0004 static-endpoint override and
-//! the criticality flag (`gears.<owner_gear>.config.consumer_wiring.<dep>`) and
-//! in log/error fields. When this attribute sits **above** `#[toolkit::gear]`,
-//! the gear attribute is still on the item and its `name = "..."` is used, so a
+//! the criticality flag (`gears.<owner_gear>.config.consumer_wiring.<dep>`), as
+//! the owner of the hub view the proxy is wired into, and in log/error fields.
+//! When this attribute sits **above** `#[toolkit::gear]`, the gear attribute is
+//! still on the item and its `name = "..."` is used, so a
 //! struct named `CredStoreGear` for gear `credstore` keys correctly. Otherwise
 //! (gear attribute already expanded, or absent) the kebab-case of the struct
 //! ident is used, and `#[toolkit::gear(name = ...)]` must match it.
@@ -230,17 +237,26 @@ pub fn generate(attr: &ConsumesAttr, item: &ItemStruct) -> SynResult<TokenStream
             // Report `Local` so the runtime treats the dep as readiness-resolved
             // without a directory lookup.
             //
-            // `try_get_local` rather than `try_get`: the hub is keyed by type,
-            // so a proxy registered by another consumer of the same contract in
-            // this process would otherwise look exactly like a local impl and
-            // wrongly mark the dependency resolved.
+            // `try_get_local` rather than `try_get`: `try_get` also returns a
+            // process-wide proxy, which is not a local impl and must not mark
+            // the dependency resolved.
             if __hub.try_get_local::<dyn #contract_path>().is_some() {
                 return ::std::result::Result::Ok(::toolkit::discovery::WireOutcome::Local);
             }
-            // Another consumer of this contract already wired a proxy: reuse it
-            // rather than building a second identical one, but still report
-            // `Remote` so this dependency gates readiness like any other.
+            // This view already holds a proxy for the contract. In a gear's view
+            // that means a second `#[consumes]` of the same contract, which would
+            // silently share the first one's provider and settings. In the
+            // process-wide hub (owner not a gear here) reuse it as before.
             if __hub.has_remote_proxy::<dyn #contract_path>() {
+                if let ::std::option::Option::Some(__owner) = __hub.owner() {
+                    return ::std::result::Result::Err(::anyhow::anyhow!(
+                        "gear `{}` declares #[toolkit::consumes] for `{}` more than once \
+                         (from = \"{}\"); a gear gets one client per contract",
+                        __owner,
+                        ::std::stringify!(#contract_path),
+                        #from,
+                    ));
+                }
                 return ::std::result::Result::Ok(::toolkit::discovery::WireOutcome::Remote);
             }
             // Otherwise register the directory-resolving REST client. The tuning
@@ -360,6 +376,20 @@ mod tests {
             pub struct Orders;
         ));
         assert!(out.contains(r#"owner_gear : "orders""#), "got:\n{out}");
+    }
+
+    /// A second proxy for the same contract in a gear's view is a boot error;
+    /// only the process-wide hub reuses an existing proxy.
+    #[test]
+    fn a_duplicate_in_a_gear_view_is_an_error() {
+        let out = expand(&parse_quote!(
+            pub struct OrdersGear;
+        ));
+        assert!(out.contains("__hub . owner ()"), "got:\n{out}");
+        assert!(
+            out.contains("stringify ! (billing_sdk :: BillingApi)"),
+            "got:\n{out}"
+        );
     }
 
     #[test]

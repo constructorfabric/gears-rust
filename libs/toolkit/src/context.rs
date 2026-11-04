@@ -134,11 +134,17 @@ impl GearCtx {
         client_hub: Arc<crate::client_hub::ClientHub>,
         cancellation_token: CancellationToken,
     ) -> Self {
+        let gear_name: Arc<str> = gear_name.into();
+        let client_hub = if client_hub.owner() == Some(&*gear_name) {
+            client_hub
+        } else {
+            client_hub.for_gear(Arc::clone(&gear_name))
+        };
         Self {
-            gear_name: gear_name.into(),
+            client_hub,
+            gear_name,
             instance_id,
             config_provider,
-            client_hub,
             cancellation_token,
             internal_token_provider: None,
             #[cfg(feature = "db")]
@@ -210,7 +216,11 @@ impl GearCtx {
         &*self.config_provider
     }
 
-    /// Get the `ClientHub` for dependency resolution.
+    /// Get this gear's view of the `ClientHub` for dependency resolution.
+    ///
+    /// Local registrations are shared by all gears; remote proxies wired by
+    /// this gear's `#[toolkit::consumes]` are its own (see
+    /// [`ClientHub::for_gear`](crate::client_hub::ClientHub::for_gear)).
     #[inline]
     #[must_use]
     pub fn client_hub(&self) -> Arc<crate::client_hub::ClientHub> {
@@ -566,6 +576,36 @@ mod tests {
         );
 
         assert_eq!(ctx.instance_id(), instance_id);
+    }
+
+    /// Issue #5686: a gear's context reads its own consumer proxy, not another
+    /// gear's. Built the way the runtime builds it, through the builder.
+    #[tokio::test]
+    async fn a_gear_ctx_reads_its_own_proxy() {
+        trait PingApi: Send + Sync {}
+        struct Ping;
+        impl PingApi for Ping {}
+
+        let hub = Arc::new(crate::client_hub::ClientHub::default());
+        let builder = GearContextBuilder::new(
+            Uuid::new_v4(),
+            Arc::new(MockConfigProvider::new()),
+            Arc::clone(&hub),
+            CancellationToken::new(),
+        );
+        let proxy: Arc<dyn PingApi> = Arc::new(Ping);
+        hub.for_gear("a")
+            .register_remote_proxy::<dyn PingApi>(Arc::clone(&proxy));
+
+        let a = builder.for_gear("a").await.unwrap();
+        let b = builder.for_gear("b").await.unwrap();
+
+        assert_eq!(a.client_hub().owner(), Some("a"));
+        assert!(Arc::ptr_eq(
+            &a.client_hub().get::<dyn PingApi>().unwrap(),
+            &proxy
+        ));
+        assert!(b.client_hub().try_get::<dyn PingApi>().is_none());
     }
 
     // --- config_expanded tests ---
