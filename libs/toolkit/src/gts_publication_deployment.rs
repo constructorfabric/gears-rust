@@ -10,7 +10,6 @@
 
 use std::fmt;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
@@ -25,13 +24,15 @@ use crate::discovery::StaticEndpointResolver;
 
 /// How one publisher ended.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum GtsDeploymentOutcome {
     /// Every document admitted (or nothing to publish).
     Published { documents: usize },
     /// A terminal refusal; the message names the publisher and GTS ids.
     Refused(String),
-    /// Not confirmed before the deadline. `unconfirmed` lists the manifest's
-    /// GTS ids: some of them may already be admitted.
+    /// Not confirmed before the job's deadline or the gear's own publication
+    /// budget. `unconfirmed` lists the manifest's GTS ids: some of them may
+    /// already be admitted.
     DeadlineExceeded { unconfirmed: Vec<String> },
     /// The caller cancelled the job first; `unconfirmed` as above.
     Cancelled { unconfirmed: Vec<String> },
@@ -84,8 +85,9 @@ impl fmt::Display for GtsDeploymentReport {
 /// future, ends every publication: they run in this future, not spawned.
 ///
 /// # Errors
-/// A setup error before any publication: a manifest that does not build, a
-/// GTS id with two publishers, or registry wiring that fails. Publication
+/// A setup error before any publication: `registry_endpoint` is not an
+/// absolute `http`/`https` URI, a manifest does not build, a GTS id has two
+/// publishers, or registry wiring fails. Publication
 /// results, refusals, the deadline and cancellation included, are in the report.
 pub async fn publish(
     descriptors: &[&'static GtsPublicationDescriptor],
@@ -95,6 +97,16 @@ pub async fn publish(
     deadline: Duration,
     cancel: &CancellationToken,
 ) -> anyhow::Result<GtsDeploymentReport> {
+    // The platform credential goes to this endpoint: refuse anything but an
+    // absolute URI naming a host, before any wiring.
+    let endpoint: http::Uri = registry_endpoint
+        .parse()
+        .map_err(|e| anyhow::anyhow!("registry endpoint '{registry_endpoint}': {e}"))?;
+    anyhow::ensure!(
+        matches!(endpoint.scheme_str(), Some("http" | "https"))
+            && endpoint.host().is_some_and(|host| !host.is_empty()),
+        "registry endpoint '{registry_endpoint}' is not an absolute http(s) URI"
+    );
     let deadline_at = tokio::time::Instant::now()
         .checked_add(deadline)
         .ok_or_else(|| anyhow::anyhow!("the publication deadline cannot be represented"))?;
@@ -105,19 +117,14 @@ pub async fn publish(
     for descriptor in descriptors {
         (descriptor.wire)(&hub, Arc::clone(&resolver), tuning.clone())
             .map_err(|e| e.context(format!("{}: registry wiring", descriptor.gear)))?;
-        prepared.push((
-            descriptor.gear,
+        prepared.push(
             PreparedGtsPublication::prepare(descriptor, config, &hub)?.with_deadline(deadline_at),
-        ));
+        );
     }
-    check_ownership(prepared.iter().map(|(_, plan)| plan.gts_manifest()))?;
-
-    let prepared: Vec<PreparedGtsPublication> =
-        prepared.into_iter().map(|(_, plan)| plan).collect();
+    check_ownership(prepared.iter().map(PreparedGtsPublication::gts_manifest))?;
 
     // Cancelled at the deadline or with the caller's token.
     let stop = cancel.child_token();
-    let deadline_passed = AtomicBool::new(false);
     let all = super::publish_all(
         &prepared,
         &stop,
@@ -125,15 +132,14 @@ pub async fn publish(
         false,
     );
     tokio::pin!(all);
-    let results = tokio::select! {
+    let (results, deadline_passed) = tokio::select! {
         biased;
         () = tokio::time::sleep_until(deadline_at) => {
             // Every unfinished publication ends: past the deadline.
-            deadline_passed.store(true, Ordering::SeqCst);
             stop.cancel();
-            all.await
+            (all.await, true)
         },
-        results = &mut all => results,
+        results = &mut all => (results, false),
     };
     let publishers = prepared
         .iter()
@@ -150,9 +156,12 @@ pub async fn publish(
                 Ok(()) => GtsDeploymentOutcome::Published {
                     documents: plan.gts_manifest().documents().len(),
                 },
-                Err(GtsPublicationError::Cancelled { .. })
-                    if deadline_passed.load(Ordering::SeqCst) =>
-                {
+                Err(GtsPublicationError::Expired { .. }) => {
+                    GtsDeploymentOutcome::DeadlineExceeded {
+                        unconfirmed: unconfirmed(),
+                    }
+                }
+                Err(GtsPublicationError::Cancelled { .. }) if deadline_passed => {
                     GtsDeploymentOutcome::DeadlineExceeded {
                         unconfirmed: unconfirmed(),
                     }

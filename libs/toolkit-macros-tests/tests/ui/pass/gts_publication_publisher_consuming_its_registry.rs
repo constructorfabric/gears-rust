@@ -31,6 +31,10 @@ pub mod adapter {
     }
     impl std::error::Error for Never {}
 
+    pub fn expired(_: &Never) -> bool {
+        false
+    }
+
     pub struct Publication<'a>(&'a Registry);
     impl<'a> Publication<'a> {
         pub fn from_manifest(

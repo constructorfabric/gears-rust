@@ -112,6 +112,8 @@ impl GrpcInstallerStore {
     }
 
     /// The next late batch; `None` once the store is closed and drained.
+    // cancel-safe: a batch is popped and returned under the lock with no await
+    // in between, so a future dropped at its await loses no batch.
     pub async fn next_late(&self) -> Option<LateBatch> {
         loop {
             let published = self.late_published.notified();

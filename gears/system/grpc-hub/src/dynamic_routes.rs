@@ -32,15 +32,17 @@ impl DynamicRoutes {
         }
     }
 
-    /// Add the services of `gears` to the served routes.
+    /// Add the services of `gears` to the served routes. Under the write lock
+    /// from the read to the store: a concurrent install cannot drop them.
     pub fn install(&self, gears: &[GearInstallers]) {
-        let mut builder = RoutesBuilder::from(self.current.read().clone());
+        let mut current = self.current.write();
+        let mut builder = RoutesBuilder::from(current.clone());
         for gear in gears {
             for installer in &gear.installers {
                 (installer.register)(&mut builder);
             }
         }
-        *self.current.write() = builder.routes();
+        *current = builder.routes();
     }
 }
 

@@ -53,14 +53,18 @@
 //!     // Returns a builder with the same `publish`.
 //!     pub fn on_pending(self, on_pending: impl FnMut(&impl std::fmt::Display) + Send) -> _;
 //!     pub async fn publish(self, cancel: &CancellationToken)
-//!         -> Result<impl Sized, impl std::error::Error + Send + Sync + 'static>;
+//!         -> Result<impl Sized, PublishError>;
 //! }
+//! // Whether `publish` failed because its budget ran out, not on a refusal.
+//! pub fn expired(error: &PublishError) -> bool;
+//! // PublishError: std::error::Error + Send + Sync + 'static
 //! ```
 //!
 //! `from_manifest` rejects invalid input before any request; the GTS ids arrive parsed. `publish` returns `Ok` only
 //! after every document is admitted; the runtime discards its value. It retries retryable
 //! conditions within its budget, reporting each pending pass to `on_pending`, and returns
-//! an error for expiry, a terminal refusal or cancellation. Its future is `Send`.
+//! an error for expiry, a terminal refusal or cancellation; `expired` tells the first
+//! apart, which the runtime reports as [`GtsPublicationError::Expired`]. Its future is `Send`.
 //! Toolkit does not depend on the adapter's crate, so the policy crosses the boundary
 //! as plain `std` values: the runtime always calls `timeout`, `retry_backoff` and
 //! `batch_size` with the gear's [`GtsPublicationOptions`], already validated.
@@ -398,6 +402,20 @@ impl GtsPublicationRequest {
         }
     }
 
+    /// The same request with the caller's absolute deadline.
+    #[must_use]
+    pub fn with_deadline(mut self, deadline: Option<tokio::time::Instant>) -> Self {
+        self.deadline = deadline;
+        self
+    }
+
+    /// The same request with the publishing gear's policy.
+    #[must_use]
+    pub fn with_options(mut self, options: GtsPublicationOptions) -> Self {
+        self.options = options;
+        self
+    }
+
     #[must_use]
     pub fn gts_manifest(&self) -> &GtsManifest {
         &self.manifest
@@ -540,8 +558,16 @@ pub trait GtsPublicationCapability: Send + Sync {
     fn descriptor(&self) -> &'static GtsPublicationDescriptor;
 }
 
+/// The context a publisher adapter puts on a [`GtsPublicationBackend`] error when
+/// the publication's budget ran out before admission, rather than on a refusal:
+/// [`PreparedGtsPublication::publish`] reports it as [`GtsPublicationError::Expired`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("the GTS publication budget ran out before admission")]
+pub struct GtsPublicationExpired;
+
 /// Why a publication did not complete.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum GtsPublicationError {
     /// The manifest could not be built from the configuration.
     #[error("{gear}: GTS manifest: {source:#}")]
@@ -564,6 +590,14 @@ pub enum GtsPublicationError {
     /// The registry refused the publication.
     #[error("{gear}: GTS publication refused: {source:#}")]
     Refused {
+        gear: &'static str,
+        source: anyhow::Error,
+    },
+    /// Not admitted before the publication's budget ran out: the configured
+    /// `timeout`, the adapter's default budget or the caller's deadline. Some
+    /// documents may already be admitted.
+    #[error("{gear}: GTS publication not admitted in time: {source:#}")]
+    Expired {
         gear: &'static str,
         source: anyhow::Error,
     },
@@ -667,7 +701,8 @@ impl PreparedGtsPublication {
     /// Publish until admitted, refused or expired. An empty manifest succeeds at once.
     ///
     /// # Errors
-    /// [`GtsPublicationError::Refused`] or [`GtsPublicationError::Cancelled`].
+    /// [`GtsPublicationError::Refused`], [`GtsPublicationError::Expired`] or
+    /// [`GtsPublicationError::Cancelled`].
     pub async fn publish(
         &self,
         cancel: &CancellationToken,
@@ -680,10 +715,10 @@ impl PreparedGtsPublication {
         let Some(backend) = &self.backend else {
             return Ok(());
         };
-        let mut request =
-            GtsPublicationRequest::new(Arc::clone(&self.manifest), cancel.clone(), progress);
-        request.deadline = self.deadline;
-        request.options = self.options;
+        let request =
+            GtsPublicationRequest::new(Arc::clone(&self.manifest), cancel.clone(), progress)
+                .with_deadline(self.deadline)
+                .with_options(self.options);
         let result = tokio::select! {
             biased;
             () = cancel.cancelled() => return Err(GtsPublicationError::Cancelled { gear }),
@@ -692,6 +727,9 @@ impl PreparedGtsPublication {
         match result {
             Ok(()) => Ok(()),
             Err(_) if cancel.is_cancelled() => Err(GtsPublicationError::Cancelled { gear }),
+            Err(source) if source.downcast_ref::<GtsPublicationExpired>().is_some() => {
+                Err(GtsPublicationError::Expired { gear, source })
+            }
             Err(source) => Err(GtsPublicationError::Refused { gear, source }),
         }
     }
@@ -704,8 +742,8 @@ pub type GtsPublicationProgress = Arc<dyn Fn(&'static str, &str) + Send + Sync>;
 /// waiting for its base never delays the base publisher. Returns one result
 /// per publication, in the order of `prepared`, once each one ended.
 ///
-/// With `stop_on_refusal`, the first refusal cancels the others: the batch
-/// failed and their admission no longer matters. The publications run in
+/// With `stop_on_refusal`, the first refusal or expiry cancels the others: the
+/// batch failed and their admission no longer matters. The publications run in
 /// this future, not spawned: dropping it, or cancelling `cancel`, ends them.
 pub async fn publish_all(
     prepared: &[PreparedGtsPublication],
@@ -733,7 +771,12 @@ pub async fn publish_all(
     let mut results: Vec<Option<Result<(), GtsPublicationError>>> =
         prepared.iter().map(|_| None).collect();
     while let Some((index, result)) = running.next().await {
-        if stop_on_refusal && matches!(result, Err(GtsPublicationError::Refused { .. })) {
+        if stop_on_refusal
+            && matches!(
+                result,
+                Err(GtsPublicationError::Refused { .. } | GtsPublicationError::Expired { .. })
+            )
+        {
             stop.cancel();
         }
         results[index] = Some(result);

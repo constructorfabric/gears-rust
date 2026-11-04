@@ -2,7 +2,7 @@
 //! the application group waits for the GTS admission of every manifest before
 //! any `init`, and cleanup.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -22,7 +22,7 @@ use crate::gts_publication::{
     DeclarationSource, GtsPublicationBackend, GtsPublicationCapability, GtsPublicationDescriptor,
     GtsPublicationRequest,
 };
-use crate::registry::{GearRegistry, RegistryBuilder};
+use crate::registry::{GearRegistry, RegistryBuilder, RegistryError};
 
 /// How the fake registry answers a publisher.
 #[derive(Clone)]
@@ -434,7 +434,7 @@ async fn a_refused_publication_fails_the_application_group_only() {
     let checker = Arc::clone(&runtime.dep_checker);
     let running = tokio::spawn(runtime.run_gear_phases().in_current_span());
     until("the terminal refusal to be reported", || {
-        logs_contain("application group preparation failed")
+        logs_contain("the application group did not start")
     })
     .await;
     tokio::time::sleep(Duration::from_millis(20)).await;
@@ -443,11 +443,18 @@ async fn a_refused_publication_fails_the_application_group_only() {
         checker.unresolved_deps(),
         [crate::runtime::PREPARATION_GATE]
     );
-    assert_eq!(fake.sent.lock().clone(), ["a"], "not retried");
+    let sent_seen = { fake.sent.lock().clone() };
+    assert_eq!(sent_seen, ["a"], "not retried");
     assert!(has(&events, "start:registry"));
 
     cancel.cancel();
-    running.await.unwrap().unwrap();
+    let err = running.await.unwrap().unwrap_err();
+    let message = format!("{err:#}");
+    assert!(
+        message.contains("the application group did not start")
+            && message.contains("GTS publication refused"),
+        "the run reports the failed group after shutdown: {message}"
+    );
     assert!(
         any_app_event(&events, &["a", "c"]).is_empty(),
         "{:?}",
@@ -644,6 +651,8 @@ async fn an_invalid_static_id_fails_startup_before_any_publication() {
 async fn two_publishers_of_one_id_fail_startup() {
     let events: Events = Arc::default();
     let mut builder = RegistryBuilder::default();
+    // An uninvolved publisher listed first is not blamed for the conflict.
+    register(&mut builder, PubGear::new("b", Some(&PUB_B), &events));
     register(&mut builder, PubGear::new("a", Some(&PUB_A), &events));
     register(&mut builder, PubGear::new("dup", Some(&PUB_DUP), &events));
     let fake = FakeRegistry::with(&[]);
@@ -659,6 +668,13 @@ async fn two_publishers_of_one_id_fail_startup() {
     assert!(
         message.contains("gts.cf.test.publication.base.v1~ is published by a and dup"),
         "{message}"
+    );
+    assert!(
+        matches!(
+            err.downcast_ref(),
+            Some(crate::registry::RegistryError::GtsOwnership { .. })
+        ),
+        "not blamed on one publishing gear: {message}"
     );
     assert!(fake.sent.lock().is_empty(), "nothing was sent");
     assert!(events.lock().is_empty());
@@ -711,11 +727,172 @@ async fn migrate_only_runs_no_init_and_no_publication() {
 
     runtime.run_migration_phases().await.unwrap();
 
+    let events_seen = { events.lock().clone() };
     assert_eq!(
-        *events.lock(),
+        events_seen,
         ["wire:registry", "pre_init:registry", "pre_init:a"]
     );
     assert!(fake.sent.lock().is_empty());
+}
+
+/// A `gts_publication` policy on a gear that publishes nothing is refused
+/// before any gear runs, not silently ignored.
+#[tokio::test]
+async fn a_publication_policy_on_a_non_publisher_is_refused() {
+    struct Configured(serde_json::Value);
+    impl ConfigProvider for Configured {
+        fn get_gear_config(&self, gear: &str) -> Option<&serde_json::Value> {
+            self.0.get(gear)
+        }
+    }
+    let events: Events = Arc::default();
+    let mut builder = RegistryBuilder::default();
+    register(&mut builder, PubGear::new("c", None, &events));
+    let runtime = HostRuntime::new(
+        builder.build_topo_sorted().unwrap(),
+        Arc::new(Configured(serde_json::json!({
+            "c": { "config": { "gts_publication": { "timeout": "5s" } } }
+        }))) as Arc<dyn ConfigProvider>,
+        DbOptions::None,
+        Arc::new(ClientHub::new()),
+        CancellationToken::new(),
+        Uuid::new_v4(),
+        None,
+    );
+
+    let err = tokio::time::timeout(Duration::from_secs(5), runtime.run_gear_phases())
+        .await
+        .expect("refused before any gear runs")
+        .unwrap_err();
+
+    let message = format!("{err:#}");
+    assert!(
+        message.contains("gears.c.config.gts_publication is set")
+            && message.contains("no `gts_publication(...)`"),
+        "{message}"
+    );
+    assert!(events.lock().is_empty(), "no hook ran: {:?}", events.lock());
+}
+
+/// Composing REST routes before the host prepared its router is refused, not
+/// composed onto an empty router without the host's layers.
+#[tokio::test]
+async fn rest_composition_needs_the_prepared_router() {
+    let runtime = runtime(
+        RegistryBuilder::default().build_topo_sorted().unwrap(),
+        &FakeRegistry::with(&[]),
+        &CancellationToken::new(),
+    );
+
+    let err = runtime
+        .compose_rest(
+            &[],
+            &crate::api::OpenApiRegistryImpl::new(),
+            &Arc::new(crate::healthcheck::RestHealthcheckRegistry::new()),
+        )
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(err, crate::registry::RegistryError::RestNotPrepared),
+        "{err}"
+    );
+}
+
+/// The client [`WIRED_CLIENT`] puts in the hub.
+pub(super) struct WiredClient;
+
+#[allow(
+    clippy::unnecessary_wraps,
+    clippy::needless_pass_by_value,
+    reason = "must match the WireFn signature the consumes macro emits"
+)]
+fn wire_client(
+    hub: &ClientHub,
+    _resolver: Arc<dyn crate::discovery::EndpointResolver>,
+    _tuning: toolkit_contract::wiring::ClientTuning,
+) -> anyhow::Result<crate::discovery::WireOutcome> {
+    hub.register::<WiredClient>(Arc::new(WiredClient));
+    Ok(crate::discovery::WireOutcome::Local)
+}
+
+/// What `#[toolkit::consumes]` would link for the `consumer` gear.
+pub(super) static WIRED_CLIENT: crate::discovery::ConsumerRegistration =
+    crate::discovery::ConsumerRegistration {
+        owner_gear: "consumer",
+        dep_gear: "provider",
+        wire: wire_client,
+    };
+
+/// An application gear recording whether its consumed client was in the hub
+/// in `init` and in `post_init`.
+#[derive(Default)]
+pub(super) struct Consumer {
+    hub: std::sync::OnceLock<Arc<ClientHub>>,
+    pub(super) in_init: std::sync::atomic::AtomicBool,
+    pub(super) in_post_init: std::sync::atomic::AtomicBool,
+    pub(super) post_init_ran: std::sync::atomic::AtomicBool,
+}
+
+#[async_trait]
+impl Gear for Consumer {
+    async fn init(&self, ctx: &GearCtx) -> anyhow::Result<()> {
+        let hub = ctx.client_hub();
+        self.in_init.store(
+            hub.try_get::<WiredClient>().is_some(),
+            std::sync::atomic::Ordering::SeqCst,
+        );
+        drop(self.hub.set(hub));
+        Ok(())
+    }
+
+    async fn post_init(&self, _ctx: &GearCtx) -> anyhow::Result<()> {
+        let wired = self
+            .hub
+            .get()
+            .is_some_and(|hub| hub.try_get::<WiredClient>().is_some());
+        self.in_post_init
+            .store(wired, std::sync::atomic::Ordering::SeqCst);
+        self.post_init_ran
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+/// The in-process startup wires a consumed client after the application
+/// group's `init` and before its `post_init`.
+#[tokio::test]
+async fn a_consumed_client_is_wired_between_init_and_post_init() {
+    let consumer = Arc::new(Consumer::default());
+    let mut builder = RegistryBuilder::default();
+    builder.register_core_with_meta("consumer", &[], consumer.clone() as Arc<dyn Gear>);
+    let cancel = CancellationToken::new();
+    let runtime = runtime_with_hub(
+        builder.build_topo_sorted().unwrap(),
+        Arc::new(ClientHub::new()),
+        &cancel,
+    )
+    .with_consumer_registrations(vec![&WIRED_CLIENT]);
+    let running = tokio::spawn(runtime.run_gear_phases());
+    until("post_init", || {
+        consumer
+            .post_init_ran
+            .load(std::sync::atomic::Ordering::SeqCst)
+    })
+    .await;
+    cancel.cancel();
+    running.await.unwrap().unwrap();
+
+    assert!(
+        !consumer.in_init.load(std::sync::atomic::Ordering::SeqCst),
+        "not yet in init"
+    );
+    assert!(
+        consumer
+            .in_post_init
+            .load(std::sync::atomic::Ordering::SeqCst),
+        "wired before post_init"
+    );
 }
 
 /// A system gear initializes before the barrier: it cannot publish.
@@ -888,9 +1065,9 @@ async fn the_registry_clients_are_wired_early_and_once() {
     runtime
         .wire_registry_clients_over(&manifests, &[&TENANT, &OTHER])
         .unwrap();
+    let early_seen = { EARLY.lock().unwrap().len() };
     assert_eq!(
-        EARLY.lock().unwrap().len(),
-        2,
+        early_seen, 2,
         "the publisher and the tenant contract, not the other provider's"
     );
     assert_eq!(
@@ -902,7 +1079,8 @@ async fn the_registry_clients_are_wired_early_and_once() {
         .wire_consumer_registrations(&[&TENANT, &OTHER])
         .unwrap();
     assert_eq!(late.len(), 1, "the registry clients are not wired again");
-    assert_eq!(EARLY.lock().unwrap().len(), 3);
+    let early_seen = { EARLY.lock().unwrap().len() };
+    assert_eq!(early_seen, 3);
 }
 
 /// An empty manifest needs no registry: its publisher client is not wired and
@@ -991,6 +1169,8 @@ struct FakeBackend {
     spawned: Mutex<Vec<String>>,
     stopped: std::sync::atomic::AtomicBool,
     fail: Option<&'static str>,
+    /// `shutdown_all` never returns, as with a child that cannot be reaped.
+    hang: bool,
 }
 
 #[async_trait]
@@ -1008,7 +1188,54 @@ impl crate::backends::OopBackend for Arc<FakeBackend> {
     async fn shutdown_all(&self) {
         self.stopped
             .store(true, std::sync::atomic::Ordering::SeqCst);
+        if self.hang {
+            std::future::pending::<()>().await;
+        }
     }
+}
+
+/// A backend whose shutdown never ends delays the in-process gears' stop by
+/// the shutdown deadline, not forever.
+#[tokio::test]
+async fn a_hung_child_shutdown_does_not_block_the_gears_stop() {
+    let events = Events::default();
+    let backend = Arc::new(FakeBackend {
+        hang: true,
+        ..FakeBackend::default()
+    });
+    let mut builder = RegistryBuilder::default();
+    register(&mut builder, PubGear::new("app", None, &events));
+    let cancel = CancellationToken::new();
+    let runtime = HostRuntime::new(
+        builder.build_topo_sorted().unwrap(),
+        Arc::new(NoConfig) as Arc<dyn ConfigProvider>,
+        DbOptions::None,
+        Arc::new(ClientHub::new()),
+        cancel.clone(),
+        Uuid::new_v4(),
+        Some(crate::runtime::OopSpawnOptions {
+            gears: vec![child("first")],
+            backend: Box::new(Arc::clone(&backend)),
+        }),
+    )
+    .with_shutdown_deadline(std::time::Duration::from_millis(200));
+    let run = tokio::spawn(runtime.run_gear_phases());
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !events.lock().iter().any(|e| e == "start:app") {
+        assert!(tokio::time::Instant::now() < deadline, "app started");
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    cancel.cancel();
+    let result = tokio::time::timeout(std::time::Duration::from_secs(5), run)
+        .await
+        .expect("the hung child shutdown is abandoned")
+        .expect("no panic");
+
+    result.expect("clean shutdown");
+    assert!(backend.stopped.load(std::sync::atomic::Ordering::SeqCst));
+    let stopped = { events.lock().iter().any(|e| e == "stop:app") };
+    assert!(stopped, "the started gear stopped");
 }
 
 fn child(name: &str) -> crate::runtime::OopGearSpawnConfig {
@@ -1153,8 +1380,9 @@ async fn each_group_runs_its_own_hooks_and_the_legacy_finalization_once() {
         fake.held.load(std::sync::atomic::Ordering::SeqCst) == 1
     })
     .await;
+    let events_seen = { events.lock().clone() };
     assert_eq!(
-        *events.lock(),
+        events_seen,
         GROUPED_STARTUP[..7],
         "no application init while a manifest is pending"
     );
@@ -1164,7 +1392,8 @@ async fn each_group_runs_its_own_hooks_and_the_legacy_finalization_once() {
         checker.unresolved_deps().is_empty()
     })
     .await;
-    assert_eq!(*events.lock(), GROUPED_STARTUP);
+    let events_seen = { events.lock().clone() };
+    assert_eq!(events_seen, GROUPED_STARTUP);
 
     cancel.cancel();
     running.await.unwrap().unwrap();
@@ -1327,14 +1556,16 @@ async fn system_clients_are_wired_with_their_group_the_rest_after_application_in
     EARLY.lock().unwrap().clear();
 
     runtime.wire_system_clients(&all).unwrap();
-    assert_eq!(EARLY.lock().unwrap().len(), 2);
+    let early_seen = { EARLY.lock().unwrap().len() };
+    assert_eq!(early_seen, 2);
     assert_eq!(
         sorted(runtime.dep_checker.unresolved_deps()),
         ["application/preparation", "billing", "sys"]
     );
 
     runtime.wire_consumer_registrations(&all).unwrap();
-    assert_eq!(EARLY.lock().unwrap().len(), 4, "the other two, once each");
+    let early_seen = { EARLY.lock().unwrap().len() };
+    assert_eq!(early_seen, 4, "the other two, once each");
     assert_eq!(
         sorted(runtime.dep_checker.unresolved_deps()),
         ["application/preparation", "billing", "remote-only", "sys"]
@@ -1380,4 +1611,163 @@ async fn a_client_wired_before_its_application_provider_is_refused() {
         "{err:#}"
     );
     assert!(events.lock().is_empty(), "no gear ran: {:?}", events.lock());
+}
+
+// The late gRPC batch: the application group's services, handed to a hub of
+// the system group already running, and its acknowledgement.
+
+struct LateHub;
+
+impl crate::contracts::GrpcHubCapability for LateHub {
+    fn bound_endpoint(&self) -> Option<String> {
+        Some("http://127.0.0.1:1".to_owned())
+    }
+}
+
+struct LateService;
+
+#[async_trait]
+impl Gear for LateService {
+    async fn init(&self, _ctx: &GearCtx) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl crate::contracts::GrpcServiceCapability for LateService {
+    async fn get_grpc_services(
+        &self,
+        _ctx: &GearCtx,
+    ) -> anyhow::Result<Vec<crate::contracts::RegisterGrpcServiceFn>> {
+        Ok(vec![crate::contracts::RegisterGrpcServiceFn {
+            service_name: "test.Late",
+            #[cfg(feature = "otel")]
+            register: Box::new(|_| {}),
+        }])
+    }
+}
+
+/// A system hub and an application gRPC gear; `hub_runs` marks the hub
+/// started, as the system group's `start` does.
+fn late_grpc_runtime(hub_runs: bool) -> HostRuntime {
+    let events = Events::default();
+    let mut builder = RegistryBuilder::default();
+    register(&mut builder, PubGear::system_gear("hub", &events));
+    builder.register_grpc_hub_with_meta(
+        "hub",
+        Arc::new(LateHub) as Arc<dyn crate::contracts::GrpcHubCapability>,
+    );
+    builder.register_core_with_meta("svc", &[], Arc::new(LateService) as Arc<dyn Gear>);
+    builder.register_grpc_service_with_meta(
+        "svc",
+        Arc::new(LateService) as Arc<dyn crate::contracts::GrpcServiceCapability>,
+    );
+    let runtime = runtime(
+        builder.build_topo_sorted().unwrap(),
+        &FakeRegistry::with(&[]),
+        &CancellationToken::new(),
+    );
+    if hub_runs {
+        runtime.start_called.lock().insert("hub");
+    }
+    runtime
+}
+
+/// What the running hub does with the late batch.
+enum HubAnswer {
+    Installed,
+    Refused,
+    Dropped,
+}
+
+/// `err` and its sources, as `{:#}` prints an `anyhow::Error`.
+fn chain(err: &RegistryError) -> String {
+    let mut text = err.to_string();
+    let mut source = std::error::Error::source(err);
+    while let Some(cause) = source {
+        text.push_str(": ");
+        text.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    text
+}
+
+async fn late_phase_with(answer: HubAnswer) -> Result<(), RegistryError> {
+    let runtime = late_grpc_runtime(true);
+    let store = Arc::clone(&runtime.grpc_installers);
+    let hub = async move {
+        let batch = store.next_late().await.expect("the late batch");
+        assert_eq!(batch.gears.len(), 1);
+        match answer {
+            HubAnswer::Installed => batch.ack(Ok(())),
+            HubAnswer::Refused => batch.ack(Err(anyhow::anyhow!("listener refused"))),
+            HubAnswer::Dropped => drop(batch),
+        }
+    };
+    let mut seen = HashSet::new();
+    let (result, ()) = tokio::join!(runtime.run_grpc_late_phase(&mut seen), hub);
+    result
+}
+
+#[tokio::test]
+async fn the_late_grpc_phase_returns_once_the_hub_installed_the_batch() {
+    late_phase_with(HubAnswer::Installed)
+        .await
+        .expect("acknowledged");
+}
+
+#[tokio::test]
+async fn a_late_grpc_batch_the_hub_refuses_fails_startup() {
+    let err = late_phase_with(HubAnswer::Refused).await.unwrap_err();
+    assert!(
+        matches!(&err, RegistryError::GrpcRegister { gear, .. } if gear == "hub"),
+        "{err}"
+    );
+    assert!(chain(&err).contains("listener refused"), "{err:#}");
+}
+
+#[tokio::test]
+async fn a_late_grpc_batch_the_hub_drops_fails_startup() {
+    let err = late_phase_with(HubAnswer::Dropped).await.unwrap_err();
+    assert!(
+        chain(&err).contains("dropped the late services uninstalled"),
+        "{}",
+        chain(&err)
+    );
+}
+
+/// A running hub that never answers fails startup after the install timeout.
+#[tokio::test(start_paused = true)]
+async fn a_late_grpc_batch_never_acknowledged_times_out() {
+    let runtime = late_grpc_runtime(true);
+    let started = tokio::time::Instant::now();
+
+    let err = runtime
+        .run_grpc_late_phase(&mut HashSet::new())
+        .await
+        .unwrap_err();
+
+    assert_eq!(started.elapsed(), super::LATE_GRPC_INSTALL_TIMEOUT);
+    assert!(
+        chain(&err).contains("did not install the late services within 30s"),
+        "{}",
+        chain(&err)
+    );
+}
+
+/// A hub of the application group has not started yet: the batch waits for
+/// it, and the phase does not wait for an acknowledgement nobody can give.
+#[tokio::test(start_paused = true)]
+async fn a_late_grpc_batch_waits_for_a_hub_not_started_yet() {
+    let runtime = late_grpc_runtime(false);
+    let started = tokio::time::Instant::now();
+
+    runtime
+        .run_grpc_late_phase(&mut HashSet::new())
+        .await
+        .expect("no acknowledgement awaited");
+
+    assert_eq!(started.elapsed(), Duration::ZERO);
+    let batch = runtime.grpc_installers.next_late().await;
+    assert!(batch.is_some(), "queued for the hub's start");
 }

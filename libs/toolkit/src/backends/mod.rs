@@ -91,7 +91,8 @@ pub trait OopBackend: Send + Sync {
     async fn spawn(&self, config: OopSpawnConfig) -> Result<()>;
 
     /// Stop every spawned instance and wait for it to end: the runtime calls
-    /// it when startup fails after a spawn, and at shutdown.
+    /// it when startup fails after a spawn, and at shutdown. The runtime waits
+    /// at most its shutdown deadline, then stops its in-process gears anyway.
     async fn shutdown_all(&self);
 }
 

@@ -238,8 +238,9 @@ async fn a_legacy_only_registry_serves_only_legacy_and_is_not_discovered() {
         }) => {}
     }
 
+    let registered_seen = { directory.registered.lock().clone() };
     assert_eq!(
-        directory.registered.lock().clone(),
+        registered_seen,
         vec![PROBE.to_owned()],
         "the registry is not advertised as a REST provider"
     );

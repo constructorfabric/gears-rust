@@ -545,13 +545,18 @@ fn layer_gear_router(
     // without an internal authenticator, tenant and unlisted routes without a bearer
     // authenticator (unless `auth_disabled`). `check_route_auth` refuses to start
     // before that can happen for a declared tenant operation.
-    let mut gear = layer_route_auth_with(
+    let gear = layer_route_auth_with(
         gear_router,
         route_auth,
         tenant_plane,
         options.internal_authenticator.clone(),
     );
+    layer_serving(gear, drain_guard)
+}
 
+/// The layers every served gear router gets outside its auth stack: drain guard,
+/// canonical errors and the trace context.
+fn layer_serving(mut gear: Router, drain_guard: DrainGuard) -> Router {
     // Drain guard sits just inside the canonical-error layer: it rejects new
     // requests while draining and tracks the in-flight count (catching handler
     // panics so the counter can never leak and stall the drain).
@@ -710,6 +715,10 @@ pub(super) struct OopHttpServer {
     options: OopServeOptions,
     cancel: CancellationToken,
     registration_task: Option<tokio::task::JoinHandle<()>>,
+    /// The `OpenAPI` document `registration_task` registers, and the channel
+    /// replacing its registration info.
+    presence_openapi: Option<Arc<str>>,
+    presence_updates: Option<tokio::sync::watch::Sender<RegisterInstanceInfo>>,
     /// Presence of co-hosted provider gears other than `options.gear_name`
     /// (the system group's, published before the application group), each
     /// deregistered on [`join`](Self::join) like the root's.
@@ -809,6 +818,8 @@ impl OopHttpServer {
             options,
             cancel,
             registration_task: None,
+            presence_openapi: None,
+            presence_updates: None,
             provider_presence: Vec::new(),
             serve: Some(serve),
         })
@@ -891,19 +902,22 @@ impl OopHttpServer {
         openapi_json: String,
         route_auth: RouteAuthPolicy,
     ) {
-        let gated = gear_router.layer(from_fn_with_state(
-            Arc::new(route_auth.clone()),
+        // Only platform and anonymous routes pass the gate, so the auth stack
+        // inside it has no tenant plane: an anonymous route keeps its anonymous
+        // `SecurityContext`, whatever `auth_disabled` says, and no tenant route
+        // reaches it to be refused or warned about. Tenant authentication is
+        // installed with the final routes.
+        let authenticated = layer_route_auth_with(
+            gear_router,
+            route_auth.without_tenant_routes(),
+            TenantPlane::Absent,
+            self.options.internal_authenticator.clone(),
+        );
+        let gated = authenticated.layer(from_fn_with_state(
+            Arc::new(route_auth),
             bootstrap_plane_gate,
         ));
-        // The bootstrap gate returns 503 for every tenant route before it can
-        // reach a handler; tenant authentication is installed with the final routes.
-        let layered = layer_gear_router(
-            gated,
-            route_auth,
-            TenantPlane::Disabled,
-            self.drain_guard.clone(),
-            &self.options,
-        );
+        let layered = layer_serving(gated, self.drain_guard.clone());
         self.late.publish(layered, Arc::from(openapi_json));
         tracing::info!(
             gear = %self.options.gear_name,
@@ -944,36 +958,54 @@ impl OopHttpServer {
     }
 
     /// Start background directory presence (registration + heartbeat +
-    /// self-heal) of the advertised gear. Started at most once; it carries
-    /// the `OpenAPI` document published so far.
+    /// self-heal) of the advertised gear, carrying the `OpenAPI` document
+    /// published so far. Called again once that document changed — a system
+    /// root's, when its application group attached — it hands the running
+    /// presence the new one, which it registers without disturbing the
+    /// heartbeats, so the directory, and the gateway proxying from it, see the
+    /// routes now served; otherwise it does nothing.
     pub(super) fn start_presence(&mut self) {
-        if self.registration_task.is_some() {
+        let openapi = self.late.openapi();
+        if let Some(updates) = &self.presence_updates {
+            if self.presence_openapi != openapi {
+                updates.send_replace(self.registration_info(openapi.as_ref()));
+                self.presence_openapi = openapi;
+            }
             return;
         }
+        let registration_info = self.registration_info(openapi.as_ref());
+        self.presence_openapi = openapi;
+        let (updates, presence) = tokio::sync::watch::channel(registration_info);
+        self.presence_updates = Some(updates);
+        let directory = Arc::clone(&self.options.directory);
+        let heartbeat_interval = self.options.heartbeat_interval;
+        let cancel = self.cancel.clone();
+        self.registration_task = Some(tokio::spawn(async move {
+            super::oop_registration::presence_loop_with_updates(
+                directory,
+                presence,
+                heartbeat_interval,
+                cancel,
+            )
+            .await;
+        }));
+    }
+
+    /// The advertised gear's registration, with `openapi`.
+    fn registration_info(&self, openapi: Option<&Arc<str>>) -> RegisterInstanceInfo {
         let mut registration_info = RegisterInstanceInfo::new(
             self.options.gear_name.clone(),
             self.options.instance_id.clone(),
         )
         .with_rest_endpoint(ServiceEndpoint::new(self.options.advertise_uri.clone()))
         .with_labels(self.options.labels.clone());
-        if let Some(openapi) = self.late.openapi() {
+        if let Some(openapi) = openapi {
             registration_info = registration_info.with_openapi_spec(openapi.to_string());
         }
         if let Some(version) = self.options.version.clone() {
             registration_info = registration_info.with_version(version);
         }
-        let directory = Arc::clone(&self.options.directory);
-        let heartbeat_interval = self.options.heartbeat_interval;
-        let cancel = self.cancel.clone();
-        self.registration_task = Some(tokio::spawn(async move {
-            super::oop_registration::presence_loop(
-                directory,
-                registration_info,
-                heartbeat_interval,
-                cancel,
-            )
-            .await;
-        }));
+        registration_info
     }
 
     /// Present `gear`, a provider co-hosted with the advertised gear, in the

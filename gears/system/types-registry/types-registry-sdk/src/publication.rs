@@ -107,11 +107,13 @@ impl<'a> Publication<'a> {
     ) -> Result<Self, PublicationInputError> {
         let publisher = PublisherContext {
             name: publisher_name.to_owned(),
-            version: publisher_version.parse().map_err(|e| {
-                PublicationInputError(format!(
-                    "{publisher_name}: publisher version {publisher_version}: {e}"
-                ))
-            })?,
+            version: publisher_version
+                .parse()
+                .map_err(|source| PublicationInputError {
+                    publisher: publisher_name.to_owned(),
+                    version: publisher_version.to_owned(),
+                    source,
+                })?,
         };
         Ok(Self::new(registry, publisher, documents.to_vec()))
     }
@@ -218,7 +220,8 @@ impl<'a, F> Publication<'a, F> {
             retry_backoff_max,
             deadline: budget,
             absolute_deadline,
-            ..ReconcileOptions::default()
+            // A publisher's desired set may wait on another writer's base type.
+            stop_when_stalled: false,
         };
         crate::reconciliation::reconcile_with_progress(
             registry,
@@ -246,17 +249,26 @@ impl<'a, F> Publication<'a, F> {
     }
 }
 
-/// An invalid publisher version or GTS id in a manifest, found before any request.
+/// An invalid publisher version in a manifest, found before any request; the
+/// parse error is its [`Error::source`].
 #[derive(Debug)]
-pub struct PublicationInputError(String);
+pub struct PublicationInputError {
+    publisher: String,
+    version: String,
+    source: crate::PublisherVersionError,
+}
 
 impl fmt::Display for PublicationInputError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
+        write!(f, "{}: publisher version {}", self.publisher, self.version)
     }
 }
 
-impl Error for PublicationInputError {}
+impl Error for PublicationInputError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        Some(&self.source)
+    }
+}
 
 /// A startup publication failure with the original canonical error as its source.
 ///
@@ -318,6 +330,25 @@ impl PublicationError {
             ),
         }
     }
+}
+
+impl PublicationError {
+    /// Whether the publication stopped because its budget ran out — the caller's
+    /// deadline or the configured `timeout` — rather than on a refusal: the
+    /// report's stop reason is [`ReconcileStop::Deadline`](crate::ReconcileStop::Deadline).
+    #[must_use]
+    pub fn is_expired(&self) -> bool {
+        self.report
+            .as_ref()
+            .is_some_and(|report| report.stop == crate::ReconcileStop::Deadline)
+    }
+}
+
+/// [`PublicationError::is_expired`], in the publisher-adapter interface of
+/// `toolkit::gts_publication`.
+#[must_use]
+pub fn expired(error: &PublicationError) -> bool {
+    error.is_expired()
 }
 
 impl Error for PublicationError {

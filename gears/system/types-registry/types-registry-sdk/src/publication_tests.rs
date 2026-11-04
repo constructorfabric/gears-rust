@@ -378,10 +378,10 @@ fn invalid_input_is_reported_before_any_request() {
             panic!("{version} is invalid");
         };
         let message = error.to_string();
-        assert!(
-            message.starts_with(&format!("my-gear: publisher version {version}: ")),
-            "{message}"
-        );
+        assert_eq!(message, format!("my-gear: publisher version {version}"));
+        let source = std::error::Error::source(&error)
+            .and_then(|source| source.downcast_ref::<crate::PublisherVersionError>());
+        assert!(source.is_some(), "the parse error is kept as the source");
     }
     assert_eq!(registry.calls(Call::BatchGet), 0);
     assert!(registry.submissions().is_empty());

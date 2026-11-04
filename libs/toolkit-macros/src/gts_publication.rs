@@ -197,7 +197,10 @@ pub fn expand(cfg: &GtsPublicationCfg, ident: &Ident, name: &LitStr) -> TokenStr
                 hub: &::toolkit::ClientHub,
             ) -> ::anyhow::Result<::toolkit::gts_publication::GtsPublicationBackend> {
                 let registry = hub.get::<#publisher::Registry>().map_err(|e| {
-                    ::anyhow::anyhow!("{}: no registry client to publish GTS documents: {e}", #name)
+                    ::anyhow::Error::new(e).context(::std::format!(
+                        "{}: no registry client to publish GTS documents",
+                        #name
+                    ))
                 })?;
                 ::core::result::Result::Ok(::toolkit::gts_publication::GtsPublicationBackend::new(
                     move |request: ::toolkit::gts_publication::GtsPublicationRequest| {
@@ -222,7 +225,15 @@ pub fn expand(cfg: &GtsPublicationCfg, ident: &Ident, name: &LitStr) -> TokenStr
                             .publish(request.cancel())
                             .await
                             .map(|_| ())
-                            .map_err(::anyhow::Error::from)
+                            .map_err(|error| {
+                                let expired = #publisher::expired(&error);
+                                let error = ::anyhow::Error::from(error);
+                                if expired {
+                                    error.context(::toolkit::gts_publication::GtsPublicationExpired)
+                                } else {
+                                    error
+                                }
+                            })
                         }
                     },
                 ))
@@ -240,7 +251,6 @@ pub fn expand(cfg: &GtsPublicationCfg, ident: &Ident, name: &LitStr) -> TokenStr
         }
 
         #[doc(hidden)]
-        #[allow(non_snake_case)]
         fn #wire_fn(
             hub: &::toolkit::ClientHub,
             resolver: ::std::sync::Arc<dyn ::toolkit::discovery::EndpointResolver>,

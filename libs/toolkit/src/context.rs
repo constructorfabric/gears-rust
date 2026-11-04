@@ -244,8 +244,8 @@ impl GearCtx {
         self.internal_token_provider.clone()
     }
 
-    /// Attach this gear's admitted GTS manifest.
-    pub fn with_gts_publication_manifest(
+    /// Attach this gear's admitted GTS manifest: the runtime's, after the barrier.
+    pub(crate) fn with_gts_publication_manifest(
         mut self,
         manifest: Arc<crate::gts_publication::GtsManifest>,
     ) -> Self {

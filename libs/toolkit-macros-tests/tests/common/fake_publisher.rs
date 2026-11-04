@@ -1,5 +1,8 @@
 //! A publisher adapter with the interface `gts_publication(publisher = ...)` expects.
-#![allow(dead_code)]
+#![allow(
+    dead_code,
+    reason = "shared by several test crates, each using a subset; `expect` would go unfulfilled in those using all of it"
+)]
 
 use std::num::NonZeroUsize;
 use std::sync::Arc;
@@ -155,6 +158,12 @@ impl<'a> Publication<'a> {
             .await
             .map_err(PublishError)
     }
+}
+
+/// Whether `publish` failed on an expired budget: the fake registry refuses
+/// with an `expired:` message for that.
+pub fn expired(error: &PublishError) -> bool {
+    error.0.starts_with("expired:")
 }
 
 /// One admitted publication: `(publisher name, version)` and its documents.

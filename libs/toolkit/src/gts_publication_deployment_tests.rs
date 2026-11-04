@@ -9,7 +9,9 @@ use toolkit_contract::wiring::ClientTuning;
 
 use super::*;
 use crate::discovery::{EndpointResolver, WireOutcome};
-use crate::gts_publication::{DeclarationSource, GtsPublicationBackend, GtsPublicationRequest};
+use crate::gts_publication::{
+    DeclarationSource, GtsPublicationBackend, GtsPublicationExpired, GtsPublicationRequest,
+};
 
 const ENDPOINT: &str = "https://registry.example:8443";
 const BASE: &str = "gts.cf.test.publication.base.v1~";
@@ -68,6 +70,11 @@ fn backend(hub: &ClientHub) -> anyhow::Result<GtsPublicationBackend> {
                     if document.get("refuse").is_some() {
                         anyhow::bail!("{id}: rejected");
                     }
+                    if document.get("expire").is_some() {
+                        // The gear's own budget, shorter than the job's deadline.
+                        return Err(anyhow::anyhow!("{id}: deadline reached")
+                            .context(GtsPublicationExpired));
+                    }
                     if id.id() == DERIVED {
                         loop {
                             let base_admitted = registry.base_admitted.notified();
@@ -115,6 +122,16 @@ fn refused() -> Vec<DeclarationSource> {
     )]
 }
 
+fn expiring() -> Vec<DeclarationSource> {
+    vec![DeclarationSource::new(
+        "t",
+        vec![(
+            "gts.cf.test.publication.expiring.v1~".to_owned(),
+            json!({"expire": true}).to_string(),
+        )],
+    )]
+}
+
 fn hanging() -> Vec<DeclarationSource> {
     vec![DeclarationSource::new(
         "t",
@@ -143,6 +160,7 @@ descriptor!(DERIVED_PUB, "derived-publisher", derived);
 descriptor!(BASE_PUB, "base-publisher", base);
 descriptor!(REFUSED_PUB, "refused-publisher", refused);
 descriptor!(HANGING_PUB, "hanging-publisher", hanging);
+descriptor!(EXPIRING_PUB, "expiring-publisher", expiring);
 
 struct NoConfig;
 
@@ -188,9 +206,12 @@ async fn publishers_run_concurrently_against_the_explicit_registry() {
     let report = report.unwrap();
 
     assert!(report.succeeded(), "{report}");
-    assert_eq!(*registry.admitted.lock(), [BASE, DERIVED]);
-    assert_eq!(registry.endpoint.lock().as_deref(), Some(ENDPOINT));
-    assert_eq!(registry.token.lock().as_deref(), Some("platform-token"));
+    let admitted_seen = { registry.admitted.lock().clone() };
+    assert_eq!(admitted_seen, [BASE, DERIVED]);
+    let endpoint_seen = { registry.endpoint.lock().clone() };
+    assert_eq!(endpoint_seen.as_deref(), Some(ENDPOINT));
+    let token_seen = { registry.token.lock().clone() };
+    assert_eq!(token_seen.as_deref(), Some("platform-token"));
 }
 
 /// A refusal is reported per publisher, with its GTS id; the others still run.
@@ -226,7 +247,8 @@ async fn the_deadline_ends_pending_publishers() {
     let (report, registry) = run(&[&HANGING_PUB, &BASE_PUB], Duration::from_secs(30)).await;
     let report = report.unwrap();
 
-    assert_eq!(*registry.deadlines.lock(), [Some(deadline), Some(deadline)]);
+    let deadlines_seen = { registry.deadlines.lock().clone() };
+    assert_eq!(deadlines_seen, [Some(deadline), Some(deadline)]);
 
     assert!(!report.succeeded());
     assert_eq!(
@@ -244,6 +266,66 @@ async fn the_deadline_ends_pending_publishers() {
             ),
         ]
     );
+}
+
+/// A publisher whose own budget runs out before the job's deadline is reported
+/// as not confirmed in time, with its GTS ids, not as refused.
+#[tokio::test]
+async fn a_gear_budget_expiry_is_a_deadline_not_a_refusal() {
+    let _serial = SERIAL.lock().await;
+    let (report, _) = run(&[&EXPIRING_PUB, &BASE_PUB], Duration::from_secs(10)).await;
+    let report = report.unwrap();
+
+    assert!(!report.succeeded());
+    assert_eq!(
+        report.publishers,
+        [
+            (
+                "expiring-publisher",
+                GtsDeploymentOutcome::DeadlineExceeded {
+                    unconfirmed: vec!["gts.cf.test.publication.expiring.v1~".to_owned()]
+                }
+            ),
+            (
+                "base-publisher",
+                GtsDeploymentOutcome::Published { documents: 1 }
+            ),
+        ]
+    );
+}
+
+/// The platform credential never goes to an endpoint that is not an absolute
+/// http(s) URI: the job fails before any wiring.
+#[tokio::test]
+async fn a_relative_or_foreign_registry_endpoint_fails_before_wiring() {
+    let _serial = SERIAL.lock().await;
+    for endpoint in [
+        "registry:8443",
+        "/registry",
+        "ftp://registry",
+        "not a uri",
+        "https://:8443",
+    ] {
+        let registry = Arc::new(RemoteRegistry::default());
+        *REGISTRY.lock() = Some(Arc::clone(&registry));
+        let err = publish(
+            &[&BASE_PUB],
+            &NoConfig,
+            endpoint,
+            &tuning(),
+            Duration::from_secs(10),
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            err.to_string().contains("registry endpoint"),
+            "{endpoint}: {err:#}"
+        );
+        let token = { registry.token.lock().clone() };
+        assert_eq!(token, None, "{endpoint}: no wiring, so no credential");
+    }
 }
 
 /// Two publishers of one GTS id fail the job before any request.

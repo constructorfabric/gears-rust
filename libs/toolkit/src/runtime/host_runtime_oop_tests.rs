@@ -72,6 +72,8 @@ struct RecordingDirectory {
     deregister_calls: AtomicUsize,
     registered_endpoint: Mutex<Option<String>>,
     registered_gears: Mutex<Vec<String>>,
+    /// The `OpenAPI` document of each registration, in order.
+    registered_openapi: Mutex<Vec<Option<String>>>,
 }
 
 #[async_trait]
@@ -95,6 +97,9 @@ impl DirectoryClient for RecordingDirectory {
         if let Some(ep) = &info.rest_endpoint {
             *self.registered_endpoint.lock() = Some(ep.uri.clone());
         }
+        self.registered_openapi
+            .lock()
+            .push(info.openapi_spec.clone());
         self.registered_gears.lock().push(info.gear);
         self.register_calls.fetch_add(1, Ordering::SeqCst);
         Ok(())
@@ -254,8 +259,9 @@ async fn e2e_oop_gear_boots_serves_registers_and_shuts_down() {
         registered,
         "the gear should self-register with the directory"
     );
+    let registered_endpoint_seen = { directory.registered_endpoint.lock().clone() };
     assert_eq!(
-        directory.registered_endpoint.lock().clone(),
+        registered_endpoint_seen,
         Some(format!("http://{addr}")),
         "the advertised REST endpoint should be registered"
     );
@@ -620,6 +626,8 @@ async fn a_worker_with_a_hub_tenant_authenticator_starts_and_checks_bearers() {
 struct HeldRegistry {
     release: tokio::sync::Notify,
     dropped: Arc<std::sync::atomic::AtomicBool>,
+    /// Refuses every publication at once instead.
+    refuse: bool,
 }
 
 /// Sets its flag when dropped.
@@ -637,6 +645,7 @@ fn held_backend(hub: &ClientHub) -> anyhow::Result<crate::gts_publication::GtsPu
         move |_| {
             let held = Arc::clone(&held);
             async move {
+                anyhow::ensure!(!held.refuse, "rejected: incompatible");
                 let flag = DropFlag(Arc::clone(&held.dropped));
                 held.release.notified().await;
                 std::mem::forget(flag);
@@ -794,6 +803,33 @@ async fn an_oop_publishing_gear_is_neither_served_nor_advertised_before_admissio
 struct SystemMarker;
 impl crate::contracts::SystemCapability for SystemMarker {}
 
+/// An application gear with a documented route.
+struct DocumentedApp;
+
+#[async_trait]
+impl Gear for DocumentedApp {
+    async fn init(&self, _ctx: &GearCtx) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
+impl RestApiCapability for DocumentedApp {
+    fn register_rest(
+        &self,
+        _ctx: &GearCtx,
+        router: Router,
+        openapi: &dyn OpenApiRegistry,
+    ) -> anyhow::Result<Router> {
+        use crate::api::OperationBuilder;
+        Ok(OperationBuilder::get("/app-doc")
+            .operation_id("app.doc")
+            .anonymous()
+            .handler(|| async { "doc" })
+            .text_response(http::StatusCode::OK, "OK", "text/plain")
+            .register(router, openapi))
+    }
+}
+
 /// A system root serves its platform-plane and anonymous routes and
 /// is present in the directory while its co-hosted application group waits
 /// for admission: other processes must still discover it (a registry, say)
@@ -820,6 +856,15 @@ async fn a_system_root_serves_and_is_present_while_the_application_group_waits()
     builder.register_gts_publication_with_meta(
         "publishing-ping",
         side.clone() as Arc<dyn crate::gts_publication::GtsPublicationCapability>,
+    );
+    builder.register_core_with_meta(
+        "documented-app",
+        &[],
+        Arc::new(DocumentedApp) as Arc<dyn Gear>,
+    );
+    builder.register_rest_with_meta(
+        "documented-app",
+        Arc::new(DocumentedApp) as Arc<dyn RestApiCapability>,
     );
     let hub = Arc::new(ClientHub::new());
     hub.register::<PublishingPing>(Arc::clone(&side));
@@ -887,6 +932,37 @@ async fn a_system_root_serves_and_is_present_while_the_application_group_waits()
         "the same listener keeps the platform routes"
     );
     assert!(poll_status(addr, "/readyz", 200, Duration::from_secs(5)).await);
+    let first = {
+        directory
+            .registered_openapi
+            .lock()
+            .first()
+            .cloned()
+            .flatten()
+    };
+    assert!(
+        first.is_some_and(|spec| spec.contains("/anon") && !spec.contains("/app-doc")),
+        "registered first with the bootstrap document"
+    );
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let last = {
+            directory
+                .registered_openapi
+                .lock()
+                .last()
+                .cloned()
+                .flatten()
+        };
+        if last.is_some_and(|spec| spec.contains("/anon") && spec.contains("/app-doc")) {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the directory gets the full document once the application group attached"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 
     cancel.cancel();
     tokio::time::timeout(Duration::from_secs(5), server)
@@ -894,6 +970,85 @@ async fn a_system_root_serves_and_is_present_while_the_application_group_waits()
         .expect("ends after cancel")
         .expect("no panic")
         .expect("clean shutdown");
+}
+
+/// A refused publication leaves the system root serving until shutdown, then
+/// the run reports the application group that never started.
+#[tokio::test]
+#[tracing_test::traced_test]
+async fn a_failed_application_group_is_returned_after_the_system_root_served() {
+    let addr = free_addr();
+    let directory = Arc::new(RecordingDirectory::default());
+    let root = Arc::new(AxisGear);
+    let side = Arc::new(PublishingPing::default());
+    let mut builder = RegistryBuilder::default();
+    builder.register_core_with_meta("axis-gear", &[], root.clone() as Arc<dyn Gear>);
+    builder.register_rest_with_meta("axis-gear", root as Arc<dyn RestApiCapability>);
+    builder.register_system_with_meta(
+        "axis-gear",
+        Arc::new(SystemMarker) as Arc<dyn crate::contracts::SystemCapability>,
+    );
+    builder.register_core_with_meta("publishing-ping", &[], side.clone() as Arc<dyn Gear>);
+    builder.register_rest_with_meta(
+        "publishing-ping",
+        side.clone() as Arc<dyn RestApiCapability>,
+    );
+    builder.register_gts_publication_with_meta(
+        "publishing-ping",
+        side.clone() as Arc<dyn crate::gts_publication::GtsPublicationCapability>,
+    );
+    let hub = Arc::new(ClientHub::new());
+    hub.register::<PublishingPing>(Arc::clone(&side));
+    hub.register::<HeldRegistry>(Arc::new(HeldRegistry {
+        refuse: true,
+        ..HeldRegistry::default()
+    }));
+    let cancel = CancellationToken::new();
+    let host = HostRuntime::new(
+        builder.build_topo_sorted().unwrap(),
+        Arc::new(EmptyConfigProvider) as Arc<dyn ConfigProvider>,
+        DbOptions::None,
+        hub,
+        cancel.clone(),
+        Uuid::new_v4(),
+        None,
+    );
+    let server = tokio::spawn(tracing::Instrument::in_current_span(
+        host.run_oop_serving(oop_options("axis-gear", addr, &directory, None)),
+    ));
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while !logs_contain("the application group did not start") {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the failure is reported"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        http_get(addr, "/anon").await.map(|r| r.0),
+        Some(200),
+        "the system root keeps serving"
+    );
+    assert_eq!(
+        http_get(addr, "/published").await.map(|r| r.0),
+        Some(503),
+        "the application routes never attach"
+    );
+    assert!(!server.is_finished(), "until shutdown");
+
+    cancel.cancel();
+    let err = tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .expect("ends after cancel")
+        .expect("no panic")
+        .unwrap_err();
+    let message = format!("{err:#}");
+    assert!(
+        message.contains("the application group did not start") && message.contains("incompatible"),
+        "{message}"
+    );
+    assert_eq!(side.handled.load(Ordering::SeqCst), 0);
 }
 
 /// Dropping the `OoP` lifecycle future while the root's publication is pending
@@ -1085,14 +1240,16 @@ async fn a_co_hosted_system_provider_is_discoverable_under_an_application_root()
         );
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
+    let registered_endpoint_seen = { directory.registered_endpoint.lock().clone() };
     assert_eq!(
-        directory.registered_endpoint.lock().clone(),
+        registered_endpoint_seen,
         Some(format!("http://{addr}")),
         "at this listener"
     );
     tokio::time::sleep(Duration::from_millis(50)).await;
+    let registered_gears_seen = { directory.registered_gears.lock().clone() };
     assert_eq!(
-        directory.registered_gears.lock().clone(),
+        registered_gears_seen,
         ["axis-gear"],
         "neither the waiting root nor the unadvertised gear"
     );
@@ -1148,6 +1305,16 @@ impl RestApiCapability for TenantAxis {
         openapi: &dyn OpenApiRegistry,
     ) -> anyhow::Result<Router> {
         use crate::api::OperationBuilder;
+        let router = OperationBuilder::get("/who")
+            .operation_id("axis.who")
+            .anonymous()
+            .handler(
+                |axum::Extension(ctx): axum::Extension<toolkit_security::SecurityContext>| async move {
+                    if ctx.is_anonymous() { "anonymous" } else { "tenant" }
+                },
+            )
+            .text_response(http::StatusCode::OK, "OK", "text/plain")
+            .register(router, openapi);
         Ok(OperationBuilder::get("/tenant")
             .operation_id("axis.tenant")
             .authenticated()
@@ -1255,6 +1422,87 @@ async fn a_system_tenant_route_is_authenticated_once_the_bridge_exists() {
         Some(401)
     );
     assert_eq!(http_status(addr, "/tenant", &[]).await, Some(401));
+
+    cancel.cancel();
+    tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .expect("ends after cancel")
+        .expect("no panic")
+        .expect("clean shutdown");
+}
+
+/// Before the application group, an anonymous system route runs as anonymous,
+/// not as the development-only default tenant: tenant authentication is not
+/// disabled, it is only not installed yet. Tenant routes still answer `503`.
+#[tokio::test]
+async fn an_anonymous_system_route_stays_anonymous_before_the_application_group() {
+    let addr = free_addr();
+    let directory = Arc::new(RecordingDirectory::default());
+    let system = Arc::new(TenantAxis);
+    let side = Arc::new(PublishingPing::default());
+    let mut builder = RegistryBuilder::default();
+    builder.register_core_with_meta("tenant-axis", &[], system.clone() as Arc<dyn Gear>);
+    builder.register_rest_with_meta("tenant-axis", system as Arc<dyn RestApiCapability>);
+    builder.register_system_with_meta(
+        "tenant-axis",
+        Arc::new(SystemMarker) as Arc<dyn crate::contracts::SystemCapability>,
+    );
+    builder.register_core_with_meta("bridge", &[], Arc::new(BearerBridge) as Arc<dyn Gear>);
+    builder.register_core_with_meta("publishing-ping", &[], side.clone() as Arc<dyn Gear>);
+    builder.register_rest_with_meta(
+        "publishing-ping",
+        side.clone() as Arc<dyn RestApiCapability>,
+    );
+    builder.register_gts_publication_with_meta(
+        "publishing-ping",
+        side.clone() as Arc<dyn crate::gts_publication::GtsPublicationCapability>,
+    );
+    let hub = Arc::new(ClientHub::new());
+    hub.register::<PublishingPing>(Arc::clone(&side));
+    let held = Arc::new(HeldRegistry::default());
+    hub.register::<HeldRegistry>(Arc::clone(&held));
+    let cancel = CancellationToken::new();
+    let host = HostRuntime::new(
+        builder.build_topo_sorted().unwrap(),
+        Arc::new(EmptyConfigProvider) as Arc<dyn ConfigProvider>,
+        DbOptions::None,
+        hub,
+        cancel.clone(),
+        Uuid::new_v4(),
+        None,
+    );
+    let options = OopServeOptions {
+        auth_disabled: false,
+        ..oop_options("tenant-axis", addr, &directory, None)
+    };
+    let server = tokio::spawn(host.run_oop_serving(options));
+
+    assert!(poll_status(addr, "/who", 200, Duration::from_secs(5)).await);
+    assert_eq!(
+        http_get(addr, "/who").await.map(|r| r.1),
+        Some("anonymous".to_owned()),
+        "no synthetic tenant context before the application group"
+    );
+    assert_eq!(http_status(addr, "/tenant", &[]).await, Some(503));
+    assert_eq!(
+        http_status(addr, "/tenant", &[("Authorization", "Bearer good-bearer")]).await,
+        Some(503)
+    );
+
+    held.release.notify_one();
+    let good = [("Authorization", "Bearer good-bearer")];
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while http_status(addr, "/tenant", &good).await != Some(200) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the tenant plane after the group"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        http_get(addr, "/who").await.map(|r| r.1),
+        Some("anonymous".to_owned())
+    );
 
     cancel.cancel();
     tokio::time::timeout(Duration::from_secs(5), server)
@@ -1393,7 +1641,8 @@ async fn the_oop_path_runs_each_group_and_the_legacy_finalization_in_order() {
         );
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    assert_eq!(*events.lock(), GROUPED_STARTUP);
+    let events_seen = { events.lock().clone() };
+    assert_eq!(events_seen, GROUPED_STARTUP);
 
     cancel.cancel();
     tokio::time::timeout(Duration::from_secs(5), server)
@@ -1401,4 +1650,47 @@ async fn the_oop_path_runs_each_group_and_the_legacy_finalization_in_order() {
         .expect("ends after cancel")
         .expect("no panic")
         .expect("clean shutdown");
+}
+
+/// The `OoP` startup wires a consumed client after the application group's
+/// `init` and before its `post_init`, as the in-process one does.
+#[tokio::test]
+async fn the_oop_path_wires_a_consumed_client_between_init_and_post_init() {
+    use super::host_runtime_preparation_tests::{Consumer, WIRED_CLIENT};
+    let consumer = Arc::new(Consumer::default());
+    let mut builder = RegistryBuilder::default();
+    builder.register_core_with_meta("consumer", &[], consumer.clone() as Arc<dyn Gear>);
+    let cancel = CancellationToken::new();
+    let host = HostRuntime::new(
+        builder.build_topo_sorted().unwrap(),
+        Arc::new(EmptyConfigProvider) as Arc<dyn ConfigProvider>,
+        DbOptions::None,
+        Arc::new(ClientHub::new()),
+        cancel.clone(),
+        Uuid::new_v4(),
+        None,
+    )
+    .with_consumer_registrations(vec![&WIRED_CLIENT]);
+    let addr = free_addr();
+    let directory = Arc::new(RecordingDirectory::default());
+    let server =
+        tokio::spawn(host.run_oop_serving(oop_options("consumer", addr, &directory, None)));
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while !consumer.post_init_ran.load(Ordering::SeqCst) {
+        assert!(tokio::time::Instant::now() < deadline, "post_init");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    cancel.cancel();
+    tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .expect("ends after cancel")
+        .expect("no panic")
+        .expect("clean shutdown");
+
+    assert!(!consumer.in_init.load(Ordering::SeqCst), "not yet in init");
+    assert!(
+        consumer.in_post_init.load(Ordering::SeqCst),
+        "wired before post_init"
+    );
 }

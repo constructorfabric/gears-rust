@@ -100,6 +100,14 @@ fn refusal(result: Result<(), GtsPublicationError>) -> String {
     }
 }
 
+/// An expired budget, told apart from a refusal across the adapter boundary.
+fn expiry(result: Result<(), GtsPublicationError>) -> String {
+    match result {
+        Err(error @ GtsPublicationError::Expired { .. }) => format!("{error:#}"),
+        other => panic!("expected an expired budget, got {other:?}"),
+    }
+}
+
 /// A registry that takes two candidates per call refuses the default batch of 100;
 /// the configured batch size fits it.
 #[tokio::test]
@@ -148,7 +156,7 @@ async fn the_configured_backoff_and_timeout_pace_and_end_the_retries() {
     let started = tokio::time::Instant::now();
     let (pending, progress) = pending_log();
 
-    let message = refusal(
+    let message = expiry(
         publication
             .publish(&CancellationToken::new(), progress)
             .await,
@@ -196,7 +204,7 @@ async fn a_callers_deadline_replaces_the_default_and_a_timeout_caps_it() {
 
     let registry = slow_read();
     let started = tokio::time::Instant::now();
-    let message = refusal(
+    let message = expiry(
         prepared(&registry, &config(Some(json!({ "timeout": "5s" }))))
             .with_deadline(started + Duration::from_secs(180))
             .publish(&CancellationToken::new(), Arc::new(|_| {}))
@@ -216,7 +224,7 @@ async fn without_the_section_the_startup_default_applies() {
     tokio::time::advance(Duration::from_secs(60)).await;
     let started = tokio::time::Instant::now();
 
-    refusal(
+    expiry(
         publication
             .publish(&CancellationToken::new(), Arc::new(|_| {}))
             .await,

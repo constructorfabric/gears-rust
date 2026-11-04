@@ -309,6 +309,32 @@ async fn the_publication_order_does_not_change_a_gears_policy() {
     }
 }
 
+/// Without a registry client the generated backend keeps the hub's error as
+/// the source, behind the gear's context.
+#[test]
+fn a_missing_registry_client_keeps_the_hub_error() {
+    let Err(err) = PreparedGtsPublication::prepare(
+        FastPublisher.descriptor(),
+        &config(None, None),
+        &ClientHub::new(),
+    ) else {
+        panic!("no registry client");
+    };
+    let toolkit::gts_publication::GtsPublicationError::Backend { source, .. } = &err else {
+        panic!("{err:#}");
+    };
+    assert!(
+        source
+            .downcast_ref::<toolkit::client_hub::ClientHubError>()
+            .is_some(),
+        "{source:#}"
+    );
+    assert!(
+        format!("{source:#}").starts_with("fast-publisher: no registry client"),
+        "{source:#}"
+    );
+}
+
 /// One gear's invalid policy fails the startup before any publication writes, for
 /// the valid neighbour too, and the error names the gear and the config path.
 #[tokio::test]

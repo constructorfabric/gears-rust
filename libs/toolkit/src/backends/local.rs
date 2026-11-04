@@ -211,15 +211,43 @@ struct Shutdown {
 impl Shutdown {
     /// Start the run once, on a task of its own, and wait until it ended.
     async fn run(self: &Arc<Self>) {
+        self.run_with(|shutdown| {
+            Box::pin(async move { LocalProcessBackend::shutdown_all_instances(&shutdown).await })
+        })
+        .await;
+    }
+
+    /// [`run`](Self::run) with `body` as the run: started once, and ended for
+    /// every waiter however it ends, a panic included.
+    async fn run_with(
+        self: &Arc<Self>,
+        body: impl FnOnce(Arc<Self>) -> futures_util::future::BoxFuture<'static, ()>,
+    ) {
         let mut done = self.done.subscribe();
         if !self.started.swap(true, std::sync::atomic::Ordering::AcqRel) {
-            let shutdown = Arc::clone(self);
+            let ended = RunEnded(Arc::clone(self));
+            let run = body(Arc::clone(self));
             tokio::spawn(async move {
-                LocalProcessBackend::shutdown_all_instances(&shutdown).await;
-                shutdown.done.send_replace(true);
+                let _ended = ended;
+                run.await;
             });
         }
         drop(done.wait_for(|done| *done).await);
+    }
+}
+
+/// Marks the shutdown run ended when dropped: also when the run panics, so no
+/// waiter of [`Shutdown::run`] is left pending.
+struct RunEnded(Arc<Shutdown>);
+
+impl Drop for RunEnded {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            tracing::error!(
+                "LocalProcessBackend: the shutdown run panicked; children it had not stopped may still run"
+            );
+        }
+        self.0.done.send_replace(true);
     }
 }
 
@@ -290,16 +318,17 @@ impl LocalProcessBackend {
 
         tracing::info!(count = all_instances.len(), "Stopping OoP gear processes");
 
-        // Stop all processes with grace period
-        for inst in &mut all_instances {
+        // Stop all processes with grace period, concurrently: the run takes one
+        // grace period, not one per child.
+        futures_util::future::join_all(all_instances.iter_mut().map(|inst| {
             stop_child_with_grace(
                 &mut inst.child,
                 &inst.handle,
                 SHUTDOWN_GRACE_PERIOD,
                 "shutdown",
             )
-            .await;
-        }
+        }))
+        .await;
 
         // Wait for forwarders to drain
         for inst in all_instances {
@@ -733,15 +762,37 @@ mod tests {
         }
     }
 
-    /// A process ignoring SIGTERM, for the grace-period paths.
+    /// A process ignoring SIGTERM, for the grace-period paths, and the marker
+    /// file it creates once it ignores it: see [`ignoring_sigterm`].
     #[cfg(unix)]
-    fn stubborn() -> OopGearConfig {
+    fn stubborn() -> (OopGearConfig, PathBuf) {
+        let marker = std::env::temp_dir().join(format!("stubborn-{}", Uuid::new_v4()));
         let mut cfg = OopGearConfig::new("stubborn", BackendKind::LocalProcess);
         cfg.binary = Some(PathBuf::from("/bin/sh"));
         // `exec`: the tracked process is the one ignoring SIGTERM, with no
-        // untracked grandchild left behind by a kill.
-        cfg.args = vec!["-c".to_owned(), "trap '' TERM; exec sleep 60".to_owned()];
-        cfg
+        // untracked grandchild left behind by a kill. An ignored signal stays
+        // ignored across `exec`.
+        cfg.args = vec![
+            "-c".to_owned(),
+            r#"trap '' TERM; : > "$1"; exec sleep 60"#.to_owned(),
+            "stubborn".to_owned(),
+            marker.display().to_string(),
+        ];
+        (cfg, marker)
+    }
+
+    /// Wait until the stubborn child ignores SIGTERM, then remove its marker.
+    #[cfg(unix)]
+    async fn ignoring_sigterm(marker: &std::path::Path) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while !marker.exists() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the stubborn child never installed its SIGTERM trap"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        std::fs::remove_file(marker).ok();
     }
 
     #[cfg(unix)]
@@ -759,9 +810,10 @@ mod tests {
     async fn stop_all_waits_for_a_shutdown_the_watcher_began() {
         let cancel = CancellationToken::new();
         let backend = LocalProcessBackend::new(cancel.clone());
-        let handle = backend.spawn_instance(&stubborn()).await.expect("spawn");
+        let (stubborn_cfg, marker) = stubborn();
+        let handle = backend.spawn_instance(&stubborn_cfg).await.expect("spawn");
         let pid = handle.pid.expect("a pid");
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        ignoring_sigterm(&marker).await;
 
         cancel.cancel();
         while backend.instances.read().contains_key(&handle.instance_id) {
@@ -771,7 +823,7 @@ mod tests {
 
         assert!(!alive(pid), "the child ended before stop_all returned");
         assert!(
-            backend.spawn_instance(&stubborn()).await.is_err(),
+            backend.spawn_instance(&stubborn().0).await.is_err(),
             "no spawn after shutdown"
         );
     }
@@ -814,9 +866,10 @@ mod tests {
     async fn an_abandoned_stop_all_still_stops_the_child() {
         let cancel = CancellationToken::new();
         let backend = LocalProcessBackend::new(cancel.clone());
-        let handle = backend.spawn_instance(&stubborn()).await.expect("spawn");
+        let (stubborn_cfg, marker) = stubborn();
+        let handle = backend.spawn_instance(&stubborn_cfg).await.expect("spawn");
         let pid = handle.pid.expect("a pid");
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        ignoring_sigterm(&marker).await;
 
         let stopping = tokio::time::timeout(Duration::from_millis(200), backend.stop_all()).await;
         assert!(
@@ -838,5 +891,25 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         assert!(!cancel.is_cancelled());
+    }
+    /// A shutdown run that panics still ends every wait for it.
+    #[tokio::test]
+    async fn a_panicking_shutdown_run_releases_its_waiters() {
+        let shutdown = Arc::new(Shutdown {
+            instances: Arc::new(RwLock::new(HashMap::new())),
+            stopping: std::sync::atomic::AtomicBool::new(false),
+            started: std::sync::atomic::AtomicBool::new(false),
+            done: tokio::sync::watch::Sender::new(false),
+        });
+
+        let first = tokio::time::timeout(
+            Duration::from_secs(5),
+            shutdown.run_with(|_| Box::pin(async { panic!("the run failed") })),
+        )
+        .await;
+        let second = tokio::time::timeout(Duration::from_secs(5), shutdown.run()).await;
+
+        assert!(first.is_ok(), "the waiter of the panicking run returns");
+        assert!(second.is_ok(), "a later waiter returns too");
     }
 }

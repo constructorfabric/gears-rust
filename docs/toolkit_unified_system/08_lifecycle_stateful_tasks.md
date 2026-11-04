@@ -66,7 +66,8 @@ See [`HostRuntime`](../../libs/toolkit/src/runtime/host_runtime.rs) for the full
   ordinary startup). Reads, submissions, polling and pauses share the same deadline.
   The system group continues serving; application initialization waits.
 - **Terminal publication failure or exhausted budget:** leave applications uninitialized and serve the system
-  group until shutdown. Shutdown also cancels pending publications.
+  group until shutdown, then return the failure, so the process exits with an error. Shutdown also
+  cancels pending publications.
 - **Invalid publication input or duplicate GTS owner:** fail before the system group starts.
 - **Other startup errors:** return an error and stop gears already started.
 

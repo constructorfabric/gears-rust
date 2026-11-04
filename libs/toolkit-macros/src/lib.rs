@@ -698,6 +698,15 @@ pub fn gear(attr: TokenStream, item: TokenStream) -> TokenStream {
             .to_compile_error()
             .into();
         }
+        Some(_) if caps_for_asserts.contains(&Capability::System) => {
+            return syn::Error::new(
+                proc_macro2::Span::call_site(),
+                "`gts_publication(...)` is not supported on a `system` gear: the system group \
+                 initializes before the GTS barrier",
+            )
+            .to_compile_error()
+            .into();
+        }
         Some(cfg) => gts_publication::expand(cfg, &struct_ident, &name_lit),
         None => proc_macro2::TokenStream::new(),
     };

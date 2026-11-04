@@ -775,6 +775,22 @@ pub enum RegistryError {
         #[source]
         source: anyhow::Error,
     },
+    /// Two publishing gears declare one GTS id; the source names both.
+    #[error("GTS publication setup failed: a GTS id has two publishers")]
+    GtsOwnership {
+        #[source]
+        source: anyhow::Error,
+    },
+    /// A GTS publication of the application group failed (refused or expired):
+    /// no application gear initialized. Returned after the system group, which
+    /// keeps serving, is shut down.
+    #[error(
+        "the application group did not start: {}",
+        .failures.iter().map(|e| format!("{e:#}")).collect::<Vec<_>>().join("; ")
+    )]
+    ApplicationGroupNotStarted {
+        failures: Vec<crate::gts_publication::GtsPublicationError>,
+    },
     #[error("start failed for '{gear}'")]
     Start {
         gear: &'static str,
@@ -822,6 +838,10 @@ pub enum RegistryError {
     RestHostNotFoundAfterValidation,
     #[error("REST host missing from entry")]
     RestHostMissingFromEntry,
+    /// Routes composed before the REST host prepared its router: a runtime
+    /// ordering bug, refused rather than composed onto an empty router.
+    #[error("REST routes composed before the REST host prepared its router")]
+    RestNotPrepared,
 
     // gRPC-related errors
     #[error("gRPC registration failed for gear '{gear}'")]

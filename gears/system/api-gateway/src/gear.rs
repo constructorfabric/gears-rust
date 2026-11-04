@@ -1704,6 +1704,48 @@ fn enrich_openapi_with_zone_limits(
 mod tests {
     use super::*;
 
+    /// A router installed before `serve` parks its pruner for `serve`; one
+    /// swapped in while serving replaces the running pruner, whose token is
+    /// cancelled, and its own stops with `serve`.
+    #[tokio::test]
+    async fn a_router_swapped_in_while_serving_replaces_the_running_pruner() {
+        let gateway = ApiGateway::default();
+        let pruner = || {
+            middleware::throttling::build_maps(&[], &ApiGatewayConfig::default())
+                .expect("no zones")
+                .2
+        };
+
+        gateway.install_serving_router(Router::new(), pruner());
+        assert!(
+            gateway.throttle_key_pruner.lock().is_some(),
+            "parked for serve"
+        );
+        assert!(gateway.pruner_cancel.lock().is_none(), "nothing runs yet");
+
+        // What `serve` does once it runs.
+        let serving = CancellationToken::new();
+        gateway
+            .serve_cancel
+            .set(serving.clone())
+            .expect("first serve");
+        let parked = gateway.throttle_key_pruner.lock().take().expect("parked");
+        gateway.spawn_pruner(parked, &serving);
+        let first = gateway.pruner_cancel.lock().clone().expect("running");
+
+        gateway.install_serving_router(Router::new(), pruner());
+        let second = gateway.pruner_cancel.lock().clone().expect("running");
+
+        assert!(first.is_cancelled(), "the replaced router's pruner stops");
+        assert!(!second.is_cancelled(), "the new one runs");
+        assert!(
+            gateway.throttle_key_pruner.lock().is_none(),
+            "spawned at once, not parked"
+        );
+        serving.cancel();
+        assert!(second.is_cancelled(), "and stops with serve");
+    }
+
     #[test]
     fn enrich_openapi_adds_zone_limits_by_zone_name() {
         use crate::config::{KeyConfig, KeyType, RateLimitZone, RateSpec, RetryAfter};

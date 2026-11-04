@@ -90,11 +90,8 @@ impl Gear for WidgetPublisher {
         let manifest = ctx.gts_publication_manifest()?;
         assert_eq!(manifest.documents().len(), 2);
         let registry = ctx.client_hub().get::<LocalRegistry>()?;
-        assert_eq!(
-            registry.admitted.lock().len(),
-            1,
-            "admitted before the publisher's init"
-        );
+        let admitted_seen = { registry.admitted.lock().len() };
+        assert_eq!(admitted_seen, 1, "admitted before the publisher's init");
         self.bound.store(true, Ordering::SeqCst);
         ctx.client_hub()
             .register::<AtomicBool>(Arc::new(AtomicBool::new(true)));
@@ -183,14 +180,16 @@ async fn the_generated_backend_forwards_the_callers_absolute_deadline() {
         .await
         .unwrap();
 
+    let policies_seen = { registry.policies.lock().clone() };
     assert_eq!(
-        *registry.policies.lock(),
+        policies_seen,
         [(
             "widget-publisher".to_owned(),
             Policy::of(GtsPublicationOptions::default(), Some(deadline))
         )]
     );
-    assert_eq!(registry.admitted.lock().len(), 1);
+    let admitted_seen = { registry.admitted.lock().len() };
+    assert_eq!(admitted_seen, 1);
 }
 
 #[tokio::test]

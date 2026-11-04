@@ -102,6 +102,8 @@ struct FakeRegistry {
 enum Mode {
     Admit,
     Refuse,
+    /// Fails on an expired budget, with the adapter's expiry context.
+    Expire,
     Hang,
 }
 
@@ -127,6 +129,8 @@ fn fake_backend(hub: &ClientHub) -> anyhow::Result<GtsPublicationBackend> {
                 match registry.mode {
                     Mode::Admit => Ok(()),
                     Mode::Refuse => anyhow::bail!("rejected: incompatible"),
+                    Mode::Expire => Err(anyhow::anyhow!("deadline reached; still pending")
+                        .context(GtsPublicationExpired)),
                     Mode::Hang => {
                         request.cancel().cancelled().await;
                         anyhow::bail!("cancelled")
@@ -224,7 +228,8 @@ async fn a_publication_reports_pending_until_admitted() {
         .unwrap();
 
     assert_eq!(registry.calls.load(Ordering::SeqCst), 1);
-    assert_eq!(pending.lock().clone(), ["dependency pending"]);
+    let pending_seen = { pending.lock().clone() };
+    assert_eq!(pending_seen, ["dependency pending"]);
 }
 
 #[tokio::test]
@@ -247,6 +252,29 @@ async fn a_refusal_is_terminal() {
         "{err}"
     );
     assert!(err.to_string().contains("incompatible"), "{err}");
+}
+
+/// An adapter error carrying the expiry context is an expired budget, not a refusal.
+#[tokio::test]
+async fn an_expired_budget_is_not_a_refusal() {
+    let registry = FakeRegistry::new(Mode::Expire);
+
+    let err = prepared(&WIDGETS, &hub_with(&registry))
+        .publish(&CancellationToken::new(), progress())
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(
+            err,
+            GtsPublicationError::Expired {
+                gear: "widgets",
+                ..
+            }
+        ),
+        "{err}"
+    );
+    assert!(err.to_string().contains("still pending"), "{err}");
 }
 
 #[tokio::test]
@@ -342,7 +370,8 @@ async fn a_batch_runs_its_publications_concurrently() {
         1,
         "admitted beside it"
     );
-    assert_eq!(reports.lock().len(), 2, "both reported pending");
+    let reports_seen = { reports.lock().len() };
+    assert_eq!(reports_seen, 2, "both reported pending");
 
     cancel.cancel();
     let results = running.await;
@@ -382,6 +411,38 @@ async fn a_refusal_ends_the_rest_of_a_stopping_batch() {
     assert!(matches!(
         results[1].1,
         Err(GtsPublicationError::Refused { .. })
+    ));
+}
+
+/// An expired budget fails a stopping batch as a refusal does.
+#[tokio::test]
+async fn an_expiry_ends_the_rest_of_a_stopping_batch() {
+    let hanging = FakeRegistry::new(Mode::Hang);
+    let expiring = FakeRegistry::new(Mode::Expire);
+    let batch = [
+        prepared(&WIDGETS, &hub_with(&hanging)),
+        prepared(&WIDGETS, &hub_with(&expiring)),
+    ];
+
+    let results = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        publish_all(
+            &batch,
+            &CancellationToken::new(),
+            Arc::new(|_, _: &str| {}),
+            true,
+        ),
+    )
+    .await
+    .expect("an expiry ends the batch");
+
+    assert!(matches!(
+        results[0].1,
+        Err(GtsPublicationError::Cancelled { .. })
+    ));
+    assert!(matches!(
+        results[1].1,
+        Err(GtsPublicationError::Expired { .. })
     ));
 }
 
@@ -651,7 +712,8 @@ async fn the_prepared_options_reach_the_backend() {
         .await
         .unwrap();
 
-    assert_eq!(registry.options.lock().clone(), [expected]);
+    let options_seen = { registry.options.lock().clone() };
+    assert_eq!(options_seen, [expected]);
     assert_eq!(expected.timeout(), Some(Duration::from_secs(9)));
     assert_eq!(expected.batch_size().get(), 4);
 }

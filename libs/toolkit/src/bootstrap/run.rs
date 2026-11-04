@@ -230,16 +230,26 @@ pub async fn run_publish_gts(config: AppConfig, options: PublishGtsOptions) -> R
     let cancel = CancellationToken::new();
     spawn_signal_handler(cancel.clone(), "publish-gts");
     let _cancel_on_drop = cancel.clone().drop_guard();
-    let internal_auth = config
-        .oop_http
-        .as_ref()
-        .and_then(|http| http.internal_auth.as_ref())
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "publish-gts needs a platform credential: configure oop_http.internal_auth"
-            )
-        })?;
-    let (_, provider) = super::oop::build_platform_credentials(internal_auth, &cancel).await?;
+    let result = publish_gts(&config, &options, &cancel).await;
+
+    // The outcome is logged before the telemetry flush, on every path.
+    match &result {
+        Ok(()) => tracing::info!("GTS publication complete"),
+        Err(e) => tracing::error!(error = format!("{e:#}"), "GTS publication failed"),
+    }
+    #[cfg(feature = "otel")]
+    tracing_shutdown().await;
+    result
+}
+
+/// [`run_publish_gts`] after initialization.
+async fn publish_gts(
+    config: &AppConfig,
+    options: &PublishGtsOptions,
+    cancel: &CancellationToken,
+) -> Result<()> {
+    let internal_auth = platform_credential(config)?;
+    let (_, provider) = super::oop::build_platform_credentials(internal_auth, cancel).await?;
     let provider = provider.ok_or_else(|| {
         anyhow::anyhow!("oop_http.internal_auth gives no outbound platform credential")
     })?;
@@ -253,23 +263,39 @@ pub async fn run_publish_gts(config: AppConfig, options: PublishGtsOptions) -> R
     );
     let report = crate::gts_publication::deployment::publish(
         &descriptors,
-        &config,
+        config,
         &options.registry_endpoint,
         &tuning,
         options.deadline,
-        &cancel,
+        cancel,
     )
-    .await;
-    let report = report?;
+    .await?;
+    publication_result(&report)
+}
 
-    #[cfg(feature = "otel")]
-    tracing_shutdown().await;
+/// The platform credential `publish-gts` sends: `oop_http.internal_auth`.
+fn platform_credential(config: &AppConfig) -> Result<&toolkit_security::InternalAuthConfig> {
+    config
+        .oop_http
+        .as_ref()
+        .and_then(|http| http.internal_auth.as_ref())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "publish-gts needs a platform credential: configure oop_http.internal_auth"
+            )
+        })
+}
 
-    if !report.succeeded() {
-        anyhow::bail!("GTS publication failed:\n{report}");
+/// The job's result: an error carrying the report unless every publisher succeeded.
+fn publication_result(
+    report: &crate::gts_publication::deployment::GtsDeploymentReport,
+) -> Result<()> {
+    if report.succeeded() {
+        tracing::info!("GTS publication report:\n{report}");
+        Ok(())
+    } else {
+        anyhow::bail!("GTS publication failed:\n{report}")
     }
-    tracing::info!("GTS publication complete:\n{report}");
-    Ok(())
 }
 
 fn resolve_db_options(config: &AppConfig) -> Result<DbOptions> {
@@ -455,5 +481,44 @@ pub async fn tracing_shutdown() {
     .await
     {
         tracing::warn!(error = %e, "Telemetry shutdown task panicked");
+    }
+}
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+mod publish_gts_tests {
+    use super::*;
+    use crate::gts_publication::deployment::{GtsDeploymentOutcome, GtsDeploymentReport};
+
+    #[test]
+    fn publish_gts_needs_the_platform_credential() {
+        let err = platform_credential(&AppConfig::default()).unwrap_err();
+        assert!(err.to_string().contains("oop_http.internal_auth"), "{err}");
+    }
+
+    #[test]
+    fn a_failed_publisher_fails_the_job_with_the_report() {
+        let failed = GtsDeploymentReport {
+            publishers: vec![
+                ("ok", GtsDeploymentOutcome::Published { documents: 1 }),
+                (
+                    "late",
+                    GtsDeploymentOutcome::DeadlineExceeded {
+                        unconfirmed: vec!["gts.cf.test.late.v1~".to_owned()],
+                    },
+                ),
+            ],
+        };
+        let err = publication_result(&failed).unwrap_err();
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("late: deadline exceeded") && message.contains("gts.cf.test.late.v1~"),
+            "{message}"
+        );
+
+        let succeeded = GtsDeploymentReport {
+            publishers: vec![("ok", GtsDeploymentOutcome::Published { documents: 1 })],
+        };
+        publication_result(&succeeded).expect("every publisher succeeded");
     }
 }

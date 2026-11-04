@@ -131,15 +131,31 @@ pub const DEFAULT_SHUTDOWN_DEADLINE: std::time::Duration = std::time::Duration::
 const LATE_GRPC_INSTALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// How the startup of the application group ended.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug)]
 enum AppStartup {
     /// Every application gear initialized and started.
     Started,
-    /// A publication was refused: no application `init` ran. The system
-    /// group keeps serving until shutdown.
-    Failed,
+    /// A publication was refused or expired: no application `init` ran. The
+    /// system group keeps serving until shutdown, after which the run returns
+    /// this [`RegistryError::ApplicationGroupNotStarted`].
+    Failed(RegistryError),
     /// Shutdown came first.
     Cancelled,
+}
+
+/// The failure of an application group that did not start, logged once here
+/// with its cause: the system group keeps serving until shutdown.
+fn startup_failure(outcome: AppStartup) -> Option<RegistryError> {
+    match outcome {
+        AppStartup::Failed(failure) => {
+            tracing::error!(
+                error = %failure,
+                "the application group did not start; serving the system group only until shutdown"
+            );
+            Some(failure)
+        }
+        AppStartup::Started | AppStartup::Cancelled => None,
+    }
 }
 
 /// The REST router composed so far against the in-process host.
@@ -182,6 +198,10 @@ pub struct HostRuntime {
     /// Consumer registrations already wired, by address: the registry
     /// clients are wired early, the rest after application `init`, each once.
     wired: parking_lot::Mutex<HashSet<usize>>,
+    /// Replaces the link-time `inventory` registrations in a test: a test
+    /// binary links none, and submitting one would wire it in every test.
+    #[cfg(test)]
+    consumer_registrations: Option<Vec<&'static crate::discovery::ConsumerRegistration>>,
     /// The in-process REST router composed so far.
     rest: parking_lot::Mutex<RestComposition>,
     cancel: CancellationToken,
@@ -254,6 +274,8 @@ impl HostRuntime {
             advertiser: Arc::new(RestAdvertiser::new(instance_id)),
             start_called: parking_lot::Mutex::new(HashSet::new()),
             wired: parking_lot::Mutex::new(HashSet::new()),
+            #[cfg(test)]
+            consumer_registrations: None,
             rest: parking_lot::Mutex::new(RestComposition::default()),
             owned,
             _owned_on_drop: owned_on_drop,
@@ -574,10 +596,28 @@ impl HostRuntime {
     /// client, so this phase never waits on provider availability (ADR-0007).
     /// A no-op when no consumer is registered, preserving the phase-order
     /// invariants relied on by existing tests.
-    fn consumer_registrations() -> Vec<&'static crate::discovery::ConsumerRegistration> {
+    #[cfg_attr(
+        not(test),
+        expect(clippy::unused_self, reason = "reads the test override in test builds")
+    )]
+    fn consumer_registrations(&self) -> Vec<&'static crate::discovery::ConsumerRegistration> {
+        #[cfg(test)]
+        if let Some(regs) = &self.consumer_registrations {
+            return regs.clone();
+        }
         inventory::iter::<crate::discovery::ConsumerRegistration>
             .into_iter()
             .collect()
+    }
+
+    /// Wire `regs` instead of the linked registrations.
+    #[cfg(test)]
+    fn with_consumer_registrations(
+        mut self,
+        regs: Vec<&'static crate::discovery::ConsumerRegistration>,
+    ) -> Self {
+        self.consumer_registrations = Some(regs);
+        self
     }
 
     /// The body of the proxy-wiring phase, taking the registrations so tests can
@@ -853,6 +893,25 @@ impl HostRuntime {
         let mut manifests = Vec::new();
         for entry in self.registry.gears() {
             let Some(publication) = entry.caps.query::<GtsPublicationCap>() else {
+                // The section would be stripped from the typed configuration and
+                // never read: a misplaced policy, refused rather than ignored.
+                if self
+                    .gears_cfg
+                    .get_gear_config(entry.name)
+                    .and_then(|gear| gear.get("config"))
+                    .and_then(|config| config.get(crate::config::GTS_PUBLICATION_CONFIG_KEY))
+                    .is_some()
+                {
+                    return Err(RegistryError::Publication {
+                        gear: entry.name,
+                        source: anyhow::anyhow!(
+                            "gears.{}.config.{} is set, but this gear publishes no GTS \
+                             documents: it declares no `gts_publication(...)`",
+                            entry.name,
+                            crate::config::GTS_PUBLICATION_CONFIG_KEY
+                        ),
+                    });
+                }
                 continue;
             };
             if entry.is_system() {
@@ -882,13 +941,8 @@ impl HostRuntime {
             })?;
             manifests.push((descriptor, Arc::new(manifest), options));
         }
-        if let Some((first, _, _)) = manifests.first() {
-            crate::gts_publication::check_ownership(manifests.iter().map(|(_, m, _)| m.as_ref()))
-                .map_err(|source| RegistryError::Publication {
-                gear: first.gear,
-                source,
-            })?;
-        }
+        crate::gts_publication::check_ownership(manifests.iter().map(|(_, m, _)| m.as_ref()))
+            .map_err(|source| RegistryError::GtsOwnership { source })?;
         Ok(manifests)
     }
 
@@ -908,7 +962,7 @@ impl HostRuntime {
     /// forever; that is a configuration error (an embedded registry without
     /// its database, say).
     fn wire_registry_clients(&self, manifests: &[GtsPublicationPlan]) -> Result<(), RegistryError> {
-        self.wire_registry_clients_over(manifests, &Self::consumer_registrations())
+        self.wire_registry_clients_over(manifests, &self.consumer_registrations())
     }
 
     /// [`Self::wire_registry_clients`] over the given consumer registrations.
@@ -1090,22 +1144,13 @@ impl HostRuntime {
         Ok(())
     }
 
-    /// Init -> proxy-wiring -> post-init over every gear, for tests that
-    /// drive the shared segment directly.
-    #[cfg(test)]
-    async fn run_init_wiring_post_init(&self) -> Result<(), RegistryError> {
-        self.run_init_phase().await?;
-        self.wire_consumer_registrations(&Self::consumer_registrations())?;
-        self.run_post_init_phase().await
-    }
-
     /// The GTS barrier: publish every manifest of the application group
     /// concurrently and wait until each one is admitted. Then record the
     /// admitted manifests for the application contexts.
     ///
     /// A backend that does not bind is a local configuration error. A
-    /// refusal fails the preparation ([`AppStartup::Failed`]): no application
-    /// `init` runs, and the refusal is not retried.
+    /// refusal or an expiry fails the preparation ([`AppStartup::Failed`]): no
+    /// application `init` runs, and it is not retried.
     async fn run_gts_publication_barrier(
         &self,
         manifests: &[GtsPublicationPlan],
@@ -1141,19 +1186,17 @@ impl HostRuntime {
         )
         .await;
 
-        let mut refusals = Vec::new();
-        for (_, result) in results {
-            match result {
-                Ok(()) | Err(crate::gts_publication::GtsPublicationError::Cancelled { .. }) => {}
-                Err(e) => refusals.push(format!("{e:#}")),
-            }
-        }
-        if !refusals.is_empty() {
-            tracing::error!(
-                error = %refusals.join("; "),
-                "application group preparation failed; the system group keeps running until shutdown"
-            );
-            return Ok(AppStartup::Failed);
+        let failures: Vec<_> = results
+            .into_iter()
+            .filter_map(|(_, result)| match result {
+                Ok(()) | Err(crate::gts_publication::GtsPublicationError::Cancelled { .. }) => None,
+                Err(e) => Some(e),
+            })
+            .collect();
+        if !failures.is_empty() {
+            return Ok(AppStartup::Failed(
+                RegistryError::ApplicationGroupNotStarted { failures },
+            ));
         }
         if self.cancel.is_cancelled() {
             return Ok(AppStartup::Cancelled);
@@ -1224,7 +1267,12 @@ impl HostRuntime {
         registry: &dyn crate::contracts::OpenApiRegistry,
         hc_registry: &Arc<crate::healthcheck::RestHealthcheckRegistry>,
     ) -> Result<Router, RegistryError> {
-        let mut router = self.rest.lock().router.take().unwrap_or_default();
+        let mut router = self
+            .rest
+            .lock()
+            .router
+            .take()
+            .ok_or(RegistryError::RestNotPrepared)?;
         for e in entries {
             let Some(rest) = e.caps.query::<RestApiCap>() else {
                 continue;
@@ -1680,7 +1728,20 @@ impl HostRuntime {
         self.owned.cancel();
         self.grpc_installers.close();
         if let Some(oop) = &self.oop_options {
-            oop.backend.shutdown_all().await;
+            // Bounded: the started gears' stop below must not wait on a child
+            // that cannot be reaped. Giving up drops the `shutdown_all` future and
+            // does not claim every child ended; `LocalProcessBackend` runs its
+            // shutdown on a task of its own, which goes on. Another backend must
+            // tolerate this future being dropped.
+            if tokio::time::timeout(self.shutdown_deadline, oop.backend.shutdown_all())
+                .await
+                .is_err()
+            {
+                tracing::warn!(
+                    timeout_secs = self.shutdown_deadline.as_secs(),
+                    "shutdown: OoP children did not stop in time; stopping the in-process gears"
+                );
+            }
         }
         self.run_stop_phase_guarded().await
     }
@@ -1962,11 +2023,7 @@ impl HostRuntime {
                 return Err(e);
             }
         };
-        if outcome == AppStartup::Failed {
-            tracing::error!(
-                "the application group did not start; serving the system group only until shutdown"
-            );
-        }
+        let failed = startup_failure(outcome);
 
         // Wait for cancellation
         self.cancel.cancelled().await;
@@ -1974,8 +2031,16 @@ impl HostRuntime {
         // Stop phase with hard timeout. Blocking stop implementations are
         // guarded by a watchdog thread so a hang cannot block shutdown,
         // whether in the in-process or OoP path.
-        self.shut_down().await?;
-        Ok(())
+        let stopped = self.shut_down().await;
+        match failed {
+            Some(failure) => {
+                if let Err(stop) = stopped {
+                    tracing::warn!(error = %stop, "stop after a failed application group reported an error");
+                }
+                Err(failure.into())
+            }
+            None => Ok(stopped?),
+        }
     }
 
     /// Draining watcher: the moment shutdown begins, flip readiness to
@@ -2007,7 +2072,7 @@ impl HostRuntime {
         // client that would be wired before its provider, fails before any
         // gear runs or anything is written.
         let manifests = self.build_gts_manifests()?;
-        let regs = Self::consumer_registrations();
+        let regs = self.consumer_registrations();
         self.check_wiring_groups(&manifests, &regs)?;
 
         // System group, complete: pre-init, migrations, init, its clients,
@@ -2330,14 +2395,18 @@ impl HostRuntime {
 
         let serve_result = match outcome {
             Ok(outcome) => {
-                if outcome == AppStartup::Failed {
-                    tracing::error!(
-                        "the application group did not start; serving the system group only \
-                         until shutdown"
-                    );
-                }
+                let failed = startup_failure(outcome);
                 // Serve until cancelled, drain, then deregister.
-                server.join().await
+                let joined = server.join().await;
+                match failed {
+                    Some(failure) => {
+                        if let Err(e) = joined {
+                            tracing::warn!(error = %e, "OoP server after a failed application group reported an error");
+                        }
+                        Err(failure.into())
+                    }
+                    None => joined,
+                }
             }
             Err(e) => {
                 tracing::error!(error = %e, "OoP startup failed before serving gear routes");
@@ -2373,7 +2442,7 @@ impl HostRuntime {
         let advertised_is_system = system.iter().any(|e| e.name == advertised.as_str());
 
         let manifests = self.build_gts_manifests()?;
-        let regs = Self::consumer_registrations();
+        let regs = self.consumer_registrations();
         self.check_wiring_groups(&manifests, &regs)?;
 
         // System group, complete before the application group.
@@ -2449,9 +2518,9 @@ impl HostRuntime {
         // presence of the advertised gear: the directory never advertises it
         // while its routes reply 503.
         server.attach(router, openapi, route_auth)?;
-        if !advertised_is_system {
-            server.start_presence();
-        }
+        // First presence of an application root; a system root's restarts
+        // with the full `OpenAPI` document.
+        server.start_presence();
         self.dep_checker.mark_resolved(PREPARATION_GATE);
         Ok(AppStartup::Started)
     }
@@ -3477,63 +3546,6 @@ mod tests {
                 "post_init:user_c",
             ]
         );
-    }
-
-    /// The in-process and `OoP` paths must agree on where proxy-wiring sits.
-    ///
-    /// They did not: the `OoP` path ran it *after* `start`, so a gear resolving
-    /// a consumed contract during its own `start` found nothing in the
-    /// `ClientHub` under Profile 2/3 while working under Profile 1. Both paths
-    /// now go through `run_init_wiring_post_init`, which pins the order.
-    ///
-    /// This test covers the two observable endpoints of that segment. The
-    /// wiring step between them is a no-op here (no `#[toolkit::consumes]`
-    /// registration is linked into this test binary), so what actually stops
-    /// the paths diverging again is the shared method itself — inlining it back
-    /// into both call sites makes it dead code and fails the `-D warnings`
-    /// build.
-    #[tokio::test]
-    async fn init_wiring_post_init_runs_as_one_ordered_segment() {
-        #[derive(Clone)]
-        struct TrackHooks {
-            events: Arc<Mutex<Vec<String>>>,
-        }
-
-        #[async_trait::async_trait]
-        impl Gear for TrackHooks {
-            async fn init(&self, _ctx: &GearCtx) -> anyhow::Result<()> {
-                self.events.lock().await.push("init".to_owned());
-                Ok(())
-            }
-
-            async fn post_init(&self, _ctx: &GearCtx) -> anyhow::Result<()> {
-                self.events.lock().await.push("post_init".to_owned());
-                Ok(())
-            }
-        }
-
-        let events = Arc::new(Mutex::new(Vec::<String>::new()));
-        let gear = Arc::new(TrackHooks {
-            events: events.clone(),
-        });
-
-        let mut builder = RegistryBuilder::default();
-        builder.register_core_with_meta("app", &[], gear.clone() as Arc<dyn Gear>);
-        let registry = builder.build_topo_sorted().unwrap();
-
-        let runtime = HostRuntime::new(
-            registry,
-            Arc::new(EmptyConfigProvider) as Arc<dyn ConfigProvider>,
-            DbOptions::None,
-            Arc::new(ClientHub::new()),
-            CancellationToken::new(),
-            Uuid::new_v4(),
-            None,
-        );
-
-        runtime.run_init_wiring_post_init().await.unwrap();
-
-        assert_eq!(events.lock().await.clone(), vec!["init", "post_init"]);
     }
 
     /// A REST gear opting out of directory advertisement is served but not
