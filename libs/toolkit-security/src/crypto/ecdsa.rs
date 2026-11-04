@@ -2,9 +2,8 @@
 
 use std::sync::Arc;
 
-use pkcs8::der::Decode;
-#[cfg(all(feature = "fips", any(target_os = "macos", target_os = "windows")))]
-use pkcs8::der::Encode;
+use pkcs8::der::asn1::UintRef;
+use pkcs8::der::{Decode, Encode, Reader, SliceReader};
 use pkcs8::{ObjectIdentifier, PrivateKeyInfoRef};
 use rustls::SignatureScheme;
 use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer, alg_id};
@@ -31,15 +30,26 @@ pub enum EcdsaAlgorithm {
 /// An ECDSA P-256 signing key owned by the configured OS backend.
 ///
 /// Private keys use PKCS#8 DER with an embedded uncompressed SEC1 public point.
-/// Public keys use `0x04 || X || Y` (65 bytes); signatures use ASN.1 DER, not
-/// fixed-width JOSE `r || s`. No backend key types escape this API.
+/// Public keys use `0x04 || X || Y` (65 bytes). [`Self::sign`] emits ASN.1 DER
+/// and [`Self::sign_fixed`] the fixed-width JOSE `r || s` form. No backend key
+/// types escape this API.
+#[derive(Clone)]
 pub struct EcdsaP256KeyPair {
     inner: Arc<dyn SigningKey>,
     public_key: Vec<u8>,
 }
 
+impl std::fmt::Debug for EcdsaP256KeyPair {
+    /// Shows the public point only; the private half never leaves the backend.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EcdsaP256KeyPair")
+            .field("public_key", &self.public_key)
+            .finish_non_exhaustive()
+    }
+}
+
 /// An uncompressed P-256 public key for verifying ASN.1 DER signatures.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct EcdsaP256VerifyingKey(Vec<u8>);
 
 impl EcdsaP256VerifyingKey {
@@ -95,6 +105,32 @@ impl EcdsaP256KeyPair {
     /// unavailable backend. Ed25519 seeds are never interpreted as EC scalars.
     pub fn from_pkcs8(bytes: &[u8]) -> Result<Self, CryptoError> {
         Self::from_pkcs8_with_provider(bytes, backend::provider()?)
+    }
+
+    /// Import an unencrypted PKCS#8 PEM document (`-----BEGIN PRIVATE KEY-----`)
+    /// with the same checks as [`Self::from_pkcs8`]. The DER is decoded into a
+    /// buffer that is erased on every path, including a rejected key.
+    ///
+    /// The decoder is the constant-time RFC 7468 parser, strict apart from
+    /// surrounding whitespace, which is trimmed: base64 lines must be 64
+    /// columns, as `openssl pkcs8 -topk8` writes them. Keys re-wrapped at
+    /// another width or collapsed onto one line are rejected. As with
+    /// [`Self::from_pkcs8`], the document must embed the public point; the
+    /// facade never derives it from the scalar.
+    ///
+    /// # Errors
+    /// Returns an error for a different PEM label, including SEC1
+    /// `EC PRIVATE KEY` and `ENCRYPTED PRIVATE KEY`, for a non-conforming
+    /// encapsulation, and for every [`Self::from_pkcs8`] failure.
+    pub fn from_pkcs8_pem(pem: &str) -> Result<Self, CryptoError> {
+        let pem = pem.trim().as_bytes();
+        let mut buffer = Zeroizing::new(vec![0; pem.len()]);
+        let (label, der) =
+            pem_rfc7468::decode(pem, &mut buffer).map_err(|_| CryptoError::InvalidKey)?;
+        if label != "PRIVATE KEY" {
+            return Err(CryptoError::InvalidKey);
+        }
+        Self::from_pkcs8(der)
     }
 
     pub(super) fn from_pkcs8_with_provider(
@@ -158,6 +194,78 @@ impl EcdsaP256KeyPair {
             .sign(message)
             .map_err(|_| CryptoError::SigningFailed)
     }
+
+    /// Sign the message with P-256/SHA-256, returning the fixed-width
+    /// `r || s` form (64 bytes) used by JOSE `ES256` and IEEE P1363.
+    ///
+    /// # Errors
+    /// Returns an error for an oversized message or native signing failure,
+    /// including a backend signature that is not a well-formed DER sequence.
+    pub fn sign_fixed(&self, message: &[u8]) -> Result<[u8; 64], CryptoError> {
+        der_to_fixed(&self.sign(message)?, 32)
+            .ok()
+            .and_then(|fixed| fixed.try_into().ok())
+            .ok_or(CryptoError::SigningFailed)
+    }
+}
+
+/// Re-encode an ASN.1 DER `ECDSA-Sig-Value` as fixed-width `r || s`, each
+/// scalar `width` bytes.
+///
+/// Structural DER decoding only: each scalar must be a canonical positive
+/// INTEGER that fits in `width` bytes; it is left-padded with zeros. Trailing
+/// bytes inside or after the sequence are rejected.
+///
+/// # Errors
+/// Returns `InvalidSignature` for anything that is not exactly a sequence of
+/// two such integers, or when `width` is outside `1..=48`.
+pub fn der_to_fixed(der: &[u8], width: usize) -> Result<Vec<u8>, CryptoError> {
+    if width == 0 || width > 48 {
+        return Err(CryptoError::InvalidSignature);
+    }
+    let mut reader = SliceReader::new(der).map_err(|_| CryptoError::InvalidSignature)?;
+    let fixed = reader.sequence(|reader| {
+        let mut fixed = vec![0; 2 * width];
+        for scalar in fixed.chunks_exact_mut(width) {
+            let integer = UintRef::decode(reader)?;
+            let bytes = integer.as_bytes();
+            let offset = width
+                .checked_sub(bytes.len())
+                .ok_or_else(|| pkcs8::der::Tag::Integer.length_error())?;
+            scalar[offset..].copy_from_slice(bytes);
+        }
+        Ok::<_, pkcs8::der::Error>(fixed)
+    });
+    let fixed = fixed.map_err(|_| CryptoError::InvalidSignature)?;
+    reader.finish().map_err(|_| CryptoError::InvalidSignature)?;
+    Ok(fixed)
+}
+
+/// Re-encode fixed-width `r || s` (each scalar `width` bytes) as an ASN.1 DER
+/// `ECDSA-Sig-Value`, the form the native verifiers accept.
+///
+/// Structural DER encoding only: each scalar becomes a canonical positive
+/// INTEGER. With `width` at most 48 the sequence stays under 128 bytes, so
+/// its length is one byte.
+///
+/// # Errors
+/// Returns `InvalidSignature` when `fixed` is not `2 * width` bytes or `width`
+/// is outside `1..=48`.
+pub fn fixed_to_der(fixed: &[u8], width: usize) -> Result<Vec<u8>, CryptoError> {
+    if width == 0 || width > 48 || fixed.len() != 2 * width {
+        return Err(CryptoError::InvalidSignature);
+    }
+    let mut der = vec![0x30, 0];
+    for scalar in fixed.chunks_exact(width) {
+        let integer = UintRef::new(scalar).map_err(|_| CryptoError::InvalidSignature)?;
+        der.extend(
+            integer
+                .to_der()
+                .map_err(|_| CryptoError::InvalidSignature)?,
+        );
+    }
+    der[1] = u8::try_from(der.len() - 2).map_err(|_| CryptoError::InvalidSignature)?;
+    Ok(der)
 }
 
 pub(super) fn validate_public_key(key: &[u8]) -> Result<(), CryptoError> {
