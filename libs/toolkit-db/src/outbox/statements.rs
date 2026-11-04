@@ -800,6 +800,14 @@ const fn now_expr(dialect: Dialect) -> &'static str {
     }
 }
 
+/// The processor's `attempts` plus one, saturating at `i16::MAX`: the column is
+/// a `SMALLINT` and is read back as an `i16`. A handler that keeps returning
+/// `Retry` - through a days-long downstream outage, say - can reach the limit,
+/// and an increment past it fails its statement; on the lease acquire that
+/// would stop the partition for good. A `CASE` reads the same in every dialect
+/// and never evaluates the overflowing sum.
+const ATTEMPTS_INCREMENT: &str = "CASE WHEN attempts < 32767 THEN attempts + 1 ELSE attempts END";
+
 fn lock_partition(dialect: Dialect, tables: &OutboxTables) -> Option<String> {
     match dialect {
         Dialect::Postgres => Some(format!(
@@ -873,13 +881,13 @@ fn record_retry(dialect: Dialect, tables: &OutboxTables) -> String {
     match dialect {
         Dialect::Postgres | Dialect::Sqlite => format!(
             "UPDATE {} \
-             SET attempts = attempts + 1, last_error = $1 \
+             SET attempts = {ATTEMPTS_INCREMENT}, last_error = $1 \
              WHERE partition_id = $2",
             tables.processor()
         ),
         Dialect::MySql => format!(
             "UPDATE {} \
-             SET attempts = attempts + 1, last_error = ? \
+             SET attempts = {ATTEMPTS_INCREMENT}, last_error = ? \
              WHERE partition_id = ?",
             tables.processor()
         ),
@@ -908,7 +916,7 @@ fn lease_acquire(dialect: Dialect, tables: &OutboxTables) -> String {
         Dialect::Postgres => format!(
             "UPDATE {} \
              SET locked_by = $1, locked_until = NOW() + $2 * INTERVAL '1 second', \
-                 attempts = attempts + 1 \
+                 attempts = {ATTEMPTS_INCREMENT} \
              WHERE partition_id = $3 \
                AND (locked_by IS NULL OR locked_until < NOW()) \
              RETURNING processed_seq, attempts",
@@ -917,7 +925,7 @@ fn lease_acquire(dialect: Dialect, tables: &OutboxTables) -> String {
         Dialect::Sqlite => format!(
             "UPDATE {} \
              SET locked_by = $1, locked_until = datetime('now', '+' || $2 || ' seconds'), \
-                 attempts = attempts + 1 \
+                 attempts = {ATTEMPTS_INCREMENT} \
              WHERE partition_id = $3 \
                AND (locked_by IS NULL OR locked_until < datetime('now')) \
              RETURNING processed_seq, attempts",
@@ -926,7 +934,7 @@ fn lease_acquire(dialect: Dialect, tables: &OutboxTables) -> String {
         Dialect::MySql => format!(
             "UPDATE {} \
              SET locked_by = ?, locked_until = DATE_ADD(NOW(6), INTERVAL ? SECOND), \
-                 attempts = attempts + 1 \
+                 attempts = {ATTEMPTS_INCREMENT} \
              WHERE partition_id = ? \
                AND (locked_by IS NULL OR locked_until < NOW(6))",
             tables.processor()
