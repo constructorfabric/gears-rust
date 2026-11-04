@@ -1,6 +1,8 @@
 # Constructor Fabric Gears (Rust)
 [![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/constructorfabric/gears-rust/badge)](https://scorecard.dev/viewer/?uri=github.com/constructorfabric/gears-rust) [![OpenSSF Best Practices](https://www.bestpractices.dev/projects/12050/badge)](https://www.bestpractices.dev/projects/12050)
 
+Nightly: [![e2e nightly](https://github.com/constructorfabric/gears-rust/actions/workflows/e2e.yml/badge.svg?event=schedule)](https://github.com/constructorfabric/gears-rust/actions/workflows/e2e.yml?query=event%3Aschedule) [![clippy nightly](https://github.com/constructorfabric/gears-rust/actions/workflows/clippy-nightly.yml/badge.svg?event=schedule)](https://github.com/constructorfabric/gears-rust/actions/workflows/clippy-nightly.yml?query=event%3Aschedule) [![macOS/Windows tests nightly](https://github.com/constructorfabric/gears-rust/actions/workflows/macos-windows-tests.yml/badge.svg?event=schedule)](https://github.com/constructorfabric/gears-rust/actions/workflows/macos-windows-tests.yml?query=event%3Aschedule) [![unused deps nightly](https://github.com/constructorfabric/gears-rust/actions/workflows/shear-nightly.yml/badge.svg?event=schedule)](https://github.com/constructorfabric/gears-rust/actions/workflows/shear-nightly.yml?query=event%3Aschedule) · [all nightly runs](https://github.com/constructorfabric/gears-rust/actions?query=event%3Aschedule)
+
 <p align="center">
   <img src="docs/img/gears.png" style='max-width: 800px' alt="Constructor Fabric Gears diagram">
 </p>
