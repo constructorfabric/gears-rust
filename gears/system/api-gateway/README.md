@@ -14,7 +14,7 @@ The `cf-gears-api-gateway` crate provides:
 
 ```yaml
 gears:
-  api_gateway:
+  api-gateway:
     config:
       bind_addr: "127.0.0.1:8086"
       enable_docs: true
