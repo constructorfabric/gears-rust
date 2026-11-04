@@ -13,7 +13,7 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: clippy-nightly-${{ github.ref }}
+  group: clippy-nightly-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
 
 permissions:
