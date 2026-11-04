@@ -12,7 +12,8 @@
 # semver patch or minor update, except cargo 0.x minors (breaking in cargo, e.g. base64
 # 0.22 -> 0.23). Entries without an update-type (docker / github_actions digest and SHA
 # bumps) are eligible; for cargo they are not. Anything unparseable, any major bump, or any
-# PR with a non-dependabot commit is never merged. Ineligible PRs get `deps:needs-migration`.
+# PR with a commit that is not authored by Dependabot, not GitHub-signed, or a merge commit
+# is never merged. Ineligible PRs get `deps:needs-migration`.
 # Red PRs whose last commit is older than 72h get one `@dependabot recreate`
 # (`deps:recreated`), then `deps:needs-migration`. Caps per run: 3 merges, 3 recreates.
 #
@@ -37,6 +38,7 @@ permissions:
   # Dry-run reads PRs and their checks with GITHUB_TOKEN; writes use the App token.
   pull-requests: read
   checks: read
+  statuses: read  # statusCheckRollup includes commit statuses
 
 concurrency:
   group: dependabot-sweeper
@@ -66,6 +68,9 @@ jobs:
           private-key: ${{ secrets.DEPS_BOT_PRIVATE_KEY }}
           permission-contents: write
           permission-pull-requests: write
+          permission-issues: write  # labels (gh label create, pr edit --add-label) use the Issues API
+          permission-checks: read
+          permission-statuses: read
 
       - name: Sweep
         env:
