@@ -116,7 +116,62 @@ async fn rejected_refusal_schema_prevents_publication_completion() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn an_unreachable_registry_keeps_startup_pending_until_cancelled() {
+async fn an_unreachable_registry_reaches_the_publication_deadline() {
+    let registry = Arc::new(MockTypesRegistry::new());
+    registry.inject(
+        Fault::on(Call::Register)
+            .fail(toolkit_canonical_errors::CanonicalError::service_unavailable().create()),
+    );
+    let hub = toolkit::ClientHub::new();
+    registry.install(&hub);
+    let publication = PreparedGtsPublication::prepare(
+        AdmissionControl::default().descriptor(),
+        &provider(),
+        &hub,
+    )
+    .unwrap();
+    let started = tokio::time::Instant::now();
+
+    let result = publication
+        .publish(&CancellationToken::new(), Arc::new(|_: &str| {}))
+        .await;
+
+    assert_eq!(
+        started.elapsed(),
+        types_registry_sdk::STARTUP_PUBLICATION_DEADLINE
+    );
+    let Err(GtsPublicationError::Refused { source, .. }) = result else {
+        panic!("expected publication deadline: {result:?}");
+    };
+    let report = source
+        .chain()
+        .find_map(|error| error.downcast_ref::<types_registry_sdk::PublicationError>())
+        .and_then(types_registry_sdk::PublicationError::report)
+        .expect("reconciliation report");
+    assert_eq!(
+        report.stop,
+        types_registry_sdk::ReconcileStop::Deadline,
+        "{source:#}"
+    );
+    assert_eq!(
+        report.outcomes.len(),
+        publication.gts_manifest().documents().len()
+    );
+    assert!(report.outcomes.values().all(|outcome| matches!(
+        outcome,
+        types_registry_sdk::ReconcileOutcome::Pending(
+            types_registry_sdk::ReconcilePendingCause::Unavailable(_)
+        )
+    )));
+    assert!(registry.calls(Call::Register) > 1, "publication retried");
+    assert!(
+        hub.try_get::<dyn admission_control_sdk::AdmissionClientV1>()
+            .is_none()
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_unreachable_registry_can_be_cancelled_before_the_deadline() {
     let registry = Arc::new(MockTypesRegistry::new());
     registry.inject(
         Fault::on(Call::Register)
@@ -133,18 +188,30 @@ async fn an_unreachable_registry_keeps_startup_pending_until_cancelled() {
     let cancel = CancellationToken::new();
     let publishing = publication.publish(&cancel, Arc::new(|_: &str| {}));
     tokio::pin!(publishing);
+
     tokio::select! {
-        result = &mut publishing => panic!("unreachable registry admitted: {result:?}"),
-        () = tokio::time::sleep(types_registry_sdk::STARTUP_PUBLICATION_DEADLINE * 2) => {}
+        result = &mut publishing => panic!("settled before cancellation: {result:?}"),
+        () = tokio::time::sleep(types_registry_sdk::STARTUP_PUBLICATION_DEADLINE / 2) => {}
     }
-    assert!(registry.calls(Call::Register) > 1, "publication retried");
+    let submissions = registry.calls(Call::Register);
+    assert!(submissions > 1, "publication retried");
     assert!(
         hub.try_get::<dyn admission_control_sdk::AdmissionClientV1>()
             .is_none()
     );
+
     cancel.cancel();
     assert!(matches!(
         publishing.await,
         Err(GtsPublicationError::Cancelled { .. })
     ));
+    assert_eq!(
+        registry.calls(Call::Register),
+        submissions,
+        "no submissions after cancellation"
+    );
+    assert!(
+        hub.try_get::<dyn admission_control_sdk::AdmissionClientV1>()
+            .is_none()
+    );
 }

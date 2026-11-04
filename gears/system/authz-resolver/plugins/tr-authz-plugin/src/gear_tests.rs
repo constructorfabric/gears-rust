@@ -164,27 +164,73 @@ async fn a_rejected_instance_fails_the_publication() {
     assert!(error.to_string().contains(&id), "{error:#}");
 }
 
-/// An admission that never completes keeps the publication pending — the
-/// runtime holds every application `init` meanwhile — until cancelled.
+/// A pending admission exhausts one publication budget without binding a client.
 #[tokio::test(start_paused = true)]
-async fn a_pending_instance_keeps_retrying_until_cancelled() {
+async fn a_pending_instance_reaches_the_deadline_without_binding() {
     let hub = Arc::new(ClientHub::new());
     let registry = Arc::new(MockTypesRegistry::new().completing_after(u32::MAX));
     registry.install(&hub);
-    let cancel = CancellationToken::new();
+    let (id, _) = instance(7);
+    let started = tokio::time::Instant::now();
 
+    let result = published(&hub, 7, &CancellationToken::new()).await;
+
+    assert_eq!(
+        started.elapsed(),
+        types_registry_sdk::STARTUP_PUBLICATION_DEADLINE
+    );
+    let Err(GtsPublicationError::Refused { source, .. }) = result else {
+        panic!("expected publication deadline: {result:?}");
+    };
+    let stop = source
+        .chain()
+        .find_map(|error| error.downcast_ref::<types_registry_sdk::PublicationError>())
+        .and_then(types_registry_sdk::PublicationError::report)
+        .map(|report| report.stop);
+    assert_eq!(
+        stop,
+        Some(types_registry_sdk::ReconcileStop::Deadline),
+        "{source:#}"
+    );
+    assert_eq!(registry.calls(Call::Register), 1, "accepted once");
+    assert!(
+        registry.calls(Call::GetOperation) > 1,
+        "polled the accepted operation"
+    );
+    assert!(!backend_published(&hub, &id));
+}
+
+/// Cancellation within the budget stops polling without binding the pending instance.
+#[tokio::test(start_paused = true)]
+async fn a_pending_instance_can_be_cancelled_before_the_deadline() {
+    let hub = Arc::new(ClientHub::new());
+    let registry = Arc::new(MockTypesRegistry::new().completing_after(u32::MAX));
+    registry.install(&hub);
+    let (id, _) = instance(7);
+    let cancel = CancellationToken::new();
     let running = published(&hub, 7, &cancel);
     tokio::pin!(running);
+
     tokio::select! {
-        _ = &mut running => panic!("never admitted"),
-        () = tokio::time::sleep(types_registry_sdk::STARTUP_PUBLICATION_DEADLINE * 3) => {}
+        result = &mut running => panic!("settled before cancellation: {result:?}"),
+        () = tokio::time::sleep(types_registry_sdk::STARTUP_PUBLICATION_DEADLINE / 2) => {}
     }
-    assert!(registry.calls(Call::Register) > 1, "retried");
+    assert_eq!(registry.calls(Call::Register), 1, "accepted once");
+    let polls = registry.calls(Call::GetOperation);
+    assert!(polls > 1, "polled the accepted operation");
+    assert!(!backend_published(&hub, &id));
+
     cancel.cancel();
     assert!(matches!(
         running.await,
         Err(GtsPublicationError::Cancelled { .. })
     ));
+    assert_eq!(
+        registry.calls(Call::GetOperation),
+        polls,
+        "no polls after cancellation"
+    );
+    assert!(!backend_published(&hub, &id));
 }
 
 #[tokio::test]

@@ -168,30 +168,72 @@ async fn a_rejected_instance_binds_nothing() {
     assert!(!bound(&hub, &id));
 }
 
-/// An admission that never completes keeps retrying past the startup deadline:
-/// an accepted but pending instance is never selectable.
+/// A pending admission exhausts one publication budget without binding a client.
 #[tokio::test(start_paused = true)]
-async fn a_pending_instance_keeps_retrying_without_binding() {
+async fn a_pending_instance_reaches_the_deadline_without_binding() {
     let hub = Arc::new(ClientHub::new());
     let registry = Arc::new(MockTypesRegistry::new().completing_after(u32::MAX));
     registry.install(&hub);
     let (id, _) = instance(7);
+    let started = tokio::time::Instant::now();
 
-    let cancel = CancellationToken::new();
-    let running = tokio::spawn({
-        let (hub, cancel) = (Arc::clone(&hub), cancel.clone());
-        async move { boot(&hub, 7, &cancel).await }
-    });
-    tokio::time::sleep(types_registry_sdk::STARTUP_PUBLICATION_DEADLINE * 3).await;
+    let result = boot(&hub, 7, &CancellationToken::new()).await;
 
-    assert!(!running.is_finished(), "still pending");
-    assert!(registry.calls(Call::Register) > 1, "retried");
+    assert_eq!(
+        started.elapsed(),
+        types_registry_sdk::STARTUP_PUBLICATION_DEADLINE
+    );
+    let Err(GtsPublicationError::Refused { source, .. }) = result else {
+        panic!("expected publication deadline: {result:?}");
+    };
+    let stop = source
+        .chain()
+        .find_map(|error| error.downcast_ref::<types_registry_sdk::PublicationError>())
+        .and_then(types_registry_sdk::PublicationError::report)
+        .map(|report| report.stop);
+    assert_eq!(
+        stop,
+        Some(types_registry_sdk::ReconcileStop::Deadline),
+        "{source:#}"
+    );
+    assert_eq!(registry.calls(Call::Register), 1, "accepted once");
+    assert!(
+        registry.calls(Call::GetOperation) > 1,
+        "polled the accepted operation"
+    );
     assert!(!bound(&hub, &id));
+}
+
+/// Cancellation within the budget stops polling without binding the pending instance.
+#[tokio::test(start_paused = true)]
+async fn a_pending_instance_can_be_cancelled_before_the_deadline() {
+    let hub = Arc::new(ClientHub::new());
+    let registry = Arc::new(MockTypesRegistry::new().completing_after(u32::MAX));
+    registry.install(&hub);
+    let (id, _) = instance(7);
+    let cancel = CancellationToken::new();
+    let running = boot(&hub, 7, &cancel);
+    tokio::pin!(running);
+
+    tokio::select! {
+        result = &mut running => panic!("settled before cancellation: {result:?}"),
+        () = tokio::time::sleep(types_registry_sdk::STARTUP_PUBLICATION_DEADLINE / 2) => {}
+    }
+    assert_eq!(registry.calls(Call::Register), 1, "accepted once");
+    let polls = registry.calls(Call::GetOperation);
+    assert!(polls > 1, "polled the accepted operation");
+    assert!(!bound(&hub, &id));
+
     cancel.cancel();
     assert!(matches!(
-        running.await.unwrap(),
+        running.await,
         Err(GtsPublicationError::Cancelled { .. })
     ));
+    assert_eq!(
+        registry.calls(Call::GetOperation),
+        polls,
+        "no polls after cancellation"
+    );
     assert!(!bound(&hub, &id));
 }
 

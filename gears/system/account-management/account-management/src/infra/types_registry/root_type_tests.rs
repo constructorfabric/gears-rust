@@ -163,21 +163,37 @@ async fn cancellation_is_startup_fatal() {
         .expect_err("a cancelled registration fails");
 }
 
-/// An unavailable registry fails startup at once — reconciliation stops on a
-/// failed read rather than waiting out the deadline — naming the root type;
-/// nothing is written.
+/// An unavailable registry is retried within one budget; the deadline names the
+/// unconfirmed root and no registration is submitted.
 #[tokio::test(start_paused = true)]
-async fn an_unavailable_registry_fails_startup_at_once_naming_the_root() {
+async fn an_unavailable_registry_reaches_the_deadline_naming_the_root() {
     let registry = registry();
     registry.inject(Fault::on(Call::BatchGet).fail(CanonicalError::service_unavailable().create()));
 
     let started = tokio::time::Instant::now();
     let error = register_root_type(registry.as_ref(), &config(false), &CancellationToken::new())
         .await
-        .expect_err("an unreachable registry fails startup");
+        .expect_err("an unreachable registry exhausts the publication budget");
 
-    assert_eq!(started.elapsed(), std::time::Duration::ZERO);
-    assert_eq!(registry.calls(Call::BatchGet), 1);
+    assert_eq!(
+        started.elapsed(),
+        types_registry_sdk::STARTUP_PUBLICATION_DEADLINE
+    );
+    let report = error
+        .downcast_ref::<types_registry_sdk::PublicationError>()
+        .expect("publication error")
+        .report()
+        .expect("reconciliation report");
+    assert_eq!(report.stop, types_registry_sdk::ReconcileStop::Deadline);
+    assert!(matches!(
+        report
+            .outcomes
+            .get(&GtsId::try_new(ROOT_TYPE).expect("valid root identifier")),
+        Some(types_registry_sdk::ReconcileOutcome::Pending(
+            types_registry_sdk::ReconcilePendingCause::Unavailable(_)
+        ))
+    ));
+    assert!(registry.calls(Call::BatchGet) > 1, "read retried");
     assert!(error.to_string().contains(ROOT_TYPE), "{error:#}");
     assert_eq!(registry.calls(Call::Register), 0);
     assert_eq!(registry.content(ROOT_TYPE), None);
