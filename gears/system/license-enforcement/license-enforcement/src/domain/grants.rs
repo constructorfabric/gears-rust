@@ -27,7 +27,7 @@ use toolkit_db::DBProvider;
 use toolkit_macros::domain_model;
 use toolkit_odata::{ODataQuery, Page};
 use toolkit_security::crypto::hash::Sha256;
-use toolkit_security::{SecurityContext, pep_properties};
+use toolkit_security::{AccessScope, SecurityContext, pep_properties};
 use uuid::Uuid;
 
 use super::check::Material;
@@ -516,7 +516,7 @@ impl<R: GrantRepo> GrantService<R> {
             )
             .await?;
         if let Some(result) = self.replayed(ctx, &token, &hash).await? {
-            return Ok(result);
+            return self.issued_in_scope(&scope, result).await;
         }
         self.check_holder(ctx, holder).await?;
 
@@ -595,6 +595,7 @@ impl<R: GrantRepo> GrantService<R> {
         let expires_at = OffsetDateTime::now_utc() + self.idempotency_window;
         let store = self.store;
         let tx_result = result.clone();
+        let tx_scope = scope.clone();
         let material = admission.material;
         let tx_token = token.clone();
         let tx_hash = hash.clone();
@@ -653,7 +654,7 @@ impl<R: GrantRepo> GrantService<R> {
                     store
                         .insert_evidence(
                             tx,
-                            &scope,
+                            &tx_scope,
                             NewEvidenceRow {
                                 id: evidence_id,
                                 holder,
@@ -668,10 +669,10 @@ impl<R: GrantRepo> GrantService<R> {
                         )
                         .await?;
                     if let Some(pack) = &tx_result.pack {
-                        store.insert_pack(tx, &scope, pack.id, holder, now).await?;
+                        store.insert_pack(tx, &tx_scope, pack.id, holder, now).await?;
                     }
                     for g in &tx_result.grants {
-                        store.insert_root(tx, &scope, g, now).await?;
+                        store.insert_root(tx, &tx_scope, g, now).await?;
                     }
                     if !store.apply_material(tx, plugin_id, &material).await? {
                         return Err(DomainError::AdmissionConflict);
@@ -682,8 +683,36 @@ impl<R: GrantRepo> GrantService<R> {
                 })
             })
             .await;
-        self.or_replayed(ctx, &token, &hash, committed.map(|()| result))
-            .await
+        // A failed write may answer with the result of a concurrent request;
+        // that one is checked against the scope of this call.
+        let replayed = committed.is_err();
+        let result = self
+            .or_replayed(ctx, &token, &hash, committed.map(|()| result))
+            .await?;
+        if replayed {
+            self.issued_in_scope(&scope, result).await
+        } else {
+            Ok(result)
+        }
+    }
+
+    /// A stored `issue` result answers only inside `scope`, as a first call
+    /// would. The roots share the holder, so the first one decides.
+    async fn issued_in_scope(
+        &self,
+        scope: &AccessScope,
+        result: IssueResult,
+    ) -> Result<IssueResult, DomainError> {
+        let conn = self.db.conn()?;
+        let in_scope = match result.grants.first() {
+            Some(g) => self.store.grant(&conn, scope, g.id, false).await?.is_some(),
+            None => false,
+        };
+        if in_scope {
+            Ok(result)
+        } else {
+            Err(DomainError::PermissionDenied)
+        }
     }
 
     /// Bind a subject to a grant, or unbind it.
@@ -717,15 +746,17 @@ impl<R: GrantRepo> GrantService<R> {
             .enforcer
             .access_scope(ctx, &resources::GRANT, action, Some(id.0))
             .await?;
-        if let Some(grant) = self.replayed(ctx, &token, &hash).await? {
-            return Ok(grant);
-        }
+        // The scoped read comes before the replay: a grant outside the current
+        // scope is not found, for a replay too.
         let conn = self.db.conn()?;
         let current = self
             .store
             .grant(&conn, &scope, id, false)
             .await?
             .ok_or_else(|| not_found(Missing::Grant, id.0))?;
+        if let Some(grant) = self.replayed(ctx, &token, &hash).await? {
+            return Ok(grant);
+        }
         // The subject type of a grant never changes, so the prefetched one holds.
         if let BindingChange::Bind(subject) = &change {
             let mut violations = Vec::new();

@@ -949,6 +949,170 @@ async fn bind_in_another_tenant_answers_not_found() {
     assert!(matches!(err, DomainError::NotFound { .. }), "{err:?}");
 }
 
+/// As [`AllowAuthZ`], except that it scopes every constrained request of one
+/// subject to a tenant that holds nothing.
+struct NarrowedSubjectAuthZ(Uuid);
+
+#[async_trait::async_trait]
+impl authz_resolver_sdk::AuthZResolverApi for NarrowedSubjectAuthZ {
+    async fn evaluate(
+        &self,
+        ctx: toolkit_security::PlatformSecurityContext,
+        request: authz_resolver_sdk::models::EvaluationRequest,
+    ) -> Result<
+        authz_resolver_sdk::models::EvaluationResponse,
+        toolkit_canonical_errors::CanonicalError,
+    > {
+        use authz_resolver_sdk::constraints::{Constraint, InPredicate, Predicate};
+        if request.subject.id != self.0 {
+            return AllowAuthZ.evaluate(ctx, request).await;
+        }
+        Ok(authz_resolver_sdk::models::EvaluationResponse {
+            decision: true,
+            context: authz_resolver_sdk::models::EvaluationResponseContext {
+                constraints: vec![Constraint {
+                    predicates: vec![Predicate::In(InPredicate::new(
+                        toolkit_security::pep_properties::OWNER_TENANT_ID,
+                        [Uuid::now_v7()],
+                    ))],
+                }],
+                ..Default::default()
+            },
+        })
+    }
+}
+
+#[tokio::test]
+async fn a_replay_outside_the_scope_of_the_caller_is_refused() {
+    let tenant = Uuid::now_v7();
+    let (owner, outsider) = (ctx(tenant), ctx(tenant));
+    let env = env_with(Arc::new(NarrowedSubjectAuthZ(outsider.subject_id()))).await;
+    let (issue_token, bind_token, issued) = (token(), token(), terms());
+
+    let g = env
+        .grants
+        .issue(
+            &owner,
+            tenant,
+            vec![issued.clone()],
+            false,
+            issue_token.clone(),
+        )
+        .await
+        .unwrap()
+        .grants[0]
+        .clone();
+    let bind = BindingChange::Bind(user("alice"));
+    env.grants
+        .change_binding(&owner, g.id, bind.clone(), bind_token.clone(), None)
+        .await
+        .unwrap();
+
+    let err = env
+        .grants
+        .issue(&outsider, tenant, vec![issued], false, issue_token)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, DomainError::PermissionDenied), "{err:?}");
+    let err = env
+        .grants
+        .change_binding(&outsider, g.id, bind, bind_token, None)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, DomainError::NotFound { .. }), "{err:?}");
+}
+
+/// The `issue` plugin that holds the admission of one subject until
+/// `release`, and the admission of any other until that one is held: the held
+/// request has looked for a stored result and found none.
+struct GatePlugin {
+    held: Uuid,
+    holding: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+#[async_trait::async_trait]
+impl GrantAdmissionPluginV1 for GatePlugin {
+    fn info(&self) -> license_enforcement_sdk::PluginInfo {
+        le_issue_admission_plugin::IssueAdmissionPlugin.info()
+    }
+
+    fn intakes(&self) -> license_enforcement_sdk::Intakes {
+        le_issue_admission_plugin::IssueAdmissionPlugin.intakes()
+    }
+
+    async fn admit(
+        &self,
+        input: AdmissionInput,
+        instant: OffsetDateTime,
+        material: &dyn license_enforcement_sdk::PluginMaterial,
+    ) -> Result<license_enforcement_sdk::Admission, AdmissionError> {
+        let AdmissionInput::Issue { caller, .. } = &input else {
+            unreachable!()
+        };
+        if caller.subject_id == self.held {
+            self.holding.notify_one();
+            self.release.notified().await;
+        } else {
+            self.holding.notified().await;
+        }
+        le_issue_admission_plugin::IssueAdmissionPlugin
+            .admit(input, instant, material)
+            .await
+    }
+
+    async fn verify(
+        &self,
+        root_id: GrantId,
+        evidence: &license_enforcement_sdk::StoredEvidence,
+        instant: OffsetDateTime,
+        material: &dyn license_enforcement_sdk::PluginMaterial,
+    ) -> Result<license_enforcement_sdk::Verification, license_enforcement_sdk::PluginFault> {
+        le_issue_admission_plugin::IssueAdmissionPlugin
+            .verify(root_id, evidence, instant, material)
+            .await
+    }
+
+    async fn health(&self) -> Result<(), license_enforcement_sdk::PluginFault> {
+        Ok(())
+    }
+}
+
+/// The write of the outsider fails after the owner commits the token: the
+/// stored result it falls back to is checked against its scope too.
+#[tokio::test]
+async fn a_concurrent_retry_outside_the_scope_of_the_caller_is_refused() {
+    let tenant = Uuid::now_v7();
+    let (owner, outsider) = (ctx(tenant), ctx(tenant));
+    let gate = Arc::new(GatePlugin {
+        held: outsider.subject_id(),
+        holding: tokio::sync::Notify::new(),
+        release: tokio::sync::Notify::new(),
+    });
+    let env = env_with_plugin(
+        Arc::new(NarrowedSubjectAuthZ(outsider.subject_id())),
+        gate.clone(),
+    )
+    .await;
+    let (issue_token, issued) = (token(), terms());
+    let issue = |c| {
+        env.grants
+            .issue(c, tenant, vec![issued.clone()], false, issue_token.clone())
+    };
+
+    let (by_owner, by_outsider) = tokio::join!(
+        async {
+            let r = issue(&owner).await;
+            gate.release.notify_one();
+            r
+        },
+        issue(&outsider),
+    );
+    by_owner.unwrap();
+    let err = by_outsider.unwrap_err();
+    assert!(matches!(err, DomainError::PermissionDenied), "{err:?}");
+}
+
 /// The `issue` plugin that writes the plugin material named by the token:
 /// `"n/put:1:absent"` puts `1` if the key is absent, `"n/del::2"` deletes the
 /// key if it holds `2`, an empty expectation is `Any`.
