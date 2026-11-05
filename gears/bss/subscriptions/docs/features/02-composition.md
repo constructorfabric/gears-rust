@@ -64,22 +64,23 @@ Preserve what was accepted and supplied, including quantities, tenant context an
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-subscriptions-flow-open-interval-cmp`
 
-1. Authorize the caller and validate requested line/item identity against the accepted order/contract context.
-2. Resolve the immutable acceptance/hold evidence using the current Pricing capability owners. Validate receipt/digest, complete selections, tenant axes, market, BillingTerms and policy descriptors. Do not substitute a fresh preview when evidence is unavailable.
-3. Freeze the accepted bindings with stable line/item IDs, service quantity source, dated SKU descriptors, currency and region/market, and immutable source provenance. Brand/PlanTier metadata is deferred. Pricing descriptor/money digest and UsageRatingPolicy identity/version/digest remain intact.
-4. At application, close and open composition and quantity intervals at the one committed boundary. Increment aggregate revision once and produce downstream frozen term slices from that revision.
-5. Retain predecessor evidence and correction lineage. Scheduled composition changes are deferred and refuse before effects. Future-start Orders remain in the separate Foundation acquisition/cancellation flow; they create no served interval before activation.
-
-A confirmed future-start order additionally retains its durable Pricing/Products commercial commitment, order-bound reservation and financial correlation separately from applied service intervals. That commitment must exist before capture under the Foundation's versioned contract; current V1 acceptance/hold evidence alone does not establish it. Confirmation or prepayment does not start service coverage. Cancelling or amending a paid future-start order cannot silently discard that commitment, reprice the customer or release its place; use the agreed amendment/cancellation and financial-remedy path. Draft/version/attempt rebinding remains gated under S-U01.
+**Steps**:
+1. [ ] - `p1` - Authorize the caller and validate requested line/item identity against the accepted order/contract context. - `inst-authorize-caller-validate-requested`
+2. [ ] - `p1` - Resolve the immutable acceptance/hold evidence using the current Pricing capability owners. Validate receipt/digest, complete selections, tenant axes, market, BillingTerms and policy descriptors. Do not substitute a fresh preview when evidence is unavailable. - `inst-resolve-immutable-acceptance-hold`
+3. [ ] - `p1` - Freeze the accepted bindings with stable line/item IDs, service quantity source, dated SKU descriptors, currency and region/market, and immutable source provenance. Brand/PlanTier metadata is deferred. Pricing descriptor/money digest and UsageRatingPolicy identity/version/digest remain intact. - `inst-freeze-accepted-bindings-stable`
+4. [ ] - `p1` - At application, close and open composition and quantity intervals at the one committed boundary. Increment aggregate revision once and produce downstream frozen term slices from that revision. - `inst-application-close-open-composition`
+5. [ ] - `p1` - Retain predecessor evidence and correction lineage. Scheduled composition changes are deferred and refuse before effects. Future-start Orders remain in the separate Foundation acquisition/cancellation flow; they create no served interval before activation. - `inst-retain-predecessor-evidence-correction`
+6. [ ] - `p1` - A confirmed future-start order additionally retains its durable Pricing/Products commercial commitment, order-bound reservation and financial correlation separately from applied service intervals. That commitment must exist before capture under the Foundation's versioned contract; current V1 acceptance/hold evidence alone does not establish it. Confirmation or prepayment does not start service coverage. Cancelling or amending a paid future-start order cannot silently discard that commitment, reprice the customer or release its place; use the agreed amendment/cancellation and financial-remedy path. Draft/version/attempt rebinding remains gated under S-U01. - `inst-confirmed-future-start-order`
 
 ### Read as of service time
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-subscriptions-flow-composition-asof`
 
-1. Authorize the requested scope and locate the committed revision/interval at the requested instant or range.
-2. Return applied composition, total quantity and complete per-interval lot allocations with stable identities, quantities, accepted terms and purchase provenance, plus effective tenant context and revision/continuation context. Do not expose scheduled composition as a supported operation; never collapse different accepted lot terms into a single current price.
-3. Resolve every term boundary within the requested range, including quantity, suspension and binding `ends_on` changes. Payer is fixed under the current profile; payer-transfer boundaries are deferred. Return explicit absence or inconsistency instead of filling a gap with today's plan.
-4. For a corrected view, expose superseded and current version references so financial consumers can reproduce the original evidence and the correction independently.
+**Steps**:
+1. [ ] - `p1` - Authorize the requested scope and locate the committed revision/interval at the requested instant or range. - `inst-authorize-requested-scope-locate`
+2. [ ] - `p1` - Return applied composition, total quantity and complete per-interval lot allocations with stable identities, quantities, accepted terms and purchase provenance, plus effective tenant context and revision/continuation context. Do not expose scheduled composition as a supported operation; never collapse different accepted lot terms into a single current price. - `inst-return-applied-composition-total`
+3. [ ] - `p1` - Resolve every term boundary within the requested range, including quantity, suspension and binding `ends_on` changes. Payer is fixed under the current profile; payer-transfer boundaries are deferred. Return explicit absence or inconsistency instead of filling a gap with today's plan. - `inst-resolve-term-boundary-requested`
+4. [ ] - `p1` - For a corrected view, expose superseded and current version references so financial consumers can reproduce the original evidence and the correction independently. - `inst-corrected-view-expose-superseded`
 
 ## 3. Processes / Business Logic (CDSL)
 
@@ -87,35 +88,30 @@ A confirmed future-start order additionally retains its durable Pricing/Products
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-subscriptions-algo-composition-intervals`
 
-Applied intervals are half-open `[effectiveFrom, effectiveTo)`. Adjacent intervals meet exactly; one logical item has at most one applied state at an instant. A quantity change preserves logical item identity and adds quantity history. Replace-price or renewal version changes do not create another economic occurrence. A new optional item gets its own stable item ID. Every correction retains its predecessor; consumed historical evidence cannot be updated or deleted. Applied history is never edited in place. Scheduled composition changes are deferred.
-
-**Quantity-lot model.** One logical component retains a separately identified lot for each purchase, with accepted binding, quantity, purchase provenance and effective-dated history. Its single applied state contains the complete lot allocation; service quantity is the sum of the effective lots. Entitlements consumes the resulting capacity. Rating consumes the full allocation in a versioned commercial fact, and corrections retain lot identities and prior evidence. Replaying a purchase business operation does not add another lot.
-
-Each lot follows Pricing's accepted renewal/continuation rules; no permanent price protection is inferred. Decreases/removals and transfers between purchase lots refuse before effects. Metered-usage allocation remains a separate contract question, as recorded in [DECISIONS](../DECISIONS.md#integration-delivery-gates).
-
-**Different-binding quantity increases: S-U08 delivery gate.** A new purchase of quantity on an existing logical item may accept a binding different from the existing quantity. One temporal binding plus a total quantity cannot represent both at the same time. The lot-aware temporal-slice/full-replacement semantics are accepted in [feature 08 §3.3](08-commercial-facts.md#33-derive-stable-facts-and-complete-accepted-term-slices). Until its exact versioned provider/consumer contract and runtime evidence exist, refuse that increase before effects; same-binding increases and distinct logical add-on items remain supported under their existing guards.
-
-The required contract must preserve immutable lot identity, accepted binding, purchase provenance and the original terms of existing lots, with lot quantities that sum to service quantity. For the initial profile it must encode increases/additions and correction allocation with version lineage. Wire schema and owner integration remain open. No resource-to-lot reassignment API is introduced.
-
-Component/item lifetime identity is distinct from S-Q04 charge-occurrence identity. Opening another interval, re-adding a component or replacing its price does not authorize a setup fee. Only a separately agreed chargeable business action can qualify under its accepted terms; retry or an attempt/draft rebuild preserves that same action. Existing order-change profile restrictions and S-U01 rebinding gates remain unchanged.
+**Steps**:
+1. [ ] - `p1` - Applied intervals are half-open `[effectiveFrom, effectiveTo)`. Adjacent intervals meet exactly; one logical item has at most one applied state at an instant. A quantity change preserves logical item identity and adds quantity history. Replace-price or renewal version changes do not create another economic occurrence. A new optional item gets its own stable item ID. Every correction retains its predecessor; consumed historical evidence cannot be updated or deleted. Applied history is never edited in place. Scheduled composition changes are deferred. - `inst-applied-intervals-half-open`
+2. [ ] - `p1` - **Quantity-lot model.** One logical component retains a separately identified lot for each purchase, with accepted binding, quantity, purchase provenance and effective-dated history. Its single applied state contains the complete lot allocation; service quantity is the sum of the effective lots. Entitlements consumes the resulting capacity. Rating consumes the full allocation in a versioned commercial fact, and corrections retain lot identities and prior evidence. Replaying a purchase business operation does not add another lot. - `inst-quantity-lot-model-logical`
+3. [ ] - `p1` - Each lot follows Pricing's accepted renewal/continuation rules; no permanent price protection is inferred. Decreases/removals and transfers between purchase lots refuse before effects. Metered-usage allocation remains a separate contract question, as recorded in [DECISIONS](../DECISIONS.md#integration-delivery-gates). - `inst-lot-follows-pricing-accepted`
+4. [ ] - `p1` - **Different-binding quantity increases: S-U08 delivery gate.** A new purchase of quantity on an existing logical item may accept a binding different from the existing quantity. One temporal binding plus a total quantity cannot represent both at the same time. The lot-aware temporal-slice/full-replacement semantics are accepted in [feature 08 §3.3](08-commercial-facts.md#33-derive-stable-facts-and-complete-accepted-term-slices). Until its exact versioned provider/consumer contract and runtime evidence exist, refuse that increase before effects; same-binding increases and distinct logical add-on items remain supported under their existing guards. - `inst-different-binding-quantity-increases`
+5. [ ] - `p1` - The required contract must preserve immutable lot identity, accepted binding, purchase provenance and the original terms of existing lots, with lot quantities that sum to service quantity. For the initial profile it must encode increases/additions and correction allocation with version lineage. Wire schema and owner integration remain open. No resource-to-lot reassignment API is introduced. - `inst-required-contract-preserve-immutable`
+6. [ ] - `p1` - Component/item lifetime identity is distinct from S-Q04 charge-occurrence identity. Opening another interval, re-adding a component or replacing its price does not authorize a setup fee. Only a separately agreed chargeable business action can qualify under its accepted terms; retry or an attempt/draft rebuild preserves that same action. Existing order-change profile restrictions and S-U01 rebinding gates remain unchanged. - `inst-component-item-lifetime-identity`
 
 ### Resolve continued bindings
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-subscriptions-algo-pricebook-bindings`
 
-At renewal or an allowed usage binding boundary, request Pricing resolution using the retained pin and the described commercial date. Follow the provider's successor rules; stop before a successor marked new when the pin contract requires it. Slice at the binding's own `ends_on`; informational `effective_to` may reflect a successor the holder did not take and is not a service/price cutoff. Retain keep-for-bound predecessors and immutable policy descriptors.
-
-Automatic adoption of a successor at a binding's own `ends_on` inside a running term needs an explicitly accepted continuation policy with its notice and assent prerequisites satisfied; a Pricing closure or a returned successor alone grants no such authority (SUB-D-41). When the boundary is known but no authorized continuation exists for an established obligation, publish a full successor fact with an explicit `Unresolved` interval and its exact successor seal instead of blocking; the interval carries reason and evidence, not invented terms (SUB-D-42).
-
-If required historical evidence is missing and the past itself is unknown, the affected fact is blocked. It cannot fall back to current prices.
-
-Usage can bind lazily per supported dimension value under the accepted policy, but value discovery must not change period identity or invent a new policy version. The resulting frozen slice must identify the actual accepted/resolved money and policy evidence. Unsupported or mismatched descriptors yield a typed failure before the slice is published.
+**Steps**:
+1. [ ] - `p1` - At renewal or an allowed usage binding boundary, request Pricing resolution using the retained pin and the described commercial date. Follow the provider's successor rules; stop before a successor marked new when the pin contract requires it. Slice at the binding's own `ends_on`; informational `effective_to` may reflect a successor the holder did not take and is not a service/price cutoff. Retain keep-for-bound predecessors and immutable policy descriptors. - `inst-renewal-allowed-usage-binding`
+2. [ ] - `p1` - Automatic adoption of a successor at a binding's own `ends_on` inside a running term needs an explicitly accepted continuation policy with its notice and assent prerequisites satisfied; a Pricing closure or a returned successor alone grants no such authority (SUB-D-41). When the boundary is known but no authorized continuation exists for an established obligation, publish a full successor fact with an explicit `Unresolved` interval and its exact successor seal instead of blocking; the interval carries reason and evidence, not invented terms (SUB-D-42). - `inst-automatic-adoption-successor-binding`
+3. [ ] - `p1` - If required historical evidence is missing and the past itself is unknown, the affected fact is blocked. It cannot fall back to current prices. - `inst-required-historical-evidence-missing`
+4. [ ] - `p1` - Usage can bind lazily per supported dimension value under the accepted policy, but value discovery must not change period identity or invent a new policy version. The resulting frozen slice must identify the actual accepted/resolved money and policy evidence. Unsupported or mismatched descriptors yield a typed failure before the slice is published. - `inst-usage-bind-lazily-supported`
 
 ### Descriptor and market continuity
 
 - [ ] `p2` - **ID**: `cpt-cf-bss-subscriptions-algo-composition-descriptors`
 
-**Deferred:** PlanTier derivation and per-sale brand retention are future metadata capabilities, not current provider prerequisites or acceptance criteria. Immutable accepted price, policy and required invoice-descriptor provenance remains mandatory; missing required historical evidence blocks replay rather than substituting live data. Currency/market changes require the explicitly supported commercial transition path; independent cancellation and new acquisition do not transfer resources or guarantee continuity.
+**Steps**:
+1. [ ] - `p2` - **Deferred:** PlanTier derivation and per-sale brand retention are future metadata capabilities, not current provider prerequisites or acceptance criteria. Immutable accepted price, policy and required invoice-descriptor provenance remains mandatory; missing required historical evidence blocks replay rather than substituting live data. Currency/market changes require the explicitly supported commercial transition path; independent cancellation and new acquisition do not transfer resources or guarantee continuity. - `inst-deferred-plantier-derivation-sale`
 
 ## 4. States (CDSL)
 
@@ -123,7 +119,7 @@ Usage can bind lazily per supported dimension value under the accepted policy, b
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-subscriptions-state-composition`
 
-The initial profile applies supported immediate composition changes under operation receipts; it does not expose a scheduled composition state. Applied evidence remains immutable; a successor revision can supersede its interpretation for a correction without changing the original. A past interval never returns to the proposed state.
+1. [ ] - `p1` - The initial profile applies supported immediate composition changes under operation receipts; it does not expose a scheduled composition state. Applied evidence remains immutable; a successor revision can supersede its interpretation for a correction without changing the original. A past interval never returns to the proposed state. - `inst-initial-profile-applies-supported`
 
 ## 5. Definitions of Done
 
@@ -133,7 +129,7 @@ The initial profile applies supported immediate composition changes under operat
 
 The implementation must persist accepted evidence, monotonic revisions, stable component identity and half-open quantity/ownership history; provide repeatable as-of reads; prevent overlapping applied states; and freeze complete term slices for Rating. Every adapter field must trace to current provider evidence or an explicit open contract gate.
 
-**Implements:** `cpt-cf-bss-subscriptions-flow-open-interval-cmp`, `cpt-cf-bss-subscriptions-flow-composition-asof`, `cpt-cf-bss-subscriptions-algo-pricebook-bindings`.
+**Implements:** `cpt-cf-bss-subscriptions-flow-open-interval-cmp`, `cpt-cf-bss-subscriptions-flow-composition-asof`, `cpt-cf-bss-subscriptions-algo-pricebook-bindings`, `cpt-cf-bss-subscriptions-algo-composition-intervals`, `cpt-cf-bss-subscriptions-algo-composition-descriptors`, `cpt-cf-bss-subscriptions-state-composition`. The deferred IDs in this list are implemented only as refusals before any effect; the capabilities stay out of scope.
 
 ## 6. Acceptance Criteria
 

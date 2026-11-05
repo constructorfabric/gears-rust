@@ -65,13 +65,15 @@ Preserve current authorization and historical financial/resource ownership for t
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-subscriptions-flow-transfer-tnt`
 
-**Deferred.** Payer/resource-owner transfer is outside the current version. No transfer endpoint, approval flow, claim handover or provider rebind is implemented. Creation-time tenant axes and authorization remain required.
+**Steps**:
+1. [ ] - `p1` - **Deferred.** Payer/resource-owner transfer is outside the current version. No transfer endpoint, approval flow, claim handover or provider rebind is implemented. Creation-time tenant axes and authorization remain required. - `inst-deferred-payer-resource-owner`
 
 ### Import a legacy subscription
 
 - [ ] `p2` - **ID**: `cpt-cf-bss-subscriptions-flow-import`
 
-**Deferred.** Refuse import before creating subscription state, claims or provider effects.
+**Steps**:
+1. [ ] - `p2` - **Deferred.** Refuse import before creating subscription state, claims or provider effects. - `inst-deferred-refuse-import-creating`
 
 ## 3. Processes / Business Logic (CDSL)
 
@@ -79,21 +81,23 @@ Preserve current authorization and historical financial/resource ownership for t
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-subscriptions-algo-transfer-billing`
 
-**Deferred.** No payer-transfer splitting or financial reallocation algorithm is implemented. Existing facts retain their recorded payer; ordinary financial replay remains unchanged.
+**Steps**:
+1. [ ] - `p1` - **Deferred.** No payer-transfer splitting or financial reallocation algorithm is implemented. Existing facts retain their recorded payer; ordinary financial replay remains unchanged. - `inst-deferred-payer-transfer-splitting`
 
 ### Hierarchy, privacy and audit
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-subscriptions-algo-tenant-reference`
 
-Commercial account and OrgTier roll-ups reference their authoritative AM identity/version. Subscriptions never defines tenant topology. Resolve current tenant identity and required ancestry through `TenantResolverClient`, behind an infrastructure adapter where a narrow domain port is useful. Use `PolicyEnforcer` for current authorization and PDP-derived scope. Keep topology, commercial relationship evidence and permission distinct: ancestry is not proof that a seller may charge a payer or grant access to a resource tenant. The [platform service bindings](../DESIGN.md#34-internal-dependencies) specify resolver reuse and historical-proof limitations.
-
-Authorize commands, historical reads and recovery ranges using current PDP-derived scope and the fixed creation-time tenant axes. Preserve the ordering partition and lifecycle sequence. Receipts/domain events retain relevant actor, reason, scope proof, source revision and correlation provenance for later audit consumers. No transfer approval flow or audit store/query/export subsystem is implemented.
+**Steps**:
+1. [ ] - `p1` - Commercial account and OrgTier roll-ups reference their authoritative AM identity/version. Subscriptions never defines tenant topology. Resolve current tenant identity and required ancestry through `TenantResolverClient`, behind an infrastructure adapter where a narrow domain port is useful. Use `PolicyEnforcer` for current authorization and PDP-derived scope. Keep topology, commercial relationship evidence and permission distinct: ancestry is not proof that a seller may charge a payer or grant access to a resource tenant. The [platform service bindings](../DESIGN.md#34-internal-dependencies) specify resolver reuse and historical-proof limitations. - `inst-commercial-account-orgtier-roll`
+2. [ ] - `p1` - Authorize commands, historical reads and recovery ranges using current PDP-derived scope and the fixed creation-time tenant axes. Preserve the ordering partition and lifecycle sequence. Receipts/domain events retain relevant actor, reason, scope proof, source revision and correlation provenance for later audit consumers. No transfer approval flow or audit store/query/export subsystem is implemented. - `inst-authorize-commands-historical-reads`
 
 ### Adoption completeness
 
 - [ ] `p2` - **ID**: `cpt-cf-bss-subscriptions-algo-import-cutover`
 
-**Deferred.** No adoption/cutover algorithm is part of the current delivery.
+**Steps**:
+1. [ ] - `p2` - **Deferred.** No adoption/cutover algorithm is part of the current delivery. - `inst-deferred-adoption-cutover-algorithm`
 
 ## 4. States (CDSL)
 
@@ -101,7 +105,7 @@ Authorize commands, historical reads and recovery ranges using current PDP-deriv
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-subscriptions-state-tenancy-import`
 
-Tenant axes remain fixed in the current profile. Transfer and import operation states are deferred; current authorization and original tenant provenance remain observable.
+1. [ ] - `p1` - Tenant axes remain fixed in the current profile. Transfer and import operation states are deferred; current authorization and original tenant provenance remain observable. - `inst-tenant-axes-remain-fixed`
 
 ## 5. Definitions of Done
 
@@ -111,14 +115,14 @@ Tenant axes remain fixed in the current profile. Transfer and import operation s
 
 Implement creation-time tenant-axis authorization, current-scope proof checks, pinned ordering and cross-tenant isolation for commands, history and replay. No transfer, import or audit subsystem is part of this definition of done.
 
-**Implements:** `cpt-cf-bss-subscriptions-algo-tenant-reference`. Transfer and import IDs remain deferred.
+**Implements:** `cpt-cf-bss-subscriptions-algo-tenant-reference`, `cpt-cf-bss-subscriptions-flow-transfer-tnt`, `cpt-cf-bss-subscriptions-flow-import`, `cpt-cf-bss-subscriptions-algo-transfer-billing`, `cpt-cf-bss-subscriptions-algo-import-cutover`, `cpt-cf-bss-subscriptions-state-tenancy-import`. The transfer and import IDs are implemented only as refusals before any effect; the capabilities stay deferred.
 
 ## 6. Acceptance Criteria
 
 - [ ] Creation binds independently authorized seller, payer and resource tenant axes and a stable ordering tenant.
 - [ ] Commands and historical/recovery reads enforce current authorization, including replay, without leaking another tenant's operation or financial history.
 - [ ] Transfer/rebinding and import are unavailable in the current profile; generic metadata updates cannot bypass that boundary.
-- [ ] Actor, correlation and applicable reason provenance accompany domain events for a future audit consumer; no dedicated audit service or projection is required.
+- [ ] Actor, delegation evidence, correlation and applicable reason provenance reach the local operation audit required by `cpt-cf-bss-subscriptions-fr-operation-audit` (SUB-D-76), as well as domain events. Foundation writes the records; feature 09 authorizes their recovery reads. A cross-gear audit service remains deferred.
 
 - [ ] A positive ancestry result without the required commercial delegation or PDP authorization cannot authorize a cross-tenant command; denial also applies to replay and recovery reads.
 - [ ] An unavailable Tenant Resolver or missing required versioned relationship proof does not produce guessed tenant identities or permission. Historical payer coordinates remain unchanged after a current hierarchy change.

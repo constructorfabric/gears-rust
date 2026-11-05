@@ -243,10 +243,12 @@ detects by re-read, never by absence of notification; Lifecycle counts a line as
 **One outcome event per intent, echoing the caller's identity.** `SubscriptionTransitionOutcome {
 transition_request_id, source { order_id, order_version, order_line_id }, wave, kind, wave_attempt,
 correlation_id, transition, outcome: applied | failed { reason_code } | oss_unconfirmed }` for
-create, activate, void and cancel, as the twin of `SubscriptionActivated`, which carries no caller
-tuple and has no failure variant. Without it Workflow cannot correlate the event Subscriptions would
-send and falls back to the status read for every outcome; Lifecycle's completion acknowledgement
-depends on Workflow receiving a terminal outcome per line. The Workflow branch's `SUB-O16`; Seam
+create, activate, void and cancel. The current Subscriptions event is
+[`SubscriptionTransitionOutcome`](../../subscriptions/docs/DESIGN.md#events-and-topics).
+The tuple and outcomes above remain the Orders consumer requirement; their mapping to the
+Subscriptions operation identity and accepted/applied outcomes requires bilateral agreement under
+S-U01. Workflow must recover missing outcomes through status reads; Lifecycle's completion
+acknowledgement depends on a terminal outcome per line. The Workflow branch's `SUB-O16`; Seam
 Atlas names the same event in C03/C09 (ticket T12).
 
 **PriceBook provisioning amendment (D-157, D-165).** The create/activate SDK must accept the exact
@@ -1064,17 +1066,16 @@ tests) and the test provider only (PR #5259 review, thread 13).
 
 **Stage 3 status (D-231, 2026-10-22):** S5-06a, port `overlap-key`, **missing**; the gate answers `Unavailable::Missing` until delivered.
 
-**Revised scope; legacy ID retained (D-163).** The key stays the one Subscriptions already defines
-and keys its cardinality rule on: the registry-owned `catalogSubscriptionProductKey` of `SUB-G1`,
-"bound to a published SKU/product key". Products removed the Product entity but keeps SKUs, so the
-derivation proposed to Subscriptions for PriceBook is the SKU of the line's paid `recurring`
-item(s) as resolve names them; `plan_id` is not proposed, because two plans selling one family
-would stop colliding; a line with several paid recurring items yields one key per such SKU. Orders
-submits the prospective line/revision, batched and seller-scoped, to a Subscriptions key operation
-(proposed `SubscriptionsOverlapKeyV1::keys`, the SUB-P8 shape: the neighbour submits, Subscriptions
-answers) and stores the key(s) plus derivation/policy provenance as answered; it never computes the
-key. Missing key and unavailable resolver are distinct. Resolve it once per assessment, store it on
-the version, and reuse it at activation. The partner/customer dimension (Q-05) is closed for
+**Revised scope; legacy ID retained (D-163).** The current key is Subscriptions'
+versioned-policy `overlapScopeKey`, historically named `catalogSubscriptionProductKey` (SUB-G1).
+Subscriptions owns the key derivation and the returned policy version. The earlier Orders proposal
+used the SKU of each paid `recurring` item; that proposal does not fix the current owner's policy.
+Orders submits the prospective line/revision, batched and seller-scoped, to a Subscriptions key
+operation (proposed `SubscriptionsOverlapKeyV1::keys`) and stores the returned key set and policy
+provenance. It never computes the keys. The current obligation is
+[`cpt-cf-bss-subscriptions-upreq-occupancy`](../../subscriptions/docs/UPSTREAM_REQS.md#occupancy-and-atomic-entry).
+The historical SUB-P8 presence read concerned Pricing retirement, not this key operation. Missing
+key and unavailable resolver are distinct. Resolve it once per assessment, store it on the version, and reuse it at activation. The partner/customer dimension (Q-05) is closed for
 the Orders in-flight claim by D-179, which keeps `resource_tenant_id` beside the key rather than
 inside it; the subscription-side dimension rides the `SUB-O5` amendment above. A key is
 non-empty text without NUL and at most 1024 UTF-8 bytes: Orders indexes it in the unique claim
