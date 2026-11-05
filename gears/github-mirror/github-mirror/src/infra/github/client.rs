@@ -3480,14 +3480,19 @@ impl GithubPort for GithubClient {
                 options,
             )
             .await?;
-        let artifacts = self
+        let artifacts = match self
             .get_json_newest_wrapped(
                 &format!("/repos/{owner}/{name}/actions/artifacts?per_page={FIRST_PAGE_SIZE}"),
                 options,
                 ARTIFACT_PAGES,
                 |page: GhArtifactsPage| page.artifacts,
             )
-            .await?;
+            .await
+        {
+            Ok(artifacts) => artifacts,
+            Err(DomainError::NotFound | DomainError::AccessLost(_)) => Vec::new(),
+            Err(error) => return Err(error),
+        };
 
         Ok(ActionsListing {
             workflow_runs: runs
