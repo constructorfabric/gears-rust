@@ -175,7 +175,7 @@ The service **MUST NOT** perform, orchestrate, or wait for the protected operati
 
 ### 4.1 In Scope
 
-- **p1**: opportunity registration with mandatory default action, mandatory standing approval setting, context attributes, and decision authority; resource projections; subjects; layered firewall-style rules; separate check and approve permissions; live approval policies with minimum approvals, mandatory approvers, and narrowed approver lists; decisions with mandatory reason and separation of duties; approval requests raised by verification, bound to context fingerprints; request reconciliation; synchronous explainable verification and batch verification; correlation ID and decision reasons in verdicts; approval leases; SDK with bounded cache; tenant hierarchy; administrator browsing and approver inbox; bulk decisions; audit trail; durable change and request events; refusal and denial reasons.
+- **p1**: opportunity registration with mandatory default action, mandatory standing approval setting, context attributes, and decision authority; resource projections; subjects; layered firewall-style rules; separate check and approve permissions; live approval policies with minimum approvals, mandatory approvers, and narrowed approver lists; decisions with mandatory reason and separation of duties; approval requests raised by verification, bound to context fingerprints; request reconciliation; synchronous explainable verification and batch verification; correlation ID and decision reasons in verdicts; approval leases; SDK with bounded cache; tenant hierarchy; administrator browsing and approver inbox; bulk decisions; audit trail; durable change and request events; refusal and denial reasons; self-managed tenant barriers.
 - **p2**: auto-approval rules; conditional policies; staged policies; group approvers; policy snapshot per request; subject-type selectors on rules; request escalation; decisions on behalf of an approver; subject group decisions; decision expiry; access review report; governance versions with drafts, comparison, and rollback.
 - **p3**: periodic recertification campaigns; delegable (overridable) ancestor rules; second-administrator review of governance changes; trial mode and previews of governance changes.
 
@@ -575,6 +575,15 @@ The system **MUST** apply the tenant hierarchy on every verification: ancestor r
 - **Rationale**: Multi-tenant platforms govern centrally while allowing local approvals within ancestor limits.
 - **Actors**: `cpt-cf-approval-service-actor-platform-vendor`, `cpt-cf-approval-service-actor-admin`
 - **Covers**: `cpt-cf-approval-service-upreq-tenant-hierarchy`
+
+#### Self-Managed Tenant Barriers
+
+- [ ] `p1` - **ID**: `cpt-cf-approval-service-fr-tenant-barriers`
+
+Ancestor runtime rules, policies, auto-approval restrictions, decisions on tenant subjects, and decision authority **MUST NOT** reach across a self-managed tenant barrier. Configuration file rules and policies **MUST** apply to every tenant, including self-managed ones. Administrators and approvers of an ancestor **MUST NOT** see or decide the requests of a tenant behind a barrier. A change of a tenant's managed or self-managed mode **MUST** take effect from the next verification.
+
+- **Rationale**: A self-managed tenant operates independently of its parent; only platform-wide rules apply everywhere.
+- **Actors**: `cpt-cf-approval-service-actor-platform-vendor`, `cpt-cf-approval-service-actor-admin`
 
 ### 5.5 Administration and Audit
 
@@ -1027,6 +1036,7 @@ Context attributes and justifications **MUST** be tenant-scoped, readable only b
 - [ ] Every verdict that does not let the operation proceed carries a reason category, a reason code, and a message; refusals are logged without context attribute values.
 - [ ] (p2) A rule or policy change saved as a draft does not affect verdicts; a version put into effect applies from the next verification; a rollback restores the earlier behaviour in one action and appears in the history.
 - [ ] (p3) A rule or policy in trial mode never changes a verdict, and its would-be outcome is reported to administrators.
+- [ ] Ancestor runtime rules, policies, and decisions do not apply behind a self-managed barrier, while configuration file rules apply to every tenant.
 - [ ] (p2) An auto-approval never overrides a `deny` rule or a deny decision, and never satisfies a policy of an ancestor of its scope tenant.
 - [ ] (p2) Policy changes do not alter the policies fixed for an open request.
 - [ ] (p2) In a staged policy, an approval counts toward a stage only after the previous stage is satisfied.
