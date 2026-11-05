@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use async_trait::async_trait;
 use event_broker_sdk::GtsTypeId;
-use event_broker_sdk::backend::{Backend, BackendError, BuildContext, Provider};
+use event_broker_sdk::backend::{Backend, BackendError, BuildContext, Provider, Role};
 
 use crate::backend::MemoryBackend;
 use crate::settings::MemorySettings;
@@ -39,6 +39,15 @@ impl Provider for MemoryBackendProvider {
 
     async fn build(&self, context: &BuildContext<'_>) -> Result<Arc<dyn Backend>, BackendError> {
         let settings = MemorySettings::parse(context.settings)?;
+        // Events live in this process only: a delivery process never sees what
+        // an ingest process stored, so a cluster role runs on memory only in a
+        // test process that runs every role in-process.
+        if context.role != Role::Standalone && !settings.single_process {
+            return Err(BackendError::invalid_config(
+                "the memory backend holds events in this process only; outside `standalone` it \
+                 needs `single_process: true`, for tests that run every role in one process",
+            ));
+        }
         let store = Arc::clone(
             self.stores
                 .lock()

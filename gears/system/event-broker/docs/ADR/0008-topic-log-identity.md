@@ -63,8 +63,8 @@ Decided now (feature 0006):
 
 - Minted by ingest at every provisioning attempt; an attempt that is abandoned and replaced gets a new one, a slow or `Pending` one keeps its own.
 - Stored by the backend with the topic's data, in whatever form its medium allows.
-- Recorded in the ingest database, `event_broker__topic_binding(topic_uuid, topic_id, log_id, state, attempt_at, partitions)`.
-- Guarded by compare-and-set on both sides: the record admits one live attempt, and the backend accepts a new id only over nothing, over the id being replaced, or over itself (the same attempt, continued). So at most one backend holds the recorded log id.
+- Recorded in the ingest database, `event_broker__topic_binding(topic_uuid, topic_id, log_id, state, attempt_at, partitions, retention_max_age_ms, retention_max_bytes, retention_version, retention_confirmed)`.
+- Guarded by compare-and-set on both sides: the record admits one live attempt, and the backend accepts a new id only over nothing, over the id being replaced, or over itself (the same attempt, continued). A re-provision of a provisioned topic is a `Held` claim, accepted only over itself: a backend holding nothing for the topic answers `NotProvisioned` and creates nothing, so a routing change never plants the recorded log on a second backend. So at most one backend holds the recorded log id.
 - An abandoned attempt that reached another backend leaves an orphan log id there that no record names. Until O1 decides where the check runs, nothing refuses writes to that backend, so an instance routed to it stays able to write the topic there.
 - The age after which an attempt counts as abandoned is a setting.
 - The backend operations that carry it take no `SecurityContext`: backends are plugins linked into the gear, and the ones that reach a remote store do so with their own credentials.

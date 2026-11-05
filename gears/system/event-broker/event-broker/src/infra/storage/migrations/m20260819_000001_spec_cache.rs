@@ -8,7 +8,7 @@ use sea_orm_migration::prelude::*;
 use super::columns::{create_index, document, gts_id};
 
 /// `SpecKind::as_str`: `topic` or `event_type`.
-const KIND_LEN: u32 = 16;
+const KIND_LEN: u32 = 10;
 
 #[derive(DeriveMigrationName)]
 pub struct Migration;

@@ -2176,6 +2176,231 @@ mod tests {
         assert_eq!(outcome.provider_response_id.as_deref(), Some("resp-test"));
     }
 
+    // ── Agentic loop usage ──
+
+    /// Provider that serves one scripted event list per `stream()` call.
+    #[allow(de0309_must_have_domain_model)]
+    struct ScriptedProvider {
+        calls: std::sync::Mutex<std::collections::VecDeque<Vec<TranslatedEvent>>>,
+    }
+
+    impl ScriptedProvider {
+        fn new(calls: Vec<Vec<TranslatedEvent>>) -> Self {
+            Self {
+                calls: std::sync::Mutex::new(calls.into()),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl LlmProvider for ScriptedProvider {
+        async fn stream(
+            &self,
+            _ctx: SecurityContext,
+            _request: LlmRequest<Streaming>,
+            _upstream_alias: &str,
+            cancel: CancellationToken,
+        ) -> Result<ProviderStream, LlmProviderError> {
+            let events = self
+                .calls
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("ScriptedProvider: no more calls scripted");
+            Ok(ProviderStream::new(
+                stream::iter(events.into_iter().map(Ok)),
+                cancel,
+            ))
+        }
+
+        async fn complete(
+            &self,
+            _ctx: SecurityContext,
+            _request: LlmRequest<NonStreaming>,
+            _upstream_alias: &str,
+        ) -> Result<ResponseResult, LlmProviderError> {
+            unimplemented!("not needed for streaming tests")
+        }
+    }
+
+    #[allow(de0309_must_have_domain_model)]
+    struct EmptyRetriever;
+
+    #[async_trait::async_trait]
+    impl crate::domain::ports::knowledge_retriever::KnowledgeRetriever for EmptyRetriever {
+        async fn retrieve(
+            &self,
+            _ctx: SecurityContext,
+            _req: crate::domain::ports::knowledge_retriever::RetrievalRequest,
+        ) -> Result<
+            Vec<crate::domain::ports::knowledge_retriever::RetrievedChunk>,
+            crate::domain::ports::knowledge_retriever::RetrievalError,
+        > {
+            Ok(vec![])
+        }
+    }
+
+    fn tokens(input_tokens: i64, output_tokens: i64) -> Usage {
+        Usage {
+            input_tokens,
+            output_tokens,
+            ..Usage::default()
+        }
+    }
+
+    fn search_knowledge_call(usage: Usage) -> TranslatedEvent {
+        TranslatedEvent::Terminal(TerminalOutcome::ToolUse {
+            tool_use_id: "call_1".to_owned(),
+            name: "search_knowledge".to_owned(),
+            input: serde_json::json!({ "query": "q" }),
+            usage,
+        })
+    }
+
+    /// Runs a provider task to its end; returns the outcome and the events
+    /// sent to the client.
+    async fn run_agentic_task(
+        provider: ScriptedProvider,
+        with_knowledge_search: bool,
+    ) -> (super::types::StreamOutcome, Vec<StreamEvent>) {
+        let (tx, mut rx) = mpsc::channel::<StreamEvent>(32);
+        let knowledge_search =
+            with_knowledge_search.then(|| provider_task::KnowledgeSearchParams {
+                retriever: Arc::new(EmptyRetriever),
+                vector_store_id: "vs".to_owned(),
+                upstream_alias: "kb".to_owned(),
+                api_version: "v1".to_owned(),
+                top_k: 5,
+                max_calls: 2,
+                max_chunk_chars: 1000,
+                use_search_result_blocks: false,
+            });
+        let handle = provider_task::spawn_provider_task::<TurnRepo, MsgRepo>(
+            mock_ctx(),
+            provider_task::ProviderTaskConfig {
+                llm: Arc::new(provider),
+                upstream_alias: "test-alias".to_owned(),
+                messages: vec![LlmMessage::user("hi")],
+                system_instructions: None,
+                tools: vec![],
+                model: "test-model".into(),
+                provider_model_id: "test-model".into(),
+                max_output_tokens: 4096,
+                max_tool_calls: 2,
+                web_search_max_calls: 2,
+                code_interpreter_max_calls: 2,
+                api_params: mini_chat_sdk::ModelApiParams {
+                    temperature: None,
+                    top_p: None,
+                    frequency_penalty: None,
+                    presence_penalty: None,
+                    stop: vec![],
+                    extra_body: None,
+                    reasoning_effort: None,
+                },
+                provider_file_id_map: std::collections::HashMap::new(),
+                anthropic_file_ids: std::collections::HashMap::new(),
+                knowledge_search,
+            },
+            CancellationToken::new(),
+            tx,
+            None,
+        );
+        let mut events = Vec::new();
+        while let Some(ev) = rx.recv().await {
+            events.push(ev);
+        }
+        (handle.await.expect("task should complete"), events)
+    }
+
+    #[tokio::test]
+    async fn tool_use_usage_is_added_to_completed_turn() {
+        let provider = ScriptedProvider::new(vec![
+            vec![search_knowledge_call(tokens(100, 10))],
+            vec![TranslatedEvent::Terminal(TerminalOutcome::Completed {
+                usage: tokens(150, 20),
+                response_id: "resp-2".to_owned(),
+                content: String::new(),
+                citations: vec![],
+                raw_response: serde_json::Value::Null,
+            })],
+        ]);
+
+        let (outcome, events) = run_agentic_task(provider, true).await;
+
+        assert_eq!(outcome.terminal, StreamTerminal::Completed);
+        let usage = outcome.usage.expect("usage");
+        assert_eq!((usage.input_tokens, usage.output_tokens), (250, 30));
+        match events.last() {
+            Some(StreamEvent::Done(done)) => {
+                assert_eq!(
+                    (done.usage.input_tokens, done.usage.output_tokens),
+                    (250, 30)
+                );
+            }
+            other => panic!("expected Done, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_use_usage_is_added_to_failed_turn_with_usage() {
+        let failed = |usage| {
+            TranslatedEvent::Terminal(TerminalOutcome::Failed {
+                error: LlmProviderError::ProviderUnavailable,
+                usage,
+                partial_content: String::new(),
+            })
+        };
+
+        let provider = ScriptedProvider::new(vec![
+            vec![search_knowledge_call(tokens(100, 10))],
+            vec![failed(Some(tokens(7, 1)))],
+        ]);
+        let (outcome, _) = run_agentic_task(provider, true).await;
+        assert_eq!(outcome.terminal, StreamTerminal::Failed);
+        let usage = outcome.usage.expect("usage");
+        assert_eq!((usage.input_tokens, usage.output_tokens), (107, 11));
+
+        // Without usage for the failed call the turn's usage is unknown.
+        let provider = ScriptedProvider::new(vec![
+            vec![search_knowledge_call(tokens(100, 10))],
+            vec![failed(None)],
+        ]);
+        let (outcome, _) = run_agentic_task(provider, true).await;
+        assert_eq!(outcome.terminal, StreamTerminal::Failed);
+        assert!(outcome.usage.is_none());
+    }
+
+    #[tokio::test]
+    async fn unexpected_tool_use_keeps_its_usage() {
+        let provider = ScriptedProvider::new(vec![vec![search_knowledge_call(tokens(100, 10))]]);
+
+        let (outcome, _) = run_agentic_task(provider, false).await;
+
+        assert_eq!(outcome.error_code.as_deref(), Some("unexpected_tool_use"));
+        let usage = outcome.usage.expect("usage");
+        assert_eq!((usage.input_tokens, usage.output_tokens), (100, 10));
+    }
+
+    #[tokio::test]
+    async fn agentic_iteration_cap_keeps_tool_use_usage() {
+        // max_calls = 2, so the loop allows 4 provider calls.
+        let provider = ScriptedProvider::new(
+            (0..4)
+                .map(|_| vec![search_knowledge_call(tokens(100, 10))])
+                .collect(),
+        );
+
+        let (outcome, _) = run_agentic_task(provider, true).await;
+
+        assert_eq!(
+            outcome.error_code.as_deref(),
+            Some("agentic_iterations_exceeded")
+        );
+        let usage = outcome.usage.expect("usage");
+        assert_eq!((usage.input_tokens, usage.output_tokens), (400, 40));
+    }
+
     /// 6.5 variant: Provider fails before first event.
     #[tokio::test]
     async fn provider_error_produces_error_event() {
@@ -6536,6 +6761,7 @@ mod tests {
         fn record_finalization_latency_ms(&self, _: f64) {
             self.finalization_latency_ms.fetch_add(1, Ordering::Relaxed);
         }
+        fn record_outbox_dead(&self, _: &str, _: &str) {}
         fn record_quota_preflight(&self, _: &str, _: &str, _: &str) {
             self.quota_preflight.fetch_add(1, Ordering::Relaxed);
         }
@@ -6546,10 +6772,12 @@ mod tests {
             self.quota_commit.fetch_add(1, Ordering::Relaxed);
         }
         fn record_quota_overshoot(&self, _: &str) {}
+        fn record_quota_overshoot_uncharged_tokens(&self, _: f64) {}
         fn record_quota_estimated_tokens(&self, _: f64) {
             self.quota_estimated_tokens.fetch_add(1, Ordering::Relaxed);
         }
         fn record_quota_actual_tokens(&self, _: f64) {}
+        fn record_quota_usage_missing(&self, _: &str) {}
         fn record_stream_incomplete(&self, _: &str, _: &str, _: &str) {
             self.stream_incomplete.fetch_add(1, Ordering::Relaxed);
         }

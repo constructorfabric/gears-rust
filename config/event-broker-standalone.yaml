@@ -1,6 +1,7 @@
 # Minimal working config for `cf-gears-event-broker-server` in standalone
-# mode (eb-single-process-implementation design.md D7) - one process, one
-# SQLite file, no cluster/network dependencies.
+# mode (eb-single-process-implementation design.md D7) - one process, two
+# SQLite files (the gear's own database and the event log), no
+# cluster/network dependencies.
 #
 # Run it from the repo root:
 #   cargo run -p cf-gears-event-broker --bin cf-gears-event-broker-server \
@@ -127,7 +128,7 @@ gears:
       # The gear's own database: ingest and delivery metadata only - cursors,
       # consumer groups, producers, the specification cache and the ingest
       # outbox. The event log is not among them; it lives in the storage
-      # backend's own database, configured under `topics` below.
+      # backend's own database, configured under `backends` below.
       #
       # `engine` must be explicit here - there's no global `servers:`
       # template to infer it from (see `config/quickstart.yaml`'s
@@ -172,11 +173,15 @@ gears:
       # boot. Credentials are written as `${VAR}` references; the backend
       # expands them when it is built.
       backends:
-        # The in-process backend: events live as long as this process, and a
-        # restart starts empty. A durable backend names its own medium here
-        # instead.
+        # The SQLite backend: the event log is a file, the deployment's second
+        # SQLite file beside the gear's own database, and it survives a
+        # restart. Plugin settings have no home-dir-relative form, so `path`
+        # spells out `home_dir` above through `${HOME}`; move both together.
+        # The gear's directory exists before the backend opens the file.
+        # `${HOME}` must be set; on Windows set `HOME` or write an absolute path.
         main:
-          type: "gts.cf.core.events.backend.v1~cf.core.backend.memory.v1~"
+          type: "gts.cf.core.events.backend.v1~cf.core.backend.sqlite.v1~"
+          path: "${HOME}/.cf-gears-event-broker/event-broker/events.db"
 
       # Which registry entry holds each topic's log. The instance-less key is
       # required, so every topic resolves to an entry; a key naming one topic

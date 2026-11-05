@@ -449,6 +449,11 @@ fn merge_json_objects(target: &mut serde_json::Value, source: &serde_json::Value
     )
 )]
 pub async fn run_oop_with_options(opts: OopRunOptions) -> Result<()> {
+    // Install the rustls crypto provider FIRST — before any TLS/network setup,
+    // mirroring `init_procedure` so OoP gears run the same crypto startup
+    // checks. Process-wide and idempotent.
+    super::init_crypto_provider()?;
+
     // Generate instance ID if not provided
     let instance_id = opts.instance_id.unwrap_or_else(Uuid::new_v4);
 

@@ -26,9 +26,16 @@ updates:
     commit-message:
       prefix: "chore(deps)"
     groups:
+      # apalis crates are pinned with `=` and must move in lockstep: #5543 bumped
+      # apalis-core/apalis-postgres to 1.0.0 via cargo-patch but left apalis on
+      # rc.10, which does not compile. Groups match in order, so this one must
+      # stay above cargo-patch.
+      apalis:
+        patterns:
+          - "apalis*"
       # RustCrypto crates share trait versions (digest/signature): bumping one
       # alone does not compile (#5350: sha2 0.11 against rsa's digest 0.10).
-      # Listed first so these never fall into the patch group below.
+      # Listed above cargo-patch so these never fall into the patch group.
       # pkcs8/sec1 are direct deps locked to rsa's generation (rustls-corecrypto-provider).
       rustcrypto:
         patterns:
@@ -79,6 +86,17 @@ updates:
     open-pull-requests-limit: 5
     commit-message:
       prefix: "chore(deps)"
+    # The rust builder image must match rust-toolchain.toml (`make docker-pins`).
+    # Dependabot cannot see that link: on its own it moved the image to 1.99.1
+    # while the toolchain stayed on 1.98.1 (#5735). Version bumps of `rust` go
+    # in by hand together with the toolchain bump; digest refreshes of the
+    # pinned tag still come through.
+    ignore:
+      - dependency-name: "rust"
+        update-types:
+          - "version-update:semver-major"
+          - "version-update:semver-minor"
+          - "version-update:semver-patch"
     groups:
       # One PR for all three directories: the same rust image bump used to
       # arrive as three PRs (#5393, #5394, #5396).

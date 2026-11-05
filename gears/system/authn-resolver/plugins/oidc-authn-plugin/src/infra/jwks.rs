@@ -579,7 +579,9 @@ mod tests {
 
     #[tokio::test]
     async fn stale_entry_inside_configured_window_is_served_on_idp_outage() {
-        let fetcher = make_fetcher_with_policy(0, 15, true, 30);
+        // The entry is 10 s old; a 60 s window leaves the failed refresh ample
+        // time on a loaded runner, so only the window's logic is tested.
+        let fetcher = make_fetcher_with_policy(0, 60, true, 30);
         let old = Instant::now()
             .checked_sub(Duration::from_secs(10))
             .unwrap_or_else(Instant::now);

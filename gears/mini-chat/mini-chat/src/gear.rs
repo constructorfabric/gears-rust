@@ -20,7 +20,9 @@ use crate::config::ProviderEntry;
 use crate::domain::ports::MiniChatMetricsPort;
 use crate::domain::service::{AppServices as GenericAppServices, Repositories};
 use crate::infra::metrics::MiniChatMetricsMeter;
-use crate::infra::outbox::{AuditEventHandler, InfraOutboxEnqueuer, UsageEventHandler};
+use crate::infra::outbox::{
+    AuditEventHandler, InfraOutboxEnqueuer, USAGE_MAX_ATTEMPTS, UsageEventHandler,
+};
 use crate::infra::workers::WorkerHandles;
 
 /// `AppServices` instantiated with the concrete SeaORM-backed repositories used by the gear.
@@ -592,6 +594,8 @@ impl RunnableCapability for MiniChatGear {
                 .queue(&od.outbox_config.queue_name, partitions)
                 .leased(UsageEventHandler {
                     plugin_provider: od.model_policy_gw.clone(),
+                    metrics: Arc::clone(&od.metrics),
+                    max_attempts: USAGE_MAX_ATTEMPTS,
                 })
                 .queue(&od.outbox_config.cleanup_queue_name, partitions)
                 .leased(

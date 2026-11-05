@@ -17,6 +17,8 @@ pub mod topics;
 #[cfg(test)]
 mod attach_tests;
 #[cfg(test)]
+mod backend_source_tests;
+#[cfg(test)]
 mod heads_tests;
 #[cfg(test)]
 mod poll_tests;

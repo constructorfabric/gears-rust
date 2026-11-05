@@ -32,8 +32,10 @@
 //!   on the same daemon shares it.
 //! - Losing the race for the name is the normal case under nextest, so a loser
 //!   waits for the winner's server to answer ([`BOOT_BUDGET`]) rather than
-//!   racing it, and only a container the daemon reports as not running is ever
-//!   force-removed. A daemon that cannot be asked licenses nothing.
+//!   racing it, and only a container the daemon reports as not running for
+//!   [`CORPSE_GRACE`] is ever force-removed — by id, so a sibling's fresh
+//!   container under the same name is never the one removed. A daemon that
+//!   cannot be asked licenses nothing.
 //! - Every Docker question goes through [`docker_client_instance`], the client
 //!   testcontainers itself starts containers with. No `docker` CLI, which some
 //!   CI images do not have.
@@ -64,13 +66,13 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use testcontainers::bollard::Docker;
 use testcontainers::bollard::errors::Error as BollardError;
-use testcontainers::bollard::models::NetworkSettings;
+use testcontainers::bollard::models::{ContainerInspectResponse, ContainerState, NetworkSettings};
 use testcontainers::bollard::query_parameters::{
     InspectContainerOptionsBuilder, RemoveContainerOptionsBuilder,
 };
-use testcontainers::core::WaitFor;
 use testcontainers::core::client::docker_client_instance;
 use testcontainers::core::ports::Ports;
+use testcontainers::core::{Mount, WaitFor};
 use testcontainers::runners::AsyncRunner;
 use testcontainers::{ContainerAsync, ContainerRequest, GenericImage, ImageExt};
 use tokio::sync::watch;
@@ -100,6 +102,21 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Interval between probes.
 const POLL: Duration = Duration::from_millis(250);
+
+/// How long a container must stay not running before it counts as a corpse.
+///
+/// A container is not running between its create and its start, and that gap
+/// stretches on a loaded daemon. A single observation cannot tell a sibling's
+/// container in that gap from a killed run's leftover; one that is still not
+/// running after this long is no sibling's boot in progress.
+const CORPSE_GRACE: Duration = Duration::from_secs(3);
+
+/// How many of the container's last log lines a start failure carries.
+const LOG_TAIL: usize = 30;
+
+/// Where the image keeps its data. The image declares it a volume, which would
+/// otherwise put first boot's writes on the daemon's disk.
+const DATA_DIR: &str = "/var/lib/clickhouse";
 
 /// Age past which a per-test database counts as a finished run's leftover.
 ///
@@ -282,10 +299,11 @@ async fn resolve_server() -> Result<(u16, Option<ContainerAsync<GenericImage>>),
     }
     // Not answering *yet*: a killed run's corpse, a sibling still booting, or
     // a daemon that could not be asked. Only the first licenses a removal, and
-    // `await_answer` returns at once on it.
+    // `await_answer` returns once it has seen it for `CORPSE_GRACE`.
     match await_answer(&docker, &name).await {
         Awaited::Answered(port) => return Ok((port, None)),
-        Awaited::Corpse => remove_named(&docker, &name).await,
+        Awaited::Vacant => {}
+        Awaited::Corpse(id) => remove_corpse(&docker, &id).await,
         Awaited::Undecided => {
             return Err(format!(
                 "the container named {name} neither answered within {BOOT_BUDGET:?} nor is \
@@ -299,21 +317,138 @@ async fn resolve_server() -> Result<(u16, Option<ContainerAsync<GenericImage>>),
         // A sibling won the name and its server already answers.
         Started::Sibling(port) => return Ok((port, None)),
     };
-    let port = container
-        .get_host_port_ipv4(HTTP_PORT)
-        .await
-        .map_err(|e| format!("map the ClickHouse HTTP port: {e}"))?;
+    let port = published_port(&docker, &container).await?;
     // Publish only a server that answers, so no caller races its boot.
     let deadline = Instant::now() + BOOT_BUDGET;
     while !answers(port).await {
         if Instant::now() >= deadline {
+            let state = match inspect_id(&docker, container.id()).await {
+                Ok(info) => describe_state(info.state.as_ref()),
+                Err(e) => e,
+            };
             return Err(format!(
-                "the ClickHouse container {name} never answered within {BOOT_BUDGET:?}"
+                "the ClickHouse container {name} never answered within {BOOT_BUDGET:?}; \
+                 {state}{}",
+                log_tail(&container).await
             ));
         }
         tokio::time::sleep(POLL).await;
     }
     Ok((port, Some(container)))
+}
+
+/// The host port the container this process started publishes for 8123.
+///
+/// `start()` returns once the daemon has started the container, but the
+/// mapping can show up in an inspect a moment later, so it is polled for up
+/// to [`BOOT_BUDGET`]. A container that stops meanwhile never publishes one:
+/// that fails at once, with its state and last log lines, because a mapping
+/// is not what it is missing.
+async fn published_port(
+    docker: &Docker,
+    container: &ContainerAsync<GenericImage>,
+) -> Result<u16, String> {
+    let id = container.id();
+    let deadline = Instant::now() + BOOT_BUDGET;
+    loop {
+        // An inspect that fails is a daemon that could not be asked this
+        // time; the deadline bounds how often that is tolerated.
+        let last = match inspect_id(docker, id).await {
+            Ok(info) => {
+                let running = info.state.as_ref().and_then(|s| s.running) == Some(true);
+                if !running {
+                    return Err(format!(
+                        "the ClickHouse container {id} stopped before it published port \
+                         {HTTP_PORT}/tcp; {}{}",
+                        describe_state(info.state.as_ref()),
+                        log_tail(container).await
+                    ));
+                }
+                if let Some(port) = host_port(info.network_settings) {
+                    return Ok(port);
+                }
+                format!("it publishes no host port for {HTTP_PORT}/tcp")
+            }
+            Err(e) => e,
+        };
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "map the ClickHouse HTTP port of {id} within {BOOT_BUDGET:?}: {last}"
+            ));
+        }
+        tokio::time::sleep(POLL).await;
+    }
+}
+
+/// Inspect a container by id. A 404 reads as removed, every other error as
+/// the daemon's.
+async fn inspect_id(docker: &Docker, id: &str) -> Result<ContainerInspectResponse, String> {
+    docker
+        .inspect_container(
+            id,
+            Some(InspectContainerOptionsBuilder::new().size(false).build()),
+        )
+        .await
+        .map_err(|e| match e {
+            BollardError::DockerResponseServerError {
+                status_code: 404, ..
+            } => format!("container {id} was removed"),
+            e => format!("inspect container {id}: {e}"),
+        })
+}
+
+/// The part of a container's state that says why it is not running.
+fn describe_state(state: Option<&ContainerState>) -> String {
+    let Some(state) = state else {
+        return "the daemon reports no state".to_owned();
+    };
+    let unknown = || "unknown".to_owned();
+    let error = state
+        .error
+        .as_deref()
+        .filter(|e| !e.is_empty())
+        .map_or_else(String::new, |e| format!(", error {e:?}"));
+    format!(
+        "status {}, exit code {}, OOMKilled {}{error}",
+        state.status.map_or_else(unknown, |s| s.to_string()),
+        state.exit_code.map_or_else(unknown, |c| c.to_string()),
+        state.oom_killed.map_or_else(unknown, |o| o.to_string()),
+    )
+}
+
+/// The last [`LOG_TAIL`] lines of the container's stdout and stderr, as a
+/// suffix for an error message; empty when there are none. The image's server
+/// log goes to files, so what reaches these streams is the entrypoint's output
+/// and a failed server's last words.
+async fn log_tail(container: &ContainerAsync<GenericImage>) -> String {
+    let mut sections = Vec::new();
+    for (stream, read) in [
+        (
+            "stdout",
+            tokio::time::timeout(PROBE_TIMEOUT, container.stdout_to_vec()).await,
+        ),
+        (
+            "stderr",
+            tokio::time::timeout(PROBE_TIMEOUT, container.stderr_to_vec()).await,
+        ),
+    ] {
+        let text = match read {
+            Ok(Ok(bytes)) => String::from_utf8_lossy(&bytes).into_owned(),
+            Ok(Err(e)) => format!("(unreadable: {e})"),
+            Err(_elapsed) => format!("(unread within {PROBE_TIMEOUT:?})"),
+        };
+        let lines: Vec<&str> = text.lines().collect();
+        if lines.is_empty() {
+            continue;
+        }
+        let last = &lines[lines.len().saturating_sub(LOG_TAIL)..];
+        sections.push(format!(
+            "\n--- last {} {stream} lines ---\n{}",
+            last.len(),
+            last.join("\n")
+        ));
+    }
+    sections.concat()
 }
 
 /// The container request for the shared server.
@@ -326,22 +461,31 @@ async fn resolve_server() -> Result<(u16, Option<ContainerAsync<GenericImage>>),
 /// No `CLICKHOUSE_DB`: setting it makes the entrypoint boot a temporary server
 /// to create the database, stop it, and start the real one, so a probe can
 /// answer and the server go away again a moment later. `default` exists anyway.
+///
+/// The data directory is a tmpfs, so first boot — creating the system
+/// databases and the access storage — runs at memory speed instead of waiting
+/// on the daemon's disk. Nothing in it needs to outlive the container. The
+/// server logs under `/var/log/clickhouse-server` stay on disk.
 fn image() -> ContainerRequest<GenericImage> {
     test_containers::clickhouse()
         .with_wait_for(WaitFor::Nothing)
+        .with_mount(Mount::tmpfs_mount(DATA_DIR))
         .with_env_var("CLICKHOUSE_USER", "default")
         .with_env_var("CLICKHOUSE_PASSWORD", PASSWORD)
 }
 
 /// What the daemon says about the container carrying the harness's name.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum Named {
     /// Running, with the host port it publishes for 8123 — `None` while it has
     /// published none yet.
     Running(Option<u16>),
-    /// No container of that name, or one that is not running. The only answer
-    /// that licenses a force-remove.
-    Corpse,
+    /// No container of that name.
+    Absent,
+    /// A container of that name, by id, that is not running: a corpse, or a
+    /// sibling's between its create and its start. Licenses a force-remove
+    /// only once it has stayed so for [`CORPSE_GRACE`].
+    Stopped(String),
     /// The daemon did not answer. Licenses **nothing**.
     Unknown,
 }
@@ -360,11 +504,12 @@ async fn inspect_named(docker: &Docker, name: &str) -> Named {
         // A 404 *is* an answer: there is no container under that name.
         Err(BollardError::DockerResponseServerError {
             status_code: 404, ..
-        }) => return Named::Corpse,
+        }) => return Named::Absent,
         Err(_) => return Named::Unknown,
     };
     if !info.state.and_then(|state| state.running).unwrap_or(false) {
-        return Named::Corpse;
+        // Without an id there is nothing to remove by, so nothing licensed.
+        return info.id.map_or(Named::Unknown, Named::Stopped);
     }
     Named::Running(host_port(info.network_settings))
 }
@@ -378,14 +523,16 @@ fn host_port(settings: Option<NetworkSettings>) -> Option<u16> {
         .map_to_host_port_ipv4(HTTP_PORT)
 }
 
-/// Force-remove the named container and its anonymous volumes. Only called on
-/// a [`Named::Corpse`]; failure is nothing to act on, the `start` that follows
-/// reports whether the name came free.
-async fn remove_named(docker: &Docker, name: &str) {
+/// Force-remove a corpse and its anonymous volumes, by the id it was observed
+/// under: a container a sibling started under the name since then has another
+/// id and is out of reach. Only called on an [`Awaited::Corpse`]; failure is
+/// nothing to act on, the `start` that follows reports whether the name came
+/// free.
+async fn remove_corpse(docker: &Docker, id: &str) {
     drop(
         docker
             .remove_container(
-                name,
+                id,
                 Some(
                     RemoveContainerOptionsBuilder::new()
                         .force(true)
@@ -397,15 +544,18 @@ async fn remove_named(docker: &Docker, name: &str) {
     );
 }
 
-/// What a wait for the named container came to. Three outcomes, because "the
-/// wait ended" and "there is nothing there" are different facts and only the
-/// second licenses a force-remove.
-#[derive(Clone, Copy, Debug)]
+/// What a wait for the named container came to. "The wait ended", "there is
+/// nothing there" and "what is there is dead" are different facts, and only
+/// the last licenses a force-remove.
+#[derive(Clone, Debug)]
 enum Awaited {
     /// The container published a port and answered on it.
     Answered(u16),
-    /// The daemon says nothing is running under the name.
-    Corpse,
+    /// The daemon says there is no container under the name.
+    Vacant,
+    /// The container under the name, by id, stayed not running for
+    /// [`CORPSE_GRACE`]. The only answer that licenses a force-remove.
+    Corpse(String),
     /// The budget ran out on a sibling still booting or a daemon that could
     /// not be asked. Licenses **nothing**.
     Undecided,
@@ -413,17 +563,31 @@ enum Awaited {
 
 /// Wait up to [`BOOT_BUDGET`] for the named container to publish a port and
 /// answer on it.
+///
+/// A container seen not running is a corpse only when a later observation,
+/// at least [`CORPSE_GRACE`] on, still finds the same container not running.
+/// One that starts meanwhile, or is replaced by another, restarts the clock.
 async fn await_answer(docker: &Docker, name: &str) -> Awaited {
     let deadline = Instant::now() + BOOT_BUDGET;
+    let mut stopped_since: Option<(String, Instant)> = None;
     loop {
-        let state = inspect_named(docker, name).await;
-        if let Named::Running(Some(port)) = state
-            && answers(port).await
-        {
-            return Awaited::Answered(port);
-        }
-        if state == Named::Corpse {
-            return Awaited::Corpse;
+        match inspect_named(docker, name).await {
+            Named::Running(Some(port)) if answers(port).await => {
+                return Awaited::Answered(port);
+            }
+            Named::Running(_) => stopped_since = None,
+            Named::Absent => return Awaited::Vacant,
+            Named::Stopped(id) => match &stopped_since {
+                Some((seen, since)) if *seen == id => {
+                    if since.elapsed() >= CORPSE_GRACE {
+                        return Awaited::Corpse(id);
+                    }
+                }
+                _ => stopped_since = Some((id, Instant::now())),
+            },
+            // Says nothing either way, so it neither starts nor resets the
+            // clock.
+            Named::Unknown => {}
         }
         if Instant::now() >= deadline {
             return Awaited::Undecided;
@@ -457,8 +621,8 @@ async fn start_named(docker: &Docker, name: &str) -> Result<Started, String> {
         };
         match await_answer(docker, name).await {
             Awaited::Answered(port) => return Ok(Started::Sibling(port)),
-            Awaited::Corpse => remove_named(docker, name).await,
-            Awaited::Undecided => {}
+            Awaited::Corpse(id) => remove_corpse(docker, &id).await,
+            Awaited::Vacant | Awaited::Undecided => {}
         }
         if Instant::now() >= deadline {
             return Err(format!(

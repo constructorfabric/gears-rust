@@ -287,3 +287,34 @@ async fn list_event_types_paginates_with_limit() {
     );
     assert!(body_back["page_info"]["prev_cursor"].is_null());
 }
+
+/// An unreadable spec cache is an outage, not an empty registry.
+#[tokio::test]
+async fn listing_event_types_during_a_spec_cache_fault_answers_503() {
+    let harness = EventBrokerHarness::builder()
+        .with_type_registry(StaticTypesRegistry::of(json!([
+            { "id": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1", "partitions": 1 },
+            {
+                "id": "gts.cf.core.events.event.v1~x.eb.t1.a.v1~",
+                "topic": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
+            },
+        ])))
+        .build()
+        .await;
+    harness.drop_metadata_table("event_broker_spec_cache").await;
+
+    let resp = harness.api_v1().get_event_types().send().await;
+
+    resp.assert_status(503);
+    assert_eq!(
+        resp.json(),
+        json!({
+            "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.service_unavailable.v1~",
+            "title": "Service Unavailable",
+            "status": 503,
+            "detail": "database scope resolution failed",
+            "instance": "/event-broker/v1/event-types",
+            "context": {},
+        })
+    );
+}

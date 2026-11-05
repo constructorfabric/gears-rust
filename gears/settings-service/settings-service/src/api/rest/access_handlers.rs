@@ -156,6 +156,12 @@ pub async fn set_access(
     // @cpt-end:cpt-cf-settings-service-flow-tenant-access-set:p1:inst-ta-set-3
     // @cpt-end:cpt-cf-settings-service-flow-tenant-access-set:p1:inst-ta-set-2
     let actor = actor(&ctx, &headers, &scope);
+    // The target check and the hierarchy lookups ask the tenant resolver,
+    // which opens its own connection and so cannot run inside the
+    // transaction below.
+    // @cpt-begin:cpt-cf-settings-service-flow-tenant-access-set:p1:inst-ta-set-4
+    let chains = service.authorized_hierarchy_chains(&actor, target).await?;
+    // @cpt-end:cpt-cf-settings-service-flow-tenant-access-set:p1:inst-ta-set-4
     let if_match = if_match(&headers).map(str::to_owned);
     let readout = {
         let service = Arc::clone(&service);
@@ -165,7 +171,15 @@ pub async fn set_access(
             .transaction_ref_mapped::<_, AccessReadout, DomainError>(move |tx| {
                 Box::pin(async move {
                     service
-                        .set(tx, &actor, &key, target, access, if_match.as_deref())
+                        .set(
+                            tx,
+                            &actor,
+                            &chains,
+                            &key,
+                            target,
+                            access,
+                            if_match.as_deref(),
+                        )
                         .await
                 })
             })
@@ -198,6 +212,10 @@ pub async fn clear_access(
     let scope = authz::access_scope(&enforcer, &ctx, &resource::VALUE, DELEGATE, None).await?;
     // @cpt-end:cpt-cf-settings-service-flow-tenant-access-clear:p1:inst-ta-clear-2
     let actor = actor(&ctx, &headers, &scope);
+    // Outside the transaction for the same reason as in `set_access`.
+    // @cpt-begin:cpt-cf-settings-service-flow-tenant-access-clear:p1:inst-ta-clear-3
+    let chains = service.authorized_hierarchy_chains(&actor, target).await?;
+    // @cpt-end:cpt-cf-settings-service-flow-tenant-access-clear:p1:inst-ta-clear-3
     let if_match = if_match(&headers).map(str::to_owned);
     let readout = {
         let service = Arc::clone(&service);
@@ -207,7 +225,7 @@ pub async fn clear_access(
             .transaction_ref_mapped::<_, AccessReadout, DomainError>(move |tx| {
                 Box::pin(async move {
                     service
-                        .clear(tx, &actor, &key, target, if_match.as_deref())
+                        .clear(tx, &actor, &chains, &key, target, if_match.as_deref())
                         .await
                 })
             })

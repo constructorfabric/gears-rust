@@ -24,14 +24,14 @@ struct StoredRow {
     body: Vec<u8>,
 }
 
-/// First and last sequence and storage time of a matched range; all `None`
-/// when it matched nothing.
+/// The first and last event of a matched range: sequence and storage time;
+/// no row when it matched nothing.
 #[derive(sqlx::FromRow)]
 struct RangeFigures {
-    first: Option<i64>,
-    last: Option<i64>,
-    start_time: Option<DateTime<Utc>>,
-    end_time: Option<DateTime<Utc>>,
+    first: i64,
+    last: i64,
+    start_time: DateTime<Utc>,
+    end_time: DateTime<Utc>,
 }
 
 /// The topic's uuid and the partition's table, after checking both exist.
@@ -220,24 +220,36 @@ pub async fn query(
     let (topic, table) = partition_of(shared, at, OP).await?;
     let pool = shared.pool()?;
     let map = |e| error::map(OP, &e);
-    let figures: RangeFigures = error::retried(|| {
+    // Seeks on the primary key, never a scan of the range: the first matched
+    // event above the floor, the last at most `limit - 1` sequences above it,
+    // and that event's row. Stored sequences have no gaps - append assigns
+    // them from the head up, retention removes whole segments from the floor
+    // up - so `first + limit - 1` is the `limit`-th matched event. `ends` is
+    // materialized (a subquery in its select list), so `l` is one key lookup;
+    // `LATERAL` would be plainer, but MariaDB lacks it.
+    let end = range.end_offset.map_or(i64::MAX, Sequence::as_i64);
+    let figures: Option<RangeFigures> = error::retried(|| {
         sqlx::query_as(AssertSqlSafe(format!(
-        "SELECT MIN(seq) AS first, MAX(seq) AS last, MIN(seq_time) AS start_time, \
-         MAX(seq_time) AS end_time FROM \
-         (SELECT seq, seq_time FROM {table} WHERE seq <= ? AND seq >= \
-          GREATEST(?, (SELECT floor_seq + 1 FROM evbk__retention WHERE topic_uuid = ? AND partition_no = ?)) \
-          ORDER BY seq LIMIT ?) AS matched"
-    )))
-    .bind(range.end_offset.map_or(i64::MAX, Sequence::as_i64))
-    .bind(range.start_offset.map_or(i64::MIN, Sequence::as_i64))
-    .bind(topic)
-    .bind(names::partition_column(at.partition))
-    .bind(i64::from(range.limit))
-    .fetch_one(pool)
+            "SELECT ends.first, ends.last, ends.start_time, l.seq_time AS end_time FROM \
+             (SELECT f.seq AS first, f.seq_time AS start_time, \
+              (SELECT e.seq FROM {table} AS e WHERE e.seq >= f.seq AND e.seq <= LEAST(?, f.seq + ? - 1) \
+               ORDER BY e.seq DESC LIMIT 1) AS last FROM \
+              (SELECT seq, seq_time FROM {table} WHERE seq <= ? AND seq >= \
+               GREATEST(?, (SELECT floor_seq + 1 FROM evbk__retention WHERE topic_uuid = ? AND partition_no = ?)) \
+               ORDER BY seq ASC LIMIT 1) AS f) AS ends \
+             JOIN {table} AS l ON l.seq = ends.last"
+        )))
+        .bind(end)
+        .bind(i64::from(range.limit))
+        .bind(end)
+        .bind(range.start_offset.map_or(i64::MIN, Sequence::as_i64))
+        .bind(topic)
+        .bind(names::partition_column(at.partition))
+        .fetch_optional(pool)
     })
     .await
     .map_err(map)?;
-    let (Some(first), Some(last)) = (figures.first, figures.last) else {
+    let Some(figures) = figures else {
         return Ok(Vec::new());
     };
     let segments: Vec<(String, i64, i64)> = error::retried(|| {
@@ -254,10 +266,10 @@ pub async fn query(
     Ok(vec![TopicSegment {
         topic: at.topic.to_string(),
         partition: at.partition.value(),
-        start_sequence: Sequence::assigned(first),
-        end_sequence: Sequence::assigned(last),
-        start_time: figures.start_time,
-        end_time: figures.end_time,
+        start_sequence: Sequence::assigned(figures.first),
+        end_sequence: Sequence::assigned(figures.last),
+        start_time: Some(figures.start_time),
+        end_time: Some(figures.end_time),
         segments: segments
             .into_iter()
             .map(|(name, from, to)| {

@@ -63,6 +63,68 @@ pub async fn provision_compare_and_set(harness: &dyn Harness) {
     );
 }
 
+/// A `Held` claim never creates: over nothing it is `NotProvisioned` and the
+/// topic stays unprovisioned; over its own log id it is Ready with the held
+/// partition count; over another it is a log conflict.
+pub async fn provision_with_a_held_claim_never_creates(harness: &dyn Harness) {
+    let backend = started(harness.build().await).await;
+    let spec = TopicSpec {
+        topic: topic("held"),
+        partitions: 2,
+        retention: KEEP,
+    };
+    let at = TopicPartition::new(spec.topic.clone(), Partition::new(0));
+    let (log, other) = (LogId::new_v4(), LogId::new_v4());
+    let outcome = |result: Result<u32, BackendError>| match result {
+        Ok(partitions) => format!("ready {partitions}"),
+        Err(BackendError::LogConflict { .. }) => "conflict".to_owned(),
+        Err(BackendError::NotProvisioned { .. }) => "not provisioned".to_owned(),
+        Err(other) => panic!("provision failed: {other}"),
+    };
+
+    let mut outcomes = vec![outcome(
+        settle(
+            backend.as_ref(),
+            &spec,
+            &LogClaim {
+                replacing: Replacing::Held,
+                new: log,
+            },
+        )
+        .await,
+    )];
+    outcomes.push(match backend.resolve(&at, Position::Latest).await {
+        Err(BackendError::NotProvisioned { .. }) => "resolve: not provisioned".to_owned(),
+        other => format!("resolve: {other:?}"),
+    });
+    for claim in [
+        LogClaim {
+            replacing: Replacing::Nothing,
+            new: log,
+        },
+        LogClaim {
+            replacing: Replacing::Held,
+            new: log,
+        },
+        LogClaim {
+            replacing: Replacing::Held,
+            new: other,
+        },
+    ] {
+        outcomes.push(outcome(settle(backend.as_ref(), &spec, &claim).await));
+    }
+    assert_eq!(
+        outcomes,
+        [
+            "not provisioned",
+            "resolve: not provisioned",
+            "ready 2",
+            "ready 2",
+            "conflict"
+        ]
+    );
+}
+
 /// `Ready` reports the partition count the backend holds: a topic provisioned
 /// with 4 and asked again for 8 under the same log id still holds 4.
 pub async fn provision_reports_the_held_partition_count(harness: &dyn Harness) {

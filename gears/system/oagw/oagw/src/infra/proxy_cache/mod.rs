@@ -5,7 +5,9 @@
 //! upstream selection, the SSRF check, route selection and the merge still
 //! run per request. Each write evicts only the entries it can affect
 //! ([`Change`]), on this replica and, through the cluster change log, on
-//! every other; each entry also expires after the TTL.
+//! every other; each entry also expires after the TTL. An expired entry is
+//! kept for `max_stale` more to answer when its reload fails, so proxying
+//! keeps working while the database is down ([`StaleHealth`] reports it).
 //!
 //! The change log, its publisher and watcher are built with the `cluster`
 //! feature only, so an in-memory OAGW binary does not link the cluster SDK
@@ -21,8 +23,10 @@ use cluster_sdk::{CacheCapability, CacheResolverBuilder, ClusterError};
 use futures_util::FutureExt;
 #[cfg(feature = "cluster")]
 use tokio::task::JoinHandle;
+use tokio::time::Instant;
 #[cfg(feature = "cluster")]
 use tokio_util::sync::CancellationToken;
+use toolkit::{Healthcheck, HealthcheckResult};
 #[cfg(feature = "cluster")]
 use tracing::{info, warn};
 use uuid::Uuid;
@@ -98,17 +102,40 @@ pub(crate) struct ProxyConfigCache {
 }
 
 impl ProxyConfigCache {
-    /// Entries live for `ttl`; each section holds at most `max_entries`.
+    /// Entries are fresh for `ttl` and kept `max_stale` longer to answer
+    /// when their reload fails; each section holds at most `max_entries`.
     pub(crate) fn new(
         ttl: Duration,
+        max_stale: Duration,
         max_entries: usize,
         metrics: Arc<dyn OagwMetricsPort>,
     ) -> Self {
         Self {
-            aliases: Section::new(CacheMap::Alias, ttl, max_entries, Arc::clone(&metrics)),
-            routes: Section::new(CacheMap::Route, ttl, max_entries, Arc::clone(&metrics)),
+            aliases: Section::new(
+                CacheMap::Alias,
+                ttl,
+                max_stale,
+                max_entries,
+                Arc::clone(&metrics),
+            ),
+            routes: Section::new(
+                CacheMap::Route,
+                ttl,
+                max_stale,
+                max_entries,
+                Arc::clone(&metrics),
+            ),
             metrics,
         }
+    }
+
+    /// When the cache last answered a stale entry.
+    #[cfg_attr(
+        all(not(feature = "cluster"), not(test)),
+        expect(dead_code, reason = "read by the health check, built with the cluster")
+    )]
+    fn last_stale(&self) -> Option<Instant> {
+        self.aliases.last_stale().max(self.routes.last_stale())
     }
 
     /// Shared by the cache, its write hook and its change feed.
@@ -121,6 +148,48 @@ impl ProxyConfigCache {
     pub(crate) fn apply(&self, change: &Change) {
         self.aliases.evict(|index| change.aliases(index));
         self.routes.evict(|index| change.routes(index));
+    }
+}
+
+/// How long the health check reports a stale answer.
+#[cfg_attr(
+    all(not(feature = "cluster"), not(test)),
+    expect(dead_code, reason = "read by the health check, built with the cluster")
+)]
+const STALE_HEALTH_WINDOW: Duration = Duration::from_secs(30);
+
+/// Serving stale entries in the readiness report: `Degraded` with code
+/// `proxy_cache_serving_stale` while the cache answered a stale entry in the
+/// last [`STALE_HEALTH_WINDOW`], never `Unhealthy`, so a database outage
+/// shows without taking the replica out of traffic (ADR-0020).
+#[cfg_attr(
+    all(not(feature = "cluster"), not(test)),
+    expect(
+        dead_code,
+        reason = "a health part only with the cluster, which caches"
+    )
+)]
+pub(crate) struct StaleHealth(
+    /// The cache whose stale answers are reported.
+    pub(crate) Arc<ProxyConfigCache>,
+);
+
+#[async_trait]
+impl Healthcheck for StaleHealth {
+    fn name(&self) -> &'static str {
+        "oagw-proxy-cache-stale"
+    }
+
+    async fn check(&self) -> HealthcheckResult {
+        match self.0.last_stale() {
+            Some(at) if at.elapsed() < STALE_HEALTH_WINDOW => HealthcheckResult::degraded(
+                "the proxy configuration cache is answering stale entries because reloads \
+                 from the database fail or are slow; see \
+                 oagw_proxy_cache_stale_served_total",
+            )
+            .with_code("proxy_cache_serving_stale"),
+            _ => HealthcheckResult::healthy(),
+        }
     }
 }
 

@@ -11,7 +11,7 @@ use opentelemetry::metrics::{Counter, Gauge, Histogram, Meter, UpDownCounter};
 
 use crate::domain::ports::OagwMetricsPort;
 use crate::domain::ports::metric_labels::{
-    CacheEviction, CacheLookup, CacheMap, METHOD_OTHER, key,
+    CacheEviction, CacheLookup, CacheMap, CacheStale, METHOD_OTHER, key,
 };
 
 /// Map an HTTP method to a low-cardinality `http.request.method` label value.
@@ -66,6 +66,7 @@ pub struct OagwMetricsMeter {
     websocket_session_duration_seconds: Histogram<f64>,
     registry_provisioning_failures: Counter<u64>,
     registry_provisioning_runs: Counter<u64>,
+    credentials_withheld: Counter<u64>,
     proxy_cache_lookups: Counter<u64>,
     proxy_cache_entries: Gauge<u64>,
     proxy_cache_evictions: Counter<u64>,
@@ -76,6 +77,7 @@ pub struct OagwMetricsMeter {
     )]
     proxy_cache_flushes: Counter<u64>,
     proxy_cache_loads_discarded: Counter<u64>,
+    proxy_cache_stale_served: Counter<u64>,
     #[cfg_attr(
         all(not(feature = "cluster"), not(test)),
         expect(
@@ -146,6 +148,12 @@ impl OagwMetricsMeter {
                 .u64_counter(format!("{prefix}_registry_provisioning_runs"))
                 .with_description("Registry reconcile runs by outcome")
                 .build(),
+            credentials_withheld: meter
+                .u64_counter(format!("{prefix}_credentials_withheld"))
+                .with_description(
+                    "Ancestor auth or headers not sent to endpoints their owner did not configure",
+                )
+                .build(),
             proxy_cache_lookups: meter
                 .u64_counter(format!("{prefix}_proxy_cache_lookups"))
                 .with_description("Proxy configuration cache lookups by section and result")
@@ -169,6 +177,12 @@ impl OagwMetricsMeter {
             proxy_cache_loads_discarded: meter
                 .u64_counter(format!("{prefix}_proxy_cache_loads_discarded"))
                 .with_description("Proxy configuration cache loads not stored after a change")
+                .build(),
+            proxy_cache_stale_served: meter
+                .u64_counter(format!("{prefix}_proxy_cache_stale_served"))
+                .with_description(
+                    "Proxy configuration cache lookups answered with a stale entry, by cause",
+                )
                 .build(),
             proxy_cache_publish_failures: meter
                 .u64_counter(format!("{prefix}_proxy_cache_publish_failures"))
@@ -281,6 +295,16 @@ impl OagwMetricsPort for OagwMetricsMeter {
             .add(1, &[KeyValue::new(key::OUTCOME, outcome.to_owned())]);
     }
 
+    fn record_credential_withheld(&self, host: &str, outcome: &'static str) {
+        self.credentials_withheld.add(
+            1,
+            &[
+                KeyValue::new(key::HOST, host.to_owned()),
+                KeyValue::new(key::OUTCOME, outcome),
+            ],
+        );
+    }
+
     // The cache's labels are static: no allocation per lookup.
     fn record_proxy_cache_lookup(&self, map: CacheMap, result: CacheLookup) {
         self.proxy_cache_lookups.add(
@@ -320,6 +344,16 @@ impl OagwMetricsPort for OagwMetricsMeter {
     fn record_proxy_cache_load_discarded(&self, map: CacheMap) {
         self.proxy_cache_loads_discarded
             .add(1, &[KeyValue::new(key::MAP, map.as_str())]);
+    }
+
+    fn record_proxy_cache_stale_served(&self, map: CacheMap, cause: CacheStale) {
+        self.proxy_cache_stale_served.add(
+            1,
+            &[
+                KeyValue::new(key::MAP, map.as_str()),
+                KeyValue::new(key::CAUSE, cause.as_str()),
+            ],
+        );
     }
 
     fn record_proxy_cache_publish_failures(&self, reason: &'static str, count: u64) {

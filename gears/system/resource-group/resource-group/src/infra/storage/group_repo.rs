@@ -301,16 +301,35 @@ impl GroupRepository {
                     None
                 }
             }
+            FilterNode::InList {
+                field: HierarchyFilterField::Type,
+                values,
+            } => {
+                let types: Vec<String> = values
+                    .iter()
+                    .filter_map(|v| match v {
+                        toolkit_odata::filter::ODataValue::String(s) => Some(s.clone()),
+                        _ => None,
+                    })
+                    .collect();
+                Some(TypeFilter::In(types))
+            }
             FilterNode::Composite {
                 op: FilterOp::And,
                 children,
             } => {
-                for child in children {
-                    if let Some(f) = Self::extract_type_from_hierarchy_node(child) {
-                        return Some(f);
-                    }
+                // Keep every type predicate of the conjunction: dropping all
+                // but the first would let `type in ('A', 'B') and type eq 'B'`
+                // return `A` rows.
+                let mut filters: Vec<TypeFilter> = children
+                    .iter()
+                    .filter_map(Self::extract_type_from_hierarchy_node)
+                    .collect();
+                match filters.len() {
+                    0 => None,
+                    1 => filters.pop(),
+                    _ => Some(TypeFilter::All(filters)),
                 }
-                None
             }
             _ => None,
         }
@@ -381,18 +400,25 @@ impl GroupRepositoryTrait for GroupRepository {
     }
 
     /// Return the id of any existing root group (`parent_id IS NULL`) whose
-    /// `gts_type.schema_id` starts with the given prefix, or `None` when no
-    /// such root exists. Used to enforce tenant-root uniqueness.
+    /// `gts_type.schema_id` starts with any of the given prefixes, or `None`
+    /// when no such root exists. Used to enforce tenant-root uniqueness.
     ///
     /// Bypasses `SecureORM` because this check is a system invariant that
     /// must see every tenant — the caller's `AccessScope` is irrelevant for
     /// correctness here.
-    async fn find_root_id_with_type_prefix<C: DBRunner>(
+    async fn find_root_id_with_type_prefixes<C: DBRunner>(
         &self,
         db: &C,
-        type_prefix: &str,
+        type_prefixes: &[String],
     ) -> Result<Option<Uuid>, DomainError> {
-        use sea_orm::{JoinType, QuerySelect};
+        use sea_orm::{Condition, JoinType, QuerySelect};
+
+        if type_prefixes.is_empty() {
+            return Ok(None);
+        }
+        let prefix_match = type_prefixes.iter().fold(Condition::any(), |cond, prefix| {
+            cond.add(gts_type::Column::SchemaId.starts_with(prefix.as_str()))
+        });
 
         // Bypass SecureORM: tenant-root uniqueness is a system invariant that
         // must see every tenant, not only the caller's scope.
@@ -406,7 +432,7 @@ impl GroupRepositoryTrait for GroupRepository {
                     .into(),
             )
             .filter(rg_entity::Column::ParentId.is_null())
-            .filter(gts_type::Column::SchemaId.starts_with(type_prefix))
+            .filter(prefix_match)
             .secure()
             .scope_with(&scope)
             .one(db)
@@ -1353,12 +1379,17 @@ impl DepthFilter {
 /// Type filter for hierarchy queries.
 enum TypeFilter {
     Eq(String),
+    In(Vec<String>),
+    /// Conjunction: every inner filter must match.
+    All(Vec<TypeFilter>),
 }
 
 impl TypeFilter {
     fn matches(&self, type_path: &str) -> bool {
         match self {
             Self::Eq(s) => type_path == s,
+            Self::In(types) => types.iter().any(|t| t == type_path),
+            Self::All(filters) => filters.iter().all(|f| f.matches(type_path)),
         }
     }
 }

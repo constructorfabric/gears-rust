@@ -218,9 +218,13 @@ async fn first_publishes_race_the_outbox_drain(engine: Engine) {
     assert_eq!(stored, accepted_ids, "every accepted event is stored once");
 }
 
-/// Strategy §5 item 2, deterministic: the first publish is held right after it
-/// read the producer's head; another publish commits on a second connection;
-/// the held publish then writes. It is accepted, not refused with `503`.
+/// Strategy §5 item 2, deterministic: the first publish is held inside its
+/// transaction after it read the producer's (absent) head and before it
+/// writes; another publish commits on a second connection; the held publish
+/// then writes and commits. It is accepted, not refused with `503`. On
+/// `SQLite` the publish takes the write lock before it reads, so no writer can
+/// commit between its read and its write: there it is held just before the
+/// write lock, the last point another commit can land.
 async fn first_publish_with_a_committed_writer_between_read_and_write(engine: Engine) {
     let Some(matrix) = Matrix::start(engine, "committed-writer").await else {
         return;
@@ -241,7 +245,11 @@ async fn first_publish_with_a_committed_writer_between_read_and_write(engine: En
         json!({ "id": producer_id, "mode": "chained", "client_agent": "contention-test" })
     );
 
-    let pause = harness.repo().head_read_pause().clone();
+    let pause = match engine {
+        Engine::Sqlite => harness.repo().before_head_read_pause(),
+        Engine::Postgres | Engine::Mysql => harness.repo().after_head_read_pause(),
+    }
+    .clone();
     pause.arm();
     let held = {
         let harness = Arc::clone(&harness);
@@ -267,7 +275,7 @@ async fn first_publish_with_a_committed_writer_between_read_and_write(engine: En
     };
     tokio::time::timeout(Duration::from_secs(10), pause.reached())
         .await
-        .expect("the first publish reaches the point after its head read");
+        .expect("the first publish reaches the pause point");
 
     let writer = harness
         .api_v1()

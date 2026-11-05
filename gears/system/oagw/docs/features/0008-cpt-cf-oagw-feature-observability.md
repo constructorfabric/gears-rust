@@ -69,7 +69,7 @@ Operators need full visibility into outbound API traffic patterns, errors, and p
 - mTLS support for client certificate authentication with upstreams (future work)
 - Centralized logging system deployment and configuration (infrastructure concern)
 - Distributed tracing backend deployment (infrastructure concern; feature provides trace context propagation)
-- Custom metric definitions beyond the 16 OAGW standard metrics and the 7 proxy configuration cache metrics
+- Custom metric definitions beyond the 16 OAGW standard metrics and the 8 proxy configuration cache metrics
 
 ### 1.6 Configuration Parameters
 
@@ -78,6 +78,10 @@ Operators need full visibility into outbound API traffic patterns, errors, and p
 | Histogram buckets (seconds) | `[0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0]` | Yes | `OagwConfig` |
 | Proxy configuration cache enabled | `true` | Yes | `proxy_cache.enabled`; no effect without a database |
 | Proxy configuration cache entry TTL | 60s | Yes | `proxy_cache.ttl`; 1s to 1h |
+| Proxy configuration cache stale lifetime | 15m | Yes | `proxy_cache.max_stale`; 0s (off) to 24h; how long past the TTL an entry answers when its reload fails |
+| Wait for a stale entry's reload | 2s from the reload's start | No | Constant |
+| Retry window after a failed reload | 5s per key | No | Constant |
+| Health report of a stale answer | 30s | No | Constant (`proxy_cache_serving_stale`) |
 | Proxy configuration cache capacity | 10,000 entries per section | Yes | `proxy_cache.max_entries`; 1 to 1,000,000 |
 | Change log bounds | 128 changes, 32 KiB | No | Constants ([ADR-0020](../ADR/0020-proxy-config-cache.md#the-change-log)) |
 | Write's wait for its change log append | 2s | No | Constant; a registry reconcile run waits once, at its end |
@@ -294,21 +298,26 @@ With a database and `proxy_cache.enabled: true` ([ADR: Proxy Configuration Cache
 
 **Output**: The raw repository answer without tags: every upstream with the alias in the chain (disabled ones included; empty for "not found"), or each upstream's enabled HTTP routes in full. Upstream selection, the SSRF check, route selection and the merge run per request on this output.
 
-**Eviction policy**: An entry older than `proxy_cache.ttl` is a miss. When a section holds `proxy_cache.max_entries`, the least recently used entry is evicted. A configuration change evicts the entries it affects (`cpt-cf-oagw-algo-obs-proxy-cache-change`).
+**Eviction policy**: An entry older than `proxy_cache.ttl` is stale: it is reloaded on use and kept to answer if the reload fails, until it is older than `proxy_cache.ttl` plus `proxy_cache.max_stale`, when it is removed. Emptying the whole cache marks every entry stale (with `max_stale: 0s` it removes them). When a section holds `proxy_cache.max_entries`, the least recently used entry is evicted. A configuration change evicts the entries it affects (`cpt-cf-oagw-algo-obs-proxy-cache-change`).
 
 **Steps**:
 1. [ ] - `p2` - Look up the key in its section - `inst-cache-1`
-2. [ ] - `p2` - **IF** an entry is present and younger than the TTL - `inst-cache-2`
+2. [ ] - `p2` - **IF** an entry is present, younger than the TTL and not marked stale - `inst-cache-2`
    1. [ ] - `p2` - **RETURN** the cached value (no database query) - `inst-cache-2a`
-3. [ ] - `p2` - **IF** a load for the key is in flight - `inst-cache-3`
-   1. [ ] - `p2` - **RETURN** that load's result, error included - `inst-cache-3a`
-4. [ ] - `p2` - DB: one SELECT for the key (alias: the upstreams with the alias across the chain; route: the enabled HTTP routes of every missing upstream at once) - `inst-cache-4`
-5. [ ] - `p2` - **IF** the load fails - `inst-cache-5`
-   1. [ ] - `p2` - **RETURN** the error to every request waiting on the load; nothing is stored - `inst-cache-5a`
-6. [ ] - `p2` - **IF** no configuration change detached the load while it ran - `inst-cache-6`
+3. [ ] - `p2` - **IF** a stale entry is present and a reload of it failed less than 5s ago - `inst-cache-st-1`
+   1. [ ] - `p2` - **RETURN** the stale entry (no database query); count it in `oagw_proxy_cache_stale_served_total` (`retry_window`) - `inst-cache-st-1a`
+4. [ ] - `p2` - **IF** a load for the key is in flight - `inst-cache-3`
+   1. [ ] - `p2` - **RETURN** that load's result, error included, or, with a stale entry, as in steps 6 and 7 - `inst-cache-3a`
+5. [ ] - `p2` - DB: one SELECT for the key (alias: the upstreams with the alias across the chain; route: the enabled HTTP routes of every missing upstream at once) - `inst-cache-4`
+6. [ ] - `p2` - **IF** the request has a stale entry and the load has not answered 2s after it started - `inst-cache-st-2`
+   1. [ ] - `p2` - **RETURN** the stale entry (`slow`); the load runs on and is stored as below - `inst-cache-st-2a`
+7. [ ] - `p2` - **IF** the load fails - `inst-cache-5`
+   1. [ ] - `p2` - **RETURN** the stale entry to every waiting request that has one (`error`), keep it, and answer it without a reload for 5s; log one warning, at most one per section every 30s - `inst-cache-st-3`
+   2. [ ] - `p2` - **RETURN** the error to every other request waiting on the load; nothing is stored - `inst-cache-5a`
+8. [ ] - `p2` - **IF** no configuration change detached the load while it ran - `inst-cache-6`
    1. [ ] - `p2` - Store the entry and index it by the upstream or route IDs it holds; evict the least recently used entry when the section is full - `inst-cache-6a`
-7. [ ] - `p2` - **ELSE** count the load in `oagw_proxy_cache_loads_discarded_total`; do not store it - `inst-cache-7`
-8. [ ] - `p2` - **RETURN** the loaded value - `inst-cache-8`
+9. [ ] - `p2` - **ELSE** count the load in `oagw_proxy_cache_loads_discarded_total`; do not store it - `inst-cache-7`
+10. [ ] - `p2` - **RETURN** the loaded value - `inst-cache-8`
 
 ### Proxy Configuration Change
 
@@ -339,14 +348,14 @@ Not applicable — this feature implements pipeline-integrated cross-cutting con
 - [ ] `p2` - **ID**: `cpt-cf-oagw-dod-obs-prometheus-metrics`
 
 The system **MUST** expose all 16 OAGW Prometheus metrics at the admin `/metrics` endpoint:
-- Counters: `oagw_requests_total`, `oagw_errors_total`, `oagw_rate_limit_exceeded_total`, `oagw_rate_limit_buckets_evicted_total`, `oagw_circuit_breaker_transitions_total`, `oagw_routing_target_host_used`, `oagw_routing_endpoint_selected`, `oagw_registry_provisioning_failures_total{kind, reason}`, `oagw_registry_provisioning_runs_total{outcome}`
+- Counters: `oagw_requests_total`, `oagw_errors_total`, `oagw_rate_limit_exceeded_total`, `oagw_rate_limit_buckets_evicted_total`, `oagw_circuit_breaker_transitions_total`, `oagw_routing_target_host_used`, `oagw_routing_endpoint_selected`, `oagw_registry_provisioning_failures_total{kind, reason}`, `oagw_registry_provisioning_runs_total{outcome}`, `oagw_credentials_withheld_total{host, outcome}`
 - Histograms: `oagw_request_duration_seconds` with buckets `[0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0]`
 - Gauges: `oagw_requests_in_flight`, `oagw_circuit_breaker_state`, `oagw_rate_limit_usage_ratio`, `oagw_rate_limit_buckets`, `oagw_upstream_available`, `oagw_upstream_connections`
 
 `oagw_request_duration_seconds` records the phases `total`, `resolve` (the upstream and route lookup, with the proxy configuration cache on or off, so the two can be compared) and `auth`.
 
-With a database, the system **MUST** also expose the 7 proxy configuration cache metrics ([ADR: Proxy Configuration Cache](../ADR/0020-proxy-config-cache.md#health-and-metrics)):
-- Counters: `oagw_proxy_cache_lookups_total{map, result}`, `oagw_proxy_cache_evictions_total{map, reason}`, `oagw_proxy_cache_changes_total{source}`, `oagw_proxy_cache_flushes_total{cause}`, `oagw_proxy_cache_loads_discarded_total{map}`, `oagw_proxy_cache_publish_failures_total{reason}`
+With a database, the system **MUST** also expose the 8 proxy configuration cache metrics ([ADR: Proxy Configuration Cache](../ADR/0020-proxy-config-cache.md#health-and-metrics)):
+- Counters: `oagw_proxy_cache_lookups_total{map, result}`, `oagw_proxy_cache_evictions_total{map, reason}`, `oagw_proxy_cache_changes_total{source}`, `oagw_proxy_cache_flushes_total{cause}`, `oagw_proxy_cache_loads_discarded_total{map}`, `oagw_proxy_cache_stale_served_total{map, cause}`, `oagw_proxy_cache_publish_failures_total{reason}`
 - Gauges: `oagw_proxy_cache_entries{map}`
 
 Cardinality **MUST** be controlled: no tenant labels; `http.route` is the normalized route match pattern from route config; `http.request.method` is normalized to a standard verb or `_OTHER`; `http.response.status_code` is the numeric upstream status (OTel HTTP semconv) — status-class queries (e.g. `5xx` rate) are expressed at query time over the numeric code. Label-key vocabulary matches the inbound API Gateway so both gateways share dashboards.
@@ -442,7 +451,7 @@ With a database, the system **MUST** serve the proxy lookup from a per-replica i
 - Every configuration write evicts only the entries it affects, on the writing replica at once and on every other replica through the cluster change log; a replica that cannot know what it missed empties its cache
 - The database stays the only source of truth: the cluster gear holds only the change log
 
-A failed or slow change log append **MUST NOT** fail the write: it is logged at WARN and each change not appended is counted once. A change log watch that is not up **MUST NOT** fail proxying: health is `Degraded` (`proxy_cache_watch_connecting` while connecting or reconnecting, `proxy_cache_watch_down` once down) and freshness falls back to the TTL. A newer-format change log, which the replica's appends skip, reports `Degraded` (`proxy_cache_newer_log`). A cluster still starting, or an `oagw` profile whose backend is degraded, **MUST NOT** fail proxying either: health is `Degraded`; only a cluster misconfiguration is `Unhealthy`. A slow cluster readiness check **MUST NOT** hold up the health check: OAGW waits at most 250 ms, reports the last result for up to 10 s, then `Degraded` (`cluster_readiness_slow`). The SDK's lookup with tags and `proxy_cache.enabled: false` read the database every time.
+A failed or slow change log append **MUST NOT** fail the write: it is logged at WARN and each change not appended is counted once. A change log watch that is not up **MUST NOT** fail proxying: health is `Degraded` (`proxy_cache_watch_connecting` while connecting or reconnecting, `proxy_cache_watch_down` once down) and freshness falls back to the TTL. A newer-format change log, which the replica's appends skip, reports `Degraded` (`proxy_cache_newer_log`). A cluster still starting, or an `oagw` profile whose backend is degraded, **MUST NOT** fail proxying either: health is `Degraded`; only a cluster misconfiguration is `Unhealthy`. A database outage **MUST NOT** stop proxying for cached configuration within `proxy_cache.max_stale` past its TTL: stale entries answer, and health is `Degraded` (`proxy_cache_serving_stale`) for 30 s after each stale answer. A slow cluster readiness check **MUST NOT** hold up the health check: OAGW waits at most 250 ms, reports the last result for up to 10 s, then `Degraded` (`cluster_readiness_slow`). The SDK's lookup with tags and `proxy_cache.enabled: false` read the database every time.
 
 **Implements**:
 - `cpt-cf-oagw-algo-obs-proxy-config-cache`
@@ -453,7 +462,7 @@ A failed or slow change log append **MUST NOT** fail the write: it is logged at 
 
 ## 6. Acceptance Criteria
 
-- [ ] All 16 Prometheus metrics are exposed at `/metrics` in Prometheus exposition format, plus the 7 `oagw_proxy_cache_*` metrics with a database
+- [ ] All 16 Prometheus metrics are exposed at `/metrics` in Prometheus exposition format, plus the 8 `oagw_proxy_cache_*` metrics with a database
 - [ ] `oagw_request_duration_seconds` histogram uses the specified 12-bucket configuration, and records `phase="resolve"` for the upstream and route lookup
 - [ ] No metric label includes tenant_id (cardinality control)
 - [ ] Metric paths are normalized from route config, not raw request paths
@@ -473,7 +482,9 @@ A failed or slow change log append **MUST NOT** fail the write: it is logged at 
 - [ ] With a database, a repeated proxy lookup is served from the proxy configuration cache with no database query, and returns what an uncached lookup returns
 - [ ] A configuration write evicts only the cache entries it affects, on the writing replica before the write answers and on every other replica once the change is delivered through the cluster change log
 - [ ] A replica that misses changes (gap, new or unreadable log, `Lagged`, `Reset`) empties its cache; a lost change is corrected within `proxy_cache.ttl`
-- [ ] With the database unavailable, cached lookups resolve, and a miss returns the error without caching it
+- [ ] With the database unavailable, cached lookups resolve, past their TTL for up to `proxy_cache.max_stale` from their stale entries (a failed key is reloaded again only after 5s), and a miss with nothing cached returns the error without caching it
+- [ ] With the database slow, a request with a stale entry answers it 2s after the entry's reload started
+- [ ] Stale answers are counted in `oagw_proxy_cache_stale_served_total` by `cause`, and health is `Degraded` with `proxy_cache_serving_stale` for 30s after one
 - [ ] When the change log append fails, the write succeeds and each change not appended is logged and counted once by `reason`; health is `Degraded` with `proxy_cache_watch_connecting`, `proxy_cache_watch_down` or `proxy_cache_newer_log` in the matching state, and with a cluster still starting or a degraded `oagw` profile; a cluster readiness check slower than 250 ms leaves the last result, then `cluster_readiness_slow`
 - [ ] At capacity, a section evicts its least recently used entry
 - [ ] Audit log entries include `trace_id` field for distributed tracing correlation

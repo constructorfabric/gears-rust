@@ -50,7 +50,7 @@ use crate::infra::proxy_cache::{
     ProxyConfigCache, WriteHook,
 };
 #[cfg(feature = "cluster")]
-use crate::infra::proxy_cache::{ChangeFeed, WatchHealth, WatchStatus};
+use crate::infra::proxy_cache::{ChangeFeed, StaleHealth, WatchHealth, WatchStatus};
 use crate::infra::storage::{
     DbRegistryRowRepo, DbRegistryStateStore, DbRouteRepo, DbUpstreamRepo, InMemoryRegistryRowRepo,
     InMemoryRouteRepo, InMemoryUpstreamRepo, Migrator,
@@ -210,6 +210,7 @@ impl OutboundApiGatewayGear {
             // cluster change log for the other replicas (ADR-0020).
             let cache = Arc::new(ProxyConfigCache::new(
                 proxy_cache.ttl,
+                proxy_cache.max_stale,
                 proxy_cache.max_entries,
                 Arc::clone(metrics),
             ));
@@ -330,15 +331,18 @@ impl Gear for OutboundApiGatewayGear {
         // the enforcer resolves it from the hub per call.
         let policy_enforcer = PolicyEnforcer::from_hub(ctx.client_hub());
 
-        let cp_impl = Arc::new(ControlPlaneServiceImpl::new(
-            upstream_repo,
-            route_repo,
-            tenant_resolver.clone(),
-            policy_enforcer.clone(),
-            credstore.clone(),
-            ssrf_guard.clone(),
-            proxy_reader,
-        ));
+        let cp_impl = Arc::new(
+            ControlPlaneServiceImpl::new(
+                upstream_repo,
+                route_repo,
+                tenant_resolver.clone(),
+                policy_enforcer.clone(),
+                credstore.clone(),
+                ssrf_guard.clone(),
+                proxy_reader,
+            )
+            .with_metrics(metrics.clone()),
+        );
         // The registry reconcile only; handlers and the SDK get `cp`.
         self.registry_provisioner
             .set(Arc::new(RegistryProvisionerImpl::new(
@@ -736,8 +740,8 @@ impl DatabaseCapability for OutboundApiGatewayGear {
 }
 
 /// The gear's readiness: on a database with the cache enabled the proxy
-/// configuration change log watch and the cluster requirements, then
-/// registry provisioning. The worst part decides the status and the code;
+/// configuration change log watch, the cluster requirements and the cache's
+/// stale answers, then registry provisioning. The worst part decides the status and the code;
 /// on a tie, the earlier part. The message joins those of every part that is
 /// not healthy, in order, so a second degraded part is not hidden.
 struct OagwHealth(Vec<Arc<dyn Healthcheck>>);
@@ -934,8 +938,8 @@ fn severity(status: HealthcheckStatus) -> u8 {
 }
 
 impl OutboundApiGatewayGear {
-    /// On a database with the cache enabled: the change log watch and the
-    /// cluster requirements.
+    /// On a database with the cache enabled: the change log watch, the
+    /// cluster requirements and stale answers.
     #[cfg(feature = "cluster")]
     fn cache_health(&self) -> Vec<Arc<dyn Healthcheck>> {
         let mut parts: Vec<Arc<dyn Healthcheck>> = Vec::new();
@@ -944,6 +948,7 @@ impl OutboundApiGatewayGear {
             parts.push(Arc::new(ClusterHealth::new(
                 cluster_sdk::cluster_readiness(Arc::clone(&sync.hub)),
             )));
+            parts.push(Arc::new(StaleHealth(Arc::clone(sync.hook.cache()))));
         }
         parts
     }

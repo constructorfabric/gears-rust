@@ -31,7 +31,8 @@ pub use db::{DbProducer, DbProducerBuilder};
 pub use migrations::producer_registration_migrations;
 #[cfg(feature = "outbox")]
 pub use outbox::{
-    ProducerOutbox, ProducerOutboxEnvelope, ProducerOutboxHandle, ProducerOutboxQueue, TEST_QUEUE,
+    PRODUCER_OUTBOX_PAYLOAD_TYPE, ProducerOutbox, ProducerOutboxEnvelope, ProducerOutboxHandle,
+    ProducerOutboxQueue, TEST_QUEUE,
 };
 #[cfg(feature = "db")]
 pub use types::{DbDeduplication, ManagedDeduplication};

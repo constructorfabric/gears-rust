@@ -42,6 +42,26 @@ pub trait FilterField: Copy + Eq + std::hash::Hash + fmt::Debug + 'static {
 
     fn kind(&self) -> FieldKind;
 
+    /// The operators this field serves, when fewer than its kind allows.
+    ///
+    /// `None`, the default, serves every operator [`FieldKind::allows`]. A list narrows that:
+    /// the contract (`$filter` description and `x-odata-filter.allowedFields`) publishes the
+    /// list in its order, and [`parse_odata_filter`] refuses the operators it leaves out, so a
+    /// caller reading the contract and a caller probing the endpoint get the same answer.
+    ///
+    /// The list must be a non-empty subset of what the kind allows, without repeats;
+    /// [`published_ops_error`] names the first violation and `with_odata_filter` panics on it
+    /// at registration. The parser never widens past the kind, whatever the list says.
+    fn published_ops(&self) -> Option<&'static [FilterOp]> {
+        None
+    }
+
+    /// Whether the parser accepts `op` on this field: the kind allows it and
+    /// [`published_ops`](Self::published_ops), when given, lists it.
+    fn serves(&self, op: FilterOp) -> bool {
+        self.kind().allows(op) && self.published_ops().is_none_or(|ops| ops.contains(&op))
+    }
+
     /// Whether the field can be absent, so that `null` compares with it: `field eq null` asks for
     /// the rows where it is absent and `field ne null` for the rows where it is present.
     ///
@@ -114,7 +134,8 @@ impl FieldKind {
     /// each endpoint's `x-odata-filter.allowedFields`, so what a caller reads
     /// in the contract is what the parser enforces: ordering operators are
     /// meaningless on a `Bool` or a `Uuid`, and the string functions only
-    /// apply to `String`.
+    /// apply to `String`. A field may serve fewer operators than its kind
+    /// allows through [`FilterField::published_ops`]; it can never serve more.
     #[must_use]
     pub const fn allows(self, op: FilterOp) -> bool {
         match self {
@@ -143,6 +164,38 @@ impl FieldKind {
             }
         }
     }
+}
+
+/// The first way `F`'s [`FilterField::published_ops`] declarations break their
+/// contract, as a message naming the field and the operator, or `None` when
+/// every field's list is a non-empty subset of what its kind allows without
+/// repeats.
+#[must_use]
+pub fn published_ops_error<F: FilterField>() -> Option<String> {
+    for field in F::FIELDS {
+        let Some(ops) = field.published_ops() else {
+            continue;
+        };
+        let name = field.name();
+        if ops.is_empty() {
+            return Some(format!(
+                "field `{name}` publishes no operators; return None to publish every operator \
+                 its kind allows"
+            ));
+        }
+        for (index, op) in ops.iter().enumerate() {
+            if !field.kind().allows(*op) {
+                return Some(format!(
+                    "field `{name}` publishes `{op}`, which its kind {} does not allow",
+                    field.kind()
+                ));
+            }
+            if ops[..index].contains(op) {
+                return Some(format!("field `{name}` publishes `{op}` twice"));
+            }
+        }
+    }
+    None
 }
 
 impl fmt::Display for FilterOp {
@@ -316,6 +369,7 @@ pub fn convert_expr_to_filter_node<F: FilterField>(
                          `ne null` compare with null"
                     )));
                 }
+                reject_unsupported_op(field, field_name, filter_op)?;
                 return Ok(FilterNode::binary(field, filter_op, value));
             }
 
@@ -345,6 +399,7 @@ pub fn convert_expr_to_filter_node<F: FilterField>(
                             got: "non-string".to_owned(),
                         });
                     }
+                    reject_unsupported_op(field, field_name, FilterOp::Contains)?;
 
                     Ok(FilterNode::binary(
                         field,
@@ -369,6 +424,7 @@ pub fn convert_expr_to_filter_node<F: FilterField>(
                             got: "non-string".to_owned(),
                         });
                     }
+                    reject_unsupported_op(field, field_name, FilterOp::StartsWith)?;
 
                     Ok(FilterNode::binary(
                         field,
@@ -393,6 +449,7 @@ pub fn convert_expr_to_filter_node<F: FilterField>(
                             got: "non-string".to_owned(),
                         });
                     }
+                    reject_unsupported_op(field, field_name, FilterOp::EndsWith)?;
 
                     Ok(FilterNode::binary(
                         field,
@@ -458,11 +515,16 @@ pub fn convert_expr_to_filter_node<F: FilterField>(
     }
 }
 
-/// Refuse an operator the field's kind does not accept, so the parser holds
-/// to the same table the contract publishes.
+/// Refuse an operator the field does not serve, so the parser holds to the
+/// same table the contract publishes: the kind's, narrowed by the field's
+/// [`FilterField::published_ops`].
 fn reject_unsupported_op<F: FilterField>(field: F, name: &str, op: FilterOp) -> FilterResult<()> {
-    if field.kind().allows(op) {
+    if field.serves(op) {
         Ok(())
+    } else if field.kind().allows(op) {
+        Err(FilterError::UnsupportedOperation(format!(
+            "`{op}` on field `{name}`; the endpoint does not serve it"
+        )))
     } else {
         Err(FilterError::UnsupportedOperation(format!(
             "`{op}` on field `{name}` of type {}",

@@ -16,7 +16,8 @@ use super::dto::{
 use crate::api::rest::handlers::action_suffix::parse_action_suffixed_id;
 use crate::api::rest::state::HandlerState;
 use crate::domain::error::{DomainError, ErrorCode};
-use crate::domain::ingest::{ProducerRegistrationInput, ProducerResetScope, ProducerResetSelector};
+use crate::domain::ingest::ProducerRegistrationInput;
+use crate::domain::producer_reset::{ProducerResetScope, ProducerResetSelector};
 
 /// # Errors
 /// Returns the mapped `CanonicalError` for any `DomainError`

@@ -5,6 +5,7 @@ use super::{
 };
 use crate::infra::storage::entity;
 use sea_orm::{ColumnTrait, QueryFilter, QueryOrder};
+use toolkit_db::secure::secure_insert_many;
 pub async fn order_version_for_order(
     runner: &impl DBRunner,
     scope: &AccessScope,
@@ -295,19 +296,44 @@ impl<T: TransactionRunner> LockedOrder<'_, T> {
             .exec_with_returning(self.tx)
             .await
     }
-    pub(crate) async fn insert_order_line(
+    /// Insert a submit version's `order_line` rows in one batch. Every row is checked against
+    /// this order first, then `secure_insert_many` validates every row's scope before sending
+    /// anything, so a refused row inserts nothing.
+    ///
+    /// `self.tx` is the transition transaction: a batch past the bind-parameter budget is split
+    /// into several statements, atomic only inside it.
+    pub(crate) async fn insert_order_lines(
         &self,
-        row: entity::order_line::Model,
-    ) -> Result<entity::order_line::Model, ScopeError> {
-        if row.order_id != self.row.order_id {
+        rows: Vec<entity::order_line::Model>,
+    ) -> Result<(), ScopeError> {
+        if rows.iter().any(|row| row.order_id != self.row.order_id) {
             return Err(ScopeError::Denied("hidden, changed, or foreign order"));
         }
-        let active = row.into_active_model();
-        entity::order_line::Entity::insert(active.clone())
-            .secure()
-            .scope_with_model(&self.child_scope(), &active)?
-            .exec_with_returning(self.tx)
-            .await
+        secure_insert_many::<entity::order_line::Entity>(
+            rows.into_iter()
+                .map(IntoActiveModel::into_active_model)
+                .collect(),
+            &self.child_scope(),
+            self.tx,
+        )
+        .await
+    }
+    /// [`Self::insert_order_lines`] for the `resolved_total` rows.
+    pub(crate) async fn insert_resolved_totals(
+        &self,
+        rows: Vec<entity::resolved_total::Model>,
+    ) -> Result<(), ScopeError> {
+        if rows.iter().any(|row| row.order_id != self.row.order_id) {
+            return Err(ScopeError::Denied("hidden, changed, or foreign order"));
+        }
+        secure_insert_many::<entity::resolved_total::Entity>(
+            rows.into_iter()
+                .map(IntoActiveModel::into_active_model)
+                .collect(),
+            &self.child_scope(),
+            self.tx,
+        )
+        .await
     }
     /// Reserve a never-used line identity and add membership in this locked transaction.
     /// A removed identity stays reserved; its primary key rejects reuse before membership.
@@ -352,20 +378,6 @@ impl<T: TransactionRunner> LockedOrder<'_, T> {
         }
         let active = row.into_active_model();
         entity::order_line_admin::Entity::insert(active.clone())
-            .secure()
-            .scope_with_model(&self.child_scope(), &active)?
-            .exec_with_returning(self.tx)
-            .await
-    }
-    pub(crate) async fn insert_resolved_total(
-        &self,
-        row: entity::resolved_total::Model,
-    ) -> Result<entity::resolved_total::Model, ScopeError> {
-        if row.order_id != self.row.order_id {
-            return Err(ScopeError::Denied("hidden, changed, or foreign order"));
-        }
-        let active = row.into_active_model();
-        entity::resolved_total::Entity::insert(active.clone())
             .secure()
             .scope_with_model(&self.child_scope(), &active)?
             .exec_with_returning(self.tx)
@@ -441,4 +453,48 @@ impl<T: TransactionRunner> LockedOrder<'_, T> {
             .exec_with_returning(self.tx)
             .await
     }
+}
+
+/// Load only the page's immutable rows, from the selected committed version.
+pub async fn committed_content_for_lines(
+    runner: &impl DBRunner,
+    scope: &AccessScope,
+    id: Uuid,
+    version: i32,
+    line_ids: &[Uuid],
+) -> Result<Vec<entity::order_line::Model>, ScopeError> {
+    if line_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    entity::order_line::Entity::find()
+        .inner_join(order::Entity)
+        .filter(entity::order_line::Column::OrderId.eq(id))
+        .filter(entity::order_line::Column::Version.eq(version))
+        .filter(entity::order_line::Column::LineId.is_in(line_ids.iter().copied()))
+        .secure()
+        .scope_with(&AccessScope::for_resources(vec![id]))
+        .and_scope_for::<order::Entity>(scope)
+        .all(runner)
+        .await
+}
+/// Totals of exactly the snapshot's current commercial version.
+pub async fn committed_totals(
+    runner: &impl DBRunner,
+    scope: &AccessScope,
+    id: Uuid,
+    version: i32,
+) -> Result<Vec<entity::resolved_total::Model>, ScopeError> {
+    use entity::resolved_total::{Column, Entity};
+    Entity::find()
+        .inner_join(order::Entity)
+        .filter(Column::OrderId.eq(id))
+        .filter(Column::Version.eq(version))
+        .order_by_asc(Column::Scope)
+        .order_by_asc(Column::LineId)
+        .order_by_asc(Column::ChargeKind)
+        .secure()
+        .scope_with(&AccessScope::for_resources(vec![id]))
+        .and_scope_for::<order::Entity>(scope)
+        .all(runner)
+        .await
 }

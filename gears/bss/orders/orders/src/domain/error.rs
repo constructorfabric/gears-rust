@@ -36,6 +36,12 @@ pub enum EngineError {
     /// Lost commit acknowledgement: resolve by retrying the same key. Never a rollback claim.
     #[error("outcome unknown")]
     OutcomeUnknown,
+    /// The order's commercial version numbers are exhausted (D-188: the high-water reached
+    /// `2147483647`): the reservation rolled back before any Pricing command and nothing is
+    /// settled. Answered as the canonical resource-exhaustion Problem with the quota subject
+    /// `version-allocation`, not as a registered business reason.
+    #[error("commercial version allocation exhausted")]
+    VersionAllocationExhausted,
 }
 
 impl From<EngineError> for OrdersError {
@@ -46,6 +52,9 @@ impl From<EngineError> for OrdersError {
             EngineError::Integration => Self::Integration,
             EngineError::Internal => Self::Internal,
             EngineError::OutcomeUnknown => Self::OutcomeUnknown,
+            EngineError::VersionAllocationExhausted => Self::Other {
+                canonical: crate::infra::error_mapping::version_allocation_exhausted(),
+            },
         }
     }
 }

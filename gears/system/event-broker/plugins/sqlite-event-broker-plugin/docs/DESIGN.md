@@ -139,8 +139,8 @@ Every instance over one file in this process shares a hub, found in a process-wi
 
 One write transaction:
 
-1. `INSERT INTO evbk__log ... ON CONFLICT (topic_uuid) DO NOTHING` with the claim's log id, the spec's partition count and retention.
-2. Read the stored `log_id` and `partitions`. If `LogClaim::accepts(stored)` is false, roll back: `LogConflict`.
+1. `INSERT INTO evbk__log ... ON CONFLICT (topic_uuid) DO NOTHING` with the claim's log id, the spec's partition count and retention. Skipped for a `Held` claim, which never creates.
+2. Read the stored `log_id` and `partitions`, if any. If `LogClaim::check` refuses it, roll back and answer its error: `LogConflict` for a foreign log id, `NotProvisioned` for a `Held` claim with no row - and so creates no row and no partition.
 3. `UPDATE` the row to the claim's log id and the spec's retention - the sweep reads the bounds on its next pass, so a retention change takes effect within `sweep.interval_ms`.
 4. Insert one `evbk__partition` row per partition of the **stored** count, `ON CONFLICT DO NOTHING`.
 
@@ -190,7 +190,21 @@ From the partition row: `Latest` is `hwm` (never lowered by removal), `Earliest`
 
 ### 4.7 query
 
-One `TopicSegment` for a non-empty match: `start_sequence`/`end_sequence` and `start_time`/`end_time` of the first `limit` events in the requested sequence range, and one opaque segment entry, `{"from_sequence": floor + 1, "to_sequence": hwm}` - the partition's stored span, the only segment this plugin has. An empty match is an empty list.
+One `TopicSegment` for a non-empty match: `start_sequence`/`start_time` are the sequence and `sequence_time` of the first matched event, `end_sequence`/`end_time` those of the last of the first `limit` matched events, and one opaque segment entry, `{"from_sequence": floor + 1, "to_sequence": hwm}` - the partition's stored span, the only segment this plugin has. An empty match is an empty list.
+
+The figures are two probes on the primary key in one statement, never a scan of the range, so a `query` costs the same over a million stored events as over ten:
+
+```sql
+SELECT f.sequence, f.sequence_time, l.sequence, l.sequence_time FROM
+  (SELECT sequence, sequence_time FROM evbk__event WHERE topic_uuid = ?t AND partition = ?p
+     AND sequence >= ?start AND sequence <= ?end ORDER BY sequence ASC LIMIT 1) AS f
+  JOIN evbk__event AS l ON l.topic_uuid = ?t AND l.partition = ?p AND l.sequence =
+  (SELECT e.sequence FROM evbk__event AS e WHERE e.topic_uuid = ?t AND e.partition = ?p
+     AND e.sequence >= f.sequence AND e.sequence <= MIN(?end, f.sequence + ?limit - 1)
+     ORDER BY e.sequence DESC LIMIT 1);
+```
+
+`first + limit - 1` is the `limit`-th matched event because stored sequences have no gaps: append assigns them from the head up (§4.2) and the sweep removes them from the floor up (§4.8).
 
 ### 4.8 Retention Sweep
 

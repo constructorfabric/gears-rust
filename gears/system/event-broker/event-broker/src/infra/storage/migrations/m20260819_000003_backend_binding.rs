@@ -5,6 +5,13 @@
 
 use sea_orm_migration::prelude::*;
 
+use super::columns::{gts_id, timestamp};
+
+/// `provisioning` or `provisioned`.
+const STATE_LEN: u32 = 12;
+/// `YYYY-MM-DDTHH:MM:SS.sssZ`, the database's clock as text (`db_clock`).
+const ATTEMPT_AT_LEN: u32 = 24;
+
 #[derive(DeriveMigrationName)]
 pub struct Migration;
 
@@ -45,8 +52,7 @@ async fn create_outbox_identity(manager: &SchemaManager<'_>) -> Result<(), DbErr
                 )
                 // Random 64 bits, 16 lowercase hex.
                 .col(ColumnDef::new(T::OutboxId).string_len(16).not_null())
-                // RFC 3339 UTC.
-                .col(ColumnDef::new(T::CreatedAt).string_len(32).not_null())
+                .col(timestamp(manager, T::CreatedAt))
                 .to_owned(),
         )
         .await
@@ -60,22 +66,29 @@ async fn create_topic_binding(manager: &SchemaManager<'_>) -> Result<(), DbErr> 
                 .table(T::Table)
                 .if_not_exists()
                 // `GtsId::to_uuid(topic_id)`.
-                .col(
-                    ColumnDef::new(T::TopicUuid)
-                        .string_len(36)
-                        .not_null()
-                        .primary_key(),
-                )
+                .col(ColumnDef::new(T::TopicUuid).uuid().not_null().primary_key())
                 // For operators, not indexed.
-                .col(ColumnDef::new(T::TopicId).string_len(1024).not_null())
+                .col(gts_id(manager, T::TopicId))
                 // The current attempt's, then the log's.
-                .col(ColumnDef::new(T::LogId).string_len(36).not_null())
-                // `provisioning` | `provisioned`.
-                .col(ColumnDef::new(T::State).string_len(16).not_null())
-                // RFC 3339 UTC, database time, compared as text.
-                .col(ColumnDef::new(T::AttemptAt).string_len(32).not_null())
+                .col(ColumnDef::new(T::LogId).uuid().not_null())
+                .col(ColumnDef::new(T::State).string_len(STATE_LEN).not_null())
+                // Database time, compared as text, so it stays text.
+                .col(
+                    ColumnDef::new(T::AttemptAt)
+                        .string_len(ATTEMPT_AT_LEN)
+                        .not_null(),
+                )
                 // The count the backend holds, once provisioned.
                 .col(ColumnDef::new(T::Partitions).big_integer().null())
+                // The retention last recorded, set when provisioned: max age
+                // in milliseconds, and max bytes, NULL when unbounded. The
+                // backend holds it while `retention_confirmed`.
+                .col(ColumnDef::new(T::RetentionMaxAgeMs).big_integer().null())
+                .col(ColumnDef::new(T::RetentionMaxBytes).big_integer().null())
+                // The compare-and-set token of the retention columns, and
+                // whether the backend is known to hold the recorded retention.
+                .col(ColumnDef::new(T::RetentionVersion).big_integer().not_null())
+                .col(ColumnDef::new(T::RetentionConfirmed).boolean().not_null())
                 .to_owned(),
         )
         .await
@@ -100,4 +113,8 @@ enum EventBrokerTopicBinding {
     State,
     AttemptAt,
     Partitions,
+    RetentionMaxAgeMs,
+    RetentionMaxBytes,
+    RetentionVersion,
+    RetentionConfirmed,
 }

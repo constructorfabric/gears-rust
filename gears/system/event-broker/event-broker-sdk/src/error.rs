@@ -806,8 +806,8 @@ impl From<CanonicalError> for EventBrokerError {
                 let name = resource_name.clone().unwrap_or_default();
                 match (resource_type.as_deref(), reason) {
                     (_, Some(reasons::SEQUENCE_MISMATCH)) => Self::SequenceViolation {
-                        // The expected-previous value rides in the violation's
-                        // description ("...; expected previous <n>"), not the
+                        // The committed head rides last in the violation's
+                        // description ("... last_sequence=<n>"), not the
                         // top-level detail, so recover it from there.
                         expected_previous: ctx
                             .violations
@@ -1238,5 +1238,16 @@ mod canonical_roundtrip_tests {
             } => assert_eq!(expected_previous, 41),
             other => panic!("expected SequenceViolation, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn expected_previous_from_detail_reads_the_trailing_last_sequence() {
+        assert_eq!(
+            expected_previous_from_detail(
+                "index=1 producer_id=0190f1a2-0000-7000-8000-000000000a02 \
+                 topic=gts.cf.core.events.topic.v1~x.eb.chain.orders.v1 last_sequence=17"
+            ),
+            17
+        );
     }
 }

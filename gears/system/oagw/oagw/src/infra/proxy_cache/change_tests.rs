@@ -19,7 +19,12 @@ use crate::domain::repo::RowKey;
 use crate::infra::proxy_cache::{AliasKey, ProxyConfigCache};
 
 fn cache() -> ProxyConfigCache {
-    ProxyConfigCache::new(Duration::from_secs(60), 100, Arc::new(NoopMetrics))
+    ProxyConfigCache::new(
+        Duration::from_secs(60),
+        Duration::ZERO,
+        100,
+        Arc::new(NoopMetrics),
+    )
 }
 
 /// A root tenant `r` with a partner `p`, the partner's customer `c`, and

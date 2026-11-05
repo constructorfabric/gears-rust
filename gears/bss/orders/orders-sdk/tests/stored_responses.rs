@@ -146,3 +146,47 @@ fn a_stored_spawn_signal_result_with_unknown_members_still_decodes() {
     assert_eq!(result.transition.state, OrderState::InFulfillment);
     assert_eq!(result.generation, 3);
 }
+
+/// `currency_scale` of a committed total is `u8` (A-T5/C9): a stored body with `2` still decodes
+/// as the same value, and a scale no `u8` holds is refused at decode, not truncated.
+#[test]
+fn committed_total_scale_is_u8_and_old_bodies_decode() {
+    let total = |scale: serde_json::Value| {
+        json!({
+            "scope": "line",
+            "line_id": "00000000-0000-0000-0000-000000000002",
+            "currency": "EUR",
+            "assessment_id": "00000000-0000-0000-0000-00000000001e",
+            "currency_scale": scale,
+            "exclusions": [],
+            "item_breakdown": [],
+            "recurring_by_cycle": [],
+            "amount_status": "committed",
+            "amount_basis": "contracted",
+            "period_evidence": {},
+            "gross_exact": "1",
+            "gross_display": "1.00",
+            "net_exact": "1",
+            "net_display": "1.00",
+            "discount_status": "none",
+            "discount_exact": null,
+            "discount_display": null,
+            "promotion_ref": null,
+            "charge_kind": "recurring",
+            "tcv_exact": null,
+            "tcv_display": null,
+            "tcv_basis": null,
+            "tcv_evidence": null,
+        })
+    };
+    let decoded: bss_orders_sdk::reads::CommittedTotal =
+        serde_json::from_value(total(json!(2))).unwrap();
+    let scale: u8 = decoded.currency_scale;
+    assert_eq!(scale, 2);
+    assert_eq!(serde_json::to_value(&decoded).unwrap(), total(json!(2)));
+    for bad in [json!(256), json!(-1)] {
+        assert!(
+            serde_json::from_value::<bss_orders_sdk::reads::CommittedTotal>(total(bad)).is_err()
+        );
+    }
+}

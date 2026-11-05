@@ -12,7 +12,7 @@ use tokio_stream::StreamExt;
 use toolkit_gts::GtsInstanceId;
 
 use crate::domain::backend::{BackendResolver, from_sdk_event};
-use crate::domain::model::{Event, Sequence};
+use crate::domain::model::{Event, Sequence, Topic};
 use crate::domain::specification::SpecificationManager;
 use crate::domain::streaming::source::PartitionKey;
 
@@ -32,6 +32,19 @@ impl BackendEventSource {
     pub fn new(specs: Arc<dyn SpecificationManager>, backends: Arc<dyn BackendResolver>) -> Self {
         Self { specs, backends }
     }
+
+    /// `Failed` when the topic is not registered or its record does not
+    /// deserialize; `Unavailable` when the lookup fails.
+    async fn topic(&self, id: &GtsInstanceId) -> Result<Topic, SourceError> {
+        match self.specs.get_topic(id).await {
+            Ok(Some(topic)) => Ok(topic),
+            Ok(None) => Err(SourceError::Failed(format!("unknown topic {id}"))),
+            Err(err) => {
+                tracing::warn!(%err, topic = %id, "topic lookup failed while reading from the backend");
+                Err(SourceError::Unavailable)
+            }
+        }
+    }
 }
 
 impl EventSource for BackendEventSource {
@@ -41,14 +54,7 @@ impl EventSource for BackendEventSource {
         after: Sequence,
         max_events: usize,
     ) -> Result<Vec<Event>, SourceError> {
-        // A topic that has gone from the registry is not a read failure and must
-        // not be retried as one: there is nothing to fetch and the demand should
-        // not survive.
-        let topic = self
-            .specs
-            .get_topic(&key.topic)
-            .await
-            .ok_or_else(|| SourceError::Failed(format!("unknown topic {}", key.topic)))?;
+        let topic = self.topic(&key.topic).await?;
 
         let backend = self.backends.resolve(&topic);
 
@@ -81,11 +87,7 @@ impl HeadSource for BackendEventSource {
         topic: &GtsInstanceId,
         partitions: &[i32],
     ) -> Result<HeadStream, SourceError> {
-        let topic = self
-            .specs
-            .get_topic(topic)
-            .await
-            .ok_or_else(|| SourceError::Failed(format!("unknown topic {topic}")))?;
+        let topic = self.topic(topic).await?;
         let backend = self.backends.resolve(&topic);
         let watched: Vec<TopicPartition> = partitions
             .iter()

@@ -186,6 +186,7 @@ members = [
     "gears/bss/products/products-sdk",
     "gears/bss/orders/orders",
     "gears/bss/orders/orders-sdk",
+    "gears/bss/orders/test-authz-plugin",
     "gears/bss/approvals/approvals",
     "gears/bss/approvals/approvals-sdk",
     "gears/bss/rate-provider/rate-provider-sdk",
@@ -347,11 +348,11 @@ verbose_file_reads = "deny"
 [workspace.dependencies]
 cel-core = "=0.5.1"
 quota-enforcement-engine-cel = { package = "cf-gears-quota-enforcement-engine-cel", version = "0.1.2", path = "gears/system/quota-enforcement/plugins/quota-enforcement-engine-cel" }
-apalis = { version = "=1.0.0-rc.10", default-features = false, features = ["tracing", "limit"] }
-apalis-core = "=1.0.0-rc.10"
+apalis = { version = "=1.0.0", default-features = false, features = ["tracing", "limit"] }
+apalis-core = "=1.0.0"
 # Keep SQLx runtime/TLS settings in the workspace. The adapter's default
 # tokio-comp feature enables rustls/ring alongside our aws-lc-rs provider.
-apalis-postgres = { version = "=1.0.0-rc.9", default-features = false, features = ["migrate"] }
+apalis-postgres = { version = "=1.0.0", default-features = false, features = ["migrate"] }
 # libs
 toolkit = { package = "cf-gears-toolkit", version = "0.12.0", path = "libs/toolkit" }
 toolkit-http = { package = "cf-gears-toolkit-http", version = "0.8.0", path = "libs/toolkit-http" }
@@ -468,6 +469,7 @@ bss-pricing = { package = "cf-gears-bss-pricing", path = "gears/bss/pricing/pric
 # not published either.
 bss-products-sdk = { package = "cf-gears-bss-products-sdk", path = "gears/bss/products/products-sdk" }
 bss-orders-sdk = { package = "cf-gears-bss-orders-sdk", path = "gears/bss/orders/orders-sdk" }
+bss-orders-test-authz-plugin = { package = "cf-gears-bss-orders-test-authz-plugin", version = "0.1.0", path = "gears/bss/orders/test-authz-plugin" }
 # The approvals inbox. Same WIP posture as pricing: no `version`, because neither
 # crate is a release artifact yet.
 bss-approvals-sdk = { package = "cf-gears-bss-approvals-sdk", path = "gears/bss/approvals/approvals-sdk" }
@@ -902,7 +904,7 @@ mime = "0.3"
 docx-rust = "0.1.11"
 # `bundled-pdfium` downloads a prebuilt libpdfium at build time rather than vendoring one;
 # Cargo.lock does not pin it. The version lives in .cargo/config.toml as PDFIUM_VERSION.
-kreuzberg = { version = "=4.9.8", features = ["html", "excel", "office", "pdf", "bundled-pdfium"] }
+kreuzberg = { version = "=4.10.4", features = ["html", "excel", "office", "pdf", "bundled-pdfium"] }
 # Content-based file type detection (ONNX model, embedded weights). Used
 # only by file-parser's optional `magika` feature.
 magika = "1.1"
@@ -929,11 +931,11 @@ temp-env = { version = "0.3", features = ["async_closure"] }
 wiremock = "0.6"
 
 # Additional utilities
-nanoid = "0.4"
+nanoid = "0.5"
 fnv = "1.0"
 
 # GTS dependencies
-jsonschema = { version = "0.40", default-features = false }
+jsonschema = { version = "0.60", default-features = false }
 walkdir = "2.5"
 
 # GTS library — published on crates.io.

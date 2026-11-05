@@ -177,31 +177,6 @@ pub async fn settle(
     }
 }
 
-/// The head of every partition of `spec`: from `Heads` where `appended`
-/// reported one, from `resolve(Latest)` otherwise.
-pub async fn heads_after(
-    backend: &dyn Backend,
-    spec: &TopicSpec,
-    appended: &Appended,
-) -> Vec<Sequence> {
-    let mut heads = Vec::new();
-    for partition in (0..spec.partitions).map(Partition::new) {
-        let at = TopicPartition::new(spec.topic.clone(), partition);
-        let reported = match appended {
-            Appended::Heads(heads) => heads.iter().find(|h| h.at == at).map(|h| h.sequence),
-            Appended::Accepted | Appended::Duplicate => None,
-        };
-        heads.push(match reported {
-            Some(head) => head,
-            None => backend
-                .resolve(&at, Position::Latest)
-                .await
-                .expect("resolve"),
-        });
-    }
-    heads
-}
-
 /// Everything stored in `at`, oldest first.
 pub async fn read_all(backend: &dyn Backend, at: &TopicPartition) -> Vec<Event> {
     let mut all = Vec::new();
