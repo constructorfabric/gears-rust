@@ -432,3 +432,67 @@ async fn long_gts_ids_keep_their_discriminating_tail() {
     assert_ne!(a, b);
     assert!(a.ends_with("first_v1_"), "{a}");
 }
+
+#[tokio::test]
+async fn gts_refs_inside_ref_siblings_are_inlined() {
+    let (source, resolver) = setup();
+    source.insert(WEATHER, json!({ "title": "base", "type": "object" }));
+    source.insert(
+        ADDRESS,
+        json!({ "type": "object", "properties": { "zip": { "type": "string" } } }),
+    );
+    let inline = json!({
+        "title": "get_weather",
+        "$ref": format!("gts://{WEATHER}"),
+        "properties": { "at": { "$ref": format!("gts://{ADDRESS}") } }
+    });
+
+    let got = resolver
+        .resolve(
+            &ctx(),
+            vec![tool(
+                json!({ "type": "inline_gts", "schema": { "json_schema": inline } }),
+            )],
+        )
+        .await
+        .expect("resolves");
+
+    let parameters = function_of(&got[0]).parameters.clone().expect("parameters");
+    assert_eq!(
+        parameters["title"],
+        json!("get_weather"),
+        "siblings still win"
+    );
+    assert_eq!(
+        parameters["properties"]["at"],
+        json!({ "type": "object", "properties": { "zip": { "type": "string" } } })
+    );
+}
+
+#[tokio::test]
+async fn ref_siblings_share_the_byte_budget() {
+    let source = FakeToolSchemas::new(Arc::new(CallLog::default()));
+    let resolver = ToolResolver::new(source.clone(), 200);
+    source.insert(WEATHER, json!({ "type": "object" }));
+    source.insert(
+        GEO,
+        json!({ "type": "object", "description": "x".repeat(300) }),
+    );
+    let inline = json!({
+        "title": "t",
+        "$ref": format!("gts://{WEATHER}"),
+        "properties": { "at": { "$ref": format!("gts://{GEO}") } }
+    });
+
+    let err = resolver
+        .resolve(
+            &ctx(),
+            vec![tool(
+                json!({ "type": "inline_gts", "schema": { "json_schema": inline } }),
+            )],
+        )
+        .await
+        .expect_err("budget exceeded through a sibling");
+
+    assert_validation(&err);
+}

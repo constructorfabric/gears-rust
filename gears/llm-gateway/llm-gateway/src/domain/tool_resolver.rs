@@ -223,8 +223,10 @@ impl ToolResolver {
                         object.remove("$ref");
                         return Ok(match expanded {
                             Value::Object(mut merged) => {
-                                // Sibling keywords of the `$ref` stay in force.
+                                // Sibling keywords of the `$ref` stay in force,
+                                // with their own `gts://` refs inlined too.
                                 for (key, value) in object {
+                                    let value = self.inline(ctx, session, value, stack).await?;
                                     merged.insert(key, value);
                                 }
                                 Value::Object(merged)
