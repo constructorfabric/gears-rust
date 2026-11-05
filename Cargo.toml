@@ -354,7 +354,7 @@ apalis-core = "=1.0.0"
 # tokio-comp feature enables rustls/ring alongside our aws-lc-rs provider.
 apalis-postgres = { version = "=1.0.0", default-features = false, features = ["migrate"] }
 # libs
-toolkit = { package = "cf-gears-toolkit", version = "0.12.0", path = "libs/toolkit" }
+toolkit = { package = "cf-gears-toolkit", version = "0.12.1", path = "libs/toolkit" }
 toolkit-http = { package = "cf-gears-toolkit-http", version = "0.8.0", path = "libs/toolkit-http" }
 toolkit-http-proxy = { package = "cf-gears-toolkit-http-proxy", version = "0.1.2", path = "libs/toolkit-http-proxy" }
 toolkit-trace-context = { package = "cf-gears-toolkit-trace-context", version = "0.3.0", path = "libs/toolkit-trace-context" }
@@ -366,11 +366,11 @@ toolkit-canonical-errors = { package = "cf-gears-toolkit-canonical-errors", vers
 toolkit-canonical-errors-macro = { package = "cf-gears-toolkit-canonical-errors-macro", version = "0.6.5", path = "libs/toolkit-canonical-errors-macro" }
 toolkit-db = { package = "cf-gears-toolkit-db", version = "0.17.2", path = "libs/toolkit-db" }
 toolkit-db-macros = { package = "cf-gears-toolkit-db-macros", version = "0.7.0", path = "libs/toolkit-db-macros" }
-toolkit-gts = { package = "cf-gears-toolkit-gts", version = "0.1.7", path = "libs/toolkit-gts" }
+toolkit-gts = { package = "cf-gears-toolkit-gts", version = "0.2.0", path = "libs/toolkit-gts" }
 # SQL/PGQ AST + renderer (docs/arch/secure-orm/ADR/0002). Security-agnostic:
 # toolkit-db owns the scope injection, this crate only knows the syntax.
 toolkit-sea-orm-pgq = { package = "cf-gears-toolkit-sea-orm-pgq", version = "0.2.0", path = "libs/toolkit-sea-orm-pgq" }
-toolkit-gts-macros = { package = "cf-gears-toolkit-gts-macros", version = "0.1.6", path = "libs/toolkit-gts-macros" }
+toolkit-gts-macros = { package = "cf-gears-toolkit-gts-macros", version = "0.2.0", path = "libs/toolkit-gts-macros" }
 toolkit-macros = { package = "cf-gears-toolkit-macros", version = "0.7.0", path = "libs/toolkit-macros" }
 toolkit-node-info = { package = "cf-gears-toolkit-node-info", version = "0.7.0", path = "libs/toolkit-node-info" }
 toolkit-odata = { package = "cf-gears-toolkit-odata", version = "0.10.1", path = "libs/toolkit-odata" }
@@ -419,7 +419,7 @@ usage-collector = { package = "cf-gears-usage-collector", version = "0.5.2", pat
 quota-enforcement = { package = "cf-gears-quota-enforcement", version = "0.3.0", path = "gears/system/quota-enforcement/quota-enforcement" }
 quota-enforcement-storage-plugin = { package = "cf-gears-quota-enforcement-storage-plugin", version = "0.3.0", path = "gears/system/quota-enforcement/plugins/quota-enforcement-storage-plugin" }
 cluster = { package = "cf-gears-cluster", version = "0.3.2", path = "gears/system/cluster/cluster" }
-api-gateway = { package = "cf-gears-api-gateway", version = "0.7.0", path = "gears/system/api-gateway" }
+api-gateway = { package = "cf-gears-api-gateway", version = "0.7.1", path = "gears/system/api-gateway" }
 # Concrete plugins needed to link a standalone-mode binary.
 static-authn-plugin = { package = "cf-gears-static-authn-plugin", version = "0.3.21", path = "gears/system/authn-resolver/plugins/static-authn-plugin" }
 static-authz-plugin = { package = "cf-gears-static-authz-plugin", version = "0.1.41", path = "gears/system/authz-resolver/plugins/static-authz-plugin" }

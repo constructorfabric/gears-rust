@@ -49,8 +49,7 @@ Run the macro and merge tests with:
 cargo test -p cf-gears-toolkit-gts-macros -p cf-gears-toolkit-gts
 ```
 
-The release/fat-LTO check is opt-in because it builds the fixture example in a
-separate target directory:
+CI runs release/fat-LTO through `make test-macros`. For an explicit local run:
 
 ```sh
 cargo test -p cf-gears-toolkit-gts-macros --test release_lto -- --ignored

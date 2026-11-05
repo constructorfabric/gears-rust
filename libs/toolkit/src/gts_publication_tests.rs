@@ -201,6 +201,23 @@ fn a_bad_configuration_fails_the_manifest() {
     assert!(format!("{err:#}").contains("widgets"), "{err:#}");
 }
 
+#[test]
+fn a_collector_failure_is_a_manifest_error_naming_the_publisher() {
+    fn declarations() -> Vec<DeclarationSource> {
+        panic!("use toolkit_gts::local for gts.cf.test.publication.widget.v1~");
+    }
+    let descriptor = GtsPublicationDescriptor {
+        gear: "broken-collector",
+        declarations,
+        ..NOTHING
+    };
+    let error = descriptor.build_gts_manifest(&Config(None)).unwrap_err();
+    let message = format!("{error:#}");
+    assert!(message.contains("broken-collector"), "{message}");
+    assert!(message.contains("toolkit_gts::local"), "{message}");
+    assert!(message.contains(WIDGET), "{message}");
+}
+
 fn hub_with(registry: &Arc<FakeRegistry>) -> Arc<ClientHub> {
     let hub = Arc::new(ClientHub::new());
     hub.register::<FakeRegistry>(Arc::clone(registry));

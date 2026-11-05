@@ -2156,3 +2156,98 @@ async fn the_gateway_starts_with_the_complete_prefixed_surface() {
         .await
         .unwrap();
 }
+
+/// Platform calls work before `AuthN` init; tenant calls wait for the final router.
+#[tokio::test]
+async fn bootstrap_listener_serves_probes_and_platform_then_switches_to_tenant_routes() {
+    use toolkit::contracts::RunnableCapability as _;
+    let mut config = axis_config(true);
+    config["bind_addr"] = json!("127.0.0.1:0");
+    config["prefix_path"] = json!("/cf");
+    let hub = Arc::new(ClientHub::new());
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let ctx = GearCtx::new(
+        "api-gateway",
+        Uuid::new_v4(),
+        Arc::new(TestConfigProvider {
+            config: json!({"api-gateway": {"config": config}}),
+        }),
+        Arc::clone(&hub),
+        cancel.clone(),
+    );
+    let checker = Arc::new(toolkit::DependencyChecker::new());
+    checker.register_dep(toolkit::runtime::PREPARATION_GATE);
+    let health = Arc::new(toolkit::RestHealthcheckRegistry::new());
+    health.register(
+        "readiness",
+        Arc::new(toolkit::runtime::ReadinessHealthcheck::new(Arc::clone(
+            &checker,
+        ))),
+    );
+    let gateway = api_gateway::ApiGateway::default();
+    let base = gateway
+        .rest_bootstrap(&ctx, Arc::clone(&health), cancel.clone())
+        .await
+        .unwrap()
+        .expect("the gateway binds before application init");
+    let endpoint = gateway.bound_endpoint().expect("listener already bound");
+    assert_eq!(listener_status(&endpoint, "/cf/healthz", &[]).await, 200);
+    assert_eq!(listener_status(&endpoint, "/cf/readyz", &[]).await, 503);
+    let routes = TestAxisGear
+        .register_rest(&create_test_gear_ctx(), base, &gateway)
+        .unwrap();
+    gateway
+        .rest_finalize_bootstrap(&ctx, routes.clone(), Arc::clone(&health))
+        .unwrap();
+    let platform = [(AXIS_INTERNAL_HEADER, AXIS_INTERNAL_SECRET)];
+    assert_eq!(
+        listener_status(&endpoint, &format!("/cf{AXIS_PLATFORM_PATH}"), &platform).await,
+        200
+    );
+    assert_eq!(
+        listener_status(&endpoint, &format!("/cf{AXIS_PLATFORM_PATH}"), &[]).await,
+        401
+    );
+    assert_eq!(
+        listener_status(&endpoint, &format!("/cf{AXIS_PATH}"), &[]).await,
+        503
+    );
+
+    hub.register::<dyn AuthNResolverClient>(Arc::new(mock_accepting_token(
+        AXIS_BEARER,
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+    )));
+    gateway.init(&ctx).await.unwrap();
+    drop(gateway.rest_finalize(&ctx, routes, health).unwrap());
+    let gear = gateway.into_gear();
+    gear.start(cancel.clone()).await.unwrap();
+    checker.mark_resolved(toolkit::runtime::PREPARATION_GATE);
+    let bearer = format!("Bearer {AXIS_BEARER}");
+    assert_eq!(
+        listener_status(
+            &endpoint,
+            &format!("/cf{AXIS_PATH}"),
+            &[("authorization", &bearer)]
+        )
+        .await,
+        200
+    );
+    assert_eq!(
+        listener_status(&endpoint, &format!("/cf{AXIS_PATH}"), &[]).await,
+        401
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while listener_status(&endpoint, "/cf/readyz", &[]).await != 200 {
+            // The framework caches health reports for two seconds.
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("readiness converges after the cached report expires");
+    assert_eq!(gear.inner().bound_endpoint().as_ref(), Some(&endpoint));
+    cancel.cancel();
+    gear.stop(tokio_util::sync::CancellationToken::new())
+        .await
+        .unwrap();
+}

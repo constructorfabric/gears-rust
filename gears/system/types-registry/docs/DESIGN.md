@@ -1802,9 +1802,13 @@ Content duplicates across Context Tenants even when only availability and owners
 
 - [ ] `p2` - **ID**: `cpt-cf-types-registry-tech-inventory-registration`
 
-Declaring crates expose `gts_declarations()` through `declare_gts_inventory!()`. The owning gear lists them in `#[toolkit::gear(…, gts_publication(crates = [crate, some_sdk]))]`; optional config-only `entities` adds configured documents. The default `types_registry_sdk::publication` adapter owns reconciliation and retries. Linking a crate alone does not publish its declarations.
+Declaring crates call `declare_gts_inventory!()` and use `toolkit_gts::local::*`. Each owning gear lists its crates in `gts_publication(crates = [crate, some_sdk])`; optional `entities` adds configured documents. A listed collector rejects leftover root-macro declarations rather than omitting them. Legacy crates may keep root macros. Linking alone publishes nothing; `types_registry_sdk::publication` owns reconciliation and retries.
 
-The system gear group (registry, discovery, cluster and gRPC hub — the only gears with the `system` capability) starts serving first. After application DB migrations and client wiring, the runtime publishes application gears’ GTS Type Schemas and Instances concurrently, before any application `init`. Pending admission holds `application/preparation` and `/readyz`; a terminal refusal fails application preparation. Plugins bind their clients in `init` using their declared instances after admission. Publication is not a lifecycle hook: the general `Gear::pre_init`/`post_init` hooks run per gear within its startup group and must not wait for a remote service. Business bootstrap still runs in `serve`; a separate business-availability gate is future work (#5547, #5562). The in-process API Gateway starts with the application gear group and serves the complete router. Child executables spawn only after parent startup and REST provider registration; the parent must not depend on a child for its registry or prerequisite GTS types.
+Both hosts bind probes early, then serve system platform/anonymous routes before application preparation; tenant calls return `503` until AuthN and application routes are ready. System providers honor their advertisement opt-out. Configure `grpc_service_owners` to protect embedded application and remote names before registration; unconfigured names retain first-registration ownership until application installers are collected.
+
+After application migrations and registry-client wiring, manifests publish concurrently. Admission gates every application `init`; refusal or expiry stops started gears and returns an error for supervisor restart. Plugins bind admitted instances in `init`. Per-gear lifecycle hooks must not wait for remote services. Business bootstrap remains in `serve`; its availability gate is future work (#5547, #5562). Children spawn after parent startup and advertisement; parent publication cannot depend on an unstarted child registry unless a local provider or explicit external endpoint satisfies it.
+
+The barrier simplifies plugin binding but lets one publisher delay all application initialization. [ADR-0005](../../../../docs/arch/toolkit-oop/ADR/0005-cpt-cf-adr-eventual-readiness.md) records this change from background publication. Directory registration and business readiness remain independent.
 
 **Stateless services** reconcile on every publication: read current entities, compare authored content, submit missing/changed documents with observed versions, and poll admission. Retryable failures retain operation identity while polling; rejection is not success. `cf-gears-example-server publish-gts` publishes the same GTS Type Schemas and Instances as a deployment step without starting gears.
 
@@ -1836,8 +1840,9 @@ Registry and DB available → migrate → publish-gts → Roll out application p
   without running their lifecycle, under one absolute job deadline passed to every publisher.
   SDK retries do not renew it. It requires a platform credential and exits unsuccessfully
   on refusal or timeout. Success means admission, not just request acceptance.
-- Ordinary startup uses one 120-second publication budget; exhaustion leaves applications uninitialized.
-- The job and application must use the same image and effective publication configuration.
+- Startup uses a 120-second publication budget; failure exits after cleanup without initializing applications.
+- Job and pods use the same image, publication validation and per-publisher transport settings. `--registry` replaces only the endpoint; required TLS is checked before wiring.
+- Timeout/cancellation reports retain errors and pending details; fallback manifest IDs are explicitly unconfirmed.
 
 **Helm:** a `pre-install,pre-upgrade` Job can run these commands sequentially. Registry, DB
 and job configuration/credentials must already be available. A registry created as a regular
@@ -1848,7 +1853,8 @@ See [Helm hook ordering](https://docs.helm.sh/docs/topics/charts_hooks/).
 
 During upgrade, old pods still run while the job prepares the new release. DB and GTS changes
 must support both versions during rollout. Hook failure or Helm rollback does not undo completed
-migrations or partial GTS admission; preparation must be safe to retry.
+migrations or partial GTS admission. Ordinary startup has the same risk: migrations precede publication.
+Use retryable preparation and expand/contract migrations compatible with old and new pods.
 
 **Planned deployment-managed mode (not implemented):** the job owns migrations and publication;
 pods verify the required DB schema and GTS state before application `init`, without performing

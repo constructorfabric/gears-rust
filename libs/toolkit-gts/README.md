@@ -123,6 +123,9 @@ crate-root macros keep their process-wide-only behaviour; crates that do not opt
 change. A `local` macro without the declaration fails to compile ("could not find
 `__toolkit_gts_inventory` in the crate root").
 
+Published crates must use `local` macros throughout. Otherwise `gts_declarations()` panics
+with the omitted IDs and migration hint. Other crates' global declarations are unaffected.
+
 ## Boundary with `types-registry`
 
 - `types-registry` is a **content-agnostic** aggregator. It calls `all_inventory_type_schemas()` / `all_inventory_instances()` and registers whatever it finds. It never names specific types, so adding a new GTS Type requires zero edits in `types-registry`.

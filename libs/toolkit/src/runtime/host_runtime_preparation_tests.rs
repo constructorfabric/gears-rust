@@ -10,7 +10,6 @@ use async_trait::async_trait;
 use parking_lot::Mutex;
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
-use tracing::Instrument as _;
 use uuid::Uuid;
 
 use super::{DbOptions, HostRuntime};
@@ -31,6 +30,7 @@ pub(super) enum Answer {
     /// Pending until notified, then admitted.
     HoldUntil(Arc<Notify>),
     Refuse,
+    Expire,
 }
 
 /// A hub-registered fake registry, answering per publisher name.
@@ -105,6 +105,7 @@ fn fake_backend(hub: &ClientHub) -> anyhow::Result<GtsPublicationBackend> {
                         Ok(())
                     }
                     Answer::Refuse => anyhow::bail!("rejected"),
+                    Answer::Expire => Err(crate::gts_publication::GtsPublicationExpired.into()),
                 }
             }
         },
@@ -449,57 +450,41 @@ async fn a_pending_publication_holds_back_the_whole_application_group() {
     );
 }
 
-/// A refused publication fails the application group: no application gear is
-/// initialized, started or stopped, the refusal is not retried, and the
-/// system group keeps running until shutdown.
+/// Refusal/expiry stops infrastructure and returns without a shutdown signal.
 #[tokio::test]
-#[tracing_test::traced_test]
-async fn a_refused_publication_fails_the_application_group_only() {
-    let events: Events = Arc::default();
-    let mut builder = RegistryBuilder::default();
-    register(&mut builder, PubGear::system_gear("registry", &events));
-    register(&mut builder, PubGear::new("a", Some(&PUB_A), &events));
-    register(&mut builder, PubGear::new("c", None, &events));
-    let fake = FakeRegistry::with(&[("a", Answer::Refuse)]);
-    let cancel = CancellationToken::new();
-    let mut runtime = runtime(builder.build_topo_sorted().unwrap(), &fake, &cancel);
-    let checker = Arc::clone(&runtime.dep_checker);
-    let backend = Arc::new(FakeBackend::default());
-    runtime.oop_options = Some(children(&backend));
-    let running = tokio::spawn(runtime.run_gear_phases().in_current_span());
-    until("the terminal refusal to be reported", || {
-        logs_contain("the application group did not start")
-    })
-    .await;
-    tokio::time::sleep(Duration::from_millis(20)).await;
-    assert!(!running.is_finished(), "the process keeps running");
-    assert_eq!(
-        checker.unresolved_deps(),
-        [crate::runtime::PREPARATION_GATE]
-    );
-    let sent_seen = { fake.sent.lock().clone() };
-    assert_eq!(sent_seen, ["a"], "not retried");
-    assert!(has(&events, "start:registry"));
-
-    cancel.cancel();
-    let err = running.await.unwrap().unwrap_err();
-    let message = format!("{err:#}");
-    assert!(
-        message.contains("the application group did not start")
-            && message.contains("GTS publication refused"),
-        "the run reports the failed group after shutdown: {message}"
-    );
-    assert!(
-        any_app_event(&events, &["a", "c"]).is_empty(),
-        "{:?}",
-        events.lock()
-    );
-    assert!(has(&events, "stop:registry"));
-    let spawned = backend.spawned.lock().clone();
-    assert!(
-        spawned.is_empty(),
-        "a refused publication spawns no children"
-    );
+async fn failed_publication_stops_the_process_without_a_shutdown_signal() {
+    for answer in [Answer::Refuse, Answer::Expire] {
+        let events: Events = Arc::default();
+        let mut builder = RegistryBuilder::default();
+        register(&mut builder, PubGear::system_gear("registry", &events));
+        register(&mut builder, PubGear::new("a", Some(&PUB_A), &events));
+        register(&mut builder, PubGear::new("c", None, &events));
+        let fake = FakeRegistry::with(&[("a", answer)]);
+        let cancel = CancellationToken::new();
+        let runtime = runtime(builder.build_topo_sorted().unwrap(), &fake, &cancel);
+        let checker = Arc::clone(&runtime.dep_checker);
+        let mut running = tokio::spawn(runtime.run_gear_phases());
+        let outcome = tokio::time::timeout(Duration::from_secs(1), &mut running).await;
+        if outcome.is_err() {
+            cancel.cancel();
+            drop(running.await);
+            panic!("failed publication waited for an external shutdown signal");
+        }
+        let failure = outcome.unwrap().unwrap().unwrap_err();
+        assert!(format!("{failure:#}").contains("the application group did not start"));
+        assert!(
+            !cancel.is_cancelled(),
+            "caller retains ownership of shutdown"
+        );
+        assert_eq!(
+            checker.unresolved_deps(),
+            [crate::runtime::PREPARATION_GATE]
+        );
+        assert_eq!(*fake.sent.lock(), ["a"]);
+        assert!(has(&events, "start:registry"));
+        assert!(has(&events, "stop:registry"));
+        assert!(any_app_event(&events, &["a", "c"]).is_empty());
+    }
 }
 
 /// A startup failing in a later start stops what started — the
@@ -2072,4 +2057,228 @@ async fn a_late_grpc_batch_waits_for_a_hub_not_started_yet() {
     assert_eq!(started.elapsed(), Duration::ZERO);
     let batch = runtime.grpc_installers.next_late().await;
     assert!(batch.is_some(), "queued for the hub's start");
+}
+
+/// Reject parent publication through a child that starts only after preparation.
+#[tokio::test]
+async fn publication_to_an_unstarted_child_registry_is_rejected_before_hooks() {
+    let events = Events::default();
+    let mut builder = RegistryBuilder::default();
+    register(&mut builder, PubGear::new("a", Some(&PUB_A), &events));
+    let mut runtime = runtime_with_hub(
+        builder.build_topo_sorted().unwrap(),
+        Arc::new(ClientHub::new()),
+        &CancellationToken::new(),
+    );
+    runtime.oop_options = Some(crate::runtime::OopSpawnOptions {
+        gears: vec![child("fake-registry")],
+        backend: Box::new(Arc::new(FakeBackend::default())),
+    });
+    let manifests = runtime.build_gts_manifests().unwrap();
+
+    let error = runtime.check_wiring_groups(&manifests, &[]).unwrap_err();
+
+    let message = chain(&error);
+    assert!(
+        message.contains("fake-registry") && message.contains("child"),
+        "{message}"
+    );
+    assert!(events.lock().is_empty(), "no lifecycle hook ran");
+}
+
+/// Merely naming a child does not create a cycle when there is no publication.
+#[tokio::test]
+async fn an_empty_publication_can_name_a_child_registry() {
+    let mut builder = RegistryBuilder::default();
+    register(
+        &mut builder,
+        PubGear::new("nil", Some(&PUB_NIL), &Events::default()),
+    );
+    let mut runtime = runtime_with_hub(
+        builder.build_topo_sorted().unwrap(),
+        Arc::new(ClientHub::new()),
+        &CancellationToken::new(),
+    );
+    runtime.oop_options = Some(crate::runtime::OopSpawnOptions {
+        gears: vec![child("fake-registry")],
+        backend: Box::new(Arc::new(FakeBackend::default())),
+    });
+
+    let manifests = runtime.build_gts_manifests().unwrap();
+    runtime.check_wiring_groups(&manifests, &[]).unwrap();
+}
+
+/// Service construction requires application init.
+#[derive(Default)]
+struct InitBoundGrpcService(std::sync::atomic::AtomicBool);
+
+#[async_trait]
+impl Gear for InitBoundGrpcService {
+    async fn init(&self, _ctx: &GearCtx) -> anyhow::Result<()> {
+        self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl crate::contracts::GrpcServiceCapability for InitBoundGrpcService {
+    async fn get_grpc_services(
+        &self,
+        _ctx: &GearCtx,
+    ) -> anyhow::Result<Vec<crate::contracts::RegisterGrpcServiceFn>> {
+        anyhow::ensure!(
+            self.0.load(std::sync::atomic::Ordering::SeqCst),
+            "application not initialized"
+        );
+        Ok(vec![crate::contracts::RegisterGrpcServiceFn {
+            service_name: "test.InitBound",
+            #[cfg(feature = "otel")]
+            register: Box::new(|_| {}),
+        }])
+    }
+}
+
+/// Configured ownership protects names before application installers exist.
+#[tokio::test]
+async fn configured_ownership_protects_application_grpc_names_during_preparation() {
+    use crate::runtime::gear_manager::{Endpoint, GearInstance};
+
+    let mut builder = RegistryBuilder::default();
+    register(
+        &mut builder,
+        PubGear::system_gear("hub", &Events::default()),
+    );
+    builder.register_grpc_hub_with_meta("hub", Arc::new(LateHub));
+    let service = Arc::new(InitBoundGrpcService::default());
+    builder.register_core_with_meta("app-service", &[], service.clone() as Arc<dyn Gear>);
+    builder.register_grpc_service_with_meta("app-service", service.clone());
+    let runtime = runtime_with_hub(
+        builder.build_topo_sorted().unwrap(),
+        Arc::new(ClientHub::new()),
+        &CancellationToken::new(),
+    );
+    runtime
+        .gear_manager
+        .set_grpc_service_owners(HashMap::from([(
+            "test.InitBound".to_owned(),
+            "app-service".to_owned(),
+        )]));
+    let mut seen = HashSet::new();
+    runtime.run_grpc_initial_phase(&mut seen).await.unwrap();
+    assert!(!service.0.load(std::sync::atomic::Ordering::SeqCst));
+
+    let peer = Arc::new(
+        GearInstance::new("peer", Uuid::new_v4())
+            .with_grpc_service("test.InitBound", Endpoint::http("127.0.0.1", 9001)),
+    );
+    assert!(
+        runtime.gear_manager.register_instance(peer).is_err(),
+        "configured application ownership is enforced before application init"
+    );
+
+    runtime
+        .run_init_phase_for(&runtime.group(false))
+        .await
+        .unwrap();
+    runtime
+        .collect_grpc_installers(false, &mut seen)
+        .await
+        .unwrap();
+    let owner = Arc::new(
+        GearInstance::new("app-service", Uuid::new_v4())
+            .with_grpc_service("test.InitBound", Endpoint::http("127.0.0.1", 9000)),
+    );
+    runtime
+        .gear_manager
+        .register_instance(owner)
+        .expect("the real owner is not blocked by a stale peer");
+}
+
+/// A legacy-only local provider cannot hide a child-registry publication cycle.
+#[tokio::test]
+async fn a_local_legacy_registry_does_not_hide_a_child_publication_cycle() {
+    struct LegacyRegistry;
+    #[async_trait]
+    impl Gear for LegacyRegistry {
+        async fn init(&self, _ctx: &GearCtx) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+    impl SystemCapability for LegacyRegistry {}
+    impl crate::contracts::RestApiCapability for LegacyRegistry {
+        fn advertised_in_directory(&self) -> bool {
+            false
+        }
+        fn register_rest(
+            &self,
+            _ctx: &GearCtx,
+            router: axum::Router,
+            _openapi: &dyn crate::contracts::OpenApiRegistry,
+        ) -> anyhow::Result<axum::Router> {
+            Ok(router)
+        }
+    }
+    static REMOTE: GtsPublicationDescriptor = GtsPublicationDescriptor {
+        wire: |_, _, _| Ok(crate::discovery::WireOutcome::Remote),
+        ..PUB_A
+    };
+    let mut builder = RegistryBuilder::default();
+    register(
+        &mut builder,
+        PubGear::new("a", Some(&REMOTE), &Events::default()),
+    );
+    let legacy = Arc::new(LegacyRegistry);
+    builder.register_core_with_meta("fake-registry", &[], legacy.clone());
+    builder.register_system_with_meta("fake-registry", legacy.clone());
+    builder.register_rest_with_meta("fake-registry", legacy);
+    let mut runtime = runtime_with_hub(
+        builder.build_topo_sorted().unwrap(),
+        Arc::new(ClientHub::new()),
+        &CancellationToken::new(),
+    );
+    runtime.oop_options = Some(crate::runtime::OopSpawnOptions {
+        gears: vec![child("fake-registry")],
+        backend: Box::new(Arc::new(FakeBackend::default())),
+    });
+    let manifests = runtime.build_gts_manifests().unwrap();
+    runtime.check_wiring_groups(&manifests, &[]).unwrap();
+
+    let error = runtime
+        .wire_registry_clients_over(&manifests, &[])
+        .unwrap_err();
+
+    assert!(chain(&error).contains("child 'fake-registry'"));
+}
+
+#[tokio::test]
+async fn an_external_registry_endpoint_does_not_depend_on_a_same_name_child() {
+    struct ExternalConfig(serde_json::Value);
+    impl ConfigProvider for ExternalConfig {
+        fn get_gear_config(&self, name: &str) -> Option<&serde_json::Value> {
+            self.0.get(name)
+        }
+    }
+    let mut builder = RegistryBuilder::default();
+    register(
+        &mut builder,
+        PubGear::new("a", Some(&PUB_A), &Events::default()),
+    );
+    let runtime = HostRuntime::new(
+        builder.build_topo_sorted().unwrap(),
+        Arc::new(ExternalConfig(serde_json::json!({
+            "a": {"config": {"consumer_wiring": {
+                "fake-registry": {"endpoint": "https://external-registry.example:8443"}
+            }}}
+        }))),
+        DbOptions::None,
+        Arc::new(ClientHub::new()),
+        CancellationToken::new(),
+        Uuid::new_v4(),
+        Some(crate::runtime::OopSpawnOptions {
+            gears: vec![child("fake-registry")],
+            backend: Box::new(Arc::new(FakeBackend::default())),
+        }),
+    );
+    let manifests = runtime.build_gts_manifests().unwrap();
+    runtime.check_wiring_groups(&manifests, &[]).unwrap();
 }

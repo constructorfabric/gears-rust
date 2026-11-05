@@ -12,7 +12,7 @@ pub use crate::api::openapi_registry::OpenApiRegistry;
 /// or depend on/consume local application gears. Early `OoP` HTTP routes allow
 /// only platform-plane and anonymous calls; tenant auth is not wired yet.
 ///
-/// The in-process REST host starts in the application group with the full router.
+/// Embedded hosts serve probes and system platform routes before application startup.
 /// Lifecycle hooks live on [`Gear`]; this trait receives runtime internals.
 #[async_trait]
 pub trait SystemCapability: Send + Sync {
@@ -124,10 +124,39 @@ pub trait RestApiCapability: Send + Sync {
     }
 }
 
-/// API Gateway capability: handles gateway hosting with prepare/finalize phases.
-/// Must be sync. Runs during REST phase, but doesn't start the server.
+/// REST hosting with optional early probes and system routes during preparation.
 #[allow(dead_code)]
+#[async_trait]
 pub trait ApiGatewayCapability: Send + Sync + 'static {
+    /// Bind probes without application clients; return a prepared router for staged hosting.
+    /// System routes attach first, then application routes. Stop on `cancel`, even if init fails.
+    async fn rest_bootstrap(
+        &self,
+        _ctx: &crate::context::GearCtx,
+        _hc_registry: std::sync::Arc<crate::healthcheck::RestHealthcheckRegistry>,
+        _cancel: CancellationToken,
+    ) -> anyhow::Result<Option<Router>> {
+        Ok(None)
+    }
+
+    /// Serve system routes during admission; reject tenant calls until `AuthN` is ready.
+    ///
+    /// # Errors
+    /// Staged serving is unsupported or composition fails.
+    fn rest_finalize_bootstrap(
+        &self,
+        _ctx: &crate::context::GearCtx,
+        _router: Router,
+        _hc_registry: std::sync::Arc<crate::healthcheck::RestHealthcheckRegistry>,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("this REST host does not support staged serving")
+    }
+
+    /// Join a bootstrap listener whose application lifecycle never started.
+    async fn rest_shutdown_bootstrap(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     /// Prepare a base Router (e.g., global middlewares) and optionally touch `OpenAPI` meta.
     /// Do NOT start the server here. `hc_registry` is the runtime's shared healthcheck
     /// registry, passed explicitly (not via `ClientHub`, which is for inter-gear clients).

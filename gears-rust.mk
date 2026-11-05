@@ -380,6 +380,7 @@ test-macros: install-tools
 	$(call print_target_banner)
 	$(call nextest_run,macros-db,-p cf-gears-toolkit-db-macros)
 	$(call nextest_run,macros-toolkit,-p cf-gears-toolkit-macros-tests)
+	$(call nextest_run,macros-gts-lto,-p cf-gears-toolkit-gts-macros --test release_lto --run-ignored ignored-only)
 
 ## Run the graph-storage gear's database-free suites
 ## Unit tests, the in-memory conformance lane, the domain-service and REST

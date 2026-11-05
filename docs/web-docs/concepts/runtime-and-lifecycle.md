@@ -33,8 +33,8 @@ The `system` capability means:
 1. **Early startup.** The system gear group's lifecycle completes before application
    preparation begins. Hooks run in dependency order within the group.
 2. **Availability during GTS admission.** Gears in this group remain running while
-   application publications await admission, including after refusal or expiry,
-   until shutdown. Application readiness remains blocked.
+   application publications await admission. Refusal or expiry stops the process
+   after cleanup, allowing its supervisor to restart it.
 3. **Dependency restrictions.** A gear in this group cannot declare `deps` or `consumes`
    on an application gear in the same process.
 4. **No managed GTS publication.** A gear in this group cannot declare
@@ -82,7 +82,8 @@ application gear group: pre_init → DB migration → GTS publication (admission
 - **`OoP spawn`** — out-of-process gears are spawned after the parent has completed
   application startup and advertised its REST endpoints. Parent GTS publication must use
   a local or already available external registry and must not depend on its children.
-  The API gateway starts in the application gear group, once, with the complete router.
+  The API Gateway serves probes and system platform routes during preparation, then
+  the full authenticated API on the same listener after application initialization.
 - **Wait for cancellation** — the runtime blocks until a cancellation signal is received
   (Ctrl-C, SIGTERM, or programmatic).
 - **`stop`** — shutdown runs in **reverse dependency order** with a platform deadline.

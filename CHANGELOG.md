@@ -9,6 +9,17 @@ release-plz updates this file in the Release PR.
 
 ## [Unreleased]
 
+### Fixed
+
+- Failed GTS publication stops the process for supervisor restart. Embedded gateways serve probes and system platform routes during admission.
+- Deployment publication honors per-publisher transport settings, validates configuration and preserves failure details.
+- Legacy-only registries stay out of discovery; parent publication cannot depend on an unstarted child registry.
+- Collectors reject omitted root-macro declarations. CI covers the real publication chain and release/LTO.
+
+### Breaking
+
+- Upgrade `toolkit-gts` and `toolkit-gts-macros` together to 0.2. Published crates must call `declare_gts_inventory!()` and use `toolkit_gts::local::*`; legacy crates may keep root macros.
+
 ## [0.1.13](https://github.com/constructorfabric/gears-rust/compare/cf-gears-model-registry-sdk-v0.1.12...cf-gears-model-registry-sdk-v0.1.13) - 2026-10-30
 
 ### Other
