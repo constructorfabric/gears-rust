@@ -1159,7 +1159,7 @@ pub enum QuotaCall {
     /// `acquire_lease`.
     Acquire {
         subject: Uuid,
-        request: AcquireLeaseRequest,
+        request: Box<AcquireLeaseRequest>,
     },
     /// `commit_lease`.
     Commit {
@@ -1278,7 +1278,7 @@ impl FakeQuota {
         self.calls()
             .into_iter()
             .filter_map(|c| match c {
-                QuotaCall::Acquire { subject, request } => Some((subject, request)),
+                QuotaCall::Acquire { subject, request } => Some((subject, *request)),
                 _ => None,
             })
             .collect()
@@ -1403,7 +1403,7 @@ impl QuotaEnforcementClientV1 for FakeQuota {
         let ttl = request.ttl_secs.unwrap_or(0);
         self.calls.lock().expect("calls").push(QuotaCall::Acquire {
             subject: ctx.subject_id(),
-            request,
+            request: Box::new(request),
         });
         if self.park_acquire.load(Ordering::SeqCst) {
             self.acquire_entered.notify_one();
