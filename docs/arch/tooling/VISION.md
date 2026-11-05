@@ -65,7 +65,7 @@ This document uses these terms with one meaning each.
 | **profile** | A named preset of conventions. A convenient starting selection, not a separate product. |
 | **bot** | An automation that runs the tool without attention and then delivers the result, usually as a pull request. The integrating project selects it and runs it. |
 | **update wiring** | The files in a repository that let a bot drive the tool: the scheduled job, the pull-request check, and the updater configuration for the pins. |
-| **drift** | The repository no longer agrees with the conventions that it follows. |
+| **drift** | The repository no longer agrees with the conventions it declared, at the versions it pinned. A pin that upstream has moved past is not drift. |
 
 Reference, generate and copy are an order of preference, best first. A reference leaves no copy to
 drift. A generated file repairs itself on the next run. A copy is the last resort, and on upgrade the
@@ -174,11 +174,12 @@ A month later a convention moves upstream. The scheduled job runs the update, an
 arrives changing four pins and two managed files. The diff is small, the reasoning is in the report,
 and it merges.
 
-The next upgrade is not like that. The new version of the build rules renames a target, and the
-project's own make file still calls the old name. The pins move and the managed files are replaced,
-but that file belongs to the project, and the tool does not edit it. So the update stops, names the
-one change the project has to make, and leaves the repository as it was. Somebody makes it
-deliberately, and the check confirms conformance again.
+The next upgrade is not like that. The new version of the build rules renames a target that the
+project's own make file calls. Working out the upgrade, the tool sees that completing it would mean
+editing that file — and that file belongs to the project. So it does not apply the upgrade. It
+reports which conventions it could not advance and the one change the project has to make first,
+and it does not claim an upgrade that did not happen. Somebody makes that change deliberately, the
+upgrade then applies, and the check confirms conformance again.
 
 That arc — **set up, check, update, check again** — is the product. The first step happens once; the
 rest repeat for the life of the repository, and the last is what makes the third safe.
@@ -209,10 +210,12 @@ A reference trades one failure for a smaller one: its content can no longer be w
 fail to resolve, and then nothing works and the cause is far away — P5 records a submodule that
 stopped `cfs` with an unclear error. An unresolved reference is therefore checked, not assumed.
 
-**It judges the repository against the maintainer's choice, not against `gears-rust`.** The
-conventions are a menu: document-first development, descriptor coverage, crate layering, FIPS and
-the full CI pipeline are each a separate choice, and a project that builds applications needs a
-different set from one that publishes gears. A project that never took a convention is in a correct,
+**It judges the repository against the maintainer's choice, at the versions that choice pinned.**
+The conventions are a menu: document-first development, descriptor coverage, crate layering, FIPS
+and the full CI pipeline are each a separate choice, and a project that builds applications needs a
+different set from one that publishes gears. A repository on version 1.2 while upstream ships 1.3 is
+conformant, not drifting — a newer release is the update loop's business, and the two answers are
+never merged into one verdict. A project that never took a convention is in a correct,
 declared state; one that took it and drifted away has failed. Only the second is an error, so the
 report shows what the project did not choose beside what passed — otherwise a project following
 almost nothing reads as perfect.
@@ -242,7 +245,7 @@ declared there are five distinct states, and only the last is good news:
 
 - the convention is declared;
 - its reference resolves;
-- its own configuration is intact — the managed file is unmodified, the pin is current;
+- its configuration is intact — the declared pin resolves, and managed content matches that pin;
 - the check that enforces it is wired and ran;
 - that check passed.
 
@@ -270,9 +273,9 @@ small set of files that cannot be referenced is replaced whole under a version c
 What makes an upgrade exceptional is where its effect lands, not how large it is. One that stays
 inside referenced or managed content is routine. One that reaches **project-owned content** is not:
 a renamed build target the project's own make file calls, a setting the project customised, a
-contract change its code depends on. The tool does not edit what the project owns, so those stop,
-name what the project has to change, and leave the repository as it was — never half-upgraded with
-no account of what happened.
+contract change its code depends on. The tool does not edit what the project owns, so it does not
+apply those upgrades: it names what the project has to change first, and reports them as not
+applied. A repository is never left partly upgraded with no account of what happened.
 
 One model is rejected outright: a **three-way merge of upstream changes into a managed file that the
 project edited**. Section 5 gives the reason — that merge fails quietly, producing no conflict
@@ -322,7 +325,7 @@ Each promise is bounded by what the tool actually controls.
 |---|---|---|
 | **Setup** | The selected conventions and their wiring are in place, each with a pin, and anything missing is named | A green build. That needs tools installed, services configured and code written |
 | **Validation** | A truthful answer within its footprint, with the five states above kept apart and every gap in its own knowledge visible | That the repository is good — only that it is, or is not, what the project said it would be |
-| **Update** | Pins and managed files move reproducibly, and an upgrade that cannot be applied stops and says why | That every upstream change applies by itself, or that anything delivers it |
+| **Update** | Pins and managed files move reproducibly; an upgrade it cannot apply is reported as not applied, with the reason | That every upstream change applies by itself, or that anything delivers it |
 
 Three safety expectations hold across all three. Conventions resolve only from sources the project
 declared, so an upgrade cannot quietly start following somebody else's. Resolution is reproducible,
