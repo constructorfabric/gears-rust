@@ -3435,7 +3435,6 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.21",
  "time",
- "tokio",
  "utoipa",
  "uuid",
 ]
@@ -4056,7 +4055,6 @@ dependencies = [
  "sea-orm-migration",
  "serde",
  "serde_json",
- "tempfile",
  "testcontainers",
  "testcontainers-modules",
  "thiserror 2.0.21",
@@ -5469,7 +5467,6 @@ dependencies = [
  "strum 0.28.0",
  "thiserror 2.0.21",
  "time",
- "tokio",
  "uuid",
 ]
 
