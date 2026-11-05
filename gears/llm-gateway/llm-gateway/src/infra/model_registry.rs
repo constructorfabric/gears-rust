@@ -1,25 +1,40 @@
 //! Model Resolver adapter over `ModelRegistryClientV1::get_tenant_model`.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use llm_gateway_sdk::LlmGatewayError;
 use model_registry_sdk::{ModelInfoV1, ModelRegistryClientV1, ModelRegistryError};
 use toolkit_security::SecurityContext;
 
+use crate::config::DependencyTimeouts;
 use crate::domain::ports::ModelResolver;
 
 /// Resolves models through Model Registry, mapping its errors to gateway
 /// errors (unknown, unapproved, and deprecated models are indistinguishable).
 pub struct ModelRegistryResolver {
     client: Arc<dyn ModelRegistryClientV1>,
+    /// `timeouts.dependency.model_registry`: bound of one lookup. On expiry
+    /// the lookup is `model_resolution_unavailable` (fail closed).
+    timeout: Duration,
 }
 
 impl ModelRegistryResolver {
     /// Build the resolver over a Model Registry client.
     #[must_use]
     pub fn new(client: Arc<dyn ModelRegistryClientV1>) -> Self {
-        Self { client }
+        Self {
+            client,
+            timeout: DependencyTimeouts::default().model_registry,
+        }
+    }
+
+    /// Bound one lookup by `timeout` (`timeouts.dependency.model_registry`).
+    #[must_use]
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
     }
 }
 
@@ -30,7 +45,16 @@ impl ModelResolver for ModelRegistryResolver {
         ctx: &SecurityContext,
         model: &str,
     ) -> Result<ModelInfoV1, LlmGatewayError> {
-        match self.client.get_tenant_model(ctx, model).await {
+        let lookup = tokio::time::timeout(self.timeout, self.client.get_tenant_model(ctx, model));
+        let Ok(lookup) = lookup.await else {
+            tracing::warn!(
+                model,
+                timeout_ms = self.timeout.as_millis(),
+                "model registry lookup timed out"
+            );
+            return Err(LlmGatewayError::ModelResolutionUnavailable);
+        };
+        match lookup {
             Ok(found) => Ok(found.info),
             // Unknown, unapproved and deprecated look the same to the caller;
             // so do a disabled/missing provider and a registry-side

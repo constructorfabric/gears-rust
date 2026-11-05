@@ -35,7 +35,8 @@ use super::ports::{
 };
 use super::provider_rules::ProviderRulesRegistry;
 use super::quota_guard::{Operation, QuotaGuard, Quote, RequestMeta, RequestQuota};
-use super::stream_supervisor::{StreamParams, initial_snapshot, supervise};
+use super::shutdown::ShutdownSignal;
+use super::stream_supervisor::{StreamLimits, StreamParams, initial_snapshot, supervise};
 use super::tool_resolver::ToolResolver;
 use crate::config::{LimitsConfig, MediaConfig, StreamConfig, TimeoutsConfig};
 
@@ -166,14 +167,35 @@ fn provider_timed_out(
         timeout_secs = timeout.as_secs(),
         "provider call exceeded timeouts.provider_sync; cancelled"
     );
-    cancel.cancel();
-    let estimate = quota.estimator().estimate(0, None);
-    quota.settle(estimate);
+    abandon_dispatched(cancel, quota);
     LlmGatewayError::provider(
         ProviderErrorCategory::ProviderUnavailable,
         "provider call timed out",
         ProviderFailure::default(),
     )
+}
+
+/// Cancel a dispatched request and settle its lease with the input-only
+/// estimate: the provider may have spent tokens we cannot see.
+fn abandon_dispatched(cancel: &CancellationToken, quota: RequestQuota) {
+    cancel.cancel();
+    let estimate = quota.estimator().estimate(0, None);
+    quota.settle(estimate);
+}
+
+/// The shutdown cut reached a request in dispatch: cancel it, settle the
+/// estimate and answer `gateway_unavailable`.
+fn cut_in_dispatch(
+    response_id: &str,
+    cancel: &CancellationToken,
+    quota: RequestQuota,
+) -> LlmGatewayError {
+    tracing::warn!(
+        response_id,
+        "shutdown drain deadline passed: request in dispatch cut; cancelled"
+    );
+    abandon_dispatched(cancel, quota);
+    LlmGatewayError::GatewayUnavailable
 }
 
 fn has_item_reference(body: &CreateResponseBody) -> bool {
@@ -234,6 +256,15 @@ pub struct Service {
     /// Bound of one sync or embeddings plugin call (`timeouts.provider_sync`),
     /// the base of the quota lease TTL.
     provider_sync: Duration,
+    /// `timeouts.dependency.authz_resolver`: bound of one PEP evaluation; on
+    /// expiry the request fails closed as `gateway_unavailable`.
+    authz_timeout: Duration,
+    /// `timeouts.stream_idle` and `timeouts.stream_max_duration`, handed to
+    /// every stream's supervisor.
+    stream_idle: Duration,
+    stream_max_duration: Duration,
+    /// Stop signal and drain deadline of the gear (never begun by default).
+    shutdown: ShutdownSignal,
 }
 
 impl Service {
@@ -270,7 +301,19 @@ impl Service {
             max_inflight_streams: permits(limits.max_inflight_streams),
             channel_capacity: stream.channel_capacity,
             provider_sync: timeouts.provider_sync,
+            authz_timeout: timeouts.dependency.authz_resolver,
+            stream_idle: timeouts.stream_idle,
+            stream_max_duration: timeouts.stream_max_duration,
+            shutdown: ShutdownSignal::default(),
         }
+    }
+
+    /// Follow `shutdown`: once it begins no request is accepted, and at its
+    /// cut deadline running calls and streams are ended (DESIGN §4.5).
+    #[must_use]
+    pub fn with_shutdown(mut self, shutdown: ShutdownSignal) -> Self {
+        self.shutdown = shutdown;
+        self
     }
 
     /// Use `fetcher` as the media egress and the `media.*` policy `media`.
@@ -328,21 +371,30 @@ impl Service {
             slot: _slot,
             mut quota,
         } = self
-            .prepare(ctx, body, response_id, cancel, Mode::Sync)
+            .until_cut(
+                response_id,
+                self.prepare(ctx, body, response_id, cancel, Mode::Sync),
+            )
             .await?;
         let estimator = quota.estimator();
         let span = |stage: &'static str| tracing::info_span!("llm_gateway.stage", stage, response_id = %response_id, model = %model);
 
         // One call, never retried: LLM calls are not idempotent.
         quota.mark_dispatched();
-        let dispatched = tokio::time::timeout(
-            self.provider_sync,
-            plugin
-                .client
-                .create_response(ctx, &call, body)
-                .instrument(span("dispatch")),
-        )
-        .await;
+        let shutdown_cut = self.shutdown.cut();
+        let dispatched = tokio::select! {
+            biased;
+            () = shutdown_cut.cancelled() => {
+                return Err(cut_in_dispatch(response_id, &call.cancel, quota));
+            }
+            dispatched = Box::pin(tokio::time::timeout(
+                self.provider_sync,
+                plugin
+                    .client
+                    .create_response(ctx, &call, body)
+                    .instrument(span("dispatch")),
+            )) => dispatched,
+        };
         let mut resource = match dispatched {
             Ok(Ok(resource)) => resource,
             Err(_elapsed) => {
@@ -501,8 +553,33 @@ impl Service {
         })
     }
 
-    /// Shared first steps: authorize `action`, then take an in-flight slot of
-    /// the `mode`'s pool.
+    /// Run the pre-dispatch work `stage` of request `request_id` until the
+    /// shutdown cut: a request still in preparation then is
+    /// `gateway_unavailable`. Dropping `stage` releases its lease (if it was
+    /// acquired) and its slot; the provider was not called, nothing is
+    /// reported.
+    async fn until_cut<T>(
+        &self,
+        request_id: &str,
+        stage: impl Future<Output = Result<T, LlmGatewayError>>,
+    ) -> Result<T, LlmGatewayError> {
+        let cut = self.shutdown.cut();
+        tokio::select! {
+            biased;
+            () = cut.cancelled() => {
+                tracing::warn!(
+                    request_id,
+                    "shutdown drain deadline passed: request cut before dispatch"
+                );
+                Err(LlmGatewayError::GatewayUnavailable)
+            }
+            outcome = Box::pin(stage) => outcome,
+        }
+    }
+
+    /// Shared first steps: refuse while the gear is stopping, authorize
+    /// `action` (bounded by `timeouts.dependency.authz_resolver`), then take
+    /// an in-flight slot of the `mode`'s pool.
     async fn admit(
         &self,
         ctx: &SecurityContext,
@@ -512,9 +589,25 @@ impl Service {
         mode: Mode,
     ) -> Result<OwnedSemaphorePermit, LlmGatewayError> {
         let span = |stage: &'static str| tracing::info_span!("llm_gateway.stage", stage, response_id = %request_id, model = %model);
-        authorize(&self.enforcer, ctx, action)
-            .instrument(span("authorize"))
-            .await?;
+        if self.shutdown.is_begun() {
+            return Err(LlmGatewayError::GatewayUnavailable);
+        }
+        let authorized = tokio::time::timeout(
+            self.authz_timeout,
+            authorize(&self.enforcer, ctx, action).instrument(span("authorize")),
+        )
+        .await;
+        match authorized {
+            Ok(outcome) => outcome?,
+            Err(_elapsed) => {
+                tracing::warn!(
+                    response_id = %request_id,
+                    timeout_ms = self.authz_timeout.as_millis(),
+                    "authorization check timed out; failing closed"
+                );
+                return Err(LlmGatewayError::GatewayUnavailable);
+            }
+        }
 
         let _enter = span("acquire_slot").entered();
         let pool = match mode {
@@ -705,23 +798,34 @@ impl Service {
             slot,
             mut quota,
         } = self
-            .prepare(ctx, body, response_id, cancel.clone(), Mode::Stream)
+            .until_cut(
+                response_id,
+                self.prepare(ctx, body, response_id, cancel.clone(), Mode::Stream),
+            )
             .await?;
         let snapshot = initial_snapshot(response_id, &body);
         let estimator = quota.estimator();
 
         // One call, never retried: LLM calls are not idempotent.
         quota.mark_dispatched();
-        let started = plugin
-            .client
-            .create_response_stream(ctx, &call, body)
-            .instrument(tracing::info_span!(
-                "llm_gateway.stage",
-                stage = "dispatch",
-                response_id = %response_id,
-                model = %model
-            ))
-            .await;
+        let shutdown_cut = self.shutdown.cut();
+        let started = tokio::select! {
+            biased;
+            () = shutdown_cut.cancelled() => {
+                return Err(cut_in_dispatch(response_id, &cancel, quota));
+            }
+            started = Box::pin(
+                plugin
+                    .client
+                    .create_response_stream(ctx, &call, body)
+                    .instrument(tracing::info_span!(
+                        "llm_gateway.stage",
+                        stage = "dispatch",
+                        response_id = %response_id,
+                        model = %model
+                    ))
+            ) => started,
+        };
         let upstream = match started {
             Ok(upstream) => upstream,
             Err(err) => {
@@ -747,6 +851,11 @@ impl Service {
                     quota.set_provider_request_id(provider_request_id);
                     quota.settle(usage);
                 })),
+                limits: StreamLimits {
+                    idle_timeout: Some(self.stream_idle),
+                    max_duration: Some(self.stream_max_duration),
+                    shutdown_cut: Some(self.shutdown.cut()),
+                },
             },
         ))
     }
@@ -800,56 +909,69 @@ impl Service {
         let _cancel_on_drop = cancel.clone().drop_guard();
 
         let model = req.model.clone();
-        let _slot = self
-            .admit(
-                ctx,
-                actions::CREATE_EMBEDDING,
-                request_id,
-                &model,
-                Mode::Sync,
-            )
-            .await?;
-        let (model_info, plugin) = self.resolve_target(ctx, request_id, &model).await?;
-        let rules = self.rules.rules_for(model_info.gts_type.as_ref());
+        let prepare = async {
+            let slot = self
+                .admit(
+                    ctx,
+                    actions::CREATE_EMBEDDING,
+                    request_id,
+                    &model,
+                    Mode::Sync,
+                )
+                .await?;
+            let (model_info, plugin) = self.resolve_target(ctx, request_id, &model).await?;
+            let rules = self.rules.rules_for(model_info.gts_type.as_ref());
 
-        let EffectiveEmbedding {
-            request,
-            ignored_parameters,
-        } = {
-            let _enter = tracing::info_span!("llm_gateway.stage", stage = "capability_check", response_id = %request_id, model = %model).entered();
-            self.checker.check_embedding(&model_info, req)?
+            let EffectiveEmbedding {
+                request,
+                ignored_parameters,
+            } = {
+                let _enter = tracing::info_span!("llm_gateway.stage", stage = "capability_check", response_id = %request_id, model = %model).entered();
+                self.checker.check_embedding(&model_info, req)?
+            };
+
+            let pricing =
+                QuotaGuard::check_pricing(rules.as_ref(), &model_info, Operation::Embedding)?;
+            let reservation = self.quota.embedding_quote(pricing, &request);
+            let (quota, call, ()) = self
+                .admit_and_call(
+                    ctx,
+                    request_id,
+                    &model,
+                    model_info,
+                    Operation::Embedding,
+                    &reservation,
+                    std::future::ready(Ok(())),
+                    cancel,
+                )
+                .await?;
+            Ok((slot, plugin, request, ignored_parameters, quota, call))
         };
-
-        let pricing = QuotaGuard::check_pricing(rules.as_ref(), &model_info, Operation::Embedding)?;
-        let reservation = self.quota.embedding_quote(pricing, &request);
-        let (mut quota, call, ()) = self
-            .admit_and_call(
-                ctx,
-                request_id,
-                &model,
-                model_info,
-                Operation::Embedding,
-                &reservation,
-                std::future::ready(Ok(())),
-                cancel,
-            )
-            .await?;
+        // `_slot` is held to the end of the function: released on every exit path.
+        let (_slot, plugin, request, ignored_parameters, mut quota, call) =
+            self.until_cut(request_id, prepare).await?;
 
         // One call, never retried: calls are not idempotent.
         quota.mark_dispatched();
-        let dispatched = tokio::time::timeout(
-            self.provider_sync,
-            plugin
-                .client
-                .create_embedding(ctx, &call, request)
-                .instrument(tracing::info_span!(
-                    "llm_gateway.stage",
-                    stage = "dispatch",
-                    response_id = %request_id,
-                    model = %model
-                )),
-        )
-        .await;
+        let shutdown_cut = self.shutdown.cut();
+        let dispatched = tokio::select! {
+            biased;
+            () = shutdown_cut.cancelled() => {
+                return Err(cut_in_dispatch(request_id, &call.cancel, quota));
+            }
+            dispatched = Box::pin(tokio::time::timeout(
+                self.provider_sync,
+                plugin
+                    .client
+                    .create_embedding(ctx, &call, request)
+                    .instrument(tracing::info_span!(
+                        "llm_gateway.stage",
+                        stage = "dispatch",
+                        response_id = %request_id,
+                        model = %model
+                    )),
+            )) => dispatched,
+        };
         let mut response = match dispatched {
             Ok(Ok(response)) => response,
             Err(_elapsed) => {
@@ -966,3 +1088,13 @@ mod service_usage_report_tests;
 #[cfg_attr(coverage_nightly, coverage(off))]
 #[path = "service_media_tests.rs"]
 mod service_media_tests;
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+#[path = "service_shutdown_tests.rs"]
+mod service_shutdown_tests;
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+#[path = "service_dependency_timeout_tests.rs"]
+mod service_dependency_timeout_tests;

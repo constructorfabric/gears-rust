@@ -11,6 +11,7 @@ pub mod pricing;
 pub mod provider_rules;
 pub mod quota_guard;
 pub mod service;
+pub mod shutdown;
 pub mod stream_supervisor;
 #[cfg(test)]
 pub mod test_support;

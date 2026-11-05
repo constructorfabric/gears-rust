@@ -472,6 +472,7 @@ async fn a_relay_failure_settles_the_estimate_once() {
             on_terminal: Some(Box::new(move |usage, _provider_request_id| {
                 quota.settle(usage);
             })),
+            limits: crate::domain::stream_supervisor::StreamLimits::default(),
         },
     );
     let events = collect(stream).await;

@@ -1094,3 +1094,79 @@ mod shutdown {
         assert_eq!(rig.reporter.pending(), 0);
     }
 }
+
+// ── timeouts.dependency.usage_collector ─────────────────────────────────────
+
+mod call_timeout {
+    use super::*;
+
+    fn rig_with_timeout(timeout: Duration) -> Rig {
+        let mut rig = Rig::new(&cfg(10, 2));
+        let reporter = UsageCollectorReporter::new(
+            rig.uc.clone(),
+            rig.identity.clone(),
+            &cfg(10, 2),
+            &ShutdownConfig {
+                usage_drain_reserve: RESERVE,
+            },
+        )
+        .expect("reporter")
+        .with_backoff_jitter(0.0)
+        .with_call_timeout(timeout);
+        rig.reporter = Arc::new(reporter);
+        rig
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[tracing_test::traced_test]
+    async fn a_call_over_the_bound_is_a_transient_failure_retried_after_the_backoff() {
+        let rig = rig_with_timeout(Duration::from_secs(3));
+        rig.uc.hang_first(1);
+        let _worker = rig.start();
+        rig.push(0..2).await;
+        tokio::time::sleep(Duration::from_secs(20)).await;
+
+        let calls = rig.uc.calls();
+        assert_eq!(calls.len(), 2, "the hung call, then the retry");
+        assert!(
+            approx(calls[1].at - calls[0].at, Duration::from_secs(3) + BACKOFF),
+            "cut at the bound, then the backoff: {:?}",
+            calls[1].at - calls[0].at
+        );
+        let keys: Vec<&str> = calls[1]
+            .records
+            .iter()
+            .map(|r| r.idempotency_key.as_str())
+            .collect();
+        assert_eq!(keys, ["resp_0", "resp_1"], "the whole batch is retried");
+        assert_eq!(rig.reporter.pending(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_default_bound_is_five_seconds() {
+        let rig = Rig::new(&cfg(10, 2));
+        rig.uc.hang_first(1);
+        let _worker = rig.start();
+        rig.push(0..2).await;
+        tokio::time::sleep(Duration::from_secs(20)).await;
+
+        let calls = rig.uc.calls();
+        assert_eq!(calls.len(), 2);
+        assert!(approx(
+            calls[1].at - calls[0].at,
+            Duration::from_secs(5) + BACKOFF
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_hanging_collector_is_retried_repeatedly_not_waited_for_forever() {
+        let rig = rig_with_timeout(Duration::from_secs(3));
+        rig.uc.hang_first(2);
+        let _worker = rig.start();
+        rig.push(0..2).await;
+        tokio::time::sleep(Duration::from_mins(1)).await;
+
+        assert_eq!(rig.uc.calls().len(), 3, "two hung calls, then delivery");
+        assert_eq!(rig.reporter.pending(), 0);
+    }
+}

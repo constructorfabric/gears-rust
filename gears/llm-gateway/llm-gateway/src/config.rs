@@ -54,6 +54,17 @@ impl LlmGatewayConfig {
         if self.timeouts.stream_max_duration.is_zero() {
             return Err("timeouts.stream_max_duration must be > 0".to_owned());
         }
+        if self.timeouts.stream_idle.is_zero() {
+            return Err("timeouts.stream_idle must be > 0".to_owned());
+        }
+        if self.timeouts.stream_idle > self.timeouts.stream_max_duration {
+            return Err("timeouts.stream_idle must be <= timeouts.stream_max_duration".to_owned());
+        }
+        for (name, timeout) in self.timeouts.dependency.named() {
+            if timeout.is_zero() {
+                return Err(format!("timeouts.dependency.{name} must be > 0"));
+            }
+        }
         self.validate_usage()?;
         self.validate_media()?;
         if let Some(credentials) = &self.client_credentials {
@@ -173,6 +184,11 @@ const MAX_USAGE_DRAIN_RESERVE: Duration = Duration::from_secs(20);
 /// Safety margin kept free at the end of the gear stop timeout.
 const SHUTDOWN_MARGIN: Duration = Duration::from_secs(3);
 
+/// Time between the drain deadline (streams and calls are cut) and the end of
+/// the quiescence wait: the cut requests settle and hand their usage over in
+/// it.
+const CUT_SETTLE_ALLOWANCE: Duration = Duration::from_secs(2);
+
 /// Usage Collector cap of records per `create_usage_records` call.
 const MAX_USAGE_BATCH: usize = 100;
 
@@ -189,6 +205,12 @@ pub struct TimeoutsConfig {
     /// streams.
     #[serde(with = "humantime_serde")]
     pub stream_max_duration: Duration,
+    /// Longest a stream waits for the next provider event (the time the
+    /// consumer is not reading is not counted).
+    #[serde(with = "humantime_serde")]
+    pub stream_idle: Duration,
+    /// Per-dependency call timeouts (`timeouts.dependency.*`).
+    pub dependency: DependencyTimeouts,
 }
 
 impl Default for TimeoutsConfig {
@@ -196,6 +218,61 @@ impl Default for TimeoutsConfig {
         Self {
             provider_sync: Duration::from_secs(600),
             stream_max_duration: Duration::from_mins(30),
+            stream_idle: Duration::from_secs(120),
+            dependency: DependencyTimeouts::default(),
+        }
+    }
+}
+
+/// Call timeouts of the gateway's dependencies (DESIGN §4.5,
+/// `timeouts.dependency.<name>`). On expiry a call fails with that
+/// dependency's fail-closed code (§ 4.4); usage delivery and settle retry.
+/// `CredStore` has no entry while the gateway fetches no keys itself, and the
+/// `AuthN` exchange is bounded by `client_credentials.exchange_timeout`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DependencyTimeouts {
+    /// PEP evaluation (`AuthZ` Resolver).
+    #[serde(with = "humantime_serde")]
+    pub authz_resolver: Duration,
+    /// `get_tenant_model` (Model Registry).
+    #[serde(with = "humantime_serde")]
+    pub model_registry: Duration,
+    /// Tool schema read (Type Registry).
+    #[serde(with = "humantime_serde")]
+    pub types_registry: Duration,
+    /// `acquire_lease`, `commit_lease` and `release_lease` (Quota
+    /// Enforcement).
+    #[serde(with = "humantime_serde")]
+    pub quota_enforcement: Duration,
+    /// `create_usage_records` (Usage Collector).
+    #[serde(with = "humantime_serde")]
+    pub usage_collector: Duration,
+}
+
+impl DependencyTimeouts {
+    /// The configured timeouts with their key names.
+    #[must_use]
+    pub fn named(&self) -> [(&'static str, Duration); 5] {
+        [
+            ("authz_resolver", self.authz_resolver),
+            ("model_registry", self.model_registry),
+            ("types_registry", self.types_registry),
+            ("quota_enforcement", self.quota_enforcement),
+            ("usage_collector", self.usage_collector),
+        ]
+    }
+}
+
+impl Default for DependencyTimeouts {
+    fn default() -> Self {
+        let default = Duration::from_secs(5);
+        Self {
+            authz_resolver: default,
+            model_registry: default,
+            types_registry: default,
+            quota_enforcement: default,
+            usage_collector: default,
         }
     }
 }
@@ -300,6 +377,16 @@ impl ShutdownConfig {
         GEAR_STOP_TIMEOUT
             .saturating_sub(self.usage_drain_reserve)
             .saturating_sub(SHUTDOWN_MARGIN)
+    }
+
+    /// The drain deadline after the stop signal: requests still running are
+    /// cut (`gateway_unavailable`) once it passes. It leaves
+    /// `CUT_SETTLE_ALLOWANCE` of the [`Self::quiescence_budget`] for the cut
+    /// requests to settle before the Usage Reporter stops waiting.
+    #[must_use]
+    pub fn cut_after(&self) -> Duration {
+        self.quiescence_budget()
+            .saturating_sub(CUT_SETTLE_ALLOWANCE)
     }
 }
 

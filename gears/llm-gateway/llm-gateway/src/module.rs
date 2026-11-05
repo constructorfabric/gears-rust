@@ -20,6 +20,7 @@ use crate::config::LlmGatewayConfig;
 use crate::domain::ports::{ServiceIdentity, UsageProducers, UsageSink};
 use crate::domain::provider_rules::ProviderRulesRegistry;
 use crate::domain::quota_guard::QuotaGuard;
+use crate::domain::shutdown::ShutdownSignal;
 use crate::domain::{KeylessCredentialBroker, LlmGatewayLocalClient, Service};
 use crate::infra::media_fetcher::NoRouteMediaFetcher;
 use crate::infra::model_registry::ModelRegistryResolver;
@@ -56,6 +57,7 @@ pub(crate) const GEAR_STOP_TIMEOUT: Duration = Duration::from_secs(30);
 pub struct LlmGatewayModule {
     service: OnceLock<Arc<Service>>,
     reporter: OnceLock<Arc<UsageCollectorReporter>>,
+    shutdown: OnceLock<ShutdownSignal>,
 }
 
 #[async_trait]
@@ -111,7 +113,8 @@ impl Gear for LlmGatewayModule {
             )
             .map_err(|err| {
                 anyhow::anyhow!("{} invalid usage configuration: {err}", Self::MODULE_NAME)
-            })?,
+            })?
+            .with_call_timeout(cfg.timeouts.dependency.usage_collector),
         );
         let quota = QuotaGuard::new(
             quota_client,
@@ -121,24 +124,35 @@ impl Gear for LlmGatewayModule {
             &cfg.timeouts,
         );
 
+        let shutdown = ShutdownSignal::new(cfg.shutdown.cut_after());
         let service = Arc::new(
             Service::new(
                 enforcer,
-                Arc::new(ModelRegistryResolver::new(registry)),
+                Arc::new(
+                    ModelRegistryResolver::new(registry)
+                        .with_timeout(cfg.timeouts.dependency.model_registry),
+                ),
                 Arc::new(GtsPluginDirectory::new(hub.clone())),
                 Arc::new(KeylessCredentialBroker),
-                Arc::new(TypesRegistryToolSchemas::new(hub.clone())),
+                Arc::new(
+                    TypesRegistryToolSchemas::new(hub.clone())
+                        .with_timeout(cfg.timeouts.dependency.types_registry),
+                ),
                 Arc::new(ProviderRulesRegistry::permissive()),
                 quota,
                 &cfg.limits,
                 &cfg.stream,
                 &cfg.timeouts,
             )
-            .with_media(Arc::new(NoRouteMediaFetcher), &cfg.media),
+            .with_media(Arc::new(NoRouteMediaFetcher), &cfg.media)
+            .with_shutdown(shutdown.clone()),
         );
 
         self.reporter
             .set(reporter)
+            .map_err(|_| anyhow::anyhow!("{} module already initialized", Self::MODULE_NAME))?;
+        self.shutdown
+            .set(shutdown)
             .map_err(|_| anyhow::anyhow!("{} module already initialized", Self::MODULE_NAME))?;
         self.service
             .set(Arc::clone(&service))
@@ -170,7 +184,16 @@ impl LlmGatewayModule {
             self.service.get().cloned().ok_or_else(|| {
                 anyhow::anyhow!("{}: serve invoked before init", Self::MODULE_NAME)
             })? as Arc<dyn UsageProducers>;
-        reporter.run(cancel, producers).await;
+        let shutdown =
+            self.shutdown.get().cloned().ok_or_else(|| {
+                anyhow::anyhow!("{}: serve invoked before init", Self::MODULE_NAME)
+            })?;
+        // Both start from the same stop signal: the Service stops accepting
+        // and starts its cut timer, the reporter starts its quiescence wait.
+        tokio::join!(
+            shutdown.begin_on(&cancel),
+            reporter.run(cancel.clone(), producers)
+        );
         tracing::info!(module = Self::MODULE_NAME, "usage reporter stopped");
         Ok(())
     }

@@ -1,6 +1,7 @@
 //! `ModelRegistryResolver`: Model Registry error mapping (DESIGN §4.1, §4.4).
 
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use llm_gateway_sdk::LlmGatewayError;
@@ -20,15 +21,25 @@ use crate::domain::test_support::{OPENAI_TYPE, ctx, sample_model};
 struct FakeRegistry {
     outcome: Box<dyn Fn() -> Result<ModelV1, ModelRegistryError> + Send + Sync>,
     requested: Mutex<Vec<String>>,
+    /// Answers only after this long (virtual time under a paused clock).
+    delay: Duration,
 }
 
 impl FakeRegistry {
     fn new(
         outcome: impl Fn() -> Result<ModelV1, ModelRegistryError> + Send + Sync + 'static,
     ) -> Arc<Self> {
+        Self::slow(Duration::ZERO, outcome)
+    }
+
+    fn slow(
+        delay: Duration,
+        outcome: impl Fn() -> Result<ModelV1, ModelRegistryError> + Send + Sync + 'static,
+    ) -> Arc<Self> {
         Arc::new(Self {
             outcome: Box::new(outcome),
             requested: Mutex::new(Vec::new()),
+            delay,
         })
     }
 }
@@ -44,6 +55,7 @@ impl ModelRegistryClientV1 for FakeRegistry {
             .lock()
             .expect("requested")
             .push(canonical_id.to_owned());
+        tokio::time::sleep(self.delay).await;
         (self.outcome)()
     }
 
@@ -230,5 +242,57 @@ async fn unrelated_registry_variants_are_model_resolution_unavailable() {
             matches!(err, LlmGatewayError::ModelResolutionUnavailable),
             "{err}"
         );
+    }
+}
+
+// ── timeouts.dependency.model_registry ──────────────────────────────────────
+
+mod timeout {
+    use super::*;
+
+    #[tokio::test(start_paused = true)]
+    #[tracing_test::traced_test]
+    async fn a_lookup_over_the_bound_is_model_resolution_unavailable_at_the_bound() {
+        let registry = FakeRegistry::slow(Duration::from_mins(1), || Ok(approved_model()));
+        let resolver = ModelRegistryResolver::new(registry).with_timeout(Duration::from_secs(3));
+        let started = tokio::time::Instant::now();
+
+        let err = resolver
+            .resolve(&ctx(), "openai::gpt-4o")
+            .await
+            .expect_err("timed out");
+
+        assert!(
+            matches!(err, LlmGatewayError::ModelResolutionUnavailable),
+            "{err:?}"
+        );
+        assert_eq!(started.elapsed(), Duration::from_secs(3));
+        assert!(logs_contain("openai::gpt-4o"), "logged with the model");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_default_bound_is_five_seconds() {
+        let registry = FakeRegistry::slow(Duration::from_mins(1), || Ok(approved_model()));
+        let resolver = ModelRegistryResolver::new(registry);
+        let started = tokio::time::Instant::now();
+
+        let err = resolver
+            .resolve(&ctx(), "openai::gpt-4o")
+            .await
+            .expect_err("timed out");
+
+        assert!(matches!(err, LlmGatewayError::ModelResolutionUnavailable));
+        assert_eq!(started.elapsed(), Duration::from_secs(5));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_lookup_answering_just_before_the_bound_succeeds() {
+        let registry = FakeRegistry::slow(Duration::from_secs(2), || Ok(approved_model()));
+        let resolver = ModelRegistryResolver::new(registry).with_timeout(Duration::from_secs(3));
+
+        resolver
+            .resolve(&ctx(), "openai::gpt-4o")
+            .await
+            .expect("answered in time");
     }
 }

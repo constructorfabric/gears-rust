@@ -28,7 +28,7 @@ use usage_collector_sdk::{
     UsageCollectorClientV1, UsageCollectorError, UsageRecord, UsageTypeGtsId,
 };
 
-use crate::config::{ShutdownConfig, UsageConfig};
+use crate::config::{DependencyTimeouts, ShutdownConfig, UsageConfig};
 use crate::domain::ports::{ServiceIdentity, UsageProducers, UsageReport, UsageSink};
 
 /// `resource_type` of the usage record resource reference.
@@ -111,6 +111,8 @@ enum Attempt {
     NoContext(anyhow::Error),
     /// The collector answered.
     Answer(Result<Vec<Result<UsageRecord, UsageCollectorError>>, UsageCollectorError>),
+    /// The call outlived `timeouts.dependency.usage_collector`.
+    TimedOut,
     /// The drain deadline passed while the call was in flight.
     DrainExpired,
 }
@@ -124,6 +126,10 @@ pub struct UsageCollectorReporter {
     config: UsageConfig,
     shutdown: ShutdownConfig,
     jitter: f64,
+    /// `timeouts.dependency.usage_collector`: bound of one
+    /// `create_usage_records` call; a call over it is a transient failure
+    /// (retried with backoff).
+    call_timeout: Duration,
     buffer: Mutex<Buffer>,
     wake: Notify,
     dropped: AtomicU64,
@@ -150,6 +156,7 @@ impl UsageCollectorReporter {
             config: usage.clone(),
             shutdown: shutdown.clone(),
             jitter: 0.2,
+            call_timeout: DependencyTimeouts::default().usage_collector,
             buffer: Mutex::new(Buffer::default()),
             wake: Notify::new(),
             dropped: AtomicU64::new(0),
@@ -161,6 +168,14 @@ impl UsageCollectorReporter {
     #[must_use]
     pub fn with_backoff_jitter(mut self, jitter: f64) -> Self {
         self.jitter = jitter;
+        self
+    }
+
+    /// Bound one `create_usage_records` call by `timeout`
+    /// (`timeouts.dependency.usage_collector`).
+    #[must_use]
+    pub fn with_call_timeout(mut self, timeout: Duration) -> Self {
+        self.call_timeout = timeout;
         self
     }
 
@@ -305,6 +320,13 @@ impl UsageCollectorReporter {
             let before = batch.len();
             match self.attempt(&batch, cancel, drain).await {
                 Attempt::DrainExpired => return batch,
+                Attempt::TimedOut => {
+                    tracing::warn!(
+                        timeout_ms = self.call_timeout.as_millis(),
+                        count = batch.len(),
+                        "usage delivery timed out; the batch will be retried"
+                    );
+                }
                 Attempt::NoContext(err) => {
                     tracing::warn!(
                         error = %err,
@@ -335,11 +357,15 @@ impl UsageCollectorReporter {
                 Err(err) => return Attempt::NoContext(err),
             };
             let records = batch.iter().map(|e| e.record.clone()).collect();
-            Attempt::Answer(
-                self.client
-                    .create_usage_records(&identity.ctx, records)
-                    .await,
+            match tokio::time::timeout(
+                self.call_timeout,
+                self.client.create_usage_records(&identity.ctx, records),
             )
+            .await
+            {
+                Ok(answer) => Attempt::Answer(answer),
+                Err(_elapsed) => Attempt::TimedOut,
+            }
         };
         tokio::pin!(call);
         if drain.is_none() {

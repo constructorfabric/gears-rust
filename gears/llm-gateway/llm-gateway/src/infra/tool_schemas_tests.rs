@@ -1,12 +1,13 @@
 //! Tool schema source over `TypesRegistryApi` (in-memory registry).
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use llm_gateway_sdk::LlmGatewayError;
 use serde_json::json;
 use toolkit::client_hub::ClientHub;
 use types_registry_sdk::TypesRegistryApi;
-use types_registry_sdk::testing_platform::MockTypesRegistry;
+use types_registry_sdk::testing_platform::{Fault, MockTypesRegistry};
 
 use super::TypesRegistryToolSchemas;
 use crate::domain::ports::ToolSchemaSource;
@@ -77,4 +78,59 @@ async fn missing_registry_client_is_schema_not_found() {
         matches!(err, LlmGatewayError::SchemaNotFound { .. }),
         "{err:?}"
     );
+}
+
+// ── timeouts.dependency.types_registry ──────────────────────────────────────
+
+fn seeded_slow_source(delay: Duration, timeout: Option<Duration>) -> TypesRegistryToolSchemas {
+    let registry = MockTypesRegistry::new();
+    registry.seed(
+        WEATHER,
+        json!({
+            "$schema": "http://json-schema.org/draft-07/schema#",
+            "$id": format!("gts://{WEATHER}"),
+            "type": "object"
+        }),
+    );
+    registry.inject(Fault::any().delay(delay));
+    let source = source_with(registry);
+    match timeout {
+        Some(timeout) => source.with_timeout(timeout),
+        None => source,
+    }
+}
+
+#[tokio::test(start_paused = true)]
+#[tracing_test::traced_test]
+async fn a_read_over_the_bound_is_schema_not_found_at_the_bound() {
+    let source = seeded_slow_source(Duration::from_mins(1), Some(Duration::from_secs(3)));
+    let started = tokio::time::Instant::now();
+
+    let err = source.schema(&ctx(), WEATHER).await.expect_err("timed out");
+
+    assert!(
+        matches!(&err, LlmGatewayError::SchemaNotFound { schema_id, .. } if schema_id == WEATHER),
+        "the existing outage mapping: {err:?}"
+    );
+    assert_eq!(started.elapsed(), Duration::from_secs(3));
+    assert!(logs_contain(WEATHER), "logged with the schema id");
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_default_bound_is_five_seconds() {
+    let source = seeded_slow_source(Duration::from_mins(1), None);
+    let started = tokio::time::Instant::now();
+
+    source.schema(&ctx(), WEATHER).await.expect_err("timed out");
+
+    assert_eq!(started.elapsed(), Duration::from_secs(5));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_read_answering_just_before_the_bound_succeeds() {
+    let source = seeded_slow_source(Duration::from_secs(2), Some(Duration::from_secs(3)));
+
+    let schema = source.schema(&ctx(), WEATHER).await.expect("in time");
+
+    assert_eq!(schema["type"], json!("object"));
 }

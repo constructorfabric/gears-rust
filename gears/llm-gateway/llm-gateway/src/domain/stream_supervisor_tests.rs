@@ -59,6 +59,7 @@ fn params() -> StreamParams {
         slot: None,
         estimator: None,
         on_terminal: None,
+        limits: super::StreamLimits::default(),
     }
 }
 
@@ -886,4 +887,70 @@ async fn a_slow_consumer_still_receives_every_event_in_order() {
     let numbers: Vec<u64> = events.iter().map(seq).collect();
     assert_eq!(numbers, (0..53).collect::<Vec<_>>());
     assert!(matches!(events.last(), Some(StreamingEvent::Completed(_))));
+}
+
+/// The relay sets the stop and drops the sender between the consumer's stop
+/// check and its channel read: the closed-channel path must deliver the stop
+/// terminal, not the "relay died" `internal` failure.
+#[test]
+fn a_stop_set_while_the_sender_closes_is_delivered_not_reported_as_a_dead_relay() {
+    use super::{Relay, State, Stop, StopCell, StopReason, UsageBasis};
+    use futures_core::Stream as _;
+    use futures_util::task::noop_waker_ref;
+
+    let params = params();
+    let (tx, rx) = tokio::sync::mpsc::channel::<StreamingEvent>(1);
+    let stop = StopCell::default();
+    let mut relay = Box::pin(Relay {
+        rx,
+        cancel: params.cancel.clone(),
+        stop: stop.clone(),
+        fallback: State::new(&params, UsageBasis::new(None)),
+        received: 0,
+        finished: false,
+        ended: false,
+    });
+    let mut cx = Context::from_waker(noop_waker_ref());
+
+    assert!(relay.as_mut().poll_next(&mut cx).is_pending());
+    stop.set(Stop {
+        reason: StopReason::Shutdown,
+        usage: reported(1, 1),
+    });
+    drop(tx);
+    // The closed-channel path itself (what a poll reaches when its stop check
+    // ran just before the relay set the stop).
+    let Some(StreamingEvent::Failed(e)) = relay.as_mut().get_mut().on_channel_closed() else {
+        panic!("expected the stop terminal");
+    };
+    assert_eq!(e.response.error.expect("error").code, "gateway_unavailable");
+    assert!(matches!(
+        relay.as_mut().poll_next(&mut cx),
+        Poll::Ready(None)
+    ));
+    assert!(!params.cancel.is_cancelled(), "no dead-relay cancel");
+}
+
+/// A closed channel with neither stop nor terminal is a dead relay.
+#[test]
+fn a_closed_channel_without_stop_or_terminal_is_still_a_dead_relay() {
+    use super::{Relay, State, StopCell, UsageBasis};
+
+    let params = params();
+    let (tx, rx) = tokio::sync::mpsc::channel::<StreamingEvent>(1);
+    let mut relay = Relay {
+        rx,
+        cancel: params.cancel.clone(),
+        stop: StopCell::default(),
+        fallback: State::new(&params, UsageBasis::new(None)),
+        received: 0,
+        finished: false,
+        ended: false,
+    };
+    drop(tx);
+    let Some(StreamingEvent::Failed(e)) = relay.on_channel_closed() else {
+        panic!("expected the internal failure");
+    };
+    assert_eq!(e.response.error.expect("error").code, "internal");
+    assert!(params.cancel.is_cancelled());
 }

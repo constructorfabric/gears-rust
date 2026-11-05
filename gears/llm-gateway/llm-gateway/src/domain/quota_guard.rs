@@ -144,6 +144,11 @@ pub fn classify_settle_error(err: &QuotaEnforcementError) -> SettleErrorClass {
     }
 }
 
+/// Settle attempts stop this long before the lease deadline: a call that late
+/// would only meet an expired lease (`LEASE_NOT_ACTIVE`). Quota Enforcement
+/// releases the lease on its own.
+const SETTLE_SAFETY_LEAD: Duration = Duration::from_secs(2);
+
 /// Default jitter of the settle retry backoff (+-20%).
 const DEFAULT_BACKOFF_JITTER: f64 = 0.2;
 
@@ -160,6 +165,10 @@ struct Inner {
     backoff_jitter: f64,
     provider_sync: Duration,
     stream_max_duration: Duration,
+    /// `timeouts.dependency.quota_enforcement`: bound of one `acquire_lease`
+    /// (`quota_check_unavailable`), `commit_lease` or `release_lease`
+    /// (transient: retried with backoff).
+    call_timeout: Duration,
     /// Every detached settle/release job, so shutdown can wait for them.
     jobs: TaskTracker,
 }
@@ -194,6 +203,7 @@ impl QuotaGuard {
                 backoff_jitter: DEFAULT_BACKOFF_JITTER,
                 provider_sync: timeouts.provider_sync,
                 stream_max_duration: timeouts.stream_max_duration,
+                call_timeout: timeouts.dependency.quota_enforcement,
                 jobs: TaskTracker::new(),
             }),
         }
@@ -332,16 +342,7 @@ impl QuotaGuard {
             ttl_secs: Some(ttl.as_secs()),
             idempotency_key: format!("{}:acquire", meta.response_id),
         };
-        let outcome = self
-            .inner
-            .client
-            .acquire_lease(ctx, request)
-            .await
-            .map_err(|err| {
-                let mapped = map_acquire_error(&err);
-                log_acquire_error(&meta.response_id, &err, &mapped);
-                mapped
-            })?;
+        let outcome = self.acquire(ctx, request, &meta.response_id).await?;
         let lease = match outcome {
             AcquireLeaseOutcome::Acquired { token, expires_at } => {
                 let remaining = expires_at - time::OffsetDateTime::now_utc();
@@ -381,6 +382,32 @@ impl QuotaGuard {
             }
         };
         Ok(RequestQuota::new(self.clone(), meta, owner, *quote, lease))
+    }
+
+    /// One `acquire_lease` call, bounded by `timeouts.dependency.quota_enforcement`
+    /// (expiry: `quota_check_unavailable`, fail closed).
+    async fn acquire(
+        &self,
+        ctx: &SecurityContext,
+        request: AcquireLeaseRequest,
+        response_id: &str,
+    ) -> Result<AcquireLeaseOutcome, LlmGatewayError> {
+        let call = self.inner.client.acquire_lease(ctx, request);
+        match tokio::time::timeout(self.inner.call_timeout, call).await {
+            Ok(result) => result.map_err(|err| {
+                let mapped = map_acquire_error(&err);
+                log_acquire_error(response_id, &err, &mapped);
+                mapped
+            }),
+            Err(_elapsed) => {
+                tracing::warn!(
+                    response_id,
+                    timeout_ms = self.inner.call_timeout.as_millis(),
+                    "quota admission failed: acquire_lease timed out"
+                );
+                Err(LlmGatewayError::QuotaCheckUnavailable)
+            }
+        }
     }
 
     /// Hand a settle (or a release) to a background task. Never blocks the
@@ -449,7 +476,8 @@ impl QuotaGuard {
     }
 
     /// Commit (`amount > 0`) or release (`amount` 0 or `None`) `lease`,
-    /// retrying transient failures until the lease expires.
+    /// retrying transient failures until shortly before the lease expires
+    /// ([`SETTLE_SAFETY_LEAD`]).
     async fn settle_lease(
         &self,
         meta: &RequestMeta,
@@ -471,10 +499,10 @@ impl QuotaGuard {
         };
         let mut reauthenticated = false;
         loop {
-            if tokio::time::Instant::now() >= lease.deadline {
+            if tokio::time::Instant::now() + SETTLE_SAFETY_LEAD >= lease.deadline {
                 tracing::warn!(
                     response_id,
-                    "quota settle abandoned: the lease expired or is about to; Quota \
+                    "quota settle abandoned: the lease expired or is about to expire; Quota \
                      Enforcement releases it on its own"
                 );
                 return;
@@ -504,30 +532,44 @@ impl QuotaGuard {
             }
         };
         let client = &self.inner.client;
-        let result = match attempt.commit_amount {
-            Some(actual) => client
-                .commit_lease(
-                    &ctx,
-                    CommitLeaseRequest {
-                        tenant_id: attempt.tenant_id,
-                        token: attempt.lease.token,
-                        actual_amount: Some(actual.min(attempt.lease.reserved_units)),
-                        idempotency_key: attempt.key.clone(),
-                    },
-                )
-                .await
-                .map(|_decision| ()),
-            None => client
-                .release_lease(
-                    &ctx,
-                    ReleaseLeaseRequest {
-                        tenant_id: attempt.tenant_id,
-                        token: attempt.lease.token,
-                        idempotency_key: attempt.key.clone(),
-                    },
-                )
-                .await
-                .map(|_decision| ()),
+        let call = async {
+            match attempt.commit_amount {
+                Some(actual) => client
+                    .commit_lease(
+                        &ctx,
+                        CommitLeaseRequest {
+                            tenant_id: attempt.tenant_id,
+                            token: attempt.lease.token,
+                            actual_amount: Some(actual.min(attempt.lease.reserved_units)),
+                            idempotency_key: attempt.key.clone(),
+                        },
+                    )
+                    .await
+                    .map(|_decision| ()),
+                None => client
+                    .release_lease(
+                        &ctx,
+                        ReleaseLeaseRequest {
+                            tenant_id: attempt.tenant_id,
+                            token: attempt.lease.token,
+                            idempotency_key: attempt.key.clone(),
+                        },
+                    )
+                    .await
+                    .map(|_decision| ()),
+            }
+        };
+        let result = match tokio::time::timeout(self.inner.call_timeout, call).await {
+            Ok(result) => result,
+            Err(_elapsed) => {
+                // Transient: the same amount and key are retried.
+                tracing::warn!(
+                    response_id,
+                    timeout_ms = self.inner.call_timeout.as_millis(),
+                    "quota settle call timed out; retrying with backoff"
+                );
+                return Next::RetryAfterBackoff;
+            }
         };
         match result {
             Ok(()) => Next::Stop,

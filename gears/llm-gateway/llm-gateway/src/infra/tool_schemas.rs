@@ -6,6 +6,7 @@
 //! `schema_not_found` carrying the schema id (DESIGN §4.8).
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use llm_gateway_sdk::LlmGatewayError;
@@ -17,18 +18,33 @@ use types_registry_sdk::{
     TypesRegistryApiExt as _,
 };
 
+use crate::config::DependencyTimeouts;
 use crate::domain::ports::ToolSchemaSource;
 
 /// [`ToolSchemaSource`] backed by the `TypesRegistryApi` client in `ClientHub`.
 pub struct TypesRegistryToolSchemas {
     hub: Arc<ClientHub>,
+    /// `timeouts.dependency.types_registry`: bound of one schema read. On
+    /// expiry the read is `schema_not_found` like any other Type Registry
+    /// outage.
+    timeout: Duration,
 }
 
 impl TypesRegistryToolSchemas {
     /// Source resolving the Type Registry client from `hub` per call.
     #[must_use]
     pub fn new(hub: Arc<ClientHub>) -> Self {
-        Self { hub }
+        Self {
+            hub,
+            timeout: DependencyTimeouts::default().types_registry,
+        }
+    }
+
+    /// Bound one schema read by `timeout` (`timeouts.dependency.types_registry`).
+    #[must_use]
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
     }
 }
 
@@ -51,21 +67,31 @@ impl ToolSchemaSource for TypesRegistryToolSchemas {
             ..ReadOptions::default()
         };
         // The caller's context: the registry applies its own visibility rules.
-        let snapshot = registry
-            .get_type_schema(ctx, &type_id, options)
-            .await
-            .map_err(|error| {
-                // Absent and invisible schemas are the caller's problem; any
-                // other failure is Type Registry trouble worth an operator's
-                // attention. The id is the only request datum logged.
-                if !matches!(
-                    error,
-                    CanonicalError::NotFound { .. } | CanonicalError::PermissionDenied { .. }
-                ) {
-                    tracing::warn!(schema_id, %error, "type registry schema read failed");
-                }
-                not_found()
-            })?;
+        let read = tokio::time::timeout(
+            self.timeout,
+            registry.get_type_schema(ctx, &type_id, options),
+        )
+        .await
+        .map_err(|_| {
+            tracing::warn!(
+                schema_id,
+                timeout_ms = self.timeout.as_millis(),
+                "type registry schema read timed out"
+            );
+            not_found()
+        })?;
+        let snapshot = read.map_err(|error| {
+            // Absent and invisible schemas are the caller's problem; any
+            // other failure is Type Registry trouble worth an operator's
+            // attention. The id is the only request datum logged.
+            if !matches!(
+                error,
+                CanonicalError::NotFound { .. } | CanonicalError::PermissionDenied { .. }
+            ) {
+                tracing::warn!(schema_id, %error, "type registry schema read failed");
+            }
+            not_found()
+        })?;
         snapshot.resolved_schema.ok_or_else(|| {
             tracing::warn!(schema_id, "type registry returned no resolved schema");
             not_found()

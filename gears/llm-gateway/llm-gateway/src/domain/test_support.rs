@@ -51,7 +51,10 @@ use super::ports::{
 use super::pricing::ModelPricing;
 use super::provider_rules::{PermissiveRules, ProviderRules, ProviderRulesRegistry};
 use super::quota_guard::QuotaGuard;
-use crate::config::{LimitsConfig, MediaConfig, QuotaConfig, StreamConfig, TimeoutsConfig};
+use super::shutdown::ShutdownSignal;
+use crate::config::{
+    LimitsConfig, MediaConfig, QuotaConfig, ShutdownConfig, StreamConfig, TimeoutsConfig,
+};
 
 /// Provider identity used by the sample model and plugin.
 pub const OPENAI_TYPE: &str = "gts.cf.genai.model.info.v1~cf.genai._.openai.v1~";
@@ -362,6 +365,8 @@ pub enum PdpMode {
     Deny,
     /// Fail the evaluation transport.
     Unreachable,
+    /// Never answer.
+    Hang,
 }
 
 /// Counting PDP fake.
@@ -433,6 +438,7 @@ impl AuthZResolverApi for FakePdp {
                     deny_reason: None,
                 },
             }),
+            PdpMode::Hang => std::future::pending().await,
             PdpMode::Unreachable => Err(CanonicalError::service_unavailable()
                 .with_detail("test fake: authz transport failure".to_owned())
                 .create()),
@@ -1178,6 +1184,8 @@ pub struct FakeQuota {
     release_script: Mutex<VecDeque<Result<(), QuotaEnforcementError>>>,
     tokens: AtomicUsize,
     park_acquire: AtomicBool,
+    /// The next this many `commit_lease` / `release_lease` calls never answer.
+    hang_settles: AtomicUsize,
     /// Notified when an `acquire_lease` call has started (only when parked).
     pub acquire_entered: Notify,
     /// Releases a parked `acquire_lease` call.
@@ -1196,6 +1204,7 @@ impl FakeQuota {
             release_script: Mutex::new(VecDeque::new()),
             tokens: AtomicUsize::new(0),
             park_acquire: AtomicBool::new(false),
+            hang_settles: AtomicUsize::new(0),
             acquire_entered: Notify::new(),
             acquire_release: Notify::new(),
             log,
@@ -1229,6 +1238,19 @@ impl FakeQuota {
     /// Park every `acquire_lease` call until `acquire_release` is notified.
     pub fn park_acquire(&self) {
         self.park_acquire.store(true, Ordering::SeqCst);
+    }
+
+    /// The next `n` settle calls (commit or release) are recorded and then
+    /// hang forever (a Quota Enforcement that never answers).
+    pub fn hang_settles(&self, n: usize) {
+        self.hang_settles.store(n, Ordering::SeqCst);
+    }
+
+    /// Whether this settle call is one of the hanging ones.
+    fn hangs(&self) -> bool {
+        self.hang_settles
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .is_ok()
     }
 
     /// Every call so far, in order.
@@ -1395,6 +1417,9 @@ impl QuotaEnforcementClientV1 for FakeQuota {
             request,
             at: tokio::time::Instant::now(),
         });
+        if self.hangs() {
+            std::future::pending::<()>().await;
+        }
         let scripted = self.commit_script.lock().expect("script").pop_front();
         scripted.unwrap_or(Ok(())).map(|()| Self::allowed())
     }
@@ -1410,6 +1435,9 @@ impl QuotaEnforcementClientV1 for FakeQuota {
             request,
             at: tokio::time::Instant::now(),
         });
+        if self.hangs() {
+            std::future::pending::<()>().await;
+        }
         let scripted = self.release_script.lock().expect("script").pop_front();
         scripted.unwrap_or(Ok(())).map(|()| Self::allowed())
     }
@@ -1624,6 +1652,8 @@ pub struct FakeUsageCollector {
     script: Mutex<VecDeque<UcScript>>,
     calls: Mutex<Vec<UcCall>>,
     parked: AtomicBool,
+    /// The next this many calls hang forever.
+    hang_first: AtomicUsize,
     panicking: AtomicBool,
 }
 
@@ -1643,6 +1673,12 @@ impl FakeUsageCollector {
     /// never answers); the call is still recorded.
     pub fn park(&self) {
         self.parked.store(true, Ordering::SeqCst);
+    }
+
+    /// The next `n` calls are recorded and then hang forever; later calls
+    /// answer normally.
+    pub fn hang_first(&self, n: usize) {
+        self.hang_first.store(n, Ordering::SeqCst);
     }
 
     /// From now on every call panics (a crashing client); the call is still
@@ -1720,7 +1756,12 @@ impl UsageCollectorClientV1 for FakeUsageCollector {
             !self.panicking.load(Ordering::SeqCst),
             "usage collector fake panics (test)"
         );
-        if self.parked.load(Ordering::SeqCst) {
+        if self.parked.load(Ordering::SeqCst)
+            || self
+                .hang_first
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                .is_ok()
+        {
             std::future::pending::<()>().await;
         }
         let scripted = self.script.lock().expect("script").pop_front();
@@ -1826,6 +1867,19 @@ pub async fn eventually_within(within: std::time::Duration, what: &str, cond: im
         );
         tokio::time::sleep(step).await;
     }
+}
+
+/// Await `fut` for at most one virtual hour, so a test of behavior that is not
+/// there (a call that never returns) fails instead of hanging the paused
+/// clock.
+///
+/// # Panics
+///
+/// When `fut` does not finish within one (virtual) hour.
+pub async fn bounded<T>(fut: impl Future<Output = T>) -> T {
+    tokio::time::timeout(std::time::Duration::from_hours(1), fut)
+        .await
+        .expect("did not finish within one virtual hour")
 }
 
 /// Wait (bounded) for `notify`.
@@ -1976,6 +2030,10 @@ pub struct Harness {
     pub quota: Arc<FakeQuota>,
     pub identity: Arc<FakeIdentity>,
     pub sink: Arc<FakeUsageSink>,
+    /// Shutdown signal the service follows; not begun until a test calls
+    /// `begin()`. Default cut delay: [`ShutdownConfig::cut_after`] of the
+    /// defaults.
+    pub shutdown: ShutdownSignal,
 }
 
 impl Harness {
@@ -2003,6 +2061,7 @@ impl Harness {
             quota: FakeQuota::new(log.clone()),
             identity: FakeIdentity::new(),
             sink: FakeUsageSink::new(log),
+            shutdown: ShutdownSignal::new(ShutdownConfig::default().cut_after()),
         }
     }
 
@@ -2112,7 +2171,8 @@ impl Harness {
                 &self.stream,
                 &self.timeouts,
             )
-            .with_media(self.fetcher.clone(), &self.media),
+            .with_media(self.fetcher.clone(), &self.media)
+            .with_shutdown(self.shutdown.clone()),
         )
     }
 }

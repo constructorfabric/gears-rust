@@ -500,3 +500,112 @@ fn well_formed_media_type_lists_are_accepted() {
     }));
     cfg.validate().expect("valid lists");
 }
+
+// ── slice 7: stream idle, dependency timeouts, drain deadline ───────────────
+
+mod slice7 {
+    use std::time::Duration;
+
+    use super::{LlmGatewayConfig, cfg};
+    use crate::config::{DependencyTimeouts, ShutdownConfig};
+
+    const NAMES: [&str; 5] = [
+        "authz_resolver",
+        "model_registry",
+        "types_registry",
+        "quota_enforcement",
+        "usage_collector",
+    ];
+
+    #[test]
+    fn stream_idle_defaults_to_two_minutes_and_max_duration_stays_thirty_minutes() {
+        let c = LlmGatewayConfig::default();
+        assert_eq!(c.timeouts.stream_idle, Duration::from_secs(120));
+        assert_eq!(c.timeouts.stream_max_duration, Duration::from_mins(30));
+    }
+
+    #[test]
+    fn every_dependency_timeout_defaults_to_five_seconds() {
+        let d = LlmGatewayConfig::default().timeouts.dependency;
+        for (name, timeout) in d.named() {
+            assert_eq!(timeout, Duration::from_secs(5), "{name}");
+        }
+        assert_eq!(d.named().map(|(name, _)| name), NAMES);
+        assert_eq!(
+            DependencyTimeouts::default().authz_resolver,
+            Duration::from_secs(5)
+        );
+    }
+
+    #[test]
+    fn the_new_timeouts_deserialize_from_humantime_and_keep_the_other_defaults() {
+        let c = cfg(serde_json::json!({
+            "timeouts": {
+                "stream_idle": "45s",
+                "dependency": { "model_registry": "1500ms", "usage_collector": "2s" }
+            }
+        }));
+        assert_eq!(c.timeouts.stream_idle, Duration::from_secs(45));
+        let d = &c.timeouts.dependency;
+        assert_eq!(d.model_registry, Duration::from_millis(1500));
+        assert_eq!(d.usage_collector, Duration::from_secs(2));
+        assert_eq!(d.authz_resolver, Duration::from_secs(5));
+        assert_eq!(d.quota_enforcement, Duration::from_secs(5));
+        assert_eq!(c.timeouts.provider_sync, Duration::from_secs(600));
+        c.validate().expect("valid");
+    }
+
+    #[test]
+    fn unknown_dependency_timeout_keys_are_rejected() {
+        let err = serde_json::from_value::<LlmGatewayConfig>(
+            serde_json::json!({ "timeouts": { "dependency": { "credstore": "1s" } } }),
+        );
+        assert!(err.is_err(), "credstore has no timeout while keyless");
+    }
+
+    #[test]
+    fn zero_values_are_rejected_naming_the_key() {
+        let mut cases = vec![(
+            serde_json::json!({ "timeouts": { "stream_idle": "0s" } }),
+            "timeouts.stream_idle".to_owned(),
+        )];
+        for name in NAMES {
+            cases.push((
+                serde_json::json!({ "timeouts": { "dependency": { (name): "0s" } } }),
+                format!("timeouts.dependency.{name}"),
+            ));
+        }
+        for (value, key) in cases {
+            let err = cfg(value).validate().expect_err(&key);
+            assert!(err.contains(&key), "{err} should name {key}");
+        }
+    }
+
+    #[test]
+    fn stream_idle_above_the_maximum_duration_is_rejected_naming_the_key() {
+        let err = cfg(serde_json::json!({
+            "timeouts": { "stream_idle": "10m", "stream_max_duration": "5m" }
+        }))
+        .validate()
+        .expect_err("idle above max");
+        assert!(err.contains("timeouts.stream_idle"), "{err}");
+        // Equal is fine.
+        cfg(serde_json::json!({
+            "timeouts": { "stream_idle": "5m", "stream_max_duration": "5m" }
+        }))
+        .validate()
+        .expect("equal bounds");
+    }
+
+    #[test]
+    fn the_drain_deadline_precedes_the_end_of_the_quiescence_budget() {
+        // The cut requests need time to settle and hand their usage over
+        // before the Usage Reporter stops waiting.
+        let defaults = ShutdownConfig::default();
+        assert_eq!(defaults.quiescence_budget(), Duration::from_secs(22));
+        assert_eq!(defaults.cut_after(), Duration::from_secs(20));
+        let widest = cfg(serde_json::json!({ "shutdown": { "usage_drain_reserve": "20s" } }));
+        assert!(widest.shutdown.cut_after() < widest.shutdown.quiescence_budget());
+        assert_eq!(widest.shutdown.cut_after(), Duration::from_secs(5));
+    }
+}

@@ -20,11 +20,14 @@
 //! Final provider usage is passed through; without it the core estimate of
 //! [`StreamParams::estimator`] applies (see [`UsageBasis`]).
 //!
-//! Stream idle timeout / maximum duration belong to a later slice.
+//! [`StreamParams::limits`] bounds the stream: no provider event within the
+//! idle timeout, the maximum duration from the stream start, and the shutdown
+//! cut (see [`StreamLimits`]).
 
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
+use std::time::Duration;
 
 use futures_core::Stream;
 use futures_util::StreamExt as _;
@@ -161,6 +164,25 @@ enum MissingUsage {
     ProviderError,
 }
 
+/// Time and shutdown bounds of one supervised stream. The default bounds
+/// nothing.
+#[domain_model]
+#[derive(Clone, Default)]
+pub struct StreamLimits {
+    /// `timeouts.stream_idle`: longest wait for the next provider event. Only
+    /// time spent waiting on the plugin stream counts: a consumer that is not
+    /// reading (backpressure) does not make the provider idle. Expiry ends the
+    /// stream with `response.failed` (`provider_unavailable`).
+    pub idle_timeout: Option<Duration>,
+    /// `timeouts.stream_max_duration`: longest total duration, from the start
+    /// of the supervised stream (consumer time included). Expiry ends the
+    /// stream like the idle timeout.
+    pub max_duration: Option<Duration>,
+    /// Fires at the shutdown drain deadline: the stream ends with
+    /// `response.failed` (`gateway_unavailable`).
+    pub shutdown_cut: Option<CancellationToken>,
+}
+
 /// Inputs of one supervised stream.
 #[domain_model]
 pub struct StreamParams {
@@ -187,6 +209,8 @@ pub struct StreamParams {
     pub estimator: Option<UsageEstimator>,
     /// Terminal hook (the Quota Guard settle); see [`TerminalHook`].
     pub on_terminal: Option<TerminalHook>,
+    /// Idle / maximum duration / shutdown bounds.
+    pub limits: StreamLimits,
 }
 
 /// The `in_progress` snapshot of response `response_id` for `body`.
@@ -245,10 +269,12 @@ pub fn supervise(upstream: ResponseEventStream, params: StreamParams) -> Respons
     let cancel = params.cancel.clone();
     let basis = UsageBasis::new(params.estimator);
     let fallback = State::new(&params, basis.clone());
-    tokio::spawn(relay(upstream, params, tx, basis).in_current_span());
+    let stop = StopCell::default();
+    tokio::spawn(relay(upstream, params, tx, basis, stop.clone()).in_current_span());
     Box::pin(Relay {
         rx,
         cancel,
+        stop,
         fallback,
         received: 0,
         finished: false,
@@ -264,6 +290,9 @@ pub fn supervise(upstream: ResponseEventStream, params: StreamParams) -> Respons
 struct Relay {
     rx: mpsc::Receiver<StreamingEvent>,
     cancel: CancellationToken,
+    /// Set by the relay when a bound ended the stream: the consumer then gets
+    /// the `response.failed` at its next read, ahead of events still buffered.
+    stop: StopCell,
     /// Builds the `response.failed` for a relay task that died.
     fallback: State,
     /// Events received so far: the next `sequence_number` (gapless from 0).
@@ -281,6 +310,12 @@ impl Stream for Relay {
         if self.ended {
             return Poll::Ready(None);
         }
+        if let Some(stop) = self.stop.take() {
+            // A bound ended the stream (the hook already settled with this
+            // usage): the terminal goes out at once, so a consumer that reads
+            // slowly is not held up by the events still buffered.
+            return Poll::Ready(Some(self.deliver_stop(stop)));
+        }
         match self.rx.poll_recv(cx) {
             Poll::Ready(Some(event)) => {
                 self.received += 1;
@@ -289,27 +324,46 @@ impl Stream for Relay {
                 }
                 Poll::Ready(Some(event))
             }
-            Poll::Ready(None) => {
-                self.ended = true;
-                if self.finished {
-                    return Poll::Ready(None);
-                }
-                self.finished = true;
-                self.cancel.cancel();
-                tracing::error!(
-                    response_id = %self.fallback.response_id,
-                    "stream aborted: the relay task ended without a terminal event"
-                );
-                let usage = self.fallback.basis.no_final();
-                let mut event = self.fallback.failed(
-                    ResponseError::new("internal", "the response stream terminated unexpectedly"),
-                    usage,
-                );
-                set_sequence(&mut event, self.received);
-                Poll::Ready(Some(event))
-            }
+            Poll::Ready(None) => Poll::Ready(self.on_channel_closed()),
             Poll::Pending => Poll::Pending,
         }
+    }
+}
+
+impl Relay {
+    /// The channel is closed and drained: the stop terminal when a bound set
+    /// one after the caller's last stop check, `None` after a delivered
+    /// terminal, else the `internal` failure of a relay task that died.
+    fn on_channel_closed(&mut self) -> Option<StreamingEvent> {
+        if let Some(stop) = self.stop.take() {
+            return Some(self.deliver_stop(stop));
+        }
+        self.ended = true;
+        if self.finished {
+            return None;
+        }
+        self.finished = true;
+        self.cancel.cancel();
+        tracing::error!(
+            response_id = %self.fallback.response_id,
+            "stream aborted: the relay task ended without a terminal event"
+        );
+        let usage = self.fallback.basis.no_final();
+        let mut event = self.fallback.failed(
+            ResponseError::new("internal", "the response stream terminated unexpectedly"),
+            usage,
+        );
+        set_sequence(&mut event, self.received);
+        Some(event)
+    }
+
+    /// The `response.failed` of a bound that ended the stream; ends the stream.
+    fn deliver_stop(&mut self, Stop { reason, usage }: Stop) -> StreamingEvent {
+        self.ended = true;
+        self.finished = true;
+        let mut event = self.fallback.failed(reason.error(), usage);
+        set_sequence(&mut event, self.received);
+        event
     }
 }
 
@@ -396,11 +450,34 @@ impl State {
         }
     }
 
-    /// Number `event` and send it; `false` when the consumer is gone.
-    async fn emit(&mut self, tx: &mpsc::Sender<StreamingEvent>, mut event: StreamingEvent) -> bool {
+    /// Number `event` and send it, giving up when a hard bound (shutdown cut,
+    /// maximum duration) is reached while the channel is full. The sequence
+    /// number is only taken once the slot is reserved, so a given-up event
+    /// leaves no gap.
+    async fn emit_bounded(
+        &mut self,
+        tx: &mpsc::Sender<StreamingEvent>,
+        event: StreamingEvent,
+        bounds: &Bounds,
+    ) -> Emit {
+        let permit = tokio::select! {
+            biased;
+            stop = bounds.hard_stop() => return Emit::Stop(stop),
+            permit = tx.reserve() => permit,
+        };
+        match permit {
+            Ok(permit) => {
+                self.send(permit, event);
+                Emit::Sent
+            }
+            Err(_) => Emit::Gone,
+        }
+    }
+
+    fn send(&mut self, permit: mpsc::Permit<'_, StreamingEvent>, mut event: StreamingEvent) {
         set_sequence(&mut event, self.next_sequence);
         self.next_sequence += 1;
-        tx.send(event).await.is_ok()
+        permit.send(event);
     }
 
     fn no_final_usage(&self) -> Usage {
@@ -584,6 +661,129 @@ fn terminal_usage(event: &StreamingEvent) -> Option<Usage> {
     }
 }
 
+/// Why a supervised stream was ended by the gateway.
+#[derive(Clone, Copy)]
+enum StopReason {
+    /// No provider event within `timeouts.stream_idle`.
+    Idle,
+    /// `timeouts.stream_max_duration` passed.
+    MaxDuration,
+    /// The shutdown drain deadline passed.
+    Shutdown,
+}
+
+impl StopReason {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::MaxDuration => "max_duration",
+            Self::Shutdown => "shutdown",
+        }
+    }
+
+    /// The `response.failed` error: fixed messages, no provider content.
+    fn error(self) -> ResponseError {
+        match self {
+            Self::Idle => ResponseError::new(
+                "provider_unavailable",
+                "the provider sent no event within the idle timeout",
+            ),
+            Self::MaxDuration => ResponseError::new(
+                "provider_unavailable",
+                "the response exceeded the maximum stream duration",
+            ),
+            Self::Shutdown => {
+                ResponseError::new("gateway_unavailable", "the gateway is shutting down")
+            }
+        }
+    }
+}
+
+/// A bound ended the stream: the reason and the usage the lease was settled
+/// with.
+struct Stop {
+    reason: StopReason,
+    usage: Usage,
+}
+
+/// Hand-over of a [`Stop`] from the relay task to the consumer side.
+#[derive(Clone, Default)]
+struct StopCell(Arc<Mutex<Option<Stop>>>);
+
+impl StopCell {
+    fn set(&self, stop: Stop) {
+        *self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(stop);
+    }
+
+    fn take(&self) -> Option<Stop> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+    }
+}
+
+/// Outcome of a bounded send.
+enum Emit {
+    Sent,
+    /// The consumer is gone.
+    Gone,
+    Stop(StopReason),
+}
+
+/// The bounds of one relay, resolved at its start.
+struct Bounds {
+    idle: Option<Duration>,
+    /// `max_duration` from the relay start.
+    deadline: Option<tokio::time::Instant>,
+    cut: Option<CancellationToken>,
+}
+
+impl Bounds {
+    fn new(limits: StreamLimits) -> Self {
+        Self {
+            idle: limits.idle_timeout,
+            deadline: limits
+                .max_duration
+                .map(|max| tokio::time::Instant::now() + max),
+            cut: limits.shutdown_cut,
+        }
+    }
+
+    /// Resolves when the shutdown cut or the maximum duration is reached;
+    /// never when neither is set. Cancel-safe.
+    async fn hard_stop(&self) -> StopReason {
+        tokio::select! {
+            biased;
+            () = async {
+                match &self.cut {
+                    Some(cut) => cut.cancelled().await,
+                    None => std::future::pending().await,
+                }
+            } => StopReason::Shutdown,
+            () = async {
+                match self.deadline {
+                    Some(deadline) => tokio::time::sleep_until(deadline).await,
+                    None => std::future::pending().await,
+                }
+            } => StopReason::MaxDuration,
+        }
+    }
+
+    /// Resolves after the idle timeout; created anew for every wait on the
+    /// plugin stream, so only that wait counts.
+    async fn idle_expired(&self) -> StopReason {
+        match self.idle {
+            Some(idle) => tokio::time::sleep(idle).await,
+            None => std::future::pending().await,
+        }
+        StopReason::Idle
+    }
+}
+
 /// Drive `upstream` into `tx` until a terminal event was sent or the consumer
 /// left. The terminal hook runs once: with the sent terminal's usage, or, on
 /// every other exit (disconnect, task death), with the estimate.
@@ -592,6 +792,7 @@ async fn relay(
     params: StreamParams,
     tx: mpsc::Sender<StreamingEvent>,
     basis: UsageBasis,
+    stop: StopCell,
 ) {
     let mut state = State::new(&params, basis.clone());
     // Released when the task ends, whichever way.
@@ -600,17 +801,42 @@ async fn relay(
         basis,
         hook: params.on_terminal,
     };
+    let bounds = Bounds::new(params.limits);
+    let ctx = StopCtx {
+        bounds: &bounds,
+        cancel: &params.cancel,
+        stop: &stop,
+    };
     let created = snapshot_event(StreamingEvent::Created, state.snapshot.clone());
     let in_progress = snapshot_event(StreamingEvent::InProgress, state.snapshot.clone());
-    if !state.emit(&tx, created).await || !state.emit(&tx, in_progress).await {
-        log_disconnect(&state.response_id);
-        return;
+    for event in [created, in_progress] {
+        match state.emit_bounded(&tx, event, &bounds).await {
+            Emit::Sent => {}
+            Emit::Gone => {
+                log_disconnect(&state.response_id);
+                return;
+            }
+            Emit::Stop(reason) => {
+                stop_stream(&state, &mut guard, &params.cancel, &stop, reason, None);
+                return;
+            }
+        }
     }
 
     loop {
+        // Only the wait on the plugin stream counts for the idle timer.
         let next = tokio::select! {
+            biased;
             () = tx.closed() => {
                 log_disconnect(&state.response_id);
+                return;
+            }
+            reason = bounds.hard_stop() => {
+                stop_stream(&state, &mut guard, &params.cancel, &stop, reason, None);
+                return;
+            }
+            reason = bounds.idle_expired() => {
+                stop_stream(&state, &mut guard, &params.cancel, &stop, reason, None);
                 return;
             }
             next = upstream.next() => next,
@@ -623,40 +849,86 @@ async fn relay(
             let usage = state.no_final_usage();
             let response = state.own_terminal(ResponseStatus::Completed, None, usage);
             let terminal = state.completed(response);
-            send_terminal(&mut state, &tx, &mut guard, terminal).await;
+            send_terminal(&mut state, &tx, &mut guard, &ctx, terminal).await;
             return;
         };
         let Some(outgoing) = state.translate(event) else {
             continue;
         };
         if is_terminal(&outgoing) {
-            send_terminal(&mut state, &tx, &mut guard, outgoing).await;
+            send_terminal(&mut state, &tx, &mut guard, &ctx, outgoing).await;
             return;
         }
-        if !state.emit(&tx, outgoing).await {
-            log_disconnect(&state.response_id);
-            return;
+        match state.emit_bounded(&tx, outgoing, &bounds).await {
+            Emit::Sent => {}
+            Emit::Gone => {
+                log_disconnect(&state.response_id);
+                return;
+            }
+            Emit::Stop(reason) => {
+                stop_stream(&state, &mut guard, &params.cancel, &stop, reason, None);
+                return;
+            }
         }
     }
 }
 
-/// Send the terminal event; once it is in the channel the stream is settled
-/// with its usage. A consumer that left first is a disconnect (the guard's
-/// estimate applies).
+/// End the stream because a bound was reached: cancel the request, settle
+/// (with `settled`, else the estimate) and hand the `response.failed` to the
+/// consumer side (see [`Relay`]), which delivers it without waiting for the
+/// channel to drain. The plugin stream is dropped when the relay returns.
+fn stop_stream(
+    state: &State,
+    guard: &mut TerminalGuard,
+    cancel: &CancellationToken,
+    stop: &StopCell,
+    reason: StopReason,
+    settled: Option<(Usage, Option<String>)>,
+) {
+    cancel.cancel();
+    tracing::warn!(
+        response_id = %state.response_id,
+        reason = reason.label(),
+        "stream aborted: a stream bound was reached"
+    );
+    let (usage, provider_request_id) = settled.unwrap_or_else(|| (state.no_final_usage(), None));
+    guard.finish(usage.clone(), provider_request_id);
+    stop.set(Stop { reason, usage });
+}
+
+/// What a terminal send needs to end the stream at a bound.
+struct StopCtx<'a> {
+    bounds: &'a Bounds,
+    cancel: &'a CancellationToken,
+    stop: &'a StopCell,
+}
+
+/// Send the terminal event, bounded by the shutdown cut and the maximum
+/// duration; once it is in the channel the stream is settled with its usage.
+/// A bound reached while the channel is full ends the stream like
+/// [`stop_stream`], settled with the terminal's own usage and provider request
+/// id (the estimate when it has none). A consumer that left first is a
+/// disconnect (the guard's estimate applies).
 async fn send_terminal(
     state: &mut State,
     tx: &mpsc::Sender<StreamingEvent>,
     guard: &mut TerminalGuard,
+    ctx: &StopCtx<'_>,
     terminal: StreamingEvent,
 ) {
     let usage = terminal_usage(&terminal);
     let provider_request_id = terminal_provider_request_id(&terminal);
-    if state.emit(tx, terminal).await {
-        if let Some(usage) = usage {
-            guard.finish(usage, provider_request_id);
+    match state.emit_bounded(tx, terminal, ctx.bounds).await {
+        Emit::Sent => {
+            if let Some(usage) = usage {
+                guard.finish(usage, provider_request_id);
+            }
         }
-    } else {
-        log_disconnect(&state.response_id);
+        Emit::Gone => log_disconnect(&state.response_id),
+        Emit::Stop(reason) => {
+            let settled = usage.map(|usage| (usage, provider_request_id));
+            stop_stream(state, guard, ctx.cancel, ctx.stop, reason, settled);
+        }
     }
 }
 
@@ -673,3 +945,8 @@ mod stream_supervisor_tests;
 #[cfg_attr(coverage_nightly, coverage(off))]
 #[path = "stream_terminal_tests.rs"]
 mod stream_terminal_tests;
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+#[path = "stream_timeout_tests.rs"]
+mod stream_timeout_tests;

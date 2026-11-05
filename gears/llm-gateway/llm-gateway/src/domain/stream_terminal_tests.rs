@@ -62,6 +62,7 @@ fn params(estimator: Option<UsageEstimator>) -> (StreamParams, Calls) {
             slot: None,
             estimator,
             on_terminal: Some(on_terminal),
+            limits: super::StreamLimits::default(),
         },
         calls,
     )
