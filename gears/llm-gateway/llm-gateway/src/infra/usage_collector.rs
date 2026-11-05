@@ -18,6 +18,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use llm_gateway_sdk::truncate_provider_id;
 use rand::RngExt as _;
 use rust_decimal::Decimal;
 use tokio::sync::Notify;
@@ -515,7 +516,7 @@ pub fn build_record(
     put("model", report.model.clone())?;
     put("provider_type", report.provider_type.clone())?;
     if let Some(id) = &report.provider_request_id {
-        put("provider_request_id", id.clone())?;
+        put("provider_request_id", truncate_provider_id(id))?;
     }
     put("complete", report.usage.complete.to_string())?;
     put("estimate", report.usage.estimated.to_string())?;

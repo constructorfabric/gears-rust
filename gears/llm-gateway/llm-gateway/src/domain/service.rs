@@ -103,15 +103,23 @@ fn details_request_id(details: Option<&ProviderDetails>) -> Option<String> {
 }
 
 /// Whether `err` maps to a 5xx response (DESIGN §4.1): a provider category
-/// not known to be caller-side counts as server-side.
+/// not known to be caller-side counts as server-side. The caller-side
+/// variants are listed explicitly; every other variant, including one added
+/// later (the error type is `non_exhaustive`), is server-side and logs at
+/// `warn` until classified here.
 fn is_server_side(err: &LlmGatewayError) -> bool {
     match err {
-        LlmGatewayError::Internal { .. }
-        | LlmGatewayError::ModelResolutionUnavailable
-        | LlmGatewayError::CredentialsUnavailable
-        | LlmGatewayError::QuotaCheckUnavailable
-        | LlmGatewayError::GatewayUnavailable
-        | LlmGatewayError::ProviderNotSupported { .. } => true,
+        LlmGatewayError::Validation { .. }
+        | LlmGatewayError::OutputValidation { .. }
+        | LlmGatewayError::ModelNotFound { .. }
+        | LlmGatewayError::CapabilityNotSupported { .. }
+        | LlmGatewayError::UnsupportedParameter { .. }
+        | LlmGatewayError::UnsupportedSchema { .. }
+        | LlmGatewayError::SchemaNotFound { .. }
+        | LlmGatewayError::MediaNotFound { .. }
+        | LlmGatewayError::UnapprovedDestination
+        | LlmGatewayError::QuotaExceeded
+        | LlmGatewayError::PermissionDenied => false,
         LlmGatewayError::Provider { category, .. } => !matches!(
             category,
             ProviderErrorCategory::ContextLengthExceeded
@@ -120,7 +128,10 @@ fn is_server_side(err: &LlmGatewayError) -> bool {
                 | ProviderErrorCategory::RateLimited
                 | ProviderErrorCategory::AuthenticationFailed
         ),
-        _ => false,
+        // `Internal`, `ModelResolutionUnavailable`, `CredentialsUnavailable`,
+        // `QuotaCheckUnavailable`, `GatewayUnavailable`, `ProviderNotSupported`
+        // and any variant added later.
+        _ => true,
     }
 }
 
@@ -166,6 +177,28 @@ fn provider_timed_out(
         response_id,
         timeout_secs = timeout.as_secs(),
         "provider call exceeded timeouts.provider_sync; cancelled"
+    );
+    abandon_dispatched(cancel, quota);
+    LlmGatewayError::provider(
+        ProviderErrorCategory::ProviderUnavailable,
+        "provider call timed out",
+        ProviderFailure::default(),
+    )
+}
+
+/// Opening the plugin stream outlived `timeouts.stream_idle` (which bounds
+/// the open as well as every wait between events): same handling and answer
+/// as [`provider_timed_out`].
+fn stream_open_timed_out(
+    response_id: &str,
+    timeout: Duration,
+    cancel: &CancellationToken,
+    quota: RequestQuota,
+) -> LlmGatewayError {
+    tracing::warn!(
+        response_id,
+        timeout_secs = timeout.as_secs(),
+        "opening the provider stream exceeded timeouts.stream_idle; cancelled"
     );
     abandon_dispatched(cancel, quota);
     LlmGatewayError::provider(
@@ -380,6 +413,7 @@ impl Service {
         let span = |stage: &'static str| tracing::info_span!("llm_gateway.stage", stage, response_id = %response_id, model = %model);
 
         // One call, never retried: LLM calls are not idempotent.
+        self.ensure_not_cut(response_id)?;
         quota.mark_dispatched();
         let shutdown_cut = self.shutdown.cut();
         let dispatched = tokio::select! {
@@ -567,7 +601,9 @@ impl Service {
         tokio::select! {
             biased;
             () = cut.cancelled() => {
-                tracing::warn!(
+                // Per request, and every request in preparation hits it at once:
+                // debug (the drain deadline itself is logged by the shutdown).
+                tracing::debug!(
                     request_id,
                     "shutdown drain deadline passed: request cut before dispatch"
                 );
@@ -575,6 +611,21 @@ impl Service {
             }
             outcome = Box::pin(stage) => outcome,
         }
+    }
+
+    /// Last check before the dispatch mark: when the shutdown cut already
+    /// fired the request is `gateway_unavailable` and the provider is not
+    /// called. The caller's `quota` is dropped undispatched: its lease is
+    /// released and nothing is reported.
+    fn ensure_not_cut(&self, request_id: &str) -> Result<(), LlmGatewayError> {
+        if self.shutdown.cut().is_cancelled() {
+            tracing::debug!(
+                request_id,
+                "shutdown drain deadline passed: request cut before dispatch"
+            );
+            return Err(LlmGatewayError::GatewayUnavailable);
+        }
+        Ok(())
     }
 
     /// Shared first steps: refuse while the gear is stopping, authorize
@@ -807,6 +858,7 @@ impl Service {
         let estimator = quota.estimator();
 
         // One call, never retried: LLM calls are not idempotent.
+        self.ensure_not_cut(response_id)?;
         quota.mark_dispatched();
         let shutdown_cut = self.shutdown.cut();
         let started = tokio::select! {
@@ -814,7 +866,8 @@ impl Service {
             () = shutdown_cut.cancelled() => {
                 return Err(cut_in_dispatch(response_id, &cancel, quota));
             }
-            started = Box::pin(
+            started = Box::pin(tokio::time::timeout(
+                self.stream_idle,
                 plugin
                     .client
                     .create_response_stream(ctx, &call, body)
@@ -823,12 +876,20 @@ impl Service {
                         stage = "dispatch",
                         response_id = %response_id,
                         model = %model
-                    ))
-            ) => started,
+                    )),
+            )) => started,
         };
         let upstream = match started {
-            Ok(upstream) => upstream,
-            Err(err) => {
+            Ok(Ok(upstream)) => upstream,
+            Err(_elapsed) => {
+                return Err(stream_open_timed_out(
+                    response_id,
+                    self.stream_idle,
+                    &cancel,
+                    quota,
+                ));
+            }
+            Ok(Err(err)) => {
                 quota.set_provider_request_id(error_provider_request_id(&err));
                 quota.settle(Usage::reported(0, 0, Decimal::ZERO));
                 return Err(err);
@@ -952,6 +1013,7 @@ impl Service {
             self.until_cut(request_id, prepare).await?;
 
         // One call, never retried: calls are not idempotent.
+        self.ensure_not_cut(request_id)?;
         quota.mark_dispatched();
         let shutdown_cut = self.shutdown.cut();
         let dispatched = tokio::select! {

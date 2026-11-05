@@ -490,6 +490,42 @@ async fn a_request_cut_in_preparation_after_the_lease_is_acquired_releases_it() 
     assert_nothing_reported(&h);
 }
 
+#[tokio::test(start_paused = true)]
+async fn a_cut_that_fires_as_preparation_completes_never_dispatches_and_releases_the_lease() {
+    // The cut fires inside the last preparation step (lease admission), so
+    // the stage still completes: the check before the dispatch mark catches it.
+    for mode in ["sync", "stream", "embeddings"] {
+        let mut h = Harness::new();
+        match mode {
+            "sync" => h.set_model(|v| set_cost(v, Some(1000), Some(2000))),
+            "stream" => h.enable_streaming_with(|v| set_cost(v, Some(1000), Some(2000))),
+            _ => h.enable_embeddings_with(|v| set_cost(v, Some(1000), None)),
+        }
+        h.quota.cancel_on_acquire(h.shutdown.cut());
+        let service = h.service();
+        let err = match mode {
+            "sync" => service
+                .create_response(&ctx(), body(MODEL))
+                .await
+                .expect_err(mode),
+            "stream" => service
+                .create_response_stream(&ctx(), body(MODEL))
+                .await
+                .err()
+                .expect(mode),
+            _ => service
+                .create_embedding(&ctx(), embedding_request())
+                .await
+                .map(|_| ())
+                .expect_err(mode),
+        };
+        assert_gateway_unavailable(&err);
+        eventually("release", || h.quota.releases().len() == 1).await;
+        assert!(h.quota.commits().is_empty(), "{mode}: nothing was consumed");
+        assert_nothing_reported(&h);
+    }
+}
+
 // ── the Usage Reporter follows the deadline ─────────────────────────────────
 
 #[tokio::test(start_paused = true)]

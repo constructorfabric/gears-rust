@@ -212,6 +212,28 @@ fn invalid_values_are_rejected_naming_the_key() {
     }
 }
 
+#[test]
+fn lease_ttl_margin_must_exceed_the_settle_safety_lead_plus_the_quota_timeout() {
+    // Default quota_enforcement timeout is 5s, the safety lead 2s: > 7s.
+    for margin in ["0s", "2s", "7s"] {
+        let err = cfg(serde_json::json!({ "quota": { "lease_ttl_margin": margin } }))
+            .validate()
+            .expect_err(margin);
+        assert!(err.contains("quota.lease_ttl_margin"), "{err}");
+    }
+    cfg(serde_json::json!({ "quota": { "lease_ttl_margin": "8s" } }))
+        .validate()
+        .expect("just above the bound");
+    // The bound follows the configured quota_enforcement timeout.
+    let err = cfg(serde_json::json!({
+        "quota": { "lease_ttl_margin": "8s" },
+        "timeouts": { "dependency": { "quota_enforcement": "10s" } }
+    }))
+    .validate()
+    .expect_err("8s <= 2s + 10s");
+    assert!(err.contains("quota.lease_ttl_margin"), "{err}");
+}
+
 // ── slice 5b: usage delivery and shutdown ───────────────────────────────────
 
 mod usage {

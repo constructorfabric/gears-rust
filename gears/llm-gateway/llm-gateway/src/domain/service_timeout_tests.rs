@@ -9,7 +9,7 @@ use llm_gateway_sdk::{EmbeddingInput, EmbeddingRequest, LlmGatewayError, Provide
 use tracing::Instrument as _;
 
 use crate::domain::test_support::{
-    FakePlugin, Harness, body, ctx, eventually, sample_response, set_cost,
+    FakePlugin, Harness, StreamScript, body, ctx, eventually, sample_response, set_cost,
 };
 
 const MODEL: &str = "openai::gpt-4o";
@@ -185,4 +185,38 @@ async fn an_embeddings_call_finishing_just_before_the_bound_is_unaffected() {
         !h.sink.reports()[0].usage.estimated,
         "the provider usage, not an estimate"
     );
+}
+
+// ── stream open ─────────────────────────────────────────────────────────────
+
+#[tokio::test(start_paused = true)]
+#[tracing_test::traced_test]
+async fn opening_a_stream_over_stream_idle_is_provider_unavailable_and_settles_the_estimate() {
+    let mut h = Harness::new();
+    h.enable_streaming_with(|v| set_cost(v, Some(1000), Some(2000)));
+    h.plugin.set_stream(StreamScript::StartHang);
+    h.timeouts.stream_idle = BOUND;
+    h.timeouts.stream_max_duration = Duration::from_secs(300);
+    let svc = h.service();
+
+    let started = tokio::time::Instant::now();
+    let failure = svc
+        .create_response_stream_traced(&ctx(), body(MODEL))
+        .await
+        .err()
+        .expect("the plugin never opens the stream");
+
+    assert_provider_unavailable(&failure.error);
+    assert_eq!(started.elapsed(), BOUND, "cut exactly at stream_idle");
+    assert!(h.plugin.contexts()[0].cancel.is_cancelled());
+    assert!(
+        logs_contain("exceeded timeouts.stream_idle") && logs_contain(&failure.response_id),
+        "the timeout is logged with the response id"
+    );
+    // Input-only estimate: 2 input tokens x 1000 / 1000.
+    eventually("commit", || h.quota.commits().len() == 1).await;
+    assert_eq!(h.quota.commits()[0].1.actual_amount, Some(2));
+    assert!(h.quota.releases().is_empty());
+    eventually("report", || h.sink.reports().len() == 1).await;
+    assert!(h.sink.reports()[0].usage.estimated);
 }

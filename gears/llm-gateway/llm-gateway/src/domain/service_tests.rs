@@ -99,6 +99,19 @@ async fn pep_checks_the_create_response_action() {
 
     let request = h.pdp.last_request().expect("PDP was asked");
     assert_eq!(request.action.name, "create_response");
+    assert_eq!(
+        request.resource.resource_type,
+        crate::domain::authz::LLM_GATEWAY_RESOURCE_TYPE
+    );
+    assert_eq!(
+        request.resource.properties.get("owner_tenant_id"),
+        Some(&serde_json::json!(ctx().subject_tenant_id().to_string())),
+        "the resource is scoped by the caller's tenant"
+    );
+    assert!(
+        !request.context.require_constraints,
+        "a subject- and tenant-level gate needs no row constraints"
+    );
 }
 
 #[tokio::test]
@@ -122,9 +135,13 @@ async fn pdp_denial_is_permission_denied_and_no_dependency_is_called() {
 async fn pdp_unavailable_fails_closed_without_calling_dependencies() {
     let mut h = Harness::new();
     h.pdp = FakePdp::new(PdpMode::Unreachable, h.log.clone());
-    let result = h.service().create_response(&ctx(), body("m")).await;
+    let err = h
+        .service()
+        .create_response(&ctx(), body("m"))
+        .await
+        .expect_err("an unreachable PDP must never permit");
 
-    assert!(result.is_err(), "an unreachable PDP must never permit");
+    assert!(matches!(err, LlmGatewayError::GatewayUnavailable), "{err}");
     assert_eq!(h.pdp.calls(), 1, "the PDP was consulted");
     assert_eq!(h.models.calls(), 0);
     assert_eq!(h.plugin.calls(), 0);
@@ -659,7 +676,9 @@ async fn caller_side_failure_logs_at_info_without_error_level() {
 #[tracing_test::traced_test]
 async fn provider_failure_logs_truncated_escaped_message_and_identifiers() {
     let mut h = Harness::new();
-    let message = format!("{}\nFORGED log line", "S".repeat(5000));
+    // The newline sits inside the first 1024 chars, so truncation keeps it
+    // and the escaping is what stands between it and a forged log line.
+    let message = format!("head\nFORGED log line{}", "S".repeat(5000));
     h.set_plugin(FakePlugin::with(
         move |_| {
             Err(LlmGatewayError::provider(
@@ -684,4 +703,93 @@ async fn provider_failure_logs_truncated_escaped_message_and_identifiers() {
     assert!(logs_contain("ctx_len"));
     assert!(!logs_contain(&"S".repeat(1025)), "message is truncated");
     assert!(!logs_contain("\nFORGED"), "newline is escaped");
+    assert!(
+        logs_contain("head\\nFORGED log line"),
+        "the escaped text is what is logged"
+    );
+}
+
+#[tokio::test]
+#[tracing_test::traced_test]
+async fn a_server_side_failure_logs_at_warn_not_error() {
+    let mut h = Harness::new();
+    h.set_plugin(FakePlugin::with(
+        |_| Err(LlmGatewayError::QuotaCheckUnavailable),
+        h.log.clone(),
+        false,
+    ));
+    let failure = h
+        .service()
+        .create_response_traced(&ctx(), body("m"))
+        .await
+        .expect_err("plugin fails");
+    assert!(logs_contain(&failure.response_id));
+    assert!(logs_contain("WARN"));
+    assert!(!logs_contain("ERROR"));
+}
+
+#[tokio::test]
+#[tracing_test::traced_test]
+async fn a_caller_side_provider_failure_logs_at_info() {
+    let mut h = Harness::new();
+    h.set_plugin(FakePlugin::with(
+        |_| {
+            Err(LlmGatewayError::provider(
+                ProviderErrorCategory::RateLimited,
+                "slow down",
+                ProviderFailure::default(),
+            ))
+        },
+        h.log.clone(),
+        false,
+    ));
+    let failure = h
+        .service()
+        .create_response_traced(&ctx(), body("m"))
+        .await
+        .expect_err("plugin fails");
+    assert!(logs_contain(&failure.response_id));
+    assert!(logs_contain("INFO"));
+    assert!(!logs_contain("WARN"));
+    assert!(!logs_contain("ERROR"));
+}
+
+#[test]
+fn the_server_side_classification_follows_the_5xx_mapping() {
+    use super::is_server_side;
+    let server_side = [
+        LlmGatewayError::internal("x"),
+        LlmGatewayError::ModelResolutionUnavailable,
+        LlmGatewayError::CredentialsUnavailable,
+        LlmGatewayError::QuotaCheckUnavailable,
+        LlmGatewayError::GatewayUnavailable,
+        LlmGatewayError::provider_not_supported("p"),
+        LlmGatewayError::provider(
+            ProviderErrorCategory::ProviderUnavailable,
+            "x",
+            ProviderFailure::default(),
+        ),
+    ];
+    for err in &server_side {
+        assert!(is_server_side(err), "{err}");
+    }
+    let caller_side = [
+        LlmGatewayError::validation("x"),
+        LlmGatewayError::model_not_found("m"),
+        LlmGatewayError::schema_not_found("s"),
+        LlmGatewayError::media_not_found(),
+        LlmGatewayError::QuotaExceeded,
+        LlmGatewayError::PermissionDenied,
+        LlmGatewayError::UnapprovedDestination,
+        LlmGatewayError::unsupported_parameter("p"),
+        LlmGatewayError::output_validation("x"),
+        LlmGatewayError::provider(
+            ProviderErrorCategory::AuthenticationFailed,
+            "x",
+            ProviderFailure::default(),
+        ),
+    ];
+    for err in &caller_side {
+        assert!(!is_server_side(err), "{err}");
+    }
 }

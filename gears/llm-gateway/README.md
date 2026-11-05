@@ -2,32 +2,41 @@
 
 Unified interface for LLM inference across providers. Stateless, pass-through design.
 
+## Status
+
+The core gear (`llm-gateway/`) is implemented in slices; see [DESIGN.md](docs/DESIGN.md) for the details of each part.
+
+- **Implemented**: Open Responses REST API (sync create-response, SSE streaming, embeddings), request pipeline with PEP authorization, model resolution, provider plugin routing, capability and parameter checks, tool schema resolution, structured output validation, media input checks and the media resolver (inline data; no network access), AI credit quota (lease admission, settle), usage reporting to Usage Collector, timeouts (provider, stream idle and maximum duration, per-dependency), in-flight limits and graceful shutdown.
+- **Deviation: keyless Credential Broker.** The broker fetches no provider keys from CredStore: until `ModelInfoV1` exposes a secret reference every model is treated as keyless (authentication is handled by OAGW). The key path is target design (DESIGN § 4.9, § 4.10).
+- **Pending (slice 6b)**: the OAGW-backed media fetcher through a configured route. Until then a byte-only plugin given an `https` media URL gets `capability_not_supported`.
+- **Not implemented**: provider fallback, pre/post-response interceptors, rate limiting, batch, audit events and the P1 modalities marked below as open.
+
 ## Capabilities
 
 ### P1 — Core
 
-- [ ] Chat completion (sync and streaming)
-- [ ] Embeddings generation
-- [ ] Vision (image analysis)
+- [x] Chat completion (sync and streaming)
+- [x] Embeddings generation
+- [x] Vision (image analysis) — inline data; URL input pending slice 6b
 - [ ] Image generation
 - [ ] Speech-to-text (transcription)
 - [ ] Text-to-speech (synthesis)
 - [ ] Video understanding
 - [ ] Video generation
-- [ ] Document understanding
-- [ ] Tool/function calling
-- [ ] Structured output (JSON mode)
+- [x] Document understanding — inline data; URL input pending slice 6b
+- [x] Tool/function calling
+- [x] Structured output (JSON mode)
 - [ ] Async jobs (long-running operations)
 - [ ] Realtime audio (WebSocket)
-- [ ] Usage tracking
+- [x] Usage tracking
 
 ### P2 — Reliability & Governance
 
 - [ ] Provider fallback
-- [ ] Timeout enforcement
+- [x] Timeout enforcement
 - [ ] Pre-call interceptor
 - [ ] Post-response interceptor
-- [ ] Per-tenant budget enforcement
+- [x] Per-tenant budget enforcement
 - [ ] Rate limiting (tenant/user)
 
 ### P3 — Optimization
@@ -47,7 +56,7 @@ gears/llm-gateway/
 │   ├── DESIGN.md
 │   └── ADR/
 ├── llm-gateway-sdk/         # Public API traits, models, errors
-├── llm-gateway/             # Core gear implementation (planned)
+├── llm-gateway/             # Core gear implementation
 └── plugins/                 # (planned)
     ├── providers/
     │   ├── openai_plugin/       # OpenAI-compatible providers

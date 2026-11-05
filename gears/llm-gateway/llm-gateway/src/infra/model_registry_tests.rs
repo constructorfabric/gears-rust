@@ -194,6 +194,22 @@ async fn model_registry_failure_is_model_resolution_unavailable() {
 }
 
 #[tokio::test]
+#[tracing_test::traced_test]
+async fn a_registry_failure_is_logged_with_its_source_chain() {
+    let resolver = ModelRegistryResolver::new(FakeRegistry::new(|| {
+        Err(ModelRegistryError::internal_from(
+            "lookup failed",
+            std::io::Error::other("connection refused by db"),
+        ))
+    }));
+    resolver
+        .resolve(&ctx(), "openai::gpt-4o")
+        .await
+        .expect_err("registry failed");
+    assert!(logs_contain("lookup failed: connection refused by db"));
+}
+
+#[tokio::test]
 async fn provider_and_access_problems_are_model_not_found() {
     let outcomes: Vec<fn() -> ModelRegistryError> = vec![
         || ModelRegistryError::provider_disabled(Uuid::nil()),

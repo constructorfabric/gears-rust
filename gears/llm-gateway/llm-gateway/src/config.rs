@@ -6,6 +6,7 @@ use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
 use usage_collector_sdk::UsageTypeGtsId;
 
+use crate::domain::quota_guard::SETTLE_SAFETY_LEAD;
 use crate::module::GEAR_STOP_TIMEOUT;
 
 /// Root configuration of the LLM Gateway gear.
@@ -64,6 +65,13 @@ impl LlmGatewayConfig {
             if timeout.is_zero() {
                 return Err(format!("timeouts.dependency.{name} must be > 0"));
             }
+        }
+        let min_margin = SETTLE_SAFETY_LEAD + self.timeouts.dependency.quota_enforcement;
+        if self.quota.lease_ttl_margin <= min_margin {
+            return Err(format!(
+                "quota.lease_ttl_margin must be > {}ms (the settle safety lead plus timeouts.dependency.quota_enforcement): a settle needs time before the lease expires",
+                min_margin.as_millis()
+            ));
         }
         self.validate_usage()?;
         self.validate_media()?;

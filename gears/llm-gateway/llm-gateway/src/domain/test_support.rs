@@ -35,6 +35,7 @@ use quota_enforcement_sdk::{
 };
 use secrecy::SecretString;
 use tokio::sync::Notify;
+use tokio_util::sync::CancellationToken;
 use toolkit::api::canonical_prelude::CanonicalError;
 use toolkit_security::{PlatformSecurityContext, SecurityContext, pep_properties};
 use usage_collector_sdk::{
@@ -552,6 +553,8 @@ pub enum StreamScript {
     EventsThenHang(Vec<StreamingEvent>),
     /// Fail before the stream starts.
     StartError(fn() -> LlmGatewayError),
+    /// Never finish opening the stream.
+    StartHang,
 }
 
 /// Stream wrapper that records its own drop (the plugin side of upstream
@@ -776,6 +779,7 @@ impl LlmGatewayProviderPluginClientV1 for FakePlugin {
         let script = self.script.lock().expect("script").clone();
         let inner: ResponseEventStream = match script {
             StreamScript::StartError(make) => return Err(make()),
+            StreamScript::StartHang => std::future::pending().await,
             StreamScript::Events(events) => Box::pin(futures_util::stream::iter(events)),
             StreamScript::EventsThenHang(events) => Box::pin(futures_util::StreamExt::chain(
                 futures_util::stream::iter(events),
@@ -1184,6 +1188,9 @@ pub struct FakeQuota {
     release_script: Mutex<VecDeque<Result<(), QuotaEnforcementError>>>,
     tokens: AtomicUsize,
     park_acquire: AtomicBool,
+    /// Cancelled by the next successful-path `acquire_lease` answer (fires the
+    /// shutdown cut right as admission completes).
+    cancel_on_acquire: Mutex<Option<CancellationToken>>,
     /// The next this many `commit_lease` / `release_lease` calls never answer.
     hang_settles: AtomicUsize,
     /// Notified when an `acquire_lease` call has started (only when parked).
@@ -1204,6 +1211,7 @@ impl FakeQuota {
             release_script: Mutex::new(VecDeque::new()),
             tokens: AtomicUsize::new(0),
             park_acquire: AtomicBool::new(false),
+            cancel_on_acquire: Mutex::new(None),
             hang_settles: AtomicUsize::new(0),
             acquire_entered: Notify::new(),
             acquire_release: Notify::new(),
@@ -1233,6 +1241,11 @@ impl FakeQuota {
         outcomes: impl IntoIterator<Item = Result<(), QuotaEnforcementError>>,
     ) {
         self.release_script.lock().expect("script").extend(outcomes);
+    }
+
+    /// Cancel `token` when the next `acquire_lease` call answers.
+    pub fn cancel_on_acquire(&self, token: CancellationToken) {
+        *self.cancel_on_acquire.lock().expect("token") = Some(token);
     }
 
     /// Park every `acquire_lease` call until `acquire_release` is notified.
@@ -1398,6 +1411,9 @@ impl QuotaEnforcementClientV1 for FakeQuota {
         }
         if let Some(outcome) = self.acquire_script.lock().expect("script").pop_front() {
             return outcome;
+        }
+        if let Some(token) = self.cancel_on_acquire.lock().expect("token").take() {
+            token.cancel();
         }
         let n = self.tokens.fetch_add(1, Ordering::SeqCst);
         Ok(acquired(

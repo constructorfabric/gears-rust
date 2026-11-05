@@ -144,6 +144,15 @@ mod mapping {
     }
 
     #[test]
+    fn an_overlong_provider_request_id_is_truncated_in_the_record() {
+        let mut r = report(1);
+        r.provider_request_id = Some("r".repeat(llm_gateway_sdk::MAX_PROVIDER_ID_CHARS + 100));
+        let record = build_record(&r, &usage_type()).expect("valid record");
+        let id = meta(&record, "provider_request_id").expect("key");
+        assert_eq!(id.chars().count(), llm_gateway_sdk::MAX_PROVIDER_ID_CHARS);
+    }
+
+    #[test]
     fn a_missing_provider_request_id_omits_the_key() {
         let mut r = report(1);
         r.provider_request_id = None;

@@ -35,8 +35,10 @@ use crate::models::plugin::{ProviderCallCtx, ProviderPluginCapabilities};
 /// Covers the P1 surfaces the core delegates per request: create-response
 /// (sync and streaming) and embeddings. Every call receives a
 /// [`ProviderCallCtx`] carrying the resolved model info as the GTS-typed
-/// `ModelInfoV1` envelope and the optional provider API key, so the plugin
-/// needs no Model Registry or `CredStore` access of its own.
+/// `ModelInfoV1` envelope and the optional provider API key (today always
+/// absent: the core's credential broker is keyless until the model info
+/// carries a secret reference), so the plugin needs no Model Registry or
+/// `CredStore` access of its own.
 ///
 /// Requests and responses are the same Open Responses–aligned SDK types the
 /// core uses. Every response carries [`crate::models::core::Usage`] with the

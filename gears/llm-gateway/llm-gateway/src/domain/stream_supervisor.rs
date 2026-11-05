@@ -773,15 +773,27 @@ impl Bounds {
         }
     }
 
-    /// Resolves after the idle timeout; created anew for every wait on the
-    /// plugin stream, so only that wait counts.
-    async fn idle_expired(&self) -> StopReason {
-        match self.idle {
-            Some(idle) => tokio::time::sleep(idle).await,
-            None => std::future::pending().await,
-        }
-        StopReason::Idle
+    /// The idle timer, one per relay: re-armed with [`Self::rearm_idle`]
+    /// before every wait on the plugin stream, so only that wait counts.
+    fn idle_timer(&self) -> Option<Pin<Box<tokio::time::Sleep>>> {
+        self.idle.map(|idle| Box::pin(tokio::time::sleep(idle)))
     }
+
+    /// Restart `timer` for a fresh wait of the idle timeout.
+    fn rearm_idle(&self, timer: &mut Option<Pin<Box<tokio::time::Sleep>>>) {
+        if let (Some(timer), Some(idle)) = (timer.as_mut(), self.idle) {
+            timer.as_mut().reset(tokio::time::Instant::now() + idle);
+        }
+    }
+}
+
+/// Resolves when `timer` fires; never when there is none.
+async fn idle_expired(timer: &mut Option<Pin<Box<tokio::time::Sleep>>>) -> StopReason {
+    match timer {
+        Some(timer) => timer.await,
+        None => std::future::pending().await,
+    }
+    StopReason::Idle
 }
 
 /// Drive `upstream` into `tx` until a terminal event was sent or the consumer
@@ -823,19 +835,26 @@ async fn relay(
         }
     }
 
+    // Both timers live across iterations: `hard_stop` is an absolute deadline
+    // (re-polling it is cheap and loses nothing), the idle timer is re-armed
+    // per wait instead of allocating a new one per event.
+    let hard_stop = bounds.hard_stop();
+    tokio::pin!(hard_stop);
+    let mut idle_timer = bounds.idle_timer();
     loop {
         // Only the wait on the plugin stream counts for the idle timer.
+        bounds.rearm_idle(&mut idle_timer);
         let next = tokio::select! {
             biased;
             () = tx.closed() => {
                 log_disconnect(&state.response_id);
                 return;
             }
-            reason = bounds.hard_stop() => {
+            reason = &mut hard_stop => {
                 stop_stream(&state, &mut guard, &params.cancel, &stop, reason, None);
                 return;
             }
-            reason = bounds.idle_expired() => {
+            reason = idle_expired(&mut idle_timer) => {
                 stop_stream(&state, &mut guard, &params.cancel, &stop, reason, None);
                 return;
             }

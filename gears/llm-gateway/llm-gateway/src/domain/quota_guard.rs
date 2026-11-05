@@ -147,7 +147,7 @@ pub fn classify_settle_error(err: &QuotaEnforcementError) -> SettleErrorClass {
 /// Settle attempts stop this long before the lease deadline: a call that late
 /// would only meet an expired lease (`LEASE_NOT_ACTIVE`). Quota Enforcement
 /// releases the lease on its own.
-const SETTLE_SAFETY_LEAD: Duration = Duration::from_secs(2);
+pub(crate) const SETTLE_SAFETY_LEAD: Duration = Duration::from_secs(2);
 
 /// Default jitter of the settle retry backoff (+-20%).
 const DEFAULT_BACKOFF_JITTER: f64 = 0.2;

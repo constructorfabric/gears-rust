@@ -75,12 +75,26 @@ impl ModelResolver for ModelRegistryResolver {
             }
             // `Internal` and any other (or future) variant: registry unavailable.
             Err(err) => {
-                // Identifiers only; the registry error chain stays off the wire.
-                tracing::warn!(model, error = %err, "model registry lookup failed");
+                // Identifiers and the full source chain; the chain stays off the
+                // wire. The service logs the outcome code separately, without
+                // the cause, so this is the only record of why.
+                tracing::warn!(model, error = %error_chain(&err), "model registry lookup failed");
                 Err(LlmGatewayError::ModelResolutionUnavailable)
             }
         }
     }
+}
+
+/// `err` and its `source` chain, `: `-separated.
+fn error_chain(err: &dyn std::error::Error) -> String {
+    let mut text = err.to_string();
+    let mut source = err.source();
+    while let Some(cause) = source {
+        text.push_str(": ");
+        text.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    text
 }
 
 #[cfg(test)]

@@ -44,8 +44,9 @@ pub struct ProviderCallCtx {
     /// sets it on the outbound provider request, which goes only through OAGW,
     /// over HTTPS, to the model's upstream alias (`provider_settings.oagw_alias`).
     /// `None` for models without a secret reference (authentication handled by
-    /// OAGW, local provider). The
-    /// key is redacted in `Debug`, zeroed on drop, and must never be logged or
+    /// OAGW, local provider). Until `ModelInfoV1` exposes a secret reference
+    /// the gateway's Credential Broker is keyless and this is always `None`
+    /// (DESIGN § 4.9). The key is redacted in `Debug`, zeroed on drop, and must never be logged or
     /// persisted.
     pub api_key: Option<SecretString>,
 
