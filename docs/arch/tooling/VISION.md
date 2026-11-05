@@ -14,9 +14,9 @@ reports that the copy went stale or wrong.
 
 **The answer.** One tool sets a repository up, checks that it still matches the conventions the
 project chose, and carries those conventions forward. The conventions are referenced by version, not
-copied, so the ordinary upgrade is a change of pins. A maintainer runs the tool to set a repository
-up and keep it correct, a gear developer runs it before a push to learn what is missing, and a bot
-runs it on a schedule to deliver an upgrade that nobody asked for.
+copied, so the ordinary upgrade is a change of pins. A maintainer runs it to set a repository up and
+keep it correct. A gear developer runs it before a push, to learn what is missing. A bot runs it on
+a schedule, to deliver an upgrade that nobody asked for.
 
 **The limit.** The tool checks only what it installed or what the project declared. It installs no
 software, runs no bot, and never merges an upstream change into a file that a project edited.
@@ -26,9 +26,9 @@ the architecture, the commands, the file formats or the implementation; those be
 and in the ADRs after it. It is written for the maintainers of `gears-rust`, `cargo-gears`,
 `gearbox` and the `studio-kit-gears` kit.
 
-**How to read it.** The whole document takes about twenty-five minutes, and section 4 is half of
-that. Skip section 3 if you already know what `cargo gears`, `gears.mk`, Studio and Gearbox each
-cover today. If you only need the decisions, read this block and section 6.
+**How to read it.** About thirty minutes end to end, and section 4 is half of that. Skip section 3
+if you already know what `cargo gears`, `gears.mk`, Studio and Gearbox each cover today. If you only
+need the decisions, read this block, the walk-through at the top of section 4, and section 6.
 
 ## Table of Contents
 
@@ -60,7 +60,8 @@ This document uses these terms with one meaning each.
 | **reference** | Upstream keeps the file. The repository holds only a pin. An upgrade changes the pin and nothing else, because the content is not here to change. |
 | **generate** | Upstream supplies a rule, not a file. The tool derives the content, and it can derive the same content again at any time. An upgrade runs the rule again. |
 | **copy** | Upstream supplies the file itself. The tool cannot derive the content. An upgrade replaces the whole file with a newer version from upstream. |
-| **managed file** | A file that the tool generated or copied. A person must not edit it. |
+| **managed file** | A file that the tool generated or copied, and still owns. A person does not edit it; a project that needs different content declares an exception, and the tool stops managing that file. |
+| **profile** | A named preset of conventions. A convenient starting selection, not a separate product. |
 | **bot** | An automation that runs the tool without attention and then delivers the result, usually as a pull request. The integrating project selects it and runs it. |
 | **update wiring** | The files in a repository that let a bot drive the tool: the scheduled job, the pull-request check, and the updater configuration for the pins. |
 | **drift** | The repository no longer agrees with the conventions that it follows. |
@@ -124,12 +125,13 @@ release cycle and a different manifest, and each stops at a different place.
 | P8 — nothing states which gear versions work together | Gearbox reads a catalogue from the 64 `gear.gdl` descriptors, resolves a product and writes `product.lock` | Sources are local paths and version resolution is not built, so a consumer outside this repository cannot use it. Composition also cannot see a gear without a descriptor, and Gearbox ships no migration tool by decision |
 | P9 — everything assumes you work inside `gears-rust` | PR #5326 adds `scripts/ci-commands.toml`, `scripts/project-paths.toml` and a `cf-gears-init` workflow that discovers a project's own commands and paths | It adapts the kit to a project. It gives the project no conventions, no CI and no build system |
 
-Two facts outlive this snapshot. Two of the four mechanisms in use generate an application from
-different manifests — `cargo gears` from `Gears.toml`, Gearbox from `gear.gdl` with `product.gdl` —
-so three files describe one gear, under one rule: each fact has exactly one owner. And a long list
-belongs to none of the five: the 30 workflows, the thirteen lint, audit, toolchain and test
-configuration files, the `gears/` + `libs/` + `apps/` layout holding 20 gears and 37 libraries, the
-`guidelines/DNA` submodule, and the document set under each gear.
+Two facts outlive this snapshot. Two of the four mechanisms in use generate an application, from
+different manifests: `cargo gears` from `Gears.toml`, Gearbox from `gear.gdl` with `product.gdl`.
+Three files therefore describe one gear, under one rule — each fact has exactly one owner.
+
+And a long list belongs to none of the five. It holds the 30 workflows, the thirteen lint, audit,
+toolchain and test configuration files, the `gears/` + `libs/` + `apps/` layout with its 20 gears
+and 37 libraries, the `guidelines/DNA` submodule, and the document set under each gear.
 
 ## 4. Vision
 
@@ -157,41 +159,60 @@ One precondition is not ours to meet. The conventions must live where a pin can 
 somebody must put them there. Section 3 records that on the date above neither place existed, and
 that work changes `gears-rust` before it changes any new project.
 
+### One repository, start to finish
+
+A maintainer starts a gear repository. They pick a profile and adjust it: document-first development
+yes, FIPS no. Setup writes the layout, the build and CI wiring, the lint and toolchain
+configuration, the Studio setup and the update wiring, with a pin for each convention. The report
+ends by naming the two tools missing from their machine. Nothing is hidden: the selection is a file
+in the repository, and so is every pin.
+
+A week later a developer adds a gear and runs the check before pushing. It reports that the crate is
+there but the DESIGN document and the descriptor are not — the parts a new gear needs that nobody
+had written down for them. The same check runs on the pull request, so the answer does not depend on
+anyone remembering.
+
+A month later a convention moves upstream. The scheduled job runs the update, and a pull request
+arrives changing four pins and two managed files. The diff is small, the reasoning is in the report,
+and it merges.
+
+The next upgrade is not like that. A make target was renamed, which no pin can express. The update
+stops, reports what it could not advance and why, and leaves the repository as it was. Somebody
+makes the change deliberately, and the check confirms conformance again.
+
+That arc — **set up, check, update, check again** — is the product. The first step happens once; the
+rest repeat for the life of the repository, and the last is what makes the third safe.
+
 ### Repository setup
 
 The tool takes an empty repository to a working one. It installs the directory layout, the make
 driver and the project make file, the CI workflows, and the configuration for lint, format, audit,
 toolchain and tests. It sets Studio up. It records a pin for every convention that it installs.
 
-Setup also includes the AI wiring. That is scaffolding, not a separate responsibility. It holds the
-skills and prompts for review, document generation and code generation. It also holds the agent
-configuration that connects them to whatever agent the developer runs.
+Setup also includes the AI wiring: the skills and prompts for review, document generation and code
+generation, plus the agent configuration that connects them to whatever agent the developer runs.
+That is scaffolding, not a separate responsibility.
 
-It also installs the update wiring. Delivery belongs to the integrator, so a new project would
-otherwise start with no automation at all. The wiring is the part of a repository that lets a bot
-drive the tool. It puts the update on a schedule. It runs the check on every change. It tells the
-updater that the project already uses about the new pins. It is a working default, not an example in
-a README. The project owns it from the first day, and can change the schedule, change the bot, or
-remove it.
-
-Once the required tools are present, the result builds and passes its own checks before the
-repository holds any product code. The tool does not install those tools; it reports the ones that
-are missing.
+And it installs the update wiring. Delivery belongs to the integrator, so a new project would
+otherwise start with no automation at all. The wiring is what lets a bot drive the tool. It puts the
+update on a schedule. It runs the check on every change. It tells the updater the project already
+uses about the new pins. It is a working default, not an example in a README. The project owns it from
+the first day and can change the schedule, change the bot, or remove it.
 
 ### Conformance validation
 
 A maintainer asks one question: is my repository still correct? P5 names this responsibility, and
-nothing answers it today. The tool answers it on every pull request, not once at the start, and the
-answer covers what the tool itself put there and what the project declared — nothing else.
+nothing answers it today. The tool answers it on every pull request, not once at the start. The
+answer covers what the tool itself put there and what the project declared, and nothing else.
 
-One thing is easy to miss. A reference trades one failure for a smaller one: its content can no
-longer be wrong, but the reference can fail to resolve, and then nothing works and the cause is far
+One thing is easy to miss. A reference trades one failure for a smaller one. Its content can no
+longer be wrong. But the reference can fail to resolve, and then nothing works and the cause is far
 away. P5 records a submodule that stopped `cfs` with an unclear error. Every reference therefore
 needs its unresolved state checked, not assumed.
 
 **It judges the repository against the maintainer's choice, not against `gears-rust`.** The
 conventions are a menu, not a standard. Document-first development, descriptor coverage, crate
-layering, FIPS and the full CI pipeline are each a separate choice, and a project that builds
+layering, FIPS and the full CI pipeline are each a separate choice. A project that builds
 applications needs a different set from one that publishes gears.
 
 A project that never took a convention is in a correct, declared state. A project that took one and
@@ -209,9 +230,23 @@ crate, the author writes the descriptor, and the Gearbox catalogue check reports
 whether the tool created, copied, referenced or declared the thing under test. If not, the check
 belongs elsewhere. `cfs` owns document structure, Gearbox owns descriptor errors, dylint owns crate
 layering, `cargo-deny` owns dependency policy. A second implementation of any of those gives a
-project two answers to one question. The tool still makes them effective, because it verifies that
-they run: it confirms the CI job exists and its pins are current, and never decides the verdict
-again.
+project two answers to one question.
+
+That boundary creates the one thing this responsibility must never get wrong. **A configured check
+is not a passing check**, and the report must not let the two blur. For every convention a project
+declared, there are five distinct states, and only the last is good news:
+
+- the convention is declared;
+- its reference resolves;
+- its own configuration is intact — the managed file is unmodified, the pin is current;
+- the check that enforces it is wired and ran;
+- that check passed.
+
+The tool answers the first four itself and reports the fifth from its owner. Where it cannot reach
+an answer — a validator that did not run, a check it has no access to — it says so. **A check that
+did not run is never reported as a check that passed**, and a convention the project never took is
+reported as unselected rather than failed. The reader must be able to tell what was checked, what
+was not, and why.
 
 **It installs conventions. It does not install software.** Installation depends on the platform, the
 runner image and the package manager of the user, and a tool that installs software becomes a package
@@ -226,10 +261,23 @@ A project asks three questions. Which versions do I pin? What moved upstream? Wh
 difference mean for me? The project then applies the upgrade. Without this loop, the tool is a
 one-time copy with extra steps, and P4 returns.
 
-**The loop is not a merge engine.** A project references its conventions by version, so the normal
-upgrade is a change of pins. The tool cannot reference a small set of files, and it replaces each of
-those as a whole file, under a version check. This vision rejects one model outright: a three-way
-merge of upstream changes onto files that a project edited. Section 5 gives the reason.
+**Routine upgrades should be version changes. Exceptional ones must be explicit.** A project
+references its conventions by version, so most upgrades move pins and touch nothing else. The small
+set of files that cannot be referenced is replaced whole, under a version check. Some upgrades
+cannot be expressed that way at all: a renamed make target, a reshaped configuration. Those must
+stop, name what they could not advance, and leave the repository as it was. A repository is
+never left half-upgraded with no account of what happened.
+
+One model is rejected outright: a **three-way merge of upstream changes into a managed file that the
+project edited**. Section 5 gives the reason — that merge fails quietly, producing no conflict
+markers and a file that is still wrong.
+
+Read that narrowly. It forbids silently reconciling two sets of edits to one file. It does not
+forbid a future versioned migration that states what it changes and why, and it does not forbid a
+project from diverging. **Divergence is allowed when it is declared**: a project records the
+exception, the tool stops managing that file, and the report shows it as a declared exception rather
+than as drift. Without that route a project edits a managed file and says nothing, and the tool
+loses the ability to tell a deliberate change from a mistake.
 
 **The loop is not a bot either, but a bot must be able to drive it.** That is a requirement, not a
 convenience. Section 2 shows that P4 fails on human attention, so the loop has value only if it runs
@@ -254,6 +302,28 @@ is strict so that the same inputs always produce the same output. A bot that can
 result cannot be trusted with it. A bot and a developer run the same command and take the same code
 path; there is no automation mode. That discipline pays on the human side too, because every change
 is then reproducible by hand and reviewable by a person.
+
+The tool owes automation a contract it can drive. It does not owe, and cannot give, the guarantee
+that the automation runs. A bot the project removed delivers nothing, and a CI provider that is down
+delivers nothing. Setup ships working wiring so that the common case needs no decision, and the
+project keeps the right to change or remove it. The loop's reliability is therefore shared: the tool
+owns determinism and honest reporting, the project owns delivery.
+
+### What the tool promises
+
+Each promise is bounded by what the tool actually controls.
+
+| | It promises | It does not promise |
+|---|---|---|
+| **Setup** | The selected conventions and their wiring are in place, each with a pin, and anything missing is named | A green build. That needs tools installed, services configured and code written |
+| **Validation** | A truthful answer within its footprint, with the five states above kept apart and every gap in its own knowledge visible | That the repository is good — only that it is, or is not, what the project said it would be |
+| **Update** | Pins and managed files move reproducibly, and an upgrade that cannot be applied stops and says why | That every upstream change applies by itself, or that anything delivers it |
+
+Three safety expectations hold across all three. Conventions resolve only from sources the project
+declared, so an upgrade cannot quietly start following somebody else's. Resolution is reproducible,
+so the same pins yield the same content for a developer today and an unattended run next week. And
+the execution boundary is explicit: read manifests, write a working tree, report. A project knows
+what it agreed to run when the scheduled job fires at three in the morning.
 
 ### What this changes for `gears-rust`
 
@@ -288,16 +358,31 @@ Three limits hold whatever is added.
 | The core keeps the contract: exit codes, report schema and lifecycle are not extensible | First-party capability then uses the same mechanism as everybody else, so the public path cannot decay |
 | An extension adds checks and commands, never new concepts | A tool whose core owns the model stays a tool; one that lets extensions rewrite it becomes a framework |
 
+Open at the edges is not the same as built at the edges. The first useful version needs none of these:
+a dependency solver, a package manager, a hosted service, a migration engine, a plugin runtime, or
+a replacement for any build, CI or validation tool that already exists. A capability that may be worth
+building later is not an argument for building it first. **A small set of conventions that can be
+installed, checked and updated beats a large catalogue that only supports the first step** — and a
+tool that cannot complete that cycle for one convention will not complete it for fifty.
+
 ### 4.2 Scope
 
 Setup answers P1, P2, P3 and P9. Validation answers P5 and P7. The update loop answers P4. The
-declaration answers P6. Two answers carry a condition: P2 and P9 wait until the conventions live
-where a pin can select them, and P8 stays with Gearbox, because only Gearbox can produce a resolved
-set of gear versions.
+declaration answers P6. Two answers carry a condition. P2 and P9 wait until the conventions live
+where a pin can select them. P8 stays with Gearbox, because only Gearbox can produce a resolved set
+of gear versions.
 
 **In scope** are the three responsibilities above, and with them the declaration of the conventions
-a repository follows and the presence check for the tools those conventions need. The rest divides
-into what an extension may add later, and what an extension must not add either.
+a repository follows and the presence check for the tools those conventions need.
+
+Three starting points are not the same problem, and only the first two are in scope. A **new
+repository** is the primary case and the one the product must do well. An **existing Gears
+repository** comes under management by declaring the conventions it already follows and letting the
+check report the gap — adoption there is a declaration plus a backlog, not a rewrite, and the tool
+must not silently take ownership of files a team maintains. An **unrelated repository** is out of
+scope today; nothing in the design forbids it, but it is not what the first version is for.
+
+The rest divides into what an extension may add later, and what an extension must not add either.
 
 | Capability | Status | Who owns it, or why not |
 |---|---|---|
@@ -306,8 +391,9 @@ into what an extension may add later, and what an extension must not add either.
 | Composition and deployment resolution | Out of scope today | Gearbox |
 | Release orchestration | Out of scope today | release-plz |
 | Migrating a consumer across a breaking platform change | Out of scope today | Would be a versioned codemod; nobody owns it yet |
-| Adopting a repository that does not use Gears | Out of scope today | A later question |
-| A three-way merge of upstream and local edits to one file | Excluded by design | A file that needs it belongs with a reference or with generation |
+| Adopting an unrelated repository that does not use Gears | Out of scope today | A later question; the first version serves Gears projects |
+| Rewriting an existing repository to match a convention it declared | Out of scope today | The check reports the gap; closing it is the team's work, not a silent edit |
+| A three-way merge of upstream and local edits to one managed file | Excluded by design | It fails quietly. A project that needs different content declares an exception instead; an upgrade that needs a real transformation states what it changes |
 | Installing tooling | Excluded by design | The platform, the runner image or the user's package manager |
 | A second implementation of another validator's judgement | Excluded by design | `cfs`, Gearbox, dylint and `cargo-deny` keep their own verdicts |
 | Any runtime responsibility | Excluded by design | This tool works at development time only |
@@ -318,51 +404,92 @@ into what an extension may add later, and what an extension must not add either.
 
 ## 5. What the successful scaffolds share
 
-This is not our preference. It is where the industry arrived after trying the alternative. Seven
-patterns repeat across the scaffolds that people use every day and that survive.
+These are observations about tools people use every day, not a law. Each one is here because it
+decides something specific below. Taken together they point at one conclusion: **minimize
+unmanaged duplication, and make the lifecycle of whatever is generated or copied explicit.**
 
 | Pattern | Evidence | What it decides here |
 |---|---|---|
-| **Generate as little as possible** | Create React App produced about 1300 packages and 350 MB; a Vite project uses about 23 and 40 MB. The React team deprecated Create React App in February 2025 for having no active maintainers | Measure setup by what it leaves behind. A large output is a larger surface somebody must keep correct in every project that received it |
-| **What survives at organization scale avoids generation** | Maven parent POMs and BOMs, Gradle convention plugins, GitHub Actions reusable workflows, ESLint shareable configs, `tsconfig` `extends` — all hold a reference and a version, and upgrade by version bump | They exist to prevent our failure, where one change to a best practice needs one pull request per repository that copied it |
+| **The cost of a scaffold is what it leaves unmanaged** | Create React App kept its build configuration inside a versioned dependency, `react-scripts`, and that part upgraded by bumping a version. What the generator wrote into the repository, and everything past `eject`, could not be upgraded at all. The React team deprecated it in February 2025 for having no active maintainers | Judge setup by how much of its output stays managed afterwards, not by how little it writes. An unmanaged file is a file somebody must keep correct by hand in every project that received it |
+| **Conventions that outlive their authors are distributed as versioned references** | Maven parent POMs and BOMs, Gradle convention plugins, GitHub Actions reusable workflows, ESLint shareable configs and `tsconfig` `extends` all put the content upstream and a version in the repository. This is about distribution, not about whether anything is generated — Expo below generates heavily and still upgrades cleanly | Prefer a reference where one is available, because one change then needs one release instead of one pull request per repository that copied it |
 | **A template is a versioned artifact, not a repository you copy** | `dotnet new` installs a template as a package at an exact version, from a public feed, a private server or a shared folder, with a version history | A convention with a version and a feed can be selected, pinned and rolled back. One in somebody's `main` branch can only be copied |
 | **Regenerate instead of edit, and make the exception explicit** | Expo regenerates native directories from the app config, so an upgrade is a bump plus a regeneration — the answer to what the 2022 React Native survey called the library's largest weakness. It never overwrites existing directories, and offers a named patch route | Prefer generation wherever a rule can produce the content. Where a project must diverge, give it a declared exception, or it will edit the file and say nothing |
-| **Real update machinery is a codemod, not a re-render** | `ng update`, `nx migrate`, `rails app:update` and `ember-cli-update` ship versioned transformations owned by the framework that caused the change. A three-way merge of a template fails quietly: no conflict markers, and the file still wrong | Why the update loop replaces whole files and never merges them |
+| **Where upgrades need to change a repository, they are explicit transformations, not merges** | `ng update`, `nx migrate`, `rails app:update` and `ember-cli-update` ship versioned transformations owned by the framework that caused the change, and each states what it touches. A three-way merge of a template fails quietly instead: no conflict markers, and the file still wrong | Why a managed file is replaced whole rather than merged, and why an upgrade that cannot be expressed that way stops and says so rather than guessing |
 | **The road is a default, not a mandate** | Netflix's Paved Road is a set of recommended products and practices that engineers follow by default and leave deliberately | A tool that fails a project for a convention it never took is a tool that teams route around |
 | **Diagnose, report, leave the repair to the operator** | `brew doctor` repairs nothing: it warns, exits non-zero, and leaves the command to the person. `flutter doctor` reports versions and missing parts. Both are the first command run when something breaks | The check command has the same shape |
 
 ## 6. Principles
 
-These are the decisions above, in one list. Sections 5 to 7 carry the reasons.
+These are the decisions above, in one list. Sections 4 and 5 carry the reasons. One sentence holds
+the rest together:
 
-- **Write as few files as possible.** Judge setup by what it leaves behind, not by what it offers.
-- **Give divergence a declared route.** Without one, a project edits a managed file and says nothing.
+> **Prefer a simple, safe and reproducible path over a universal one. Automate the routine, expose
+> the exceptional, and never hide uncertainty behind a successful exit code.**
+
+**What the tool is**
+
 - **A command, not a service.** No action needs a hosted component, an account, or a specific forge.
-- **Delivery belongs to the integrator.** The project picks the bot, the schedule and the approvers.
-- **A check is worth more than a generator.** A generator acts once; a check acts always.
-- **Check your own footprint.** Where another validator owns a judgement, confirm that it runs and
-  leave the verdict to its owner.
-- **Check the tools. Do not install them.** Report the missing tool and its required version.
-- **Generated content and owned content stay separate.** An upgrade never asks a person which lines
-  were theirs.
-- **One fact, one owner.** Several manifests describe one gear. Each fact belongs to one of them.
-- **Documents before code.** A refusal enforces the order. A generator does not.
 - **One place to ask, not one place to run.** `make` and CI run the work; the tool answers questions
   about the repository.
+- **The easiest path is the correct path.** A developer benefits from the convention model without
+  having to learn it. Defaults are good and visible, diagnostics say what to do next, and advanced
+  choices appear only when a project needs them. Nobody should have to configure every convention by
+  hand to get a working repository.
+
+**What it owns, and what it leaves alone**
+
+- **Check your own footprint.** Where another validator owns a judgement, confirm that it runs and
+  leave the verdict to its owner.
+- **Integrate rather than replace.** Reuse the build, CI, generation and validation that exist.
+- **One fact, one owner.** Several manifests describe one gear. Each fact belongs to one of them.
+- **Check the tools. Do not install them.** Report the missing tool and its required version.
+- **Managed content and owned content stay distinct.** An upgrade never asks a person which lines
+  were theirs, and the tool never takes ownership of a file a team maintains.
+- **Delivery belongs to the integrator.** The project picks the bot, the schedule and the approvers.
+
+**How it behaves when things are uncertain**
+
+- **Safety over automatic application.** An upgrade that cannot be applied safely and predictably is
+  reported, not guessed at.
+- **Determinism over cleverness.** A developer and an unattended run reach the same result from the
+  same inputs, and both can reproduce it.
+- **Give divergence a declared route.** Without one, a project edits a managed file and says nothing.
+- **State what you cannot do.** Never invent a substitute, and never report an unrun check as a pass.
+
+**What it optimises for**
+
+- **Lifecycle completeness over feature breadth.** A few conventions that install, check and update
+  beat a catalogue that only installs.
+- **Simplicity over universality.** Serve the Gears workflow well before serving every repository
+  shape.
+- **A check is worth more than a generator.** A generator acts once; a check acts always, including
+  on what already exists and is wrong.
+- **Useful defaults over mandatory standards.** Conventions are a choice the project declares, and
+  silence is never consent.
 - **Extensible at the edges, fixed at the core.** Exit codes, report schema and lifecycle stay fixed.
-- **Conventions are a choice, and the project declares it.** Silence is never consent.
-- **State what you cannot do.** Name what you cannot configure; never invent a substitute.
 
 ## 7. What success looks like
 
-Success is a repository that nobody had to assemble, that says what it follows, and that corrects
-itself when the platform moves. A maintainer learns about drift from a report instead of an
-incident. A developer learns what is missing before a push instead of after one. An upgrade arrives
-in a week when nobody touched the repository.
+Success is visible in what stops happening, and each outcome has somewhere it can be seen. The
+signal is where to look, not a target to hit.
 
-The measurable form of each statement belongs in the requirements, not here. One signal, however,
-outranks every measure. If teams keep copying `gears-rust` by hand while the tool exists, then the
-tool failed, whatever any other number says.
+| Outcome | Where it shows |
+|---|---|
+| Nobody assembles a repository by reading `gears-rust` and copying from it | New repositories start from a declared selection rather than a copied tree, and the first commit is not a dump of configuration |
+| A maintainer learns about drift from a report, not an incident | Drift is found by a check on a pull request rather than by a build that broke for an unrelated reason |
+| A developer learns what a gear is missing before pushing | The check runs locally as a habit, not only in CI — if it only ever runs in CI, the value arrived too late |
+| An upgrade lands in a week when nobody touched the repository | Repositories do not sit on pins that upstream moved past long ago, and the update pull request is a small diff rather than an afternoon |
+| A convention improves in one place and reaches everyone | Fixing a shared rule means one release, not one pull request per repository that copied it |
+| The set of files nobody manages keeps shrinking | The list of copied files gets shorter between releases, and each addition to it has a recorded reason |
+
+None of that is the same as a healthy repository, and the tool should never claim otherwise. It
+makes the state of a repository **legible** — what it follows, how far it has drifted, what it was
+never told to care about. Teams still decide and still do the work.
+
+Two outcomes would be failure even if every feature shipped. If teams keep copying `gears-rust` by
+hand while the tool exists, it did not solve its problem. And if a green check comes to mean
+"nothing ran", it is worse than what came before, because it replaces a known absence with a false
+assurance. The measurable form of these belongs in the requirements, not here.
 
 ## 8. Assumptions and constraints
 
@@ -389,5 +516,6 @@ A team that watches for the signal sees the risk before it costs anything.
 | Divergence has no declared route | A project edits a managed file instead of declaring an exception, so whole-file replacement stops being enough | Somebody asks for a merge mode |
 | The tool becomes a framework | Extensions redefine the model instead of adding checks, and the maintainer stops getting one clear answer | An extension that needs a new concept in the core |
 | A second source of truth returns | A check computes a verdict that `cfs`, Gearbox, dylint or `cargo-deny` already owns | Two reports disagree about one file |
+| A pass stops meaning anything | Unrun or unreachable checks are folded into a green result, and the report no longer separates "checked and passed" from "not checked" | Somebody asks what a green check actually covered, and the answer takes investigation |
 | The menu fragments | Every project selects a unique set, so one piece of advice helps no second repository | No two projects share a selection |
 | The tool lives only in CI | Developers meet it after a push, at the slowest point, and learn to work around it | The check command is absent from local use |
