@@ -123,7 +123,7 @@ The architecture decision below is recorded as an ADR.
 
 - [ ] `p1` - **ID**: `cpt-cf-llm-gateway-principle-stateless-processing-v1`
 
-Every request carries its full context. The Gateway keeps no conversation history, stores no responses, and never sends `previous_response_id` or `store=true` to providers. Instance memory holds only in-flight request state and configuration caches (plugin directory). The gear persists nothing: it has no database and stores no request or response data. This keeps any instance able to serve any request and makes horizontal scaling a deployment concern.
+Every request carries its full context. The Gateway keeps no conversation history, stores no responses, and never sends `previous_response_id` or `store=true` to providers, including on pass-through routes, where `store=false` is forced and stateful fields are rejected (§ 3.3 Pass-through stateless guard). Instance memory holds only in-flight request state and configuration caches (plugin directory). The gear persists nothing: it has no database and stores no request or response data. This keeps any instance able to serve any request and makes horizontal scaling a deployment concern.
 
 #### Content Non-Interpretation
 
