@@ -81,6 +81,10 @@ fn backend(hub: &ClientHub) -> anyhow::Result<GtsPublicationBackend> {
                     if document.get("refuse").is_some() {
                         anyhow::bail!("{id}: rejected");
                     }
+                    if document.get("opaque_expire").is_some() {
+                        // An adapter whose expiry carries no identifier.
+                        return Err(anyhow::Error::new(GtsPublicationExpired));
+                    }
                     if document.get("expire").is_some() {
                         // The gear's own budget, shorter than the job's deadline.
                         return Err(anyhow::anyhow!("{id}: deadline reached")
@@ -152,6 +156,22 @@ fn expiring() -> Vec<DeclarationSource> {
     )]
 }
 
+const OPAQUE: &str = "gts.cf.test.publication.opaque.v1~";
+const OPAQUE_PEER: &str = "gts.cf.test.publication.opaque_peer.v1~";
+
+fn opaque_expiring() -> Vec<DeclarationSource> {
+    vec![DeclarationSource::new(
+        "t",
+        vec![
+            (
+                OPAQUE.to_owned(),
+                json!({"opaque_expire": true}).to_string(),
+            ),
+            (OPAQUE_PEER.to_owned(), "{}".to_owned()),
+        ],
+    )]
+}
+
 fn hanging() -> Vec<DeclarationSource> {
     vec![DeclarationSource::new(
         "t",
@@ -181,6 +201,7 @@ descriptor!(BASE_PUB, "base-publisher", base);
 descriptor!(REFUSED_PUB, "refused-publisher", refused);
 descriptor!(HANGING_PUB, "hanging-publisher", hanging);
 descriptor!(EXPIRING_PUB, "expiring-publisher", expiring);
+descriptor!(OPAQUE_PUB, "opaque-publisher", opaque_expiring);
 
 struct NoConfig;
 
@@ -508,6 +529,31 @@ async fn a_gear_budget_expiry_is_a_deadline_not_a_refusal() {
             GtsDeploymentOutcome::Published { documents: 1 }
         )
     );
+}
+
+/// An expiry whose adapter error names no identifier still reports the
+/// manifest's ids, as not confirmed rather than as exactly pending.
+#[tokio::test]
+async fn an_opaque_budget_expiry_still_names_the_manifest_ids() {
+    let _serial = SERIAL.lock().await;
+    let (report, _) = run(&[&OPAQUE_PUB], Duration::from_secs(10)).await;
+    let report = report.unwrap();
+
+    let (gear, GtsDeploymentOutcome::DeadlineExceededWithDetails(detail)) = &report.publishers[0]
+    else {
+        panic!("{report}");
+    };
+    assert_eq!(*gear, "opaque-publisher");
+    assert!(
+        detail.contains("budget ran out before admission"),
+        "{detail}"
+    );
+    let (_, ids) = detail
+        .split_once("; not confirmed (some may be admitted): ")
+        .unwrap_or_else(|| panic!("{detail}"));
+    let mut ids: Vec<&str> = ids.split(", ").collect();
+    ids.sort_unstable();
+    assert_eq!(ids, [OPAQUE, OPAQUE_PEER], "{detail}");
 }
 
 /// The platform credential never goes to an endpoint that is not an absolute

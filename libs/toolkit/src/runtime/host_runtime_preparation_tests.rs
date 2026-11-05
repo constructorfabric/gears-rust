@@ -453,7 +453,10 @@ async fn a_pending_publication_holds_back_the_whole_application_group() {
 /// Refusal/expiry stops infrastructure and returns without a shutdown signal.
 #[tokio::test]
 async fn failed_publication_stops_the_process_without_a_shutdown_signal() {
-    for answer in [Answer::Refuse, Answer::Expire] {
+    for (answer, cause) in [
+        (Answer::Refuse, "GTS publication refused"),
+        (Answer::Expire, "budget ran out before admission"),
+    ] {
         let events: Events = Arc::default();
         let mut builder = RegistryBuilder::default();
         register(&mut builder, PubGear::system_gear("registry", &events));
@@ -461,8 +464,10 @@ async fn failed_publication_stops_the_process_without_a_shutdown_signal() {
         register(&mut builder, PubGear::new("c", None, &events));
         let fake = FakeRegistry::with(&[("a", answer)]);
         let cancel = CancellationToken::new();
-        let runtime = runtime(builder.build_topo_sorted().unwrap(), &fake, &cancel);
+        let mut runtime = runtime(builder.build_topo_sorted().unwrap(), &fake, &cancel);
         let checker = Arc::clone(&runtime.dep_checker);
+        let backend = Arc::new(FakeBackend::default());
+        runtime.oop_options = Some(children(&backend));
         let mut running = tokio::spawn(runtime.run_gear_phases());
         let outcome = tokio::time::timeout(Duration::from_secs(1), &mut running).await;
         if outcome.is_err() {
@@ -470,8 +475,11 @@ async fn failed_publication_stops_the_process_without_a_shutdown_signal() {
             drop(running.await);
             panic!("failed publication waited for an external shutdown signal");
         }
-        let failure = outcome.unwrap().unwrap().unwrap_err();
-        assert!(format!("{failure:#}").contains("the application group did not start"));
+        let failure = format!("{:#}", outcome.unwrap().unwrap().unwrap_err());
+        assert!(
+            failure.contains("the application group did not start") && failure.contains(cause),
+            "{failure}"
+        );
         assert!(
             !cancel.is_cancelled(),
             "caller retains ownership of shutdown"
@@ -484,6 +492,11 @@ async fn failed_publication_stops_the_process_without_a_shutdown_signal() {
         assert!(has(&events, "start:registry"));
         assert!(has(&events, "stop:registry"));
         assert!(any_app_event(&events, &["a", "c"]).is_empty());
+        let spawned = backend.spawned.lock().clone();
+        assert!(
+            spawned.is_empty(),
+            "a failed publication spawns no children: {spawned:?}"
+        );
     }
 }
 

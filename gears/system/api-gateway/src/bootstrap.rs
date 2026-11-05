@@ -36,7 +36,7 @@ impl ApiGateway {
         }
         let prefix = Self::normalize_prefix_path(&cfg.prefix_path)?;
         self.bootstrap_routes
-            .store(Arc::new(Self::apply_prefix(probes, &prefix)));
+            .store(Arc::new(Self::apply_prefix(probes, &prefix).with_state(())));
         let addr = Self::parse_bind_address(&cfg.bind_addr)?;
         let listener = tokio::net::TcpListener::bind(addr).await?;
         let bound = listener.local_addr()?;

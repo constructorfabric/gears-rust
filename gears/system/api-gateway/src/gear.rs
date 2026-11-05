@@ -1279,7 +1279,9 @@ impl ApiGateway {
         }
         if let Some(cancel) = self.bootstrap_cancel.get() {
             self.start_key_pruner(cancel);
-            self.bootstrap_routes.store(Arc::new(router.clone()));
+            // Materialize routes once; direct Router dispatch would rebuild them per request.
+            self.bootstrap_routes
+                .store(Arc::new(router.clone().with_state(())));
         }
     }
 

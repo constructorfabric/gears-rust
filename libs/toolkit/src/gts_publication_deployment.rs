@@ -221,8 +221,20 @@ pub async fn publish(
                 Ok(()) => GtsDeploymentOutcome::Published {
                     documents: plan.gts_manifest().documents().len(),
                 },
+                // An opaque error needs the manifest IDs as unconfirmed context.
                 Err(GtsPublicationError::Expired { source, .. }) => {
-                    GtsDeploymentOutcome::DeadlineExceededWithDetails(format!("{source:#}"))
+                    let detail = format!("{source:#}");
+                    let unconfirmed: Vec<String> = unconfirmed();
+                    if unconfirmed.is_empty()
+                        || unconfirmed.iter().any(|id| detail.contains(id.as_str()))
+                    {
+                        GtsDeploymentOutcome::DeadlineExceededWithDetails(detail)
+                    } else {
+                        GtsDeploymentOutcome::DeadlineExceededWithDetails(format!(
+                            "{detail}; not confirmed (some may be admitted): {}",
+                            unconfirmed.join(", ")
+                        ))
+                    }
                 }
                 Err(GtsPublicationError::Cancelled { .. }) if deadline_passed => {
                     progress.lock().remove(gear).map_or_else(

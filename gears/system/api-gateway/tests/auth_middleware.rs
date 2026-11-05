@@ -2251,3 +2251,100 @@ async fn bootstrap_listener_serves_probes_and_platform_then_switches_to_tenant_r
         .await
         .unwrap();
 }
+
+/// Counts how often its layer is applied to a route.
+#[derive(Clone)]
+struct CountingLayer(Arc<std::sync::atomic::AtomicUsize>);
+
+impl CountingLayer {
+    fn applied(&self) -> usize {
+        self.0.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl<S> tower::Layer<S> for CountingLayer {
+    type Service = S;
+
+    fn layer(&self, inner: S) -> S {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        inner
+    }
+}
+
+/// Publishing builds route layers once, rather than on every request.
+#[tokio::test]
+async fn bootstrap_listener_builds_each_published_router_once() {
+    use toolkit::contracts::RunnableCapability as _;
+    let mut config = axis_config(true);
+    config["bind_addr"] = json!("127.0.0.1:0");
+    config["prefix_path"] = json!("/cf");
+    let hub = Arc::new(ClientHub::new());
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let ctx = GearCtx::new(
+        "api-gateway",
+        Uuid::new_v4(),
+        Arc::new(TestConfigProvider {
+            config: json!({"api-gateway": {"config": config}}),
+        }),
+        Arc::clone(&hub),
+        cancel.clone(),
+    );
+    let health = Arc::new(toolkit::RestHealthcheckRegistry::new());
+    let gateway = api_gateway::ApiGateway::default();
+    let base = gateway
+        .rest_bootstrap(&ctx, Arc::clone(&health), cancel.clone())
+        .await
+        .unwrap()
+        .expect("the gateway binds before application init");
+    let endpoint = gateway.bound_endpoint().expect("listener already bound");
+    let counter = CountingLayer(Arc::default());
+    let routes = TestAxisGear
+        .register_rest(&create_test_gear_ctx(), base, &gateway)
+        .unwrap()
+        .layer(counter.clone());
+
+    // System stage.
+    gateway
+        .rest_finalize_bootstrap(&ctx, routes.clone(), Arc::clone(&health))
+        .unwrap();
+    let platform = [(AXIS_INTERNAL_HEADER, AXIS_INTERNAL_SECRET)];
+    let platform_path = format!("/cf{AXIS_PLATFORM_PATH}");
+    assert_eq!(
+        listener_status(&endpoint, &platform_path, &platform).await,
+        200
+    );
+    let built = counter.applied();
+    assert!(built > 0, "the counting layer wraps the platform route");
+    for _ in 0..3 {
+        assert_eq!(
+            listener_status(&endpoint, &platform_path, &platform).await,
+            200
+        );
+    }
+    assert_eq!(counter.applied(), built, "system stage: built per request");
+
+    // Final stage.
+    hub.register::<dyn AuthNResolverClient>(Arc::new(mock_accepting_token(
+        AXIS_BEARER,
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+    )));
+    gateway.init(&ctx).await.unwrap();
+    drop(gateway.rest_finalize(&ctx, routes, health).unwrap());
+    let gear = gateway.into_gear();
+    gear.start(cancel.clone()).await.unwrap();
+    let bearer = format!("Bearer {AXIS_BEARER}");
+    let tenant = [("authorization", bearer.as_str())];
+    let tenant_path = format!("/cf{AXIS_PATH}");
+    assert_eq!(listener_status(&endpoint, &tenant_path, &tenant).await, 200);
+    let built = counter.applied();
+    for _ in 0..3 {
+        assert_eq!(listener_status(&endpoint, &tenant_path, &tenant).await, 200);
+    }
+    assert_eq!(counter.applied(), built, "final stage: built per request");
+
+    cancel.cancel();
+    gear.stop(tokio_util::sync::CancellationToken::new())
+        .await
+        .unwrap();
+}

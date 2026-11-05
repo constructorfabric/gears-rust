@@ -24,6 +24,7 @@ use crate::gts_publication::{
     DeclarationSource, GtsPublicationBackend, GtsPublicationCapability, GtsPublicationDescriptor,
 };
 use crate::healthcheck::RestHealthcheckRegistry;
+use crate::registry::RegistryError;
 use crate::{DirectoryClient, GearCtx, RegisterInstanceInfo, ServiceEndpoint, ServiceInstanceInfo};
 
 #[derive(Default)]
@@ -35,11 +36,18 @@ struct State {
     admitted: Notify,
     started: Notify,
     refuse: bool,
+    /// The staged host call that fails: `bootstrap`, `system` or `final`.
+    fail: Option<&'static str>,
 }
 
 impl State {
     fn record(&self, event: impl Into<String>) {
         self.events.lock().push(event.into());
+    }
+
+    fn fail_at(&self, stage: &str) -> anyhow::Result<()> {
+        anyhow::ensure!(self.fail != Some(stage), "{stage} failed");
+        Ok(())
     }
 }
 
@@ -65,6 +73,7 @@ impl ApiGatewayCapability for Gateway {
         _cancel: CancellationToken,
     ) -> anyhow::Result<Option<Router>> {
         self.state.record("bind");
+        self.state.fail_at("bootstrap")?;
         self.rest_prepare(ctx, Router::new(), health).map(Some)
     }
 
@@ -75,6 +84,7 @@ impl ApiGatewayCapability for Gateway {
         _health: Arc<RestHealthcheckRegistry>,
     ) -> anyhow::Result<()> {
         self.state.record("system-routes");
+        self.state.fail_at("system")?;
         *self.state.bootstrap.lock() = Some(router);
         Ok(())
     }
@@ -101,6 +111,7 @@ impl ApiGatewayCapability for Gateway {
         _health: Arc<RestHealthcheckRegistry>,
     ) -> anyhow::Result<Router> {
         self.state.record("final-routes");
+        self.state.fail_at("final")?;
         *self.state.final_router.lock() = Some(router.clone());
         Ok(router)
     }
@@ -380,4 +391,35 @@ async fn refused_publication_joins_the_bootstrap_host_without_starting_applicati
             .any(|event| event == "start:gateway" || event == "init:application"),
         "{events:?}"
     );
+}
+
+/// Staged errors retain the same host/phase context as ordinary REST errors.
+#[tokio::test]
+async fn staged_rest_host_failures_carry_the_host_gear_and_phase() {
+    for stage in ["bootstrap", "system", "final"] {
+        let state = Arc::new(State {
+            fail: Some(stage),
+            ..State::default()
+        });
+        // Admission is granted up front, so the final stage is reached.
+        state.admitted.notify_one();
+        let error = runtime(&state, &CancellationToken::new())
+            .run_gear_phases()
+            .await
+            .unwrap_err();
+        let registry_error = error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<RegistryError>())
+            .unwrap_or_else(|| panic!("{stage}: no RegistryError in {error:#}"));
+        let gear = match (stage, registry_error) {
+            ("bootstrap", RegistryError::RestPrepare { gear, .. })
+            | ("system" | "final", RegistryError::RestFinalize { gear, .. }) => *gear,
+            _ => panic!("{stage}: unexpected {registry_error:?}"),
+        };
+        assert_eq!(gear, "gateway", "{stage}");
+        assert!(
+            format!("{error:#}").contains(&format!("{stage} failed")),
+            "{stage}: the host error is the source: {error:#}"
+        );
+    }
 }

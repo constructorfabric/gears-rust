@@ -28,15 +28,26 @@ impl HostRuntime {
         health
     }
 
-    pub(super) async fn bind_rest_bootstrap(&self) -> anyhow::Result<Option<RestComposition>> {
+    pub(super) async fn bind_rest_bootstrap(
+        &self,
+    ) -> Result<Option<RestComposition>, RegistryError> {
         let Some((entry, host)) = self.rest_host() else {
             return Ok(None);
         };
-        let ctx = self.ctx_builder.for_gear(entry.name).await?;
+        let prepare = |source| RegistryError::RestPrepare {
+            gear: entry.name,
+            source,
+        };
+        let ctx = self
+            .ctx_builder
+            .for_gear(entry.name)
+            .await
+            .map_err(prepare)?;
         let health = self.rest_health_registry();
         let router = host
             .rest_bootstrap(&ctx, Arc::clone(&health), self.owned.clone())
-            .await?;
+            .await
+            .map_err(prepare)?;
         Ok(router.map(|router| RestComposition { router, health }))
     }
 
@@ -76,7 +87,7 @@ impl HostRuntime {
         &self,
         composition: &mut RestComposition,
         system: &[&GearEntry],
-    ) -> anyhow::Result<()> {
+    ) -> Result<(), RegistryError> {
         let (entry, host) = self
             .rest_host()
             .ok_or(RegistryError::RestHostNotFoundAfterValidation)?;
@@ -88,21 +99,29 @@ impl HostRuntime {
                 host.as_registry(),
             )
             .await?;
-        let ctx = self.ctx_builder.for_gear(entry.name).await?;
+        let finalize = |source| RegistryError::RestFinalize {
+            gear: entry.name,
+            source,
+        };
+        let ctx = self
+            .ctx_builder
+            .for_gear(entry.name)
+            .await
+            .map_err(finalize)?;
         host.rest_finalize_bootstrap(
             &ctx,
             composition.router.clone(),
             Arc::clone(&composition.health),
-        )?;
-        self.run_directory_register_phase(system).await?;
-        Ok(())
+        )
+        .map_err(finalize)?;
+        self.run_directory_register_phase(system).await
     }
 
     pub(super) async fn finish_rest_bootstrap(
         &self,
         composition: RestComposition,
         app: &[&GearEntry],
-    ) -> anyhow::Result<()> {
+    ) -> Result<(), RegistryError> {
         let (entry, host) = self
             .rest_host()
             .ok_or(RegistryError::RestHostNotFoundAfterValidation)?;
@@ -114,8 +133,19 @@ impl HostRuntime {
                 host.as_registry(),
             )
             .await?;
-        let ctx = self.ctx_builder.for_gear(entry.name).await?;
-        drop(host.rest_finalize(&ctx, router, composition.health)?);
+        let finalize = |source| RegistryError::RestFinalize {
+            gear: entry.name,
+            source,
+        };
+        let ctx = self
+            .ctx_builder
+            .for_gear(entry.name)
+            .await
+            .map_err(finalize)?;
+        drop(
+            host.rest_finalize(&ctx, router, composition.health)
+                .map_err(finalize)?,
+        );
         Ok(())
     }
 }
