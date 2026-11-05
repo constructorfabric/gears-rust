@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use authz_resolver_sdk::PolicyEnforcer;
+use futures_util::future::{Aborted, abortable};
 use llm_gateway_sdk::{
     CreateResponseBody, EmbeddingRequest, EmbeddingResponse, InputItem, LlmGatewayError,
     ProviderCallCtx, ProviderDetails, ProviderErrorCategory, ProviderFailure, ResponseEventStream,
@@ -23,17 +24,20 @@ use tracing::Instrument as _;
 use uuid::Uuid;
 
 use super::authz::{actions, authorize};
-use super::capability_checker::{CapabilityChecker, EffectiveEmbedding, EffectiveRequest};
+use super::capability_checker::{
+    CapabilityChecker, EffectiveEmbedding, EffectiveRequest, check_well_formed_input,
+};
+use super::media::MediaResolver;
 use super::output_validator::OutputValidator;
 use super::ports::{
-    CredentialBroker, ModelResolver, PluginDirectory, ResolvedPlugin, ToolSchemaSource,
-    UsageProducers,
+    CredentialBroker, MediaFetcher, ModelResolver, PluginDirectory, ResolvedPlugin,
+    ToolSchemaSource, UsageProducers,
 };
 use super::provider_rules::ProviderRulesRegistry;
 use super::quota_guard::{Operation, QuotaGuard, Quote, RequestMeta, RequestQuota};
 use super::stream_supervisor::{StreamParams, initial_snapshot, supervise};
 use super::tool_resolver::ToolResolver;
-use crate::config::{LimitsConfig, StreamConfig, TimeoutsConfig};
+use crate::config::{LimitsConfig, MediaConfig, StreamConfig, TimeoutsConfig};
 
 /// A failed create-response call together with the response `id` that was
 /// allocated for it, so REST Problems can carry the id.
@@ -216,6 +220,7 @@ pub struct Service {
     credentials: Arc<dyn CredentialBroker>,
     tool_resolver: ToolResolver,
     checker: CapabilityChecker,
+    media: MediaResolver,
     rules: Arc<ProviderRulesRegistry>,
     quota: QuotaGuard,
     validator: OutputValidator,
@@ -254,6 +259,7 @@ impl Service {
             credentials,
             tool_resolver: ToolResolver::new(tool_schemas, limits.max_schema_bytes),
             checker: CapabilityChecker::new(limits, Arc::clone(&rules)),
+            media: MediaResolver::unrouted(&MediaConfig::default()),
             rules,
             quota,
             validator: OutputValidator,
@@ -265,6 +271,17 @@ impl Service {
             channel_capacity: stream.channel_capacity,
             provider_sync: timeouts.provider_sync,
         }
+    }
+
+    /// Use `fetcher` as the media egress and the `media.*` policy `media`.
+    /// Without it the service has no media egress route (default policy).
+    #[must_use]
+    pub fn with_media(mut self, fetcher: Arc<dyn MediaFetcher>, media: &MediaConfig) -> Self {
+        self.media = MediaResolver::new(fetcher, media);
+        self.checker = self
+            .checker
+            .with_media_policy(media, self.media.has_route());
+        self
     }
 
     /// Create a response (sync) and return it, or the failure with the
@@ -390,6 +407,9 @@ impl Service {
 
         {
             let _enter = span("capability_gate").entered();
+            // Before the gate: a malformed `item_reference` is a
+            // `validation_error`, not `capability_not_supported`.
+            check_well_formed_input(&body)?;
             if has_item_reference(&body) {
                 return Err(LlmGatewayError::capability_not_supported("item_reference"));
             }
@@ -443,7 +463,22 @@ impl Service {
         let rules = self.rules.rules_for(model_info.gts_type.as_ref());
         let pricing = QuotaGuard::check_pricing(rules.as_ref(), &model_info, op)?;
         let reservation = self.quota.response_quote(pricing, &model_info, &body);
-        let (quota, call) = self
+        let media_mode = plugin.capabilities().media_input;
+        let media = async {
+            if !MediaResolver::has_media(&body) {
+                return Ok(body);
+            }
+            self.media
+                .resolve(media_mode, body)
+                .instrument(tracing::info_span!(
+                    "llm_gateway.stage",
+                    stage = "media_resolution",
+                    response_id = %response_id,
+                    model = %model
+                ))
+                .await
+        };
+        let (quota, call, body) = self
             .admit_and_call(
                 ctx,
                 response_id,
@@ -451,6 +486,7 @@ impl Service {
                 model_info,
                 op,
                 &reservation,
+                media,
                 cancel,
             )
             .await?;
@@ -511,11 +547,14 @@ impl Service {
         Ok((model_info, plugin))
     }
 
-    /// Shared concurrent step: quota admission and credential resolution run
-    /// together. A failed admission drops the fetched key unused; a failed
-    /// credential resolution releases a lease acquired meanwhile.
+    /// Shared concurrent step: quota admission, the `media` arm (Media
+    /// Resolver; a ready no-op for embeddings and requests without media) and
+    /// credential resolution run together. Errors rank admission, then media,
+    /// then credentials; a failure after a lease was acquired releases it, and
+    /// a failed admission drops the fetched key unused and aborts the media arm
+    /// (a parked fetch never delays the admission error).
     #[allow(clippy::too_many_arguments)] // one shared step of three pipelines
-    async fn admit_and_call(
+    async fn admit_and_call<M>(
         &self,
         ctx: &SecurityContext,
         request_id: &str,
@@ -523,25 +562,52 @@ impl Service {
         model_info: ModelInfoV1,
         op: Operation,
         reservation: &Quote,
+        media: impl Future<Output = Result<M, LlmGatewayError>>,
         cancel: CancellationToken,
-    ) -> Result<(RequestQuota, ProviderCallCtx), LlmGatewayError> {
+    ) -> Result<(RequestQuota, ProviderCallCtx, M), LlmGatewayError> {
         let meta = RequestMeta {
             response_id: request_id.to_owned(),
             model: model.to_owned(),
             provider_type: model_info.gts_type.as_ref().to_owned(),
         };
-        let (admission, key) = tokio::join!(
-            self.quota
+        // A failed admission wins over every other arm, so the media arm is
+        // aborted at once: a parked fetch must not delay the admission error.
+        let (media, abort_media) = abortable(media);
+        let admission = async {
+            let outcome = self
+                .quota
                 .admit(ctx, meta, op, reservation)
                 .instrument(tracing::info_span!(
                     "llm_gateway.stage",
                     stage = "quota_admission",
                     response_id = %request_id,
                     model = %model
-                )),
+                ))
+                .await;
+            if outcome.is_err() {
+                abort_media.abort();
+            }
+            outcome
+        };
+        let (admission, media, key) = tokio::join!(
+            admission,
+            media,
             self.resolve_key(ctx, &model_info, request_id, model),
         );
         let quota = admission?;
+        let media = match media {
+            Ok(Ok(media)) => media,
+            Ok(Err(err)) => {
+                quota.release();
+                return Err(err);
+            }
+            // Only a failed admission aborts the media arm, and that returned
+            // above; kept as a defined failure rather than a panic.
+            Err(Aborted) => {
+                quota.release();
+                return Err(LlmGatewayError::GatewayUnavailable);
+            }
+        };
         let api_key = match key {
             Ok(key) => key,
             Err(err) => {
@@ -553,7 +619,7 @@ impl Service {
         if let Some(key) = api_key {
             call = call.with_api_key(key);
         }
-        Ok((quota, call))
+        Ok((quota, call, media))
     }
 
     /// Credential resolution.
@@ -756,7 +822,7 @@ impl Service {
 
         let pricing = QuotaGuard::check_pricing(rules.as_ref(), &model_info, Operation::Embedding)?;
         let reservation = self.quota.embedding_quote(pricing, &request);
-        let (mut quota, call) = self
+        let (mut quota, call, ()) = self
             .admit_and_call(
                 ctx,
                 request_id,
@@ -764,6 +830,7 @@ impl Service {
                 model_info,
                 Operation::Embedding,
                 &reservation,
+                std::future::ready(Ok(())),
                 cancel,
             )
             .await?;
@@ -894,3 +961,8 @@ mod service_timeout_tests;
 #[cfg_attr(coverage_nightly, coverage(off))]
 #[path = "service_usage_report_tests.rs"]
 mod service_usage_report_tests;
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+#[path = "service_media_tests.rs"]
+mod service_media_tests;

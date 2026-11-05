@@ -45,13 +45,13 @@ use uuid::Uuid;
 
 use super::Service;
 use super::ports::{
-    CredentialBroker, IdentityContext, ModelResolver, PluginDirectory, ResolvedPlugin,
-    ServiceIdentity, ToolSchemaSource, UsageReport, UsageSink,
+    CredentialBroker, FetchedMedia, IdentityContext, MediaFetchLimits, MediaFetcher, ModelResolver,
+    PluginDirectory, ResolvedPlugin, ServiceIdentity, ToolSchemaSource, UsageReport, UsageSink,
 };
 use super::pricing::ModelPricing;
 use super::provider_rules::{PermissiveRules, ProviderRules, ProviderRulesRegistry};
 use super::quota_guard::QuotaGuard;
-use crate::config::{LimitsConfig, QuotaConfig, StreamConfig, TimeoutsConfig};
+use crate::config::{LimitsConfig, MediaConfig, QuotaConfig, StreamConfig, TimeoutsConfig};
 
 /// Provider identity used by the sample model and plugin.
 pub const OPENAI_TYPE: &str = "gts.cf.genai.model.info.v1~cf.genai._.openai.v1~";
@@ -523,6 +523,7 @@ pub struct FakePlugin {
     embedding_requests: Mutex<Vec<EmbeddingRequest>>,
     embedding_contexts: Mutex<Vec<ProviderCallCtx>>,
     web_search: AtomicBool,
+    prefetch_media: AtomicBool,
     log: Arc<CallLog>,
     /// Notified when a call has entered the plugin (only when `gated`).
     pub entered: Notify,
@@ -604,6 +605,7 @@ impl FakePlugin {
             embedding_requests: Mutex::new(Vec::new()),
             embedding_contexts: Mutex::new(Vec::new()),
             web_search: AtomicBool::new(false),
+            prefetch_media: AtomicBool::new(false),
             log,
             entered: Notify::new(),
             release: Notify::new(),
@@ -614,6 +616,12 @@ impl FakePlugin {
             stream_dropped: Arc::new(AtomicBool::new(false)),
             stream_dropped_notify: Arc::new(Notify::new()),
         })
+    }
+
+    /// Make the plugin report `PrefetchRequired` (bytes only) media input;
+    /// the default is `UrlForward`.
+    pub fn set_prefetch_media(&self, enabled: bool) {
+        self.prefetch_media.store(enabled, Ordering::SeqCst);
     }
 
     /// Number of `create_response` calls.
@@ -716,7 +724,12 @@ impl FakePlugin {
 #[async_trait]
 impl LlmGatewayProviderPluginClientV1 for FakePlugin {
     fn capabilities(&self) -> ProviderPluginCapabilities {
-        let mut caps = ProviderPluginCapabilities::new(MediaInputMode::UrlForward);
+        let mode = if self.prefetch_media.load(Ordering::SeqCst) {
+            MediaInputMode::PrefetchRequired
+        } else {
+            MediaInputMode::UrlForward
+        };
+        let mut caps = ProviderPluginCapabilities::new(mode);
         if self.streaming_transport.load(Ordering::SeqCst) {
             caps = caps.with_streaming_transport();
         }
@@ -1831,6 +1844,113 @@ pub async fn eventually(what: &str, cond: impl Fn() -> bool) {
     eventually_within(std::time::Duration::from_secs(1), what, cond).await;
 }
 
+// ── Media fetcher fake ──────────────────────────────────────────────────────
+
+type FetchOutcome = Box<dyn Fn(&str) -> Result<FetchedMedia, LlmGatewayError> + Send + Sync>;
+
+/// Media fetcher fake: records every fetch, answers a scripted outcome
+/// (default: a tiny PNG), optionally parks inside the fetch until released.
+/// Starts without a media egress route.
+pub struct FakeMediaFetcher {
+    routed: AtomicBool,
+    gated: AtomicBool,
+    outcome: Mutex<FetchOutcome>,
+    urls: Mutex<Vec<String>>,
+    limits: Mutex<Vec<MediaFetchLimits>>,
+    log: Arc<CallLog>,
+    /// Notified when a fetch has entered (only when gated).
+    pub entered: Notify,
+    /// Releases a parked fetch (only when gated).
+    pub release: Notify,
+}
+
+impl FakeMediaFetcher {
+    /// Fetcher without a media egress route.
+    #[must_use]
+    pub fn new(log: Arc<CallLog>) -> Arc<Self> {
+        Arc::new(Self {
+            routed: AtomicBool::new(false),
+            gated: AtomicBool::new(false),
+            outcome: Mutex::new(Box::new(|_| Ok(png_media()))),
+            urls: Mutex::new(Vec::new()),
+            limits: Mutex::new(Vec::new()),
+            log,
+            entered: Notify::new(),
+            release: Notify::new(),
+        })
+    }
+
+    /// Whether a media egress route is configured.
+    pub fn set_route(&self, routed: bool) {
+        self.routed.store(routed, Ordering::SeqCst);
+    }
+
+    /// Script the outcome of every fetch (given the URL).
+    pub fn script(
+        &self,
+        outcome: impl Fn(&str) -> Result<FetchedMedia, LlmGatewayError> + Send + Sync + 'static,
+    ) {
+        *self.outcome.lock().expect("outcome") = Box::new(outcome);
+    }
+
+    /// Park every fetch until `release` is notified.
+    pub fn gate(&self) {
+        self.gated.store(true, Ordering::SeqCst);
+    }
+
+    /// Number of fetches.
+    #[must_use]
+    pub fn calls(&self) -> usize {
+        self.urls.lock().expect("urls").len()
+    }
+
+    /// Fetched URLs in order.
+    #[must_use]
+    pub fn urls(&self) -> Vec<String> {
+        self.urls.lock().expect("urls").clone()
+    }
+
+    /// The limits of every fetch.
+    #[must_use]
+    pub fn limits(&self) -> Vec<MediaFetchLimits> {
+        self.limits.lock().expect("limits").clone()
+    }
+}
+
+/// The bytes the fake fetcher serves by default.
+pub const PNG_BYTES: &[u8] = b"\x89PNG\r\n\x1a\n";
+
+/// A PNG response of [`PNG_BYTES`].
+#[must_use]
+pub fn png_media() -> FetchedMedia {
+    FetchedMedia {
+        content_type: "image/png".to_owned(),
+        bytes: PNG_BYTES.to_vec(),
+    }
+}
+
+#[async_trait]
+impl MediaFetcher for FakeMediaFetcher {
+    fn has_route(&self) -> bool {
+        self.routed.load(Ordering::SeqCst)
+    }
+
+    async fn fetch(
+        &self,
+        url: &str,
+        limits: &MediaFetchLimits,
+    ) -> Result<FetchedMedia, LlmGatewayError> {
+        self.log.push("media_fetch");
+        self.urls.lock().expect("urls").push(url.to_owned());
+        self.limits.lock().expect("limits").push(*limits);
+        if self.gated.load(Ordering::SeqCst) {
+            self.entered.notify_one();
+            self.release.notified().await;
+        }
+        (self.outcome.lock().expect("outcome"))(url)
+    }
+}
+
 // ── Harness ─────────────────────────────────────────────────────────────────
 
 /// All fakes of one pipeline; mutate the public fields, then call
@@ -1849,6 +1969,10 @@ pub struct Harness {
     pub stream: StreamConfig,
     pub timeouts: TimeoutsConfig,
     pub quota_cfg: QuotaConfig,
+    /// `media.*` policy of the Media Resolver and the Capability Checker.
+    pub media: MediaConfig,
+    /// Media egress; has no route until `set_route(true)`.
+    pub fetcher: Arc<FakeMediaFetcher>,
     pub quota: Arc<FakeQuota>,
     pub identity: Arc<FakeIdentity>,
     pub sink: Arc<FakeUsageSink>,
@@ -1874,6 +1998,8 @@ impl Harness {
             stream: StreamConfig::default(),
             timeouts: TimeoutsConfig::default(),
             quota_cfg: QuotaConfig::default(),
+            media: MediaConfig::default(),
+            fetcher: FakeMediaFetcher::new(log.clone()),
             quota: FakeQuota::new(log.clone()),
             identity: FakeIdentity::new(),
             sink: FakeUsageSink::new(log),
@@ -1970,21 +2096,24 @@ impl Harness {
     /// Guard.
     #[must_use]
     pub fn service_with_quota(&self, quota: QuotaGuard) -> Arc<Service> {
-        Arc::new(Service::new(
-            PolicyEnforcer::new(self.pdp.clone()),
-            self.models.clone(),
-            self.plugins.clone(),
-            self.broker.clone(),
-            self.tool_schemas.clone(),
-            Arc::new(
-                ProviderRulesRegistry::permissive()
-                    .with_rules(OPENAI_TYPE, Arc::new(self.rules.clone())),
-            ),
-            quota,
-            &self.limits,
-            &self.stream,
-            &self.timeouts,
-        ))
+        Arc::new(
+            Service::new(
+                PolicyEnforcer::new(self.pdp.clone()),
+                self.models.clone(),
+                self.plugins.clone(),
+                self.broker.clone(),
+                self.tool_schemas.clone(),
+                Arc::new(
+                    ProviderRulesRegistry::permissive()
+                        .with_rules(OPENAI_TYPE, Arc::new(self.rules.clone())),
+                ),
+                quota,
+                &self.limits,
+                &self.stream,
+                &self.timeouts,
+            )
+            .with_media(self.fetcher.clone(), &self.media),
+        )
     }
 }
 

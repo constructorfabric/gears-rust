@@ -21,6 +21,7 @@ use crate::domain::ports::{ServiceIdentity, UsageProducers, UsageSink};
 use crate::domain::provider_rules::ProviderRulesRegistry;
 use crate::domain::quota_guard::QuotaGuard;
 use crate::domain::{KeylessCredentialBroker, LlmGatewayLocalClient, Service};
+use crate::infra::media_fetcher::NoRouteMediaFetcher;
 use crate::infra::model_registry::ModelRegistryResolver;
 use crate::infra::plugin_directory::GtsPluginDirectory;
 use crate::infra::service_identity::AuthNServiceIdentity;
@@ -120,18 +121,21 @@ impl Gear for LlmGatewayModule {
             &cfg.timeouts,
         );
 
-        let service = Arc::new(Service::new(
-            enforcer,
-            Arc::new(ModelRegistryResolver::new(registry)),
-            Arc::new(GtsPluginDirectory::new(hub.clone())),
-            Arc::new(KeylessCredentialBroker),
-            Arc::new(TypesRegistryToolSchemas::new(hub.clone())),
-            Arc::new(ProviderRulesRegistry::permissive()),
-            quota,
-            &cfg.limits,
-            &cfg.stream,
-            &cfg.timeouts,
-        ));
+        let service = Arc::new(
+            Service::new(
+                enforcer,
+                Arc::new(ModelRegistryResolver::new(registry)),
+                Arc::new(GtsPluginDirectory::new(hub.clone())),
+                Arc::new(KeylessCredentialBroker),
+                Arc::new(TypesRegistryToolSchemas::new(hub.clone())),
+                Arc::new(ProviderRulesRegistry::permissive()),
+                quota,
+                &cfg.limits,
+                &cfg.stream,
+                &cfg.timeouts,
+            )
+            .with_media(Arc::new(NoRouteMediaFetcher), &cfg.media),
+        );
 
         self.reporter
             .set(reporter)

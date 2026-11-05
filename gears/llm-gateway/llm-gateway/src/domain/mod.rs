@@ -4,6 +4,7 @@ pub mod authz;
 pub mod capability_checker;
 pub mod credential_broker;
 pub mod local_client;
+pub mod media;
 pub mod output_validator;
 pub mod ports;
 pub mod pricing;

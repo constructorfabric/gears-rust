@@ -216,6 +216,25 @@ async fn item_reference_input_is_capability_not_supported_without_provider_call(
     assert_eq!(h.plugin.calls(), 0);
 }
 
+#[tokio::test]
+async fn malformed_item_reference_is_validation_error_before_the_capability_gate() {
+    let h = Harness::new();
+    let mut value = serde_json::to_value(body("m")).expect("serializes");
+    value["input"] = serde_json::json!([{ "type": "item_reference" }]);
+    let request = serde_json::from_value(value).expect("deserializes");
+    let err = h
+        .service()
+        .create_response(&ctx(), request)
+        .await
+        .expect_err("rejected");
+
+    assert!(
+        matches!(&err, LlmGatewayError::Validation { param: Some(p), .. } if p == "input[0]"),
+        "{err}"
+    );
+    assert_eq!(h.plugin.calls(), 0);
+}
+
 // ── model resolution ────────────────────────────────────────────────────────
 
 #[tokio::test]

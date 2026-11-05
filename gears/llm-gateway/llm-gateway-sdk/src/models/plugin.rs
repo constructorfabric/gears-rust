@@ -114,9 +114,13 @@ pub enum MediaInputMode {
     /// Base64 data and external URLs are forwarded to the provider as-is; URLs
     /// stay URLs (`cpt-cf-llm-gateway-fr-vision-v1`).
     UrlForward,
-    /// The provider accepts only bytes: the core fetches external URLs before
-    /// dispatch and hands the plugin base64 content. `FileStorage` URLs are
-    /// resolved the same way from P2 (`cpt-cf-llm-gateway-fr-filestorage-media-v1`).
+    /// The provider accepts only bytes: every `image_url` and `file_data`
+    /// reaches the plugin as a `data:<mime>;base64,...` URI and `file_url` is
+    /// cleared (plain base64 `file_data` is typed from the filename). The core
+    /// fetches an `https` URL before dispatch only when a media egress route
+    /// exists; otherwise the request is rejected with `capability_not_supported`
+    /// (`media_url`). `FileStorage` URLs are resolved the same way from P2
+    /// (`cpt-cf-llm-gateway-fr-filestorage-media-v1`).
     PrefetchRequired,
 }
 

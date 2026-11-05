@@ -35,6 +35,8 @@ usage-collector = { workspace = true }
 
 anyhow = { workspace = true }
 async-trait = { workspace = true }
+# Data URIs of inline and prefetched media.
+base64 = { workspace = true }
 axum = { workspace = true, features = ["macros"] }
 jsonschema = { workspace = true }
 # Jitter of the settle retry backoff.

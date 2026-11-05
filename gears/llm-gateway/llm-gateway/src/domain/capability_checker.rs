@@ -41,7 +41,16 @@
 //! Structured output: a schema construct the rules cannot express ->
 //! `unsupported_schema` naming the construct.
 //!
+//! Malformed input: an input item or content part with a core-owned `type`
+//! (`message`, `item_reference`, `function_call`, ..., `input_image`, ...)
+//! that does not deserialize into its typed form (the SDK keeps it as an
+//! extension) -> `validation_error` (param `input[i]` / `input[i].content[j]`),
+//! checked first. Other `type`s stay allowed as extensions.
+//!
 //! Limits (`validation_error`): `max_input_items` (param `input`),
+//! `max_media_fetches` (param `input`: `https` media URLs a `PrefetchRequired`
+//! plugin with a media route would have fetched; a `file_url` next to
+//! `file_data` is not counted),
 //! `max_tools` (param `tools`), `max_schema_bytes` for each function tool
 //! `parameters` (param `tools`) and for the `text.format` schema (param
 //! `text`), measured in serialized bytes.
@@ -71,16 +80,21 @@ use std::sync::Arc;
 use llm_gateway_sdk::models::items::InputContent;
 use llm_gateway_sdk::{
     CreateResponseBody, EmbeddingInput, EmbeddingRequest, InputContentPart, InputItem,
-    LlmGatewayError, NamedToolChoice, ResponseInput, TextFormatKind, Tool, ToolChoice,
+    LlmGatewayError, MediaInputMode, NamedToolChoice, ResponseInput, TextFormatKind, Tool,
+    ToolChoice,
 };
 use model_registry_sdk::{ModelInfoV1, SupportedApi};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use toolkit_macros::domain_model;
 
+use super::media::{
+    decoded_base64_len, has_https_scheme_without_user_info, indexed_content_parts, mime_allowed,
+    mime_for_filename, parse_data_uri, starts_with_data_scheme,
+};
 use super::ports::ResolvedPlugin;
 use super::provider_rules::{INPUT_TYPE, PROMPT_CACHE_KEY, ProviderRules, ProviderRulesRegistry};
-use crate::config::LimitsConfig;
+use crate::config::{LimitsConfig, MediaConfig};
 
 /// Outcome of the checks: the request to dispatch and the parameters that
 /// were not applied.
@@ -105,11 +119,22 @@ pub struct EffectiveEmbedding {
     pub ignored_parameters: Vec<String>,
 }
 
+/// Which media allow-list applies to a part.
+#[domain_model]
+#[derive(Debug, Clone, Copy)]
+enum MediaKind {
+    Image,
+    File,
+}
+
 /// Runs the Capability Checker checks.
 #[domain_model]
 pub struct CapabilityChecker {
     limits: LimitsConfig,
     rules: Arc<ProviderRulesRegistry>,
+    media: MediaConfig,
+    /// Whether a media egress route is configured.
+    egress_route: bool,
 }
 
 impl CapabilityChecker {
@@ -119,7 +144,138 @@ impl CapabilityChecker {
         Self {
             limits: limits.clone(),
             rules,
+            media: MediaConfig::default(),
+            egress_route: false,
         }
+    }
+
+    /// Use the media allow-lists of `media`; `egress_route` tells whether a
+    /// media egress route is configured (default: no route, default lists).
+    #[must_use]
+    pub fn with_media_policy(mut self, media: &MediaConfig, egress_route: bool) -> Self {
+        self.media = media.clone();
+        self.egress_route = egress_route;
+        self
+    }
+
+    /// Media parts in document order, first failure wins (DESIGN §3.2).
+    fn check_media(
+        &self,
+        plugin: &ResolvedPlugin,
+        body: &CreateResponseBody,
+    ) -> Result<(), LlmGatewayError> {
+        let prefetch = plugin.capabilities().media_input == MediaInputMode::PrefetchRequired;
+        let mut fetches = 0usize;
+        for ((i, j), part) in indexed_content_parts(body) {
+            let path = || format!("input[{i}].content[{j}]");
+            let mut fetch = false;
+            match part {
+                InputContentPart::InputImage(image) => {
+                    require(image.file_id.is_none(), "file_id")?;
+                    if let Some(url) = &image.image_url {
+                        fetch = self.check_source(url, MediaKind::Image, prefetch, &path)?;
+                    }
+                }
+                InputContentPart::InputFile(file) => {
+                    require(file.file_id.is_none(), "file_id")?;
+                    if let Some(data) = &file.file_data {
+                        self.check_file_data(data, file.filename.as_deref(), &path)?;
+                    }
+                    if let Some(url) = &file.file_url {
+                        // `file_data` wins: a second source is never fetched.
+                        let needs_fetch =
+                            self.check_source(url, MediaKind::File, prefetch, &path)?;
+                        fetch = needs_fetch && file.file_data.is_none();
+                    }
+                }
+                InputContentPart::InputAudio(_) => require(false, "audio_input")?,
+                InputContentPart::InputVideo(_) => require(false, "video_input")?,
+                InputContentPart::InputText(_) | InputContentPart::Other(_) => {}
+            }
+            if fetch {
+                fetches += 1;
+                if fetches > self.limits.max_media_fetches {
+                    return Err(LlmGatewayError::validation_param(
+                        "too many media fetches",
+                        "input",
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn allowed(&self, kind: MediaKind) -> &[String] {
+        match kind {
+            MediaKind::Image => &self.media.allowed_image_types,
+            MediaKind::File => &self.media.allowed_file_types,
+        }
+    }
+
+    /// An `image_url` / `file_url`: an inline data URI or an `https` URL.
+    /// Whether the Media Resolver will fetch it (an `https` URL for a
+    /// `PrefetchRequired` plugin; the route is required, checked here).
+    fn check_source(
+        &self,
+        value: &str,
+        kind: MediaKind,
+        prefetch: bool,
+        path: &dyn Fn() -> String,
+    ) -> Result<bool, LlmGatewayError> {
+        if starts_with_data_scheme(value) {
+            self.check_data_uri(value, kind, path)?;
+            return Ok(false);
+        }
+        if !has_https_scheme_without_user_info(value) {
+            return Err(LlmGatewayError::media_not_found_param(path()));
+        }
+        require(!prefetch || self.egress_route, "media_url")?;
+        Ok(prefetch)
+    }
+
+    /// `file_data`: a data URI, or plain base64 typed by the filename.
+    fn check_file_data(
+        &self,
+        data: &str,
+        filename: Option<&str>,
+        path: &dyn Fn() -> String,
+    ) -> Result<(), LlmGatewayError> {
+        if starts_with_data_scheme(data) {
+            return self.check_data_uri(data, MediaKind::File, path);
+        }
+        let not_found = || LlmGatewayError::media_not_found_param(path());
+        let decoded = decoded_base64_len(data).ok_or_else(not_found)?;
+        let mime = filename.and_then(mime_for_filename).ok_or_else(not_found)?;
+        if !mime_allowed(self.allowed(MediaKind::File), mime) {
+            return Err(not_found());
+        }
+        self.check_inline_size(decoded)
+    }
+
+    fn check_data_uri(
+        &self,
+        value: &str,
+        kind: MediaKind,
+        path: &dyn Fn() -> String,
+    ) -> Result<(), LlmGatewayError> {
+        let not_found = || LlmGatewayError::media_not_found_param(path());
+        let parsed = parse_data_uri(value).ok_or_else(not_found)?;
+        // Size from the text length: nothing is decoded or allocated.
+        let decoded = decoded_base64_len(parsed.payload).ok_or_else(not_found)?;
+        if !mime_allowed(self.allowed(kind), &parsed.mime) {
+            return Err(not_found());
+        }
+        self.check_inline_size(decoded)
+    }
+
+    fn check_inline_size(&self, decoded: usize) -> Result<(), LlmGatewayError> {
+        if decoded > self.limits.max_inline_media_bytes {
+            return Err(LlmGatewayError::validation_param(
+                "inline media too large",
+                "input",
+            ));
+        }
+        Ok(())
     }
 
     /// Run every check on the tool-resolved `body` for `model` served by
@@ -138,6 +294,7 @@ impl CapabilityChecker {
         let rules = self.rules.rules_for(model.gts_type.as_ref());
         self.check_limits(&body)?;
         check_capabilities(model, plugin, &body)?;
+        self.check_media(plugin, &body)?;
 
         let mut body = body;
         let mut policy = ParameterPolicy {
@@ -231,6 +388,7 @@ impl CapabilityChecker {
     }
 
     fn check_limits(&self, body: &CreateResponseBody) -> Result<(), LlmGatewayError> {
+        check_well_formed_input(body)?;
         if let Some(ResponseInput::Items(items)) = &body.input
             && items.len() > self.limits.max_input_items
         {
@@ -270,6 +428,74 @@ impl CapabilityChecker {
         // oversized rather than slipping through.
         serde_json::to_vec(schema).map_or(true, |bytes| bytes.len() > self.limits.max_schema_bytes)
     }
+}
+
+/// `type` tags of the content parts the core owns (`InputContentPart`).
+const CORE_CONTENT_TYPES: [&str; 5] = [
+    "input_text",
+    "input_image",
+    "input_audio",
+    "input_video",
+    "input_file",
+];
+
+/// `type` tags of the input items the core owns (`InputItem`).
+const CORE_ITEM_TYPES: [&str; 5] = [
+    "message",
+    "function_call",
+    "function_call_output",
+    "item_reference",
+    "reasoning",
+];
+
+/// Reject an input item or content part that carries a core-owned `type` but
+/// failed typed deserialization: the SDK keeps such a value as an extension
+/// (`Other`), so without this check one malformed field (a bad `detail`,
+/// audio `format` or `role`, a missing field) would let it skip every other
+/// check. Provider-namespaced and unknown `type`s stay allowed. Messages are
+/// fixed: the offending value is never echoed.
+///
+/// Runs first in the checker and in the service before the `item_reference`
+/// gate, so a malformed `item_reference` is a `validation_error`, not
+/// `capability_not_supported`.
+///
+/// # Errors
+///
+/// `validation_error` (param `input[i]` or `input[i].content[j]`).
+pub fn check_well_formed_input(body: &CreateResponseBody) -> Result<(), LlmGatewayError> {
+    let Some(ResponseInput::Items(items)) = &body.input else {
+        return Ok(());
+    };
+    for (i, item) in items.iter().enumerate() {
+        match item {
+            InputItem::Other(ext) if is_core_type(ext.kind(), &CORE_ITEM_TYPES) => {
+                return Err(LlmGatewayError::validation_param(
+                    "malformed input item",
+                    format!("input[{i}]"),
+                ));
+            }
+            InputItem::Message(message) => {
+                if let InputContent::Parts(parts) = &message.content {
+                    for (j, part) in parts.iter().enumerate() {
+                        if let InputContentPart::Other(ext) = part
+                            && is_core_type(ext.kind(), &CORE_CONTENT_TYPES)
+                        {
+                            return Err(LlmGatewayError::validation_param(
+                                "malformed content part",
+                                format!("input[{i}].content[{j}]"),
+                            ));
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn is_core_type(kind: Option<&str>, core: &[&str]) -> bool {
+    kind.is_some_and(|kind| core.contains(&kind))
 }
 
 fn output_schema(body: &CreateResponseBody) -> Option<&serde_json::Value> {
@@ -584,3 +810,8 @@ mod capability_checker_tests;
 #[cfg_attr(coverage_nightly, coverage(off))]
 #[path = "capability_checker_embedding_tests.rs"]
 mod capability_checker_embedding_tests;
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+#[path = "capability_checker_media_tests.rs"]
+mod capability_checker_media_tests;

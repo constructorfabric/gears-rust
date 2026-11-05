@@ -181,3 +181,54 @@ pub trait UsageProducers: Send + Sync {
     /// handed off so far has finished (its usage reached [`UsageSink`]).
     async fn quiescent(&self);
 }
+
+/// Limits the Media Resolver passes to a fetch (`media.*`).
+#[domain_model]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MediaFetchLimits {
+    /// Upper bound of the fetch (`media.fetch_timeout`).
+    pub timeout: std::time::Duration,
+    /// Largest accepted response body (`media.max_bytes`).
+    pub max_bytes: usize,
+}
+
+/// Media fetched from an external URL.
+#[domain_model]
+#[derive(Clone, PartialEq, Eq)]
+pub struct FetchedMedia {
+    /// `Content-Type` of the response, as received.
+    pub content_type: String,
+    /// The response body.
+    pub bytes: Vec<u8>,
+}
+
+impl std::fmt::Debug for FetchedMedia {
+    // Media content is never logged.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FetchedMedia")
+            .field("content_type", &self.content_type)
+            .field("len", &self.bytes.len())
+            .finish()
+    }
+}
+
+/// Media egress (DESIGN §3.2 Media Resolver): fetches public media through a
+/// dedicated route that enforces the address, redirect and limit rules.
+#[async_trait]
+pub trait MediaFetcher: Send + Sync {
+    /// Whether a media egress route is configured. Without one the
+    /// Capability Checker rejects URL input for plugins that need bytes.
+    fn has_route(&self) -> bool;
+
+    /// Fetch the `https` `url` within `limits`.
+    ///
+    /// # Errors
+    ///
+    /// `media_not_found` for every failure (blocked, failed, too large,
+    /// timed out, no route), never saying which rule failed.
+    async fn fetch(
+        &self,
+        url: &str,
+        limits: &MediaFetchLimits,
+    ) -> Result<FetchedMedia, LlmGatewayError>;
+}

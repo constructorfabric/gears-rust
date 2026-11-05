@@ -360,3 +360,143 @@ mod usage {
             .expect("100 is the cap, not over it");
     }
 }
+
+// ── media (DESIGN §4.5, `media.*`, `limits.max_inline_media_bytes`) ─────────
+
+use super::MediaConfig;
+use std::time::Duration;
+
+const MIB: usize = 1024 * 1024;
+
+#[allow(clippy::needless_pass_by_value)] // call sites build the value inline with `json!`
+fn media_cfg(media: serde_json::Value) -> LlmGatewayConfig {
+    serde_json::from_value(serde_json::json!({ "media": media })).expect("media config parses")
+}
+
+#[test]
+fn media_defaults_are_sensible() {
+    let media = MediaConfig::default();
+    assert_eq!(media.fetch_timeout, Duration::from_secs(10));
+    assert_eq!(media.total_timeout, Duration::from_secs(30));
+    assert_eq!(media.max_bytes, 20 * MIB);
+    assert_eq!(LimitsConfig::default().max_media_fetches, 16);
+    assert_eq!(
+        media.allowed_image_types,
+        ["image/png", "image/jpeg", "image/gif", "image/webp"]
+    );
+    assert_eq!(media.allowed_file_types, ["application/pdf", "text/*"]);
+    assert_eq!(LimitsConfig::default().max_inline_media_bytes, 20 * MIB);
+    assert_eq!(LlmGatewayConfig::default().media.max_bytes, 20 * MIB);
+    LlmGatewayConfig::default()
+        .validate()
+        .expect("defaults validate");
+}
+
+#[test]
+fn media_settings_deserialize_and_keep_other_defaults() {
+    let cfg: LlmGatewayConfig = serde_json::from_value(serde_json::json!({
+        "limits": { "max_inline_media_bytes": 1024, "max_media_fetches": 4 },
+        "media": {
+            "fetch_timeout": "3s",
+            "total_timeout": "45s",
+            "max_bytes": 2048,
+            "allowed_image_types": ["image/png"]
+        }
+    }))
+    .expect("media settings deserialize");
+    assert_eq!(cfg.limits.max_inline_media_bytes, 1024);
+    assert_eq!(cfg.limits.max_media_fetches, 4);
+    assert_eq!(cfg.media.total_timeout, Duration::from_secs(45));
+    assert_eq!(cfg.limits.max_tools, 128);
+    assert_eq!(cfg.media.fetch_timeout, Duration::from_secs(3));
+    assert_eq!(cfg.media.max_bytes, 2048);
+    assert_eq!(cfg.media.allowed_image_types, ["image/png"]);
+    assert_eq!(
+        cfg.media.allowed_file_types,
+        MediaConfig::default().allowed_file_types
+    );
+    cfg.validate().expect("valid");
+}
+
+#[test]
+fn unknown_media_keys_are_rejected() {
+    let result: Result<LlmGatewayConfig, _> =
+        serde_json::from_value(serde_json::json!({ "media": { "max_byte": 3 } }));
+    assert!(result.is_err());
+}
+
+#[test]
+fn invalid_media_values_are_rejected_naming_the_key() {
+    let cases = [
+        (
+            serde_json::json!({ "media": { "fetch_timeout": "0s" } }),
+            "media.fetch_timeout",
+        ),
+        (
+            serde_json::json!({ "media": { "max_bytes": 0 } }),
+            "media.max_bytes",
+        ),
+        (
+            serde_json::json!({ "media": { "total_timeout": "0s" } }),
+            "media.total_timeout",
+        ),
+        (
+            serde_json::json!({ "media": { "fetch_timeout": "20s", "total_timeout": "19s" } }),
+            "media.total_timeout",
+        ),
+        (
+            serde_json::json!({ "limits": { "max_media_fetches": 0 } }),
+            "limits.max_media_fetches",
+        ),
+        (
+            serde_json::json!({ "media": { "allowed_image_types": [] } }),
+            "media.allowed_image_types",
+        ),
+        (
+            serde_json::json!({ "media": { "allowed_file_types": [] } }),
+            "media.allowed_file_types",
+        ),
+        (
+            serde_json::json!({ "media": { "allowed_image_types": ["png"] } }),
+            "media.allowed_image_types",
+        ),
+        (
+            serde_json::json!({ "media": { "allowed_image_types": ["image/"] } }),
+            "media.allowed_image_types",
+        ),
+        (
+            serde_json::json!({ "media": { "allowed_image_types": ["*/*"] } }),
+            "media.allowed_image_types",
+        ),
+        (
+            serde_json::json!({ "media": { "allowed_image_types": ["Image/PNG"] } }),
+            "media.allowed_image_types",
+        ),
+        (
+            serde_json::json!({ "media": { "allowed_image_types": ["image/png; q=1"] } }),
+            "media.allowed_image_types",
+        ),
+        (
+            serde_json::json!({ "media": { "allowed_file_types": [""] } }),
+            "media.allowed_file_types",
+        ),
+        (
+            serde_json::json!({ "limits": { "max_inline_media_bytes": 0 } }),
+            "limits.max_inline_media_bytes",
+        ),
+    ];
+    for (value, key) in cases {
+        let cfg: LlmGatewayConfig = serde_json::from_value(value.clone()).expect("parses");
+        let err = cfg.validate().expect_err(&format!("{value} must fail"));
+        assert!(err.contains(key), "{value}: {err}");
+    }
+}
+
+#[test]
+fn well_formed_media_type_lists_are_accepted() {
+    let cfg = media_cfg(serde_json::json!({
+        "allowed_image_types": ["image/*", "image/svg+xml"],
+        "allowed_file_types": ["application/pdf", "application/vnd.ms-excel", "text/*"]
+    }));
+    cfg.validate().expect("valid lists");
+}

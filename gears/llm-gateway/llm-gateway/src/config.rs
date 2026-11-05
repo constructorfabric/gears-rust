@@ -22,6 +22,8 @@ pub struct LlmGatewayConfig {
     pub quota: QuotaConfig,
     /// Usage delivery to Usage Collector (`usage.*`).
     pub usage: UsageConfig,
+    /// Media input policy (`media.*`).
+    pub media: MediaConfig,
     /// Graceful shutdown (`shutdown.*`).
     pub shutdown: ShutdownConfig,
     /// Service identity for settle and usage delivery. Required: the module
@@ -53,6 +55,7 @@ impl LlmGatewayConfig {
             return Err("timeouts.stream_max_duration must be > 0".to_owned());
         }
         self.validate_usage()?;
+        self.validate_media()?;
         if let Some(credentials) = &self.client_credentials {
             if credentials.client_id.trim().is_empty() {
                 return Err("client_credentials.client_id must not be empty".to_owned());
@@ -72,6 +75,43 @@ impl LlmGatewayConfig {
 }
 
 impl LlmGatewayConfig {
+    /// `media.*`, `limits.max_inline_media_bytes` and `limits.max_media_fetches`.
+    fn validate_media(&self) -> Result<(), String> {
+        let media = &self.media;
+        if media.fetch_timeout.is_zero() {
+            return Err("media.fetch_timeout must be > 0".to_owned());
+        }
+        if media.total_timeout.is_zero() {
+            return Err("media.total_timeout must be > 0".to_owned());
+        }
+        if media.total_timeout < media.fetch_timeout {
+            return Err("media.total_timeout must be >= media.fetch_timeout".to_owned());
+        }
+        if self.limits.max_media_fetches == 0 {
+            return Err("limits.max_media_fetches must be > 0".to_owned());
+        }
+        if media.max_bytes == 0 {
+            return Err("media.max_bytes must be > 0".to_owned());
+        }
+        if self.limits.max_inline_media_bytes == 0 {
+            return Err("limits.max_inline_media_bytes must be > 0".to_owned());
+        }
+        for (key, types) in [
+            ("media.allowed_image_types", &media.allowed_image_types),
+            ("media.allowed_file_types", &media.allowed_file_types),
+        ] {
+            if types.is_empty() {
+                return Err(format!("{key} must not be empty"));
+            }
+            if let Some(entry) = types.iter().find(|entry| !is_media_type_pattern(entry)) {
+                return Err(format!(
+                    "{key} entry {entry:?} must be a lowercase `type/subtype` or `type/*`"
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// `usage.*` and `shutdown.usage_drain_reserve`.
     fn validate_usage(&self) -> Result<(), String> {
         let usage = &self.usage;
@@ -103,6 +143,26 @@ impl LlmGatewayConfig {
         }
         Ok(())
     }
+}
+
+/// A `type` or `subtype` token of a MIME type: non-empty, ASCII letters
+/// (either case), digits and `!#$&-^_.+`. Shared by the allow-list
+/// validation and the media data URI / `Content-Type` checks; `*`, quotes,
+/// commas, backslashes and whitespace are not token characters.
+pub(crate) fn is_mime_token(part: &str) -> bool {
+    !part.is_empty()
+        && part
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"!#$&-^_.+".contains(&b))
+}
+
+/// A lowercase `type/subtype` or `type/*` MIME pattern: no parameters, no
+/// `*/*`, no whitespace.
+fn is_media_type_pattern(entry: &str) -> bool {
+    let token = |part: &str| is_mime_token(part) && !part.bytes().any(|b| b.is_ascii_uppercase());
+    entry
+        .split_once('/')
+        .is_some_and(|(kind, subtype)| token(kind) && (subtype == "*" || token(subtype)))
 }
 
 /// Largest accepted `shutdown.usage_drain_reserve`: leaves at least
@@ -349,6 +409,15 @@ pub struct LimitsConfig {
     /// limit: `validation_error` (param `input`) before quota admission and
     /// credential retrieval.
     pub max_embedding_inputs: usize,
+    /// Maximum decoded size in bytes of one inline media part (a base64 data
+    /// URI or `file_data`). Over the limit: `validation_error` (param
+    /// `input`) before quota admission and credential retrieval.
+    pub max_inline_media_bytes: usize,
+    /// Maximum number of `https` media URLs one request may have fetched
+    /// (only a `PrefetchRequired` plugin with a media egress route fetches).
+    /// Over the limit: `validation_error` (param `input`) before quota
+    /// admission and credential retrieval.
+    pub max_media_fetches: usize,
 }
 
 impl Default for LimitsConfig {
@@ -360,6 +429,42 @@ impl Default for LimitsConfig {
             max_tools: 128,
             max_schema_bytes: 262_144,
             max_embedding_inputs: 2_048,
+            max_inline_media_bytes: 20 * 1024 * 1024,
+            max_media_fetches: 16,
+        }
+    }
+}
+
+/// Media input policy (DESIGN §3.2 Media Resolver, §4.5, `media.*`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct MediaConfig {
+    /// Upper bound of one media fetch.
+    #[serde(with = "humantime_serde")]
+    pub fetch_timeout: Duration,
+    /// Upper bound of the whole media resolution of one request (all fetches
+    /// together; must be >= `fetch_timeout`). On expiry the first unresolved
+    /// part fails with `media_not_found`.
+    #[serde(with = "humantime_serde")]
+    pub total_timeout: Duration,
+    /// Maximum size in bytes of a fetched media response.
+    pub max_bytes: usize,
+    /// MIME types accepted for image parts (`type/subtype`, or `type/*`).
+    pub allowed_image_types: Vec<String>,
+    /// MIME types accepted for file parts (`type/subtype`, or `type/*`).
+    pub allowed_file_types: Vec<String>,
+}
+
+impl Default for MediaConfig {
+    fn default() -> Self {
+        Self {
+            fetch_timeout: Duration::from_secs(10),
+            total_timeout: Duration::from_secs(30),
+            max_bytes: 20 * 1024 * 1024,
+            allowed_image_types: ["image/png", "image/jpeg", "image/gif", "image/webp"]
+                .map(str::to_owned)
+                .to_vec(),
+            allowed_file_types: ["application/pdf", "text/*"].map(str::to_owned).to_vec(),
         }
     }
 }
