@@ -63,3 +63,16 @@ store-success-output = false
 store-failure-output = true
 # Requires nextest >= 0.9.143 (see NEXTEST_MIN_VERSION in gears.mk).
 report-skipped = "ignored"
+
+# TEMP #5710 repro arm B (do not merge): run the trybuild compile-fail suites one
+# at a time. Each spawns nested cargo/rustc builds; the hypothesis is that several
+# at once exhaust memory on the 7 GB macOS runner.
+[test-groups]
+compile-fail = { max-threads = 1 }
+
+[[profile.default.overrides]]
+filter = '''binary(ui) | binary(compile_tests) | binary(typed_builder_compilefail)
+  | (package(cf-gears-bss-orders) & binary(capability_types))
+  | (package(cf-gears-toolkit) & binary(domain_model_tests) & test(/compile_fail/))
+  | (package(cf-gears-event-broker-sdk) & test(/typestate_builder_compile_failures_are_checked|an_incomplete_managed_builder_is_not_accepted_as_deduplication|sequence_arithmetic_does_not_compile/))'''
+test-group = 'compile-fail'
