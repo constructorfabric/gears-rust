@@ -1175,6 +1175,114 @@ fn runtime_publishing(descriptor: &'static GtsPublicationDescriptor) -> HostRunt
     )
 }
 
+/// Remote registry clients belong to each publisher's hub view, including when
+/// multiple publishers use the same registry contract.
+#[tokio::test]
+async fn each_publisher_uses_its_own_registry_proxy() {
+    #[allow(clippy::unnecessary_wraps, reason = "must match the WireFn signature")]
+    fn wire(
+        hub: &ClientHub,
+        _resolver: Arc<dyn crate::discovery::EndpointResolver>,
+        _tuning: toolkit_contract::wiring::ClientTuning,
+    ) -> anyhow::Result<crate::discovery::WireOutcome> {
+        hub.register_remote_proxy::<FakeRegistry>(FakeRegistry::with(&[]));
+        Ok(crate::discovery::WireOutcome::Remote)
+    }
+    static A: GtsPublicationDescriptor = GtsPublicationDescriptor { wire, ..PUB_REMOTE };
+    static B: GtsPublicationDescriptor = GtsPublicationDescriptor {
+        gear: "b",
+        declarations: other_document,
+        wire,
+        ..PUB_REMOTE
+    };
+    let events: Events = Arc::default();
+    let mut builder = RegistryBuilder::default();
+    register(&mut builder, PubGear::new("a", Some(&A), &events));
+    register(&mut builder, PubGear::new("b", Some(&B), &events));
+    let hub = Arc::new(ClientHub::new());
+    let runtime = runtime_with_hub(
+        builder.build_topo_sorted().unwrap(),
+        Arc::clone(&hub),
+        &CancellationToken::new(),
+    );
+    let manifests = runtime.build_gts_manifests().unwrap();
+    runtime.wire_registry_clients_over(&manifests, &[]).unwrap();
+
+    let outcome = runtime
+        .run_gts_publication_barrier(&manifests)
+        .await
+        .unwrap();
+
+    assert!(matches!(outcome, super::AppStartup::Started));
+    for publisher in ["a", "b"] {
+        let registry = hub.for_gear(publisher).get::<FakeRegistry>().unwrap();
+        assert_eq!(*registry.sent.lock(), [publisher]);
+    }
+    assert!(hub.try_get::<FakeRegistry>().is_none());
+}
+
+/// The publication adapter may reuse a consumer's registry proxy; a second
+/// explicit consumer registration must still be rejected.
+#[test]
+fn publication_reuses_an_explicit_registry_consumer() {
+    fn consume(
+        hub: &ClientHub,
+        _resolver: Arc<dyn crate::discovery::EndpointResolver>,
+        _tuning: toolkit_contract::wiring::ClientTuning,
+    ) -> anyhow::Result<crate::discovery::WireOutcome> {
+        anyhow::ensure!(
+            !hub.has_remote_proxy::<FakeRegistry>(),
+            "duplicate consumer"
+        );
+        hub.register_remote_proxy::<FakeRegistry>(FakeRegistry::with(&[]));
+        Ok(crate::discovery::WireOutcome::Remote)
+    }
+    fn publish(
+        hub: &ClientHub,
+        resolver: Arc<dyn crate::discovery::EndpointResolver>,
+        tuning: toolkit_contract::wiring::ClientTuning,
+    ) -> anyhow::Result<crate::discovery::WireOutcome> {
+        if hub.has_remote_proxy::<FakeRegistry>() {
+            return Ok(crate::discovery::WireOutcome::Remote);
+        }
+        consume(hub, resolver, tuning)
+    }
+    static PUBLICATION: GtsPublicationDescriptor = GtsPublicationDescriptor {
+        wire: publish,
+        ..PUB_REMOTE
+    };
+    static CONSUMER: crate::discovery::ConsumerRegistration =
+        crate::discovery::ConsumerRegistration {
+            owner_gear: "a",
+            dep_gear: "fake-registry",
+            wire: consume,
+        };
+    let events: Events = Arc::default();
+    let mut builder = RegistryBuilder::default();
+    register(&mut builder, PubGear::new("a", Some(&PUBLICATION), &events));
+    let runtime = runtime_with_hub(
+        builder.build_topo_sorted().unwrap(),
+        Arc::new(ClientHub::new()),
+        &CancellationToken::new(),
+    );
+    let manifests = runtime.build_gts_manifests().unwrap();
+
+    runtime
+        .wire_registry_clients_over(&manifests, &[&CONSUMER])
+        .unwrap();
+
+    let hub = runtime.client_hub.for_gear("a");
+    assert!(hub.has_remote_proxy::<FakeRegistry>());
+    assert!(
+        runtime
+            .wire_consumer_registrations(&[&CONSUMER])
+            .unwrap()
+            .is_empty()
+    );
+    let error = runtime.wire_untracked(&[&CONSUMER]).unwrap_err();
+    assert!(format!("{error:#}").contains("duplicate consumer"));
+}
+
 /// The registry clients of the publications are wired early, each once: the
 /// publisher's, and every consumed contract of the same provider as a
 /// registration of its own. A later wiring of every registration skips them;

@@ -68,7 +68,9 @@ async fn an_explicit_consumer_of_the_registry_still_gates_readiness() {
     .await;
     assert_eq!(checker.unresolved_deps(), ["fake-registry"]);
     assert!(
-        hub.get::<fake_publisher::Registry>().is_ok(),
+        hub.for_gear("registry-user")
+            .get::<fake_publisher::Registry>()
+            .is_ok(),
         "the business client is wired"
     );
 

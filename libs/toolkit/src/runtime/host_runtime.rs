@@ -579,14 +579,19 @@ impl HostRuntime {
         &self,
         regs: &[&crate::discovery::ConsumerRegistration],
     ) -> Result<Vec<crate::discovery::WireOutcome>, RegistryError> {
-        let regs: Vec<&crate::discovery::ConsumerRegistration> = {
-            let mut wired = self.wired.lock();
-            regs.iter()
-                .copied()
-                .filter(|reg| wired.insert(std::ptr::from_ref(*reg) as usize))
-                .collect()
-        };
+        let regs = self.unwired_consumer_registrations(regs);
         self.wire_untracked(&regs)
+    }
+
+    fn unwired_consumer_registrations<'a>(
+        &self,
+        regs: &[&'a crate::discovery::ConsumerRegistration],
+    ) -> Vec<&'a crate::discovery::ConsumerRegistration> {
+        let mut wired = self.wired.lock();
+        regs.iter()
+            .copied()
+            .filter(|reg| wired.insert(std::ptr::from_ref(*reg) as usize))
+            .collect()
     }
 
     /// Wire `regs` without deduplication; callers manage which registrations run.
@@ -919,10 +924,24 @@ impl HostRuntime {
         if publications.is_empty() {
             return Ok(());
         }
-        let publishers: Vec<&crate::discovery::ConsumerRegistration> =
-            publications.iter().collect();
-        let outcomes = self.wire_untracked(&publishers)?;
-        for (publisher, outcome) in publishers.iter().zip(outcomes) {
+        let providers: HashSet<&str> = publications.iter().map(|p| p.dep_gear).collect();
+        let consumers: Vec<&crate::discovery::ConsumerRegistration> = all
+            .iter()
+            .copied()
+            .filter(|reg| providers.contains(reg.dep_gear))
+            .collect();
+        // Explicit consumers reject duplicate contracts. Wire them first, then
+        // let publication adapters reuse their proxies in the same gear view.
+        // One batch keeps a static endpoint from resolving a dependency that
+        // another consumer still needs to discover.
+        let mut regs = self.unwired_consumer_registrations(&consumers);
+        let consumer_count = regs.len();
+        regs.extend(publications.iter());
+        let outcomes = self.wire_untracked(&regs)?;
+        for (publisher, outcome) in publications
+            .iter()
+            .zip(outcomes.into_iter().skip(consumer_count))
+        {
             if outcome != crate::discovery::WireOutcome::Remote {
                 continue;
             }
@@ -946,13 +965,6 @@ impl HostRuntime {
                 });
             }
         }
-        let providers: HashSet<&str> = publications.iter().map(|p| p.dep_gear).collect();
-        let consumers: Vec<&crate::discovery::ConsumerRegistration> = all
-            .iter()
-            .copied()
-            .filter(|reg| providers.contains(reg.dep_gear))
-            .collect();
-        self.wire_consumer_registrations(&consumers)?;
         Ok(())
     }
 
@@ -1086,7 +1098,7 @@ impl HostRuntime {
                     descriptor,
                     Arc::clone(manifest),
                     *options,
-                    &self.client_hub,
+                    &self.client_hub.for_gear(descriptor.gear),
                 )
                 .map_err(|e| RegistryError::Publication {
                     gear: descriptor.gear,
@@ -3219,7 +3231,10 @@ mod tests {
 
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         assert!(
-            !runtime.dep_checker.all_resolved(),
+            runtime
+                .dep_checker
+                .unresolved_deps()
+                .contains(&"shipping".to_owned()),
             "no provider is advertised yet"
         );
 
@@ -3230,12 +3245,17 @@ mod tests {
             ))
             .unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            while !runtime.dep_checker.all_resolved() {
+            while runtime
+                .dep_checker
+                .unresolved_deps()
+                .contains(&"shipping".to_owned())
+            {
                 tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             }
         })
         .await
         .expect("the probe must resolve the dep once the provider is advertised");
+        assert_eq!(runtime.dep_checker.unresolved_deps(), [PREPARATION_GATE]);
         runtime.owned.cancel();
     }
 
@@ -3251,7 +3271,7 @@ mod tests {
             .wire_consumer_registrations(&[&reg_a, &reg_b])
             .unwrap();
 
-        assert!(runtime.dep_checker.all_resolved());
+        assert_eq!(runtime.dep_checker.unresolved_deps(), [PREPARATION_GATE]);
     }
 
     /// One gear consuming the same contract twice is a boot error naming it.
@@ -3259,8 +3279,9 @@ mod tests {
     async fn a_gear_consuming_a_contract_twice_fails_wiring() {
         let runtime = shipping_runtime(serde_json::json!({}));
         let reg = shipping_registration("a");
+        let duplicate = shipping_registration("a");
         let err = runtime
-            .wire_consumer_registrations(&[&reg, &reg])
+            .wire_consumer_registrations(&[&reg, &duplicate])
             .expect_err("a duplicate consumer must fail wiring");
         assert!(
             matches!(err, RegistryError::ProxyWiring { gear, .. } if gear == "a"),
