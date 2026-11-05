@@ -4,6 +4,7 @@
 pub mod dto;
 pub mod error;
 pub mod handlers;
+mod odata_list;
 pub mod routes;
 
 pub mod batch;

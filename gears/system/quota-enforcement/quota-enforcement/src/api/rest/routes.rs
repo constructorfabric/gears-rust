@@ -10,7 +10,9 @@ use std::sync::Arc;
 use axum::http::StatusCode;
 use axum::{Extension, Router};
 use toolkit::api::OpenApiRegistry;
-use toolkit::api::operation_builder::{OperationBuilder, ResponseHeaderSpec, ResponseHeaderType};
+use toolkit::api::operation_builder::{
+    OperationBuilder, OperationBuilderODataExt as _, ResponseHeaderSpec, ResponseHeaderType,
+};
 
 use super::{dto, handlers};
 use crate::domain::Service;
@@ -88,22 +90,42 @@ fn register_quota_routes(mut router: Router, openapi: &dyn OpenApiRegistry) -> R
         .standard_errors(openapi)
         .register(router, openapi);
 
-    router = OperationBuilder::get(format!("{PATH_PREFIX}/quotas"))
+    // By hand: the OData extension would publish orders the list does not serve, and has no `$top`.
+    #[allow(unknown_lints, de0802_use_odata_ext)]
+    let listed = OperationBuilder::get(format!("{PATH_PREFIX}/quotas"))
         .operation_id("quota_enforcement.list_quotas")
         .summary("List Quotas")
         .description(
             "A filtered, cursor-paginated page of Quotas within the caller's scope, ordered by \
-             identifier (creation order). `projection_type` and `subject_id` come together; \
-             repeat `id` to name several Quotas.",
+             identifier (creation order). `$filter` takes `eq` on every field and `in` on `id`, \
+             joined by `and`; `projection_type` and `subject_id` come together.",
         )
         .tag(API_TAG)
         .authenticated()
         .no_license_required()
-        .query_params_from::<dto::ListQuotasQuery>()
+        .with_odata_filter::<quota_enforcement_sdk::QuotaFilterField>()
+        .query_param(
+            "$orderby",
+            false,
+            "OData v4 orderby expression; only `id asc`, the keyset order, is supported",
+        )
+        .query_param_typed(
+            "$top",
+            false,
+            "Page size, canonical OData spelling",
+            "integer",
+        )
+        .query_param_typed("limit", false, "Page size, alias of `$top`", "integer")
+        .query_param("cursor", false, "Forward-only CursorV1 continuation token")
         .handler(handlers::list_quotas)
-        .json_response_with_schema::<dto::QuotaPageDto>(openapi, StatusCode::OK, "One page")
+        .json_response_with_schema::<toolkit_odata::Page<dto::QuotaViewDto>>(
+            openapi,
+            StatusCode::OK,
+            "One page",
+        )
         .standard_errors(openapi)
         .register(router, openapi);
+    router = listed;
     // @cpt-end:cpt-cf-quota-enforcement-flow-quota-read:p1:inst-qrd-request
 
     // @cpt-begin:cpt-cf-quota-enforcement-flow-quota-update:p1:inst-qup-request

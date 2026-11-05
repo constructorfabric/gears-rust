@@ -48,7 +48,9 @@ utoipa = { workspace = true }
 gts = { workspace = true }
 
 axum = { workspace = true }
-# Repeated list query parameters (`id=a&id=b`) and their OpenAPI declaration.
+# `$filter`, `$top` and `CursorV1` on the REST lists, and the `Page<T>` envelope.
+toolkit-odata = { workspace = true, features = ["with-utoipa"] }
+# The policy read and delete query parameters and their OpenAPI declaration.
 toolkit-contract = { workspace = true, features = ["runtime-client", "rest-server"] }
 anyhow = { workspace = true }
 # One server clock reading per read response and the gauge refresh timing.

@@ -356,6 +356,12 @@ impl PolicyManagement<'_> {
         }
     }
 
+    /// The bounds this service runs with.
+    #[must_use]
+    pub const fn limits(&self) -> PolicyLimits {
+        self.limits
+    }
+
     /// Read immutable history with the storage-issued opaque cursor. An absent
     /// `limit` means the platform default, within the configured maximum.
     /// # Errors

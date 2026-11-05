@@ -210,7 +210,7 @@ Realises `cpt-cf-quota-enforcement-seq-quota-deactivate-cascade`.
 - Rows outside the caller's tenant or `AccessScope` are unreachable by construction; they are absent, not errors
 
 **Steps**:
-1. [x] - `p1` - Caller sends `GET /v1/quota-enforcement/quotas/{id}` or `GET /v1/quota-enforcement/quotas` with filter and page parameters - `inst-qrd-request`
+1. [x] - `p1` - Caller sends `GET /v1/quota-enforcement/quotas/{id}` or `GET /v1/quota-enforcement/quotas` with an OData `$filter`, `$orderby=id asc`, `$top` and a forward-only cursor - `inst-qrd-request`
 2. [x] - `p1` - DB: `read_quotas(filter, page)` under the caller's `AccessScope` per `cpt-cf-quota-enforcement-algo-pdp-constraint-composition` (foundation); reads are read-only (I3) - `inst-qrd-read`
 3. [x] - `p1` - Deactivated Quotas remain readable; deactivation retains the record for read access - `inst-qrd-deactivated`
 4. [x] - `p1` - Compute `currently_within_window` per `cpt-cf-quota-enforcement-algo-validity-window` for each returned Quota - `inst-qrd-window`
@@ -343,7 +343,7 @@ time in-tx (I6). Updates preserve the quota ID and the subject reference; breaki
 **Touches**:
 - API: `POST /v1/quota-enforcement/quotas`, `GET /v1/quota-enforcement/quotas/{id}`,
   `PATCH /v1/quota-enforcement/quotas/{id}`, `POST /v1/quota-enforcement/quotas/{id}/deactivate`,
-  `GET /v1/quota-enforcement/quotas`; `QuotaManagerApi` Quota methods
+  `GET /v1/quota-enforcement/quotas` (OData `$filter`, `$top` and cursor); `QuotaManagerApi` Quota methods
 - DB: `cpt-cf-quota-enforcement-db-schema` (`quotas` table plus the allocation-counter materialization)
 - Entities: `Quota`, `QuotaDraft`, `QuotaUpdate`, `QuotaPatch`, `QuotaFilter`, `QuotaId`, `DeactivateOutcome`
 

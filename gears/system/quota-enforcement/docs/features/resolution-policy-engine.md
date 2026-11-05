@@ -326,7 +326,7 @@ from `QuotaManagerApi` per PRD §2.3.
 
 **Touches**:
 - API: `POST /v1/quota-enforcement/policies`, `GET /v1/quota-enforcement/policies/{id}`,
-  `GET /v1/quota-enforcement/policies/{id}/versions`, `PATCH /v1/quota-enforcement/policies/{id}`,
+  `GET /v1/quota-enforcement/policies/{id}/versions` (`$top` and a forward-only cursor), `PATCH /v1/quota-enforcement/policies/{id}`,
   `POST /v1/quota-enforcement/policies/{id}/rollback`, `DELETE /v1/quota-enforcement/policies/{id}`;
   `QuotaOperatorApi` Policy methods
 - DB: `cpt-cf-quota-enforcement-db-schema`

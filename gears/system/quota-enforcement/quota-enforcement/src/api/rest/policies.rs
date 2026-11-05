@@ -1,19 +1,27 @@
 //! Platform policy routes over the shared operator service.
 use super::error::ApiResult;
+use super::odata_list::{
+    continuation, next_cursor, page_size, policy_binding, reject_filter, reject_select,
+    reject_unknown_params, require_order,
+};
 use crate::domain::{DomainError, Service};
+use axum::extract::Query;
 use axum::http::{StatusCode, Uri};
 use axum::response::IntoResponse;
 use axum::{Extension, Router};
 use quota_enforcement_sdk::{
-    MetricId, PolicyId, PolicyPatch, PolicyScope, PolicySpec, PolicyVersion, PolicyVersionMeta,
+    MetricId, PageRequest, PolicyId, PolicyPatch, PolicyScope, PolicySpec, PolicyVersion,
+    PolicyVersionMeta,
 };
 use serde::Deserialize;
 use serde_json::Value;
 use std::sync::Arc;
+use toolkit::api::odata::OData;
 use toolkit::api::operation_builder::OperationBuilder;
 use toolkit::api::rest::extract::{Json as JsonBody, Path};
 use toolkit::api::{OpenApiRegistry, response::created_json};
 use toolkit_contract::query::QueryParamsExtractor;
+use toolkit_odata::{Page, PageInfo};
 use toolkit_security::SecurityContext;
 
 /// Exact policy scope. Global remains a string-compatible path ID.
@@ -140,16 +148,6 @@ pub struct ReadQuery {
     /// Omit for active version.
     pub version: Option<u32>,
 }
-/// History pagination.
-#[derive(Debug, Clone, Default, Deserialize, toolkit_contract::QueryParams)]
-#[serde(deny_unknown_fields)]
-pub struct HistoryQuery {
-    /// Bounded page size.
-    pub limit: Option<u32>,
-    /// Opaque storage-issued cursor.
-    pub cursor: Option<String>,
-}
-
 /// Public version view; persisted validation snapshots remain server-owned.
 #[derive(Debug, Clone)]
 #[toolkit_macros::api_dto(response)]
@@ -224,16 +222,6 @@ impl From<PolicyVersionMeta> for VersionMetaDto {
         }
     }
 }
-/// A page of retained versions.
-#[derive(Debug, Clone)]
-#[toolkit_macros::api_dto(response)]
-pub struct PolicyHistoryDto {
-    /// Ordered versions.
-    pub items: Vec<VersionMetaDto>,
-    /// Next page cursor.
-    pub next_cursor: Option<String>,
-}
-
 // @cpt-begin:cpt-cf-quota-enforcement-flow-policy-write:p1:inst-pw-request
 async fn create(
     uri: Uri,
@@ -310,17 +298,36 @@ async fn history(
     Extension(ctx): Extension<SecurityContext>,
     Extension(service): Extension<Arc<Service>>,
     Path(id): Path<String>,
-    QueryParamsExtractor(query): QueryParamsExtractor<HistoryQuery>,
-) -> ApiResult<axum::Json<PolicyHistoryDto>> {
-    let page = service
-        .policies()?
-        .list(&ctx, &PolicyId::new(id), query.limit, query.cursor)
+    Query(params): Query<Vec<(String, String)>>,
+    OData(query): OData,
+) -> ApiResult<axum::Json<Page<VersionMetaDto>>> {
+    reject_unknown_params(&params)?;
+    reject_select(query.select.as_ref())?;
+    reject_filter(query.filter.as_deref())?;
+    require_order(&query.order, "version")?;
+    let policies = service.policies()?;
+    let limit = page_size(
+        query.limit,
+        PageRequest::DEFAULT_LIMIT,
+        policies.limits().list_limit,
+    )?;
+    let binding = policy_binding(&id);
+    let cursor = continuation(query.cursor.as_ref(), VERSION_ORDER, &binding)?;
+    let page = policies
+        .list(&ctx, &PolicyId::new(id), Some(limit), cursor)
         .await?;
-    Ok(axum::Json(PolicyHistoryDto {
+    Ok(axum::Json(Page {
         items: page.items.into_iter().map(Into::into).collect(),
-        next_cursor: page.next_cursor,
+        page_info: PageInfo {
+            next_cursor: next_cursor(page.next_cursor, VERSION_ORDER, &binding)?,
+            prev_cursor: None,
+            limit: u64::from(limit),
+        },
     }))
 }
+
+/// The keyset order of a policy history, as a cursor's signed sort token.
+const VERSION_ORDER: &str = "+version";
 
 /// Mount all policy operations before attaching the shared service extension.
 pub fn register(mut router: Router, openapi: &dyn OpenApiRegistry) -> Router {
@@ -360,18 +367,38 @@ pub fn register(mut router: Router, openapi: &dyn OpenApiRegistry) -> Router {
         .json_response_with_schema::<PolicyDto>(openapi, StatusCode::OK, "Policy version")
         .standard_errors(openapi)
         .register(router, openapi);
-    router = OperationBuilder::get(format!("{prefix}/policies/{{id}}/versions"))
+    // By hand: the OData extension would publish orders the history does not serve, and has no `$top`.
+    #[allow(unknown_lints, de0802_use_odata_ext)]
+    let history_route = OperationBuilder::get(format!("{prefix}/policies/{{id}}/versions"))
         .operation_id("quota_enforcement.list_policy_versions")
         .summary("Read policy history")
+        .description("Every retained version of one policy, oldest first, cursor-paginated.")
         .tag("Policies")
         .authenticated()
         .no_license_required()
         .path_param("id", "Opaque policy ID, including global")
-        .query_params_from::<HistoryQuery>()
+        .query_param(
+            "$orderby",
+            false,
+            "OData v4 orderby expression; only `version asc`, the keyset order, is supported",
+        )
+        .query_param_typed(
+            "$top",
+            false,
+            "Page size, canonical OData spelling",
+            "integer",
+        )
+        .query_param_typed("limit", false, "Page size, alias of `$top`", "integer")
+        .query_param("cursor", false, "Forward-only CursorV1 continuation token")
         .handler(history)
-        .json_response_with_schema::<PolicyHistoryDto>(openapi, StatusCode::OK, "Version history")
+        .json_response_with_schema::<Page<VersionMetaDto>>(
+            openapi,
+            StatusCode::OK,
+            "Version history",
+        )
         .standard_errors(openapi)
         .register(router, openapi);
+    router = history_route;
     router = OperationBuilder::post(format!("{prefix}/policies/{{id}}/rollback"))
         .operation_id("quota_enforcement.rollback_policy")
         .summary("Reactivate a retained policy version")

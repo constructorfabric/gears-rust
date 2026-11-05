@@ -144,5 +144,10 @@ def debit_body(subject: str, amount: int) -> dict:
 
 
 def subject_filter(subject: str) -> dict:
-    """``GET /quotas`` query naming one user subject."""
-    return {"tenant_id": TENANT_A, "projection_type": USER_PROJECTION, "subject_id": subject}
+    """``GET /quotas`` ``$filter`` naming one user subject."""
+    return {
+        "$filter": (
+            f"tenant_id eq {TENANT_A} and projection_type eq '{USER_PROJECTION}' "
+            f"and subject_id eq '{subject}'"
+        )
+    }

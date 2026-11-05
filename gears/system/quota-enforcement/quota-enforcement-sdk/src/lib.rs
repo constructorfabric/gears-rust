@@ -29,6 +29,7 @@ pub mod engine;
 pub mod gts;
 pub mod models;
 pub mod notifications;
+pub mod odata;
 pub mod period;
 pub mod rest;
 pub mod storage_plugin;
@@ -85,6 +86,7 @@ pub use notifications::{
     DeliveryOutcome, DispatchError, NotificationDeliveryHandle, NotificationDeliveryV1, QuotaEvent,
     QuotaNotificationSinkV1,
 };
+pub use odata::QuotaFilterField;
 pub use rest::{
     QuotaEnforcementApiRest, QuotaManagerApiRest, QuotaOperatorApiRest,
     quota_enforcement_api_rest_http_binding, quota_manager_api_rest_http_binding,

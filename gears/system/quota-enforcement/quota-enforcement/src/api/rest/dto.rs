@@ -11,8 +11,8 @@ use std::collections::BTreeMap;
 
 use gts::GtsTypeId;
 use quota_enforcement_sdk::{
-    DeactivateOutcome, EnforcementMode, LeaseToken, PageResult, PeriodType, QuotaId, QuotaSource,
-    QuotaStatus, QuotaType, QuotaView, SubjectRef, TenantId, ValidityWindow,
+    DeactivateOutcome, EnforcementMode, LeaseToken, PeriodType, QuotaSource, QuotaStatus,
+    QuotaType, QuotaView, SubjectRef, TenantId, ValidityWindow,
 };
 use serde::{Deserialize, Deserializer};
 use serde_json::{Map, Value};
@@ -20,7 +20,7 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 use crate::domain::error::DomainError;
-use crate::domain::quotas::{CreateQuotaRequest, ListQuotasRequest, Presence, UpdateQuotaRequest};
+use crate::domain::quotas::{CreateQuotaRequest, Presence, UpdateQuotaRequest};
 use crate::domain::tokens;
 
 /// Absent key → `Absent` (through `#[serde(default)]`); present key → `Null`
@@ -239,77 +239,6 @@ impl From<UpdateQuotaDto> for UpdateQuotaRequest {
     }
 }
 
-/// Query of `GET /quotas`. Repeated `id` keys collect into a list.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize, toolkit_contract::QueryParams)]
-pub struct ListQuotasQuery {
-    /// Owning tenant UUID; the caller's own tenant when absent.
-    pub tenant_id: Option<String>,
-    /// Subject projection type id; must come with `subject_id`.
-    pub projection_type: Option<String>,
-    /// Subject identifier; must come with `projection_type`.
-    pub subject_id: Option<String>,
-    /// Metric instance id.
-    pub metric: Option<String>,
-    /// `active` or `deactivated`.
-    pub status: Option<String>,
-    /// Quota UUIDs; repeat the key for several.
-    #[serde(default)]
-    pub id: Vec<String>,
-    /// Page size.
-    pub limit: Option<u32>,
-    /// Opaque continuation cursor from a previous page.
-    pub cursor: Option<String>,
-}
-
-impl TryFrom<ListQuotasQuery> for ListQuotasRequest {
-    type Error = DomainError;
-
-    fn try_from(query: ListQuotasQuery) -> Result<Self, Self::Error> {
-        let tenant_id = query
-            .tenant_id
-            .map(|raw| {
-                Uuid::parse_str(&raw)
-                    .map(TenantId::new)
-                    .map_err(|_| invalid("tenant_id", tokens::TENANT_ID_INVALID))
-            })
-            .transpose()?;
-        let projection_type = query
-            .projection_type
-            .map(|raw| {
-                GtsTypeId::try_new(&raw)
-                    .map_err(|_| invalid("projection_type", tokens::PROJECTION_INVALID))
-            })
-            .transpose()?;
-        let status = query
-            .status
-            .map(|raw| match raw.as_str() {
-                "active" => Ok(QuotaStatus::Active),
-                "deactivated" => Ok(QuotaStatus::Deactivated),
-                _ => Err(invalid("status", tokens::STATUS_INVALID)),
-            })
-            .transpose()?;
-        let ids = query
-            .id
-            .iter()
-            .map(|raw| {
-                Uuid::parse_str(raw)
-                    .map(QuotaId::new)
-                    .map_err(|_| invalid("id", tokens::QUOTA_ID_INVALID))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(Self {
-            tenant_id,
-            projection_type,
-            subject_id: query.subject_id,
-            metric: query.metric,
-            status,
-            ids,
-            limit: query.limit,
-            cursor: query.cursor,
-        })
-    }
-}
-
 /// The contract reference snapshotted with a Quota.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[toolkit_macros::api_dto(response)]
@@ -408,25 +337,6 @@ impl From<QuotaView> for QuotaViewDto {
                     .and_then(|v| v.as_str().map(str::to_owned))
                     .unwrap_or_default()
             }),
-        }
-    }
-}
-
-/// One page of Quotas.
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[toolkit_macros::api_dto(response)]
-pub struct QuotaPageDto {
-    /// The items of this page.
-    pub items: Vec<QuotaViewDto>,
-    /// Cursor of the next page; `null` on the last page.
-    pub next_cursor: Option<String>,
-}
-
-impl From<PageResult<QuotaView>> for QuotaPageDto {
-    fn from(page: PageResult<QuotaView>) -> Self {
-        Self {
-            items: page.items.into_iter().map(QuotaViewDto::from).collect(),
-            next_cursor: page.next_cursor,
         }
     }
 }

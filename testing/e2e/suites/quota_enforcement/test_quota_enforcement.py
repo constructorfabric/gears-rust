@@ -142,10 +142,14 @@ class TestPagination:
                 page = resp.json()
                 pages += 1
                 seen += [item["id"] for item in page["items"]]
-                if page["next_cursor"] is None:
+                if page["page_info"]["next_cursor"] is None:
                     break
                 assert pages < 4, f"cursor did not terminate: {page}"
-                params = {**subject_filter(subject), "limit": 1, "cursor": page["next_cursor"]}
+                params = {
+                    **subject_filter(subject),
+                    "limit": 1,
+                    "cursor": page["page_info"]["next_cursor"],
+                }
 
             assert pages == 3, seen
             assert len(seen) == len(set(seen)), f"duplicate ids: {seen}"

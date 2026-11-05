@@ -59,6 +59,8 @@ inventory = { workspace = true }
 
 # `AccessScope` and `SecurityContext` on the plugin contract signatures.
 toolkit-security = { workspace = true }
+# The `$filter` fields the Quota list publishes.
+toolkit-odata = { workspace = true }
 # `QuotaEnforcementError` is the platform canonical error (DESIGN section 3.3).
 toolkit-canonical-errors = { workspace = true }
 

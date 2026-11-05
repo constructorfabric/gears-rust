@@ -1,13 +1,12 @@
 #![allow(clippy::expect_used)]
 
-use quota_enforcement_sdk::{PeriodType, QuotaStatus};
+use quota_enforcement_sdk::PeriodType;
 use serde_json::{Value, json};
-use toolkit_contract::QueryParams;
 use uuid::Uuid;
 
-use super::{CreateQuotaDto, ListQuotasQuery, UpdateQuotaDto};
+use super::{CreateQuotaDto, UpdateQuotaDto};
 use crate::domain::error::DomainError;
-use crate::domain::quotas::{CreateQuotaRequest, ListQuotasRequest, Presence, UpdateQuotaRequest};
+use crate::domain::quotas::{CreateQuotaRequest, Presence, UpdateQuotaRequest};
 use crate::domain::tokens;
 use crate::test_support::{LLM_USER_PROJECTION, METRIC_TOKENS};
 
@@ -108,74 +107,4 @@ fn update_bodies_distinguish_absent_null_and_value_for_every_gated_field() {
         serde_json::from_value::<UpdateQuotaDto>(json!({ "bogus": 1 })).is_err(),
         "unknown keys"
     );
-}
-
-#[test]
-fn list_queries_declare_a_repeated_id_and_parse_into_the_domain_request() {
-    let id_param = ListQuotasQuery::openapi_params()
-        .iter()
-        .find(|p| p.name == "id")
-        .expect("id declared");
-    assert!(id_param.array, "repeated keys collect into a list");
-    assert!(!id_param.required);
-
-    let a = Uuid::from_u128(1);
-    let b = Uuid::from_u128(2);
-    let request = ListQuotasRequest::try_from(ListQuotasQuery {
-        tenant_id: Some(Uuid::from_u128(9).to_string()),
-        projection_type: Some(LLM_USER_PROJECTION.to_owned()),
-        subject_id: Some("u1".to_owned()),
-        metric: Some(METRIC_TOKENS.to_owned()),
-        status: Some("deactivated".to_owned()),
-        id: vec![a.to_string(), b.to_string()],
-        limit: Some(5),
-        cursor: Some("c".to_owned()),
-    })
-    .expect("request");
-    assert_eq!(
-        request.ids.iter().map(|q| q.as_uuid()).collect::<Vec<_>>(),
-        vec![a, b]
-    );
-    assert_eq!(request.status, Some(QuotaStatus::Deactivated));
-    assert_eq!(request.limit, Some(5));
-
-    for (query, field, reason) in [
-        (
-            ListQuotasQuery {
-                tenant_id: Some("nope".to_owned()),
-                ..ListQuotasQuery::default()
-            },
-            "tenant_id",
-            tokens::TENANT_ID_INVALID,
-        ),
-        (
-            ListQuotasQuery {
-                projection_type: Some("nope".to_owned()),
-                ..ListQuotasQuery::default()
-            },
-            "projection_type",
-            tokens::PROJECTION_INVALID,
-        ),
-        (
-            ListQuotasQuery {
-                status: Some("paused".to_owned()),
-                ..ListQuotasQuery::default()
-            },
-            "status",
-            tokens::STATUS_INVALID,
-        ),
-        (
-            ListQuotasQuery {
-                id: vec!["nope".to_owned()],
-                ..ListQuotasQuery::default()
-            },
-            "id",
-            tokens::QUOTA_ID_INVALID,
-        ),
-    ] {
-        assert_eq!(
-            ListQuotasRequest::try_from(query).expect_err(field),
-            DomainError::InvalidArgument { field, reason }
-        );
-    }
 }

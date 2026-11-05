@@ -138,8 +138,14 @@ async fn create_read_update_rollback_and_history_round_trip() {
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["items"].as_array().map(Vec::len), Some(1));
-    assert!(body["next_cursor"].is_string(), "{body}");
-    let cursor = body["next_cursor"].as_str().expect("cursor").to_owned();
+    assert!(
+        body["page_info"]["prev_cursor"].is_null(),
+        "forward only: {body}"
+    );
+    let cursor = body["page_info"]["next_cursor"]
+        .as_str()
+        .expect("cursor")
+        .to_owned();
     let (status, body) = send(
         &app,
         Method::GET,
@@ -172,6 +178,71 @@ async fn history_without_a_limit_returns_the_first_page_within_the_configured_bo
     let (status, body) = send(&app, Method::GET, &format!("/policies/{id}/versions"), None).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["items"].as_array().map(Vec::len), Some(1), "{body}");
+}
+
+#[tokio::test]
+async fn history_takes_no_filter_one_order_and_a_cursor_bound_to_its_policy() {
+    let app = operator_app().await;
+    let first = created(&app, metric_policy()).await;
+    let (status, body) = send(
+        &app,
+        Method::PATCH,
+        &format!("/policies/{first}"),
+        Some(json!({ "if_match_version": 1, "timeout_ms": 2 })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (status, body) = send(
+        &app,
+        Method::GET,
+        &format!("/policies/{first}/versions?$top=1&$orderby=version%20asc"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["page_info"]["limit"], json!(1));
+    let cursor = body["page_info"]["next_cursor"]
+        .as_str()
+        .expect("a second version follows")
+        .to_owned();
+
+    let refusals = [
+        ("$filter=version%20eq%201".to_owned(), "INVALID_FILTER"),
+        (
+            "$orderby=version%20desc".to_owned(),
+            "INVALID_ORDERBY_FIELD",
+        ),
+        ("$orderby=created_at".to_owned(), "INVALID_ORDERBY_FIELD"),
+        ("$select=version".to_owned(), "UNSUPPORTED_QUERY_PARAM"),
+        ("$top=51".to_owned(), "INVALID_LIMIT"),
+        ("version=1".to_owned(), "UNSUPPORTED_QUERY_PARAM"),
+        (
+            format!("cursor={cursor}&$orderby=version"),
+            "ORDER_WITH_CURSOR",
+        ),
+    ];
+    // A cursor names its policy: continuing another policy's history is refused.
+    let (status, body) = send(
+        &app,
+        Method::GET,
+        &format!("/policies/global/versions?cursor={cursor}"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body.to_string().contains("FILTER_MISMATCH"), "{body}");
+    for (query, reason) in refusals {
+        let (status, body) = send(
+            &app,
+            Method::GET,
+            &format!("/policies/{first}/versions?{query}"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{query}: {body}");
+        assert!(body.to_string().contains(reason), "{query}: {body}");
+    }
 }
 
 #[tokio::test]
