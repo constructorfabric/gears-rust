@@ -113,6 +113,62 @@ class Checks(unittest.TestCase):
         self.assertEqual(s.classify_checks([self.cr("COMPLETED", "STALE")]), "wait")
 
 
+def verdict(rollup=None, runs=None, total=None, age_min=60):
+    rollup = ok_rollup() if rollup is None else rollup
+    runs = RUNS if runs is None else runs
+    return s.ci_verdict(rollup, runs, len(runs) if total is None else total, age_min)
+
+
+class CiVerdict(unittest.TestCase):
+    def test_all_good(self):
+        self.assertEqual(verdict(), "green")
+
+    def test_zero_runs(self):
+        self.assertEqual(s.ci_verdict(ok_rollup(), [], 0, 60), "wait")
+
+    def test_run_in_progress(self):
+        self.assertEqual(verdict(runs=[{"status": "in_progress", "conclusion": None}]), "wait")
+
+    def test_run_failure(self):
+        self.assertEqual(verdict(runs=[{"status": "completed", "conclusion": "failure"}]), "red")
+
+    def test_run_cancelled(self):
+        self.assertEqual(verdict(runs=[{"status": "completed", "conclusion": "cancelled"}]), "red")
+
+    def test_run_action_required(self):
+        self.assertEqual(verdict(runs=[{"status": "completed", "conclusion": "action_required"}]), "red")
+
+    def test_run_skipped_ok(self):
+        runs = RUNS + [{"status": "completed", "conclusion": "skipped"}]
+        self.assertEqual(verdict(runs=runs), "green")
+
+    def test_partial_run_list(self):
+        self.assertEqual(verdict(total=101), "wait")
+
+    def test_dco_missing(self):
+        self.assertEqual(verdict(rollup=ok_rollup()[:1] + ok_rollup()[2:]), "wait")
+
+    def test_sonar_missing(self):
+        self.assertEqual(verdict(rollup=ok_rollup()[:2]), "wait")
+
+    def test_sonar_failure(self):
+        r = ok_rollup()
+        r[2]["conclusion"] = "FAILURE"
+        self.assertEqual(verdict(rollup=r), "red")
+
+    def test_dco_pending(self):
+        r = ok_rollup()
+        r[1]["state"] = "PENDING"
+        self.assertEqual(verdict(rollup=r), "wait")
+
+    def test_young_head(self):
+        self.assertEqual(verdict(age_min=29), "wait")
+
+    def test_rollup_red(self):
+        r = ok_rollup() + [{"__typename": "CheckRun", "name": "x", "status": "COMPLETED", "conclusion": "FAILURE"}]
+        self.assertEqual(verdict(rollup=r), "red")
+
+
 class Decide(unittest.TestCase):
     def test_untrusted(self):
         self.assertEqual(act(untrusted_commits=True), "skip: non-Dependabot commit")
@@ -156,6 +212,29 @@ class Decide(unittest.TestCase):
         b = s.Budget()
         r = [act(budget=b) for _ in range(5)]
         self.assertEqual(r, ["merge"] * 3 + ["defer: merge cap"] * 2)
+
+    def test_hold(self):
+        self.assertEqual(act(labels={s.LABEL_HOLD}), "skip: hold")
+
+    def test_hold_beats_ineligible(self):
+        self.assertEqual(act(labels={s.LABEL_HOLD}, eligible=False), "skip: hold")
+
+    def test_draft(self):
+        self.assertEqual(act(draft=True), "skip: draft")
+
+    def test_green_needs_migration_label(self):
+        self.assertEqual(act(labels={s.LABEL_MIGRATION}), "skip: needs-migration label")
+
+    def test_changes_requested(self):
+        self.assertEqual(act(review_decision="CHANGES_REQUESTED"), "skip: changes requested")
+
+    def test_unresolved_threads(self):
+        self.assertEqual(act(unresolved_threads=True), "skip: unresolved threads")
+
+    def test_skips_keep_budget(self):
+        b = s.Budget()
+        act(unresolved_threads=True, budget=b)
+        self.assertEqual(b.merges, 0)
 
     def test_recreate_cap(self):
         b = s.Budget()
@@ -225,8 +304,16 @@ class Trust(unittest.TestCase):
 
 
 PR = {"number": 7, "title": "Bump x from 1.0.0 to 1.0.1", "headRefName": "dependabot/cargo/x", "body": ""}
-VIEW = {"statusCheckRollup": [{"__typename": "CheckRun", "status": "COMPLETED", "conclusion": "SUCCESS"}],
-        "mergeable": "MERGEABLE", "reviews": [], "labels": [], "headRefOid": "a"}
+def ok_rollup():
+    return [{"__typename": "CheckRun", "name": "build", "status": "COMPLETED", "conclusion": "SUCCESS"},
+            {"__typename": "StatusContext", "context": "DCO", "state": "SUCCESS"},
+            {"__typename": "CheckRun", "name": "SonarCloud Code Analysis", "status": "COMPLETED",
+             "conclusion": "SUCCESS"}]
+
+
+RUNS = [{"status": "completed", "conclusion": "success"}]
+VIEW = {"statusCheckRollup": ok_rollup(), "mergeable": "MERGEABLE", "reviews": [], "labels": [],
+        "headRefOid": "a", "isDraft": False, "reviewDecision": None}
 NOW = datetime(2026, 1, 2, tzinfo=timezone.utc)
 
 
@@ -236,9 +323,22 @@ def graphql(commits, total=None):
         "totalCount": len(nodes) if total is None else total, "nodes": nodes}}}}}
 
 
-def fake_read(commits, total=None):
+def threads(resolved=(True,), total=None):
+    return {"data": {"repository": {"pullRequest": {"reviewThreads": {
+        "totalCount": len(resolved) if total is None else total,
+        "nodes": [{"isResolved": r} for r in resolved]}}}}}
+
+
+def fake_read(commits, total=None, view=None, runs=RUNS, runs_total=None, thr=None):
     def read(self, *args):
-        return graphql(commits, total) if args[0] == "api" else VIEW
+        if args[0] != "api":
+            return VIEW if view is None else view
+        if "actions/runs" in args[1]:
+            return {"total_count": len(runs) if runs_total is None else runs_total,
+                    "workflow_runs": runs}
+        if any("reviewThreads" in a for a in args):
+            return thr or threads()
+        return graphql(commits, total)
     return read
 
 
@@ -270,7 +370,7 @@ class Failures(unittest.TestCase):
 
         view = dict(VIEW, reviews=reviews or [])
         with mock.patch.object(s.Gh, "read_json",
-                               lambda self, *a: graphql([GOOD]) if a[0] == "api" else view), \
+                               fake_read([GOOD], view=view)), \
                 mock.patch("subprocess.run", side_effect=fake_run):
             row = s.process(s.Gh("o/r", True), PR, s.Budget(), NOW)
         return row, calls
@@ -344,8 +444,123 @@ class Failures(unittest.TestCase):
         with mock.patch.object(s.Gh, "read_json", fake_read([GOOD], total=150)):
             self.assertEqual(s.fetch_commits(s.Gh("o/r", False), 7), (150, [GOOD]))
 
+    def test_hold_live_no_writes(self):
+        view = dict(VIEW, labels=[{"name": s.LABEL_HOLD}])
+        with mock.patch.object(s.Gh, "read_json", fake_read([GOOD], view=view)), \
+                mock.patch("subprocess.run") as run:
+            row = s.process(s.Gh("o/r", True), PR, s.Budget(), NOW)
+        self.assertEqual((row[-1], run.call_count), ("skip: hold", 0))
+
+    def test_draft_live_no_writes(self):
+        view = dict(VIEW, isDraft=True)
+        with mock.patch.object(s.Gh, "read_json", fake_read([GOOD], view=view)), \
+                mock.patch("subprocess.run") as run:
+            row = s.process(s.Gh("o/r", True), PR, s.Budget(), NOW)
+        self.assertEqual((row[-1], run.call_count), ("skip: draft", 0))
+
+    def test_unresolved_thread_row(self):
+        with mock.patch.object(s.Gh, "read_json", fake_read([GOOD], thr=threads((True, False)))):
+            row = s.process(s.Gh("o/r", False), PR, s.Budget(), NOW)
+        self.assertEqual(row[-1], "skip: unresolved threads")
+
+    def test_over_100_threads_unresolved(self):
+        with mock.patch.object(s.Gh, "read_json", fake_read([GOOD], thr=threads((True,), total=101))):
+            self.assertTrue(s.fetch_unresolved_threads(s.Gh("o/r", False), 7))
+
+    def test_no_workflow_runs_waits(self):
+        with mock.patch.object(s.Gh, "read_json", fake_read([GOOD], runs=[])):
+            row = s.process(s.Gh("o/r", False), PR, s.Budget(), NOW)
+        self.assertEqual(row[-1], "wait")
+
+    def test_young_head_waits(self):
+        with mock.patch.object(s.Gh, "read_json", fake_read([GOOD])):
+            row = s.process(s.Gh("o/r", False), PR, s.Budget(), datetime(2026, 1, 1, 0, 10, tzinfo=timezone.utc))
+        self.assertEqual(row[-1], "wait")
+
+    def test_runs_read_failure(self):
+        def read(self, *args):
+            if args[0] == "api" and "actions/runs" in args[1]:
+                raise TIMEOUT
+            return fake_read([GOOD])(self, *args)
+        with mock.patch.object(s.Gh, "read_json", read):
+            row = s.process(s.Gh("o/r", False), PR, s.Budget(), NOW)
+        self.assertEqual(row[-1], "read FAILED (timeout)")
+
+
+class Helpers(unittest.TestCase):
+    def test_title_pipe(self):
+        self.assertEqual(s.md_title("a | b"), "a \\| b")
+
+    def test_title_mention(self):
+        self.assertEqual(s.md_title("@user"), "@\u200buser")
+
+    def test_title_link(self):
+        self.assertEqual(s.md_title("[x](y)"), "\\[x\\](y)")
+
+    def test_title_markup(self):
+        self.assertEqual(s.md_title("<b>*a*_`c`\\"), "\\<b\\>\\*a\\*\\_\\`c\\`\\\\")
+
+    def test_title_long(self):
+        out = s.md_title("x" * 300)
+        self.assertEqual((len(out), out[-1]), (100, "…"))
+
+    def test_add_label_rest(self):
+        gh = mock.Mock()
+        s.add_label(gh, 7, "deps:hold")
+        gh.write.assert_called_once_with(
+            "api", "-X", "POST", f"repos/{gh.repo}/issues/7/labels", "-f", "labels[]=deps:hold")
+
 
 class Main(unittest.TestCase):
+    def run_argv(self, argv, env):
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch("subprocess.run") as run, \
+                mock.patch.dict(os.environ, env, clear=True), \
+                mock.patch("sys.argv", ["dependabot_sweeper.py", *argv]), \
+                redirect_stdout(out), redirect_stderr(err):
+            rc = s.main()
+        return rc, run.call_count
+
+    def test_invalid_repo(self):
+        self.assertEqual(self.run_argv(["--repo", "o/r; rm -rf"], {}), (2, 0))
+
+    def test_repo_without_slash(self):
+        self.assertEqual(self.run_argv(["--repo", "orr"], {}), (2, 0))
+
+    def test_live_off_main(self):
+        env = {"GITHUB_REPOSITORY": "o/r", "GITHUB_REF": "refs/heads/feature"}
+        self.assertEqual(self.run_argv(["--live"], env), (2, 0))
+
+    def test_live_without_ref(self):
+        self.assertEqual(self.run_argv(["--live"], {"GITHUB_REPOSITORY": "o/r"}), (2, 0))
+
+    def test_dry_run_makes_no_writes(self):
+        prs = [{"number": i, "title": "t", "headRefName": "dependabot/cargo/x"} for i in (1, 2, 3)]
+        inner = fake_read([GOOD])
+
+        def read(self, *args):
+            if args[:2] == ("label", "list"):
+                return []
+            return prs if args[:2] == ("pr", "list") else inner(self, *args)
+        with mock.patch.object(s.Gh, "read_json", read), \
+                mock.patch.object(s.Gh, "write") as write:
+            rc, _ = self.run_argv([], {"GITHUB_REPOSITORY": "o/r"})
+        self.assertEqual(write.call_count, 0)
+
+    def test_deadline_defers_rest(self):
+        prs = [{"number": i, "title": "t", "headRefName": "b"} for i in (1, 2, 3)]
+        out = io.StringIO()
+        clock = iter([0, 0, 1000, 1000, 1000])
+        with mock.patch.object(s.Gh, "read_json", lambda self, *a: prs if a[:2] == ("pr", "list") else []), \
+                mock.patch.object(s, "process", return_value=["#1", "t", "?", "no", "wait", "x"]) as proc, \
+                mock.patch.object(s.time, "monotonic", side_effect=lambda: next(clock)), \
+                mock.patch.dict(os.environ, {"GITHUB_REPOSITORY": "o/r"}, clear=True), \
+                mock.patch("sys.argv", ["dependabot_sweeper.py"]), \
+                redirect_stdout(out), redirect_stderr(io.StringIO()):
+            rc = s.main()
+        self.assertEqual((rc, proc.call_count, "deferred: run deadline reached, 2 PRs not processed" in out.getvalue()),
+                         (0, 1, True))
+
     def run_main(self, read):
         env = {k: v for k, v in os.environ.items() if k != "GITHUB_STEP_SUMMARY"}
         env["GITHUB_REPOSITORY"] = "o/r"

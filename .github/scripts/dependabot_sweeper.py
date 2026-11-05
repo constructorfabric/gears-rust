@@ -16,19 +16,29 @@ import os
 import re
 import subprocess
 import sys
+import time
 from datetime import datetime, timezone
 
 LABEL_MIGRATION = "deps:needs-migration"
 LABEL_RECREATED = "deps:recreated"
+LABEL_HOLD = "deps:hold"
 LABELS = {
     LABEL_MIGRATION: ("B60205", "Dependabot update needs manual migration"),
     LABEL_RECREATED: ("FBCA04", "Dependabot was asked to recreate this PR"),
+    LABEL_HOLD: ("C5DEF5", "Dependabot sweeper: do not touch this PR"),
 }
 MAX_MERGES = 3
 MAX_RECREATES = 3
 STALE_HOURS = 72
 GH_TIMEOUT = 60  # seconds, per gh call
 PR_LIST_LIMIT = 500
+RUN_DEADLINE_SECONDS = 600
+LIVE_REF = "refs/heads/main"
+REPO_RE = r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+"
+TITLE_MAX = 100
+REQUIRED_CHECKS = ("DCO", "SonarCloud Code Analysis")
+MIN_HEAD_AGE_MINUTES = 30
+RUN_OK_CONCLUSIONS = {"success", "skipped", "neutral"}
 GH_ERRORS = (subprocess.CalledProcessError, subprocess.TimeoutExpired, json.JSONDecodeError)
 
 SAFE_TYPES = {"version-update:semver-patch", "version-update:semver-minor"}
@@ -126,6 +136,44 @@ def classify_checks(rollup):
     return "green"
 
 
+def _check_name(c):
+    return c.get("context") if c.get("__typename") == "StatusContext" else c.get("name")
+
+
+def ci_verdict(rollup, workflow_runs, total_runs, head_age_min):
+    """'wait' | 'red' | 'green': the strict all-green gate for one head SHA.
+
+    Needs the rollup green, every workflow run for the SHA completed and not failed
+    (from a complete list), the required external checks present and green, and a
+    head commit old enough for late-registering checks to have appeared.
+    Wait beats red, as in classify_checks; when in doubt, never green.
+    """
+    verdicts = [classify_checks(rollup)]
+    for name in REQUIRED_CHECKS:
+        found = [c for c in rollup or [] if _check_name(c) == name]
+        verdicts.append(classify_checks(found))
+    if not workflow_runs or total_runs > len(workflow_runs):
+        verdicts.append("wait")
+    elif any(r.get("status") != "completed" for r in workflow_runs):
+        verdicts.append("wait")
+    elif any(r.get("conclusion") not in RUN_OK_CONCLUSIONS for r in workflow_runs):
+        verdicts.append("red")
+    if head_age_min < MIN_HEAD_AGE_MINUTES:
+        verdicts.append("wait")
+    if "wait" in verdicts:
+        return "wait"
+    return "red" if "red" in verdicts else "green"
+
+
+def md_title(title):
+    """Make a PR title safe for one markdown table cell (no markup, no mentions)."""
+    title = " ".join((title or "").split())
+    if len(title) > TITLE_MAX:
+        title = title[:TITLE_MAX - 1] + "…"
+    title = re.sub(r"([\\|\[\]<>*_`])", r"\\\1", title)
+    return title.replace("@", "@\u200b")
+
+
 def parse_time(s):
     return datetime.fromisoformat(s.replace("Z", "+00:00"))
 
@@ -140,10 +188,15 @@ class Budget:
         self.recreates = 0
 
 
-def decide(*, untrusted_commits, eligible, checks, mergeable, labels, age_h, budget):
+def decide(*, untrusted_commits, eligible, checks, mergeable, labels, age_h, budget,
+           draft=False, review_decision=None, unresolved_threads=False):
     """Return an action string; consumes budget for merge/recreate."""
     if untrusted_commits:
         return "skip: non-Dependabot commit"
+    if LABEL_HOLD in labels:
+        return "skip: hold"
+    if draft:
+        return "skip: draft"
     if not eligible:
         return "noop (labelled)" if LABEL_MIGRATION in labels else "label needs-migration"
     if checks == "wait":
@@ -157,6 +210,12 @@ def decide(*, untrusted_commits, eligible, checks, mergeable, labels, age_h, bud
             return "defer: recreate cap"
         budget.recreates += 1
         return "recreate"
+    if LABEL_MIGRATION in labels:
+        return "skip: needs-migration label"
+    if review_decision == "CHANGES_REQUESTED":
+        return "skip: changes requested"
+    if unresolved_threads:
+        return "skip: unresolved threads"
     if mergeable == "CONFLICTING":
         return "skip: conflicting"
     if mergeable != "MERGEABLE":
@@ -212,6 +271,11 @@ COMMITS_QUERY = (
     "{pullRequest(number:$number){commits(first:100){totalCount nodes{commit{oid messageHeadline "
     "messageBody committedDate parents{totalCount} authors(first:10){nodes{user{login}}} "
     "signature{isValid wasSignedByGitHub}}}}}}}"
+)
+
+THREADS_QUERY = (
+    "query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name)"
+    "{pullRequest(number:$number){reviewThreads(first:100){totalCount nodes{isResolved}}}}}"
 )
 
 
@@ -277,20 +341,39 @@ def fetch_commits(gh, n):
     return conn["totalCount"], [x["commit"] for x in conn["nodes"]]
 
 
+def fetch_unresolved_threads(gh, n):
+    """True if PR n has an unresolved review thread (or more than 100 threads)."""
+    owner, name = gh.repo.split("/", 1)
+    data = gh.read_json(
+        "api", "graphql", "-f", f"query={THREADS_QUERY}",
+        "-F", f"owner={owner}", "-F", f"name={name}", "-F", f"number={n}",
+    )
+    conn = data["data"]["repository"]["pullRequest"]["reviewThreads"]
+    return conn["totalCount"] > 100 or any(not x["isResolved"] for x in conn["nodes"])
+
+
+def fetch_runs(gh, sha):
+    """Return (total_count, [workflow runs]) for the head SHA (first 100 runs)."""
+    data = gh.read_json("api", f"repos/{gh.repo}/actions/runs?head_sha={sha}&per_page=100")
+    return data["total_count"], data["workflow_runs"]
+
+
 def add_label(gh, n, label):
-    gh.write("pr", "edit", str(n), "--repo", gh.repo, "--add-label", label)
+    gh.write("api", "-X", "POST", f"repos/{gh.repo}/issues/{n}/labels", "-f", f"labels[]={label}")
 
 
 def process(gh, pr, budget, now):
     n = pr["number"]
     eco = ecosystem_from_branch(pr["headRefName"])
-    title = pr["title"].replace("|", "\\|")
+    title = md_title(pr["title"])
     try:
         view = gh.read_json(
             "pr", "view", str(n), "--repo", gh.repo, "--json",
-            "statusCheckRollup,mergeable,reviews,labels,headRefOid",
+            "statusCheckRollup,mergeable,reviews,labels,headRefOid,isDraft,reviewDecision",
         )
         total, commits = fetch_commits(gh, n)
+        unresolved = fetch_unresolved_threads(gh, n)
+        total_runs, runs = fetch_runs(gh, view.get("headRefOid"))
     except GH_ERRORS as e:
         return [f"#{n}", title, eco or "?", "?", "?", f"read FAILED ({describe(e)})"]
     head = commits[-1] if commits else {}
@@ -304,12 +387,13 @@ def process(gh, pr, budget, now):
     ok, reason = eligibility(
         eco, parse_metadata(message), parse_from_versions(head.get("messageHeadline", ""), head.get("messageBody"))
     )
-    checks = classify_checks(view.get("statusCheckRollup"))
+    age_h = age_hours(head["committedDate"], now) if commits else 0
+    checks = ci_verdict(view.get("statusCheckRollup"), runs, total_runs, age_h * 60)
     labels = {x["name"] for x in view.get("labels", [])}
     action = decide(
         untrusted_commits=untrusted, eligible=ok, checks=checks, mergeable=view.get("mergeable"),
-        labels=labels, age_h=age_hours(head["committedDate"], now) if commits else 0,
-        budget=budget,
+        labels=labels, age_h=age_h, budget=budget, draft=bool(view.get("isDraft")),
+        review_decision=view.get("reviewDecision"), unresolved_threads=unresolved,
     )
     done = action
     if gh.live:
@@ -365,6 +449,12 @@ def main():
     args = ap.parse_args()
     if not args.repo:
         ap.error("--repo or $GITHUB_REPOSITORY required")
+    if not re.fullmatch(REPO_RE, args.repo):
+        print(f"error: invalid --repo {args.repo!r}", file=sys.stderr)
+        return 2
+    if args.live and os.environ.get("GITHUB_REF") != LIVE_REF:
+        print(f"error: --live only runs on {LIVE_REF}", file=sys.stderr)
+        return 2
     gh = Gh(args.repo, args.live)
     labels_ok = ensure_labels(gh)
     try:
@@ -376,11 +466,19 @@ def main():
         write_summary(f"### Dependabot sweeper: listing PRs FAILED ({describe(e)})\n")
         return 1
     budget, now, rows = Budget(), datetime.now(timezone.utc), []
-    for pr in sorted(prs, key=lambda p: p["number"]):
+    start = time.monotonic()
+    ordered = sorted(prs, key=lambda p: p["number"])
+    deferred = 0
+    for i, pr in enumerate(ordered):
+        if time.monotonic() - start > RUN_DEADLINE_SECONDS:
+            deferred = len(ordered) - i
+            break
         rows.append(process(gh, pr, budget, now))
     out = [f"### Dependabot sweeper ({'live' if args.live else 'dry-run'})", "",
            "| PR | Title | Ecosystem | Eligibility | Checks | Action |", "|---|---|---|---|---|---|"]
     out += ["| " + " | ".join(r) + " |" for r in rows]
+    if deferred:
+        out += ["", f"deferred: run deadline reached, {deferred} PRs not processed"]
     truncated = len(prs) >= PR_LIST_LIMIT
     if truncated:
         out += ["", f"**Warning:** PR list hit the limit of {PR_LIST_LIMIT}; "
