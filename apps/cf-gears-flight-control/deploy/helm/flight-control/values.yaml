@@ -116,8 +116,10 @@ config:
           require_auth_by_default: true
           internal_auth:
             provider: kube
-            audiences: ["toolkit-internal"]
-            token_path: '{{ .Values.saToken.mountPath }}/{{ .Values.saToken.fileName }}'
+            verify:
+              audiences: ["toolkit-internal"]
+            present:
+              token_path: '{{ .Values.saToken.mountPath }}/{{ .Values.saToken.fileName }}'
           gateway_proxy:
             enabled: true
             directory_endpoint: "http://127.0.0.1:{{ .Values.grpc.port }}"
@@ -128,7 +130,8 @@ config:
           listen_addr: "0.0.0.0:{{ .Values.grpc.port }}"
           internal_auth:
             provider: kube
-            audiences: ["{{ .Values.saToken.audience }}"]
+            verify:
+              audiences: ["{{ .Values.saToken.audience }}"]
           internal_auth_enforcement: required
 
       authn-resolver:

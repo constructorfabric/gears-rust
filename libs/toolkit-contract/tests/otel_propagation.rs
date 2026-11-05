@@ -131,6 +131,7 @@ async fn client_span_trace_id_propagates_to_server() {
     let subscriber = tracing_subscriber::registry().with(otel_layer);
     // `#[tokio::test]` defaults to a single-threaded (current-thread) runtime,
     // so a thread-local default subscriber is valid across the awaits below.
+    keep_interest_shared();
     let _subscriber_guard = tracing::subscriber::set_default(subscriber);
 
     let (base_url, captured) = start_server().await;
@@ -176,4 +177,13 @@ async fn client_span_trace_id_propagates_to_server() {
         "the trace_id the server observed must be the same trace the client's root span started \
          (client span -> outgoing_http span -> wire), not an unrelated ID"
     );
+}
+
+/// Keeps a second dispatcher registered for the whole binary. With only one, tracing-core
+/// computes a callsite's interest from the registering thread's default, so a test without a
+/// capture can cache `never` for a callsite another test's capture needs. Call it before
+/// installing a thread-local subscriber (`set_default` / `with_default`).
+fn keep_interest_shared() {
+    static SHARED: std::sync::OnceLock<tracing::Dispatch> = std::sync::OnceLock::new();
+    SHARED.get_or_init(|| tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default()));
 }

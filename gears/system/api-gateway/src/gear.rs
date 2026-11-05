@@ -56,6 +56,7 @@ use crate::middleware::auth;
 use toolkit_http_middleware::internal_auth_middleware;
 use toolkit_security::constants::{DEFAULT_SUBJECT_ID, DEFAULT_TENANT_ID};
 use toolkit_security::{DynInternalAuthenticator, InternalAuthConfig, SecurityContext};
+use toolkit_transport_grpc::{InternalAuthInterceptor, OutboundCredentialError};
 
 use crate::middleware;
 use crate::router_cache::RouterCache;
@@ -1014,7 +1015,9 @@ impl ApiGateway {
 
     /// Retry [`connect_directory`](Self::connect_directory) with exponential
     /// backoff until it succeeds (returning the client) or `cancel` fires
-    /// (returning `None`).
+    /// (returning `None`). Every failure is retried: config-determined ones
+    /// (no `directory_endpoint`, no outbound credential) are rejected in `init`,
+    /// and an unreadable projected token may simply not be written yet.
     async fn connect_with_backoff(
         cfg: &GatewayProxyConfig,
         internal_auth: Option<&InternalAuthConfig>,
@@ -1024,8 +1027,17 @@ impl ApiGateway {
         const MAX_BACKOFF: Duration = Duration::from_secs(30);
 
         let mut backoff = INITIAL_BACKOFF;
+        // The outbound credential is built once (on the first attempt whose
+        // token read succeeds) and reused by every later attempt: its clones
+        // share one token reader and one refresh task.
+        let mut credential = None;
         loop {
-            match Self::connect_directory(cfg, internal_auth).await {
+            let attempt =
+                match Self::outbound_credential(internal_auth, &mut credential, cancel).await {
+                    Ok(interceptor) => Self::connect_directory(cfg, interceptor).await,
+                    Err(err) => Err(err.into()),
+                };
+            match attempt {
                 Ok(directory) => return Some(directory),
                 Err(err) => tracing::warn!(
                     error = %err,
@@ -1050,26 +1062,49 @@ impl ApiGateway {
         }
     }
 
-    /// Connect to the `DirectoryService`, attaching the platform-plane
-    /// credential when configured.
+    /// The outbound platform-plane credential for directory polls: `None` without
+    /// `internal_auth`, otherwise built on first use and stored in `built`, then
+    /// handed out as clones. A build that fails (e.g. a projected token the kubelet
+    /// has not written yet) leaves `built` empty, so the next attempt retries it.
+    /// The token's refresh task stops when `cancel` fires.
+    ///
+    /// # Errors
+    /// Returns [`OutboundCredentialError`] when the credential cannot be built.
+    async fn outbound_credential(
+        internal_auth: Option<&InternalAuthConfig>,
+        built: &mut Option<InternalAuthInterceptor>,
+        cancel: &CancellationToken,
+    ) -> Result<Option<InternalAuthInterceptor>, OutboundCredentialError> {
+        let Some(internal_auth) = internal_auth else {
+            return Ok(None);
+        };
+        if built.is_none() {
+            *built = Some(
+                toolkit_transport_grpc::build_outbound_interceptor(internal_auth, cancel).await?,
+            );
+            tracing::info!("attaching platform-plane credential to edge DirectoryService polls");
+        }
+        Ok(built.clone())
+    }
+
+    /// Connect to the `DirectoryService`, attaching `interceptor` (the
+    /// platform-plane credential) when there is one.
     ///
     /// # Errors
     /// Returns an error if `directory_endpoint` is unset or the connection fails.
     async fn connect_directory(
         cfg: &GatewayProxyConfig,
-        internal_auth: Option<&InternalAuthConfig>,
+        interceptor: Option<InternalAuthInterceptor>,
     ) -> anyhow::Result<Arc<dyn DirectoryClient>> {
         let endpoint = cfg.directory_endpoint.clone().ok_or_else(|| {
             anyhow::anyhow!("gateway_proxy.enabled but directory_endpoint is unset")
         })?;
 
-        let client = if let Some(internal_auth) = internal_auth {
-            let interceptor =
-                toolkit_transport_grpc::build_internal_auth_interceptor(internal_auth).await?;
-            tracing::info!("attaching platform-plane credential to edge DirectoryService polls");
-            DirectoryGrpcClient::connect_with_interceptor(endpoint.clone(), interceptor).await?
-        } else {
-            DirectoryGrpcClient::connect(endpoint.clone()).await?
+        let client = match interceptor {
+            Some(interceptor) => {
+                DirectoryGrpcClient::connect_with_interceptor(endpoint.clone(), interceptor).await?
+            }
+            None => DirectoryGrpcClient::connect(endpoint.clone()).await?,
         };
         Ok(Arc::new(client))
     }
@@ -1232,6 +1267,10 @@ impl toolkit::Gear for ApiGateway {
         // starting a proxy that silently serves 404 for every out-of-process route.
         cfg.gateway_proxy
             .validate()
+            .map_err(|e| anyhow::anyhow!(e))?;
+        // Likewise for an enabled proxy that has no outbound credential to
+        // present on its DirectoryService polls.
+        cfg.validate_proxy_credential()
             .map_err(|e| anyhow::anyhow!(e))?;
         self.config.store(Arc::new(cfg.clone()));
 
@@ -1414,43 +1453,32 @@ async fn build_internal_authenticator(
     // Shared-secret (and any future dependency-light provider) builds here. An
     // unusable secret fails the build rather than falling through to the kube
     // branch, which would report the wrong problem.
-    match cfg.build_authenticator()? {
+    let audiences = match cfg.build_authenticator()? {
         toolkit_security::BuiltAuthenticator::Built(auth) => {
             tracing::info!("Initializing shared-secret platform-plane authenticator");
             return Ok(Some(auth));
         }
-        toolkit_security::BuiltAuthenticator::RequiresExternalBackend => {}
-    }
+        // Kube: `audiences` was validated non-empty by `build_authenticator`.
+        toolkit_security::BuiltAuthenticator::RequiresExternalBackend { audiences } => audiences,
+    };
 
     #[cfg(feature = "k8s-auth")]
     {
-        if cfg.is_kube() {
-            tracing::info!("Initializing Kubernetes TokenReview platform-plane authenticator");
-            let audiences = cfg.kube_audiences().unwrap_or_default().to_vec();
-            let auth = toolkit_k8s_auth::build_cached_k8s_authenticator(
-                audiences,
-                Some(toolkit_security::DEFAULT_TOKEN_REVIEW_CACHE_TTL),
-                None,
-            )
-            .await
-            .map_err(|e| {
-                anyhow::anyhow!("failed to init Kubernetes TokenReview authenticator: {e}")
-            })?;
-            return Ok(Some(auth));
-        }
+        tracing::info!("Initializing Kubernetes TokenReview platform-plane authenticator");
+        let auth = toolkit_k8s_auth::build_cached_k8s_authenticator(
+            audiences,
+            Some(toolkit_security::DEFAULT_TOKEN_REVIEW_CACHE_TTL),
+            None,
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to init Kubernetes TokenReview authenticator: {e}"))?;
+        Ok(Some(auth))
     }
     #[cfg(not(feature = "k8s-auth"))]
     {
-        if cfg.is_kube() {
-            anyhow::bail!(
-                "api-gateway internal_auth provider=kube requires the `k8s-auth` feature"
-            );
-        }
+        drop(audiences);
+        anyhow::bail!("api-gateway internal_auth provider=kube requires the `k8s-auth` feature");
     }
-
-    anyhow::bail!(
-        "internal_auth is configured but no authenticator could be built for the selected provider"
-    )
 }
 
 /// Enrich throttled operations with their zones' numeric limits.
@@ -1674,8 +1702,10 @@ mod tests {
     #[tokio::test]
     async fn build_internal_authenticator_rejects_kube_without_feature() {
         let cfg = InternalAuthConfig::Kube {
-            audiences: vec!["toolkit-internal".to_owned()],
-            token_path: None,
+            verify: Some(toolkit_security::KubeVerify {
+                audiences: vec!["toolkit-internal".to_owned()],
+            }),
+            present: None,
         };
         let err = build_internal_authenticator(Some(&cfg))
             .await
@@ -1767,12 +1797,11 @@ mod tests {
         assert!(err.to_string().contains("directory_endpoint"));
     }
 
-    /// `connect_directory` takes the credential-attach branch when an
-    /// `internal_auth` config is supplied: the shared-secret interceptor is
-    /// built and attached before the connect attempt. The endpoint is
-    /// unreachable, so the connect itself fails after exhausting retries — but
-    /// the outbound platform-plane path (`cpt-cf-adr-two-plane-auth`) is
-    /// exercised.
+    /// `connect_directory` takes the credential-attach branch when given an
+    /// interceptor: the shared-secret credential is built and attached before
+    /// the connect attempt. The endpoint is unreachable, so the connect itself
+    /// fails after exhausting retries — but the outbound platform-plane path
+    /// (`cpt-cf-adr-two-plane-auth`) is exercised.
     #[tokio::test]
     async fn connect_directory_attaches_internal_auth_credential() {
         let cfg = GatewayProxyConfig {
@@ -1787,7 +1816,16 @@ mod tests {
             secret: "dev-internal-token".to_owned().into(),
             peer_name: "toolkit-internal".to_owned(),
         };
-        let result = ApiGateway::connect_directory(&cfg, Some(&internal)).await;
+        let mut built = None;
+        let interceptor =
+            ApiGateway::outbound_credential(Some(&internal), &mut built, &CancellationToken::new())
+                .await
+                .expect("shared secret builds");
+        assert!(
+            interceptor.is_some(),
+            "internal_auth must yield a credential"
+        );
+        let result = ApiGateway::connect_directory(&cfg, interceptor).await;
         assert!(
             result.is_err(),
             "connect must fail against an unreachable directory endpoint"
@@ -1806,6 +1844,135 @@ mod tests {
         };
         let registry = Arc::new(toolkit_gateway::ProxyRegistry::new());
         ApiGateway::proxy_sync_supervisor(cfg, None, registry, CancellationToken::new()).await;
+    }
+
+    fn kube_internal_auth(token_path: Option<std::path::PathBuf>) -> InternalAuthConfig {
+        InternalAuthConfig::Kube {
+            verify: Some(toolkit_security::KubeVerify {
+                audiences: vec!["toolkit-internal".to_owned()],
+            }),
+            present: token_path.map(|token_path| toolkit_security::KubePresent { token_path }),
+        }
+    }
+
+    fn unique_token_path(tag: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir()
+            .join(format!("gw-cred-{tag}-{}-{n}", std::process::id()))
+            .join("token")
+    }
+
+    /// No `internal_auth` (Profile 1): nothing is built or attached.
+    #[tokio::test]
+    async fn outbound_credential_is_none_without_internal_auth() {
+        let mut built = None;
+        let interceptor =
+            ApiGateway::outbound_credential(None, &mut built, &CancellationToken::new())
+                .await
+                .expect("no credential to build");
+        assert!(interceptor.is_none());
+        assert!(built.is_none());
+    }
+
+    /// `kube` without a `present` block would leave the edge's directory polls
+    /// unauthenticated, so no credential is built. (`init` already refuses this
+    /// config; this pins the builder's own answer.)
+    #[tokio::test]
+    async fn outbound_credential_requires_kube_present_block() {
+        let mut built = None;
+        let err = ApiGateway::outbound_credential(
+            Some(&kube_internal_auth(None)),
+            &mut built,
+            &CancellationToken::new(),
+        )
+        .await
+        .err()
+        .expect("kube without a present block must not connect unauthenticated");
+        assert!(
+            matches!(err, OutboundCredentialError::MissingKubePresent),
+            "got {err:?}"
+        );
+    }
+
+    /// The credential is built once and reused: after the first successful
+    /// build, later attempts neither re-read the token file nor start another
+    /// refresh task. A token file that is not there yet (the kubelet has not
+    /// written it) fails the build and leaves nothing cached, so the next
+    /// attempt retries it.
+    #[tokio::test]
+    async fn outbound_credential_retries_an_unreadable_token_then_reuses_it() {
+        let path = unique_token_path("reuse");
+        let internal = kube_internal_auth(Some(path.clone()));
+        let cancel = CancellationToken::new();
+        let mut built = None;
+
+        // Not written yet: retryable, nothing cached.
+        let err = ApiGateway::outbound_credential(Some(&internal), &mut built, &cancel)
+            .await
+            .err()
+            .expect("a missing token file cannot be read");
+        assert!(
+            matches!(err, OutboundCredentialError::TokenUnreadable { .. }),
+            "got {err:?}"
+        );
+        assert!(built.is_none(), "a failed build must not be cached");
+
+        // Written: the next attempt builds it.
+        tokio::fs::create_dir_all(path.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(&path, "kube.sa.jwt").await.unwrap();
+        let first = ApiGateway::outbound_credential(Some(&internal), &mut built, &cancel).await;
+        assert!(
+            matches!(first, Ok(Some(_))),
+            "token now readable: the credential must be built"
+        );
+        assert!(built.is_some(), "a successful build is cached");
+
+        // Removed: a rebuild would now fail, so success proves reuse.
+        tokio::fs::remove_dir_all(path.parent().unwrap())
+            .await
+            .unwrap();
+        let second = ApiGateway::outbound_credential(Some(&internal), &mut built, &cancel).await;
+        assert!(
+            matches!(second, Ok(Some(_))),
+            "the cached credential must be reused, not rebuilt from the deleted file"
+        );
+    }
+
+    /// An unreadable token keeps the connect loop retrying until shutdown
+    /// rather than giving up: it is treated as "not written yet", not as a
+    /// configuration error.
+    #[tokio::test]
+    async fn connect_with_backoff_keeps_retrying_an_unreadable_token_until_cancel() {
+        let cfg = GatewayProxyConfig {
+            enabled: true,
+            directory_endpoint: Some("http://127.0.0.1:1".to_owned()),
+            ..Default::default()
+        };
+        let internal = kube_internal_auth(Some(unique_token_path("never-written")));
+        let cancel = CancellationToken::new();
+        let canceller = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            canceller.cancel();
+        });
+
+        let started = std::time::Instant::now();
+        let directory = tokio::time::timeout(
+            Duration::from_secs(5),
+            ApiGateway::connect_with_backoff(&cfg, Some(&internal), &cancel),
+        )
+        .await
+        .expect("the loop must end on cancel");
+        assert!(directory.is_none());
+        assert!(
+            started.elapsed() >= Duration::from_millis(350),
+            "the loop gave up before shutdown: {:?}",
+            started.elapsed()
+        );
     }
 
     /// `start_proxy_sync` spawns the supervisor task; with no endpoint the task

@@ -1,26 +1,30 @@
 //! Declarative configuration for the platform (internal) authentication plane.
 //!
 //! [`InternalAuthConfig`] is the single, transport-agnostic config surface used
-//! by every participant in the platform plane:
+//! by every participant in the platform plane. A participant may use either or
+//! both directions:
 //!
-//! - **`OoP` gears** (`oop_http.internal_auth`) — selects the *inbound* HTTP
-//!   validator for the gear's own routes **and** the *outbound* credential the
-//!   gear attaches to its `DirectoryService` calls.
-//! - **The `service-discovery`** — selects the *inbound* gRPC validator that
-//!   protects the `DirectoryService` RPCs.
-//! - **The `api-gateway`** (`gateway_proxy.internal_auth`) — selects the
-//!   *outbound* credential attached to the edge's `DirectoryService` polls.
+//! - **Inbound** — validating the `X-ToolKit-Internal-Token` callers present:
+//!   `OoP` gears (their own routes), `grpc-hub` (the RPCs it serves, e.g.
+//!   `DirectoryService`) and the `api-gateway` (co-hosted internal routes).
+//! - **Outbound** — the credential a participant presents on its own
+//!   platform-plane calls: `OoP` gears (`DirectoryService` registration and
+//!   heartbeat) and the `api-gateway` (`DirectoryService` polls).
 //!
 //! Two providers are supported:
 //!
 //! - [`InternalAuthConfig::SharedSecret`] — a single pre-shared token. No
 //!   Kubernetes required; ideal for local demos, single-node deployments, and
-//!   tests. Both the inbound validator and the outbound credential are derived
-//!   from the same `secret`.
-//! - [`InternalAuthConfig::Kube`] — a projected `ServiceAccount` token
-//!   (Profile 3). Inbound validation uses the Kubernetes `TokenReview` API
-//!   (built in a layer that can depend on `kube`); the outbound credential is
-//!   read (and rotated) from `token_path`.
+//!   tests. It is **symmetric**: the same `secret` is both accepted (inbound)
+//!   and attached (outbound).
+//! - [`InternalAuthConfig::Kube`] — projected `ServiceAccount` tokens
+//!   (Profile 3). The two directions are unrelated, so each has its own block:
+//!   `verify` (inbound: `TokenReview` audiences) and `present` (outbound: the
+//!   projected-token file to read and rotate). Either may be omitted, but not
+//!   both. A missing block is an error only for the code that needs it:
+//!   [`build_authenticator`](InternalAuthConfig::build_authenticator) refuses a
+//!   config without `verify`, and the outbound builder in
+//!   `toolkit-transport-grpc` refuses one without `present`.
 //!
 //! This crate builds only the dependency-light shared-secret validator
 //! ([`build_authenticator`](InternalAuthConfig::build_authenticator)); the
@@ -30,6 +34,7 @@
 use std::path::{Path, PathBuf};
 
 use secrecy::SecretString;
+use serde::de::IgnoredAny;
 use serde::{Deserialize, Serialize};
 
 use crate::authenticator::DynInternalAuthenticator;
@@ -54,11 +59,17 @@ pub const DEFAULT_INTERNAL_PEER_NAME: &str = "toolkit-internal";
 /// ```yaml
 /// internal_auth:
 ///   provider: kube
-///   audiences: ["toolkit-internal"]
-///   token_path: /var/run/secrets/tokens/toolkit-internal
+///   verify:                      # inbound; omit if this participant validates nothing
+///     audiences: ["toolkit-internal"]
+///   present:                     # outbound; omit if this participant never calls out
+///     token_path: /var/run/secrets/tokens/toolkit-internal
 /// ```
+///
+/// The flat kube form (`audiences` / `token_path` next to `provider`) is no
+/// longer accepted; it fails to deserialize with an error naming the new
+/// blocks.
 #[derive(Clone, Deserialize)]
-#[serde(tag = "provider", rename_all = "snake_case")]
+#[serde(try_from = "RawInternalAuthConfig")]
 pub enum InternalAuthConfig {
     /// A single pre-shared secret (dev / single-node). See the [module
     /// docs](self).
@@ -71,29 +82,108 @@ pub enum InternalAuthConfig {
         /// impls below staying correct as fields are added.
         secret: SecretString,
         /// Caller label assigned to validated peers (inbound side only).
+        peer_name: String,
+    },
+    /// Projected Kubernetes `ServiceAccount` tokens (Profile 3).
+    ///
+    /// Deserialization requires at least one block. A value built in code may
+    /// have neither; it is then refused by both the inbound and the outbound
+    /// builders rather than treated as "no authentication".
+    Kube {
+        /// Inbound: how to validate the tokens callers present.
+        verify: Option<KubeVerify>,
+        /// Outbound: the token this participant presents on its own calls.
+        present: Option<KubePresent>,
+    },
+}
+
+/// Inbound half of [`InternalAuthConfig::Kube`]: validate callers' projected
+/// tokens via the Kubernetes `TokenReview` API.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KubeVerify {
+    /// Expected token audiences for `TokenReview`.
+    ///
+    /// **Required, and must not be empty.** An empty list disables audience
+    /// binding twice over in `toolkit-k8s-auth`: no audience is sent to the
+    /// API server, *and* the client-side comparison against the response is
+    /// skipped. Any `ServiceAccount` token the API server accepts — from any
+    /// workload in the cluster, issued for any audience — would then
+    /// authenticate as a platform peer.
+    #[serde(deserialize_with = "non_empty_audiences")]
+    pub audiences: Vec<String>,
+}
+
+/// Outbound half of [`InternalAuthConfig::Kube`]: the projected token this
+/// participant presents on its own platform-plane calls.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KubePresent {
+    /// Projected-token file to read, and re-read on rotation.
+    pub token_path: PathBuf,
+}
+
+/// Wire shape of [`InternalAuthConfig`], validated by its `TryFrom` impl.
+///
+/// Unknown keys are rejected at every level, so a misspelled block (e.g.
+/// `prsent:`) fails the config instead of reading as an omitted one. serde only
+/// allows `deny_unknown_fields` on the whole enum, so it covers `shared_secret`
+/// too.
+#[derive(Deserialize)]
+#[serde(tag = "provider", rename_all = "snake_case", deny_unknown_fields)]
+enum RawInternalAuthConfig {
+    SharedSecret {
+        secret: SecretString,
         #[serde(default = "default_peer_name")]
         peer_name: String,
     },
-    /// A projected Kubernetes `ServiceAccount` token (Profile 3).
     Kube {
-        /// Expected token audiences for `TokenReview` (inbound).
-        ///
-        /// **Required, and must not be empty.** An empty list disables audience
-        /// binding twice over in `toolkit-k8s-auth`: no audience is sent to the
-        /// API server, *and* the client-side comparison against the response is
-        /// skipped. Any `ServiceAccount` token the API server accepts — from
-        /// any workload in the cluster, issued for any audience — would then
-        /// authenticate as a platform peer.
-        ///
-        /// It used to default to empty, so a config that simply omitted the
-        /// field got that silently.
-        #[serde(deserialize_with = "non_empty_audiences")]
-        audiences: Vec<String>,
-        /// Projected-token path to read + rotate for outbound calls. When
-        /// absent, no outbound credential is attached (inbound-only).
         #[serde(default)]
-        token_path: Option<PathBuf>,
+        verify: Option<KubeVerify>,
+        #[serde(default)]
+        present: Option<KubePresent>,
+        // The removed flat form, captured only to reject it with a pointer to
+        // the new blocks. Ignoring it silently would turn a deployed
+        // `{audiences, token_path}` config into "no blocks".
+        #[serde(default)]
+        audiences: Option<IgnoredAny>,
+        #[serde(default)]
+        token_path: Option<IgnoredAny>,
     },
+}
+
+impl TryFrom<RawInternalAuthConfig> for InternalAuthConfig {
+    type Error = String;
+
+    fn try_from(raw: RawInternalAuthConfig) -> Result<Self, Self::Error> {
+        match raw {
+            RawInternalAuthConfig::SharedSecret { secret, peer_name } => {
+                Ok(Self::SharedSecret { secret, peer_name })
+            }
+            RawInternalAuthConfig::Kube {
+                audiences,
+                token_path,
+                ..
+            } if audiences.is_some() || token_path.is_some() => Err(
+                "internal_auth provider=kube no longer accepts top-level `audiences` / \
+                 `token_path`: move `audiences` under `verify:` (inbound) and `token_path` \
+                 under `present:` (outbound)"
+                    .to_owned(),
+            ),
+            RawInternalAuthConfig::Kube {
+                verify: None,
+                present: None,
+                ..
+            } => Err(
+                "internal_auth provider=kube needs at least one of `verify:` (inbound \
+                 audiences) or `present:` (outbound token_path)"
+                    .to_owned(),
+            ),
+            RawInternalAuthConfig::Kube {
+                verify, present, ..
+            } => Ok(Self::Kube { verify, present }),
+        }
+    }
 }
 
 fn default_peer_name() -> String {
@@ -115,8 +205,9 @@ where
     let audiences = Vec::<String>::deserialize(deserializer)?;
     if audiences.is_empty() {
         return Err(D::Error::custom(
-            "internal_auth provider=kube requires a non-empty `audiences` list; an empty one \
-             disables audience verification and accepts any ServiceAccount token in the cluster",
+            "internal_auth provider=kube requires a non-empty `verify.audiences` list; an empty \
+             one disables audience verification and accepts any ServiceAccount token in the \
+             cluster",
         ));
     }
     Ok(audiences)
@@ -134,13 +225,10 @@ impl std::fmt::Debug for InternalAuthConfig {
                 .field("secret", &"<redacted>")
                 .field("peer_name", peer_name)
                 .finish(),
-            Self::Kube {
-                audiences,
-                token_path,
-            } => f
+            Self::Kube { verify, present } => f
                 .debug_struct("Kube")
-                .field("audiences", audiences)
-                .field("token_path", token_path)
+                .field("verify", verify)
+                .field("present", present)
                 .finish(),
         }
     }
@@ -169,14 +257,15 @@ impl Serialize for InternalAuthConfig {
                 map.serialize_entry("peer_name", peer_name)?;
                 map.end()
             }
-            Self::Kube {
-                audiences,
-                token_path,
-            } => {
-                let mut map = serializer.serialize_map(Some(3))?;
+            Self::Kube { verify, present } => {
+                let mut map = serializer.serialize_map(None)?;
                 map.serialize_entry("provider", "kube")?;
-                map.serialize_entry("audiences", audiences)?;
-                map.serialize_entry("token_path", token_path)?;
+                if let Some(verify) = verify {
+                    map.serialize_entry("verify", verify)?;
+                }
+                if let Some(present) = present {
+                    map.serialize_entry("present", present)?;
+                }
                 map.end()
             }
         }
@@ -195,10 +284,18 @@ pub enum InvalidInternalAuth {
     /// API server, and the client-side check against the response is skipped —
     /// so any `ServiceAccount` token the cluster issues would authenticate.
     #[error(
-        "internal_auth provider=kube requires a non-empty `audiences` list; an empty one \
+        "internal_auth provider=kube requires a non-empty `verify.audiences` list; an empty one \
          disables audience verification and accepts any ServiceAccount token in the cluster"
     )]
     EmptyKubeAudiences,
+    /// `provider: kube` has no `verify` block, but this participant validates
+    /// inbound platform-plane tokens. Refused rather than running the inbound
+    /// side unauthenticated.
+    #[error(
+        "internal_auth provider=kube has no `verify:` block, but this participant validates \
+         inbound platform-plane tokens; set `verify.audiences`"
+    )]
+    MissingKubeVerify,
 }
 
 /// What [`InternalAuthConfig::build_authenticator`] could do with the config.
@@ -213,22 +310,30 @@ pub enum InvalidInternalAuth {
 pub enum BuiltAuthenticator {
     /// The validator was built here.
     Built(DynInternalAuthenticator),
-    /// The provider needs a backend this crate cannot construct. Build it with
-    /// [`kube_audiences`](InternalAuthConfig::kube_audiences), via a layer that
-    /// depends on `kube` (e.g. `toolkit-k8s-auth`).
-    RequiresExternalBackend,
+    /// The provider needs a backend this crate cannot construct: build it via a
+    /// layer that depends on `kube` (e.g. `toolkit-k8s-auth`) with the carried
+    /// `audiences`.
+    RequiresExternalBackend {
+        /// The kube `verify.audiences`, already checked to be non-empty. An
+        /// empty list would disable audience binding, so callers take this
+        /// value rather than re-reading (and defaulting) the config.
+        audiences: Vec<String>,
+    },
 }
 
 impl InternalAuthConfig {
     /// Build the **inbound** validator when it can be constructed without a
-    /// heavier backend.
+    /// heavier backend. Only participants that validate inbound tokens call
+    /// this, so it is where a missing kube `verify` block is refused.
     ///
     /// # Errors
     ///
     /// Returns [`InvalidInternalAuth::SharedSecret`] when the configured shared
     /// secret is unusable — empty, or the redaction placeholder from a
-    /// serialized config. Returns [`InvalidInternalAuth::EmptyKubeAudiences`]
-    /// when `provider: kube` has no configured audiences.
+    /// serialized config. Returns [`InvalidInternalAuth::MissingKubeVerify`]
+    /// when `provider: kube` has no `verify` block, and
+    /// [`InvalidInternalAuth::EmptyKubeAudiences`] when its audience list is
+    /// empty.
     pub fn build_authenticator(&self) -> Result<BuiltAuthenticator, InvalidInternalAuth> {
         match self {
             Self::SharedSecret { secret, peer_name } => {
@@ -238,15 +343,22 @@ impl InternalAuthConfig {
                     auth,
                 )))
             }
-            // Checked here as well as during deserialization. The variant's
-            // fields are public, so a config built in code never passes through
-            // serde — and every caller reaches this before it reads
-            // `kube_audiences`, which makes it the last point where an unbound
-            // validator can still be refused.
-            Self::Kube { audiences, .. } if audiences.is_empty() => {
-                Err(InvalidInternalAuth::EmptyKubeAudiences)
-            }
-            Self::Kube { .. } => Ok(BuiltAuthenticator::RequiresExternalBackend),
+            Self::Kube { verify: None, .. } => Err(InvalidInternalAuth::MissingKubeVerify),
+            // Checked here as well as during deserialization. The fields are
+            // public, so a config built in code never passes through serde —
+            // and the audiences callers build the validator with come out of
+            // this check, so it is the last point where an unbound validator
+            // can still be refused.
+            Self::Kube {
+                verify: Some(verify),
+                ..
+            } if verify.audiences.is_empty() => Err(InvalidInternalAuth::EmptyKubeAudiences),
+            Self::Kube {
+                verify: Some(verify),
+                ..
+            } => Ok(BuiltAuthenticator::RequiresExternalBackend {
+                audiences: verify.audiences.clone(),
+            }),
         }
     }
 
@@ -265,22 +377,29 @@ impl InternalAuthConfig {
         matches!(self, Self::Kube { .. })
     }
 
-    /// The configured `TokenReview` audiences for the Kubernetes provider.
+    /// The configured `TokenReview` audiences (`verify.audiences`) for the
+    /// Kubernetes provider, if it validates inbound tokens.
     #[must_use]
     pub fn kube_audiences(&self) -> Option<&[String]> {
         match self {
-            Self::Kube { audiences, .. } => Some(audiences),
-            Self::SharedSecret { .. } => None,
+            Self::Kube {
+                verify: Some(verify),
+                ..
+            } => Some(&verify.audiences),
+            Self::Kube { verify: None, .. } | Self::SharedSecret { .. } => None,
         }
     }
 
-    /// The projected-token path for the Kubernetes provider's outbound
-    /// credential, if configured.
+    /// The projected-token path (`present.token_path`) for the Kubernetes
+    /// provider's outbound credential, if configured.
     #[must_use]
     pub fn kube_token_path(&self) -> Option<&Path> {
         match self {
-            Self::Kube { token_path, .. } => token_path.as_deref(),
-            Self::SharedSecret { .. } => None,
+            Self::Kube {
+                present: Some(present),
+                ..
+            } => Some(&present.token_path),
+            Self::Kube { present: None, .. } | Self::SharedSecret { .. } => None,
         }
     }
 }
@@ -291,6 +410,21 @@ mod tests {
     use super::*;
     use crate::internal_auth::{InternalAuthNError, InternalAuthenticator, PlatformIdentity};
     use secrecy::ExposeSecret;
+
+    fn kube_both() -> InternalAuthConfig {
+        InternalAuthConfig::Kube {
+            verify: Some(KubeVerify {
+                audiences: vec!["toolkit-internal".to_owned()],
+            }),
+            present: Some(KubePresent {
+                token_path: PathBuf::from("/var/run/secrets/tokens/t"),
+            }),
+        }
+    }
+
+    fn parse(value: serde_json::Value) -> Result<InternalAuthConfig, serde_json::Error> {
+        serde_json::from_value(value)
+    }
 
     #[test]
     fn debug_redacts_shared_secret_but_keeps_other_fields() {
@@ -307,11 +441,7 @@ mod tests {
         assert!(rendered.contains("hello"), "peer_name must be preserved");
 
         // The Kube variant carries no secret; all fields render normally.
-        let kube = InternalAuthConfig::Kube {
-            audiences: vec!["toolkit-internal".to_owned()],
-            token_path: Some(PathBuf::from("/var/run/secrets/tokens/t")),
-        };
-        let rendered = format!("{kube:?}");
+        let rendered = format!("{:?}", kube_both());
         assert!(rendered.contains("toolkit-internal"));
         assert!(rendered.contains("/var/run/secrets/tokens/t"));
     }
@@ -335,15 +465,20 @@ mod tests {
         let round: InternalAuthConfig = serde_json::from_str(&json).expect("round-trip");
         assert!(matches!(round, InternalAuthConfig::SharedSecret { .. }));
 
-        // The Kube variant carries no secret; all fields serialize normally.
-        let kube = InternalAuthConfig::Kube {
-            audiences: vec!["toolkit-internal".to_owned()],
-            token_path: Some(PathBuf::from("/var/run/secrets/tokens/t")),
-        };
-        let json = serde_json::to_string(&kube).expect("serialize");
-        assert!(json.contains("kube"));
-        assert!(json.contains("toolkit-internal"));
-        assert!(json.contains("/var/run/secrets/tokens/t"));
+        // The Kube variant carries no secret; all fields serialize normally,
+        // in the nested shape, and round-trip.
+        let json = serde_json::to_value(kube_both()).expect("serialize");
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "provider": "kube",
+                "verify": { "audiences": ["toolkit-internal"] },
+                "present": { "token_path": "/var/run/secrets/tokens/t" },
+            })
+        );
+        let round = parse(json).expect("round-trip");
+        assert_eq!(round.kube_audiences().map(<[String]>::len), Some(1));
+        assert!(round.kube_token_path().is_some());
     }
 
     #[tokio::test]
@@ -390,11 +525,11 @@ mod tests {
     }
 
     #[test]
-    fn deserializes_kube_with_token_path() {
-        let cfg: InternalAuthConfig = serde_json::from_value(serde_json::json!({
+    fn deserializes_kube_with_both_blocks() {
+        let cfg = parse(serde_json::json!({
             "provider": "kube",
-            "audiences": ["toolkit-internal"],
-            "token_path": "/var/run/secrets/tokens/toolkit-internal"
+            "verify": { "audiences": ["toolkit-internal"] },
+            "present": { "token_path": "/var/run/secrets/tokens/toolkit-internal" }
         }))
         .unwrap();
         assert!(cfg.is_kube());
@@ -407,73 +542,177 @@ mod tests {
             Some(PathBuf::from("/var/run/secrets/tokens/toolkit-internal"))
         );
         // Kube inbound validator is built elsewhere (needs kube), and the type
-        // says so rather than returning a bare `None` the caller has to
-        // interpret.
-        assert!(matches!(
-            cfg.build_authenticator(),
-            Ok(BuiltAuthenticator::RequiresExternalBackend)
-        ));
+        // says so — carrying the validated audiences — rather than returning a
+        // bare `None` the caller has to interpret.
+        match cfg.build_authenticator() {
+            Ok(BuiltAuthenticator::RequiresExternalBackend { audiences }) => {
+                assert_eq!(audiences, ["toolkit-internal".to_owned()]);
+            }
+            other => panic!("expected RequiresExternalBackend, got {other:?}"),
+        }
         assert!(cfg.shared_secret().is_none());
     }
 
     #[test]
-    fn kube_built_in_code_with_no_audiences_is_refused() {
-        // The serde check does not cover this: the variant's fields are public,
-        // so a config constructed in code never passes through deserialization.
+    fn kube_verify_only_validates_but_presents_nothing() {
+        let cfg = parse(serde_json::json!({
+            "provider": "kube",
+            "verify": { "audiences": ["toolkit-internal"] }
+        }))
+        .unwrap();
+        assert!(matches!(
+            cfg.build_authenticator(),
+            Ok(BuiltAuthenticator::RequiresExternalBackend { .. })
+        ));
+        assert_eq!(cfg.kube_token_path(), None);
+    }
+
+    #[test]
+    fn kube_present_only_refuses_to_build_an_inbound_validator() {
+        let cfg = parse(serde_json::json!({
+            "provider": "kube",
+            "present": { "token_path": "/var/run/secrets/tokens/toolkit-internal" }
+        }))
+        .unwrap();
+        assert!(cfg.kube_token_path().is_some());
+        assert!(cfg.kube_audiences().is_none());
+        // A participant that validates inbound tokens must not come up with
+        // its inbound side unauthenticated.
+        let err = cfg
+            .build_authenticator()
+            .expect_err("no verify block means no inbound validator");
+        assert!(matches!(err, InvalidInternalAuth::MissingKubeVerify));
+        assert!(err.to_string().contains("verify"), "got: {err}");
+    }
+
+    #[test]
+    fn kube_without_any_block_is_refused() {
+        let err = parse(serde_json::json!({ "provider": "kube" }))
+            .expect_err("a kube config with neither block does nothing");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("verify") && msg.contains("present"),
+            "the error must name both blocks: {msg}"
+        );
+    }
+
+    #[test]
+    fn flat_kube_form_is_refused_with_a_migration_hint() {
+        for legacy in [
+            serde_json::json!({
+                "provider": "kube",
+                "audiences": ["toolkit-internal"],
+                "token_path": "/var/run/secrets/tokens/toolkit-internal"
+            }),
+            serde_json::json!({ "provider": "kube", "audiences": ["toolkit-internal"] }),
+            // Mixed: new block plus a leftover flat field is still refused.
+            serde_json::json!({
+                "provider": "kube",
+                "verify": { "audiences": ["toolkit-internal"] },
+                "token_path": "/var/run/secrets/tokens/toolkit-internal"
+            }),
+        ] {
+            let err = parse(legacy.clone()).expect_err("the flat form was removed");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("verify:") && msg.contains("present:"),
+                "the error must point to the new blocks for {legacy}: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn kube_verify_without_audiences_is_refused() {
+        // An omitted list used to default to empty, which disables audience
+        // binding entirely -- any ServiceAccount token in the cluster would
+        // authenticate as a platform peer. Refusing the config is the point:
+        // failing to start beats starting unbound.
+        let err = parse(serde_json::json!({ "provider": "kube", "verify": {} }))
+            .expect_err("verify without audiences must not deserialize");
+        assert!(
+            err.to_string().contains("audiences"),
+            "the error must name the field: {err}"
+        );
+
+        let err = parse(serde_json::json!({ "provider": "kube", "verify": { "audiences": [] } }))
+            .expect_err("an explicitly empty list is the same weakness");
+        assert!(err.to_string().contains("audiences"), "got: {err}");
+    }
+
+    #[test]
+    fn kube_blocks_reject_unknown_fields() {
+        // A typo inside a block must not silently drop the setting.
+        let err = parse(serde_json::json!({
+            "provider": "kube",
+            "present": { "tokenpath": "/var/run/secrets/tokens/toolkit-internal" }
+        }))
+        .expect_err("misspelled field");
+        assert!(err.to_string().contains("tokenpath"), "got: {err}");
+    }
+
+    #[test]
+    fn misspelled_kube_block_is_refused_rather_than_read_as_omitted() {
+        // `prsent` must not parse as "no present block": that would surface
+        // later as a misleading "set present.token_path" (or an inactive
+        // gateway proxy) with nothing pointing at the typo.
+        let err = parse(serde_json::json!({
+            "provider": "kube",
+            "verify": { "audiences": ["toolkit-internal"] },
+            "prsent": { "token_path": "/var/run/secrets/tokens/toolkit-internal" }
+        }))
+        .expect_err("a misspelled block must not be ignored");
+        assert!(err.to_string().contains("prsent"), "got: {err}");
+
+        // The legacy keys are still declared, so they keep their migration
+        // message instead of becoming a generic unknown-field error.
+        let err = parse(serde_json::json!({
+            "provider": "kube",
+            "audiences": ["toolkit-internal"]
+        }))
+        .expect_err("the flat form was removed");
+        assert!(err.to_string().contains("verify:"), "got: {err}");
+    }
+
+    #[test]
+    fn shared_secret_rejects_unknown_fields() {
+        let err = parse(serde_json::json!({
+            "provider": "shared_secret",
+            "secret": "s",
+            "peer_nmae": "hello"
+        }))
+        .expect_err("a misspelled field must not be ignored");
+        assert!(err.to_string().contains("peer_nmae"), "got: {err}");
+    }
+
+    #[test]
+    fn kube_built_in_code_with_no_audiences_or_no_blocks_is_refused() {
+        // The serde checks do not cover this: the fields are public, so a
+        // config constructed in code never passes through deserialization.
         let unbound = InternalAuthConfig::Kube {
-            audiences: Vec::new(),
-            token_path: None,
+            verify: Some(KubeVerify {
+                audiences: Vec::new(),
+            }),
+            present: None,
         };
         assert!(matches!(
             unbound.build_authenticator(),
             Err(InvalidInternalAuth::EmptyKubeAudiences)
         ));
 
-        // With an audience it is buildable again, by the layer that owns kube.
-        let bound = InternalAuthConfig::Kube {
-            audiences: vec!["toolkit-internal".to_owned()],
-            token_path: None,
+        let empty = InternalAuthConfig::Kube {
+            verify: None,
+            present: None,
         };
         assert!(matches!(
-            bound.build_authenticator(),
-            Ok(BuiltAuthenticator::RequiresExternalBackend)
+            empty.build_authenticator(),
+            Err(InvalidInternalAuth::MissingKubeVerify)
         ));
-    }
 
-    #[test]
-    fn kube_without_audiences_is_refused() {
-        // An omitted list used to default to empty, which disables audience
-        // binding entirely -- any ServiceAccount token in the cluster would
-        // authenticate as a platform peer. Refusing the config is the point:
-        // failing to start beats starting unbound.
-        let err =
-            serde_json::from_value::<InternalAuthConfig>(serde_json::json!({ "provider": "kube" }))
-                .expect_err("kube without audiences must not deserialize");
-        assert!(
-            err.to_string().contains("audiences"),
-            "the error must name the field: {err}"
-        );
-
-        let err = serde_json::from_value::<InternalAuthConfig>(
-            serde_json::json!({ "provider": "kube", "audiences": [] }),
-        )
-        .expect_err("an explicitly empty list is the same weakness");
-        assert!(err.to_string().contains("audiences"), "got: {err}");
-    }
-
-    #[test]
-    fn kube_with_audiences_and_no_token_path_is_inbound_only() {
-        let cfg: InternalAuthConfig = serde_json::from_value(
-            serde_json::json!({ "provider": "kube", "audiences": ["toolkit-internal"] }),
-        )
-        .unwrap();
-
-        assert!(cfg.is_kube());
-        assert_eq!(
-            cfg.kube_token_path(),
-            None,
-            "no token path means inbound-only: nothing is minted outbound"
-        );
+        // With an audience it is buildable again, by the layer that owns kube.
+        assert!(matches!(
+            kube_both().build_authenticator(),
+            Ok(BuiltAuthenticator::RequiresExternalBackend { .. })
+        ));
     }
 
     #[test]

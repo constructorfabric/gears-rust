@@ -434,6 +434,7 @@ fn warn_capture() -> (
         .with_writer(SharedWriter(std::sync::Arc::clone(&buf)))
         .with_max_level(tracing::Level::WARN)
         .finish();
+    keep_interest_shared();
     let guard = tracing::subscriber::set_default(subscriber);
     (guard, buf)
 }
@@ -610,4 +611,13 @@ fn each_verdict_maps_to_unhealthy_with_its_own_code() {
         Verdict::Ready.into_result().status,
         toolkit::HealthcheckStatus::Healthy
     );
+}
+
+/// Keeps a second dispatcher registered for the whole binary. With only one, tracing-core
+/// computes a callsite's interest from the registering thread's default, so a test without a
+/// capture can cache `never` for a callsite another test's capture needs. Call it before
+/// installing a thread-local subscriber (`set_default` / `with_default`).
+fn keep_interest_shared() {
+    static SHARED: std::sync::OnceLock<tracing::Dispatch> = std::sync::OnceLock::new();
+    SHARED.get_or_init(|| tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default()));
 }

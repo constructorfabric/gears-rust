@@ -67,6 +67,10 @@
 #[cfg(test)]
 extern crate self as toolkit;
 
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+pub(crate) mod test_tracing;
+
 pub use anyhow::Result;
 pub use async_trait::async_trait;
 

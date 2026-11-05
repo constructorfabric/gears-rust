@@ -35,9 +35,11 @@ gears:
         # Kubernetes TokenReview API. Requires this gear's `k8s-auth`
         # Cargo feature to be enabled at build time; without it,
         # `provider: kube` is a hard `init` error, not a silent downgrade.
+        # The hub only validates inbound tokens, so it needs the `verify`
+        # block (an `init` error without it); a `present` block is unused.
         # provider: kube
-        # audiences: ["toolkit-internal"]
-        # token_path: /var/run/secrets/tokens/toolkit-internal
+        # verify:
+        #   audiences: ["toolkit-internal"]
 
       # How an ABSENT credential is treated when `internal_auth` is set.
       # "required" (default) rejects every non-exempt RPC with no token;

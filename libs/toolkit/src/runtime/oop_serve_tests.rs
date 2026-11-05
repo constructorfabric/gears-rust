@@ -669,6 +669,7 @@ async fn trace_context_middleware_continues_inbound_w3c_trace() {
     let tracer = provider.tracer("oop-serve-trace-test");
     let subscriber =
         tracing_subscriber::registry().with(tracing_opentelemetry::layer().with_tracer(tracer));
+    crate::test_tracing::keep_interest_shared();
     let _guard = tracing::subscriber::set_default(subscriber);
 
     let inbound_trace_id = "4bf92f3577b34da6a3ce929d0e0e4736";
@@ -837,6 +838,7 @@ async fn canonical_error_layer_runs_inside_the_trace_span_when_composed() {
         .await
         .unwrap();
     assert!(warm_up.status().is_server_error(), "the gear route failed");
+    crate::test_tracing::keep_interest_shared();
     let _guard = tracing::subscriber::set_default(subscriber);
 
     let resp = app
