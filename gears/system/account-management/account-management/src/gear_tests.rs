@@ -605,7 +605,7 @@ mod no_seed_startup_tests {
             hub,
             migrated_sqlite(crate::Migrator::migrations()).await,
         )
-        .with_gts_publication_manifest(Arc::new(manifest));
+        .with_gts_publication_manifest_for_test(Arc::new(manifest));
         let err = gear.init(&ctx).await.expect_err("no platform API");
         assert!(format!("{err:#}").contains("platform API"), "got: {err:#}");
     }
@@ -682,6 +682,7 @@ mod no_seed_startup_tests {
             toolkit::gts_publication::PreparedGtsPublication::bind(
                 descriptor,
                 Arc::clone(&manifest),
+                toolkit::gts_publication::GtsPublicationOptions::default(),
                 &hub,
             )
             .expect("platform API")
@@ -713,7 +714,7 @@ mod no_seed_startup_tests {
             Arc::clone(&hub),
             migrated_sqlite(crate::Migrator::migrations()).await,
         )
-        .with_gts_publication_manifest(manifest);
+        .with_gts_publication_manifest_for_test(manifest);
         let loaded: crate::config::AccountManagementConfig = account_management_ctx
             .config_or_default()
             .expect("load AM startup config");
@@ -1030,12 +1031,13 @@ mod restart_tests {
                 toolkit::gts_publication::PreparedGtsPublication::bind(
                     descriptor,
                     Arc::clone(&manifest),
+                    toolkit::gts_publication::GtsPublicationOptions::default(),
                     &hub,
                 )?
                 .publish(&cancel, Arc::new(|_: &str| {}))
                 .await?;
                 am.inner()
-                    .init(&am_ctx.with_gts_publication_manifest(manifest))
+                    .init(&am_ctx.with_gts_publication_manifest_for_test(manifest))
                     .await?;
                 am.start(cancel.clone()).await?;
                 loop {

@@ -79,6 +79,6 @@ pub fn gear_ctx_raw(config: &Value, registry: MockTypesRegistry) -> (GearCtx, Ar
         Arc::clone(&hub),
         CancellationToken::new(),
     )
-    .with_gts_publication_manifest(Arc::new(manifest));
+    .with_gts_publication_manifest_for_test(Arc::new(manifest));
     (ctx, hub)
 }

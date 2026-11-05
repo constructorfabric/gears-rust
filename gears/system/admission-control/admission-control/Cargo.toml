@@ -56,6 +56,7 @@ tracing = { workspace = true }
 opentelemetry = { workspace = true }
 
 [dev-dependencies]
+toolkit = { workspace = true, features = ["test-support"] }
 tokio = { workspace = true, features = ["macros", "rt", "test-util"] }
 types-registry-sdk = { workspace = true, features = ["test-util"] }
 parking_lot = { workspace = true }

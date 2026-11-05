@@ -10,6 +10,7 @@ use toolkit::gts::PluginV1;
 use toolkit::gts_publication::GtsPublicationInputs;
 use toolkit::plugins::bind_plugin_instances;
 use toolkit::{Gear, context::GearCtx};
+use types_registry_sdk::GtsId;
 
 use crate::config::{
     KeycloakIdpPluginConfig, KeycloakIdpPluginEnabledProbe, KeycloakIdpPluginInstanceProbe,
@@ -55,7 +56,7 @@ impl KeycloakIdpPluginGear {
     /// the plugin is disabled.
     fn plugin_instance(
         inputs: &GtsPublicationInputs<'_>,
-    ) -> anyhow::Result<Vec<(String, serde_json::Value)>> {
+    ) -> anyhow::Result<Vec<(GtsId, serde_json::Value)>> {
         let probe: KeycloakIdpPluginInstanceProbe = inputs.config_or_default()?;
         if !probe.enabled {
             return Ok(Vec::new());
@@ -71,7 +72,7 @@ impl KeycloakIdpPluginGear {
             probe.priority,
         )
         .map_err(|e| anyhow::anyhow!("keycloak-idp-plugin: build_registration: {e}"))?;
-        Ok(vec![(id.as_ref().to_owned(), document)])
+        Ok(vec![(GtsId::try_new(id.as_ref())?, document)])
     }
 }
 

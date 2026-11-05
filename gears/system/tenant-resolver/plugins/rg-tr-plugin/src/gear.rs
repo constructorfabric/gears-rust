@@ -11,6 +11,7 @@ use toolkit::gts::PluginV1;
 use toolkit::gts_publication::GtsPublicationInputs;
 use toolkit::plugins::bind_plugin_instances;
 use tracing::info;
+use types_registry_sdk::GtsId;
 
 use crate::config::RgTrPluginConfig;
 use crate::domain::Service;
@@ -48,14 +49,14 @@ impl RgTrPlugin {
     /// The publication's config-only documents: the plugin instance.
     fn plugin_instance(
         inputs: &GtsPublicationInputs<'_>,
-    ) -> anyhow::Result<Vec<(String, serde_json::Value)>> {
+    ) -> anyhow::Result<Vec<(GtsId, serde_json::Value)>> {
         let cfg: RgTrPluginConfig = inputs.config_or_default()?;
         let (id, document) = PluginV1::<TenantResolverPluginSpecV1>::build_registration(
             INSTANCE_SEGMENT,
             cfg.vendor,
             cfg.priority,
         )?;
-        Ok(vec![(id.as_ref().to_owned(), document)])
+        Ok(vec![(GtsId::try_new(id.as_ref())?, document)])
     }
 }
 

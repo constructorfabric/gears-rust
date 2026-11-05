@@ -73,14 +73,23 @@ fn manifest() -> GtsManifest {
 
 /// The runtime's publication of the manifest under `cancel`.
 async fn published(hub: &ClientHub, cancel: &CancellationToken) -> Result<(), GtsPublicationError> {
-    PreparedGtsPublication::bind(SingleTenantTrPlugin.descriptor(), Arc::new(manifest()), hub)?
-        .publish(cancel, Arc::new(|_: &str| {}))
-        .await
+    PreparedGtsPublication::bind(
+        SingleTenantTrPlugin.descriptor(),
+        Arc::new(manifest()),
+        toolkit::gts_publication::GtsPublicationOptions::default(),
+        hub,
+    )?
+    .publish(cancel, Arc::new(|_: &str| {}))
+    .await
 }
 
 #[test]
 fn the_manifest_is_the_configured_instance() {
-    assert_eq!(manifest().documents(), [instance()]);
+    assert_eq!(
+        manifest().documents(),
+        [instance()]
+            .map(|(id, document)| (types_registry_sdk::GtsId::try_new(&id).unwrap(), document))
+    );
 }
 
 // Publication is independent of the plugin's runtime dependencies: it needs no `init`.
@@ -94,7 +103,7 @@ async fn init_binds_the_admitted_instance() {
         .expect("admitted");
     assert!(!backend_published(&hub, &id), "nothing bound before init");
     SingleTenantTrPlugin
-        .init(&ctx(&hub).with_gts_publication_manifest(Arc::new(manifest())))
+        .init(&ctx(&hub).with_gts_publication_manifest_for_test(Arc::new(manifest())))
         .await
         .expect("init succeeds");
 

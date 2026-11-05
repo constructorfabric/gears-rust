@@ -84,7 +84,7 @@ fn ctx(config: &Value, admitted: Option<GtsManifest>) -> GearCtx {
         CancellationToken::new(),
     );
     match admitted {
-        Some(manifest) => ctx.with_gts_publication_manifest(Arc::new(manifest)),
+        Some(manifest) => ctx.with_gts_publication_manifest_for_test(Arc::new(manifest)),
         None => ctx,
     }
 }
@@ -113,7 +113,7 @@ fn the_manifest_is_the_configured_instance() {
 
     let documents = manifest.documents();
     assert_eq!(documents.len(), 1);
-    assert_eq!(documents[0].0, instance_id());
+    assert_eq!(documents[0].0.id(), instance_id());
     assert_eq!(documents[0].1["vendor"], "cf");
     assert_eq!(documents[0].1["priority"], 7);
 }
@@ -246,16 +246,15 @@ async fn a_pending_instance_is_polled_within_the_budget_until_cancelled() {
     ));
 }
 
-/// An admission still pending when the publication budget runs out is refused
-/// with the deadline as the reconciliation stop.
+/// A publication still pending at budget expiry reports the deadline stop.
 #[tokio::test(start_paused = true)]
-async fn a_pending_instance_is_refused_once_the_budget_runs_out() {
+async fn a_pending_publication_expires_once_the_budget_runs_out() {
     let registry = Arc::new(MockTypesRegistry::new().completing_after(u32::MAX));
 
     let result = published(Some(&registry), &json!({}), &CancellationToken::new()).await;
 
-    let Err(GtsPublicationError::Refused { source, .. }) = result else {
-        panic!("expected a refusal: {result:?}");
+    let Err(GtsPublicationError::Expired { source, .. }) = result else {
+        panic!("expected publication expiry: {result:?}");
     };
     let stop = source
         .chain()

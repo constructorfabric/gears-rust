@@ -13,8 +13,8 @@ use toolkit::Gear;
 use toolkit::gts_publication::{
     GtsPublicationCapability as _, GtsPublicationError, PreparedGtsPublication,
 };
-use types_registry_sdk::AdmissionFailureReason;
 use types_registry_sdk::testing_platform::{Call, Fault, MockTypesRegistry};
+use types_registry_sdk::{AdmissionFailureReason, GtsId};
 
 fn provider() -> common::MockConfigProvider {
     common::MockConfigProvider::new(&json!({}))
@@ -26,9 +26,14 @@ fn manifest_contains_exactly_the_four_owned_sdk_declarations() {
         .descriptor()
         .build_gts_manifest(&provider())
         .unwrap();
-    let expected: Vec<(String, serde_json::Value)> = admission_control_sdk::gts_declarations()
+    let expected: Vec<(GtsId, serde_json::Value)> = admission_control_sdk::gts_declarations()
         .into_iter()
-        .map(|(id, text)| (id, serde_json::from_str(&text).unwrap()))
+        .map(|(id, text)| {
+            (
+                GtsId::try_new(&id).unwrap(),
+                serde_json::from_str(&text).unwrap(),
+            )
+        })
         .collect();
     assert_eq!(manifest.documents(), expected);
     assert_eq!(manifest.documents().len(), 4);
@@ -41,7 +46,7 @@ fn manifest_contains_exactly_the_four_owned_sdk_declarations() {
             manifest
                 .documents()
                 .iter()
-                .any(|(declared, _)| declared == id),
+                .any(|(declared, _)| declared.id() == id),
             "missing {id}"
         );
     }
@@ -61,6 +66,7 @@ async fn init_after_publication_registers_the_client_without_publishing_again() 
     let publication = PreparedGtsPublication::bind(
         AdmissionControl::default().descriptor(),
         Arc::clone(&manifest),
+        toolkit::gts_publication::GtsPublicationOptions::default(),
         &hub,
     )
     .unwrap();
@@ -77,7 +83,7 @@ async fn init_after_publication_registers_the_client_without_publishing_again() 
         Arc::clone(&hub),
         CancellationToken::new(),
     )
-    .with_gts_publication_manifest(manifest);
+    .with_gts_publication_manifest_for_test(manifest);
     AdmissionControl::default().init(&ctx).await.unwrap();
     assert!(
         hub.try_get::<dyn admission_control_sdk::AdmissionClientV1>()
@@ -140,7 +146,7 @@ async fn an_unreachable_registry_reaches_the_publication_deadline() {
         started.elapsed(),
         types_registry_sdk::STARTUP_PUBLICATION_DEADLINE
     );
-    let Err(GtsPublicationError::Refused { source, .. }) = result else {
+    let Err(GtsPublicationError::Expired { source, .. }) = result else {
         panic!("expected publication deadline: {result:?}");
     };
     let report = source

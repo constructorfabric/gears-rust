@@ -19,6 +19,7 @@ use toolkit::context::GearCtx;
 use toolkit::gts::PluginV1;
 use toolkit::gts_publication::GtsPublicationInputs;
 use tracing::{info, warn};
+use types_registry_sdk::GtsId;
 
 use crate::config::{INSTANCE_SUFFIX, OidcAuthNGearConfig};
 use crate::domain::authenticate::OidcAuthNPlugin;
@@ -52,7 +53,7 @@ impl OidcAuthNPluginGear {
     }
 
     /// The plugin instance for `vendor` and the configured priority.
-    fn registration(vendor: &str, priority: u32) -> anyhow::Result<(String, serde_json::Value)> {
+    fn registration(vendor: &str, priority: u32) -> anyhow::Result<(GtsId, serde_json::Value)> {
         let instance_id = AuthNResolverPluginSpecV1::gts_make_instance_id(INSTANCE_SUFFIX);
         let instance = PluginV1::<AuthNResolverPluginSpecV1> {
             id: instance_id.clone(),
@@ -61,7 +62,7 @@ impl OidcAuthNPluginGear {
             properties: AuthNResolverPluginSpecV1,
         };
         Ok((
-            instance_id.as_ref().to_owned(),
+            GtsId::try_new(instance_id.as_ref())?,
             serde_json::to_value(&instance)?,
         ))
     }
@@ -69,7 +70,7 @@ impl OidcAuthNPluginGear {
     /// The publication's config-only documents: the plugin instance.
     fn plugin_instance(
         inputs: &GtsPublicationInputs<'_>,
-    ) -> anyhow::Result<Vec<(String, serde_json::Value)>> {
+    ) -> anyhow::Result<Vec<(GtsId, serde_json::Value)>> {
         let cfg = Self::resolved(inputs.config().map_err(anyhow::Error::from))?;
         Ok(vec![Self::registration(
             &cfg.plugin.vendor,
@@ -312,7 +313,7 @@ mod tests {
             assert!(
                 ctx.client_hub()
                     .try_get_scoped::<dyn AuthNResolverPluginClient>(&ClientScope::gts_id(
-                        published
+                        published.id()
                     ))
                     .is_some(),
                 "bound under {published}"
@@ -360,16 +361,15 @@ mod tests {
             ));
         }
 
-        /// An admission still pending when the publication budget runs out is
-        /// refused with the deadline as the reconciliation stop.
+        /// A publication still pending at budget expiry reports the deadline stop.
         #[tokio::test(start_paused = true)]
-        async fn a_pending_instance_is_refused_once_the_budget_runs_out() {
+        async fn a_pending_publication_expires_once_the_budget_runs_out() {
             let registry = Arc::new(MockTypesRegistry::new().completing_after(u32::MAX));
 
             let result = published(Some(&registry), &CancellationToken::new()).await;
 
-            let Err(GtsPublicationError::Refused { source, .. }) = result else {
-                panic!("expected a refusal: {result:?}");
+            let Err(GtsPublicationError::Expired { source, .. }) = result else {
+                panic!("expected publication expiry: {result:?}");
             };
             let stop = source
                 .chain()
@@ -400,7 +400,7 @@ mod tests {
             let [(id, content)] = manifest.documents() else {
                 panic!("one instance: {manifest:?}");
             };
-            assert_eq!(id, &instance_id());
+            assert_eq!(id.id(), instance_id());
             assert_eq!(
                 (&content["vendor"], &content["priority"]),
                 (&json!("cf"), &json!(5))

@@ -21,7 +21,7 @@ use toolkit::plugins::bind_plugin_instances;
 use toolkit::{ClientHub, Gear, GearCtx, Healthcheck, HealthcheckResult, RestApiCapability};
 use toolkit_db::Db;
 use toolkit_db::odata::LimitCfg;
-use types_registry_sdk::{PlatformTypesRegistryApi, TypesRegistryApi};
+use types_registry_sdk::{GtsId, PlatformTypesRegistryApi, TypesRegistryApi};
 
 use crate::config::PolicyEngineConfig;
 use crate::domain::decision::{BuiltinPolicySet, CompileCache, DecisionMetrics, DecisionService};
@@ -70,7 +70,7 @@ impl PolicyEngine {
     /// The configured engine instance, published before any application init.
     fn plugin_instance(
         inputs: &GtsPublicationInputs<'_>,
-    ) -> anyhow::Result<Vec<(String, serde_json::Value)>> {
+    ) -> anyhow::Result<Vec<(GtsId, serde_json::Value)>> {
         let config: PolicyEngineConfig = inputs.config_or_default()?;
         config
             .validate()
@@ -79,7 +79,7 @@ impl PolicyEngine {
             &config.engine_plugin.vendor,
             config.engine_plugin.priority,
         )?;
-        Ok(vec![(id.as_ref().to_owned(), document)])
+        Ok(vec![(GtsId::try_new(id.as_ref())?, document)])
     }
 }
 
@@ -253,7 +253,7 @@ fn build_services(
 
 fn register_clients_and_plugin(
     clients: &Clients,
-    admitted: &[(String, serde_json::Value)],
+    admitted: &[(GtsId, serde_json::Value)],
     decision: &Arc<DecisionService>,
     management_client: &Arc<dyn PolicyManagementClientV1>,
 ) -> anyhow::Result<()> {

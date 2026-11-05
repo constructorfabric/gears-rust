@@ -275,5 +275,5 @@ pub async fn gear_ctx_over(config: &Value, hub: Arc<ClientHub>) -> GearCtx {
         CancellationToken::new(),
     )
     .with_db(dbp)
-    .with_gts_publication_manifest(Arc::new(manifest))
+    .with_gts_publication_manifest_for_test(Arc::new(manifest))
 }

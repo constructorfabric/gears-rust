@@ -128,6 +128,7 @@ async fn published(hub: &ClientHub, cancel: &CancellationToken) -> Result<(), Gt
     PreparedGtsPublication::bind(
         RgTrPlugin::default().descriptor(),
         Arc::new(manifest()),
+        toolkit::gts_publication::GtsPublicationOptions::default(),
         hub,
     )?
     .publish(cancel, Arc::new(|_: &str| {}))
@@ -136,7 +137,11 @@ async fn published(hub: &ClientHub, cancel: &CancellationToken) -> Result<(), Gt
 
 #[test]
 fn the_manifest_is_the_configured_instance() {
-    assert_eq!(manifest().documents(), [instance()]);
+    assert_eq!(
+        manifest().documents(),
+        [instance()]
+            .map(|(id, document)| (types_registry_sdk::GtsId::try_new(&id).unwrap(), document))
+    );
 }
 
 // Publication is independent of Resource Group's state (#4568): it needs no `init`.
@@ -150,7 +155,7 @@ async fn init_binds_the_admitted_instance() {
         .expect("admitted");
     assert!(!backend_published(&hub, &id), "nothing bound before init");
     RgTrPlugin::default()
-        .init(&ctx(&hub).with_gts_publication_manifest(Arc::new(manifest())))
+        .init(&ctx(&hub).with_gts_publication_manifest_for_test(Arc::new(manifest())))
         .await
         .expect("init succeeds");
 

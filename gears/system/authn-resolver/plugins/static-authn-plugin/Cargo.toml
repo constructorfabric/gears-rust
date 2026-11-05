@@ -53,6 +53,7 @@ secrecy = { workspace = true }
 inventory = { workspace = true }
 
 [dev-dependencies]
+toolkit = { workspace = true, features = ["test-support"] }
 tokio-util = { workspace = true }
 temp-env = { workspace = true }
 secrecy = { workspace = true }

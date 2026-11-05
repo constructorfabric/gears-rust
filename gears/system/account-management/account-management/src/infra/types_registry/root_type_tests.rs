@@ -9,9 +9,8 @@ use types_registry_sdk::GtsTypeId;
 use types_registry_sdk::testing_platform::{Call, Fault, MockTypesRegistry};
 
 use super::*;
-use types_registry_sdk::{
-    GtsId, PlatformTypesRegistryApi, PublisherContext, publish_startup_entities,
-};
+use types_registry_sdk::publication::{Publication, Registry};
+use types_registry_sdk::{GtsId, PublisherContext};
 
 /// Publish the configured root type alone, as the `startup` task does with the rest.
 ///
@@ -19,7 +18,7 @@ use types_registry_sdk::{
 /// An invalid configuration, a refused or unsettled admission (the error
 /// names the identifier and its outcome), the deadline or cancellation.
 async fn register_root_type(
-    registry: &dyn PlatformTypesRegistryApi,
+    registry: &Registry,
     cfg: &RootTypeConfig,
     cancel: &CancellationToken,
 ) -> anyhow::Result<()> {
@@ -29,7 +28,9 @@ async fn register_root_type(
         name: "account-management".to_owned(),
         version: env!("CARGO_PKG_VERSION").parse()?,
     };
-    publish_startup_entities(registry, &publisher, &[(id, desired)], cancel).await?;
+    Publication::new(registry, publisher, vec![(id, desired)])
+        .publish(cancel)
+        .await?;
     Ok(())
 }
 

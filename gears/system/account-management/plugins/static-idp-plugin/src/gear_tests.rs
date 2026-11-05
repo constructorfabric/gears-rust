@@ -77,14 +77,19 @@ async fn boot(
             .build_gts_manifest(&config(priority))
             .unwrap(),
     );
-    PreparedGtsPublication::bind(gear.descriptor(), Arc::clone(&manifest), hub)?
-        .publish(cancel, Arc::new(|_: &str| {}))
-        .await?;
+    PreparedGtsPublication::bind(
+        gear.descriptor(),
+        Arc::clone(&manifest),
+        toolkit::gts_publication::GtsPublicationOptions::default(),
+        hub,
+    )?
+    .publish(cancel, Arc::new(|_: &str| {}))
+    .await?;
     assert!(
         !bound(hub, &instance(priority).0),
         "nothing bound before init"
     );
-    gear.init(&ctx(hub, priority).with_gts_publication_manifest(manifest))
+    gear.init(&ctx(hub, priority).with_gts_publication_manifest_for_test(manifest))
         .await
         .expect("init after admission");
     Ok(())
@@ -114,7 +119,11 @@ fn the_manifest_is_the_configured_instance() {
     let gear = StaticIdpPlugin::default();
     let manifest = gear.descriptor().build_gts_manifest(&config(7)).unwrap();
 
-    assert_eq!(manifest.documents(), [instance(7)]);
+    assert_eq!(
+        manifest.documents(),
+        [instance(7)]
+            .map(|(id, document)| (types_registry_sdk::GtsId::try_new(&id).unwrap(), document))
+    );
     assert_eq!(manifest.publisher_name(), "static-idp-plugin");
     assert_eq!(manifest.publisher_version(), env!("CARGO_PKG_VERSION"));
 }
@@ -182,7 +191,7 @@ async fn a_pending_instance_reaches_the_deadline_without_binding() {
         started.elapsed(),
         types_registry_sdk::STARTUP_PUBLICATION_DEADLINE
     );
-    let Err(GtsPublicationError::Refused { source, .. }) = result else {
+    let Err(GtsPublicationError::Expired { source, .. }) = result else {
         panic!("expected publication deadline: {result:?}");
     };
     let stop = source

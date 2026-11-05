@@ -84,6 +84,7 @@ async fn published(
     PreparedGtsPublication::bind(
         TrAuthZPlugin::default().descriptor(),
         Arc::new(manifest(priority)),
+        toolkit::gts_publication::GtsPublicationOptions::default(),
         hub,
     )?
     .publish(cancel, Arc::new(|_: &str| {}))
@@ -95,14 +96,18 @@ async fn admitted_init(hub: &Arc<ClientHub>, priority: i16) -> anyhow::Result<()
     TrAuthZPlugin::default()
         .init(
             &ctx(hub, priority, CancellationToken::new())
-                .with_gts_publication_manifest(Arc::new(manifest(priority))),
+                .with_gts_publication_manifest_for_test(Arc::new(manifest(priority))),
         )
         .await
 }
 
 #[test]
 fn the_manifest_is_the_configured_instance() {
-    assert_eq!(manifest(7).documents(), [instance(7)]);
+    assert_eq!(
+        manifest(7).documents(),
+        [instance(7)]
+            .map(|(id, document)| (types_registry_sdk::GtsId::try_new(&id).unwrap(), document))
+    );
 }
 
 #[tokio::test]
@@ -179,7 +184,7 @@ async fn a_pending_instance_reaches_the_deadline_without_binding() {
         started.elapsed(),
         types_registry_sdk::STARTUP_PUBLICATION_DEADLINE
     );
-    let Err(GtsPublicationError::Refused { source, .. }) = result else {
+    let Err(GtsPublicationError::Expired { source, .. }) = result else {
         panic!("expected publication deadline: {result:?}");
     };
     let stop = source

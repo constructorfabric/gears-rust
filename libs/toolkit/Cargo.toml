@@ -22,6 +22,8 @@ workspace = true
 # Enable the runner and the runtime integration by default.
 default = ["otel", "db"]
 coverage_nightly = []
+# Fixture helpers for downstream gear tests; enable only in dev-dependencies.
+test-support = []
 # Use the facade's per-OS policy for TLS and application primitives.
 fips = ["toolkit-security/fips", "dep:toolkit-http", "toolkit-http/fips"]
 

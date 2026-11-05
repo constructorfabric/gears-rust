@@ -76,6 +76,7 @@ parking_lot = { workspace = true }
 lru = { workspace = true }
 
 [dev-dependencies]
+toolkit = { workspace = true, features = ["test-support"] }
 # Linked by the real-registry GTS test: the topic and event bases the
 # admission-control SDK's audit topic instance needs.
 event-broker-sdk = { workspace = true }

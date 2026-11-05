@@ -133,10 +133,9 @@ async fn an_unreachable_registry_is_retried_within_the_budget_until_cancelled() 
     ));
 }
 
-/// A registry still unreachable when the publication budget runs out is
-/// refused with the deadline as the reconciliation stop.
+/// Publication against an unreachable registry expires with the deadline stop.
 #[tokio::test(start_paused = true)]
-async fn an_unreachable_registry_is_refused_once_the_budget_runs_out() {
+async fn an_unreachable_registry_exhausts_the_publication_budget() {
     let registry = common::registry();
     registry.inject(
         Fault::on(Call::Register)
@@ -155,8 +154,8 @@ async fn an_unreachable_registry_is_refused_once_the_budget_runs_out() {
         .publish(&CancellationToken::new(), Arc::new(|_: &str| {}))
         .await;
 
-    let Err(GtsPublicationError::Refused { source, .. }) = result else {
-        panic!("expected a refusal: {result:?}");
+    let Err(GtsPublicationError::Expired { source, .. }) = result else {
+        panic!("expected publication expiry: {result:?}");
     };
     let stop = source
         .chain()

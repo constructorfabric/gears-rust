@@ -72,6 +72,7 @@ use crate::tr_plugin::PluginImpl as TrPluginImpl;
 use tenant_resolver_sdk::{TenantResolverPluginClient, TenantResolverPluginSpecV1};
 use toolkit::gts::PluginV1;
 use toolkit::gts_publication::GtsPublicationInputs;
+use types_registry_sdk::GtsId;
 
 type ConcreteService = TenantService<TenantRepoImpl>;
 
@@ -1171,7 +1172,7 @@ impl Gear for AccountManagementGear {
 fn tr_plugin_registration(
     vendor: &str,
     priority: i16,
-) -> anyhow::Result<(String, serde_json::Value)> {
+) -> anyhow::Result<(GtsId, serde_json::Value)> {
     let id = TenantResolverPluginSpecV1::gts_make_instance_id(TR_PLUGIN_SEGMENT);
     // `vendor` and `priority` are both config-driven. `vendor` defaults to
     // `"constructorfabric"` to match `TenantResolverConfig::default()` — deploys
@@ -1189,7 +1190,7 @@ fn tr_plugin_registration(
     };
     let document = serde_json::to_value(&instance)
         .map_err(|e| anyhow::anyhow!("tr-plugin: serialize instance failed: {e}"))?;
-    Ok((id.as_ref().to_owned(), document))
+    Ok((GtsId::try_new(id.as_ref())?, document))
 }
 
 impl AccountManagementGear {
@@ -1197,7 +1198,7 @@ impl AccountManagementGear {
     /// when enabled, the TR-plugin instance.
     fn configured_entities(
         inputs: &GtsPublicationInputs<'_>,
-    ) -> anyhow::Result<Vec<(String, serde_json::Value)>> {
+    ) -> anyhow::Result<Vec<(GtsId, serde_json::Value)>> {
         let cfg: AccountManagementConfig = inputs.config_or_default()?;
         let mut entities = Vec::new();
         if let Some(root_cfg) = cfg
@@ -1205,7 +1206,7 @@ impl AccountManagementGear {
             .map_err(|err| anyhow::anyhow!("account-management root-type config invalid: {err}"))?
         {
             let id = root_cfg.validated_id().map_err(anyhow::Error::msg)?;
-            entities.push((id.to_owned(), desired_root_schema(&root_cfg)?));
+            entities.push((GtsId::try_new(id)?, desired_root_schema(&root_cfg)?));
         }
         if cfg.tr_plugin.enabled {
             entities.push(tr_plugin_registration(

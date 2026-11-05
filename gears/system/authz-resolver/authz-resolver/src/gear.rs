@@ -196,11 +196,7 @@ mod gts_publication_tests {
 
         assert_eq!(manifest.publisher_name(), "authz-resolver");
         assert_eq!(manifest.publisher_version(), env!("CARGO_PKG_VERSION"));
-        let ids: Vec<&str> = manifest
-            .documents()
-            .iter()
-            .map(|(id, _)| id.as_str())
-            .collect();
+        let ids: Vec<&str> = manifest.documents().iter().map(|(id, _)| id.id()).collect();
         let declared: Vec<String> = authz_resolver_sdk::gts_declarations()
             .into_iter()
             .map(|(id, _)| id)

@@ -49,6 +49,7 @@ tracing = { workspace = true }
 inventory = { workspace = true }
 
 [dev-dependencies]
+toolkit = { workspace = true, features = ["test-support"] }
 tokio = { workspace = true, features = ["rt", "macros", "test-util"] }
 tokio-util = { workspace = true }
 serde_json = { workspace = true }

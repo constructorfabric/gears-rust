@@ -298,8 +298,14 @@ mod publication {
         assert_eq!(
             manifest(&json!({ "priority": 10 })).documents(),
             [instance(10)]
+                .map(|(id, document)| (types_registry_sdk::GtsId::try_new(&id).unwrap(), document))
         );
-        assert_eq!(manifest(&json!({})).documents(), [instance(50)], "defaults");
+        assert_eq!(
+            manifest(&json!({})).documents(),
+            [instance(50)]
+                .map(|(id, document)| (types_registry_sdk::GtsId::try_new(&id).unwrap(), document)),
+            "defaults"
+        );
     }
 
     #[test]
@@ -316,6 +322,7 @@ mod publication {
         PreparedGtsPublication::bind(
             KeycloakIdpPluginGear.descriptor(),
             Arc::new(manifest(&json!({ "priority": priority }))),
+            toolkit::gts_publication::GtsPublicationOptions::default(),
             &hub,
         )?
         .publish(&CancellationToken::new(), Arc::new(|_: &str| {}))

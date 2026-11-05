@@ -99,6 +99,7 @@ authz-resolver = { workspace = true }
 integration = []
 
 [dev-dependencies]
+toolkit = { workspace = true, features = ["test-support"] }
 tokio = { workspace = true, features = ["macros", "rt", "test-util"] }
 types-registry-sdk = { workspace = true, features = ["test-util"] }
 # In-process `Router::oneshot` HTTP harness for the REST integration
