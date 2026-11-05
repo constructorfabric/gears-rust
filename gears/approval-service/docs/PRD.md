@@ -175,7 +175,7 @@ The service **MUST NOT** perform, orchestrate, or wait for the protected operati
 
 ### 4.1 In Scope
 
-- **p1**: opportunity registration with mandatory default action, mandatory standing approval setting, context attributes, and decision authority; resource projections; subjects; layered firewall-style rules; separate check and approve permissions; live approval policies with minimum approvals, mandatory approvers, and narrowed approver lists; decisions with mandatory reason and separation of duties; approval requests raised by verification, bound to context fingerprints; request reconciliation; synchronous explainable verification and batch verification; correlation ID and decision reasons in verdicts; approval leases; SDK with bounded cache; tenant hierarchy; administrator browsing and approver inbox; bulk decisions; audit trail; durable change and request events.
+- **p1**: opportunity registration with mandatory default action, mandatory standing approval setting, context attributes, and decision authority; resource projections; subjects; layered firewall-style rules; separate check and approve permissions; live approval policies with minimum approvals, mandatory approvers, and narrowed approver lists; decisions with mandatory reason and separation of duties; approval requests raised by verification, bound to context fingerprints; request reconciliation; synchronous explainable verification and batch verification; correlation ID and decision reasons in verdicts; approval leases; SDK with bounded cache; tenant hierarchy; administrator browsing and approver inbox; bulk decisions; audit trail; durable change and request events; refusal and denial reasons.
 - **p2**: auto-approval rules; conditional policies; staged policies; group approvers; policy snapshot per request; subject-type selectors on rules; request escalation; decisions on behalf of an approver; subject group decisions; decision expiry; access review report; governance versions with drafts, comparison, and rollback.
 - **p3**: periodic recertification campaigns; delegable (overridable) ancestor rules; second-administrator review of governance changes; trial mode and previews of governance changes.
 
@@ -510,6 +510,26 @@ The system **MUST** accept a caller correlation ID on a verification call, store
 - **Rationale**: Process gears, such as Orders Workflow, correlate approvals with their own process instances and record why an approval was granted or denied.
 - **Actors**: `cpt-cf-approval-service-actor-integrated-gear`
 - **Covers**: `cpt-cf-approval-service-upreq-approval-request`, `cpt-cf-approval-service-upreq-decision-outcome`
+
+#### Refusal and Denial Reasons
+
+- [ ] `p1` - **ID**: `cpt-cf-approval-service-fr-refusal-reasons`
+
+Every verdict that does not let the operation proceed **MUST** carry a reason category, a machine-readable reason code, and a human-readable message. The reason categories **MUST** distinguish at least:
+
+| Category | Meaning |
+|----------|---------|
+| `no_permission` | The caller lacks the permission for the call, for example the check or request permission |
+| `blocked_by_rule` | A `deny` rule applies; the verdict names the rule |
+| `denied_by_approver` | An applicable deny decision exists; the verdict carries the approver's reason |
+| `approval_missing` | Approval is required and not yet satisfied; the verdict names the unmet requirements |
+| `invalid_facts` | Unknown opportunity, unaccepted type, or invalid or missing context attributes |
+| `unavailable` | The verdict cannot be established reliably |
+
+Administrators **MUST** be able to attach a message to a rule, shown to requesters when that rule decides. A denial **MUST** always carry a reason. The system **MUST** log every refusal with its category, code, opportunity, scope tenant, and correlation ID, without context attribute values, and **MUST** record refusals of calls with the register option in audit.
+
+- **Rationale**: Requesters, gears, and support need to know why an operation was refused, whether for lack of access, a rule, an approver's decision, or missing facts, instead of a bare yes or no, and auditors need the reason recorded.
+- **Actors**: `cpt-cf-approval-service-actor-requester`, `cpt-cf-approval-service-actor-integrated-gear`, `cpt-cf-approval-service-actor-admin`
 
 #### Approval Lease
 
@@ -1004,6 +1024,7 @@ Context attributes and justifications **MUST** be tenant-scoped, readable only b
 - [ ] Verification sustains 1,000 calls/s from 8 parallel clients with 1,000,000 approval decisions stored, on PostgreSQL and on MariaDB.
 - [ ] Verification returns `unavailable` with `mayProceed = false` when a dependency fails.
 - [ ] Every governance change commits atomically with its audit record and durable event record, and its event reaches the Event Broker at least once after commit.
+- [ ] Every verdict that does not let the operation proceed carries a reason category, a reason code, and a message; refusals are logged without context attribute values.
 - [ ] (p2) A rule or policy change saved as a draft does not affect verdicts; a version put into effect applies from the next verification; a rollback restores the earlier behaviour in one action and appears in the history.
 - [ ] (p3) A rule or policy in trial mode never changes a verdict, and its would-be outcome is reported to administrators.
 - [ ] (p2) An auto-approval never overrides a `deny` rule or a deny decision, and never satisfies a policy of an ancestor of its scope tenant.
