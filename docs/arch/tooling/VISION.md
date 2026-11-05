@@ -56,7 +56,7 @@ This document uses these terms with one meaning each.
 | **convention** | A rule or a configuration that a Gears project follows. |
 | **the tool** | The Gears CLI that this document describes. |
 | **upstream** | The source that owns a convention and releases new versions of it. |
-| **pin** | A version number that a repository records for a convention. |
+| **pin** | What a repository records to select one exact version of a convention. It has to designate content that cannot change afterwards; a name somebody can move later is not a pin. |
 | **install** | The tool puts a convention into a repository: it writes the pin, and any file that the convention generates or copies. The word never means obtaining a program. |
 | **reference** | Upstream keeps the file. The repository holds only a pin. An upgrade changes the pin and nothing else, because the content is not here to change. |
 | **generate** | Upstream supplies a rule, not a file. The tool derives the content, and it can derive the same content again at any time. An upgrade runs the rule again. |
@@ -143,7 +143,7 @@ project chose. **Validation** reports when the repository stops matching them. *
 carries them forward. Setup happens once. The other two happen for the life of the project.
 
 **Why this needs a tool at all is a Rust gap.** A reference works for the build rules, as a
-versioned `gears.mk` that a pin resolves, and for CI, through reusable workflows that a tag selects.
+versioned `gears.mk` that a pin resolves, and for CI, through reusable workflows that a pin selects.
 It does not work for `clippy.toml`, `rustfmt.toml`, `deny.toml`, `rust-toolchain.toml`,
 `.config/nextest.toml` or `.cargo/config.toml`: Rust has no `extends`, no parent manifest and no
 remote configuration inheritance, and `[workspace.lints]` stops at the workspace. Those files have
@@ -329,9 +329,12 @@ Each promise is bounded by what the tool actually controls.
 
 Three safety expectations hold across all three. Conventions resolve only from sources the project
 declared, so an upgrade cannot quietly start following somebody else's. Resolution is reproducible,
-so the same pins yield the same content for a developer today and an unattended run next week. And
-the execution boundary is explicit: read manifests, write a working tree, report. A project knows
-what it agreed to run when the scheduled job fires at three in the morning.
+so the same pins yield the same content for a developer today and an unattended run next week — and
+that holds only where a pin designates something immutable, which a movable tag or branch is not.
+`gears-rust` already settled this for its own CI by pinning action SHAs rather than tags (#2093);
+the conventions need the same discipline, and how each kind of artefact is identified is a design
+decision. And the execution boundary is explicit: read manifests, write a working tree, report. A
+project knows what it agreed to run when the scheduled job fires at three in the morning.
 
 ### What this changes for `gears-rust`
 
