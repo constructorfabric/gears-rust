@@ -1565,17 +1565,17 @@ fn generate_method_route(method: &RestMethodModel, model: &RestContractModel) ->
             if let Some(item_ty) = vec_item_type(ok_ty) {
                 quote! {
                     .json_array_response_with_schema::<#item_ty>(
-                        openapi, ::axum::http::StatusCode::OK, ""
+                        openapi, ::axum::http::StatusCode::OK, "OK"
                     )
                 }
             } else {
                 quote! {
-                    .json_response_with_schema::<#ok_ty>(openapi, ::axum::http::StatusCode::OK, "")
+                    .json_response_with_schema::<#ok_ty>(openapi, ::axum::http::StatusCode::OK, "OK")
                 }
             }
         }
         _ => quote! {
-            .json_response(::axum::http::StatusCode::OK, "")
+            .json_response(::axum::http::StatusCode::OK, "OK")
         },
     };
 
