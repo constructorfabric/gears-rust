@@ -87,3 +87,8 @@ mod routes_tests;
 #[cfg_attr(coverage_nightly, coverage(off))]
 #[path = "routes_embedding_tests.rs"]
 mod routes_embedding_tests;
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+#[path = "routes_quota_tests.rs"]
+mod routes_quota_tests;

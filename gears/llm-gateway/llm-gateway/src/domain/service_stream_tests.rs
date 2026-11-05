@@ -143,8 +143,16 @@ async fn pre_stream_stages_run_in_pipeline_order() {
         .expect("stream starts");
     let _ = collect(stream).await;
 
+    // The usage hand-off runs in the background after the terminal; this test
+    // is about the pre-stream stages.
+    let stages: Vec<&str> = h
+        .log
+        .entries()
+        .into_iter()
+        .filter(|entry| *entry != "usage_sink")
+        .collect();
     assert_eq!(
-        h.log.entries(),
+        stages,
         vec!["authz", "models", "plugins", "credentials", "plugin"]
     );
 }

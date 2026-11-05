@@ -57,6 +57,8 @@ fn params() -> StreamParams {
         output_schema: None,
         ignored_parameters: Vec::new(),
         slot: None,
+        estimator: None,
+        on_terminal: None,
     }
 }
 

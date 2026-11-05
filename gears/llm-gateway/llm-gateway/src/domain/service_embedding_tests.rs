@@ -146,8 +146,16 @@ async fn dependencies_are_called_in_pipeline_order() {
         .await
         .expect("succeeds");
 
+    // The usage hand-off runs in the background after the response; this test
+    // is about the pipeline stages.
+    let stages: Vec<&str> = h
+        .log
+        .entries()
+        .into_iter()
+        .filter(|entry| *entry != "usage_sink")
+        .collect();
     assert_eq!(
-        h.log.entries(),
+        stages,
         vec!["authz", "models", "plugins", "credentials", "plugin"]
     );
 }

@@ -10,6 +10,8 @@ use std::sync::Arc;
 use model_registry_sdk::ModelInfoV1;
 use toolkit_macros::domain_model;
 
+use super::pricing::ModelPricing;
+
 /// Wire names of the generic generation parameters rules are asked about.
 pub const GENERIC_PARAMETERS: &[&str] = &[
     "temperature",
@@ -57,6 +59,12 @@ pub trait ProviderRules: Send + Sync {
         model: &ModelInfoV1,
         schema: &serde_json::Value,
     ) -> Option<String>;
+
+    /// Token pricing of `model`, parsed from `provider_settings.cost`
+    /// (`input_per_1k_micro`, `output_per_1k_micro`). A missing or
+    /// unparseable rate is `None`; whether it is required is decided by the
+    /// Quota Guard per operation.
+    fn pricing(&self, model: &ModelInfoV1) -> ModelPricing;
 }
 
 /// Rules that support everything: the default for provider types without
@@ -84,6 +92,25 @@ impl ProviderRules for PermissiveRules {
         _schema: &serde_json::Value,
     ) -> Option<String> {
         None
+    }
+
+    fn pricing(&self, model: &ModelInfoV1) -> ModelPricing {
+        parse_pricing(model)
+    }
+}
+
+/// Parse `provider_settings.cost` (`input_per_1k_micro`, `output_per_1k_micro`):
+/// a rate that is absent or not a non-negative integer is `None`.
+#[must_use]
+pub fn parse_pricing(model: &ModelInfoV1) -> ModelPricing {
+    let cost = model.provider_settings.get("cost");
+    let rate = |key: &str| {
+        cost.and_then(|c| c.get(key))
+            .and_then(serde_json::Value::as_u64)
+    };
+    ModelPricing {
+        input_per_1k_micro: rate("input_per_1k_micro"),
+        output_per_1k_micro: rate("output_per_1k_micro"),
     }
 }
 

@@ -3,7 +3,7 @@
 //! Every helper is test-only, so `expect` on internal mutexes is fine.
 #![allow(clippy::missing_panics_doc)]
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -17,7 +17,9 @@ use llm_gateway_sdk::models::core::{
     ReasoningConfig, ResponseError, ResponseStatus, TextFormat, ToolChoice, ToolChoiceMode,
     TruncationStrategy,
 };
-use llm_gateway_sdk::models::streaming::{ErrorEvent, OutputTextEvent, ResponseSnapshotEvent};
+use llm_gateway_sdk::models::streaming::{
+    ErrorEvent, OutputTextEvent, ReasoningSummaryTextEvent, ResponseSnapshotEvent,
+};
 use llm_gateway_sdk::{
     CreateResponseBody, EmbeddingData, EmbeddingRequest, EmbeddingResponse, EmbeddingVector,
     LlmGatewayError, LlmGatewayProviderPluginClientV1, MediaInputMode, ProviderCallCtx,
@@ -25,6 +27,12 @@ use llm_gateway_sdk::{
     StreamingEvent, Usage,
 };
 use model_registry_sdk::{ModelInfoV1, ModelV1};
+use quota_enforcement_sdk::{
+    AcquireLeaseOutcome, AcquireLeaseRequest, BatchDebitRequest, BatchDecision, CommitLeaseRequest,
+    DebitRequest, Decision, DecisionPreview, DecisionResult, LeaseToken, PageResult,
+    PreviewRequest, QuotaEnforcementClientV1, QuotaEnforcementError, QuotaId, QuotaSnapshot,
+    ReleaseLeaseRequest, RollbackRequest, SnapshotRequest,
+};
 use secrecy::SecretString;
 use tokio::sync::Notify;
 use toolkit::api::canonical_prelude::CanonicalError;
@@ -33,10 +41,13 @@ use uuid::Uuid;
 
 use super::Service;
 use super::ports::{
-    CredentialBroker, ModelResolver, PluginDirectory, ResolvedPlugin, ToolSchemaSource,
+    CredentialBroker, IdentityContext, ModelResolver, PluginDirectory, ResolvedPlugin,
+    ServiceIdentity, ToolSchemaSource, UsageReport, UsageSink,
 };
-use super::provider_rules::{ProviderRules, ProviderRulesRegistry};
-use crate::config::{LimitsConfig, StreamConfig};
+use super::pricing::ModelPricing;
+use super::provider_rules::{PermissiveRules, ProviderRules, ProviderRulesRegistry};
+use super::quota_guard::QuotaGuard;
+use crate::config::{LimitsConfig, QuotaConfig, StreamConfig, TimeoutsConfig};
 
 /// Provider identity used by the sample model and plugin.
 pub const OPENAI_TYPE: &str = "gts.cf.genai.model.info.v1~cf.genai._.openai.v1~";
@@ -109,10 +120,33 @@ pub fn sample_model_info_patched(
         "default_parameters": model_registry_sdk::DefaultInferenceParametersV1::default(),
         "allow_parameter_override": false,
         "allow_extra_params": [],
-        "provider_settings": { "oagw_alias": "openai-prod" }
+        // Zero pricing by default: admitted without a lease, so tests that
+        // are not about quota never touch Quota Enforcement. Quota tests
+        // patch the rates with `set_cost`.
+        "provider_settings": {
+            "oagw_alias": "openai-prod",
+            "cost": { "input_per_1k_micro": 0, "output_per_1k_micro": 0 }
+        }
     });
     patch(&mut value);
     serde_json::from_value(value).expect("sample model info deserializes")
+}
+
+/// Patch for [`sample_model_info_patched`]: set `provider_settings.cost`
+/// rates (`None` is a JSON `null`, i.e. a missing rate).
+pub fn set_cost(value: &mut serde_json::Value, input: Option<u64>, output: Option<u64>) {
+    value["provider_settings"]["cost"] = serde_json::json!({
+        "input_per_1k_micro": input,
+        "output_per_1k_micro": output,
+    });
+}
+
+/// Patch for [`sample_model_info_patched`]: drop `provider_settings.cost`.
+pub fn remove_cost(value: &mut serde_json::Value) {
+    value["provider_settings"]
+        .as_object_mut()
+        .expect("provider_settings is an object")
+        .remove("cost");
 }
 
 /// Approved production model of provider type `gts_type`.
@@ -244,6 +278,18 @@ pub fn ev_text_delta(seq: u64, text: &str) -> StreamingEvent {
         content_index: 0,
         text: text.to_owned(),
         logprobs: None,
+    })
+}
+
+/// `response.reasoning_summary_text.delta` with `text`.
+#[must_use]
+pub fn ev_summary_delta(seq: u64, text: &str) -> StreamingEvent {
+    StreamingEvent::ReasoningSummaryTextDelta(ReasoningSummaryTextEvent {
+        sequence_number: seq,
+        item_id: "rs_1".to_owned(),
+        output_index: 0,
+        summary_index: 0,
+        text: text.to_owned(),
     })
 }
 
@@ -978,6 +1024,550 @@ impl ProviderRules for FakeRules {
     ) -> Option<String> {
         self.unsupported_construct.map(ToOwned::to_owned)
     }
+
+    fn pricing(&self, model: &ModelInfoV1) -> ModelPricing {
+        PermissiveRules.pricing(model)
+    }
+}
+
+// ── Quota Enforcement error builders ────────────────────────────────────────
+
+/// Canonical errors shaped like the ones Quota Enforcement produces
+/// (`quota-enforcement/src/infra/canonical_mapping.rs`): where each reason
+/// token rides depends on the category.
+pub mod qe_errors {
+    use toolkit::api::canonical_prelude::CanonicalError;
+    use toolkit_canonical_errors::resource_error;
+
+    #[resource_error(gts_id!("cf.core.qe.lease.v1~"))]
+    struct LeaseResource;
+
+    /// `FailedPrecondition` whose violation `type` is `token`
+    /// (`LEASE_NOT_ACTIVE`, `METRIC_NOT_REGISTERED`, ...).
+    #[must_use]
+    pub fn precondition(token: &str) -> CanonicalError {
+        LeaseResource::failed_precondition()
+            .with_precondition_violation("subject", format!("{token} (test)"), token)
+            .create()
+    }
+
+    /// `InvalidArgument` whose field violation reason is `token`
+    /// (`TTL_OUT_OF_BOUNDS`).
+    #[must_use]
+    pub fn invalid_argument(token: &str) -> CanonicalError {
+        LeaseResource::invalid_argument()
+            .with_field_violation("ttl_secs", format!("{token} (test)"), token)
+            .create()
+    }
+
+    /// `Aborted` with reason `token` (`LEASE_CONTENTION_TIMEOUT`,
+    /// `IDEMPOTENCY_PAYLOAD_MISMATCH`).
+    #[must_use]
+    pub fn aborted(token: &str) -> CanonicalError {
+        LeaseResource::aborted("aborted (test)")
+            .with_reason(token)
+            .create()
+    }
+
+    /// `ResourceExhausted` whose quota violation description is `token`
+    /// (`LEASE_INFLIGHT_LIMIT_EXCEEDED`, `ENGINE_COST_EXCEEDED`).
+    #[must_use]
+    pub fn exhausted(token: &str) -> CanonicalError {
+        LeaseResource::resource_exhausted("exhausted (test)")
+            .with_quota_violation("(tenant, metric)", token)
+            .create()
+    }
+
+    /// `PermissionDenied` as the PDP refusal lifts (`AUTHZ`).
+    #[must_use]
+    pub fn permission_denied() -> CanonicalError {
+        LeaseResource::permission_denied()
+            .with_reason("AUTHZ")
+            .create()
+    }
+
+    /// `NotFound`.
+    #[must_use]
+    pub fn not_found() -> CanonicalError {
+        LeaseResource::not_found("lease not found (test)")
+            .with_resource("lease")
+            .create()
+    }
+
+    /// `DeadlineExceeded`.
+    #[must_use]
+    pub fn deadline_exceeded() -> CanonicalError {
+        LeaseResource::deadline_exceeded("deadline (test)").create()
+    }
+
+    /// `ServiceUnavailable`.
+    #[must_use]
+    pub fn unavailable() -> CanonicalError {
+        CanonicalError::service_unavailable()
+            .with_detail("DEPENDENCY_UNAVAILABLE: test")
+            .create()
+    }
+
+    /// `Unauthenticated`: the service identity was refused.
+    #[must_use]
+    pub fn unauthenticated() -> CanonicalError {
+        CanonicalError::unauthenticated()
+            .with_reason("TOKEN_EXPIRED")
+            .create()
+    }
+
+    /// `Internal`.
+    #[must_use]
+    pub fn internal() -> CanonicalError {
+        CanonicalError::internal("internal error").create()
+    }
+}
+
+// ── Quota Enforcement client fake ───────────────────────────────────────────
+
+/// One call the Quota Enforcement fake received; `subject` is the subject id
+/// of the `SecurityContext` it was made under.
+#[derive(Debug, Clone)]
+pub enum QuotaCall {
+    /// `acquire_lease`.
+    Acquire {
+        subject: Uuid,
+        request: AcquireLeaseRequest,
+    },
+    /// `commit_lease`.
+    Commit {
+        subject: Uuid,
+        request: CommitLeaseRequest,
+        at: tokio::time::Instant,
+    },
+    /// `release_lease`.
+    Release {
+        subject: Uuid,
+        request: ReleaseLeaseRequest,
+        at: tokio::time::Instant,
+    },
+}
+
+/// Subject id of the service identity the fakes hand out.
+pub const SERVICE_SUBJECT: u128 = 77;
+
+/// Scripted `QuotaEnforcementClientV1`: records calls and pops scripted
+/// outcomes (default: `Acquired` with a lease valid for the requested TTL,
+/// commit and release succeed).
+pub struct FakeQuota {
+    calls: Mutex<Vec<QuotaCall>>,
+    acquire_script: Mutex<VecDeque<Result<AcquireLeaseOutcome, QuotaEnforcementError>>>,
+    commit_script: Mutex<VecDeque<Result<(), QuotaEnforcementError>>>,
+    release_script: Mutex<VecDeque<Result<(), QuotaEnforcementError>>>,
+    tokens: AtomicUsize,
+    park_acquire: AtomicBool,
+    /// Notified when an `acquire_lease` call has started (only when parked).
+    pub acquire_entered: Notify,
+    /// Releases a parked `acquire_lease` call.
+    pub acquire_release: Notify,
+    log: Arc<CallLog>,
+}
+
+impl FakeQuota {
+    /// Fake with default outcomes.
+    #[must_use]
+    pub fn new(log: Arc<CallLog>) -> Arc<Self> {
+        Arc::new(Self {
+            calls: Mutex::new(Vec::new()),
+            acquire_script: Mutex::new(VecDeque::new()),
+            commit_script: Mutex::new(VecDeque::new()),
+            release_script: Mutex::new(VecDeque::new()),
+            tokens: AtomicUsize::new(0),
+            park_acquire: AtomicBool::new(false),
+            acquire_entered: Notify::new(),
+            acquire_release: Notify::new(),
+            log,
+        })
+    }
+
+    /// Queue `acquire_lease` outcomes (consumed in order, then the default).
+    pub fn script_acquire(
+        &self,
+        outcomes: impl IntoIterator<Item = Result<AcquireLeaseOutcome, QuotaEnforcementError>>,
+    ) {
+        self.acquire_script.lock().expect("script").extend(outcomes);
+    }
+
+    /// Queue `commit_lease` outcomes (consumed in order, then success).
+    pub fn script_commit(
+        &self,
+        outcomes: impl IntoIterator<Item = Result<(), QuotaEnforcementError>>,
+    ) {
+        self.commit_script.lock().expect("script").extend(outcomes);
+    }
+
+    /// Queue `release_lease` outcomes (consumed in order, then success).
+    pub fn script_release(
+        &self,
+        outcomes: impl IntoIterator<Item = Result<(), QuotaEnforcementError>>,
+    ) {
+        self.release_script.lock().expect("script").extend(outcomes);
+    }
+
+    /// Park every `acquire_lease` call until `acquire_release` is notified.
+    pub fn park_acquire(&self) {
+        self.park_acquire.store(true, Ordering::SeqCst);
+    }
+
+    /// Every call so far, in order.
+    #[must_use]
+    pub fn calls(&self) -> Vec<QuotaCall> {
+        self.calls.lock().expect("calls").clone()
+    }
+
+    /// The `acquire_lease` requests so far.
+    #[must_use]
+    pub fn acquires(&self) -> Vec<(Uuid, AcquireLeaseRequest)> {
+        self.calls()
+            .into_iter()
+            .filter_map(|c| match c {
+                QuotaCall::Acquire { subject, request } => Some((subject, request)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The `commit_lease` requests so far.
+    #[must_use]
+    pub fn commits(&self) -> Vec<(Uuid, CommitLeaseRequest)> {
+        self.calls()
+            .into_iter()
+            .filter_map(|c| match c {
+                QuotaCall::Commit {
+                    subject, request, ..
+                } => Some((subject, request)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The `release_lease` requests so far.
+    #[must_use]
+    pub fn releases(&self) -> Vec<(Uuid, ReleaseLeaseRequest)> {
+        self.calls()
+            .into_iter()
+            .filter_map(|c| match c {
+                QuotaCall::Release {
+                    subject, request, ..
+                } => Some((subject, request)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Settle calls (commit or release) so far.
+    #[must_use]
+    pub fn settle_calls(&self) -> usize {
+        self.commits().len() + self.releases().len()
+    }
+
+    /// Times (tokio clock) of the commit and release calls, in order.
+    #[must_use]
+    pub fn settle_times(&self) -> Vec<tokio::time::Instant> {
+        self.calls()
+            .into_iter()
+            .filter_map(|c| match c {
+                QuotaCall::Commit { at, .. } | QuotaCall::Release { at, .. } => Some(at),
+                QuotaCall::Acquire { .. } => None,
+            })
+            .collect()
+    }
+
+    /// Token the default `Acquired` outcome hands out for lease number `n`
+    /// (0-based).
+    #[must_use]
+    pub fn token(n: usize) -> LeaseToken {
+        LeaseToken::from(Uuid::from_u128(0x1000 + n as u128))
+    }
+
+    fn allowed() -> Decision {
+        Decision::allowed_with_plan(BTreeMap::new())
+    }
+
+    fn unsupported<T>() -> Result<T, QuotaEnforcementError> {
+        Err(qe_errors::internal())
+    }
+}
+
+/// A `Denied` acquire outcome with `reason` and one violated quota.
+pub fn denied(reason: &str) -> AcquireLeaseOutcome {
+    AcquireLeaseOutcome::Denied {
+        decision: Decision {
+            result: DecisionResult::Denied {
+                violated_quota_ids: vec![QuotaId::from(Uuid::from_u128(0xBAD))],
+                reason: reason.to_owned(),
+            },
+            debit_plan: BTreeMap::new(),
+            diagnostics: BTreeMap::new(),
+        },
+    }
+}
+
+/// An `Acquired` outcome for `token` valid for `ttl_secs`.
+pub fn acquired(token: LeaseToken, ttl_secs: i64) -> AcquireLeaseOutcome {
+    AcquireLeaseOutcome::Acquired {
+        token,
+        expires_at: time::OffsetDateTime::now_utc() + time::Duration::seconds(ttl_secs),
+    }
+}
+
+#[async_trait]
+impl QuotaEnforcementClientV1 for FakeQuota {
+    async fn debit(
+        &self,
+        _ctx: &SecurityContext,
+        _request: DebitRequest,
+    ) -> Result<Decision, QuotaEnforcementError> {
+        Self::unsupported()
+    }
+
+    async fn rollback(
+        &self,
+        _ctx: &SecurityContext,
+        _request: RollbackRequest,
+    ) -> Result<Decision, QuotaEnforcementError> {
+        Self::unsupported()
+    }
+
+    async fn evaluate_preview(
+        &self,
+        _ctx: &SecurityContext,
+        _request: PreviewRequest,
+    ) -> Result<DecisionPreview, QuotaEnforcementError> {
+        Self::unsupported()
+    }
+
+    async fn acquire_lease(
+        &self,
+        ctx: &SecurityContext,
+        request: AcquireLeaseRequest,
+    ) -> Result<AcquireLeaseOutcome, QuotaEnforcementError> {
+        self.log.push("quota_acquire");
+        let ttl = request.ttl_secs.unwrap_or(0);
+        self.calls.lock().expect("calls").push(QuotaCall::Acquire {
+            subject: ctx.subject_id(),
+            request,
+        });
+        if self.park_acquire.load(Ordering::SeqCst) {
+            self.acquire_entered.notify_one();
+            self.acquire_release.notified().await;
+        }
+        if let Some(outcome) = self.acquire_script.lock().expect("script").pop_front() {
+            return outcome;
+        }
+        let n = self.tokens.fetch_add(1, Ordering::SeqCst);
+        Ok(acquired(
+            Self::token(n),
+            i64::try_from(ttl).expect("ttl fits"),
+        ))
+    }
+
+    async fn commit_lease(
+        &self,
+        ctx: &SecurityContext,
+        request: CommitLeaseRequest,
+    ) -> Result<Decision, QuotaEnforcementError> {
+        self.log.push("quota_commit");
+        self.calls.lock().expect("calls").push(QuotaCall::Commit {
+            subject: ctx.subject_id(),
+            request,
+            at: tokio::time::Instant::now(),
+        });
+        let scripted = self.commit_script.lock().expect("script").pop_front();
+        scripted.unwrap_or(Ok(())).map(|()| Self::allowed())
+    }
+
+    async fn release_lease(
+        &self,
+        ctx: &SecurityContext,
+        request: ReleaseLeaseRequest,
+    ) -> Result<Decision, QuotaEnforcementError> {
+        self.log.push("quota_release");
+        self.calls.lock().expect("calls").push(QuotaCall::Release {
+            subject: ctx.subject_id(),
+            request,
+            at: tokio::time::Instant::now(),
+        });
+        let scripted = self.release_script.lock().expect("script").pop_front();
+        scripted.unwrap_or(Ok(())).map(|()| Self::allowed())
+    }
+
+    async fn batch_debit(
+        &self,
+        _ctx: &SecurityContext,
+        _request: BatchDebitRequest,
+    ) -> Result<BatchDecision, QuotaEnforcementError> {
+        Self::unsupported()
+    }
+
+    async fn snapshot(
+        &self,
+        _ctx: &SecurityContext,
+        _request: SnapshotRequest,
+    ) -> Result<PageResult<QuotaSnapshot>, QuotaEnforcementError> {
+        Self::unsupported()
+    }
+}
+
+// ── Service identity fake ───────────────────────────────────────────────────
+
+/// Service identity fake: hands out a context whose subject is
+/// [`SERVICE_SUBJECT`]; the first `fail_first` calls fail.
+pub struct FakeIdentity {
+    fail_first: AtomicUsize,
+    calls: AtomicUsize,
+    invalidations: AtomicUsize,
+    invalidated: Mutex<Vec<u64>>,
+}
+
+impl FakeIdentity {
+    /// Identity that always succeeds.
+    #[must_use]
+    pub fn new() -> Arc<Self> {
+        Self::failing_first(0)
+    }
+
+    /// Identity whose first `n` calls fail (credentials exchange failure).
+    #[must_use]
+    pub fn failing_first(n: usize) -> Arc<Self> {
+        Arc::new(Self {
+            fail_first: AtomicUsize::new(n),
+            calls: AtomicUsize::new(0),
+            invalidations: AtomicUsize::new(0),
+            invalidated: Mutex::new(Vec::new()),
+        })
+    }
+
+    /// Number of `invalidate` calls (the cached context was refused).
+    #[must_use]
+    pub fn invalidations(&self) -> usize {
+        self.invalidations.load(Ordering::SeqCst)
+    }
+
+    /// Generations passed to `invalidate`, in order.
+    #[must_use]
+    pub fn invalidated_generations(&self) -> Vec<u64> {
+        self.invalidated.lock().expect("invalidated").clone()
+    }
+
+    /// Number of `context` calls.
+    #[must_use]
+    pub fn calls(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+}
+
+/// The service `SecurityContext` of the fakes (distinct from [`ctx`]).
+#[must_use]
+pub fn service_ctx() -> SecurityContext {
+    SecurityContext::builder()
+        .subject_id(Uuid::from_u128(SERVICE_SUBJECT))
+        .subject_tenant_id(Uuid::from_u128(3))
+        .subject_type("service")
+        .build()
+        .expect("service context")
+}
+
+#[async_trait]
+impl ServiceIdentity for FakeIdentity {
+    async fn context(&self) -> anyhow::Result<IdentityContext> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let failing = self
+            .fail_first
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .is_ok();
+        if failing {
+            anyhow::bail!("credentials exchange failed (test)");
+        }
+        // A new generation after every invalidation, like a re-exchange.
+        Ok(IdentityContext {
+            ctx: service_ctx(),
+            generation: 1 + self.invalidations.load(Ordering::SeqCst) as u64,
+        })
+    }
+
+    async fn invalidate(&self, generation: u64) {
+        self.invalidated
+            .lock()
+            .expect("invalidated")
+            .push(generation);
+        self.invalidations.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+// ── Usage sink fake ─────────────────────────────────────────────────────────
+
+/// Usage sink fake recording every report.
+#[derive(Default)]
+pub struct FakeUsageSink {
+    reports: Mutex<Vec<UsageReport>>,
+    log: Arc<CallLog>,
+}
+
+impl FakeUsageSink {
+    /// Empty sink.
+    #[must_use]
+    pub fn new(log: Arc<CallLog>) -> Arc<Self> {
+        Arc::new(Self {
+            reports: Mutex::new(Vec::new()),
+            log,
+        })
+    }
+
+    /// Reports received so far.
+    #[must_use]
+    pub fn reports(&self) -> Vec<UsageReport> {
+        self.reports.lock().expect("reports").clone()
+    }
+}
+
+#[async_trait]
+impl UsageSink for FakeUsageSink {
+    async fn record(&self, report: UsageReport) {
+        self.log.push("usage_sink");
+        self.reports.lock().expect("reports").push(report);
+    }
+}
+
+/// Wait until `cond` holds, polling on the tokio clock (so it also works with
+/// a paused clock, where the wait advances virtual time); panics after
+/// `within`.
+///
+/// # Panics
+///
+/// When `cond` does not hold within `within`.
+pub async fn eventually_within(within: std::time::Duration, what: &str, cond: impl Fn() -> bool) {
+    let deadline = tokio::time::Instant::now() + within;
+    // Coarser polling for long (virtual-clock) waits keeps them cheap.
+    let step = (within / 1000).max(std::time::Duration::from_millis(5));
+    while !cond() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for: {what}"
+        );
+        tokio::time::sleep(step).await;
+    }
+}
+
+/// Wait (bounded) for `notify`.
+///
+/// # Panics
+///
+/// When it is not notified within one second.
+pub async fn entered(notify: &Notify) {
+    tokio::time::timeout(std::time::Duration::from_secs(1), notify.notified())
+        .await
+        .expect("the expected call never started");
+}
+
+/// [`eventually_within`] with a one second bound (real-time tests).
+pub async fn eventually(what: &str, cond: impl Fn() -> bool) {
+    eventually_within(std::time::Duration::from_secs(1), what, cond).await;
 }
 
 // ── Harness ─────────────────────────────────────────────────────────────────
@@ -996,6 +1586,11 @@ pub struct Harness {
     pub rules: FakeRules,
     pub limits: LimitsConfig,
     pub stream: StreamConfig,
+    pub timeouts: TimeoutsConfig,
+    pub quota_cfg: QuotaConfig,
+    pub quota: Arc<FakeQuota>,
+    pub identity: Arc<FakeIdentity>,
+    pub sink: Arc<FakeUsageSink>,
 }
 
 impl Harness {
@@ -1012,11 +1607,25 @@ impl Harness {
             plugin: plugin.clone(),
             plugins: FakePluginDirectory::new(OPENAI_TYPE, plugin, log.clone()),
             broker: FakeBroker::with(|| Ok(None), log.clone()),
-            tool_schemas: FakeToolSchemas::new(log),
+            tool_schemas: FakeToolSchemas::new(log.clone()),
             rules: FakeRules::default(),
             limits: LimitsConfig::default(),
             stream: StreamConfig::default(),
+            timeouts: TimeoutsConfig::default(),
+            quota_cfg: QuotaConfig::default(),
+            quota: FakeQuota::new(log.clone()),
+            identity: FakeIdentity::new(),
+            sink: FakeUsageSink::new(log),
         }
+    }
+
+    /// Serve a model of [`OPENAI_TYPE`] patched with `patch` (e.g.
+    /// `|v| set_cost(v, Some(1000), Some(2000))`).
+    pub fn set_model(&mut self, patch: impl FnOnce(&mut serde_json::Value)) {
+        self.models = FakeModels::found(
+            sample_model_info_patched(OPENAI_TYPE, patch),
+            self.log.clone(),
+        );
     }
 
     /// Replace the plugin (and the directory that serves it).
@@ -1070,6 +1679,20 @@ impl Harness {
         );
     }
 
+    /// The Quota Guard over the current fakes.
+    #[must_use]
+    pub fn quota_guard(&self) -> QuotaGuard {
+        QuotaGuard::new(
+            self.quota.clone(),
+            self.identity.clone(),
+            self.sink.clone(),
+            &self.quota_cfg,
+            &self.timeouts,
+        )
+        // Deterministic backoff; jitter has its own test.
+        .with_backoff_jitter(0.0)
+    }
+
     /// Build the service over the current fakes.
     #[must_use]
     pub fn service(&self) -> Arc<Service> {
@@ -1083,8 +1706,10 @@ impl Harness {
                 ProviderRulesRegistry::permissive()
                     .with_rules(OPENAI_TYPE, Arc::new(self.rules.clone())),
             ),
+            self.quota_guard(),
             &self.limits,
             &self.stream,
+            &self.timeouts,
         ))
     }
 }

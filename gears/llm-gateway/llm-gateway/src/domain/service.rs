@@ -4,14 +4,17 @@
 //! `ignored_parameters`.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use authz_resolver_sdk::PolicyEnforcer;
 use llm_gateway_sdk::{
     CreateResponseBody, EmbeddingRequest, EmbeddingResponse, InputItem, LlmGatewayError,
-    ProviderCallCtx, ProviderErrorCategory, ResponseEventStream, ResponseInput, ResponseResource,
-    TextFormatKind,
+    ProviderCallCtx, ProviderErrorCategory, ProviderFailure, ResponseEventStream, ResponseInput,
+    ResponseResource, TextFormatKind, Usage,
 };
 use model_registry_sdk::ModelInfoV1;
+use rust_decimal::Decimal;
+use secrecy::SecretString;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
 use toolkit_macros::domain_model;
@@ -26,9 +29,10 @@ use super::ports::{
     CredentialBroker, ModelResolver, PluginDirectory, ResolvedPlugin, ToolSchemaSource,
 };
 use super::provider_rules::ProviderRulesRegistry;
+use super::quota_guard::{Operation, QuotaGuard, Quote, RequestMeta, RequestQuota};
 use super::stream_supervisor::{StreamParams, initial_snapshot, supervise};
 use super::tool_resolver::ToolResolver;
-use crate::config::{LimitsConfig, StreamConfig};
+use crate::config::{LimitsConfig, StreamConfig, TimeoutsConfig};
 
 /// A failed create-response call together with the response `id` that was
 /// allocated for it, so REST Problems can carry the id.
@@ -129,6 +133,31 @@ fn log_info(response_id: &str, code: &str, chain: &str) {
     tracing::info!(response_id, code, error = %chain, "gateway request failed");
 }
 
+/// A dispatched plugin call outlived `timeouts.provider_sync`: cancel the
+/// request, settle the lease with the input-only estimate (the provider may
+/// have spent tokens we cannot see, same as an abort after dispatch) and
+/// answer `provider_unavailable`. The message is fixed: no provider content.
+fn provider_timed_out(
+    response_id: &str,
+    timeout: Duration,
+    cancel: &CancellationToken,
+    quota: RequestQuota,
+) -> LlmGatewayError {
+    tracing::warn!(
+        response_id,
+        timeout_secs = timeout.as_secs(),
+        "provider call exceeded timeouts.provider_sync; cancelled"
+    );
+    cancel.cancel();
+    let estimate = quota.estimator().estimate(0, None);
+    quota.settle(estimate);
+    LlmGatewayError::provider(
+        ProviderErrorCategory::ProviderUnavailable,
+        "provider call timed out",
+        ProviderFailure::default(),
+    )
+}
+
 fn has_item_reference(body: &CreateResponseBody) -> bool {
     matches!(
         &body.input,
@@ -155,6 +184,8 @@ struct Prepared {
     output_schema: Option<serde_json::Value>,
     /// Held until the call (sync) or the stream (stream) is over.
     slot: OwnedSemaphorePermit,
+    /// The quota state of the request: its lease, if any.
+    quota: RequestQuota,
 }
 
 /// Domain service running the request pipeline.
@@ -166,17 +197,22 @@ pub struct Service {
     credentials: Arc<dyn CredentialBroker>,
     tool_resolver: ToolResolver,
     checker: CapabilityChecker,
+    rules: Arc<ProviderRulesRegistry>,
+    quota: QuotaGuard,
     validator: OutputValidator,
     max_tools: usize,
     inflight_sync: Arc<Semaphore>,
     inflight_streams: Arc<Semaphore>,
     channel_capacity: usize,
+    /// Bound of one sync or embeddings plugin call (`timeouts.provider_sync`),
+    /// the base of the quota lease TTL.
+    provider_sync: Duration,
 }
 
 impl Service {
     /// Build the service from its ports and the configured limits.
     #[must_use]
-    #[allow(clippy::too_many_arguments)] // ports plus the two config sections
+    #[allow(clippy::too_many_arguments)] // ports, the quota guard and the config sections
     pub fn new(
         enforcer: PolicyEnforcer,
         models: Arc<dyn ModelResolver>,
@@ -184,8 +220,10 @@ impl Service {
         credentials: Arc<dyn CredentialBroker>,
         tool_schemas: Arc<dyn ToolSchemaSource>,
         rules: Arc<ProviderRulesRegistry>,
+        quota: QuotaGuard,
         limits: &LimitsConfig,
         stream: &StreamConfig,
+        timeouts: &TimeoutsConfig,
     ) -> Self {
         Self {
             enforcer,
@@ -193,12 +231,15 @@ impl Service {
             plugins,
             credentials,
             tool_resolver: ToolResolver::new(tool_schemas, limits.max_schema_bytes),
-            checker: CapabilityChecker::new(limits, rules),
+            checker: CapabilityChecker::new(limits, Arc::clone(&rules)),
+            rules,
+            quota,
             validator: OutputValidator,
             max_tools: limits.max_tools,
             inflight_sync: Arc::new(Semaphore::new(limits.max_inflight_sync)),
             inflight_streams: Arc::new(Semaphore::new(limits.max_inflight_streams)),
             channel_capacity: stream.channel_capacity,
+            provider_sync: timeouts.provider_sync,
         }
     }
 
@@ -244,22 +285,53 @@ impl Service {
             ignored_parameters,
             output_schema,
             slot: _slot,
+            mut quota,
         } = self
             .prepare(ctx, body, response_id, cancel, Mode::Sync)
             .await?;
+        let estimator = quota.estimator();
         let span = |stage: &'static str| tracing::info_span!("llm_gateway.stage", stage, response_id = %response_id, model = %model);
 
         // One call, never retried: LLM calls are not idempotent.
-        let mut resource = plugin
-            .client
-            .create_response(ctx, &call, body)
-            .instrument(span("dispatch"))
-            .await?;
+        quota.mark_dispatched();
+        let dispatched = tokio::time::timeout(
+            self.provider_sync,
+            plugin
+                .client
+                .create_response(ctx, &call, body)
+                .instrument(span("dispatch")),
+        )
+        .await;
+        let mut resource = match dispatched {
+            Ok(Ok(resource)) => resource,
+            Err(_elapsed) => {
+                return Err(provider_timed_out(
+                    response_id,
+                    self.provider_sync,
+                    &call.cancel,
+                    quota,
+                ));
+            }
+            Ok(Err(err)) => {
+                // A provider error carries no cost: nothing to commit.
+                quota.settle(Usage::reported(0, 0, Decimal::ZERO));
+                return Err(err);
+            }
+        };
+        let usage = resource
+            .usage
+            .clone()
+            .unwrap_or_else(|| estimator.estimate(0, None));
 
         if let Some(schema) = output_schema {
             let _enter = span("output_validation").entered();
-            self.validator.validate(&schema, &resource)?;
+            if let Err(err) = self.validator.validate(&schema, &resource) {
+                // The tokens were spent: settle with the plugin's usage.
+                quota.settle(usage);
+                return Err(err);
+            }
         }
+        quota.settle(usage);
 
         let mut ignored = std::mem::take(&mut resource.ignored_parameters);
         ignored.extend(ignored_parameters);
@@ -338,8 +410,23 @@ impl Service {
             _ => None,
         };
 
-        let call = self
-            .provider_call(ctx, model_info, response_id, &model, cancel)
+        let op = match mode {
+            Mode::Sync => Operation::Response,
+            Mode::Stream => Operation::Stream,
+        };
+        let rules = self.rules.rules_for(model_info.gts_type.as_ref());
+        let pricing = QuotaGuard::check_pricing(rules.as_ref(), &model_info, op)?;
+        let reservation = self.quota.response_quote(pricing, &model_info, &body);
+        let (quota, call) = self
+            .admit_and_call(
+                ctx,
+                response_id,
+                &model,
+                model_info,
+                op,
+                &reservation,
+                cancel,
+            )
             .await?;
         Ok(Prepared {
             plugin,
@@ -348,6 +435,7 @@ impl Service {
             ignored_parameters,
             output_schema,
             slot,
+            quota,
         })
     }
 
@@ -397,30 +485,68 @@ impl Service {
         Ok((model_info, plugin))
     }
 
-    /// Shared credential resolution and provider call context.
-    async fn provider_call(
+    /// Shared concurrent step: quota admission and credential resolution run
+    /// together. A failed admission drops the fetched key unused; a failed
+    /// credential resolution releases a lease acquired meanwhile.
+    #[allow(clippy::too_many_arguments)] // one shared step of three pipelines
+    async fn admit_and_call(
         &self,
         ctx: &SecurityContext,
-        model_info: ModelInfoV1,
         request_id: &str,
         model: &str,
+        model_info: ModelInfoV1,
+        op: Operation,
+        reservation: &Quote,
         cancel: CancellationToken,
-    ) -> Result<ProviderCallCtx, LlmGatewayError> {
-        let api_key = self
-            .credentials
-            .resolve(ctx, &model_info)
+    ) -> Result<(RequestQuota, ProviderCallCtx), LlmGatewayError> {
+        let meta = RequestMeta {
+            response_id: request_id.to_owned(),
+            model: model.to_owned(),
+            provider_type: model_info.gts_type.as_ref().to_owned(),
+        };
+        let (admission, key) = tokio::join!(
+            self.quota
+                .admit(ctx, meta, op, reservation)
+                .instrument(tracing::info_span!(
+                    "llm_gateway.stage",
+                    stage = "quota_admission",
+                    response_id = %request_id,
+                    model = %model
+                )),
+            self.resolve_key(ctx, &model_info, request_id, model),
+        );
+        let quota = admission?;
+        let api_key = match key {
+            Ok(key) => key,
+            Err(err) => {
+                quota.release();
+                return Err(err);
+            }
+        };
+        let mut call = ProviderCallCtx::new(model_info, request_id, cancel);
+        if let Some(key) = api_key {
+            call = call.with_api_key(key);
+        }
+        Ok((quota, call))
+    }
+
+    /// Credential resolution.
+    async fn resolve_key(
+        &self,
+        ctx: &SecurityContext,
+        model_info: &ModelInfoV1,
+        request_id: &str,
+        model: &str,
+    ) -> Result<Option<SecretString>, LlmGatewayError> {
+        self.credentials
+            .resolve(ctx, model_info)
             .instrument(tracing::info_span!(
                 "llm_gateway.stage",
                 stage = "resolve_credentials",
                 response_id = %request_id,
                 model = %model
             ))
-            .await?;
-        let mut call = ProviderCallCtx::new(model_info, request_id, cancel);
-        if let Some(key) = api_key {
-            call = call.with_api_key(key);
-        }
-        Ok(call)
+            .await
     }
 
     /// Create a response (sync); SDK-shaped wrapper over
@@ -485,13 +611,16 @@ impl Service {
             ignored_parameters,
             output_schema,
             slot,
+            mut quota,
         } = self
             .prepare(ctx, body, response_id, cancel.clone(), Mode::Stream)
             .await?;
         let snapshot = initial_snapshot(response_id, &body);
+        let estimator = quota.estimator();
 
         // One call, never retried: LLM calls are not idempotent.
-        let upstream = plugin
+        quota.mark_dispatched();
+        let started = plugin
             .client
             .create_response_stream(ctx, &call, body)
             .instrument(tracing::info_span!(
@@ -500,7 +629,14 @@ impl Service {
                 response_id = %response_id,
                 model = %model
             ))
-            .await?;
+            .await;
+        let upstream = match started {
+            Ok(upstream) => upstream,
+            Err(err) => {
+                quota.settle(Usage::reported(0, 0, Decimal::ZERO));
+                return Err(err);
+            }
+        };
 
         guard.disarm();
         Ok(supervise(
@@ -513,6 +649,8 @@ impl Service {
                 output_schema,
                 ignored_parameters,
                 slot: Some(slot),
+                estimator: Some(estimator),
+                on_terminal: Some(Box::new(move |usage| quota.settle(usage))),
             },
         ))
     }
@@ -576,6 +714,7 @@ impl Service {
             )
             .await?;
         let (model_info, plugin) = self.resolve_target(ctx, request_id, &model).await?;
+        let rules = self.rules.rules_for(model_info.gts_type.as_ref());
 
         let EffectiveEmbedding {
             request,
@@ -585,21 +724,51 @@ impl Service {
             self.checker.check_embedding(&model_info, req)?
         };
 
-        let call = self
-            .provider_call(ctx, model_info, request_id, &model, cancel)
+        let pricing = QuotaGuard::check_pricing(rules.as_ref(), &model_info, Operation::Embedding)?;
+        let reservation = self.quota.embedding_quote(pricing, &request);
+        let (mut quota, call) = self
+            .admit_and_call(
+                ctx,
+                request_id,
+                &model,
+                model_info,
+                Operation::Embedding,
+                &reservation,
+                cancel,
+            )
             .await?;
 
         // One call, never retried: calls are not idempotent.
-        let mut response = plugin
-            .client
-            .create_embedding(ctx, &call, request)
-            .instrument(tracing::info_span!(
-                "llm_gateway.stage",
-                stage = "dispatch",
-                response_id = %request_id,
-                model = %model
-            ))
-            .await?;
+        quota.mark_dispatched();
+        let dispatched = tokio::time::timeout(
+            self.provider_sync,
+            plugin
+                .client
+                .create_embedding(ctx, &call, request)
+                .instrument(tracing::info_span!(
+                    "llm_gateway.stage",
+                    stage = "dispatch",
+                    response_id = %request_id,
+                    model = %model
+                )),
+        )
+        .await;
+        let mut response = match dispatched {
+            Ok(Ok(response)) => response,
+            Err(_elapsed) => {
+                return Err(provider_timed_out(
+                    request_id,
+                    self.provider_sync,
+                    &call.cancel,
+                    quota,
+                ));
+            }
+            Ok(Err(err)) => {
+                quota.settle(Usage::reported(0, 0, Decimal::ZERO));
+                return Err(err);
+            }
+        };
+        quota.settle(response.usage.clone());
 
         let mut ignored = std::mem::take(&mut response.ignored_parameters);
         ignored.extend(ignored_parameters);
@@ -645,3 +814,18 @@ mod service_stream_tests;
 #[cfg_attr(coverage_nightly, coverage(off))]
 #[path = "service_embedding_tests.rs"]
 mod service_embedding_tests;
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+#[path = "service_quota_tests.rs"]
+mod service_quota_tests;
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+#[path = "service_quota_stream_tests.rs"]
+mod service_quota_stream_tests;
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+#[path = "service_timeout_tests.rs"]
+mod service_timeout_tests;

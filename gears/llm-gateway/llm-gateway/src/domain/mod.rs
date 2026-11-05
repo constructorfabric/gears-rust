@@ -6,7 +6,9 @@ pub mod credential_broker;
 pub mod local_client;
 pub mod output_validator;
 pub mod ports;
+pub mod pricing;
 pub mod provider_rules;
+pub mod quota_guard;
 pub mod service;
 pub mod stream_supervisor;
 #[cfg(test)]

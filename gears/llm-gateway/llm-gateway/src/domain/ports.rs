@@ -105,3 +105,64 @@ pub trait CredentialBroker: Send + Sync {
         model: &ModelInfoV1,
     ) -> Result<Option<SecretString>, LlmGatewayError>;
 }
+
+/// A service `SecurityContext` together with the generation of the exchange
+/// that produced it, so a refusal invalidates only that exchange.
+#[domain_model]
+#[derive(Debug, Clone)]
+pub struct IdentityContext {
+    /// The service context.
+    pub ctx: SecurityContext,
+    /// Generation of the exchange the context came from.
+    pub generation: u64,
+}
+
+/// Gear service identity (client credentials): the context settle and usage
+/// delivery run under, since they outlive the caller's request.
+#[async_trait]
+pub trait ServiceIdentity: Send + Sync {
+    /// The service context, cached and refreshed by the adapter.
+    ///
+    /// # Errors
+    ///
+    /// When the credentials exchange fails (or is rate-limited); callers retry
+    /// with backoff and never block consumer requests on it.
+    async fn context(&self) -> anyhow::Result<IdentityContext>;
+
+    /// A downstream call refused the context of `generation`
+    /// (`Unauthenticated`): drop it so the next [`Self::context`] exchanges
+    /// the credentials again. A no-op when a newer exchange already replaced
+    /// that generation, and for identities that cache nothing.
+    async fn invalidate(&self, _generation: u64) {}
+}
+
+/// What the Quota Guard hands to the Usage Reporter once a dispatched
+/// request's lease is settled (or settle was abandoned, or no lease was held).
+#[domain_model]
+#[derive(Debug, Clone)]
+pub struct UsageReport {
+    /// Response (or embedding request) `id`: the usage idempotency key.
+    pub response_id: String,
+    /// Tenant of the request.
+    pub tenant_id: uuid::Uuid,
+    /// User (subject) of the request.
+    pub user_id: uuid::Uuid,
+    /// Model identifier as requested.
+    pub model: String,
+    /// Provider type (`gts_type` of the model).
+    pub provider_type: String,
+    /// Terminal usage: `cost` is the AI credit quantity, with the
+    /// `complete` and `estimated` flags of the DESIGN usage table.
+    pub usage: llm_gateway_sdk::Usage,
+    /// The same quantity in metric units (micro-credits), rounded up.
+    pub quantity_micro_credits: i64,
+    /// Stamped once at the terminal state.
+    pub terminal_at: std::time::SystemTime,
+}
+
+/// Usage Reporter entry point (implemented in slice 5b).
+#[async_trait]
+pub trait UsageSink: Send + Sync {
+    /// Accept the usage of one terminal request. Must not block on delivery.
+    async fn record(&self, report: UsageReport);
+}

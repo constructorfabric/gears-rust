@@ -75,8 +75,16 @@ async fn pep_runs_before_any_other_dependency_call() {
         .await
         .expect("succeeds");
 
+    // The usage hand-off runs in the background after the response; this test
+    // is about the pipeline stages.
+    let stages: Vec<&str> = h
+        .log
+        .entries()
+        .into_iter()
+        .filter(|entry| *entry != "usage_sink")
+        .collect();
     assert_eq!(
-        h.log.entries(),
+        stages,
         vec!["authz", "models", "plugins", "credentials", "plugin"]
     );
 }
@@ -321,8 +329,10 @@ async fn default_broker_gives_the_plugin_no_api_key() {
         Arc::new(KeylessCredentialBroker),
         h.tool_schemas.clone(),
         Arc::new(crate::domain::provider_rules::ProviderRulesRegistry::permissive()),
+        h.quota_guard(),
         &h.limits,
         &h.stream,
+        &h.timeouts,
     );
     svc.create_response(&ctx(), body("m"))
         .await

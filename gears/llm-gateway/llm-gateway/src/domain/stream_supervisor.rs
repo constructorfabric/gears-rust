@@ -14,8 +14,13 @@
 //! - dropping the returned stream cancels the request token and drops the
 //!   plugin stream.
 //!
-//! Slice 3 scope: stream idle timeout / maximum duration, quota settle and
-//! the incomplete-usage estimate belong to later slices.
+//! At every terminal path (provider or synthesized terminal, provider error,
+//! consumer disconnect, relay failure) the [`StreamParams::on_terminal`] hook
+//! is called exactly once with the terminal usage (the Quota Guard settle).
+//! Final provider usage is passed through; without it the core estimate of
+//! [`StreamParams::estimator`] applies (see [`UsageBasis`]).
+//!
+//! Stream idle timeout / maximum duration belong to a later slice.
 
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -30,14 +35,129 @@ use llm_gateway_sdk::models::streaming::ResponseSnapshotEvent;
 use llm_gateway_sdk::{
     CreateResponseBody, ResponseEventStream, ResponseResource, StreamingEvent, Usage,
 };
+use rust_decimal::Decimal;
 use tokio::sync::{OwnedSemaphorePermit, mpsc};
 use tokio_util::sync::CancellationToken;
 use toolkit_macros::domain_model;
+use tracing::Instrument as _;
 
 use super::output_validator::OutputValidator;
+use super::pricing::UsageEstimator;
 
-/// Last provider usage seen by the relay task, readable by the consumer side.
-type SharedUsage = Arc<Mutex<Option<Usage>>>;
+/// Called exactly once per stream, at its terminal state, with the terminal
+/// usage: `cost` is the AI credit quantity, `complete` / `estimated` follow
+/// the DESIGN usage table. Every terminal path calls it: a provider or
+/// synthesized terminal, a provider error, consumer disconnect and relay
+/// failure.
+pub type TerminalHook = Box<dyn FnOnce(Usage) + Send + 'static>;
+
+/// What the relay saw so far; shared by the relay task, its terminal guard and
+/// the consumer side (which builds the terminal when the task dies).
+#[derive(Default)]
+struct Progress {
+    /// Last usage a provider snapshot carried (partial, not final).
+    last_usage: Option<Usage>,
+    /// UTF-8 bytes of output (text, refusal, reasoning, tool arguments)
+    /// relayed to the consumer.
+    output_bytes: u64,
+}
+
+/// The facts the terminal usage is derived from when the provider gave no
+/// final usage (DESIGN §3.2 Usage Reporter table).
+#[derive(Clone)]
+struct UsageBasis {
+    progress: Arc<Mutex<Progress>>,
+    estimator: Option<UsageEstimator>,
+}
+
+impl UsageBasis {
+    fn new(estimator: Option<UsageEstimator>) -> Self {
+        Self {
+            progress: Arc::default(),
+            estimator,
+        }
+    }
+
+    fn progress(&self) -> std::sync::MutexGuard<'_, Progress> {
+        self.progress
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn note_usage(&self, usage: Usage) {
+        self.progress().last_usage = Some(usage);
+    }
+
+    fn note_output(&self, bytes: usize) {
+        let mut progress = self.progress();
+        progress.output_bytes = progress.output_bytes.saturating_add(bytes as u64);
+    }
+
+    /// Usage when the provider reported no final usage: the core estimate
+    /// (`complete = false`, `estimated = true`); without an estimator the last
+    /// partial usage numbers at zero cost, `complete = false`,
+    /// `estimated = false` (no estimate can be made).
+    fn no_final(&self) -> Usage {
+        let progress = self.progress();
+        match &self.estimator {
+            Some(estimator) => {
+                estimator.estimate(progress.output_bytes, progress.last_usage.as_ref())
+            }
+            None => progress
+                .last_usage
+                .clone()
+                .map_or_else(Usage::unknown, |mut usage| {
+                    usage.complete = false;
+                    usage.estimated = false;
+                    usage.cost = Decimal::ZERO;
+                    usage
+                }),
+        }
+    }
+
+    /// Usage of a provider error without usage: the estimate when output was
+    /// already relayed to the consumer, otherwise a final zero.
+    fn provider_error(&self) -> Usage {
+        if self.estimator.is_some() && self.progress().output_bytes == 0 {
+            Usage::reported(0, 0, Decimal::ZERO)
+        } else {
+            self.no_final()
+        }
+    }
+}
+
+/// Calls the terminal hook exactly once: with the sent terminal's usage via
+/// [`TerminalGuard::finish`], or, when the relay ends any other way (consumer
+/// disconnect, task death), with the no-final-usage estimate on drop.
+struct TerminalGuard {
+    basis: UsageBasis,
+    hook: Option<TerminalHook>,
+}
+
+impl TerminalGuard {
+    fn finish(&mut self, usage: Usage) {
+        if let Some(hook) = self.hook.take() {
+            hook(usage);
+        }
+    }
+}
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        if let Some(hook) = self.hook.take() {
+            hook(self.basis.no_final());
+        }
+    }
+}
+
+/// Which fallback usage a terminal without usage gets.
+#[derive(Clone, Copy)]
+enum MissingUsage {
+    /// No final provider usage: the core estimate.
+    NoFinal,
+    /// A provider error: the estimate only if output was relayed.
+    ProviderError,
+}
 
 /// Inputs of one supervised stream.
 #[domain_model]
@@ -60,6 +180,11 @@ pub struct StreamParams {
     pub ignored_parameters: Vec<String>,
     /// In-flight slot held for the lifetime of the stream.
     pub slot: Option<OwnedSemaphorePermit>,
+    /// Estimate for terminals without final provider usage. `None`: no
+    /// estimate can be made (the last seen numbers at zero cost, flags false).
+    pub estimator: Option<UsageEstimator>,
+    /// Terminal hook (the Quota Guard settle); see [`TerminalHook`].
+    pub on_terminal: Option<TerminalHook>,
 }
 
 /// The `in_progress` snapshot of response `response_id` for `body`.
@@ -116,14 +241,13 @@ pub fn initial_snapshot(response_id: &str, body: &CreateResponseBody) -> Respons
 pub fn supervise(upstream: ResponseEventStream, params: StreamParams) -> ResponseEventStream {
     let (tx, rx) = mpsc::channel(params.channel_capacity.max(1));
     let cancel = params.cancel.clone();
-    let shared_usage = SharedUsage::default();
-    let fallback = State::new(&params);
-    tokio::spawn(relay(upstream, params, tx, Arc::clone(&shared_usage)));
+    let basis = UsageBasis::new(params.estimator);
+    let fallback = State::new(&params, basis.clone());
+    tokio::spawn(relay(upstream, params, tx, basis).in_current_span());
     Box::pin(Relay {
         rx,
         cancel,
         fallback,
-        shared_usage,
         received: 0,
         finished: false,
         ended: false,
@@ -140,8 +264,6 @@ struct Relay {
     cancel: CancellationToken,
     /// Builds the `response.failed` for a relay task that died.
     fallback: State,
-    /// Last provider usage the relay task saw (for the fallback terminal).
-    shared_usage: SharedUsage,
     /// Events received so far: the next `sequence_number` (gapless from 0).
     received: u64,
     /// A terminal event was delivered, or the stream ended.
@@ -176,16 +298,11 @@ impl Stream for Relay {
                     response_id = %self.fallback.response_id,
                     "stream aborted: the relay task ended without a terminal event"
                 );
-                let last_usage = self
-                    .shared_usage
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .clone();
-                self.fallback.last_usage = last_usage;
-                let mut event = self.fallback.failed(ResponseError::new(
-                    "internal",
-                    "the response stream terminated unexpectedly",
-                ));
+                let usage = self.fallback.basis.no_final();
+                let mut event = self.fallback.failed(
+                    ResponseError::new("internal", "the response stream terminated unexpectedly"),
+                    usage,
+                );
                 set_sequence(&mut event, self.received);
                 Poll::Ready(Some(event))
             }
@@ -259,20 +376,20 @@ struct State {
     /// Concatenated `response.output_text.delta` text (schema streams only);
     /// `None` until the first delta.
     text: Option<String>,
-    /// Last usage a provider snapshot carried.
-    last_usage: Option<Usage>,
+    /// Source of the usage of terminals without final provider usage.
+    basis: UsageBasis,
     next_sequence: u64,
 }
 
 impl State {
-    fn new(params: &StreamParams) -> Self {
+    fn new(params: &StreamParams, basis: UsageBasis) -> Self {
         Self {
             response_id: params.response_id.clone(),
             snapshot: params.snapshot.clone(),
             ignored_parameters: params.ignored_parameters.clone(),
             output_schema: params.output_schema.clone(),
             text: None,
-            last_usage: None,
+            basis,
             next_sequence: 0,
         }
     }
@@ -284,21 +401,13 @@ impl State {
         tx.send(event).await.is_ok()
     }
 
-    /// Usage of a terminal the provider did not finish: the last usage seen,
-    /// marked incomplete (estimation belongs to the Usage Reporter).
-    fn interrupted_usage(&self) -> Usage {
-        self.last_usage
-            .clone()
-            .map_or_else(Usage::unknown, |mut usage| {
-                usage.complete = false;
-                usage.estimated = false;
-                usage
-            })
+    fn no_final_usage(&self) -> Usage {
+        self.basis.no_final()
     }
 
     /// Gateway-owned fields of a terminal snapshot: id and merged
     /// `ignored_parameters`.
-    fn finish_snapshot(&self, response: &mut ResponseResource) {
+    fn finish_snapshot(&self, response: &mut ResponseResource, missing: MissingUsage) {
         self.response_id.clone_into(&mut response.id);
         let mut ignored = std::mem::take(&mut response.ignored_parameters);
         ignored.extend(self.ignored_parameters.iter().cloned());
@@ -307,7 +416,10 @@ impl State {
         response.ignored_parameters = ignored;
         // Every terminal carries one Usage; provider-supplied usage is kept.
         if response.usage.is_none() {
-            response.usage = Some(self.interrupted_usage());
+            response.usage = Some(match missing {
+                MissingUsage::NoFinal => self.basis.no_final(),
+                MissingUsage::ProviderError => self.basis.provider_error(),
+            });
         }
     }
 
@@ -316,20 +428,21 @@ impl State {
         &self,
         status: ResponseStatus,
         error: Option<ResponseError>,
+        usage: Usage,
     ) -> ResponseResource {
         let mut response = self.snapshot.clone();
         response.status = status;
         response.error = error;
         response.completed_at = Some(now_secs());
-        response.usage = Some(self.interrupted_usage());
-        self.finish_snapshot(&mut response);
+        response.usage = Some(usage);
+        self.finish_snapshot(&mut response, MissingUsage::NoFinal);
         response
     }
 
-    fn failed(&self, error: ResponseError) -> StreamingEvent {
+    fn failed(&self, error: ResponseError, usage: Usage) -> StreamingEvent {
         snapshot_event(
             StreamingEvent::Failed,
-            self.own_terminal(ResponseStatus::Failed, Some(error)),
+            self.own_terminal(ResponseStatus::Failed, Some(error), usage),
         )
     }
 
@@ -340,7 +453,9 @@ impl State {
             StreamingEvent::Created(e)
             | StreamingEvent::InProgress(e)
             | StreamingEvent::Queued(e) => {
-                self.last_usage = e.response.usage.or(self.last_usage.take());
+                if let Some(usage) = e.response.usage {
+                    self.basis.note_usage(usage);
+                }
                 return None;
             }
             StreamingEvent::Error(e) => {
@@ -349,24 +464,42 @@ impl State {
                     code = %e.error.code,
                     "stream aborted: the provider sent an error event"
                 );
-                self.failed(e.error)
+                let usage = self.basis.provider_error();
+                self.failed(e.error, usage)
             }
             StreamingEvent::Completed(e) => self.completed(e.response),
             StreamingEvent::Incomplete(e) => {
                 let mut response = e.response;
-                self.finish_snapshot(&mut response);
+                self.finish_snapshot(&mut response, MissingUsage::NoFinal);
                 snapshot_event(StreamingEvent::Incomplete, response)
             }
             StreamingEvent::Failed(e) => {
                 let mut response = e.response;
-                self.finish_snapshot(&mut response);
+                self.finish_snapshot(&mut response, MissingUsage::ProviderError);
                 snapshot_event(StreamingEvent::Failed, response)
             }
             StreamingEvent::OutputTextDelta(e) => {
+                self.basis.note_output(e.text.len());
                 if self.output_schema.is_some() {
                     self.text.get_or_insert_with(String::new).push_str(&e.text);
                 }
                 StreamingEvent::OutputTextDelta(e)
+            }
+            StreamingEvent::RefusalDelta(e) => {
+                self.basis.note_output(e.delta.len());
+                StreamingEvent::RefusalDelta(e)
+            }
+            StreamingEvent::ReasoningDelta(e) => {
+                self.basis.note_output(e.delta.len());
+                StreamingEvent::ReasoningDelta(e)
+            }
+            StreamingEvent::ReasoningSummaryTextDelta(e) => {
+                self.basis.note_output(e.text.len());
+                StreamingEvent::ReasoningSummaryTextDelta(e)
+            }
+            StreamingEvent::FunctionCallArgumentsDelta(e) => {
+                self.basis.note_output(e.arguments.len());
+                StreamingEvent::FunctionCallArgumentsDelta(e)
             }
             other => other,
         })
@@ -386,16 +519,17 @@ impl State {
                     code = err.code(),
                     "stream aborted: structured output validation failed"
                 );
-                let mut failed =
-                    self.own_terminal(ResponseStatus::Failed, Some(err.to_response_error()));
                 // Keep the provider's usage: the tokens were spent.
-                if response.usage.is_some() {
-                    failed.usage = response.usage.take();
-                }
+                let usage = response
+                    .usage
+                    .take()
+                    .unwrap_or_else(|| self.no_final_usage());
+                let failed =
+                    self.own_terminal(ResponseStatus::Failed, Some(err.to_response_error()), usage);
                 return snapshot_event(StreamingEvent::Failed, failed);
             }
         }
-        self.finish_snapshot(&mut response);
+        self.finish_snapshot(&mut response, MissingUsage::NoFinal);
         snapshot_event(StreamingEvent::Completed, response)
     }
 }
@@ -416,17 +550,32 @@ fn now_secs() -> i64 {
         .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
 }
 
+/// Usage carried by a terminal event (every terminal carries one).
+fn terminal_usage(event: &StreamingEvent) -> Option<Usage> {
+    match event {
+        StreamingEvent::Completed(e)
+        | StreamingEvent::Incomplete(e)
+        | StreamingEvent::Failed(e) => e.response.usage.clone(),
+        _ => None,
+    }
+}
+
 /// Drive `upstream` into `tx` until a terminal event was sent or the consumer
-/// left.
+/// left. The terminal hook runs once: with the sent terminal's usage, or, on
+/// every other exit (disconnect, task death), with the estimate.
 async fn relay(
     mut upstream: ResponseEventStream,
     params: StreamParams,
     tx: mpsc::Sender<StreamingEvent>,
-    shared_usage: SharedUsage,
+    basis: UsageBasis,
 ) {
-    let mut state = State::new(&params);
+    let mut state = State::new(&params, basis.clone());
     // Released when the task ends, whichever way.
     let _slot = params.slot;
+    let mut guard = TerminalGuard {
+        basis,
+        hook: params.on_terminal,
+    };
     let created = snapshot_event(StreamingEvent::Created, state.snapshot.clone());
     let in_progress = snapshot_event(StreamingEvent::InProgress, state.snapshot.clone());
     if !state.emit(&tx, created).await || !state.emit(&tx, in_progress).await {
@@ -447,27 +596,42 @@ async fn relay(
                 response_id = %state.response_id,
                 "stream aborted: the provider stream ended without a terminal event"
             );
-            let response = state.own_terminal(ResponseStatus::Completed, None);
+            let usage = state.no_final_usage();
+            let response = state.own_terminal(ResponseStatus::Completed, None, usage);
             let terminal = state.completed(response);
-            let _ = state.emit(&tx, terminal).await;
+            send_terminal(&mut state, &tx, &mut guard, terminal).await;
             return;
         };
         let Some(outgoing) = state.translate(event) else {
-            // Dropped lifecycle snapshots are the only source of `last_usage`.
-            shared_usage
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clone_from(&state.last_usage);
             continue;
         };
-        let terminal = is_terminal(&outgoing);
+        if is_terminal(&outgoing) {
+            send_terminal(&mut state, &tx, &mut guard, outgoing).await;
+            return;
+        }
         if !state.emit(&tx, outgoing).await {
             log_disconnect(&state.response_id);
             return;
         }
-        if terminal {
-            return;
+    }
+}
+
+/// Send the terminal event; once it is in the channel the stream is settled
+/// with its usage. A consumer that left first is a disconnect (the guard's
+/// estimate applies).
+async fn send_terminal(
+    state: &mut State,
+    tx: &mpsc::Sender<StreamingEvent>,
+    guard: &mut TerminalGuard,
+    terminal: StreamingEvent,
+) {
+    let usage = terminal_usage(&terminal);
+    if state.emit(tx, terminal).await {
+        if let Some(usage) = usage {
+            guard.finish(usage);
         }
+    } else {
+        log_disconnect(&state.response_id);
     }
 }
 
@@ -479,3 +643,8 @@ fn log_disconnect(response_id: &str) {
 #[cfg_attr(coverage_nightly, coverage(off))]
 #[path = "stream_supervisor_tests.rs"]
 mod stream_supervisor_tests;
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+#[path = "stream_terminal_tests.rs"]
+mod stream_terminal_tests;
