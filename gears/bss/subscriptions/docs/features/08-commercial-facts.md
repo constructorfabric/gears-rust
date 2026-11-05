@@ -335,6 +335,10 @@ The system **MUST** preserve stable economic identities and payer lineage, publi
 
 - [ ] A binding ends on day 10, its end is discovered on day 15, and cancellation applies on day 20. The served day-10-to-day-20 interval remains `Unresolved` after cancellation; Rating cannot finalize it or use an old result. Recovering valid historical continuation evidence produces one full replacement and successor seal; cancellation alone never does.
 
+- [ ] For that same day-10-to-day-20 gap, a new Orders purchase or operator approval supplies only later terms. Neither resolves the historical interval, changes its price or clears Rating's blocker. Recovery with authoritative evidence valid for the served interval publishes a full replacement and exact successor seal; replay preserves that result without another correction.
+
+- [ ] Historical authority cannot be recovered. The adapter retains `Unresolved` and the operator-visible finding; it cannot waive the debt, assume zero price or mark valuation complete. Only the agreed S-U08/S-U13 owner remedy may provide the required disposition and replacement evidence. Missing remedy/completion semantics keep the profile gated; cancellation or a new purchase does not bypass that gate.
+
 - [ ] Redelivering the same fact/version/digest changes no commercial or financial identity; a changed digest under the same version fails visibly. Two legitimate revisions produce two recoverable immutable versions of one fact.
 - [ ] A usage-only subscription publishes its parent at activation without waiting for usage or month end. Rating consumes that authoritative parent without synthesizing another obligation for the same source.
 - [ ] A full October UTC usage parent permits Rating to derive 744 hourly slots; Subscriptions publishes one commercial parent per obligation and no hourly timer. A mid-hour activation clips served extent without inventing a full served hour.
