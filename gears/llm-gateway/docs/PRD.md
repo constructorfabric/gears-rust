@@ -555,13 +555,14 @@ Gateway errors on pass-through APIs, including `capability_not_supported`, **MUS
 
 Whether a model can be called through a pass-through API is part of the model capabilities in Model Registry: a model declares which pass-through APIs (OpenAI, Anthropic) it supports, and an administrator can disable that capability per model. The system **MUST** send a pass-through request only to a model whose capabilities include the matching pass-through API; otherwise the system **MUST** return a `capability_not_supported` error without calling the provider.
 
-Granting a model a pass-through capability is a trust decision of the administrator. Apart from the model substitution, the usage request, the usage enrichment, and the stateless rules described here, the system **MUST NOT** restrict or modify the native request based on its content; it reads only the fields needed for routing and the quota estimate (`model`, `stream`, output limit, input text). The unified API rules on disabled capabilities, generation parameter policy (model defaults, override and extra-parameter gates), and provider-executed tools do not apply to pass-through requests. The system still never executes tools and keeps no conversation state itself.
+Granting a model a pass-through capability is a trust decision of the administrator. Apart from the model substitution, the usage request, the usage enrichment, and the stateless rules described here, the system **MUST NOT** restrict or modify the native request based on its content; it reads only the fields needed for routing and the quota estimate (`model`, `stream`, output limit, input text). The unified API rules on disabled capabilities, generation parameter policy (model defaults, override and extra-parameter gates), and provider-executed tools do not apply to pass-through requests, except the rule on paid provider tools below. The system still never executes tools and keeps no conversation state itself.
 
 Pass-through requests **MUST** be stateless, like requests to the unified API:
 
 - Only an allowlist of stateless endpoints is exposed: OpenAI `POST /v1/responses`, `POST /v1/chat/completions`, `POST /v1/embeddings`; Anthropic `POST /v1/messages`, `POST /v1/messages/count_tokens`. All other provider endpoints (files, uploads, vector stores, assistants and threads, conversations, containers, batches, retrieval or deletion of stored responses and completions) are not available.
 - The system **MUST** reject, with `capability_not_supported` and without calling the provider, requests that contain a field from the denylist of stateful fields: fields that create or reference provider-side state (for example `previous_response_id`, `conversation`, background requests, stored prompts, references to stored items or uploaded files, containers, and tools backed by provider-side stores or containers).
 - The system **MUST** always request that the provider does not store the request or response (for example, `store=false` for OpenAI), regardless of the value sent by the consumer.
+- The system **MUST** reject, with `capability_not_supported` and without calling the provider, requests that use provider-executed tools billed per call (for example web search and image generation), because their cost cannot be covered by the quota reservation or reported as usage.
 - Provider beta-feature headers are forwarded only for an allowlist of values, so that stateful beta features (for example the Anthropic Files API) cannot be enabled.
 
 The consumer sends the Gateway's model identifier in the native `model` field. The system **MUST** replace it with the provider's model identifier before calling the provider and **MUST** return the Gateway's model identifier in the `model` fields of the native response and stream events.
@@ -1230,7 +1231,8 @@ LLM Gateway exposes a REST API (documented in DESIGN.md) and the `llm-gateway-sd
 **Alternative Flows**:
 - **Model does not support the pass-through API**: Gateway returns capability_not_supported without calling the provider.
 - **Stateful request**: the request contains a field from the denylist of stateful fields (e.g. `previous_response_id`, a file reference, a container); Gateway returns capability_not_supported without calling the provider.
-- **Endpoint not allowlisted**: the provider endpoint is not exposed; Gateway returns a not-found error.
+- **Paid provider tool**: the request uses a provider tool billed per call (e.g. web search, image generation); Gateway returns capability_not_supported without calling the provider.
+- **Endpoint not allowlisted**: the provider endpoint is not exposed; Gateway returns a not-found error in the provider's error format.
 - **Common failures**: invalid model, no plugin for provider, credentials unavailable, unapproved destination, quota exhausted or unavailable are handled as in UC-001; streaming interruptions are handled as in UC-002.
 - **Error format**: every Gateway error is returned in the error format of the route's provider API, not in the unified error format; provider errors are returned with the provider's status code and native error body.
 
