@@ -62,51 +62,55 @@ fn inlines_from_text(raw: &str, annotations: &[TextAnnotation]) -> Vec<Inline> {
     let text = raw.trim();
     let lead = raw.len() - raw.trim_start().len();
 
-    // (start, end, style flags) in trimmed-text coordinates.
-    let ranges: Vec<(usize, usize, InlineStyle)> = annotations
-        .iter()
-        .filter_map(|a| {
-            let mut style = InlineStyle::default();
-            match a.kind {
-                AnnotationKind::Bold => style.bold = true,
-                AnnotationKind::Italic => style.italic = true,
-                AnnotationKind::Underline => style.underline = true,
-                AnnotationKind::Strikethrough => style.strike = true,
-                _ => return None,
-            }
-            let start = (a.start as usize).saturating_sub(lead).min(text.len());
-            let end = (a.end as usize).saturating_sub(lead).min(text.len());
-            (start < end).then_some((start, end, style))
-        })
-        .collect();
-    if ranges.is_empty() {
+    // Sweep events (position, flag index, +1/-1) in trimmed-text coordinates. The
+    // annotation list comes from an untrusted document, so the work is O(n log n)
+    // in the annotation count rather than a boundary-by-range scan.
+    let mut events: Vec<(usize, usize, i32)> = Vec::new();
+    for a in annotations {
+        let flag = match a.kind {
+            AnnotationKind::Bold => 0,
+            AnnotationKind::Italic => 1,
+            AnnotationKind::Underline => 2,
+            AnnotationKind::Strikethrough => 3,
+            _ => continue,
+        };
+        let start = (a.start as usize).saturating_sub(lead).min(text.len());
+        let end = (a.end as usize).saturating_sub(lead).min(text.len());
+        if start < end {
+            events.push((start, flag, 1));
+            events.push((end, flag, -1));
+        }
+    }
+    if events.is_empty() {
         return vec![Inline::plain(text)];
     }
+    events.sort_unstable();
 
-    let mut bounds: Vec<usize> = vec![0, text.len()];
-    for (s, e, _) in &ranges {
-        bounds.extend([*s, *e]);
-    }
-    bounds.retain(|b| text.is_char_boundary(*b));
-    bounds.sort_unstable();
-    bounds.dedup();
+    let style_of = |counts: &[i32; 4]| InlineStyle {
+        bold: counts[0] > 0,
+        italic: counts[1] > 0,
+        underline: counts[2] > 0,
+        strike: counts[3] > 0,
+        code: false,
+    };
 
     let mut out: Vec<(String, InlineStyle)> = Vec::new();
-    for w in bounds.windows(2) {
-        let (from, to) = (w[0], w[1]);
-        let mut style = InlineStyle::default();
-        for (s, e, st) in &ranges {
-            if *s <= from && to <= *e {
-                style.bold |= st.bold;
-                style.italic |= st.italic;
-                style.underline |= st.underline;
-                style.strike |= st.strike;
-            }
+    let mut push = |from: usize, to: usize, style: InlineStyle| match out.last_mut() {
+        Some((prev, prev_style)) if *prev_style == style => prev.push_str(&text[from..to]),
+        _ => out.push((text[from..to].to_owned(), style)),
+    };
+    let mut counts = [0i32; 4];
+    let mut seg_start = 0usize;
+    for (pos, flag, delta) in events {
+        // A position inside a multibyte char cannot split the text: skip the cut.
+        if pos > seg_start && text.is_char_boundary(pos) {
+            push(seg_start, pos, style_of(&counts));
+            seg_start = pos;
         }
-        match out.last_mut() {
-            Some((prev, prev_style)) if *prev_style == style => prev.push_str(&text[from..to]),
-            _ => out.push((text[from..to].to_owned(), style)),
-        }
+        counts[flag] += delta;
+    }
+    if seg_start < text.len() {
+        push(seg_start, text.len(), style_of(&counts));
     }
     out.into_iter()
         .map(|(t, style)| {
@@ -446,7 +450,10 @@ pub fn kreuzberg_table_to_block(table: &kreuzberg::Table) -> Option<ParsedBlock>
 }
 
 #[cfg(test)]
-#[allow(clippy::non_ascii_literal)]
+#[expect(
+    clippy::non_ascii_literal,
+    reason = "tests use multibyte fixtures to check byte offsets"
+)]
 mod tests {
     use super::*;
     use kreuzberg::types::document_structure::{ContentLayer, NodeId};
@@ -789,16 +796,12 @@ mod tests {
 
     #[test]
     fn non_char_boundary_offset_does_not_panic() {
-        // byte 1 is inside the 2-byte 'П'; must not panic, text stays intact.
-        let out = inlines_from_text("Привет", &[ann(1, 12, AnnotationKind::Bold)]);
-        let joined: String = out
-            .iter()
-            .map(|i| match i {
-                Inline::Text { text, .. } => text.as_str(),
-                _ => "",
-            })
-            .collect();
-        assert_eq!(joined, "Привет");
+        // byte 1 is inside the 2-byte 'П': the misaligned cut is skipped, so the
+        // run is not split mid-char and the style applies to the enclosing segment.
+        assert_eq!(
+            inlines_from_text("Привет", &[ann(1, 12, AnnotationKind::Bold)]),
+            vec![txt("Привет", st("b"))]
+        );
     }
 
     #[test]
@@ -813,6 +816,21 @@ mod tests {
             inlines_from_text("  ab", &[ann(0, 3, AnnotationKind::Bold)]),
             vec![txt("a", st("b")), Inline::plain("b")]
         );
+    }
+
+    #[test]
+    fn many_annotations_stay_linear_and_correct() {
+        // 50k alternating bold runs of one char each: a quadratic scan would take
+        // seconds; the sweep finishes at once and yields 50k segments.
+        let n = 50_000u32;
+        let text = "ab".repeat(n as usize);
+        let anns: Vec<TextAnnotation> = (0..n)
+            .map(|k| ann(2 * k, 2 * k + 1, AnnotationKind::Bold))
+            .collect();
+        let out = inlines_from_text(&text, &anns);
+        assert_eq!(out.len(), 2 * n as usize);
+        assert_eq!(out[0], txt("a", st("b")));
+        assert_eq!(out[1], Inline::plain("b"));
     }
 
     fn styled_para(kind: AnnotationKind, text: &str) -> DocumentNode {

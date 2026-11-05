@@ -443,7 +443,10 @@ fn collect(
     }
 }
 
-#[allow(clippy::non_ascii_literal)]
+#[expect(
+    clippy::non_ascii_literal,
+    reason = "Cyrillic fixture text checks multibyte offsets"
+)]
 #[tokio::test]
 async fn test_docx_parser_preserves_inline_styles() {
     use file_parser::domain::ir::InlineStyle;
