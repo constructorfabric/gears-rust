@@ -34,8 +34,9 @@ pub async fn migrated_gear_db(gear_db: &GearDb) -> toolkit_db::DBProvider<toolki
 /// A context for `mode`, with `db` attached and `extra` merged into the
 /// `event-broker` config over a single memory backend routed for every topic.
 ///
-/// Registers an empty `MockTypesRegistryClient` on `hub` (a test that seeds
-/// one registers its own afterwards), and binds a `standalone` cache provider
+/// Registers an empty `MockTypesRegistry` on `hub` as the
+/// `PlatformTypesRegistryApi` the gear consumes (a test that seeds one
+/// registers its own afterwards), and binds a `standalone` cache provider
 /// under the `event-broker` cluster profile unless `hub` already resolves one.
 pub async fn module_ctx(
     mode: &str,
@@ -43,8 +44,8 @@ pub async fn module_ctx(
     extra: &serde_json::Value,
     db: toolkit_db::DBProvider<toolkit_db::DbError>,
 ) -> GearCtx {
-    hub.register::<dyn types_registry_sdk::TypesRegistryClient>(Arc::new(
-        types_registry_sdk::testing::MockTypesRegistryClient::new(),
+    hub.register::<dyn types_registry_sdk::PlatformTypesRegistryApi>(Arc::new(
+        types_registry_sdk::testing_platform::MockTypesRegistry::new(),
     ));
     if crate::domain::cluster::EventBrokerCluster::resolve(&hub)
         .await

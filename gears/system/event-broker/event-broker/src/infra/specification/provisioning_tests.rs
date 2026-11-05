@@ -16,7 +16,6 @@ use tokio::sync::Notify;
 use toolkit_db::migration_runner::run_migrations_for_testing;
 use toolkit_db::{ConnectOpts, DBProvider, connect_db};
 use toolkit_gts::GtsInstanceId;
-use types_registry_sdk::testing::{MockTypesRegistryClient, make_test_instance};
 use uuid::Uuid;
 
 use super::super::TypesRegistrySpecificationManager;
@@ -26,6 +25,7 @@ use crate::domain::specification::{ProvisioningLimits, SpecificationManager, Top
 use crate::infra::storage::entity::topic_binding;
 use crate::infra::storage::migrations::Migrator;
 use crate::test_support::SingleBackendResolver;
+use crate::test_support::type_registry::registry_holding;
 use sea_orm_migration::MigratorTrait;
 
 const TOPIC_A: &str = "gts.cf.core.events.topic.v1~example.eb.prov.a.v1";
@@ -260,14 +260,12 @@ async fn load(
         "topics": { "gts.cf.core.events.topic.v1~": settings },
     }))
     .expect("test configuration deserializes");
-    let client: Arc<dyn types_registry_sdk::TypesRegistryClient> = Arc::new(
-        MockTypesRegistryClient::new().with_instances(topics.iter().map(|id| {
-            make_test_instance(
-                id,
-                json!({ "id": id, "description": "a topic to provision" }),
-            )
-        })),
-    );
+    let documents: Vec<serde_json::Value> = topics
+        .iter()
+        .map(|id| json!({ "id": id, "description": "a topic to provision" }))
+        .collect();
+    let client: Arc<dyn types_registry_sdk::PlatformTypesRegistryApi> =
+        registry_holding(&documents, &[]);
     super::super::bulk_load(&client, db, &cfg)
         .await
         .expect("bulk_load");

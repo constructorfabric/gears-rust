@@ -298,8 +298,8 @@ async fn standalone_register_rest_builds_router_and_serves_a_route_with_no_auth_
     hub.register::<dyn authz_resolver_sdk::AuthZResolverApi>(Arc::new(
         crate::test_support::authz_doubles::AllowAllAuthZ,
     ));
-    hub.register::<dyn types_registry_sdk::TypesRegistryClient>(Arc::new(
-        types_registry_sdk::testing::MockTypesRegistryClient::new(),
+    hub.register::<dyn types_registry_sdk::PlatformTypesRegistryApi>(Arc::new(
+        types_registry_sdk::testing_platform::MockTypesRegistry::new(),
     ));
     let ctx = make_ctx_with_hub("standalone", hub).await;
     let module = EventBrokerModule::default();
@@ -565,126 +565,6 @@ async fn an_unreachable_backend_does_not_stop_the_start_and_its_topics_are_unava
         .expect("serve must return Ok on cancellation");
 }
 
-/// A registry whose list calls never answer, as one that is unreachable
-/// without refusing the connection; every other call is the empty mock's.
-/// The second field is notified once `list_instances` has been entered.
-struct HangingListRegistry(
-    types_registry_sdk::testing::MockTypesRegistryClient,
-    Arc<tokio::sync::Notify>,
-);
-
-#[async_trait::async_trait]
-impl types_registry_sdk::TypesRegistryClient for HangingListRegistry {
-    async fn register(
-        &self,
-        entities: Vec<serde_json::Value>,
-    ) -> Result<Vec<types_registry_sdk::RegisterResult>, toolkit_canonical_errors::CanonicalError>
-    {
-        self.0.register(entities).await
-    }
-
-    async fn register_type_schemas(
-        &self,
-        type_schemas: Vec<serde_json::Value>,
-    ) -> Result<Vec<types_registry_sdk::RegisterResult>, toolkit_canonical_errors::CanonicalError>
-    {
-        self.0.register_type_schemas(type_schemas).await
-    }
-
-    async fn get_type_schema(
-        &self,
-        type_id: &str,
-    ) -> Result<types_registry_sdk::GtsTypeSchema, toolkit_canonical_errors::CanonicalError> {
-        self.0.get_type_schema(type_id).await
-    }
-
-    async fn get_type_schema_by_uuid(
-        &self,
-        type_uuid: Uuid,
-    ) -> Result<types_registry_sdk::GtsTypeSchema, toolkit_canonical_errors::CanonicalError> {
-        self.0.get_type_schema_by_uuid(type_uuid).await
-    }
-
-    async fn get_type_schemas(
-        &self,
-        type_ids: Vec<String>,
-    ) -> std::collections::HashMap<
-        String,
-        Result<types_registry_sdk::GtsTypeSchema, toolkit_canonical_errors::CanonicalError>,
-    > {
-        self.0.get_type_schemas(type_ids).await
-    }
-
-    async fn get_type_schemas_by_uuid(
-        &self,
-        type_uuids: Vec<Uuid>,
-    ) -> std::collections::HashMap<
-        Uuid,
-        Result<types_registry_sdk::GtsTypeSchema, toolkit_canonical_errors::CanonicalError>,
-    > {
-        self.0.get_type_schemas_by_uuid(type_uuids).await
-    }
-
-    async fn list_type_schemas(
-        &self,
-        _query: types_registry_sdk::TypeSchemaQuery,
-    ) -> Result<Vec<types_registry_sdk::GtsTypeSchema>, toolkit_canonical_errors::CanonicalError>
-    {
-        std::future::pending().await
-    }
-
-    async fn register_instances(
-        &self,
-        instances: Vec<serde_json::Value>,
-    ) -> Result<Vec<types_registry_sdk::RegisterResult>, toolkit_canonical_errors::CanonicalError>
-    {
-        self.0.register_instances(instances).await
-    }
-
-    async fn get_instance(
-        &self,
-        id: &str,
-    ) -> Result<types_registry_sdk::GtsInstance, toolkit_canonical_errors::CanonicalError> {
-        self.0.get_instance(id).await
-    }
-
-    async fn get_instance_by_uuid(
-        &self,
-        uuid: Uuid,
-    ) -> Result<types_registry_sdk::GtsInstance, toolkit_canonical_errors::CanonicalError> {
-        self.0.get_instance_by_uuid(uuid).await
-    }
-
-    async fn get_instances(
-        &self,
-        ids: Vec<String>,
-    ) -> std::collections::HashMap<
-        String,
-        Result<types_registry_sdk::GtsInstance, toolkit_canonical_errors::CanonicalError>,
-    > {
-        self.0.get_instances(ids).await
-    }
-
-    async fn get_instances_by_uuid(
-        &self,
-        uuids: Vec<Uuid>,
-    ) -> std::collections::HashMap<
-        Uuid,
-        Result<types_registry_sdk::GtsInstance, toolkit_canonical_errors::CanonicalError>,
-    > {
-        self.0.get_instances_by_uuid(uuids).await
-    }
-
-    async fn list_instances(
-        &self,
-        _query: types_registry_sdk::InstanceQuery,
-    ) -> Result<Vec<types_registry_sdk::GtsInstance>, toolkit_canonical_errors::CanonicalError>
-    {
-        self.1.notify_one();
-        std::future::pending().await
-    }
-}
-
 /// A stop while the startup registry load waits on a registry that never
 /// answers ends the start promptly: a process stopped right after launch
 /// exits instead of hanging on the load.
@@ -694,18 +574,29 @@ async fn a_stop_during_the_startup_registry_load_ends_the_start_promptly() {
     let ctx = make_ctx_with_hub("standalone", Arc::clone(&hub)).await;
     let module = Arc::new(EventBrokerModule::default());
     module.init(&ctx).await.expect("init must succeed");
-    // After `init`: `serve()` resolves the registry for the startup load.
-    let listing = Arc::new(tokio::sync::Notify::new());
-    hub.register::<dyn types_registry_sdk::TypesRegistryClient>(Arc::new(HangingListRegistry(
-        types_registry_sdk::testing::MockTypesRegistryClient::new(),
-        Arc::clone(&listing),
-    )));
+    // After `init`: `serve()` resolves the registry for the startup load. Its
+    // list calls never answer, as a registry that is unreachable without
+    // refusing the connection would.
+    let registry = Arc::new(types_registry_sdk::testing_platform::MockTypesRegistry::new());
+    registry.inject(
+        types_registry_sdk::testing_platform::Fault::on(
+            types_registry_sdk::testing_platform::Call::List,
+        )
+        .delay(Duration::from_secs(3600)),
+    );
+    hub.register::<dyn types_registry_sdk::PlatformTypesRegistryApi>(
+        Arc::clone(&registry) as Arc<dyn types_registry_sdk::PlatformTypesRegistryApi>
+    );
 
     let cancel = CancellationToken::new();
     let serve_task = crate::test_support::module_boot::spawn_serve(&module, &cancel);
-    tokio::time::timeout(Duration::from_secs(2), listing.notified())
-        .await
-        .expect("the startup load must reach the registry's list call within 2s");
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while registry.calls(types_registry_sdk::testing_platform::Call::List) < 1 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the startup load must reach the registry's list call within 2s");
     assert!(
         !serve_task.is_finished(),
         "the start waits on the registry load until the stop"

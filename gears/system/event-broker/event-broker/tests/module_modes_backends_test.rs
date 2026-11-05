@@ -20,6 +20,7 @@ use event_broker::EventBrokerModule;
 use event_broker::domain::specification::SpecificationManager;
 use event_broker::infra::specification::TypesRegistrySpecificationManager;
 use event_broker::test_support::module_boot::{migrated_gear_db, module_ctx, spawn_serve};
+use event_broker::test_support::type_registry::registry_holding;
 use event_broker::test_support::{standalone_event_broker_cluster, test_directory_client};
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
@@ -43,13 +44,9 @@ async fn only_the_ingest_role_maintains_the_specification_cache() {
         let db = migrated_gear_db(&matrix.gear_db()).await;
         let ctx = module_ctx(mode, Arc::clone(&hub), &json!({}), db).await;
         // After `module_ctx`, which registers an empty one of its own.
-        hub.register::<dyn types_registry_sdk::TypesRegistryClient>(Arc::new(
-            types_registry_sdk::testing::MockTypesRegistryClient::new().with_instances(vec![
-                types_registry_sdk::testing::make_test_instance(
-                    TOPIC_ID,
-                    json!({ "id": TOPIC_ID, "description": "a topic the roles test seeds" }),
-                ),
-            ]),
+        hub.register::<dyn types_registry_sdk::PlatformTypesRegistryApi>(registry_holding(
+            &[json!({ "id": TOPIC_ID, "description": "a topic the roles test seeds" })],
+            &[],
         ));
         let db = Arc::new(ctx.db_required().expect("the test ctx carries a database"));
 

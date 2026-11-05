@@ -124,6 +124,7 @@ fn registry_to_build(
 }
 
 #[toolkit::consumes(contract = authz_resolver_sdk::AuthZResolverApi, from = "authz-resolver")]
+#[toolkit::consumes(contract = types_registry_sdk::PlatformTypesRegistryApi, from = "types-registry")]
 #[toolkit::gear(
     name = "event-broker",
     deps = [cluster, types_registry],
@@ -148,9 +149,9 @@ pub struct EventBrokerModule {
     /// this itself) and read by `register_rest()`. The actual
     /// cache-table population (`infra::specification::bulk_load`, a free
     /// function - not a method on this trait, since it never touches the
-    /// object itself, only the `TypesRegistryClient`/`db` `init()` also has
-    /// in hand) happens later, from `serve()` - see that method's own doc
-    /// comment for why.
+    /// object itself, only the `PlatformTypesRegistryApi` client and `db`)
+    /// happens later, from `serve()` - see the comment at the start of
+    /// `start_workers` for why.
     spec_manager: OnceLock<Arc<dyn crate::domain::specification::SpecificationManager>>,
     /// The partition caches this instance serves from. Built in `init()` because
     /// two callers need the *same* one: `register_rest()` hands it to the
@@ -261,8 +262,8 @@ impl Gear for EventBrokerModule {
 
         // eb-single-process-implementation D1: the actual cache-table
         // populate (`infra::specification::bulk_load`) happens later, in
-        // `serve()` - see that method's own doc comment for why. The
-        // manager is usable immediately either way: `get_topic`/etc. query
+        // `serve()` - see the comment at the start of `start_workers` for
+        // why. The manager is usable immediately either way: `get_topic`/etc. query
         // the gear-database cache table directly on every call, so handing
         // services this not-yet-loaded manager now is safe as long as the
         // table is populated before any real request can reach them
@@ -573,10 +574,9 @@ impl EventBrokerModule {
         mode: DeploymentMode,
     ) -> anyhow::Result<()> {
         // Must happen before anything else, and only where the ingest role runs.
-        // `types-registry` commits `entities:`-seeded instances from its
-        // configuration-mode storage to queryable storage during the platform's
-        // `post_init`, which runs after every gear's `init()` but before
-        // `serve()`, so a load in `init()` would always see zero of them.
+        // The platform API may be a remote proxy, which the proxy-wiring phase
+        // registers only after every gear's `init()`, so the load runs here
+        // rather than in `init()`.
         //
         // Exactly one role writes this state and the others re-read it: a
         // delivery instance reads what ingest resolved out of the shared
@@ -710,7 +710,7 @@ impl EventBrokerModule {
             .client_hub
             .get()
             .ok_or_else(|| anyhow::anyhow!("init must run before serve()"))?
-            .get::<dyn types_registry_sdk::TypesRegistryClient>()?;
+            .get::<dyn types_registry_sdk::PlatformTypesRegistryApi>()?;
 
         let spec_manager = self
             .spec_manager

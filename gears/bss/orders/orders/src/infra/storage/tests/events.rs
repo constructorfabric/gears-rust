@@ -14,7 +14,7 @@ use crate::infra::events::payload::{
     LineRef, OrderCancelled, OrderHeld, OrderResumed, OrderSubmitted,
 };
 use crate::infra::events::test_support::{Root, root};
-use crate::infra::events::test_support::{encoded_max_events, max_events, registry_client};
+use crate::infra::events::test_support::{encoded_max_events, max_events, platform_registry};
 use crate::infra::events::{
     self as events, EventEnqueueError, EventKind, EventSink, OrderSummary, QUEUE, TOPIC, TxEvents,
 };
@@ -141,7 +141,7 @@ impl Env {
         let granted = Arc::new(AtomicBool::new(true));
         let pdp = grants(Arc::clone(&granted));
         let harness = EventBrokerHarness::builder()
-            .with_types_registry_client(registry_client(), &[(TOPIC, partitions)])
+            .with_types_registry_client(platform_registry(), &[(TOPIC, partitions)])
             .with_policy_enforcer(authz_resolver_sdk::PolicyEnforcer::new(
                 Arc::clone(&pdp) as Arc<dyn authz_resolver_sdk::AuthZResolverApi>
             ))

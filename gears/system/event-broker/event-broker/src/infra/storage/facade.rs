@@ -729,9 +729,9 @@ impl RoutingMarkers for Storage {
 mod tests {
     use chrono::{DateTime, Utc};
     use toolkit_db::outbox::{LeasedMessageHandler, MessageResult, OutboxMessage, Partitions};
-    use types_registry_sdk::testing::{MockTypesRegistryClient, make_test_instance};
 
     use super::*;
+    use crate::test_support::type_registry::registry_holding;
 
     const TEST_INSTANCE_ID: Uuid = Uuid::from_u128(0x5eed);
     use crate::domain::idempotency::ProducerChainCheck;
@@ -798,15 +798,13 @@ mod tests {
     /// read the outbox's own bookkeeping tables directly.
     async fn test_storage_with_db() -> (Storage, String) {
         let (db, dsn) = test_db().await;
-        let instance = make_test_instance(
-            TOPIC_ID,
-            serde_json::json!({
+        let client: Arc<dyn types_registry_sdk::PlatformTypesRegistryApi> = registry_holding(
+            &[serde_json::json!({
                 "id": TOPIC_ID,
                 "description": "a topic this test keeps cursors for",
-            }),
+            })],
+            &[],
         );
-        let client: Arc<dyn types_registry_sdk::TypesRegistryClient> =
-            Arc::new(MockTypesRegistryClient::new().with_instances(vec![instance]));
         crate::infra::specification::bulk_load(
             &client,
             &db,

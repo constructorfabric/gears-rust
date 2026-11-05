@@ -159,7 +159,6 @@ mod tests {
     use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData};
     use opentelemetry_sdk::metrics::{InMemoryMetricExporter, PeriodicReader, SdkMeterProvider};
     use toolkit_db::DBProvider;
-    use types_registry_sdk::testing::{MockTypesRegistryClient, make_test_instance};
     use uuid::Uuid;
 
     use event_broker_sdk::backend::Partition;
@@ -171,6 +170,7 @@ mod tests {
     use crate::infra::specification::TypesRegistrySpecificationManager;
     use crate::infra::storage::migrations::Migrator;
     use crate::test_support::SingleBackendResolver;
+    use crate::test_support::type_registry::registry_holding;
 
     const TOPIC_ID: &str =
         toolkit_gts::gts_id!("cf.core.events.topic.v1~example.eb.ingestoutbox.topic.v1");
@@ -301,15 +301,13 @@ mod tests {
         provisioned: bool,
     ) -> (IngestOutboxHandler, MemoryBackend, Recorder, String) {
         let (db, dsn) = test_db().await;
-        let instance = make_test_instance(
-            TOPIC_ID,
-            serde_json::json!({
+        let client: Arc<dyn types_registry_sdk::PlatformTypesRegistryApi> = registry_holding(
+            &[serde_json::json!({
                 "id": TOPIC_ID,
                 "description": "a topic this test drains the outbox into",
-            }),
+            })],
+            &[],
         );
-        let client: Arc<dyn types_registry_sdk::TypesRegistryClient> =
-            Arc::new(MockTypesRegistryClient::new().with_instances(vec![instance]));
         crate::infra::specification::bulk_load(
             &client,
             &db,

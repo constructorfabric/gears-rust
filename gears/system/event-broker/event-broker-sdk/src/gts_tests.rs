@@ -368,7 +368,7 @@ fn a_topic_missing_a_required_property_is_rejected() {
 /// admits any JSON value, which is wider than the base's `["object", "null"]`,
 /// and `types-registry` refuses the document with "Schema at `$.data` changes
 /// type incompatibly" - which stops the whole gear from booting, since the
-/// registry commits its configuration-seeded entities during `post_init`.
+/// registry admits its configuration-seeded entities at startup.
 ///
 /// That failure reached a running process once because nothing here covered
 /// this helper at all: every fixture and the mock build their event types

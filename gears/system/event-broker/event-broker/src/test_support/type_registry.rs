@@ -3,13 +3,21 @@
 //! Every entry becomes the document `types-registry` would actually hold - a
 //! topic as an instance of the topic base type, an event type as a derived type
 //! schema of the abstract event base type - and the harness loads them through
-//! the same path a booting process uses. Building the broker's own structs
-//! directly, as this used to, is what let a whole unit suite pass against a
-//! process that could not load a topic at all.
+//! the same path a booting process uses. Fixtures built as the broker's own
+//! structs would let a unit suite pass against a process that cannot load a
+//! topic at all.
 //!
 //! `StaticTypesRegistry::of(...)` takes a flat list; each entry's `id` alone
 //! says which kind it is, since there is exactly one base type per kind, and
 //! every id is validated as the GTS kind it claims to be.
+//!
+//! The documents are held by a `MockTypesRegistry` that also holds the
+//! broker's two base types, taken from the declarations `event-broker-sdk`
+//! links into this binary's GTS inventory, so every listed type schema is
+//! resolved the way `types-registry` resolves it. Nothing else from the
+//! inventory is held: a gear's own contract is never included. A test that
+//! needs it passes a registry holding it through
+//! `EventBrokerHarnessBuilder::with_types_registry_client`.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -17,8 +25,8 @@ use std::sync::Arc;
 use event_broker_sdk::gts::{EventV1, TopicV1};
 use gts::GtsTypeId;
 use serde_json::{Value as JsonValue, json};
-use toolkit_gts::{GtsInstanceId, GtsSchema};
-use types_registry_sdk::GtsTypeSchema;
+use toolkit_gts::{GTS_ID_URI_PREFIX, GtsInstanceId, GtsSchema};
+use types_registry_sdk::testing_platform::MockTypesRegistry;
 
 use crate::config::EventBrokerConfig;
 
@@ -31,43 +39,9 @@ const EVENT_BASE: &str = EventV1::TYPE_ID;
 const MEMORY_BACKEND: &str =
     toolkit_gts::gts_id!("cf.core.events.backend.v1~cf.core.backend.memory.v1~");
 
-/// A stand-in for the registered base event type.
-///
-/// Carries what resolution actually reads: the members a partition-key pointer
-/// may name, and the trait schema whose default reaches a type that declares no
-/// pointer of its own. The real base is emitted from `event-broker-sdk`'s
-/// declaration into the process-wide GTS inventory; pulling that inventory into
-/// a unit test would be testing the macro rather than the broker.
-#[must_use]
-pub fn event_base_schema() -> Arc<GtsTypeSchema> {
-    Arc::new(
-        GtsTypeSchema::try_new(
-            GtsTypeId::new(EVENT_BASE),
-            json!({
-                "type": "object",
-                "properties": {
-                    "id": { "type": "string" },
-                    "tenant_id": { "type": "string" },
-                    "source": { "type": "string" },
-                    "subject": { "type": "string" },
-                    "subject_type": { "type": "string" },
-                    "occurred_at": { "type": "string" },
-                    "data": { "type": ["object", "null"] },
-                },
-                "x-gts-traits-schema": {
-                    "properties": { "partition_key": { "default": "/tenant_id" } },
-                },
-            }),
-            None,
-            None,
-        )
-        .expect("the base event type schema is valid"),
-    )
-}
-
-/// A derived event-type schema over [`event_base_schema`], its body built by
-/// the same helper the mock and the production fixtures use, so what a test
-/// registers is the shape `types-registry` provisions.
+/// A derived event-type schema document, built by the same helper the
+/// production fixtures use, so what a test registers is the shape
+/// `types-registry` provisions.
 ///
 /// # Panics
 /// Panics if `type_id` is not a well-formed GTS type identifier.
@@ -77,42 +51,62 @@ pub fn derived_event_type(
     topic: &str,
     data_schema: JsonValue,
     allowed_subject_types: &[&str],
-) -> GtsTypeSchema {
-    schema_from_body(
+) -> JsonValue {
+    GtsTypeId::try_new(type_id)
+        .unwrap_or_else(|err| panic!("'{type_id}' is not a valid GTS type id: {err}"));
+    event_broker_sdk::gts::derived_event_type_schema(
         type_id,
-        event_broker_sdk::gts::derived_event_type_schema(
-            type_id,
-            topic,
-            data_schema,
-            allowed_subject_types,
-        ),
+        topic,
+        data_schema,
+        allowed_subject_types,
     )
 }
 
-/// A derived schema over [`event_base_schema`] from a body the caller has
-/// already shaped - which is how a fixture overrides a trait the standard
-/// builder fixes, such as pointing the partition key at a payload member.
+/// A registry holding the broker's two base types (`TOPIC_BASE` and
+/// `EVENT_BASE`, as `event-broker-sdk` declares them), the `topics` instance
+/// documents (keyed by their `id`) and the `event_types` schema documents
+/// (keyed by their `$id`). Nothing else from this binary's GTS inventory is
+/// held, so a gear's own contract is never included.
 ///
 /// # Panics
-/// Panics if `type_id` is not a well-formed GTS type identifier.
+///
+/// Panics if a base type is missing from the inventory or its schema is not
+/// valid JSON, if a topic document names no string `id`, or if an event-type
+/// document names no string `$id`.
 #[must_use]
-pub fn schema_from_body(type_id: &str, body: JsonValue) -> GtsTypeSchema {
-    GtsTypeSchema::try_new(
-        GtsTypeId::try_new(type_id)
-            .unwrap_or_else(|err| panic!("'{type_id}' is not a valid GTS type id: {err}")),
-        body,
-        None,
-        Some(event_base_schema()),
-    )
-    .expect("a derived event-type schema is valid")
+pub fn registry_holding(topics: &[JsonValue], event_types: &[JsonValue]) -> Arc<MockTypesRegistry> {
+    let registry = Arc::new(MockTypesRegistry::new());
+    for base in [TOPIC_BASE, EVENT_BASE] {
+        let entry = toolkit_gts::inventory::iter::<toolkit_gts::InventoryTypeSchema>
+            .into_iter()
+            .find(|entry| entry.type_id == base)
+            .unwrap_or_else(|| panic!("the GTS inventory holds no '{base}' type schema"));
+        let schema = serde_json::from_str((entry.schema_fn)().as_str())
+            .unwrap_or_else(|err| panic!("the '{base}' type schema is not valid JSON: {err}"));
+        registry.seed(base, schema);
+    }
+    for topic in topics {
+        let id = topic["id"].as_str().expect("a topic document names its id");
+        registry.seed(id, topic.clone());
+    }
+    for event_type in event_types {
+        let id = event_type["$id"]
+            .as_str()
+            .expect("an event-type document names its $id");
+        registry.seed(
+            id.strip_prefix(GTS_ID_URI_PREFIX).unwrap_or(id),
+            event_type.clone(),
+        );
+    }
+    registry
 }
 
 /// Declarative fixtures, applied by `EventBrokerHarnessBuilder::build()`.
 pub struct StaticTypesRegistry {
     /// Topic instance documents, exactly as an owning gear would register them.
     pub(super) topics: Vec<JsonValue>,
-    /// Derived event-type schemas, with the base as their resolved parent.
-    pub(super) event_types: Vec<GtsTypeSchema>,
+    /// Derived event-type schema documents.
+    pub(super) event_types: Vec<JsonValue>,
     /// The configuration the partition counts came from: a topic carries no
     /// count of its own, so a fixture that asks for four partitions is asking
     /// for a deployment configured that way.
@@ -176,7 +170,7 @@ impl StaticTypesRegistry {
                 }));
                 settings.insert(id.to_owned(), json!({ "partitions": partitions }));
             } else if id.starts_with(EVENT_BASE) {
-                let type_id = GtsTypeId::try_new(id).unwrap_or_else(|err| {
+                GtsTypeId::try_new(id).unwrap_or_else(|err| {
                     panic!(
                         "'{id}' is not a valid GTS type id: {err} - a concrete event type is a \
                          derived type schema, so its identifier ends in '~'"
@@ -228,8 +222,7 @@ impl StaticTypesRegistry {
                 if let Some(pointer) = entry.get("partition_key").and_then(JsonValue::as_str) {
                     body["x-gts-traits"]["partition_key"] = json!(pointer);
                 }
-                let _ = type_id;
-                event_types.push(schema_from_body(id, body));
+                event_types.push(body);
             } else {
                 panic!(
                     "'{id}' is neither a topic instance ('{TOPIC_BASE}...') nor an event type \

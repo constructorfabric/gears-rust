@@ -33,9 +33,6 @@ fn entities() -> Vec<Value> {
             "display_name": format!("Orders {}", p.action),
         })
     }));
-    // The event contract (§4.7): topic, abstract family base and eleven final types. The order
-    // subject type above (`ORDER`) is registered in the same batch, before them.
-    values.extend(crate::infra::events::schema::documents());
     values
 }
 
@@ -95,7 +92,9 @@ pub fn validate_catalog() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Register every Orders GTS schema and instance with the types registry.
+/// Register the Orders resource, error, reason and category types and the category and permission
+/// instances with the types registry; the event contract is not among them (it is a GTS inventory
+/// entry set, see `crate::infra::events::schema`).
 /// Fails unless each one is accepted exactly once.
 pub(crate) async fn register(
     registry: &dyn types_registry_sdk::TypesRegistryClient,

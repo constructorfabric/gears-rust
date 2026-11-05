@@ -238,7 +238,7 @@ async def test_412_sequence_violation_envelope(api):
                 "meta": {
                     "version": 1,
                     "producer_id": producer_id,
-                    "previous": 999,  # wrong — broker has last_sequence=1
+                    "previous": 999,  # wrong - broker has last_sequence=1
                     "sequence": 1000,
                 },
             },

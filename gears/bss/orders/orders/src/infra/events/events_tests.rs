@@ -11,6 +11,9 @@ use crate::domain::failure::FailureReason;
 use bss_orders_sdk::catalog::OrderState;
 use event_broker_sdk::TypedEvent;
 use serde_json::{Value, json};
+use toolkit_security::PlatformSecurityContext;
+use types_registry_sdk::testing_platform::MockTypesRegistry;
+use types_registry_sdk::{GtsIdPattern, ListEntitiesRequest, PlatformTypesRegistryApiExt};
 
 fn rooted<K: EventKind>(summary: OrderSummary, detail: K) -> OrderEvent<K> {
     OrderEvent::rooted(RootTenant(u(1)), summary, detail)
@@ -61,6 +64,82 @@ async fn the_real_registry_commits_and_resolves_the_event_contract() {
             .expect("derived from the family base");
         assert_eq!(parent.type_id.as_ref(), EVENT_BASE, "{id}");
     }
+}
+
+/// The contract reaches the platform registry API through the link-time inventory alone: the listed
+/// documents are exactly the ones `schema` builds, with the traits Event Broker reads
+/// (DESIGN §4.7).
+#[tokio::test]
+async fn the_platform_registry_lists_the_event_contract_from_the_inventory() {
+    let mock = MockTypesRegistry::new();
+    mock.seed_inventory();
+    let ctx = PlatformSecurityContext::outbound_marker();
+
+    let family = GtsIdPattern::try_new(&format!("{EVENT_BASE}*")).unwrap();
+    let schemas = mock
+        .list_type_schemas(&ctx, ListEntitiesRequest::matching(family))
+        .await
+        .unwrap();
+    let mut listed: Vec<&str> = schemas.iter().map(|s| s.type_id.as_ref()).collect();
+    listed.sort_unstable();
+    let mut expected = vec![EVENT_BASE];
+    expected.extend(EVENT_TYPE_IDS);
+    expected.sort_unstable();
+    assert_eq!(
+        listed, expected,
+        "the family base and the eleven final types"
+    );
+    for schema in &schemas {
+        let id = schema.type_id.as_ref();
+        if id == EVENT_BASE {
+            assert_eq!(
+                schema.effective_traits,
+                Some(json!({"allowed_subject_types": [], "partition_key": "/tenant_id"})),
+                "the abstract family base declares no publishable traits"
+            );
+            assert_eq!(schema.content, Some(schema::abstract_base()), "{id}");
+        } else {
+            let uri = format!("gts://{id}");
+            let final_types = schema::final_types();
+            let matches: Vec<&Value> = final_types
+                .iter()
+                .filter(|document| document["$id"] == uri.as_str())
+                .collect();
+            let [expected] = matches.as_slice() else {
+                panic!("exactly one final type for {id}, got {matches:#?}");
+            };
+            assert_eq!(schema.content.as_ref(), Some(*expected), "{id}");
+            assert_eq!(
+                schema.effective_traits,
+                Some(json!({
+                    "topic": TOPIC,
+                    "partition_key": PARTITION_KEY,
+                    "allowed_subject_types": [ORDER_SUBJECT_TYPE],
+                })),
+                "{id}"
+            );
+        }
+    }
+
+    let topics = mock
+        .list_instances(
+            &ctx,
+            ListEntitiesRequest::matching(GtsIdPattern::try_new(TOPIC).unwrap()),
+        )
+        .await
+        .unwrap();
+    let [topic] = topics.as_slice() else {
+        panic!("exactly the Orders topic, got {topics:#?}");
+    };
+    assert_eq!(topic.id.as_ref(), TOPIC);
+    assert_eq!(
+        topic.content,
+        Some(json!({
+            "id": TOPIC,
+            "description": "Orders internal lifecycle events: platform-root tenancy, one partition stream per order (D-95, D-200).",
+            "retention": null,
+        }))
+    );
 }
 
 /// The envelope mapping of §4.4: type, root tenant, source, canonical order-UUID subject.
