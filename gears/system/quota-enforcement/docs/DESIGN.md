@@ -1484,7 +1484,7 @@ renegotiating the corresponding invariant or NFR, and that renegotiation is out 
 | ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | Metrics emission    | The `QeMetrics` domain port, whose `OpenTelemetry` adapter records on a scoped `Meter` from the ToolKit meter provider (logs and spans use `tracing` macros); export pipeline (OTLP / Prometheus exporter) configured by the platform binary via `toolkit`'s `otel` feature.                                                     |
 | Cardinality         | Bounded label sets per `cpt-cf-quota-enforcement-constraint-bounded-cardinality`. IDs, projection types, caller attribution, and raw/unregistered metric input MUST NOT appear as metric labels. Canonical registered `metric` is permitted only on catalogue-declared instruments. |
-| Tracing             | OpenTelemetry; spans nested under `qe.gateway.handle_request` root.                                                                                                                                          |
+| Tracing             | OpenTelemetry; `quota_enforcement.*` spans nested under the platform's request span (`http_request` for REST).                                                                                               |
 | Operator dashboards | Out of DESIGN scope; maintained in the infrastructure repository.                                                                                                                                            |
 
 **Dependency Rules** (per project conventions):
@@ -2408,10 +2408,25 @@ declare them in the catalogue above and are populated only after registry/catalo
 Caller attribution is intentionally not a metric dimension: although typed, the registry does not bound the number of
 service projection types across deployments. It is available on sampled traces and structured diagnostics instead.
 
-**Tracing.** OpenTelemetry traces propagate from the `qe.gateway.handle_request` root. Stage spans:
-`subject_resolution`, `applicable_quotas_fetch`, `policy_lookup`, `engine_evaluate`, `invariant_check`,
-`storage.apply_debit_plan`, `notification.enqueue`. Attribute keys: `qe.tenant_id`, `qe.metric`, `qe.engine_id`,
-`qe.policy_id`, `qe.policy_version`, `qe.result`.
+**Tracing.** Spans follow the platform `tracing` conventions and nest under the request span the platform opens
+(`http_request` for REST); an in-process call has none above them. Each operation opens
+`quota_enforcement.<area>.<op>`, for example `quota_enforcement.operations.debit`, `quota_enforcement.quotas.list` or
+`quota_enforcement.policies.update`, with `tenant_id` and, where the request names them, `quota_id`, `metric`,
+`policy_id`, and `item_count` for batch and bulk envelopes. Under it, as siblings:
+
+- `quota_enforcement.admission`: the operation's whole admission phase, every PDP call it makes. A batch or bulk
+  envelope admits each item with its own PDP call, so this one span covers all of them and records `item_count`; its
+  duration is the aggregate admission time, not one call.
+- `quota_enforcement.engine.evaluate`, for an evaluating operation: the storage attempts and any preparation retries
+  (`preparations` records how many), with `quota_enforcement.engine.prepare` (`policy_id`, `version`) under it when a
+  policy version is compiled.
+
+Each storage plugin call that writes is `quota_enforcement.storage.<method>`, under the evaluation span when it
+evaluates. Plain reads open no span: a bulk update or deactivate reads each target under its own item's scope, and its
+replay checks are paged reads, so read spans would grow with the envelope. Their time stays inside the operation span.
+No span is opened per item or per engine invocation: the engine runs inside the storage transaction, once per batch
+item, and is measured by `engine_evaluation_seconds` instead. Identifiers are span attributes only, never metric labels; the
+`SecurityContext`, lease tokens and metadata are never recorded.
 
 **Structured logging.** Tracing crate. The system never logs metric values, metadata content, or subject identifiers
 verbatim at INFO level.

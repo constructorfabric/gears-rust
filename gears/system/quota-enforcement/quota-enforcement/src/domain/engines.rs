@@ -366,6 +366,11 @@ impl<'a> PreparedEvaluation<'a> {
     /// # Errors
     /// As [`Self::run`], and `BatchTimeout` when the armed timer runs out
     /// during a preparation.
+    #[tracing::instrument(
+        name = "quota_enforcement.engine.evaluate",
+        skip_all,
+        fields(preparations = tracing::field::Empty)
+    )]
     pub async fn run_within<T, Fut>(
         &self,
         timer: Option<&quota_enforcement_sdk::BatchTimer>,
@@ -390,6 +395,7 @@ impl<'a> PreparedEvaluation<'a> {
                 )));
             }
             prepared += 1;
+            tracing::Span::current().record("preparations", prepared);
             let preparation = self.prepare(&failure.0, failure.1);
             match timer.and_then(quota_enforcement_sdk::BatchTimer::armed_remaining) {
                 Some(left) => tokio::time::timeout(left, preparation)
@@ -413,6 +419,11 @@ impl<'a> PreparedEvaluation<'a> {
     /// compilation kept running, and the artifact it paid for would be thrown
     /// away. Here the job publishes first and releases afterwards, so an
     /// abandoned caller still leaves the artifact behind it.
+    #[tracing::instrument(
+        name = "quota_enforcement.engine.prepare",
+        skip_all,
+        fields(policy_id = %policy_id, version)
+    )]
     async fn prepare(&self, policy_id: &PolicyId, version: u32) -> Result<(), DomainError> {
         let key = (policy_id.clone(), version);
         let gate = GateGuard::enter(&self.artifacts, key).await;

@@ -784,6 +784,465 @@ async fn a_bulk_envelope_over_the_sql_plugin_replays_only_while_its_targets_stay
     fixture.stop().await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_debit_over_the_sql_plugin_traces_admission_and_evaluation_under_the_operation() {
+    let mut documents = llm_gateway_documents();
+    documents.extend(metric_base_documents());
+    let hub = hub_with_registry(in_process_registry(documents));
+    register_pdp(
+        &hub,
+        Arc::new(PermitTenantsPdp::new(vec![tenant().as_uuid()])),
+    );
+    let fixture = wire_cluster(&hub);
+    StoragePluginGear::default()
+        .init(&sql_plugin_ctx(hub.clone()).await)
+        .await
+        .expect("plugin init");
+    let gear = Arc::new(QuotaEnforcementGear::default());
+    gear.init(&make_ctx(hub.clone())).await.expect("init");
+    let (tx, rx) = oneshot::channel();
+    let cancel = CancellationToken::new();
+    let handle = tokio::spawn(
+        gear.clone()
+            .serve(cancel.clone(), ReadySignal::from_sender(tx)),
+    );
+    rx.await.expect("ready");
+
+    let manager = hub.get::<dyn QuotaManagerApi>().expect("manager client");
+    manager
+        .create_quota(
+            &security_ctx(),
+            quota_enforcement_sdk::QuotaSpec {
+                tenant_id: tenant(),
+                subject: SubjectRef {
+                    projection_type: gts::GtsTypeId::new(LLM_USER_PROJECTION),
+                    subject_id: "u-1".to_owned(),
+                },
+                metric: quota_enforcement_sdk::MetricId::parse(crate::test_support::METRIC_TOKENS)
+                    .expect("metric"),
+                quota_type: quota_enforcement_sdk::QuotaType::Consumption,
+                period: Some(quota_enforcement_sdk::PeriodType::Month),
+                enforcement_mode: quota_enforcement_sdk::EnforcementMode::Hard,
+                cap: Some(100),
+                notification_thresholds: Vec::new(),
+                validity_window: None,
+                fail_open_hint: false,
+                metadata: json!({ "regions": ["eu"], "weight": 5 })
+                    .as_object()
+                    .cloned()
+                    .expect("object"),
+                source: quota_enforcement_sdk::QuotaSource::Operator,
+            },
+        )
+        .await
+        .expect("quota over the SQL plugin");
+
+    let capture = crate::test_support::SpanCapture::default();
+    let guard = capture.install();
+    let decision = hub
+        .get::<dyn quota_enforcement_sdk::QuotaEnforcementApi>()
+        .expect("consumer client")
+        .debit(
+            &security_ctx(),
+            quota_enforcement_sdk::DebitRequest {
+                attribution: quota_enforcement_sdk::EvaluationAttribution {
+                    tenant_id: tenant(),
+                    metric: crate::test_support::METRIC_TOKENS.to_owned(),
+                    subjects: vec![quota_enforcement_sdk::SubjectClaim {
+                        kind: quota_enforcement_sdk::SCOPE_USER.to_owned(),
+                        id: "u-1".to_owned(),
+                    }],
+                    metadata: json!({ "region": "eu-west-1" }).as_object().cloned(),
+                    resource: None,
+                },
+                amount: 1,
+                idempotency_key: "traced".to_owned(),
+            },
+        )
+        .await
+        .expect("debit");
+    drop(guard);
+    assert_eq!(
+        decision.result,
+        quota_enforcement_sdk::DecisionResult::Allowed
+    );
+
+    // PDP and evaluation are siblings under the operation; storage runs inside evaluation.
+    let operation = Some("quota_enforcement.operations.debit".to_owned());
+    assert_eq!(
+        capture.parent_of("quota_enforcement.admission"),
+        operation,
+        "{:?}",
+        capture.spans()
+    );
+    assert_eq!(
+        capture.parent_of("quota_enforcement.engine.evaluate"),
+        operation,
+        "{:?}",
+        capture.spans()
+    );
+    assert_eq!(
+        capture.parent_of("quota_enforcement.storage.apply_debit_plan"),
+        Some("quota_enforcement.engine.evaluate".to_owned()),
+        "{:?}",
+        capture.spans()
+    );
+
+    cancel.cancel();
+    handle
+        .await
+        .expect("serve task joins")
+        .expect("serve returns Ok on shutdown");
+    fixture.stop().await;
+}
+
+/// The spans of every fresh and replayed bulk step over the SQL plugin for `count` items.
+async fn bulk_step_spans(
+    client: &Arc<dyn QuotaManagerApi>,
+    capture: &crate::test_support::SpanCapture,
+    count: usize,
+) -> Vec<(&'static str, Vec<String>)> {
+    let spec = |subject: String| quota_enforcement_sdk::QuotaSpec {
+        tenant_id: tenant(),
+        subject: SubjectRef {
+            projection_type: gts::GtsTypeId::new(LLM_USER_PROJECTION),
+            subject_id: subject,
+        },
+        metric: quota_enforcement_sdk::MetricId::parse(crate::test_support::METRIC_TOKENS)
+            .expect("metric"),
+        quota_type: quota_enforcement_sdk::QuotaType::Consumption,
+        period: Some(quota_enforcement_sdk::PeriodType::Month),
+        enforcement_mode: quota_enforcement_sdk::EnforcementMode::Hard,
+        cap: Some(100),
+        notification_thresholds: Vec::new(),
+        validity_window: None,
+        fail_open_hint: false,
+        metadata: json!({ "regions": ["eu"], "weight": 5 })
+            .as_object()
+            .cloned()
+            .expect("object"),
+        source: quota_enforcement_sdk::QuotaSource::Operator,
+    };
+    let create = quota_enforcement_sdk::BulkCreateQuotasRequest {
+        tenant_id: tenant(),
+        idempotency_key: format!("create-{count}"),
+        items: (0..count)
+            .map(|i| quota_enforcement_sdk::BulkCreateItem {
+                idempotency_key: None,
+                spec: spec(format!("n{count}-u{i}")),
+            })
+            .collect(),
+    };
+    let mut steps = Vec::new();
+    let mut step = |name: &'static str| {
+        let mut names = capture.names();
+        names.sort();
+        steps.push((name, names));
+        capture.clear();
+    };
+    capture.clear();
+    let created = client
+        .bulk_create_quotas(&security_ctx(), create.clone())
+        .await
+        .expect("bulk create");
+    step("create");
+    client
+        .bulk_create_quotas(&security_ctx(), create)
+        .await
+        .expect("bulk create replay");
+    step("create replay");
+    let update = quota_enforcement_sdk::BulkUpdateQuotasRequest {
+        tenant_id: tenant(),
+        idempotency_key: format!("update-{count}"),
+        items: created
+            .items
+            .iter()
+            .map(|item| quota_enforcement_sdk::BulkUpdateItem {
+                idempotency_key: None,
+                quota_id: item.quota_id,
+                patch: quota_enforcement_sdk::QuotaUpdate {
+                    cap: Some(quota_enforcement_sdk::CapPatch::Bounded(200)),
+                    ..quota_enforcement_sdk::QuotaUpdate::default()
+                },
+            })
+            .collect(),
+    };
+    client
+        .bulk_update_quotas(&security_ctx(), update.clone())
+        .await
+        .expect("bulk update");
+    step("update");
+    client
+        .bulk_update_quotas(&security_ctx(), update)
+        .await
+        .expect("bulk update replay");
+    step("update replay");
+    let deactivate = quota_enforcement_sdk::BulkDeactivateQuotasRequest {
+        tenant_id: tenant(),
+        idempotency_key: format!("deactivate-{count}"),
+        items: created
+            .items
+            .iter()
+            .map(|item| quota_enforcement_sdk::BulkDeactivateItem {
+                idempotency_key: None,
+                quota_id: item.quota_id,
+            })
+            .collect(),
+    };
+    client
+        .bulk_deactivate_quotas(&security_ctx(), deactivate.clone())
+        .await
+        .expect("bulk deactivate");
+    step("deactivate");
+    client
+        .bulk_deactivate_quotas(&security_ctx(), deactivate)
+        .await
+        .expect("bulk deactivate replay");
+    step("deactivate replay");
+    steps
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bulk_envelopes_over_the_sql_plugin_open_the_same_spans_for_one_item_and_for_ten() {
+    let mut documents = llm_gateway_documents();
+    documents.extend(metric_base_documents());
+    let hub = hub_with_registry(in_process_registry(documents));
+    register_pdp(
+        &hub,
+        Arc::new(PermitTenantsPdp::new(vec![tenant().as_uuid()])),
+    );
+    let fixture = wire_cluster(&hub);
+    StoragePluginGear::default()
+        .init(&sql_plugin_ctx(hub.clone()).await)
+        .await
+        .expect("plugin init");
+    let gear = Arc::new(QuotaEnforcementGear::default());
+    gear.init(&make_ctx(hub.clone())).await.expect("init");
+    let (tx, rx) = oneshot::channel();
+    let cancel = CancellationToken::new();
+    let handle = tokio::spawn(
+        gear.clone()
+            .serve(cancel.clone(), ReadySignal::from_sender(tx)),
+    );
+    rx.await.expect("ready");
+    let client = hub.get::<dyn QuotaManagerApi>().expect("manager client");
+
+    let capture = crate::test_support::SpanCapture::default();
+    let guard = capture.install();
+    let one = bulk_step_spans(&client, &capture, 1).await;
+    let ten = bulk_step_spans(&client, &capture, 10).await;
+    drop(guard);
+    assert_eq!(one, ten);
+    // The write transaction of each fresh envelope is still traced.
+    for (step, storage) in [
+        ("create", "quota_enforcement.storage.bulk_create_quotas"),
+        ("update", "quota_enforcement.storage.bulk_update_quotas"),
+        (
+            "deactivate",
+            "quota_enforcement.storage.bulk_deactivate_quotas",
+        ),
+    ] {
+        let (_, names) = one.iter().find(|(name, _)| *name == step).expect("step");
+        assert!(
+            names.iter().any(|name| name == storage),
+            "{step}: {names:?}"
+        );
+    }
+
+    cancel.cancel();
+    handle
+        .await
+        .expect("serve task joins")
+        .expect("serve returns Ok on shutdown");
+    fixture.stop().await;
+}
+
+/// Median per-call time of `run` over `ROUNDS` interleaved rounds, without and with
+/// a JSON formatter recording span closes to `io::sink`.
+async fn plain_and_formatted<F, Fut>(label: &str, run: F) -> (u128, u128)
+where
+    F: Fn(String) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    const CALLS: usize = 1_000;
+    const ROUNDS: usize = 5;
+    const MEDIAN: usize = 2;
+    for i in 0..200 {
+        run(format!("{label}-warm-{i}")).await;
+    }
+    let mut plain = Vec::with_capacity(ROUNDS);
+    let mut formatted = Vec::with_capacity(ROUNDS);
+    for round in 0..ROUNDS {
+        for traced in [false, true] {
+            let _guard = traced.then(|| {
+                tracing::subscriber::set_default(
+                    tracing_subscriber::fmt()
+                        .json()
+                        .with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE)
+                        .with_writer(std::io::sink)
+                        .finish(),
+                )
+            });
+            let started = std::time::Instant::now();
+            for i in 0..CALLS {
+                run(format!("{label}-r{round}-{traced}-{i}")).await;
+            }
+            let per_call = started.elapsed() / u32::try_from(CALLS).expect("small");
+            if traced {
+                formatted.push(per_call);
+            } else {
+                plain.push(per_call);
+            }
+        }
+    }
+    plain.sort();
+    formatted.sort();
+    println!(
+        "{label} over the SQL plugin, median of {ROUNDS} rounds of {CALLS}: recording off {} µs, json-formatted spans {} µs",
+        plain[MEDIAN].as_micros(),
+        formatted[MEDIAN].as_micros()
+    );
+    (plain[MEDIAN].as_micros(), formatted[MEDIAN].as_micros())
+}
+
+/// Local tracing overhead of a debit and of a lease acquire plus commit through the
+/// whole gear, the SQL plugin and in-memory `SQLite`; not a production database
+/// figure. Run on demand:
+/// `cargo nextest run --release -p cf-gears-quota-enforcement --run-ignored only --no-capture -E 'test(span_overhead_over_the_sql_plugin)'`
+#[ignore = "timing harness, run on demand"]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn span_overhead_over_the_sql_plugin() {
+    let mut documents = llm_gateway_documents();
+    documents.extend(metric_base_documents());
+    let hub = hub_with_registry(in_process_registry(documents));
+    register_pdp(
+        &hub,
+        Arc::new(PermitTenantsPdp::new(vec![tenant().as_uuid()])),
+    );
+    let fixture = wire_cluster(&hub);
+    StoragePluginGear::default()
+        .init(&sql_plugin_ctx(hub.clone()).await)
+        .await
+        .expect("plugin init");
+    let gear = Arc::new(QuotaEnforcementGear::default());
+    gear.init(&make_ctx(hub.clone())).await.expect("init");
+    let (tx, rx) = oneshot::channel();
+    let cancel = CancellationToken::new();
+    let handle = tokio::spawn(
+        gear.clone()
+            .serve(cancel.clone(), ReadySignal::from_sender(tx)),
+    );
+    rx.await.expect("ready");
+    hub.get::<dyn QuotaManagerApi>()
+        .expect("manager client")
+        .create_quota(
+            &security_ctx(),
+            quota_enforcement_sdk::QuotaSpec {
+                tenant_id: tenant(),
+                subject: SubjectRef {
+                    projection_type: gts::GtsTypeId::new(LLM_USER_PROJECTION),
+                    subject_id: "u-1".to_owned(),
+                },
+                metric: quota_enforcement_sdk::MetricId::parse(crate::test_support::METRIC_TOKENS)
+                    .expect("metric"),
+                quota_type: quota_enforcement_sdk::QuotaType::Consumption,
+                period: Some(quota_enforcement_sdk::PeriodType::Month),
+                enforcement_mode: quota_enforcement_sdk::EnforcementMode::Hard,
+                cap: None,
+                notification_thresholds: Vec::new(),
+                validity_window: None,
+                fail_open_hint: false,
+                metadata: json!({ "regions": ["eu"], "weight": 5 })
+                    .as_object()
+                    .cloned()
+                    .expect("object"),
+                source: quota_enforcement_sdk::QuotaSource::Operator,
+            },
+        )
+        .await
+        .expect("quota");
+    let client = hub
+        .get::<dyn quota_enforcement_sdk::QuotaEnforcementApi>()
+        .expect("consumer client");
+    let attribution = || quota_enforcement_sdk::EvaluationAttribution {
+        tenant_id: tenant(),
+        metric: crate::test_support::METRIC_TOKENS.to_owned(),
+        subjects: vec![quota_enforcement_sdk::SubjectClaim {
+            kind: quota_enforcement_sdk::SCOPE_USER.to_owned(),
+            id: "u-1".to_owned(),
+        }],
+        metadata: json!({ "region": "eu-west-1" }).as_object().cloned(),
+        resource: None,
+    };
+
+    plain_and_formatted("debit", |key| {
+        let client = Arc::clone(&client);
+        async move {
+            let decision = client
+                .debit(
+                    &security_ctx(),
+                    quota_enforcement_sdk::DebitRequest {
+                        attribution: attribution(),
+                        amount: 1,
+                        idempotency_key: key,
+                    },
+                )
+                .await
+                .expect("debit");
+            assert_eq!(
+                decision.result,
+                quota_enforcement_sdk::DecisionResult::Allowed
+            );
+        }
+    })
+    .await;
+    plain_and_formatted("lease acquire + commit", |key| {
+        let client = Arc::clone(&client);
+        async move {
+            let acquired = client
+                .acquire_lease(
+                    &security_ctx(),
+                    quota_enforcement_sdk::AcquireLeaseRequest {
+                        attribution: attribution(),
+                        amount: 1,
+                        ttl_secs: Some(60),
+                        idempotency_key: format!("{key}-acquire"),
+                    },
+                )
+                .await
+                .expect("acquire");
+            let quota_enforcement_sdk::AcquireLeaseOutcome::Acquired { token, .. } = acquired
+            else {
+                panic!("lease denied: {acquired:?}");
+            };
+            let decision = client
+                .commit_lease(
+                    &security_ctx(),
+                    quota_enforcement_sdk::CommitLeaseRequest {
+                        tenant_id: tenant(),
+                        token,
+                        actual_amount: None,
+                        idempotency_key: format!("{key}-commit"),
+                    },
+                )
+                .await
+                .expect("commit");
+            assert_eq!(
+                decision.result,
+                quota_enforcement_sdk::DecisionResult::Allowed
+            );
+        }
+    })
+    .await;
+
+    cancel.cancel();
+    handle
+        .await
+        .expect("serve task joins")
+        .expect("serve returns Ok on shutdown");
+    fixture.stop().await;
+}
+
 /// Every method of the three contracts, as its internal REST path.
 const INTERNAL_ROUTES: [&str; 22] = [
     "/quotas/create",

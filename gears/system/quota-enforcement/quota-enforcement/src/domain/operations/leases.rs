@@ -12,8 +12,10 @@
 //! carries a token the cache's record cannot hold, and a settlement's scope is
 //! only known inside the transaction. Replays are answered by storage.
 
+use crate::domain::admission::admission_span;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tracing::Instrument as _;
 
 use quota_enforcement_sdk::{
     AcquireLeaseOutcome, AcquireLeaseRequest, CommitLeaseRequest, Decision, EvaluatedLease,
@@ -90,6 +92,7 @@ impl Operations<'_> {
     /// quota-gated; the admission error; `LeaseInflightLimitExceeded` at the
     /// active-lease cap; `LeaseContentionTimeout` when the contention budget
     /// runs out; the storage error of a failed evaluation or hold.
+    #[tracing::instrument(name = "quota_enforcement.operations.acquire_lease", skip_all, fields(tenant_id = %request.attribution.tenant_id, metric = %request.attribution.metric))]
     pub async fn acquire_lease(
         &self,
         ctx: &toolkit_security::SecurityContext,
@@ -132,6 +135,7 @@ impl Operations<'_> {
                 actions::RESERVE,
                 request.attribution,
             )
+            .instrument(admission_span(1))
             .await?;
         // @cpt-end:cpt-cf-quota-enforcement-flow-lease-acquire:p1:inst-lac-request
         // @cpt-begin:cpt-cf-quota-enforcement-flow-lease-acquire:p1:inst-lac-pipeline
@@ -225,6 +229,7 @@ impl Operations<'_> {
     /// `LeaseNotActive` for an expired or resolved lease;
     /// `OverCommitNotAuthorized` above the reserved amount;
     /// `LeaseContentionTimeout` when the contention budget runs out.
+    #[tracing::instrument(name = "quota_enforcement.operations.commit_lease", skip_all, fields(tenant_id = %request.tenant_id))]
     pub async fn commit_lease(
         &self,
         ctx: &toolkit_security::SecurityContext,
@@ -258,6 +263,7 @@ impl Operations<'_> {
                 actions::COMMIT,
                 AdmissionTarget::resource(request.tenant_id, request.token.as_uuid()),
             )
+            .instrument(admission_span(1))
             .await?;
         // @cpt-end:cpt-cf-quota-enforcement-flow-lease-commit:p1:inst-lcm-request
         // Storage completes the scope from the lease's acquisition subject key.
@@ -290,6 +296,7 @@ impl Operations<'_> {
     /// for a token the authorized tenant does not hold; `LeaseNotActive` for an
     /// expired or resolved lease; `LeaseContentionTimeout` when the contention
     /// budget runs out.
+    #[tracing::instrument(name = "quota_enforcement.operations.release_lease", skip_all, fields(tenant_id = %request.tenant_id))]
     pub async fn release_lease(
         &self,
         ctx: &toolkit_security::SecurityContext,
@@ -321,6 +328,7 @@ impl Operations<'_> {
                 actions::RELEASE,
                 AdmissionTarget::resource(request.tenant_id, request.token.as_uuid()),
             )
+            .instrument(admission_span(1))
             .await?;
         // @cpt-end:cpt-cf-quota-enforcement-flow-lease-release:p1:inst-lrl-request
         let partial = PartialIdempotencyWrite {

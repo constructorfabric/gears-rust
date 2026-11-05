@@ -12,9 +12,11 @@
 //! `operation = batch_debit` label. Denials and engine instruments are
 //! recorded as on every other path.
 
+use crate::domain::admission::admission_span;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
+use tracing::Instrument as _;
 
 use quota_enforcement_sdk::{
     BatchDebitItem, BatchDebitRequest, BatchDecision, BatchEntry, BatchMode, BatchRecord,
@@ -73,6 +75,7 @@ impl Operations<'_> {
     /// mixed tenants, or more items than allowed; the admission error of any
     /// item; `MetricNotQuotaGated`; `NotYetImplemented` for `independent`
     /// mode; `BatchTimeout`; the storage error of a failed evaluation.
+    #[tracing::instrument(name = "quota_enforcement.operations.batch_debit", skip_all, fields(item_count = request.items.len()))]
     pub async fn batch_debit(
         &self,
         ctx: &toolkit_security::SecurityContext,
@@ -100,7 +103,10 @@ impl Operations<'_> {
             mode: request.mode,
             items: &request.items,
         })?;
-        let admitted = self.admit_items(ctx, &request).await?;
+        let admitted = self
+            .admit_items(ctx, &request)
+            .instrument(admission_span(request.items.len()))
+            .await?;
         // @cpt-end:cpt-cf-quota-enforcement-flow-batch-debit:p1:inst-bde-request
         // @cpt-begin:cpt-cf-quota-enforcement-flow-batch-debit:p1:inst-bde-resolve
         let scope = envelope_scope(tenant, &admitted, request.idempotency_key.clone());

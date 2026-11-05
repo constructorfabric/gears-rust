@@ -1751,3 +1751,82 @@ pub async fn bound_service_over(
         .expect("bind");
     service
 }
+
+/// One opened span: its name, its parent's name, and its `item_count` field.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CapturedSpan {
+    pub name: String,
+    pub parent: Option<String>,
+    pub item_count: Option<u64>,
+}
+
+/// Records every `quota_enforcement.*` span as it opens, for the span tests.
+#[derive(Clone, Default)]
+pub struct SpanCapture(Arc<parking_lot::Mutex<Vec<CapturedSpan>>>);
+
+impl SpanCapture {
+    /// Capture spans opened on this thread until the guard drops.
+    pub fn install(&self) -> tracing::subscriber::DefaultGuard {
+        use tracing_subscriber::layer::SubscriberExt as _;
+        tracing::subscriber::set_default(tracing_subscriber::registry().with(self.clone()))
+    }
+
+    pub fn spans(&self) -> Vec<CapturedSpan> {
+        self.0.lock().clone()
+    }
+
+    pub fn names(&self) -> Vec<String> {
+        self.spans().into_iter().map(|s| s.name).collect()
+    }
+
+    pub fn parent_of(&self, name: &str) -> Option<String> {
+        self.spans()
+            .into_iter()
+            .find(|s| s.name == name)
+            .and_then(|s| s.parent)
+    }
+
+    pub fn clear(&self) {
+        self.0.lock().clear();
+    }
+}
+
+struct ItemCount(Option<u64>);
+
+impl tracing::field::Visit for ItemCount {
+    fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+        if field.name() == "item_count" {
+            self.0 = Some(value);
+        }
+    }
+
+    fn record_debug(&mut self, _: &tracing::field::Field, _: &dyn std::fmt::Debug) {}
+}
+
+impl<S> tracing_subscriber::Layer<S> for SpanCapture
+where
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+{
+    fn on_new_span(
+        &self,
+        attrs: &tracing::span::Attributes<'_>,
+        id: &tracing::span::Id,
+        ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        let name = attrs.metadata().name();
+        if !name.starts_with("quota_enforcement.") {
+            return;
+        }
+        let mut count = ItemCount(None);
+        attrs.record(&mut count);
+        let parent = ctx
+            .span(id)
+            .and_then(|span| span.parent())
+            .map(|parent| parent.name().to_owned());
+        self.0.lock().push(CapturedSpan {
+            name: name.to_owned(),
+            parent,
+            item_count: count.0,
+        });
+    }
+}

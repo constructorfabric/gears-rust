@@ -9,8 +9,10 @@
 //! A denial is a successful call: it carries a verdict, and the REST surface
 //! renders it as HTTP 200. Only a failure to decide is an error.
 
+use crate::domain::admission::admission_span;
 use std::sync::Arc;
 use std::time::Instant;
+use tracing::Instrument as _;
 
 use quota_enforcement_sdk::{
     AppliedMutation, CreditRequest, DebitRequest, Decision, DecisionPreview, DecisionResult,
@@ -134,6 +136,7 @@ impl Operations<'_> {
     // @cpt-flow:cpt-cf-quota-enforcement-flow-debit:p1
     // @cpt-algo:cpt-cf-quota-enforcement-algo-evaluation-pipeline:p1
     // @cpt-algo:cpt-cf-quota-enforcement-algo-idempotency-replay:p1
+    #[tracing::instrument(name = "quota_enforcement.operations.debit", skip_all, fields(tenant_id = %request.attribution.tenant_id, metric = %request.attribution.metric))]
     pub async fn debit(
         &self,
         ctx: &toolkit_security::SecurityContext,
@@ -177,6 +180,7 @@ impl Operations<'_> {
                 actions::DEBIT,
                 request.attribution,
             )
+            .instrument(admission_span(1))
             .await?;
         // @cpt-end:cpt-cf-quota-enforcement-algo-evaluation-pipeline:p1:inst-pipe-resolve
         // @cpt-begin:cpt-cf-quota-enforcement-algo-evaluation-pipeline:p1:inst-pipe-gated-if
@@ -282,6 +286,7 @@ impl Operations<'_> {
     /// `InvalidArgument` for a non-positive amount or a missing key; the
     /// admission error; the storage error of the mutation.
     // @cpt-flow:cpt-cf-quota-enforcement-flow-credit:p1
+    #[tracing::instrument(name = "quota_enforcement.operations.credit", skip_all, fields(tenant_id = %request.tenant_id, quota_id = %request.quota_id))]
     pub async fn credit(
         &self,
         ctx: &toolkit_security::SecurityContext,
@@ -319,6 +324,7 @@ impl Operations<'_> {
                 actions::CREDIT,
                 AdmissionTarget::tenant(request.tenant_id),
             )
+            .instrument(admission_span(1))
             .await?;
         // Storage completes the idempotency scope from the locked Quota row.
         let partial = PartialIdempotencyWrite {
@@ -350,6 +356,7 @@ impl Operations<'_> {
     /// when no committed debit answers the request under the recomputed scope
     /// and authorized attribution.
     // @cpt-flow:cpt-cf-quota-enforcement-flow-rollback:p1
+    #[tracing::instrument(name = "quota_enforcement.operations.rollback", skip_all, fields(tenant_id = %request.attribution.tenant_id, metric = %request.attribution.metric))]
     pub async fn rollback(
         &self,
         ctx: &toolkit_security::SecurityContext,
@@ -385,6 +392,7 @@ impl Operations<'_> {
                 actions::ROLLBACK,
                 request.attribution,
             )
+            .instrument(admission_span(1))
             .await?;
         let scope = Self::scope_of(&admitted, OperationType::Rollback, request.idempotency_key);
         // @cpt-begin:cpt-cf-quota-enforcement-flow-rollback:p1:inst-rlb-idem
@@ -431,6 +439,7 @@ impl Operations<'_> {
     ///
     /// The errors of [`Self::debit`], minus the idempotency ones.
     // @cpt-flow:cpt-cf-quota-enforcement-flow-evaluate-preview:p1
+    #[tracing::instrument(name = "quota_enforcement.operations.preview", skip_all, fields(tenant_id = %request.attribution.tenant_id, metric = %request.attribution.metric))]
     pub async fn preview(
         &self,
         ctx: &toolkit_security::SecurityContext,
@@ -458,6 +467,7 @@ impl Operations<'_> {
                 actions::PREVIEW,
                 request.attribution,
             )
+            .instrument(admission_span(1))
             .await?;
         // @cpt-end:cpt-cf-quota-enforcement-flow-evaluate-preview:p1:inst-prv-request
         self.classifications.ensure_quota_gated(&admitted.metric)?;

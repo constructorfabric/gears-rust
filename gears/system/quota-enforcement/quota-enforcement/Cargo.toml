@@ -84,6 +84,8 @@ cluster = { package = "cf-gears-cluster", path = "../../cluster/cluster" }
 standalone-cluster-plugin = { package = "cf-gears-standalone-cluster-plugin", path = "../../cluster/plugins/standalone-cluster-plugin" }
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
 tokio = { workspace = true, features = ["rt", "macros", "time", "test-util"] }
+# A recording subscriber: the span tests and the traced bench variants.
+tracing-subscriber = { workspace = true }
 # Router round trips in the REST tests.
 tower = { workspace = true, features = ["util"] }
 # The published SQL storage plugin over SQLite, for the end-to-end delivery test.
