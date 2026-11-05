@@ -99,6 +99,7 @@ gears:
         description: "CF/Gears Example Server API Documentation"
       defaults:
         body_limit_bytes: 64000000
+        request_timeout: 30s
 
       # Authentication: disabled for local development (uses default root SecurityContext).
       # Set to false to enable bearer-token auth via authn-resolver pipeline below.
