@@ -150,7 +150,19 @@ jobs:
 
       - name: cargo test (no macros)
         shell: bash
-        run: tools/scripts/with_rust_annotations.sh make test-no-macros
+        run: |
+          # TEMP #5710 repro: memory samples go into this step's live log, so they
+          # survive a runner that dies mid-step (the if: failure() steps do not).
+          if [ "$RUNNER_OS" = macOS ]; then
+            echo "MEMINFO memsize=$(sysctl -n hw.memsize) ncpu=$(sysctl -n hw.ncpu)"
+            ( while :; do
+                echo "MEMSAMPLE $(date -u +%H:%M:%S) $(sysctl -n vm.swapusage) | $(memory_pressure 2>/dev/null | grep -i 'free percentage') | $(vm_stat | awk '/Swapouts|Pageouts/ {printf "%s%s ", $1, $2}')"
+                sleep 30
+              done ) &
+            mp=$!
+            trap 'kill $mp 2>/dev/null' EXIT
+          fi
+          tools/scripts/with_rust_annotations.sh make test-no-macros
 
       # Runs on failure too: a failed night is exactly when these numbers matter.
       - name: Disk usage report (macOS)
