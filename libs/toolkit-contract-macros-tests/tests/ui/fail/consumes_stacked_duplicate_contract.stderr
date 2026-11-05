@@ -1,0 +1,5 @@
+error: contract is consumed by another #[toolkit::consumes] on this struct; a gear gets one client per contract
+ --> tests/ui/fail/consumes_stacked_duplicate_contract.rs:9:23
+  |
+9 | #[consumes(contract = FooApi, from = "bar")]
+  |                       ^^^^^^

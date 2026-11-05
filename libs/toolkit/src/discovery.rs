@@ -182,12 +182,15 @@ pub enum WireOutcome {
 ///      trait via [`ClientHub::register_remote_proxy`] (using the supplied
 ///      [`EndpointResolver`]) and return [`WireOutcome::Remote`].
 ///
-/// Step 1 must use `try_get_local`, not `try_get`. The hub is keyed by type, so
-/// when two consumers in one process depend on the same contract the second to
-/// wire would find the first one's proxy under `try_get`, report `Local`, and
-/// have its dependency marked readiness-resolved — flipping `/readyz` to 200
-/// while the provider is still absent. `register_remote_proxy` is what makes
-/// that distinction visible to the hub.
+/// The runtime passes the owner gear's view ([`ClientHub::for_gear`]) when
+/// `owner_gear` is a gear in this process, so each consumer gets its own proxy
+/// built from its own `consumer_wiring.<dep>` settings; otherwise it passes the
+/// process-wide hub.
+///
+/// Step 1 must use `try_get_local`, not `try_get`: `try_get` also returns a
+/// process-wide proxy, and reporting that as `Local` would mark the dependency
+/// readiness-resolved — flipping `/readyz` to 200 while the provider is still
+/// absent.
 pub struct ConsumerRegistration {
     /// Gear that declares the dependency (diagnostics).
     pub owner_gear: &'static str,
@@ -394,11 +397,6 @@ mod tests {
     /// Mirrors the body `#[toolkit::consumes]` generates, so the wiring
     /// contract is exercised without going through `inventory` (which is
     /// link-time global and cannot hold two registrations built by a test).
-    #[allow(
-        clippy::unnecessary_wraps,
-        reason = "mirrors the fallible signature of ConsumerRegistration::wire so the test \
-                  exercises the same shape the macro emits"
-    )]
     fn generated_wire_body<C>(hub: &ClientHub, proxy: Arc<C>) -> anyhow::Result<WireOutcome>
     where
         C: ?Sized + Send + Sync + 'static,
@@ -407,6 +405,9 @@ mod tests {
             return Ok(WireOutcome::Local);
         }
         if hub.has_remote_proxy::<C>() {
+            if let Some(owner) = hub.owner() {
+                anyhow::bail!("gear `{owner}` declares #[toolkit::consumes] more than once");
+            }
             return Ok(WireOutcome::Remote);
         }
         hub.register_remote_proxy::<C>(proxy);
@@ -420,17 +421,17 @@ mod tests {
     impl Payments for PaymentsLocal {}
 
     #[test]
-    fn two_consumers_of_one_contract_both_report_remote() {
+    fn two_consumers_of_one_contract_get_their_own_proxies() {
         // Two gears in one process consuming the same contract from the same
-        // provider. Whichever wires second used to find the first one's proxy,
-        // conclude the dependency was local, and get it marked
-        // readiness-resolved — with both registrations sharing a `dep_gear`,
-        // that flipped the very entry the unresolved remote dep was gating on,
-        // and `/readyz` went green with no provider up.
+        // provider. Each must get its own proxy (built from its own wiring
+        // settings), and neither may short-circuit to `Local`, which would mark
+        // the dependency readiness-resolved with no provider up.
         let hub = ClientHub::new();
+        let a = hub.for_gear("a");
+        let b = hub.for_gear("b");
 
-        let first = generated_wire_body::<dyn Payments>(&hub, Arc::new(PaymentsProxy)).unwrap();
-        let second = generated_wire_body::<dyn Payments>(&hub, Arc::new(PaymentsProxy)).unwrap();
+        let first = generated_wire_body::<dyn Payments>(&a, Arc::new(PaymentsProxy)).unwrap();
+        let second = generated_wire_body::<dyn Payments>(&b, Arc::new(PaymentsProxy)).unwrap();
 
         assert_eq!(first, WireOutcome::Remote);
         assert_eq!(
@@ -438,6 +439,33 @@ mod tests {
             WireOutcome::Remote,
             "the second consumer must still gate readiness, not short-circuit to Local"
         );
+        assert!(!Arc::ptr_eq(
+            &a.get::<dyn Payments>().unwrap(),
+            &b.get::<dyn Payments>().unwrap()
+        ));
+    }
+
+    #[test]
+    fn a_gear_consuming_one_contract_twice_is_an_error() {
+        let hub = ClientHub::new();
+        let a = hub.for_gear("a");
+
+        generated_wire_body::<dyn Payments>(&a, Arc::new(PaymentsProxy)).unwrap();
+        let err = generated_wire_body::<dyn Payments>(&a, Arc::new(PaymentsProxy)).unwrap_err();
+
+        assert!(err.to_string().contains("more than once"), "{err}");
+    }
+
+    #[test]
+    fn the_process_wide_hub_reuses_its_proxy() {
+        // Registrations whose owner is not a gear here (cluster-sdk's) wire into
+        // the plain hub and share one proxy.
+        let hub = ClientHub::new();
+
+        let first = generated_wire_body::<dyn Payments>(&hub, Arc::new(PaymentsProxy)).unwrap();
+        let second = generated_wire_body::<dyn Payments>(&hub, Arc::new(PaymentsProxy)).unwrap();
+
+        assert_eq!((first, second), (WireOutcome::Remote, WireOutcome::Remote));
     }
 
     #[test]

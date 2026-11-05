@@ -1,0 +1,5 @@
+error: `contract = [...]` lists no contracts
+ --> tests/ui/fail/provides_list_empty.rs:6:44
+  |
+6 | #[provides(transports = [grpc], contract = [])]
+  |                                            ^^

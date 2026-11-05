@@ -489,15 +489,15 @@ impl HostRuntime {
         // Wire each consumer contract. The outcome distinguishes a co-located
         // local impl (hub short-circuit) from a directory-resolving REST client.
         // Every dep is registered as a readiness gate; local ones are marked
-        // resolved immediately, and only remote ones gate readiness + get the
-        // background directory-resolve loop (ADR-0007: startup-gating + sticky).
+        // resolved once wiring is done, and only remote ones gate readiness + get
+        // the background directory-resolve loop (ADR-0007: startup-gating + sticky).
         // `owner_gear` is set by `#[toolkit::consumes]` to the gear's declared
         // `#[toolkit::gear(name = ...)]`, falling back to the kebab-case of the
         // struct ident when that attribute is absent. It is used as the config key
-        // `gears.<owner_gear>.config.consumer_wiring.<dep>`. If it does not match
-        // any registered gear name, wiring still works (the loop below does not
-        // filter on owner) but that static-override config key silently resolves to
-        // nothing, so warn.
+        // `gears.<owner_gear>.config.consumer_wiring.<dep>` and as the owner of the
+        // hub view the proxy is wired into. If it does not match any registered
+        // gear name, the proxy is wired process-wide and that config key silently
+        // resolves to nothing, so warn.
         let known_gears: std::collections::HashSet<&str> =
             self.registry.gears().iter().map(GearEntry::name).collect();
         // In-process gears with no REST API to advertise: a `Remote` outcome for
@@ -525,7 +525,11 @@ impl HostRuntime {
             }
         }
 
-        let mut remote_deps: Vec<String> = Vec::new();
+        // A dep is resolved at wiring time only if no consumer of it needs the
+        // directory: with one consumer on a static endpoint and another on
+        // discovery, the dep waits for the probe.
+        let mut resolved_now: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+        let mut remote_deps: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
         for reg in regs {
             // Read the consumer's `consumer_wiring.<dep>` entry (if any) and
             // split it into an optional static-endpoint override and the
@@ -572,7 +576,16 @@ impl HostRuntime {
                 Arc::clone(&resolver)
             };
 
-            let outcome = (reg.wire)(&self.client_hub, reg_resolver, tuning).map_err(|source| {
+            // Each registered consumer wires into its own view, so its proxy carries
+            // its own settings. An owner that is not a gear here (an SDK-level
+            // registration such as cluster-sdk's, or a stray consumer) wires
+            // process-wide.
+            let hub = if known_gears.contains(reg.owner_gear) {
+                self.client_hub.for_gear(reg.owner_gear)
+            } else {
+                Arc::clone(&self.client_hub)
+            };
+            let outcome = (reg.wire)(&hub, reg_resolver, tuning).map_err(|source| {
                 RegistryError::ProxyWiring {
                     gear: reg.owner_gear,
                     source,
@@ -582,11 +595,11 @@ impl HostRuntime {
             match outcome {
                 // Local impl won the hub short-circuit — resolved.
                 crate::discovery::WireOutcome::Local => {
-                    self.dep_checker.mark_resolved(reg.dep_gear);
+                    resolved_now.insert(reg.dep_gear);
                 }
                 // Static override → fixed endpoint, always resolvable — no probe.
                 crate::discovery::WireOutcome::Remote if is_static => {
-                    self.dep_checker.mark_resolved(reg.dep_gear);
+                    resolved_now.insert(reg.dep_gear);
                 }
                 // A registered consumer depends on an in-process dep with no local
                 // impl and no REST API: wiring fell to a self-pointing proxy that
@@ -610,7 +623,9 @@ impl HostRuntime {
                     });
                 }
                 // Directory-resolved remote → gate readiness + background probe.
-                crate::discovery::WireOutcome::Remote => remote_deps.push(reg.dep_gear.to_owned()),
+                crate::discovery::WireOutcome::Remote => {
+                    remote_deps.insert(reg.dep_gear);
+                }
             }
             tracing::debug!(
                 owner = reg.owner_gear,
@@ -621,12 +636,17 @@ impl HostRuntime {
             );
         }
 
+        for dep in resolved_now.difference(&remote_deps) {
+            self.dep_checker.mark_resolved(dep);
+        }
+
         // Only remote deps need directory resolution; local wins are already
         // resolved above. Without a directory the null resolver can never resolve
         // them, so skip the probe entirely and leave those deps gating /readyz.
         if !have_directory || remote_deps.is_empty() {
             return Ok(());
         }
+        let remote_deps: Vec<String> = remote_deps.into_iter().map(str::to_owned).collect();
 
         let readiness = Arc::clone(&self.dep_checker);
         let cancel = self.cancel.clone();
@@ -2311,6 +2331,243 @@ mod tests {
         assert_eq!(
             endpoint_override(&cfg, "ApiContractsConsumer", "api-contracts"),
             None,
+        );
+    }
+
+    /// What a consumer's proxy was built from, for the per-consumer tests.
+    trait ShippingApi: Send + Sync {
+        fn wiring(&self) -> &ShippingProxy;
+    }
+
+    struct ShippingProxy {
+        resolver: Arc<dyn crate::discovery::EndpointResolver>,
+        timeout: Option<std::time::Duration>,
+        max_attempts: Option<u32>,
+        require_tls: Option<bool>,
+    }
+
+    impl ShippingApi for ShippingProxy {
+        fn wiring(&self) -> &ShippingProxy {
+            self
+        }
+    }
+
+    /// The body `#[toolkit::consumes]` emits, with a proxy that keeps its
+    /// resolver and tuning.
+    fn wire_shipping(
+        hub: &ClientHub,
+        resolver: Arc<dyn crate::discovery::EndpointResolver>,
+        tuning: toolkit_contract::wiring::ClientTuning,
+    ) -> anyhow::Result<crate::discovery::WireOutcome> {
+        if hub.try_get_local::<dyn ShippingApi>().is_some() {
+            return Ok(crate::discovery::WireOutcome::Local);
+        }
+        if hub.has_remote_proxy::<dyn ShippingApi>() {
+            if let Some(owner) = hub.owner() {
+                anyhow::bail!("gear `{owner}` declares #[toolkit::consumes] more than once");
+            }
+            return Ok(crate::discovery::WireOutcome::Remote);
+        }
+        hub.register_remote_proxy::<dyn ShippingApi>(Arc::new(ShippingProxy {
+            resolver,
+            timeout: tuning.timeout,
+            max_attempts: tuning.retry.and_then(|r| r.max_attempts),
+            require_tls: tuning.require_tls,
+        }));
+        Ok(crate::discovery::WireOutcome::Remote)
+    }
+
+    fn shipping_registration(owner_gear: &'static str) -> crate::discovery::ConsumerRegistration {
+        crate::discovery::ConsumerRegistration {
+            owner_gear,
+            dep_gear: "shipping",
+            wire: wire_shipping,
+        }
+    }
+
+    /// A runtime hosting consumer gears `a` and `b` (shipping is remote).
+    fn shipping_runtime(config: serde_json::Value) -> HostRuntime {
+        let mut b = crate::registry::RegistryBuilder::default();
+        b.register_core_with_meta("a", &[], Arc::new(DummyCore));
+        b.register_core_with_meta("b", &[], Arc::new(DummyCore));
+        let registry = b.build_topo_sorted().unwrap();
+        let map = serde_json::from_value(config).unwrap();
+        HostRuntime::new(
+            registry,
+            Arc::new(MapCfg(map)),
+            DbOptions::None,
+            Arc::new(ClientHub::new()),
+            CancellationToken::new(),
+            Uuid::new_v4(),
+            None,
+        )
+    }
+
+    /// Issue #5686: two gears consuming one contract each get a proxy built
+    /// from their own `consumer_wiring`, whichever wires first.
+    #[tokio::test]
+    async fn each_consumer_gets_a_proxy_with_its_own_wiring() {
+        let config = serde_json::json!({
+            "a": { "config": { "consumer_wiring": { "shipping": {
+                "endpoint": "http://shipping-for-a:8080",
+                "timeout": "1s",
+                "retry": { "max_attempts": 2 },
+                "require_tls": false
+            } } } },
+            "b": { "config": { "consumer_wiring": { "shipping": {
+                "endpoint": "http://shipping-for-b:8080",
+                "timeout": "10s",
+                "retry": { "max_attempts": 5 },
+                "require_tls": true
+            } } } }
+        });
+        let (reg_a, reg_b) = (shipping_registration("a"), shipping_registration("b"));
+
+        for order in [[&reg_a, &reg_b], [&reg_b, &reg_a]] {
+            let runtime = shipping_runtime(config.clone());
+            runtime.wire_consumer_registrations(&order).unwrap();
+
+            let hub = &runtime.client_hub;
+            let a = hub.for_gear("a").get::<dyn ShippingApi>().unwrap();
+            let b = hub.for_gear("b").get::<dyn ShippingApi>().unwrap();
+            assert!(!Arc::ptr_eq(&a, &b));
+            assert!(
+                hub.try_get::<dyn ShippingApi>().is_none(),
+                "a gear's proxy is not process-wide"
+            );
+
+            let (a, b) = (a.wiring(), b.wiring());
+            assert_eq!(
+                a.resolver
+                    .resolve_endpoint("shipping")
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                Some("http://shipping-for-a:8080")
+            );
+            assert_eq!(
+                b.resolver
+                    .resolve_endpoint("shipping")
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                Some("http://shipping-for-b:8080")
+            );
+            assert_eq!(a.timeout, Some(std::time::Duration::from_secs(1)));
+            assert_eq!(b.timeout, Some(std::time::Duration::from_secs(10)));
+            assert_eq!((a.max_attempts, b.max_attempts), (Some(2), Some(5)));
+            assert_eq!((a.require_tls, b.require_tls), (Some(false), Some(true)));
+        }
+    }
+
+    /// An owner that is not a gear in this process (an SDK-level registration)
+    /// wires a process-wide proxy that every gear's view can read.
+    #[tokio::test]
+    async fn an_unknown_owner_wires_a_process_wide_proxy() {
+        let runtime = shipping_runtime(serde_json::json!({}));
+        let reg = shipping_registration("shipping-sdk");
+        runtime.wire_consumer_registrations(&[&reg]).unwrap();
+
+        let hub = &runtime.client_hub;
+        let shared = hub.get::<dyn ShippingApi>().unwrap();
+        let seen_by_a = hub.for_gear("a").get::<dyn ShippingApi>().unwrap();
+        assert!(Arc::ptr_eq(&shared, &seen_by_a));
+    }
+
+    /// With one consumer on a static endpoint and another on discovery, the dep
+    /// stays unresolved: the second consumer's provider is not found yet.
+    #[tokio::test]
+    async fn a_static_consumer_does_not_resolve_a_dep_another_consumer_discovers() {
+        let config = serde_json::json!({
+            "a": { "config": { "consumer_wiring": { "shipping": {
+                "endpoint": "http://shipping:8080"
+            } } } }
+        });
+        let (reg_a, reg_b) = (shipping_registration("a"), shipping_registration("b"));
+
+        for order in [[&reg_a, &reg_b], [&reg_b, &reg_a]] {
+            let runtime = shipping_runtime(config.clone());
+            runtime.wire_consumer_registrations(&order).unwrap();
+
+            assert!(
+                runtime
+                    .dep_checker
+                    .unresolved_deps()
+                    .contains(&"shipping".to_owned()),
+                "the discovery consumer must keep the dep gating readiness"
+            );
+        }
+    }
+
+    /// Same mix with a directory: the dep stays unresolved until the provider
+    /// is advertised, then the probe resolves it.
+    #[tokio::test]
+    async fn a_mixed_dep_resolves_once_the_provider_is_advertised() {
+        let config = serde_json::json!({
+            "a": { "config": { "consumer_wiring": { "shipping": {
+                "endpoint": "http://shipping:8080"
+            } } } }
+        });
+        let runtime = shipping_runtime(config);
+        let gears = Arc::new(crate::runtime::GearManager::new());
+        runtime
+            .client_hub
+            .register::<dyn crate::DirectoryClient>(Arc::new(
+                crate::directory::LocalDirectoryClient::new(Arc::clone(&gears)),
+            ));
+        let (reg_a, reg_b) = (shipping_registration("a"), shipping_registration("b"));
+        runtime
+            .wire_consumer_registrations(&[&reg_a, &reg_b])
+            .unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(
+            !runtime.dep_checker.all_resolved(),
+            "no provider is advertised yet"
+        );
+
+        gears
+            .register_instance(Arc::new(
+                crate::runtime::GearInstance::new("shipping", Uuid::new_v4())
+                    .with_rest_endpoint(crate::runtime::Endpoint::http("shipping", 8080)),
+            ))
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !runtime.dep_checker.all_resolved() {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the probe must resolve the dep once the provider is advertised");
+        runtime.cancel.cancel();
+    }
+
+    /// Both consumers on static endpoints: resolved at wiring time.
+    #[tokio::test]
+    async fn static_consumers_resolve_the_dep() {
+        let entry = serde_json::json!({ "config": { "consumer_wiring": { "shipping": {
+            "endpoint": "http://shipping:8080"
+        } } } });
+        let runtime = shipping_runtime(serde_json::json!({ "a": entry, "b": entry }));
+        let (reg_a, reg_b) = (shipping_registration("a"), shipping_registration("b"));
+        runtime
+            .wire_consumer_registrations(&[&reg_a, &reg_b])
+            .unwrap();
+
+        assert!(runtime.dep_checker.all_resolved());
+    }
+
+    /// One gear consuming the same contract twice is a boot error naming it.
+    #[tokio::test]
+    async fn a_gear_consuming_a_contract_twice_fails_wiring() {
+        let runtime = shipping_runtime(serde_json::json!({}));
+        let reg = shipping_registration("a");
+        let err = runtime
+            .wire_consumer_registrations(&[&reg, &reg])
+            .expect_err("a duplicate consumer must fail wiring");
+        assert!(
+            matches!(err, RegistryError::ProxyWiring { gear, .. } if gear == "a"),
+            "got {err:?}"
         );
     }
 
