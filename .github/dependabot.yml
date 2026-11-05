@@ -68,6 +68,13 @@ updates:
           - "sha2"
           - "sha3"
           - "signature"
+      # opentelemetry-rust crates release in lockstep and tracing-opentelemetry
+      # tracks them: bumping opentelemetry_sdk alone does not compile (#5613).
+      # Listed above cargo-patch so these never fall into the patch group.
+      opentelemetry:
+        patterns:
+          - "opentelemetry*"
+          - "tracing-opentelemetry"
       # Patch only: in cargo a 0.x minor bump is a breaking change (#4900:
       # base64 0.22 -> 0.23), and one breaking crate would block the whole group.
       # Minor bumps stay individual PRs.
