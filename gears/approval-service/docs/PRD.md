@@ -213,7 +213,7 @@ Candidates without a committed priority:
 
 The system **MUST** let a gear register approval opportunities as GTS types. Each opportunity **MUST** declare its accepted projection types, its accepted subject types, its context attributes (possibly none), its decision authority (subject tenant by default, or resource tenant), whether standing approvals are `allowed` or `prohibited`, and exactly one default action (`deny`, `require_approval`, or `not_required`). Registration without a default action or without the standing approval setting **MUST** be rejected. When an update changes the setting to `prohibited`, existing standing approvals for the opportunity **MUST** stop applying.
 
-The system **MUST** let only the owning gear's service identity register or update its opportunities.
+The system **MUST** let only the owning gear's service identity register or update its opportunities. Administrators **MUST** be able to see each opportunity's default action. An update that removes or renames a declared context attribute **MUST** be rejected unless the opportunity moves to a new major version, and a rule or policy that refers to an attribute the opportunity no longer declares **MUST** make verification return `invalid`, never let the operation proceed.
 
 - **Rationale**: A mandatory default makes every verdict resolvable without any hard-coded fallback. A mandatory standing approval setting makes gear vendors decide whether an approval may outlive the facts of a request: acceptable for `repo.read`, not for `po.release`.
 - **Actors**: `cpt-cf-approval-service-actor-gear-vendor`, `cpt-cf-approval-service-actor-integrated-gear`
