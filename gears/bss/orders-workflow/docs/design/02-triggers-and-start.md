@@ -268,7 +268,7 @@ principal and its explicit `order × read` grant.
 
 Before any admission outcome is returned, `admit-trigger` reads current order state and
 `orderVersion` from Orders Lifecycle (seam R1, see
-[`../../../orders-lifecycle/docs/features/06-workflow-seam.md`](../../../orders/docs/features/06-workflow-seam.md)
+[`../../../orders/docs/features/06-workflow-seam.md`](../../../orders/docs/features/06-workflow-seam.md)
 §4.1). A trigger carrying a superseded `orderVersion` is ignored for start and advance purposes;
 where the running instance itself is behind the order, the outcome is `supersede` and the
 definition unwinds it (§4.2). This is what makes out-of-order and stale triggers safe without a
@@ -563,7 +563,7 @@ failure). It applies when the event's version equals the order's current version
 | `OrderApproved` | listen | — | `advance` | `supersede` | `ignored-terminated` | The fulfillment stage (slice 04); fragment (a) enters it from `afterReflect` in the same invocation and does not `listen` for this event, which it may do only through `admit-trigger` |
 | `OrderHeld` | listen | — | `advance` | `supersede` | `ignored-terminated` | `apply-hold` (08) |
 | `OrderResumed` | listen | — | `advance` | `supersede` | `ignored-terminated` | `apply-resume` (08); a resume with no open suspension is `apply-resume`'s to refuse, not this slice's to invent |
-| `OrderAcceptanceRecorded` | listen | — | `advance` | `supersede` | `ignored-terminated` | `evaluate-payment-auth-eligibility` (04): the buyer-acceptance precondition is re-evaluated for begin-fulfillment. The payload carries `acceptedVersion`, `acceptedAt`, `recordingActor` and `requirementSource` (camelCase on the wire, Lifecycle D-256; decision D-325); consent is bound to that version (Lifecycle `bss/orders-stage4` D-256, *Recording consent after submit*, OL-26; decision D-239). **No Lifecycle call is made by intake**; this event is not a fulfillment outcome and never leads to the `fulfillment-acknowledgement` seam call |
+| `OrderAcceptanceRecorded` | listen | — | `advance` | `supersede` | `ignored-terminated` | `evaluate-payment-auth-eligibility` (04): the buyer-acceptance precondition is re-evaluated for begin-fulfillment. The payload carries `acceptedVersion`, `acceptedAt`, `recordingActor` and `requirementSource` (camelCase on the wire, Lifecycle `bss/orders-stage4` D-256; decision D-325); consent is bound to that version (Lifecycle `bss/orders-stage4` D-256, *Recording consent after submit*, OL-26; decision D-239). **No Lifecycle call is made by intake**; this event is not a fulfillment outcome and never leads to the `fulfillment-acknowledgement` seam call |
 | `OrderCancelled` | listen | — | `terminate` | `supersede` | `ignored-terminated` | `terminate-on-terminal-event`, then the terminal unwind of fragment (f) |
 | `OrderExpired` | listen | — | `terminate` | `supersede` | `ignored-terminated` | As above. This is also how a parked approval process (slice 03) reaches a terminal outcome when the Lifecycle `submitted` TTL elapses |
 | `OrderRejected` | listen | — | `terminate` | `supersede` | `ignored-terminated` | As above |
@@ -585,11 +585,11 @@ order that closed before this gear acted on it has nothing to compensate.
 | Dependency Gear | Interface Used | Purpose |
 |--------------------|----------------|----------|
 | `serverless-runtime` | Event triggers and the running invocation's `listen` (by reference, `10 §3.3`) | Delivers the ten triggers to the definition, which calls this slice's operations; **no code today** (`10 §1`) |
-| `orders-lifecycle` | Versioned contract / SDK client: `order × read` (R1), per [`../../../orders-lifecycle/docs/features/06-workflow-seam.md`](../../../orders/docs/features/06-workflow-seam.md) §3.3 | Read current order state and version inside `admit-trigger`; the five seam operations (`approval-reflection`, `begin-fulfillment`, `spawn-signal`, `fulfillment-acknowledgement`, `workflow-cancel`) are called by slices 03, 04, 05 and 06, not by this slice |
+| `bss-orders` | Versioned contract / SDK client: `order × read` (R1), per [`../../../orders/docs/features/06-workflow-seam.md`](../../../orders/docs/features/06-workflow-seam.md) §3.3 | Read current order state and version inside `admit-trigger`; the five seam operations (`approval-reflection`, `begin-fulfillment`, `spawn-signal`, `fulfillment-acknowledgement`, `workflow-cancel`) are called by slices 03, 04, 05 and 06, not by this slice |
 | `authz-resolver` | `PolicyEnforcer` adapter, through the envelope | The `execute` decision on both step routes |
 
 **By-reference binding to the Orders Lifecycle seam (R1–R5)**: per Orders Lifecycle seam R1–R5,
-see [`../../../orders-lifecycle/docs/features/06-workflow-seam.md`](../../../orders/docs/features/06-workflow-seam.md)
+see [`../../../orders/docs/features/06-workflow-seam.md`](../../../orders/docs/features/06-workflow-seam.md)
 §4.1–§4.6. This slice does not restate those rules; it states only the execution consequences it
 is bound by:
 
@@ -1065,11 +1065,11 @@ owns the harness and its result.
   *Trigger*, §3.3 *Event Trigger Management API*;
   [DESIGN_GTS_SCHEMAS](../../../../serverless-runtime/docs/DESIGN_GTS_SCHEMAS.md#trigger) *Trigger*
   (`dead_letter_queue`)
-- **Boundary reference (by-reference, not restated)**: [`../../../orders-lifecycle/docs/features/06-workflow-seam.md`](../../../orders/docs/features/06-workflow-seam.md)
+- **Boundary reference (by-reference, not restated)**: [`../../../orders/docs/features/06-workflow-seam.md`](../../../orders/docs/features/06-workflow-seam.md)
   §3.3 (the five seam operations), §4.1–§4.6 (normative R1–R5 consequences);
-  [`../../../orders-lifecycle/docs/features/04-versioning.md`](../../../orders/docs/features/04-versioning.md)
+  [`../../../orders/docs/features/04-versioning.md`](../../../orders/docs/features/04-versioning.md)
   §4.3 (amendment publishes `OrderAmended`, not `OrderSubmitted`);
-  [`../../../orders-lifecycle/docs/features/08-read-and-authz.md`](../../../orders/docs/features/08-read-and-authz.md)
+  [`../../../orders/docs/features/08-read-and-authz.md`](../../../orders/docs/features/08-read-and-authz.md)
   §3.8 (no replica reads)
 - **Consumers**: `03-approval-execution.md` (verdict path after `start`), `04-fulfillment-plan.md`
   (`OrderAcceptanceRecorded` admitted to `evaluate-payment-auth-eligibility`),

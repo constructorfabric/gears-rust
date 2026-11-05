@@ -369,7 +369,16 @@ enables the protocol only after reading the arm listed, its own release check
 lacking an arm from the moment a release declares the arm (step 2), not once an upstream protocol
 is enabled, which this gear cannot see; a rollback dropping a declared arm is no rollback target,
 and the fix goes forward. `protocol_arms_ready` is computed on each read from the declared-arm set
-and the non-terminal bindings, with no stored copy, and never drops a listed arm.
+and the non-terminal bindings, with no stored copy, and never drops a listed arm. **Amended
+2026-11-05 by D-333**: the gear-wide `protocol_arms_ready` and its release-wide drain are withdrawn.
+Lifecycle gates an upstream-started protocol per order on `protocol_arms`, the declared arms the
+document of the order's bound version carries — a version carries an arm when its document calls
+the operation the release configuration's declared-arm set names for it — stored on that order's
+binding by `start-instance` from the platform registry, fixed for the binding's life, empty for an order with no
+instance; an order whose instance lacks the arm keeps Lifecycle's pre-arm path. The confirmation
+checks that `protocol_arms` lists exactly the declared arms whose operation the bound version's
+document calls, for a version carrying the arm and for one lacking it, and keeps the mutant
+rollback without the arm that the job must refuse.
 
 ## Pros and Cons of the Options
 

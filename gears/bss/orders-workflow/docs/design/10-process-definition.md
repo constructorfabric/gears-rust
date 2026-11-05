@@ -581,7 +581,7 @@ payload that deliver a Temporal signal are an **upstream ask** (§3.3).
 
 | Purpose | Platform endpoint | Reference | Orders' use |
 |---------|-------------------|-----------|-------------|
-| Register draft, validate, publish, list versions, deprecate | `/api/serverless-runtime/v1/functions` (CRUD over Function and Workflow entities) | `DESIGN.md:857` | Publishing a definition version from the publish job of §4.2 after the CI test of §3.2 and the behavioural gate; deprecating the version it replaces (D-138); the validation hook would run inside "validate" and "publish" once the platform calls a consumer hook (pending ask); `owf_definition_binding` is to block archive/delete of a bound version through that hook, and until then through the pipeline |
+| Register draft, validate, publish, list versions, deprecate | `/api/serverless-runtime/v1/functions` (CRUD over Function and Workflow entities) | `DESIGN.md:857` | Publishing a definition version from the publish job of §4.2 after the CI test of §3.2 and the behavioural gate; deprecating the version it replaces (D-138); the validation hook would run inside "validate" and "publish" once the platform calls a consumer hook (pending ask); `owf_definition_binding` is to block archive/delete of a bound version through that hook, and until then through the pipeline; `start-instance` reading the pinned version's document (`get`) for the binding's `protocol_arms` (§4.3 item 2, D-333) |
 | Start an invocation | `POST /api/serverless-runtime/v1/invocations` with `function_id`, `mode: async`, `params`, `Idempotency-Key` | `DESIGN.md:865`, `DESIGN.md:895`–`910` | Not called by Orders — the two event triggers are the only start of `order_process` (`02 §2.2`, D-107), and a direct start by another caller is asked to be refused platform-side (`…-upreq-serverless-runtime-invocation-control-restriction`); one that happens anyway meets `admit-trigger`'s tenant, category and state checks. An operator re-drive is `…:control` `retry` keeping `invocation_id` (D-86), never a second start; with no function-level handler a failure goes on to `dead_lettered` (`DESIGN.md:458`), from which `retry` is not offered (`DESIGN.md:888`), and "retry from `dead_lettered`, keeping `invocation_id`, resuming at the faulted task" is part of the signals ask; until it is confirmed, the fallback is the dead-instance unwind of `01 §4.16` and a new order (D-105) |
 | Read invocation status | `GET /api/serverless-runtime/v1/invocations/{invocation_id}` | `DESIGN.md:867` | The instance liveness pass of the `reconciliation-sweep` worker, which raises an instance whose invocation is not live as an `invocation-dead` task (`01 §3.8`, D-105); `start-instance`, which records the `function_id` and `function_version` the invocation record reports as the binding (`01 §3.3`, D-137); and the progress read (`09`) |
 | Generic control | `POST …/invocations/{invocation_id}:control` (`cancel`, `suspend`, `resume`, `retry`, `replay`) | `DESIGN.md:868`, `DESIGN.md:883`–`889` | `retry` by an operator re-drive only — of the bound invocation through the `invocation-dead` task (its own `retry` route or the step-retry route, both the Control Operation Gateway's not-live branch, `09 §3.6`, D-301), and of the start invocation through the `start-admission-stalled` task (the *Start re-drive*, `09 §3.6`, D-278, D-287) (`07 §4.4`) — from the states the platform offers it from (`failed` today, `DESIGN.md:888`), and only once the platform confirms it keeps `invocation_id`, resumes at the faulted task and is valid from `dead_lettered` — until then `action-not-offered`, the one remedy the dead-instance unwind, or for a stalled start Lifecycle's cancel and a new order (`01 §3.8` *Readiness*, `01 §4.16`, D-192); `cancel` **never** for an order cancel (§3.2); `suspend`/`resume` **never** — hold is a definition arm, not a platform suspension. Orders cannot stop another caller issuing them: a generic `cancel` surfaces as `canceled` and is raised by the liveness pass, a generic `suspend` only when it times out into `failed`; denying them on `order_process` is `…-upreq-serverless-runtime-invocation-control-restriction` (§4.4) |
@@ -817,7 +817,7 @@ use:
       delay: { minutes: 5 }
       backoff: { constant: {} }
       limit: { duration: { hours: 24 } }
-    recheck:                            # 04 §4.8 item 4 (D-306, D-316): at least 5 attempts, and a duration covering 5 calls × the 10 s deadline + 4 × 10 s delay = 90 s, so the operation's two ladders (per round at most 2 defers + 2 unavailable reads in any order, then the settling call; the defer ladder resets only at the round's entry, D-321), not the budget, decide; a deadline-cut or breaker 503 spends an attempt outside that bound, and a spent budget faults the invocation → invocation-dead task (D-114)
+    recheck:                            # 04 §4.8 item 4 (D-306, D-316): at least 5 attempts, and a duration covering 5 calls × the 10 s deadline + 4 × 10 s delay = 90 s, so the operation's two ladders (per round at most 2 defers + 2 unavailable reads in any order, then the settling call; the defer ladder resets only at the round's entry, D-321), not the budget, decide; a port's breaker refusal or call deadline counts on that port's ladder (D-326); only a cut of the operation's 10 s deadline or a Lifecycle read's breaker 503 spends an attempt outside that bound, and a spent budget faults the invocation → invocation-dead task (D-114); the duration stays ≤ 120 s, the re-drive reset age of the re-check's round entry (D-326)
       delay: { seconds: 10 }
       backoff: { constant: {} }
       limit: { attempt: { count: 5 }, duration: { seconds: 120 } }
@@ -1649,9 +1649,9 @@ The fulfillment stage, the `do` list of `process.fulfillment`:
 - sweepFailure:                         # D-257: a typed verified expiry discovered by a read takes the no-task unwind, as the dispatch's own answer does
     switch:
       - verifiedExpiry: { when: '${ [ $context.sweepFailed[] | select(.refusalKind == "verified-expiry") ] | length > 0 }', then: wave2VerifiedExpiry }
-      - unresolvedOnly: { when: '${ ($context.sweepUnresolved | length) == 0 and ([ $context.sweepFailed[] | select(.refusalKind != "unresolved") ] | length) == 0 }', then: sweepUnresolvedRefusal }   # D-285: as onWave2's unresolvedOnly
+      - unresolvedOnly: { when: '${ ([ $context.sweepFailed[] | select(.refusalKind != "unresolved") ] | length) == 0 }', then: sweepUnresolvedRefusal }   # D-285: as onWave2's unresolvedOnly; D-330: an intent past the sweep floor (sweepUnresolved) is given its task under either policy too (PRD fr-owf-intent-sweep), so only a typed failure in the same answer lets the policy decide
       - lineTask:       { then: sweepLineFailure }
-- sweepUnresolvedRefusal: { set: { forceTask: true }, then: sweepLineFailure }
+- sweepUnresolvedRefusal: { set: { forceTask: true }, then: sweepLineFailure }   # unresolved refusals and sweep-floor intents only (D-285, D-330)
 - sweepLineFailure:                     # fragment (c): never-dispatched | intent-unresolved | wave failures
     set: { failureScope: line, failureSubjects: '${ [ $context.sweepFailed[] | { subjectRef: .lineRef, reason: .reason, cause: "sweep-discovered-terminal-failure" } ] + [ $context.sweepUnresolved[] | { subjectRef: ., reason: "intent-unresolved", cause: "sweep-floor-reached" } ] }', sourceStep: reconcile-intent, sourceAttempt: '${ $context.sweepAttempt }', nextStage: failure, stageLoop: null }
     then: exit
@@ -1700,9 +1700,9 @@ The fulfillment stage, the `do` list of `process.fulfillment`:
     switch:
       - reread:     { when: '${ $context.waveOutcome == "reread" }',    then: wave2Reread }
       - exhausted:  { when: '${ $context.waveOutcome == "exhausted" }', then: wave2Exhausted }
-      - externallyActivated: { when: '${ $context.wave2ExternallyActivated }', then: wave2ExternallyActivated }   # D-233: a draft found active without this gear's activation; first, ahead of every other case — the order fails under either policy and the walk cancels that subscription
+      - externallyActivated: { when: '${ $context.wave2ExternallyActivated }', then: wave2ExternallyActivated }   # D-233: a draft found active without this gear's activation; first, ahead of every other case — the order fails under either policy and the walk cancels that subscription; a failed or unresolved line of the same answer, which gets no task, gets the fence's incident under either policy (06 §3.6 inst-fence-failfast-incident, D-330)
       - bindingExpired: { when: '${ $context.wave2BindingExpired }', then: wave2BindingExpired }   # D-194: the guard's deadline half; nothing was submitted, and no list is non-empty
-      - verifiedExpiry: { when: '${ $context.wave2VerifiedExpiry }', then: wave2VerifiedExpiry }   # D-257: Subscriptions refused a line with a typed verified expiry, closure or temporary end; before deferred and failed, so no task is raised for it under either policy
+      - verifiedExpiry: { when: '${ $context.wave2VerifiedExpiry }', then: wave2VerifiedExpiry }   # D-257: Subscriptions refused a line with a typed verified expiry, closure or temporary end; before deferred and failed, so no task is raised for it under either policy, and a failed or unresolved line of the same answer gets the fence's incident instead (D-330)
       - deferred:   { when: '${ ($context.wave2Deferred | length) > 0 }', then: awaitDeferral2 }   # the deferral loop is the deferred lines' only carrier (item 4); wave2Failed and pendingLapsed accumulate across answers, so neither is dropped by the wait
       - unresolvedOnly: { when: '${ ($context.wave2Failed | length) > 0 and ([ $context.wave2Failed[] | select(.refusalKind != "unresolved") ] | length) == 0 }', then: lineFailure2Unresolved }   # D-285: every failed line is an unresolved refusal (unknown code, denial, outage): its task is opened under either policy and never exhausted (07 §4.2); a mixed answer takes anyFailed, where a typed failure decides the policy: under remediate every failed line gets its task, under fail-fast the order ends at once and the unresolved line, which never got a task, gets the incident (06 §3.6 inst-fence-failfast-incident, D-300)
       - anyFailed:  { when: '${ ($context.wave2Failed | length) > 0 }', then: lineFailure2 }   # D-54; before lapsed, so a line failed in the same answer as a lapsed one gets its task (item 6)
@@ -1744,7 +1744,7 @@ The fulfillment stage, the `do` list of `process.fulfillment`:
 - onReplaceGrant:
     switch:
       - go:        { when: '${ $context.grantOutcome == "granted" or $context.grantOutcome == "not-needed" }', then: grantDone }
-      - unsettled: { when: '${ $context.grantOutcome == "predecessor-unsettled" }', then: enterGrantWait }   # an activation of the old generation is still in flight: the barrier loop reconciles, then calls again
+      - unsettled: { when: '${ $context.grantOutcome == "predecessor-unsettled" }', then: enterGrantWait }   # an old-generation activation in flight, a receiver not attested, or Lifecycle refused this attempt (D-329): the barrier loop reconciles, then calls again
       - held:      { when: '${ $context.grantOutcome == "held" }', then: enterHeldGrant }
       - refused:   { when: '${ $context.grantOutcome == "refused" }', then: grantRefused }
       - terminal:  { then: enterBarrierLoop }   # not-dispatchable: the barrier's lifecycle arm consumes the terminal event
@@ -1838,7 +1838,12 @@ The fulfillment stage, the `do` list of `process.fulfillment`:
       - barrier:          { when: '${ $context.stageLoop == "barrierLoop" }',   then: reconcilePoll }   # also the held wave-2 deferral entered from the barrier
       - held:             { when: '${ $context.stageLoop == "heldSpawn" or $context.stageLoop == "heldReport" or $context.stageLoop == "heldGrant" }', then: retryHeld }
       - wave1:            { then: wave1Again }   # stageLoop wave1: the held wave-1 deferral
-- heldPollFailure:                      # fragment (c); the failing call's key tail is poll:{suspensionRef}:{round}, unique across suspensions (07 §3.3)
+- heldPollFailure:                      # D-330: deferred failures that are all sweep-floor intents get their task under either policy, as sweepFailure's unresolvedOnly
+    switch:
+      - unresolvedOnly: { when: '${ ([ $context.resumeFailed[] | select(.reason != "intent-unresolved") ] | length) == 0 }', then: heldPollUnresolved }
+      - lineTask:       { then: heldPollLineFailure }
+- heldPollUnresolved: { set: { forceTask: true }, then: heldPollLineFailure }   # D-330: forceTask is a boolean literal (rule 1)
+- heldPollLineFailure:                  # fragment (c); the failing call's key tail is poll:{suspensionRef}:{round}, unique across suspensions (07 §3.3)
     set: { failureScope: line, failureSubjects: '${ [ $context.resumeFailed[] | { subjectRef: .lineRef, reason: .reason, cause: (if .reason == "intent-unresolved" then "sweep-floor-reached" else "sweep-discovered-terminal-failure" end) } ] }', sourceStep: apply-resume, sourceAttempt: '${ $context.resumePollTail }', nextStage: failure, stageLoop: null }
     then: exit
 - leave: { set: { nextStage: '${ .arm }', returnStage: fulfillment }, then: exit }
@@ -2087,7 +2092,7 @@ exhaustion on it, never on the answer's `resumeAt` or a returned list (decision 
 - afterResolution:
     switch:
       - resolution: { when: '${ .arm == "resolution" }', then: enterResolveTask }
-      - failFastSweep: { when: '${ .arm == "sla" and $context.policy == "fail-fast" and $context.failureScope == "line" }', then: failFastSweep }   # D-300: under fail-fast a line task is only a forced unresolved-refusal task (lineFailure2Unresolved, sweepUnresolvedRefusal); decided on arm and the pinned policy and failureScope (rule 1)
+      - failFastSweep: { when: '${ .arm == "sla" and $context.policy == "fail-fast" and $context.failureScope == "line" }', then: failFastSweep }   # D-300: under fail-fast a line task is only a forced unresolved-refusal or sweep-floor task (lineFailure2Unresolved, sweepUnresolvedRefusal, D-330); decided on arm and the pinned policy and failureScope (rule 1)
       - sla:        { when: '${ .arm == "sla" }',        then: slaCheck }
       - other:      { then: leave }
 - enterResolveTask: { set: { stageLoop: resolveTask } }   # the resolution arm consumed its signal: a checkpoint before the call (D-147)
@@ -2106,11 +2111,11 @@ exhaustion on it, never on the answer's `resumeAt` or a returned list (decision 
     export: { as: '${ $context + { sweepFailed: .failed, sweepUnresolved: .unresolved, sweepAttempt: ($context.sweepRound | tostring), sweepRound: .nextSweepRound } }' }   # redispatch is not read: dispatch waits while a task is open (07 §4.3)
 - onFailFastSweep:                      # routes as onSweep and sweepFailure; sweepFailed is not pinned, but both ways satisfy §4.1 (rule 1): fail-fast with forceTask unset reaches the unwind with no create-manual-task, and the task way calls it
     switch:
-      - typedFailure: { when: '${ ($context.sweepUnresolved | length) > 0 or ([ $context.sweepFailed[] | select(.refusalKind != "unresolved") ] | length) > 0 }', then: failFastUnwind }   # a typed failure, a verified expiry or an intent past the sweep floor ends the order; the open task stays until terminate-instance and its line gets no incident (06 §3.6 inst-fence-failfast-incident)
-      - unresolved:   { when: '${ ($context.sweepFailed | length) > 0 }', then: failFastSweepTask }   # only unresolved refusals: each line gets its own task, as sweepUnresolvedRefusal
+      - typedFailure: { when: '${ ([ $context.sweepFailed[] | select(.refusalKind != "unresolved") ] | length) > 0 }', then: failFastUnwind }   # a typed failure or a verified expiry ends the order; the open task stays until terminate-instance and its line gets no incident, while a line of the same answer with no task gets one (06 §3.6 inst-fence-failfast-incident, D-330)
+      - unresolved:   { when: '${ (($context.sweepFailed + $context.sweepUnresolved) | length) > 0 }', then: failFastSweepTask }   # only unresolved refusals and intents past the sweep floor: each line gets its own task, as sweepUnresolvedRefusal (D-330)
       - none:         { then: slaCheck }
 - failFastSweepTask:
-    set: { failureSubjects: '${ [ $context.sweepFailed[] | { subjectRef: .lineRef, reason: .reason, cause: "sweep-discovered-terminal-failure" } ] }', sourceStep: reconcile-intent, sourceAttempt: '${ $context.sweepAttempt }', forceTask: true, arm: sweepTask }   # forceTask is a boolean literal and arm a literal (rule 1); failureScope is not written: it is already line, and only the task that enters the stage writes it (rule 1, D-317)
+    set: { failureSubjects: '${ [ $context.sweepFailed[] | { subjectRef: .lineRef, reason: .reason, cause: "sweep-discovered-terminal-failure" } ] + [ $context.sweepUnresolved[] | { subjectRef: ., reason: "intent-unresolved", cause: "sweep-floor-reached" } ] }', sourceStep: reconcile-intent, sourceAttempt: '${ $context.sweepAttempt }', forceTask: true, arm: sweepTask }   # forceTask is a boolean literal and arm a literal (rule 1); failureScope is not written: it is already line, and only the task that enters the stage writes it (rule 1, D-317)
     then: createTasks   # no checkpoint: a ceiling that cancels process during the call re-enters at awaitResolution; the next tick's read lists every refusal no task covers yet again, so the line still gets its task (05 inst-ri-handoff, D-324)
 - slaCheck:                             # composable (07): the SLA re-check; escalates inside the operation only once the stored SLA deadline has passed
     timeout: step
@@ -2274,10 +2279,11 @@ the failing stage recorded — and carries `attemptKey`, which a line retry file
 of a line entry returns to the barrier like the last retry (decision D-146); `closed` with a task
 still open, `escalated`, `refused` and `none` return to the waiting fork. **Fail-fast still ends at
 once** (decision D-300): under the pinned `fail-fast` policy a line entry's open task is a forced
-unresolved-refusal task, so the `PT5M` tick first calls `reconcile-intent` (`failFastSweep`); a
-typed failure, a verified expiry or an intent past the sweep floor of any other line routes to the
-unwind, the open task staying until `terminate-instance` and its line taking no incident
-(`06 §3.6` `inst-fence-failfast-incident`), another unresolved refusal opens that line's task and then takes the SLA check of the same tick
+unresolved-refusal or sweep-floor task (D-330), so the `PT5M` tick first calls `reconcile-intent`
+(`failFastSweep`); a typed failure or a verified expiry of any other line routes to the unwind, the
+open task staying until `terminate-instance` and its line taking no incident, while a line of the
+same answer with no task takes one (`06 §3.6` `inst-fence-failfast-incident`, D-330), another
+unresolved refusal or intent past the sweep floor opens that line's task and then takes the SLA check of the same tick
 (`onCreate`'s `swept` case, D-317), and a read that lists nothing goes on to the SLA check. That
 `createTasks` call has no checkpoint of its own: a lifetime ceiling that cancels `process` during it
 re-enters at `awaitResolution`, and the refusal its read handed off would have neither task nor
@@ -2756,7 +2762,12 @@ the stage holds it; the call passes null and the operation resolves the order's 
 - backToResumeWait: { set: { nextStage: hold, returnStage: hold, stageLoop: awaitResume }, then: exit }   # suspensionRef and resumePollRound kept: the wait polls the same suspension
 - stillHeldBack: { set: { nextStage: '${ $context.heldStage }', returnStage: '${ $context.heldStage }', stageLoop: '${ $context.heldLoop }' }, then: exit }   # suspensionRef kept, so a polled wait keeps polling it (D-133)
 - backResumed: { set: { nextStage: '${ $context.heldStage }', returnStage: '${ $context.heldStage }', stageLoop: '${ $context.heldLoop }', suspensionRef: null }, then: exit }   # the stage and loop the hold interrupted; apply-resume's due is the escalation re-check's first answer
-- resumeFailure:                        # fragment (c)
+- resumeFailure:                        # D-330: deferred failures that are all sweep-floor intents get their task under either policy, as sweepFailure's unresolvedOnly
+    switch:
+      - unresolvedOnly: { when: '${ ([ $context.resumeFailed[] | select(.reason != "intent-unresolved") ] | length) == 0 }', then: resumeUnresolved }
+      - lineTask:       { then: resumeLineFailure }
+- resumeUnresolved: { set: { forceTask: true }, then: resumeLineFailure }   # D-330: forceTask is a boolean literal (rule 1)
+- resumeLineFailure:                    # fragment (c)
     set: { failureScope: line, failureSubjects: '${ [ $context.resumeFailed[] | { subjectRef: .lineRef, reason: .reason, cause: (if .reason == "intent-unresolved" then "sweep-floor-reached" else "sweep-discovered-terminal-failure" end) } ] }', sourceStep: apply-resume, sourceAttempt: '${ $context.resumeEventId }', nextStage: failure, stageLoop: null, suspensionRef: null }
     then: exit
 - back: { set: { nextStage: '${ $context.returnStage }' }, then: exit }
@@ -3017,7 +3028,7 @@ any of them:
 | Verdict | `obtain-verdict` **<** `reflect-verdict`; `record-decision` **<** `reflect-verdict` on the decision path. The `p1` composables on their paths (decision D-135): on every walk where `verdict = unobtainable`, `park` **<** a park loop whose tick calls `arm-park-escalation`, with a walk from it to `raise-overdue-escalation` (`escalationKind: park`), and no `reflect-verdict`, `open-gates` or `nextStage: fulfillment` until a later `obtain-verdict` answers `required` or `not-required` (ADR-0007, `03 §4.5` items 2 and 6); on every walk where `open-gates` answers `unresolved`, `park` **<** the same park loop, with no `record-decision`, gate loop or `reflect-verdict` until a later `open-gates` at that position answers `opened` (`03 §4.5` item 2, D-266); on every walk where `reflected = pending_approval`, `open-gates` **<** `record-decision`, and the wait between them is a competing `fork` carrying the decision `listen` and a tick branch whose route calls `escalate-gate` `mode: fire` and then `mode: probe`, with a walk from a probe to `raise-overdue-escalation` (`escalationKind: approval-outage`) (`fr-owf-approval-request`, `fr-owf-approval-escalation`, `03 §4.5` items 1, 4 and 5) | `open-gates`, `escalate-gate`, `arm-park-escalation`, `park`, `unpark` (beyond those paths) |
 | Plan | `evaluate-payment-auth-eligibility` **<** `construct-and-freeze-plan` **<** `begin-fulfillment`; on the payment-wait route, `evaluate-payment-auth-eligibility` answering `pending` with `paymentWaitExpired` and the pinned action `request-cancel` **<** `request-prefulfillment-cancel`, and no `begin-fulfillment` between them (`08 §3.3`, D-228, D-249) | `evaluate-activation-eligibility` |
 | Waves | `begin-fulfillment` **<** `dispatch-wave1-create` **<** `re-check-pre-activation` **<** `report-spawn-signal` **<** `dispatch-wave2-activate`, and every walk that reaches either dispatch operation carries the pinned `beginResult = in-fulfillment` (decision D-143): the failure stage's return to the barrier and the resume stage's failure route are decided on it or on the interrupted stage, never on a returned list; every walk to `dispatch-wave2-activate` passes an `evaluate-activation-eligibility` answer whose pinned `released` is `true`, and the pinned `spawned = true` of a sent spawn signal, before it — the ADR-0004 conjunction: `released` is true only once database time has reached `expected_fulfillment_at` and every create is confirmed (`04 §3.6` `inst-ae-if-conjunction-false`), so the `waitExpected` re-check loop is where a walk waits while `due` is false, not a separate order constraint, and the run-time guard is `05 §3.6` `inst-pi-wave2-guard` (`activation-precondition-unmet`) (decision D-144); `evaluate-activation-eligibility` stays `composable` everywhere else; on every walk from `rebuild-wave1` where the pinned `spawned` is true, `rebuild-wave1` **<** `replace-fulfillment-grant` **<** `dispatch-wave1-create` (decision D-243) | `evaluate-activation-eligibility` (beyond the conjunction), `reconcile-intent`, `reread-draft-liveness`, `rebuild-wave1` |
-| Failure | `create-manual-task` before any terminal outcome on every walk where `policy = remediate` or `forceTask` is set, except the three walks that reach the unwind under either policy with no task: the wave-2 guard's `bindingExpired` answer (`wave2BindingExpired`, D-194), a non-empty `externallyActivated[]` (`wave2ExternallyActivated`, D-233; `07 §4.8` item 1), and a `failed[]` entry carrying `refusalKind = verified-expiry`, from the dispatch or from a read (`wave2VerifiedExpiry`, D-257; inert until `SUB-O11` gives slice 05 the typed refusal code, D-279); a `failed[]` whose every entry carries `refusalKind = unresolved` sets `forceTask` (`lineFailure2Unresolved`, `sweepUnresolvedRefusal`), so an unknown code, a denial or an outage is given its task under either policy and never reaches the unwind by itself (`06 §4.8`, `07 §4.2`, D-285); under `policy = fail-fast` that forced task's wait reads `reconcile-intent` on its tick, and a typed failure of another line reaches the unwind with no further `create-manual-task` while another unresolved refusal sets `forceTask` (`failFastSweep`, `failFastSweepTask`, D-300); on a walk where `policy = fail-fast` and `forceTask` is not set, the failure route reaches the unwind with no `create-manual-task` (`07 §4.8` item 1), so the switch that picks the route reads the seller's pinned `policy` and no literal of its own (decision D-135). After every `create-manual-task`, and after the ceiling's `raise-overdue-escalation` (`lifetime-ceiling`), the wait that holds the task is a competing `fork` carrying the `task-resolution-requested` `listen`, whose route calls `resolve-manual-task` (`trigger: request`), and a tick branch whose route calls `resolve-manual-task` (`trigger: sla-check`) (`fr-owf-manual-task`, `nfr-owf-manual-task-sla`, `07 §4.8` item 3) — except the inline `payment-wait-expired` task, whose wait is the eligibility wait: its poll tick calls `resolve-manual-task` `sla-check` scoped to `paymentTaskRef` before the evaluation, and it carries no task-resolution `listen`, because the task offers no action a request carries (`07 §4.4`, D-245) — and the inline `receiver-control-abandoned` task, whose wait is the pause stage's `awaitControlTask`: its tick calls `resolve-manual-task` `sla-check` scoped to `controlTaskRef`, and it carries no task-resolution `listen` for the same reason (D-253); `verify-override` only after a `resolve-manual-task` (`07 §4.8` item 5) | `resolve-manual-task` (which runs `retry-step` in-process), `verify-override`, `raise-overdue-escalation` (beyond those paths) |
+| Failure | `create-manual-task` before any terminal outcome on every walk where `policy = remediate` or `forceTask` is set, except the three walks that reach the unwind under either policy with no task: the wave-2 guard's `bindingExpired` answer (`wave2BindingExpired`, D-194), a non-empty `externallyActivated[]` (`wave2ExternallyActivated`, D-233; `07 §4.8` item 1), and a `failed[]` entry carrying `refusalKind = verified-expiry`, from the dispatch or from a read (`wave2VerifiedExpiry`, D-257; inert until `SUB-O11` gives slice 05 the typed refusal code, D-279) — a failed or unresolved line listed with any of the three gets no task and is handed to the Incident Recorder by the fence under either policy (`06 §3.6` `inst-fence-failfast-incident`, D-330); a `failed[]` whose every entry carries `refusalKind = unresolved`, with or without a `reconcile-intent` `unresolved[]` of intents past the sweep floor, sets `forceTask` (`lineFailure2Unresolved`, `sweepUnresolvedRefusal`), so an unknown code, a denial, an outage or an outcome still unknown at the sweep floor is given its task under either policy and never reaches the unwind by itself (`06 §4.8`, `07 §4.2`, D-285, D-330); under `policy = fail-fast` that forced task's wait reads `reconcile-intent` on its tick, and a typed failure of another line reaches the unwind with no further `create-manual-task` while another unresolved refusal or sweep-floor intent sets `forceTask` (`failFastSweep`, `failFastSweepTask`, D-300, D-330); on a walk where `policy = fail-fast` and `forceTask` is not set, the failure route reaches the unwind with no `create-manual-task` (`07 §4.8` item 1), so the switch that picks the route reads the seller's pinned `policy` and no literal of its own (decision D-135). After every `create-manual-task`, and after the ceiling's `raise-overdue-escalation` (`lifetime-ceiling`), the wait that holds the task is a competing `fork` carrying the `task-resolution-requested` `listen`, whose route calls `resolve-manual-task` (`trigger: request`), and a tick branch whose route calls `resolve-manual-task` (`trigger: sla-check`) (`fr-owf-manual-task`, `nfr-owf-manual-task-sla`, `07 §4.8` item 3) — except the inline `payment-wait-expired` task, whose wait is the eligibility wait: its poll tick calls `resolve-manual-task` `sla-check` scoped to `paymentTaskRef` before the evaluation, and it carries no task-resolution `listen`, because the task offers no action a request carries (`07 §4.4`, D-245) — and the inline `receiver-control-abandoned` task, whose wait is the pause stage's `awaitControlTask`: its tick calls `resolve-manual-task` `sla-check` scoped to `controlTaskRef`, and it carries no task-resolution `listen` for the same reason (D-253); `verify-override` only after a `resolve-manual-task` (`07 §4.8` item 5) | `resolve-manual-task` (which runs `retry-step` in-process), `verify-override`, `raise-overdue-escalation` (beyond those paths) |
 | Unwind | `run-cancellation-fence` **<** `compensate-order` **<** `report-outcome` on every failure, cancel, supersede and terminal-event path, and after a `report-outcome` answering `lifecycleCall = revoke-pending`, `compensate-order` **<** `report-outcome` again (decision D-269); `authorize-cancel` **<** `run-cancellation-fence` on the cancel path; `terminate-on-terminal-event` **<** `run-cancellation-fence` on the terminal-event path | — |
 | Hold | `apply-hold` **<** `apply-resume`, in the arm that owns the escalation `wait`; every fork of fragments (b) and (c) carries the pause arm, whose route calls `settle-receiver-pause` and never `apply-hold`, and no unwind fork carries it (`08 §4.7` item 11, D-243) | — |
 | Termination | `terminate-instance` last on every path; `report-outcome` **<** `terminate-instance` where an outcome is reported | — |
@@ -3124,11 +3135,11 @@ the same run; instances of the old major run to termination on it.
 an environment's `owf_definition_binding`. The gear's readiness check compares the versions its
 bindings name with the registry's version listing and alerts on one that is neither `active` nor
 `deprecated`; because the job never archives or deletes, such a version is the trace of a publish
-or transition outside the job. `protocol_arms_ready` is not stored or cached: every progress read
-computes it from the declared-arm set of the release configuration and the environment's
-non-terminal bindings — an arm is listed once no non-terminal binding names a version whose
-document lacks it — so every replica answers the same (§4.3 item 2, decisions D-319, D-320,
-D-323).
+or transition outside the job. `protocol_arms` is per order, not a release-wide value: Lifecycle's
+progress read of an order computes it from that order's own binding — the arms of the release
+configuration's declared-arm set that the bound version's document carries — so it reads one
+binding, never another order's or tenant's, and every replica answers the same (§4.3 item 2,
+decisions D-320, D-323, D-333).
 
 Whether the platform registry calls a consumer-supplied hook before
 publish is a **pending upstream ask**
@@ -3186,30 +3197,37 @@ those instances' calls valid:
    version carrying the arm takes it, and an instance bound to a version lacking it (D-319) keeps the pre-arm
    path, the behaviour of the release before step (1), until those instances drain. A protocol an
    upstream starts — for example Lifecycle staging a post-spawn pause control and waiting on the
-   barrier, the D-243 pause arm — has no per-instance gate: Lifecycle cannot read the binding, and
-   the control intake checks none (`08 §3.3` *Fulfillment control intake*, whose only answers are
-   `accepted` and its refusals), so step (3)'s upstream enabling release is gated release-wide on
-   the drain evidence, and no pre-arm path is kept for it. The drain evidence tests the arm's
-   presence, not a version's age: **no non-terminal `owf_definition_binding` on a version lacking
-   the arm** — a version carries the arm when its document in `definitions/` does — because a
-   forward rollback (§4.2) publishes the last good document as a *newer* version, which may lack
-   the arm (decision D-319). From the moment a release declares the arm — step (2), before any
-   upstream can enable the protocol, which this gear cannot see — the publish job **MUST** refuse a
-   candidate lacking it, a forward rollback included: the rollback re-versions the last good
-   document that carries the arm, or the fix goes forward (D-319, D-323). The evidence is therefore
-   latched by construction: once an arm is listed no new binding can lack it, so it is never
-   dropped; a binding made outside the job is the readiness check's alert (§4.2 *Bound versions*). The upstream reads the evidence, since it cannot read the binding:
-   this gear publishes, per arm, `protocol_arms_ready` on the progress read Lifecycle already holds
-   (`GET /bss-orders-workflow/v1/workflows/{orderId}/progress`, `Gc`; `09 §4.5`), the same gear-wide
-   value on every order's answer, which lists an arm once its drain evidence holds in the
-   environment, computed on each read from the declared-arm set and the non-terminal bindings,
-   with no stored copy (§4.2 *Bound versions*, D-323); Lifecycle reads it on the order it stages
-   the control for, which always has an instance and so an answer, and enables the protocol only
-   after the arm is listed
-   (`cpt-cf-bss-orders-workflow-upreq-lifecycle-protocol-enable-on-arm-capability`,
-   [`../UPSTREAM_REQS.md`](../UPSTREAM_REQS.md) §2.4, decision D-320). The enabling release names,
-   per behaviour, which gate holds it, the pre-arm fallback of a per-instance gate, the drain
-   evidence and, for an upstream-started protocol, the arm it waits for in `protocol_arms_ready`.
+   barrier, the D-243 pause arm — is gated by the upstream per order: Lifecycle cannot read the
+   binding, and the control intake checks none (`08 §3.3` *Fulfillment control intake*, whose only
+   answers are `accepted` and its refusals), so this gear publishes the arms an order's instance
+   carries as `protocol_arms` on the progress read Lifecycle already holds
+   (`GET /bss-orders-workflow/v1/workflows/{orderId}/progress`, `Gc`; `09 §4.5`), and the upstream
+   enables the protocol for an order only when that order's `protocol_arms` lists the arm, keeping
+   its pre-arm path for every other order (decision D-333, superseding D-312's release-wide gate).
+   **Its inputs** (D-333). The release configuration's **declared-arm set** names each protocol arm
+   a release has declared and the operation the arm calls — the operation step (1) registers, such
+   as `settle-receiver-pause` for the pause arm; a definition version **carries** an arm when its
+   document calls that operation, the one test both the publish job applies to a candidate (§4.2)
+   and `start-instance` applies to the version it pins. `start-instance` reads the pinned version's
+   document from the platform registry (`GET /api/serverless-runtime/v1/functions`, its `get`)
+   under this gear's service identity before its unit of work — a published document never
+   changes, so the answer may be kept in memory per version — and stores the arms it carries on
+   `owf_definition_binding.protocol_arms` with the binding, written once (`01 §3.3`, §3.7); a failed
+   registry read is `retryable-failure` with nothing written. The progress read projects that
+   column, so the value is the same on every replica and every read and is fixed for the binding's
+   life: latched by construction, with nothing to drain, no runtime registry read on the read path
+   and no scan of other bindings. An order with no bound instance reports no arms, so the upstream
+   does not enable the protocol for it. From the moment a release declares the arm — step
+   (2) — the publish job **MUST** refuse a candidate lacking it, a forward rollback included: the
+   rollback re-versions the last good document that carries the arm, or the fix goes forward
+   (D-319, D-323). New orders therefore start on versions carrying every declared arm, so the
+   upstream's pre-arm path serves only orders bound before the declaration and can be retired once
+   they terminate; a binding made outside the job is the readiness check's alert (§4.2 *Bound
+   versions*). Lifecycle's per-order enabling is the ask
+   `cpt-cf-bss-orders-workflow-upreq-lifecycle-protocol-enable-on-arm-capability`
+   ([`../UPSTREAM_REQS.md`](../UPSTREAM_REQS.md) §2.4, decisions D-320, D-333). The enabling release
+   names, per behaviour, which gate holds it, the pre-arm fallback of its gate and, for an
+   upstream-started protocol, the arm it reads in `protocol_arms`.
 3. **Checked by** the release pipeline's compatibility test of ADR-0012 *Confirmation* (the
    *after an Orders release* case): instances pinned to the previous `active` version run to
    termination against the new release.
@@ -3228,11 +3246,13 @@ before delivery — the request row the originating control operation of `09` wr
 delivers that row and records none — and **MUST** be delivered idempotently under the
 caller-side duplicate protocol. For `reauthorize-requested` and `unpark-requested` the
 record-before-delivery rule is **deferred until Q-13** is answered: neither has an origin route
-or a request row in this design set (`09 §3.3`), so neither is delivered today; a signal with no consuming arm in
-the current stage **MUST** be held by the plugin's subscription until an arm consumes it, and if
+or a request row in this design set (`09 §3.3`), so neither is delivered today; a signal to a live invocation
+with no consuming arm in the current stage **MUST** be held by the plugin's subscription until an arm consumes it, and if
 the platform cannot guarantee that, the originating control operation **MUST** answer
 `still-processing` until Orders observes the arm's recording operation (`authorize-cancel`,
-`evaluate-payment-auth-eligibility`, `resolve-manual-task`). The exact `:plugin-control` verb and payload are an
+`evaluate-payment-auth-eligibility`, `resolve-manual-task`). A `task-resolution-requested` signal is
+never sent to an invocation the platform does not report live: slice 07's intake refuses the request
+`action-not-offered` first and writes nothing (`07 §3.2` *Resolution intake*, D-331). The exact `:plugin-control` verb and payload are an
 upstream ask (§3.3); this rule binds regardless of their shape.
 
 **Events delivered between listens.** A broker event — `OrderHeld`, `OrderResumed`, the approval
@@ -3392,7 +3412,7 @@ This table is the one statement of which change needs which vehicle (decision D-
 | Adding or removing a `listen` arm whose type is in the closed set, other than the shared arms rule 8 requires | A new definition version | Rules 3 and 8 |
 | The approval escalation window, the overdue window, the manual-task SLA classes, the partial-failure policy, the payment wait and its expiry action (D-228), the `approval_required` declaration (D-265) | A write of the seller's policy — a promotion of `owf_seller_policy` rows on the policy channel ([`01 §3.7`](./01-foundation.md#table-owf_seller_policy)), audited; it reaches only records pinned after it (decisions D-134, D-140) | The policy load's bounds check before commit (`07 §4.8` item 8) |
 | Approval gate parties, their count and order | The approval routing configuration, which `open-gates` reads (`03 §3.6`) | Not Orders' |
-| A new operation; any operation's behaviour, input or output schema, `deadline_ms`, `retry_class` or `protection`; the protected list and its order; the path a `p1` composable is required on | An Orders release of the slice that owns it, then a definition version that uses it; a schema change only additively, a narrowing as a new operation name, and a behaviour that needs a new protocol arm in three steps — the operation registered dormant, the version carrying the arm `active`, then the release enabling it, per binding's `definition_version` with the pre-arm path for older pinned instances until they drain when this gear starts the behaviour, release-wide on the drain evidence — no non-terminal binding on a version lacking the arm, published as `protocol_arms_ready` on the progress read for the upstream to wait on — when an upstream starts the protocol (§4.3, D-264, D-275, D-312, D-319, D-320) | The release pipeline; `owf_step_operation` is compiled (ADR-0012); the *after an Orders release* compatibility test; the publish job's refusal of a candidate, a rollback included, lacking an arm a release has declared (D-319, D-323) |
+| A new operation; any operation's behaviour, input or output schema, `deadline_ms`, `retry_class` or `protection`; the protected list and its order; the path a `p1` composable is required on | An Orders release of the slice that owns it, then a definition version that uses it; a schema change only additively, a narrowing as a new operation name, and a behaviour that needs a new protocol arm in three steps — the operation registered dormant, the version carrying the arm `active`, then the release enabling it, per binding's `definition_version` with the pre-arm path for older pinned instances until they drain when this gear starts the behaviour, per order on `protocol_arms`, the arms the order's bound version carries, published on the progress read for the upstream to read, with the upstream's pre-arm path for any other order, when an upstream starts the protocol (§4.3, D-264, D-275, D-312, D-319, D-320, D-333) | The release pipeline; `owf_step_operation` is compiled (ADR-0012); the *after an Orders release* compatibility test; the publish job's refusal of a candidate, a rollback included, lacking an arm a release has declared (D-319, D-323) |
 | A refusal or manual-task reason; a table or column, seam call, idempotency family, audit kind or PDP catalogue value | An Orders release | The release pipeline |
 | A `listen` type, operator signal, Lifecycle trigger or process event | A PRD-level change, then an Orders release | The release pipeline |
 | A `call` to a platform Function; a `run`, `emit`, `for` or `schedule` task | Not permitted by any vehicle | Rules 2 and 7 |

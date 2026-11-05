@@ -1046,7 +1046,7 @@ this table is the index the validation hook of `10 §2.2` and the envelope's cou
 | `rebuild-wave1` (05) | `rebuildRound` → `nextRebuildRound` | `…:rebuild-wave1:{planRef}:{rebuildRound}` |
 | `reconcile-intent` (05) | `sweepRound` → `nextSweepRound` | `…:reconcile-intent:{sweepRound}` |
 | `report-spawn-signal` (05) | `round` → `nextRound` | `{tenant}:{orderId}:{orderVersion}:report-spawn-signal:{round}`, step and Lifecycle alike |
-| `replace-fulfillment-grant` (05) | `round` → `nextRound`, the definition's `grantRound` | step `…:replace-fulfillment-grant:{planRef}:{round}`; Lifecycle `{tenant}:{orderId}:{orderVersion}:replace-fulfillment-grant:{predecessorGeneration}`, one per predecessor generation (D-243) |
+| `replace-fulfillment-grant` (05) | `round` → `nextRound`, the definition's `grantRound` | step `…:replace-fulfillment-grant:{planRef}:{round}`; Lifecycle `{tenant}:{orderId}:{orderVersion}:replace-fulfillment-grant:{predecessorGeneration}:{replaceAttempt}`, the attempt advanced only after a settled `grant-predecessor-unsettled` and kept for a crash replay; one replacement per predecessor generation (D-243, D-329) |
 | `settle-receiver-pause` (08), per control | `round` → `nextRound`, the definition's `pauseRound`, 0 for each new `controlRef` | step `…:settle-receiver-pause:{controlRef}:{round}`; Lifecycle report `{tenant}:{orderId}:{orderVersion}:control:{controlId}` (D-243) |
 | `compensate-order` (06) | `pass` → `nextPass`, from `0`; `pass + 1` after an exhausted retry. Validated by the operation's own pass guard against the fence row's `last_pass` — any pass above the highest presented is admitted — not by the envelope's counter, so a pass whose lease died is settled by the next (`06 §3.6` `inst-co-fence-guard`, `inst-co-settle-prior`, D-247) | `…:compensate-order:{pass}` |
 | `compensate-order` (06), per compensating leg — the intent key family | `comp_attempt` on `owf_compensation_record`, from 1, minted only by `retry-step`'s effect inside the compensation task's `retry` (`07 §3.6` `inst-rmt-retry`), never by a pass or a platform retry (D-258, mirroring `wave_attempt`, D-119) | intent `{tenant}:{orderId}+{orderVersion}+{orderLineId}+{wave}+{intentKind}[+{wave_attempt}][+c{comp_attempt}]`, the tail appended once above 1 |
@@ -1107,7 +1107,9 @@ seller axis is resolved inside Orders and `admit-trigger`'s settled result carri
 `start-instance`); insert `owf_process_instance` with `invocation_id = invocationId` and
 `next_liveness_at` = now + 15 min (§3.8 *Instance liveness pass*) (the partial unique index
 `UNIQUE (order_id) WHERE terminal_outcome IS NULL` arbitrates a race, not a prior read), insert
-`owf_definition_binding`, write `instance-start` with `definition_version` set, set the event's
+`owf_definition_binding` with its `protocol_arms` (the declared arms the pinned version's document
+carries, read from the platform registry before the unit of work, kept in memory per version; a
+failed registry read answers `retryable-failure` with nothing written, D-333), write `instance-start` with `definition_version` set, set the event's
 `owf_pending_start` row `settled` if one exists (`02 §3.7`, decision D-255) — and, where that row
 was `escalated` with its `start-admission-stalled` task open, close the task through slice 07's
 closure port (`reason = start-admission-stalled`, `outcome = closed-by-progress`) in the same
@@ -1261,7 +1263,7 @@ terminal.
 | Dependency Gear | Interface Used | Purpose |
 |-------------------|----------------|----------|
 | `serverless-runtime` | Function registry, invocation and event-trigger APIs of its [DESIGN §3.3](../../../../serverless-runtime/docs/DESIGN.md#33-api-contracts) — by reference from `10 §3.3` | Publishing and validating definition versions; reading invocation status for the sweep and the progress read; delivering operator signals to a running invocation. **No SDK exists today** (`10 §1`) |
-| `orders-lifecycle` | Versioned contract / SDK client | Read of current order state and version inside an operation before it acts; this gear never writes the order aggregate directly |
+| `bss-orders` | Versioned contract / SDK client | Read of current order state and version inside an operation before it acts; this gear never writes the order aggregate directly |
 | `toolkit-db` | Runtime-scoped database access plus `outbox` | The process instance, step log, idempotency registry, audit chain, definition binding, operation registry and seller policy; toolkit outbox migrations and the managed producer queue |
 | `event-broker-sdk` | `EventBrokerApi`, `DbProducer`, `ProducerOutboxQueue` (`outbox` feature) | Typed validation, managed chained producer registration, broker partitioning and asynchronous publication of the six process events |
 | `types-registry` | SDK client | Resolving and registering the gear's topic instance and GTS event types of §4.7, the error types of §4.9 and the step input/output reference schemas of §3.3 before readiness; a type that fails to register fails the boot |
@@ -1498,7 +1500,7 @@ and `owf_read_access_log`, keyed by the caller's `subject_tenant_id` with the or
 nullable (`09 §3.7`, decision D-191); `DESIGN.md` §3.7 lists all seven. `payer_tenant_id` is
 the billing axis and is carried only where a payment decision is recorded against the row; the
 engine tables record none. The axis names are the sibling gear's
-([`orders-lifecycle` §3.7](../../../orders/docs/features/01-foundation.md)). Each table
+([`bss-orders` §3.7](../../../orders/docs/features/01-foundation.md)). Each table
 states its axis choice in **Additional info**. Without the column the platform's SecureORM
 `#[secure(tenant_col = ...)]` isolation has nothing to attach to and §4.11's tenant-scoping claim
 has no enforcing predicate.
@@ -1592,6 +1594,7 @@ partitioning at this phase.
 | definition_version | text, NOT NULL | The published version pinned at start |
 | definition_source | enum, NOT NULL | `platform` — the registered definition executed by the plugin; `code` — the stated fallback in which Orders sequences the same operations in Rust (`10 §1`) |
 | pinned_at | timestamptz, NOT NULL | Database time of `start-instance` |
+| protocol_arms | text[], NOT NULL | The declared protocol arms (`10 §4.3` item 2) that the pinned version's document carries, computed by `start-instance` from that document in the platform registry when it writes this row and never rewritten; an empty array when the version carries none. The progress read projects it to Lifecycle as `protocol_arms` (`09 §4.5`, decision D-333) |
 | published_by | text, nullable | Opaque subject id of the principal that published the pinned version, copied at start from the registry once it reports a publisher per version (part of `…-upreq-serverless-runtime-definition-versioning-validation-hook`); null until then, because the registered callable carries no publisher and the definition must not name its own. Until then the evidence of a publish is the publish job's run and the registry's version listing (`10 §4.2`, decision D-137; D-61 minimisation applies) |
 | resource_tenant_id | uuid, NOT NULL | Resource-recipient axis |
 
@@ -1785,7 +1788,9 @@ and abort on a failed validation, serialization or enqueue
 - **What the caller gets** — the `aborted` outcome of §3.3. Lifecycle's *Infrastructure-error termination* mapping
   (`01-foundation.md:853-862`): a known temporary unavailability — a lost connection, a
   serialization or deadlock failure, a lock or statement timeout, the zero-rows fence, the second
-  audit-sequence collision of §3.7 `owf_audit_entry` *Chain allocation* — answers
+  audit-sequence collision of §3.7 `owf_audit_entry` *Chain allocation*, or an outbound dependency
+  a route reads inside its transaction being unavailable (its breaker open, its per-call deadline
+  elapsed, or its own 503; §4.5, decision D-332) — answers
   the canonical `ServiceUnavailable` (503), which the definition's `*transient` catch re-issues
   under the same key (`10 §2.2`: 429, 503, 504, 409). Every other failure — an audit encoding failure, an enqueue the SDK refuses for schema,
   serialization or size, any unexpected persistence error — answers the canonical `Internal`
@@ -2408,6 +2413,16 @@ and `../UPSTREAM_REQS.md` §2.9 point here.
      **or** by `…-upreq-lifecycle-thin-events` together with the §2.3 reference-only decision
      event (`../UPSTREAM_REQS.md` §2.9 *Member-only storage*). The asks of items 1, 3, 4, 5 and 6
      complete the section.
+  10. **The version header** (D-334). Lifecycle's `OrderVersionView` exposes `header`, shown by a
+      startup probe of `get_version` or a declared SDK capability, as for `actors` (D-281): plan
+      construction reads every order's market and payer from it (`04 §3.6` `inst-pc-read-order`),
+      and `main`'s `OrderVersionView` has none until Lifecycle `bss/orders-stage4` D-262 merges.
+  11. **Overlap keys on the version read** (decision D-327). Lifecycle's `OrderVersionView`
+      carries each line's `overlap_item_keys` and legacy scalar `overlap_scope_key` at the version
+      (`…-upreq-lifecycle-version-overlap-keys`), shown by a startup probe of `get_version` or a
+      declared SDK capability, as the `actors` check of a `library` binding is (D-281). Without it
+      the pre-activation re-check cannot tell a keyless line from an absent member, so every
+      re-check would defer and abort `overlap-read-unevaluable` (`04 §3.6` `inst-rc-compose-lifecycle`).
 
   Not in the gate: `…-upreq-lifecycle-repause-after-abandon`,
   `…-upreq-lifecycle-order-read-pre-hold-state` and
@@ -2745,7 +2760,9 @@ Lifecycle, Payments, the approval policy adapter — **MUST** sit behind a circu
 baseline: **open at a 50 % failure rate over 20 calls in 10 s, stay open 60 s, then admit 3
 half-open probes**. A call refused by an open breaker settles `retryable-failure` with
 `circuit-breaker-open` and leaves the key `open`; it is a capacity signal the definition's retry
-policy will re-issue against, and the operation **MUST NOT** count it as a downstream attempt.
+policy will re-issue against, and the operation **MUST NOT** count it as a downstream attempt,
+except where an operation's own ladder counts it: `re-check-pre-activation` counts a refusal of
+the identity, occupancy or readiness port on that port's ladder (`04 §3.6`, D-326).
 
 **A gear-wide retry budget is now the platform's to enforce**, because the per-task retry
 policy is the plugin's; Orders exposes the per-dependency breaker state and the `open` re-run

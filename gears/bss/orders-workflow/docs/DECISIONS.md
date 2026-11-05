@@ -6044,6 +6044,8 @@ D-150–D-168) is uncommitted in its worktree, so this entry cites it by decisio
 **Amended by D-208 (2026-10-05)**: the Lifecycle rewrite is merged on `main` (#4775, `b26ef8720`),
 so the decision numbers cited here resolve in the repository.
 
+> **Amended by D-327 (2026-11-05)**: item (2)'s "the overlap keys" was not backed: neither `main`'s nor the Stage 4 `OrderVersionView` carries a line's overlap evidence (its lines are `DraftLine`, committed members `commercial_attempt_id` and `order_pin`). The keys are the `overlap_scope_key` values of `orders_order_line.overlap_item_keys`, the scalar only for a legacy row whose collection is NULL; the new ask `…-upreq-lifecycle-version-overlap-keys` (`UPSTREAM_REQS.md` §2.4) asks `get_version` to carry them, readiness is refused until a probe or declared SDK capability shows them (`design/01` §3.8 item 11), and the "version read, never the current read" rule stands.
+
 **Propagated**: `DESIGN.md` §2.2 (*No price computation*), §3.1, §3.5; `design/03-approval-execution.md`
 §3.2, §3.4, §3.6; `design/04-fulfillment-plan.md` §1.3, §3.2, §3.4, §3.6; `design/05-provisioning-intents.md`
 §2.2, §3.2, §3.5; `design/06-saga-and-compensation.md` §3.2, §3.3; `design/08-hold-and-cancel.md` §3.5;
@@ -6367,6 +6369,11 @@ Subscriptions may answer it.
 **Amended by D-208 (2026-10-05)**: per Lifecycle D-179 the read is keyed by
 `(payer, resource_tenant, key)`, the resource tenant a default dimension of Subscriptions' key.
 
+**Amended by D-335 (2026-11-05)**: the resource tenant is a dimension of the tuple beside the key,
+not inside it: Lifecycle's `SUBSCRIPTIONS_CONTRACT.md` (on `main`, merged with PR #5536) spells the
+capacity tuple `(payerTenantId, resourceTenantId, overlapScopeKey)`, and the key is
+`overlap_scope_key`, distinct from `catalog_subscription_product_key` (Q-08's D-335 note).
+
 ### D-206 (L) The plan is frozen before begin-fulfillment; the PRD states one normative ordering
 
 **Accepted (2026-10-05).** *(PRD alignment with D-92, D-109; answers PR #4787 review)*
@@ -6467,6 +6474,8 @@ item 20; D-193, D-205.
 ### D-209 (H) Subscriptions' answers in PR #5131 are received: resubmit-then-void, no caller start instant, composition by reference
 
 > **Amended by D-256 (2026-11-02)**: with no recorded request id a create is recovered by its same-key resubmit and a transition is read by order, version, line and wave and matched on the echoed `idempotencyKey`; *Amended by D-258*: a compensating leg settled `failed` is retried under a new `comp_attempt`, never the same key.
+
+> **Amended by D-335 (2026-11-05)**: item 11's ask is answered by Lifecycle's `SUBSCRIPTIONS_CONTRACT.md` (on `main`, merged with PR #5536): the resource tenant is its own dimension of the capacity tuple `(payerTenantId, resourceTenantId, overlapScopeKey)`, beside the key rather than carried inside `overlapScopeKey`; Subscriptions' ratification of the contract stays open there.
 
 **Accepted (2026-10-12).** *(reciprocal of Subscriptions PR #5131, open; amends D-195, D-200, D-202)*
 
@@ -6858,6 +6867,8 @@ D-223.
 
 > **Amended by D-268 (2026-11-02)**: the freeze and the re-check use one *line activation limit* (`design/04` §3.7), and the own reservation is keyed on the `(order_id, order_version, order_line_id)` tuples passed as `ownContext`, not on binding references (`UPSTREAM_REQS.md` §2.1 `SUB-O5`).
 
+> **Amended by D-328 (2026-11-05)**: the overlap read no longer asks Subscriptions to exclude the acquisition's own reservation, and an occupancy naming only the order's own rights is no longer read as no collision. In the terms of the contract merged with #5536 (`SUBSCRIPTIONS_CONTRACT.md`, Lifecycle D-242) the read takes `own_context` and returns the three literal counts unchanged plus complete own-membership; this gear composes Lifecycle's protected decision unchanged — new demand excludes the lines holding an `order_reserved` own right, never a subtraction from a count (`design/04` §3.6, `UPSTREAM_REQS.md` §2.1 `SUB-O5`, §2.2).
+
 **Accepted (2026-10-21).** *(PR #4787 proposal item 2, this gear's side; refines D-194)*
 
 **Decision**: the frozen plan carries `assessment_deadline_at` (Lifecycle's assessment expiry,
@@ -6922,6 +6933,8 @@ closed into review.
 > **Amended by D-235 (2026-10-26)**: the named approver comes from the approval policy adapter's routing configuration, never from seller policy.
 
 > **Amended by D-266 (2026-11-02)**: specified end to end — `open-gates` answers `unresolved` and the definition parks it on the gate park; `generation` travels the inbox, the decision request and the decision record; `record-decision` carries the `not-assignee` and `stale-generation` guards; `approval_gate × assign` is in the `09` catalogue and matrix and refuses self-assignment (`self-assignment-barred`); the port gains `routing` and `cancel`.
+
+> **Amended by D-282 (2026-11-02)**: the assign route no longer "re-submits the condition under the unchanged request key", on which `submit` is idempotent for the life of the gate: it bumps `gate_generation` and calls the port's `reassign`, whose library adapter withdraws the held unit and submits a new one carrying the new condition for that generation, mapping (`requestKey`, `gate_generation`) onto (`unit_id`, unit generation) (D-286).
 
 **Accepted (2026-10-21).** *(PR #4787 proposal item 7, this gear's side; extends D-56, D-197, D-224)*
 
@@ -7068,6 +7081,8 @@ which may be correct is cancelled.
 `design/06-saga-and-compensation.md` §3.6 (`inst-fence-cause`), §4.8; `design/10-process-definition.md`
 §3.6 (`onWave2`, `wave2ExternallyActivated`); `design/01-foundation.md` §4.9; `PRD.md` §6.3, AC 5g.
 
+> **Amended by D-330 (2026-11-05)**: a failed or unresolved line listed in the same answer as the external activation gets no task and is handed to the Incident Recorder by the fence under either policy (`design/06` §3.6 `inst-fence-failfast-incident`, `design/10` §3.6 (b), §4.1).
+
 ### D-234 (M) `OrderFulfillmentAborted` is published on every unwind with its mode and the retained obligations
 
 > **Amended by D-259 (2026-11-02)**: `report-outcome`'s registered declaration now names both events and the every-unwind rule; `declared_event` is a set.
@@ -7135,7 +7150,7 @@ owner part as an assumption keeps the PRD from presenting an unagreed contract a
 
 ### D-237 (M) Lifecycle's Stage 3 contract is mirrored: gate refusals decode but never reach this gear's calls, and the re-check adopts the frozen vectors and the occupancy count scope
 
-**Accepted (2026-10-27).** *(mirrors Lifecycle D-232, D-233, D-234, D-235 item 10, D-237 item 9, D-240, D-241 and D-242 on Lifecycle's Stage 3 branch `bss/orders-stage3`; refines D-193, D-208, D-227, D-231)*
+**Accepted (2026-10-27).** *(mirrors Lifecycle D-232, D-233, D-234, D-235 item 10, D-237 item 9, D-240, D-241 and D-242 on `main`, merged with PR #5536; refines D-193, D-208, D-227, D-231)*
 
 **Decision**:
 
@@ -7188,7 +7203,7 @@ owner part as an assumption keeps the PRD from presenting an unagreed contract a
    an admission guarantee. A later collision is the wave-2 failure that `design/06` §4.8 already
    maps to `overlap-collision`.
 
-**Rationale**: Lifecycle's Stage 3 branch lists these as the #4787 mirror (its D-235 item 10,
+**Rationale**: Lifecycle's Stage 3 decisions (on `main`, merged with PR #5536) list these as the #4787 mirror (its D-235 item 10,
 D-240 item 7, D-241 item 3). Most of it changes nothing this gear calls, so the decision says
 that explicitly instead of adding rows that could never be reached. The re-check is the one place
 the gear consumes the new shapes, so it adopts Lifecycle's frozen vectors rather than restating
@@ -7199,37 +7214,41 @@ the algorithm.
 `design/06-saga-and-compensation.md` §4.9; `UPSTREAM_REQS.md` §2.1 (`SUB-O5` row and the
 overlap-presence read).
 
+> **Amended by D-327 (2026-11-05)**: item 5's "stored keys" are the `overlap_scope_key` values of each line's `overlap_item_keys`, the scalar only for a legacy row whose collection is NULL (Lifecycle `03-gate-and-pin.md` `inst-rc-reread-overlap`); `[]` is keyless, and mixed or malformed evidence, or a version answer without the member, defers to `overlap-read-unevaluable`. `get_version` carries neither form yet: `…-upreq-lifecycle-version-overlap-keys` and readiness item 11 of `design/01` §3.8.
+
+> **Amended by D-328 (2026-11-05)**: item 3 composes Lifecycle's decision unchanged, now without any own-reservation addition. Item 6: the conformance set is version 1 for a legacy-profile occupancy answer and `activation-recheck-v2.json` for a `protected_full_tuple_v1` answer; the `ownBindingRefs` clause (replaced by `ownContext` in D-268) is replaced by the contract's `own_context` in, literal counts and complete own-membership out, with no subtraction (`UPSTREAM_REQS.md` §2.1 `SUB-O5`).
+
 ### D-238 (M) Lifecycle's Stage 4 amendment and consent contract is mirrored: a fresh verdict per new version, version-bound acceptance, no new calls
 
 > **Amended by D-268 (2026-11-02)**: the Lifecycle numbers here are Stage 4's of 2026-10-29, since renumbered on `bss/orders-stage4`, and they collide with #5536's register (D-242). Read them by title: D-241 → `bss/orders-stage4` D-249 *Amendment has one payer check*; D-242 → D-250 *S4-01 errata*; D-244 → D-252 *Self-service consent on submit is decided from the frozen attempt*; D-245 → D-253 *Amendments refuse an unknown line and an empty result as guards*; D-246 → D-254 *The amendment service runs the submit pipeline over the proposed version*. The live docs cite the branch-qualified id with its title.
 
-> **Amended by D-325 (2026-11-03)**: the citations in this entry now carry Lifecycle's final Stage 4 numbers (D-249, D-250, D-252, D-253, D-254 on `bss/orders-stage4` at `875084668`); the D-268 note above is the record of the renumbering. Item 1's member is `supersedesVersion` on the wire and item 4's are `acceptedVersion`, `acceptedAt` (camelCase; snake_case is the SDK field name). Item 6: the amend route, like submit and record-acceptance, is development-delivered only (`gate-dev-stubs` and `gate.dev_stubs`, Lifecycle D-235, D-254; Lifecycle `DESIGN.md` *Stage 4 readiness register*); its refusals `amendment-cap-exhausted` (`context.data` `{cap, amendment_count}`) and `administrative-field-in-amendment` (`{field, use}`, Lifecycle D-264) and its prerequisite-outage 503s (Lifecycle D-265) still reach none of this gear's calls.
+> **Amended by D-325 (2026-11-03)**: the citations in this entry now carry Lifecycle's final Stage 4 numbers (D-249, D-250, D-252, D-253, D-254 on `bss/orders-stage4` at `875084668`); the D-268 note above is the record of the renumbering. Item 1's member is `supersedesVersion` on the wire and item 4's are `acceptedVersion`, `acceptedAt` (camelCase; snake_case is the SDK field name). Item 6: the amend route, like submit and record-acceptance, is development-delivered only (`gate-dev-stubs` and `gate.dev_stubs`, Lifecycle D-235, `bss/orders-stage4` D-254; Lifecycle `DESIGN.md` *Stage 4 readiness register*); its refusals `amendment-cap-exhausted` (`context.data` `{cap, amendment_count}`) and `administrative-field-in-amendment` (`{field, use}`, Lifecycle `bss/orders-stage4` D-264) and its prerequisite-outage 503s (Lifecycle `bss/orders-stage4` D-265) still reach none of this gear's calls.
 
 **Accepted (2026-10-29).** *(mirrors Lifecycle D-249, D-250, D-252, D-253 and D-254 on Lifecycle's Stage 4 branch `bss/orders-stage4`; refines D-231, D-237)*
 
 **Decision**:
 
 1. **`OrderAmended` is now emitted.** Lifecycle sends one `OrderAmended { supersedes_version }`
-   per committed amendment (rows 18–20, Lifecycle D-254) and none on a refusal. This gear's
+   per committed amendment (rows 18–20, Lifecycle `bss/orders-stage4` D-254) and none on a refusal. This gear's
    handling is unchanged (`design/03` §3.2): the prior instance terminates and the new version's
    invocation obtains its verdict from scratch.
 2. **The fresh verdict is now a PRD requirement.** PRD §6.2 states that `OrderAmended` re-runs
    verdict retrieval and reflection for the new `orderVersion`, as on `OrderSubmitted`, and never
    carries the prior verdict forward. This closes `design/03` Disclosure 2 and `UPSTREAM_REQS.md`
    §4 item 2.
-3. **Acceptance is version-bound** (Lifecycle OL-26, Lifecycle D-250). Begin-fulfillment's acceptance guard
+3. **Acceptance is version-bound** (Lifecycle OL-26, Lifecycle `bss/orders-stage4` D-250). Begin-fulfillment's acceptance guard
    is satisfied only by acceptance recorded on the version being fulfilled; acceptance on a
    superseded version never counts (PRD §6.3).
 4. **`OrderSubmitted.acceptance`.** A self-service submit now carries
-   `acceptance { accepted_version, accepted_at }` (Lifecycle D-252); partner and delegated submits
+   `acceptance { accepted_version, accepted_at }` (Lifecycle `bss/orders-stage4` D-252); partner and delegated submits
    carry none. The projection question of `UPSTREAM_REQS.md` §2.4 now names this member.
 5. **Stale results.** A result naming a version an amendment superseded is refused
-   `version-conflict` naming the current version (Lifecycle D-254). `design/03` §4.4 already maps it
+   `version-conflict` naming the current version (Lifecycle `bss/orders-stage4` D-254). `design/03` §4.4 already maps it
    to `moved`; no row changes.
 6. **The amend operation exists, but this gear does not call it.** `POST
    /bss-orders/v1/orders/{orderId}/amendments` is the Seller Operator's cure for
    `order-binding-expired` (PRD §6.3). Lifecycle's amendment reasons (`amendment-cap-exhausted`,
-   `line-not-found`, `no-lines`, Lifecycle D-253) and the removed `payer-rebinding-requires-seller` (Lifecycle D-249)
+   `line-not-found`, `no-lines`, Lifecycle `bss/orders-stage4` D-253) and the removed `payer-rebinding-requires-seller` (Lifecycle `bss/orders-stage4` D-249)
    reach none of this gear's calls.
 
 **Rationale**: Lifecycle's Stage 4 waves 1–2 change four things this gear reads: the amendment
@@ -7245,18 +7264,18 @@ the §4.4 expected-version paragraph; `UPSTREAM_REQS.md` §2.4 and §4 item 2.
 
 > **Amended by D-268 (2026-11-02)**: as for D-238: D-247 → `bss/orders-stage4` D-255 *Version and consent history reads in production*; D-248 → D-256 *Recording consent after submit*; D-249 → D-257 *The begin-fulfillment consent and payment guard*. Item 5: the seam trait is specified in Lifecycle `DESIGN.md` as `OrdersWorkflowSeamV1`, not yet in the SDK (Stage 4 D-255 item 2).
 
-> **Amended by D-325 (2026-11-03)**: the citations in this entry now carry Lifecycle's final numbers (D-255, D-256, D-257 on `bss/orders-stage4` at `875084668`) and item 5 the trait name `OrdersWorkflowSeamV1`. Item 1's members are `acceptedVersion`, `acceptedAt`, `recordingActor`, `requirementSource` on the wire (camelCase). Item 3 holds on an admissible snapshot only: Lifecycle settles `acceptance-requirement-unevaluable` when the order was `approved` at its snapshot; when Workflow's approval reflection commits between Lifecycle's snapshot and its lock, Lifecycle aborts that pass unsettled and runs once more itself, and a second race answers `unavailable` with nothing settled, which `inst-bf-if-transient` retries under the same key (Lifecycle D-257 item 9). Lifecycle's guard takes `AuthorizationOutcome` exactly `{ outcome: authorized | pending | failed }` and fingerprints it from Stage 5, so a same-key retry with another outcome is `idempotency-mismatch` (Lifecycle D-257 items 2, 10): `design/04` `inst-bf-call` presents the outcome of the `eligibilitySeq` answer. `begin_fulfillment` has no Lifecycle route yet: it is engine-only until Stage 5's seam driver (Lifecycle D-257 item 1).
+> **Amended by D-325 (2026-11-03)**: the citations in this entry now carry Lifecycle's final numbers (D-255, D-256, D-257 on `bss/orders-stage4` at `875084668`) and item 5 the trait name `OrdersWorkflowSeamV1`. Item 1's members are `acceptedVersion`, `acceptedAt`, `recordingActor`, `requirementSource` on the wire (camelCase). Item 3 holds on an admissible snapshot only: Lifecycle settles `acceptance-requirement-unevaluable` when the order was `approved` at its snapshot; when Workflow's approval reflection commits between Lifecycle's snapshot and its lock, Lifecycle aborts that pass unsettled and runs once more itself, and a second race answers `unavailable` with nothing settled, which `inst-bf-if-transient` retries under the same key (Lifecycle `bss/orders-stage4` D-257 item 9). Lifecycle's guard takes `AuthorizationOutcome` exactly `{ outcome: authorized | pending | failed }` and fingerprints it from Stage 5, so a same-key retry with another outcome is `idempotency-mismatch` (Lifecycle `bss/orders-stage4` D-257 items 2, 10): `design/04` `inst-bf-call` presents the outcome of the `eligibilitySeq` answer. `begin_fulfillment` has no Lifecycle route yet: it is engine-only until Stage 5's seam driver (Lifecycle `bss/orders-stage4` D-257 item 1).
 
 **Accepted (2026-10-29).** *(mirrors Lifecycle D-255, D-256 and D-257 on Lifecycle's Stage 4 branch `bss/orders-stage4`; refines D-89, D-193, D-238)*
 
 **Decision**:
 
-1. **`OrderAcceptanceRecorded` is now emitted** (Lifecycle D-256), once per recorded consent, with
+1. **`OrderAcceptanceRecorded` is now emitted** (Lifecycle `bss/orders-stage4` D-256), once per recorded consent, with
    `accepted_version`, `accepted_at`, `recording_actor` and `requirement_source`. This gear's
    handling is unchanged (`design/02` §3.3 intake table): it re-runs
    `evaluate-payment-auth-eligibility`. Consent is bound to `accepted_version`; consent on a
    superseded version never satisfies the version being fulfilled (D-238 item 3).
-2. **Lifecycle decides begin-fulfillment's guards** (Lifecycle D-257): missing required consent on
+2. **Lifecycle decides begin-fulfillment's guards** (Lifecycle `bss/orders-stage4` D-257): missing required consent on
    the current version refuses `acceptance-required-not-recorded` before any payment branch;
    `pending` refuses `authorization-pending`; a conclusive `failed` is tolerated only by the
    seller's, then the platform's, election (unset false), else `authorization-failed`. D-89 stands:
@@ -7269,7 +7288,7 @@ the §4.4 expected-version paragraph; `UPSTREAM_REQS.md` §2.4 and §4 item 2.
    `authorization_failure_tolerated_at` once; it is never cleared. That column is the risk flag
    `design/04` refers to.
 5. **`get_version`.** Lifecycle delivers it on `OrdersV1` and as a production REST read
-   (Lifecycle D-255). The seam trait `OrdersWorkflowSeamV1` this gear names (D-193) does not yet exist
+   (Lifecycle `bss/orders-stage4` D-255). The seam trait `OrdersWorkflowSeamV1` this gear names (D-193) does not yet exist
    in the Lifecycle SDK; the operation and its authorization (`order × read`) are the same.
 
 **Rationale**: Lifecycle's Stage 4 wave 3 makes the consent event real and moves the begin-
@@ -7282,7 +7301,7 @@ settled 503, which a status-based classifier would retry forever under the same 
 
 ### D-240 (M) Pending-payment continuation is specified as requirements and waits on the durable engine (Q-10)
 
-> **Amended by D-325 (2026-11-03)**: the rationale's citation is Lifecycle's final D-257. This gear also owns the payment-pending-age and Payments-outage alerts and the amended-`submitted` dwell signal against its own reflection lead time, which Lifecycle leaves to this gear (Lifecycle D-258 items 2, 4; D-266 item 2); their thresholds are set with the continuation and are open until then.
+> **Amended by D-325 (2026-11-03)**: the rationale's citation is Lifecycle's final `bss/orders-stage4` D-257. This gear also owns the payment-pending-age and Payments-outage alerts and the amended-`submitted` dwell signal against its own reflection lead time, which Lifecycle leaves to this gear (Lifecycle `bss/orders-stage4` D-258 items 2, 4; Lifecycle `bss/orders-stage4` D-266 item 2); their thresholds are set with the continuation and are open until then.
 
 **Accepted (2026-10-29).** *(mirrors Lifecycle Stage 4 S4-11; refines D-89, D-239)*
 
@@ -7301,14 +7320,14 @@ settled 503, which a status-based classifier would retry forever under the same 
 3. **No behaviour changes today.** The existing poll `wait` and wake-up arms stand as
    specified; this decision adds no operation, event or reason.
 
-**Rationale**: Lifecycle has no payment port and no timer (Lifecycle D-257), so the continuation is
+**Rationale**: Lifecycle has no payment port and no timer (Lifecycle `bss/orders-stage4` D-257), so the continuation is
 this gear's. Recording the contract now keeps Stage 4 from being read as having delivered it.
 
 **Propagated**: `design/04-fulfillment-plan.md` (*Pending-payment continuation*).
 
 ### D-241 (M) Lifecycle's PR #5536 review fixes are mirrored: stricter decodes, the committed-total scale, forward-only migrations and one item quantity per line
 
-**Accepted (2026-10-30).** *(mirrors Lifecycle D-244 and D-246 on Lifecycle's Stage 3 branch `bss/orders-stage3`, PR #5536; refines D-237)*
+**Accepted (2026-10-30).** *(mirrors Lifecycle D-244 and D-246 on `main`, merged with PR #5536; refines D-237)*
 
 **Decision**: one item per Lifecycle hand-off item. None changes a wire byte, a reason or a
 status this gear calls or answers.
@@ -7385,7 +7404,9 @@ parts this gear reads or shares.
 
 > **Amended by D-325 (2026-11-03)**: the rationale's last sentence no longer holds. Lifecycle's Stage 4 decisions are D-249…D-266 on `bss/orders-stage4` (they were D-241…D-250 when D-238…D-240 cited them, +8), so this gear's citations of them carry the final numbers (D-325 item 1); with Stage 3 at D-231…D-248 the two series do not overlap.
 
-**Accepted (2026-10-30).** *(mirrors Lifecycle D-247 on Lifecycle's Stage 3 branch `bss/orders-stage3`, PR #5536; refines D-237, D-241)*
+> **Amended by D-335 (2026-11-05)**: item 2 is the rule for this register: its citations of Lifecycle's Stage 3 decisions carry the new numbers whatever their date, D-237 (2026-10-27) included. Lifecycle D-247 item 2's rule that Workflow #4787 text written before 2026-10-30 uses the old numbers does not apply here, because Lifecycle D-247 item 4 moved those citations in the accompanying Workflow change; no Lifecycle document changes. Stage 3 is on `main`, merged with PR #5536, so D-237, D-241 and this entry no longer name the `bss/orders-stage3` branch.
+
+**Accepted (2026-10-30).** *(mirrors Lifecycle D-247 on `main`, merged with PR #5536; refines D-237, D-241)*
 
 **Decision**:
 
@@ -7489,6 +7510,8 @@ Documentation only; none of the peer SDKs exists yet.
 §4.4, §4.5; `design/06` §3.2, §3.6, §3.7, §4.8; `design/08` §1.1, §1.3, §2.1, §2.2, §3.1–§3.7, §4.4,
 §4.7, §4.8; `design/10` §3.3, §3.6 (a), (b), (e), §4.1; `ADR/0012`; `DESIGN.md` §1.2, §3.2;
 `UPSTREAM_REQS.md` §2.1, §2.4, §3.
+
+> **Amended by D-329 (2026-11-05)**: the Lifecycle key of `replace-fulfillment-grant` is `{tenant}:{orderId}:{orderVersion}:replace-fulfillment-grant:{predecessorGeneration}:{replaceAttempt}`; `replace_attempt` on the predecessor's `owf_fulfillment_grant` row advances only in the unit of work that settles a Lifecycle `grant-predecessor-unsettled`, so a refusal Lifecycle settles under its key is not replayed to every later round, while a crash replay keeps the key of the committed grant; a refused attempt authorizes nothing and Lifecycle's current-predecessor guard still allows one replacement per predecessor generation. The operation registers one 10 s `deadline_ms` (`design/05` §3.3, §3.6, §3.7; `design/01` §3.3).
 
 ### D-244 (M) An abandoned pause request is recovered by a fresh hold and a resume; cancel stays available
 
@@ -7999,6 +8022,8 @@ could route on; `04` still cited D-162's comparison, which Lifecycle D-190 super
 **Propagated**: `design/06` §3.6 (`inst-fence-cause`), §4.8; `design/04` §2.2, §3.6; `design/05`
 §3.3, §3.7; `design/07` §4.8 item 1; `design/10` §3.6 (b), §4.1, §4.6; D-194.
 
+> **Amended by D-330 (2026-11-05)**: a failed or unresolved line listed in the same answer as a typed verified expiry gets no task and is handed to the Incident Recorder by the fence under either policy (`design/06` §3.6 `inst-fence-failfast-incident`, `design/10` §3.6 (b), §4.1).
+
 ### D-258 (M) A terminally failed compensating intent counts toward the bound and is retried under a new compensation attempt
 
 > **Amended by D-280 (2026-11-02)**: the PRD's single key statement, AC 7j, slice 05's key text and the `SUB-O13` lookup tuple carry the `+c{comp_attempt}` tail.
@@ -8348,7 +8373,7 @@ gains `park_stage`; no new ask beyond the D-224 one, whose "exactly" list now na
 
 > **Amended by D-281 (2026-11-02)**: the unreadable-bar park reason is `barred-subjects-unavailable`, not `verdict-source-unavailable`; binding the `library` adapter is refused at configuration and readiness until `OrderVersionView` exposes `actors`.
 
-> **Amended by D-325 (2026-11-03)**: item 2's ask is answered. Lifecycle D-260 (implemented 2026-11-02 on `bss/orders-stage4`, `875084668`, not yet on `main`) adds required `OrderVersionView.actors { creator, submitter?, amender? }`, each `{ actor, actor_tenant_id }` as `VersionRecord` spells them: `creator` is version 1's pair, `submitter` the `submit` version's pair (absent on version 1), `amender` the requested version's own pair when its reason is `amendment`; a missing role row is an integration failure, never an absent member. `open-gates` takes `barred_subjects` from it. The D-281 readiness probe stays the gate for a `library` binding until a Lifecycle build carrying D-260 is deployed.
+> **Amended by D-325 (2026-11-03)**: item 2's ask is answered. Lifecycle `bss/orders-stage4` D-260 (implemented 2026-11-02 at `875084668`, not yet on `main`) adds required `OrderVersionView.actors { creator, submitter?, amender? }`, each `{ actor, actor_tenant_id }` as `VersionRecord` spells them: `creator` is version 1's pair, `submitter` the `submit` version's pair (absent on version 1), `amender` the requested version's own pair when its reason is `amendment`; a missing role row is an integration failure, never an absent member. `open-gates` takes `barred_subjects` from it. The D-281 readiness probe stays the gate for a `library` binding until a Lifecycle build carrying D-260 is deployed.
 
 **Accepted (2026-11-02).** *(macrocheese review finding #33; amends D-56; mirrors Lifecycle D-130 as amended by its D-146)*
 
@@ -8385,6 +8410,9 @@ from acceptance are the ones that authored the commercial content the gate appro
 > **Amended by D-283 (2026-11-02)**: the `binding-expired` plan state of `design/04` §4.3 is defined on the line's activation limit as well; ADR-0013's member list also names `failedTaskRefs` by its `{lineRef, reason}` element shape.
 
 > **Amended by D-269 (2026-11-02)**: item 3's count is now thirty-three tables (`owf_receiver_revoke`); item 8's re-check follows `inst-co-revoke`, whose revokes extend the committed fence and are not a submission it guards.
+
+> **Amended by D-334 (2026-11-05)**: item 4's branch qualifier is the one citation rule for Lifecycle's Stage 4 decisions: they are cited as Lifecycle `bss/orders-stage4` D-NNN in the live docs and in this register, and D-325 item 1's "Lifecycle" prefix is withdrawn.
+> **Amended by D-328 (2026-11-05)**: item 7's identity stands — the order, version and line ids built from the stored version, sent as the contract's `own_context` with payer and resource tenant — but the "one addition" is withdrawn: the re-check composes Lifecycle's protected decision unchanged over the literal counts and complete own-membership, and asks for no exclusion (`design/04` §3.6, `UPSTREAM_REQS.md` §2.1 `SUB-O5`).
 
 **Accepted (2026-11-02).** *(macrocheese review findings #22–#31; amends D-45, D-57, D-83, D-84, D-131, D-170, D-186, D-193, D-203, D-227, D-228, D-231, D-233, D-238, D-239, D-243; ADR-0005, ADR-0013)*
 
@@ -8742,6 +8770,8 @@ the way `failureScope` and `released` joined in D-144.
 > **Amended by D-312 (2026-11-03)**: item 2's per-instance gate holds only behaviour this gear starts; a protocol an upstream starts (Lifecycle staging a pause control) is gated in the upstream's enabling release release-wide on the drain evidence, with no pre-arm path.
 
 > **Amended by D-319 and D-320 (2026-11-03)**: the release-wide drain evidence is no non-terminal binding on a version lacking the arm, and a candidate, a rollback included, lacking an arm an enabled upstream protocol depends on is refused (D-319); this gear publishes the evidence as `protocol_arms_ready` and Lifecycle's enabling waits on it (D-320).
+
+> **Amended by D-333 (2026-11-05)**: the release-wide gate of an upstream-started protocol is withdrawn: Lifecycle gates it per order on `protocol_arms`, the arms the order's bound version carries, keeping its pre-arm path for an order whose instance lacks the arm; item 2's per-binding gate of this gear's own behaviour stands.
 
 **Accepted (2026-11-02).** *(macrocheese re-review finding R16; amends D-264)*
 
@@ -9625,6 +9655,8 @@ output), §3.6, §3.7 (`owf_fulfillment_grant` ownership); `design/06` §3.2, §
 
 > **Amended by D-313 (2026-11-03)**: item 2's derivation misses a paused predecessor that step 5 already rewrote `revoked`, so the claim "a resume always finds its predecessor recorded closed `paused`" was wrong; the rewrite now keeps the earlier state in `revoked_from`, and the derivation is closed `paused`, or `revoked` with `revoked_from = paused` → `resume`, otherwise → `replace`. Item 3's algorithm stores no attestation: `inst-rg-close` re-reads each receiver's under its unchanged close key on every run, and `inst-rg-call` re-checks the phase under the instance row lock before Lifecycle's call, answering `not-dispatchable` on `compensating`; the algorithm has its own `05 §3.6` subsection.
 
+> **Amended by D-329 (2026-11-05)**: the write order is unchanged, but `inst-rg-close` is bounded: it sends closes only while the remaining deadline strictly exceeds one close, one attestation read and the Lifecycle call (2 + 2 + 2 s), records each complete attestation on the predecessor's `receiver_closes`, and returns `predecessor-unsettled` with `nextRound` for any receiver left unattested or unsent; the Lifecycle key carries `replace_attempt` (`design/05` §3.3, §3.6).
+
 ### D-297 (L) The control intake reads the phase under the instance row lock
 
 **Accepted (2026-11-03).** *(macrocheese third review 5749410608, comment 4452626222; amends D-269)*
@@ -9767,6 +9799,8 @@ description), *Fixed waits and re-check loops*, §4.1 (Failure row); `design/07`
 (Incident Recorder), §3.3, §4.2, §4.3, §4.8 items 1 and 3; `design/06` §3.2
 (Cancellation-Fencing scope), §3.6 (`inst-fence-failfast-incident`, description); `design/04` §3.6,
 §4.4; D-285, D-290, D-295.
+
+> **Amended by D-330 (2026-11-05)**: item 3's "an intent past the sweep floor → `failFastUnwind`" is replaced: an intent past the sweep floor opens its line's task under either policy, as an unresolved refusal does (`sweepUnresolvedRefusal`, `failFastSweepTask`, `create-manual-task` step 3), and only a typed failure or a verified expiry routes to the unwind. Item 2's incident rule is widened: `inst-fence-failfast-incident` hands every failed or unresolved forward line with no open task to the Incident Recorder under `fail-fast`, and under `remediate` when the cause is an external activation or `order-binding-expired` from the guard or a verified expiry, which unwind under either policy with no task; the PRD exception reads "unless another line's failure ends the order in the same answer under either policy" (PRD §6.4, AC 9, AC 11).
 
 ### D-301 (L) The `invocation-dead` task's own routes: `retry` is the gateway's not-live branch, `cancel` is not offered; the re-drive condition is the platform's `retry` state
 
@@ -10199,6 +10233,8 @@ member could be copied into `nextStage`.
 
 > **Amended by D-319 and D-320 (2026-11-03)**: item 2's evidence tests the arm's presence — no non-terminal binding on a version lacking the arm — since a forward rollback is a newer version (D-319); the rationale's and consequences' "no new upstream ask" is withdrawn: this gear publishes the evidence as `protocol_arms_ready` on the progress read and Lifecycle's enabling is the `p2` ask `…-upreq-lifecycle-protocol-enable-on-arm-capability`, held by Lifecycle's release, not by this gear's confirmation (D-320).
 
+> **Amended by D-333 (2026-11-05)**: item 2 is superseded — an upstream-started protocol is no longer gated release-wide on the drain evidence, and a pre-arm path is kept: the upstream enables it per order when that order's `protocol_arms`, the declared arms its bound version's document carries, lists the arm. Item 1 and item 3 stand; the rationale's rule (a gate is held by the party that can read what it tests) is met by publishing the per-order value.
+
 **Accepted (2026-11-03).** *(macrocheese third review 5749410608, comment 4452627489; amends D-275)*
 
 **Context**: D-275 said the dependent behaviour "is gated per instance by its
@@ -10280,6 +10316,8 @@ output), §3.6 (new subsection, `inst-rg-close`, `inst-rg-call`, `inst-rg-record
 `inst-rg-recover`), §3.7 (`owf_fulfillment_grant` columns, ownership, mutability); `design/06`
 §3.2, §3.3 *Per-pass deadline*, §3.6 (`inst-co-revoke`, `inst-co-step5`); `DESIGN.md` §3.7;
 `UPSTREAM_REQS.md` §2.4 (`…-upreq-lifecycle-current-grant-read`); D-269, D-296, D-299.
+
+> **Amended by D-329 (2026-11-05)**: item 2 is reversed. Closure attestations are stored, not re-read: each receiver's complete attestation is written once on the predecessor row's `receiver_closes` and counts in every later round of that predecessor generation, so a roster larger than one deadline allows is closed across rounds; unattested receivers are sent least recently sent first. Item 3's phase re-check before Lifecycle's call still runs, and `inst-rg-record`'s closure and `inst-rg-recover`'s replay read the recorded attestations (`design/05` §3.6, §3.7).
 
 ### D-314 (L) A live read closes an open `invocation-dead` task by progress; a recorded order cancel starts the dead-instance unwind by design
 
@@ -10441,6 +10479,8 @@ wording elsewhere. No new reason, column, value, operation or routing/pinned mem
 
 > **Amended by D-323 (2026-11-03)**: the consequences' "no new … column, table" is withdrawn for the library binding: item 2's `decisionEventId` record has no store — the library's `approval_decision`, keyed (`unit_id`, `actor`, `generation`), holds no event id — so that record, item 3's reassignment read of `record-decision`'s settled answer, and the `order_version` subject accepting a second unit on the same `ref_id` after an applied one are Q-14 binding items, inert while the stand-in is bound. Item 1's route `not-assignee` is reachable only through the common inbox's future source adapter; item 2's `Contended` reaches AC 4a as `version-mismatch`; `approval-unit-divergence` is an anomaly, not a catalogue reason.
 
+> **Amended by D-332 (2026-11-05)**: item 1's "until the named-user condition lands" is replaced — the route's guards, `not-assignee` included, stay permanently as a second check in front of the library, also once the library carries the criterion. Item 2's mapping changes in three places: `GenerationMismatch` is a breach with `Refreshed` (`Internal`, 500, counted `approval-unit-divergence`), no longer `stale-generation`, since only a committed refresh moves the unit generation the adapter recorded; `Db` (seen by the retry classifier through `db_err()`) and a failure of the subject's `collect` are infrastructure errors — rolled back, answered by `01 §4.9`'s mapping (503 when transient, retried under the same key), never counted; and the library's typed refusal of a non-assignee, once the criterion lands with it, is `not-assignee` (403).
+
 **Accepted (2026-11-03).** *(independent check of D-296..D-312 at de28b2498, findings D-N1, D-N2, D-N3; amends D-282, D-286, D-308; refines Q-14)*
 
 **Context**: D-308 assumed that `record-decision` closes every decision the inbox captures, but it
@@ -10509,6 +10549,8 @@ table or PDP pair; the 01 reason count is unchanged.
 
 > **Amended by D-323 (2026-11-03)**: item 2's "once an upstream protocol is enabled" is replaced — this gear cannot see the upstream's enabling — by "from the moment a release declares the arm" (step (2) of `10 §4.3` item 2); a candidate dropping a declared arm is no rollback target, and the fix goes forward.
 
+> **Amended by D-333 (2026-11-05)**: item 1's drain evidence is withdrawn with the release-wide gate; its test of presence stays as the definition of *carries* — a version carries an arm when its document calls the operation the release configuration's declared-arm set names for it — applied by the publish job to a candidate and by the progress read to a bound version. Item 2's refusal stays, now so that new orders start on versions carrying every declared arm.
+
 **Accepted (2026-11-03).** *(independent check of D-296..D-312 at de28b2498, finding D-N4 and the D-311 nit; amends D-312, D-275, D-311)*
 
 **Context**: D-312's release-wide drain evidence was "no non-terminal `owf_definition_binding` on
@@ -10541,6 +10583,8 @@ rollbacks go forward.
 ### D-320 (L) This gear publishes the drain evidence as `protocol_arms_ready`; Lifecycle enables an upstream-started protocol only after reading it
 
 > **Amended by D-323 (2026-11-03)**: item 1's "as the readiness check last computed it" is replaced: `protocol_arms_ready` is computed on each read from the release configuration's declared-arm set and the non-terminal bindings, with no stored copy, so every replica answers the same; it never drops a listed arm, since the job refuses every arm-less candidate from the declaration on; Lifecycle reads it on the order it stages the control for.
+
+> **Amended by D-333 (2026-11-05)**: item 1's gear-wide `protocol_arms_ready` is replaced by the per-order `protocol_arms` on the same read and projection (`Gc` only): the declared arms that the document of the order's bound version carries, read from that order's binding and the platform registry under this gear's service identity, empty for an order with no bound instance; item 2's ask becomes per order — Lifecycle enables the protocol for an order only when its `protocol_arms` lists the arm and keeps its pre-arm path otherwise; item 3's confirmation checks the per-order value.
 
 **Accepted (2026-11-03).** *(independent check of D-296..D-312 at de28b2498, finding D-N5; amends D-312)*
 
@@ -10619,6 +10663,8 @@ operation or routing member.
 (`recheck_ladder_seq`, `recheck_defer_count`, `recheck_first_defer_at`,
 `recheck_readiness_first_unavailable_at`), §4.6, §4.8 item 4; `design/10` §3.6 (`recheck` policy
 comment, `sweptSlaCheck`); D-316, D-317.
+
+> **Amended by D-326 (2026-11-05)**: item 2's breaker case is narrowed: a breaker refusal or call deadline of the identity or occupancy port is that port's `defer` on step 4's ladder, and of the readiness port an unavailable read on step 7's (Lifecycle `inst-rc-if-identity-unavailable`, `inst-rc-if-occupancy-unavailable`); only a cut of the operation's own 10 s deadline and a Lifecycle read's breaker refusal stay ladder-neutral and can still fault. Item 1's round entry also resets when `recheck_ladder_seq` equals `evaluationSeq` but a ladder stamp is older than the `recheck` policy's 120 s: a platform re-drive resumes the faulted round under the same `evaluationSeq`, so the rationale's "a round's identity is its key's `evaluationSeq`" holds for one run of the round, not across a re-drive.
 
 ### D-322 (L) A re-drive is refused while an order cancel is recorded; the gateway's live read closes nothing; `auto-closed` finality has the D-314 exception; a reopen keeps the escalation stamps
 
@@ -10723,6 +10769,8 @@ today.
 `design/09` §4.1 (decision row), §4.5 (`protocol_arms_ready`); `design/10` §4.2 (*Rollback*,
 *Bound versions*), §4.3 item 2, §4.7; `ADR/0012` (*Confirmation*); Q-14; D-318, D-319, D-320.
 
+> **Amended by D-332 and D-333 (2026-11-05)**: item 6's route `not-assignee` stays permanently as a second check in front of the library, also once the library carries the named-user criterion, whose typed refusal of a non-assignee maps to `not-assignee` (403) (D-332). Items 1 and 2 are replaced: the gear-wide `protocol_arms_ready` is withdrawn for a per-order `protocol_arms` — the declared arms the order's bound version's document carries, fixed for the binding's life, so nothing is latched, drained or scanned across tenants; the publish job's refusal of an arm-less candidate from the declaration on stays, so new orders start on versions carrying every declared arm (D-333).
+
 ### D-324 (L) An unresolved activation refusal no manual task covers is listed by every definition-called round until one does
 
 **Accepted (2026-11-03).** *(independent check of D-321..D-323 at dbd486d11, the fail-fast sweep's ceiling edge, marked uncertain and confirmed; amends D-125, D-300, D-317)*
@@ -10788,23 +10836,23 @@ Workflow statements also predate Stage 4's final review.
 1. **Final numbers.** Every citation of a Lifecycle Stage 4 decision uses D-249…D-266, prefixed
    "Lifecycle" where a bare number would read as this gear's (D-238, D-239, D-240 and their D-325
    notes; D-242's rationale amended). Stage 3 citations (D-231…D-248) are unchanged.
-2. **The settled 503 needs an admissible snapshot** (Lifecycle D-257 item 9). Lifecycle settles
+2. **The settled 503 needs an admissible snapshot** (Lifecycle `bss/orders-stage4` D-257 item 9). Lifecycle settles
    `acceptance-requirement-unevaluable` only when the order was `approved` at its snapshot; a
    snapshot-to-lock race (this gear's approval reflection committing in between) is decided once
    more by Lifecycle, and a second race answers `unavailable`, unsettled, which
    `inst-bf-if-transient` retries under the same key (`design/04` `inst-bf-if-withheld`).
-3. **The outcome presented** (Lifecycle D-257 items 2, 10). `AuthorizationOutcome` is exactly
+3. **The outcome presented** (Lifecycle `bss/orders-stage4` D-257 items 2, 10). `AuthorizationOutcome` is exactly
    `{ outcome: authorized | pending | failed }`; the refusal reason stays in `readiness_reason`.
    `inst-bf-call` maps the `readiness` of the `eligibilitySeq` answer (`not-required`, `satisfied`
    → `authorized`; `refused` → `failed`), never the re-check-overwritten `payment_auth_outcome`,
    so a same-key retry presents one outcome; Lifecycle's Stage 5 route fingerprints it, and its
    `idempotency-mismatch` settles `permanent-failure` `idempotency-key-conflict`
    (`inst-bf-if-key-mismatch`).
-4. **Acceptance is Lifecycle's guard only** (Lifecycle D-257 items 3, 5). PRD §6.3 no longer says
+4. **Acceptance is Lifecycle's guard only** (Lifecycle `bss/orders-stage4` D-257 items 3, 5). PRD §6.3 no longer says
    acceptance "MUST be satisfied before the call": Lifecycle evaluates it under its lock, this gear
-   neither reads nor gates on it, and `get_acceptance` (production, Lifecycle D-255) is not read.
+   neither reads nor gates on it, and `get_acceptance` (production, Lifecycle `bss/orders-stage4` D-255) is not read.
    The tolerance election order is stated: seller, then platform, unset not tolerated.
-5. **Delivery scope** (Lifecycle `DESIGN.md` *Stage 4 readiness register*, D-235, D-254, D-256,
+5. **Delivery scope** (Lifecycle `DESIGN.md` *Stage 4 readiness register*, D-235; `bss/orders-stage4` D-254, D-256,
    D-257 item 1, D-266). Amend, submit and record-acceptance are development-delivered only;
    `begin_fulfillment` has no route and is engine-only until Stage 5; the history reads and the
    administrative edit are production. D-266's prerequisites (the consent election read ahead of
@@ -10812,24 +10860,24 @@ Workflow statements also predate Stage 4's final review.
    this gear never calls.
 6. **Wire member names.** Event members are camelCase (`acceptedVersion`, `acceptedAt`,
    `recordingActor`, `requirementSource`, `supersedesVersion`); snake_case is the SDK field name.
-7. **The version read as delivered** (Lifecycle D-260, D-262, D-263). `OrderVersionView` carries
+7. **The version read as delivered** (Lifecycle `bss/orders-stage4` D-260, D-262, D-263). `OrderVersionView` carries
    `reason`, `actor`, `actor_tenant_id`, `created_at`, `amendment_reason?`,
    `supersedes_version?`, `header { category, resource_tenant_id, seller_tenant_id,
    payer_tenant_id, contract_id?, market? }` at that version, `actors { creator, submitter?,
    amender? }` and the order's current `admin` projection (readable by every `order × read`
    principal, current not historical). `construct-and-freeze-plan` reads market and payer from
    `header`; `open-gates` reads `barred_subjects` from `actors`. The read DTOs tolerate unknown
-   members (Lifecycle D-262 item 8), so this gear's SDK decode survives a newer Lifecycle in a
+   members (Lifecycle `bss/orders-stage4` D-262 item 8), so this gear's SDK decode survives a newer Lifecycle in a
    rolling deploy.
-8. **Asks.** `…-upreq-lifecycle-version-actors` is answered by Lifecycle D-260 (implemented,
+8. **Asks.** `…-upreq-lifecycle-version-actors` is answered by Lifecycle `bss/orders-stage4` D-260 (implemented,
    unmerged); D-281's probe still gates a `library` binding until a build carrying it is deployed.
-   `…-upreq-lifecycle-control-supersede-by-revoke` (Lifecycle D-259) and
-   `…-upreq-lifecycle-order-read-pre-hold-state` (Lifecycle D-261) stay open: designed, not
+   `…-upreq-lifecycle-control-supersede-by-revoke` (Lifecycle `bss/orders-stage4` D-259) and
+   `…-upreq-lifecycle-order-read-pre-hold-state` (Lifecycle `bss/orders-stage4` D-261) stay open: designed, not
    implemented.
-9. **Alerts this gear owns** (Lifecycle D-258 items 2, 4; D-266 item 2). Payment-pending age,
+9. **Alerts this gear owns** (Lifecycle `bss/orders-stage4` D-258 items 2, 4; Lifecycle `bss/orders-stage4` D-266 item 2). Payment-pending age,
    Payments outage, and the amended-`submitted` dwell against this gear's reflection lead time
    (`design/04` §2.1 continuation item 9); thresholds open with the continuation.
-10. **No change needed.** Lifecycle D-264's refusal `context.data` (`amendment-cap-exhausted`
+10. **No change needed.** Lifecycle `bss/orders-stage4` D-264's refusal `context.data` (`amendment-cap-exhausted`
     `{cap, amendment_count}`, `administrative-field-in-amendment` `{field, use}`) and D-265's
     prerequisite-outage 503s (e.g. `identity-party-unavailable` instead of a 500) belong to submit
     and amendment, which reach none of this gear's calls, so no refusal table changes; this gear
@@ -10852,6 +10900,526 @@ item; no new reason, column, operation or ask.
 `inst-bf-call`, `inst-bf-if-withheld`, `inst-bf-if-key-mismatch`), §3.7 (`payment_auth_outcome`,
 `begin_fulfillment_auth_outcome`); `UPSTREAM_REQS.md` §2.4 (thin-events residual,
 supersede-by-revoke, pre-hold state, version actors), §3; D-238, D-239, D-240, D-242, D-267.
+
+> **Amended by D-334 (2026-11-05)**: item 1's rule is replaced by D-268 item 4's branch qualifier: a Lifecycle Stage 4 decision is cited as Lifecycle `bss/orders-stage4` D-NNN, never as a bare or only "Lifecycle"-prefixed number, because `main`'s Lifecycle register ends at D-248 and Stage 4 may renumber again when it merges; item 1's text stays as the record, and the other items now carry the qualifier. Item 8 gains `header`: like `actors` it exists only on `bss/orders-stage4` (Lifecycle `bss/orders-stage4` D-262), and because `construct-and-freeze-plan` reads every order's market and payer from it, the gear is not ready until a startup probe of `get_version` or a declared SDK capability shows it (`design/01` §3.8, `design/04` `inst-pc-read-order`).
+
+
+### D-326 (L) A port's breaker refusal or call deadline counts on that port's re-check ladder; a re-drive of a faulted re-check starts a fresh ladder
+
+**Accepted (2026-11-05).** *(PR #4787 fourth review; amends D-321 items 1–2; relates to D-306, D-316, D-272)*
+
+**Context**: D-321 item 2 made every breaker-refused re-check attempt ladder-neutral: it spends a
+`recheck` attempt and, once the five are spent, faults the invocation to `invocation-dead`. A
+breaker stays open 60 s (`design/01` §4.5) and five refusals 10 s apart take about 40 s, so an
+identity or occupancy outage faulted every order reaching the re-check. That contradicted step 7
+of the same operation (an open readiness circuit has its own ladder ending in `not-dispatchable`)
+and Lifecycle's algorithm, which step 2 composes unchanged: a port that is unavailable or whose
+deadline elapsed is `defer` (Lifecycle `03-gate-and-pin.md` `inst-rc-if-identity-unavailable`,
+`inst-rc-if-occupancy-unavailable`). Separately, D-321's round entry resets the ladders only when
+`recheck_ladder_seq` ≠ `evaluationSeq`. A platform re-drive resumes the faulted task with the same
+input (`design/01` §3.8, D-192), so the same `evaluationSeq`, and it inherited the old ladder: the
+first defer after a re-drive hours later found more than 60 s since `recheck_first_defer_at` and
+aborted `overlap-read-unevaluable`. No per-attempt identity tells a re-drive apart (the interim
+`attemptId` is `{invocationId}:{taskReference}`, `design/01` §3.3).
+
+**Decision**:
+1. **Port outages are ladder answers.** A call to the identity or overlap-occupancy port that
+   that port's open breaker refuses, or that its call deadline ends while the attempt can still
+   commit, is that port's `defer` on step 4's ladder. For the readiness port it is an unavailable
+   read on step 7's ladder. Only two answers stay ladder-neutral and spend a `recheck` attempt: a
+   cut of the operation's own 10 s deadline, whose unit of work cannot commit a count, and a
+   breaker refusal of a Lifecycle read (`get`, `get_version`), which has no ladder of its own. A
+   Lifecycle outage can therefore still fault the invocation into `invocation-dead`.
+   `design/01` §4.5's "MUST NOT count it as a downstream attempt" gains "except where an
+   operation's own ladder counts it".
+2. **Re-drive resets the ladder.** The round entry (step 1) also resets when `recheck_ladder_seq`
+   equals `evaluationSeq` and `recheck_first_defer_at` or `recheck_readiness_first_unavailable_at`
+   is older than the `recheck` retry policy's total duration (120 s, `design/10` §3.6). Every
+   attempt of one round falls inside that duration, so an older stamp under the same
+   `evaluationSeq` can only be a re-drive. The policy's duration **MUST NOT** exceed 120 s
+   (`design/04` §4.8 item 4). The threshold is not the ladder's 60 s, because a 60 s reset would
+   restart the ladder inside a round and defeat step 4's 60 s abort. No new column.
+
+**Rationale**: Lifecycle's algorithm is what this gear claims to compose, and it treats an
+unavailable or timed-out port as `defer`. Step 7 already does this for readiness (D-272), so the
+fix applies the same rule to all three ports. The whole-operation deadline cut stays neutral
+because nothing can be committed in it. The Lifecycle read breaker stays neutral because the
+algorithm gives that read no ladder. For the re-drive, the plan row already stores the stamps, and
+the retry policy bounds a round's wall time. The age of a stamp is therefore enough to tell a
+re-drive apart, with no new column and no gateway port (the D-302 alternative).
+
+**Consequences**: an identity or occupancy outage now aborts after the defer ladder (3 defers
+within 60 s) with that port's reason, `identity-party-unavailable` or `overlap-read-unevaluable`.
+This matches Lifecycle; before this change the invocation faulted. A readiness outage reaches
+`not-dispatchable` / `readiness-unavailable`. One new constraint on the definition: the `recheck`
+policy duration is at most 120 s. No new reason, column, operation or ask.
+
+**Propagated**: `design/04` §3.6 (`inst-rc-if-spawned`, `inst-rc-if-defer`, `inst-rc-if-stale`),
+§3.7 (`recheck_defer_count`, `recheck_first_defer_at`, `recheck_readiness_first_unavailable_at`,
+`recheck_ladder_seq`), §4.6 (re-check defer ladder row), §4.8 item 4; `design/10` §3.6 (`recheck`
+policy comment); `design/01` §4.5 (*Circuit breakers*); D-321 (note).
+
+### D-327 (L) The re-check's overlap keys come from `overlap_item_keys`, and `get_version` must carry them
+
+**Accepted (2026-11-05).** *(PR #4787 fourth review; amends D-193 item (2), D-237 item 5)*
+
+**Context**: step 2 of `re-check-pre-activation` read "each line's stored `overlap_scope_key`".
+Merged Lifecycle reads the `overlap_scope_key` values of `orders_order_line.overlap_item_keys`, and
+the scalar only for a legacy row whose collection is NULL. Mixed or malformed evidence defers
+(Lifecycle `03-gate-and-pin.md` `inst-rc-reread-overlap`). New collection rows keep the scalar NULL
+(`SUBSCRIPTIONS_CONTRACT.md`). A new line therefore looked keyless to this gear: the occupancy
+read was skipped and the check failed open, which bypassed the §4.7 SUB-O5 fail-closed seam.
+`overlap_item_keys` did not appear anywhere in the Workflow set. Verification went further than
+the finding. Neither `main`'s nor the Stage 4 `OrderVersionView` carries any overlap evidence: in
+Stage 4 `orders-sdk` `reads.rs` the lines are `DraftLine`, and their committed members are
+`commercial_attempt_id` and `order_pin`. D-193 (2)'s claim that `get_version` carries "the
+overlap keys" was never backed.
+
+**Decision**:
+1. **Which keys.** A line's keys are the `overlap_scope_key` values of its `overlap_item_keys` at
+   the version. The scalar `overlap_scope_key` is used only for a legacy row whose collection is
+   NULL. `[]` is keyless and needs no read. Mixed or malformed evidence, or a version answer that
+   omits the member, is a `defer` on step 4's ladder that ends in `overlap-read-unevaluable`. It
+   is never read as keyless.
+2. **Where from.** A new upstream ask, `cpt-cf-bss-orders-workflow-upreq-lifecycle-version-overlap-keys`
+   (`p1`, `UPSTREAM_REQS.md` §2.4): `OrderVersionView` carries each line's `overlap_item_keys`, and
+   the legacy scalar, at that version. D-193's rule stands: the keys come from the version read,
+   never from the current read. Option (b), a composed `get` with a version-equality check, was
+   rejected.
+3. **Readiness.** Item 11 of the `design/01` §3.8 release gate: readiness is refused until a
+   startup probe of `get_version` or a declared SDK capability shows the member. This is the same
+   mechanism as the D-281 `actors` check and the D-325 item 8 precedent. Until a build carries the
+   member, any re-check that does run defers fail-closed, the same posture as the §4.7 SUB-O5 seam.
+
+**Rationale**: the re-check claims to compose Lifecycle's algorithm unchanged, so it must read the
+same evidence. Asking the producer for the field on the version read keeps the D-193 boundary. A
+readiness gate keeps a build without the field from ever reading a new line as keyless.
+
+**Consequences**: one new upstream ask (Lifecycle, Stage 4 `OrderVersionView`) and one new
+release-gate item (`design/01` §3.8 item 11). No new reason (`overlap-read-unevaluable` exists), no
+new column and no new operation.
+
+**Propagated**: `design/04` §3.6 (`inst-rc-compose-lifecycle`), §3.7 (*A line's overlap keys*),
+§4.7 (a); `design/01` §3.8 (item 11); `UPSTREAM_REQS.md` §2.1 (overlap-presence read, key storage),
+§2.4 (new ask; thin-events dependency note), §2.5, §3 (priority row); `DESIGN.md` §3.4 (Orders
+Lifecycle row); D-193, D-237 (notes).
+
+### D-328 (L) The own-reservation clause is restated in the merged contract's terms: literal counts plus own-membership, never a subtraction
+
+**Accepted (2026-11-05).** *(PR #4787 fourth review; amends D-227, D-237 items 3 and 6, D-268 item 7)*
+
+**Context**: the `SUB-O5` clause (D-227, re-keyed by D-268) asked Subscriptions to exclude the
+acquisition's own reservation from the reported occupancy. `design/04` step 2 composed Lifecycle's
+algorithm "with one addition", that exclusion. The contract merged with #5536
+(`SUBSCRIPTIONS_CONTRACT.md`, adopted by Lifecycle D-242) keeps three literal counts. It returns
+complete own-membership beside them (`OwnRight { claim_id, line_id, state }`) and calls "aggregate
+subtraction of reserved count" unsafe. It also lets zero new demand convert above a lowered limit.
+Under the protected profile the two gears disagreed. Example: one other active subscription, this
+order's reservation as the second right, and the limit lowered to 1. The clause aborted
+`overlap-collision` (1 + 1 > 1). The contract converts the right.
+
+**Decision**:
+1. **The read.** The read takes `own_context`: order id, version, payer, resource tenant and every
+   relevant line id, built from the stored version (D-268's identity). It returns the three
+   literal counts unchanged plus complete own-membership (`complete = true`). It never subtracts.
+2. **The decision is Lifecycle's, unchanged.**
+   - New demand is the order's pending lines on the key that have no `order_reserved` own right.
+   - Zero new demand converts, even above a lowered limit.
+   - Positive new demand needs active + retained suspended + reserved + new ≤
+     `max_concurrent_active`.
+   - An own right in `active` or `retained_suspended`, or incomplete or malformed membership, is
+     unevaluable (`defer`).
+3. **No addition.** `design/04` step 2 drops "one addition, the own-reservation exclusion" and the
+   "occupancy that names only those tuples is no collision" rule.
+4. **Conformance.** Version 1 (`activation-recheck-v1.json`) applies to a legacy-profile answer and
+   `activation-recheck-v2.json` to a `protected_full_tuple_v1` answer.
+5. **Status.** The protected-purchase ask reads "adopted by Lifecycle D-242 (`main`); Subscriptions
+   ratification open". Lifecycle claims no bilateral agreement.
+
+**Rationale**: the reviewer's sequence is a real divergence on a paid, protected purchase.
+Subscriptions will implement the contract, so an exclusion this gear asks for would never be
+delivered. Composing Lifecycle's decision over the contract's answer keeps both gears on one
+predicate.
+
+**Consequences**: none (no new reason, column, operation or ask; the existing `SUB-O5` clause and
+protected-purchase ask are reworded).
+
+**Propagated**: `design/04` §3.6 (`inst-rc-compose-lifecycle`); `UPSTREAM_REQS.md` §2.1 (`SUB-O5`
+own-rights clause), §2.2 (protected purchase: body, *What this gear needs*, agreement status,
+source); D-227, D-237, D-268 (notes); D-227 index row.
+
+### D-329 (L) Replacement grant: an attempt in Lifecycle's key, one registered deadline, closure attestations kept across rounds
+
+**Accepted (2026-11-05).** *(PR #4787 fourth review; amends D-243, D-296, D-313)*
+
+**Context**: Lifecycle settles `grant-predecessor-unsettled` as a registered business refusal with
+ordinary idempotency settlement: the same key and fingerprint replays the stored result (Lifecycle
+`DESIGN.md` *Internal draft-rebuild continuation (D-201)*). This gear's Lifecycle key for
+`replace-fulfillment-grant` was `{tenant}:{orderId}:{orderVersion}:replace-fulfillment-grant:{predecessorGeneration}`,
+with no round, while `nextRound` changed only the step key. So after one refusal every later round
+replayed it, or met a fingerprint conflict once the closure proof changed: wave 2 never resumed
+and no task was raised, because `predecessor-unsettled` is a settled success. The operation's
+`deadline` also read "10 s per outbound call; one call per receiver, then one Lifecycle call". That
+is not one `deadline_ms` that `01 §3.3` can register or `10 §2.2` rule 4 can check, and with N
+receivers one attempt could take (N + 1) × 10 s against the 3-minute `step` timeout. D-313 item 2
+re-read every receiver's attestation on every run, so a roster larger than one deadline could
+never be closed.
+
+**Decision**:
+
+1. **Attempt in the key.** The Lifecycle key is
+   `{tenant}:{orderId}:{orderVersion}:replace-fulfillment-grant:{predecessorGeneration}:{replaceAttempt}`.
+   `replace_attempt` (integer NOT NULL, default 0) sits on the predecessor's `owf_fulfillment_grant`
+   row. It advances by one only in the unit of work that settles a Lifecycle
+   `grant-predecessor-unsettled` (`inst-rg-call`), never on a crash, a timeout or an unavailable
+   Lifecycle. So `inst-rg-recover` presents the key whose stored outcome holds the committed grant.
+   A refused attempt authorizes nothing, and Lifecycle's current-predecessor guard still allows one
+   replacement per predecessor generation. Lifecycle defines no key format, so nothing is asked of
+   Lifecycle.
+2. **One registered deadline.** `deadline` is 10 s, the dispatch-operation baseline of `01 §4.2`,
+   registered as one `deadline_ms`. The per-call budgets inside it, beside D-299's, are 2 s for a
+   receiver close, 2 s for a receiver attestation read and 2 s for the Lifecycle call.
+   `inst-rg-close` sends to a receiver only while the remaining deadline strictly exceeds one close,
+   one attestation read and the Lifecycle call (2 + 2 + 2 s). It visits never-sent receivers first,
+   then the rest in ascending last send. Any receiver left unattested or unsent returns
+   `predecessor-unsettled` with `nextRound` (the `inst-co-revoke` precedent, D-299, D-313).
+3. **Attestations kept across rounds (reverses D-313 item 2).** The predecessor row gains
+   `receiver_closes` (jsonb NOT NULL, default `{}`), keyed by `receiver_ref`. Each entry holds the
+   last close sent and, once the receiver marks it complete, its closure attestation for that
+   generation with `attested_at`. The attestation is written once per `replace_attempt` and counts
+   in every later round of that attempt because it belongs to that predecessor row and generation.
+   The unit of work that advances `replace_attempt` on a settled `grant-predecessor-unsettled`
+   clears the recorded attestations (last sends kept): Lifecycle refuses for a missing, incomplete
+   or uncertain closure and re-validates the peer evidence at commit, so a refused attempt's proof
+   is re-read, never resent. It is the closure proof of
+   `inst-rg-call` and the evidence of `inst-rg-record`'s `closed_at`. The phase re-check before
+   Lifecycle's call (D-313 item 3) still runs.
+
+4. **The same deadline for `settle-receiver-pause`** (`design/08` §3.3, same class). Its
+   "10 s per outbound call" is registered the same way: one 10 s `deadline_ms`, a receiver pause
+   command, an attestation read and the Lifecycle report at 2 s each, and `inst-rp-fanout` sends
+   only while 2 + 2 + 2 s remain; a receiver the budget did not reach stays unattested and the
+   operation answers `pending` under `nextRound`, as it already does for an unavailable one. Its
+   attestations already persist across rounds (`owf_fulfillment_control.attestations`), which now
+   also keeps each receiver's last send for that order.
+
+**Rationale**: a refusal Lifecycle settles under a key cannot be retried under the same key. The
+gear owns the key, so the gear-side attempt counter is the remedy, as `wave_attempt` (D-119) and
+`comp_attempt` (D-258) are for Subscriptions keys. One registered deadline is what the nesting
+invariant checks. Stored write-once attestations let a large roster close over several bounded
+rounds instead of never.
+
+**Consequences**: two columns on `owf_fulfillment_grant` (`replace_attempt`, `receiver_closes`),
+with ownership and mutability stated. The Lifecycle key family changes. There is no new reason,
+operation, table or upstream ask; `UPSTREAM_REQS.md` §2.4 gains a note that this changes nothing
+for Lifecycle.
+
+**Propagated**: `design/08` §3.3 (`settle-receiver-pause` `deadline`), §3.6 (`inst-rp-fanout`), §3.7 (`owf_fulfillment_control.attestations` last send); `design/05` §3.3 (`replace-fulfillment-grant` `output`, `idempotency_key`,
+`deadline`), §3.6 (*Wave-1 Rebuild* sequence, `inst-rg-close`, `inst-rg-call`, `inst-rg-record`,
+`inst-rg-recover`), §3.7 (`owf_fulfillment_grant` columns, ownership, mutability); `design/01`
+§3.3 (key families); `design/10` §3.6 (b) (`onReplaceGrant` comment); `DESIGN.md` §3.7;
+`UPSTREAM_REQS.md` §2.4 (Replacement SDK); D-243, D-296, D-313.
+
+### D-330 (L) Unresolved lines when the order unwinds: a sweep-floor intent gets its task under either policy; a taskless line of an either-policy unwind gets the incident
+
+**Accepted (2026-11-05).** *(PR #4787 fourth review; amends D-300, D-233, D-257)*
+
+**Context**: Three gaps were found.
+
+- **Fail-fast sweep floor.** Under `fail-fast` an intent past the sweep floor, recorded
+  `unresolved` and listed in `unresolved[]` (`05 §3.6` `inst-ri-ladder`), was routed to
+  `failFastUnwind`. That happened through `onFailFastSweep`'s `typedFailure` case (D-300 item 3),
+  and on the main path through `sweepFailure`'s `lineTask` with `forceTask` unset. The fence's
+  `failure` causes have no entry for it, so `inst-fence-cause` refused `not-found` and the
+  invocation faulted. The PRD already says an outcome still unknown at the sweep budget "MUST
+  become unresolved and raise a line manual task" (`fr-owf-intent-sweep`, AC at PRD §12).
+- **Mixed answer under `remediate`.** `externallyActivated` and `verifiedExpiry` route to the
+  unwind under either policy with no task, and `inst-fence-failfast-incident` ran only under
+  `fail-fast`. So under `remediate` a line refused in the same answer, unresolved or even typed,
+  got neither a task nor an incident. That breaks PRD AC 11's zero-silent-failures rule.
+- **Exit list and flowchart.** PRD §6.4's exit list for an unresolved refusal omitted "another
+  line's task exhausted under `remediate`". The §17.1 flowchart had no unresolved-refusal task.
+
+**Decision**:
+
+1. **Sweep floor → a line task under either policy.** `sweepFailure`'s `unresolvedOnly` case
+   (forcing the task) is taken whenever no entry of `failed[]` is a typed failure, whether or not
+   `unresolved[]` is empty. `onFailFastSweep` sends only a typed failure or a verified expiry to
+   `failFastUnwind`. Unresolved refusals and sweep-floor intents go to `failFastSweepTask`, whose
+   subjects now include `unresolved[]` (`intent-unresolved`, `sweep-floor-reached`).
+   `create-manual-task` step 3 admits `intent-unresolved` under `fail-fast`. This amends D-300
+   item 3; the fence gains no cause.
+2. **Incident for a taskless line of any failure unwind.** `inst-fence-failfast-incident` (fence
+   step 5) hands to the Incident Recorder each forward line that is failed, or whose current
+   forward intent is recorded `unresolved`, and that has no open manual task. Under `fail-fast`
+   this applies always. Under `remediate` it applies only when the record holds a cause the
+   definition unwinds under either policy with no task: `draft-activated-externally`, or
+   `order-binding-expired` from the guard or a verified expiry. A line with an open task keeps it
+   and gets no incident (D-300 item 2). The D-300 precedent: "a line … which never got its task,
+   gets the incident entry".
+3. **PRD.** The exception in §6.4 and AC 9 / AC 11 now reads "unless another line's failure ends
+   the order in the same answer under either policy, in which case the line gets the incident
+   entry". The exit list gains "by the failure unwind another line starts — its typed failure
+   under fail-fast, its task exhausted under remediate, or its external activation or verified
+   expiry under either policy", matching `04 §3.6`, `04 §4.2` and
+   `07 §4.2`. In the §17.1 flowchart, `PERM_FAIL` branches on "Unresolved refusal" to an
+   either-policy, never-exhausted line task, with edges to `RESUME` and `ABORT`. This is stated
+   wherever the general failure rule is (D-304).
+4. **The deferred-failure routes too** (`design/10` §3.6 (b), (c), same class). `heldPollFailure`
+   and `resumeFailure` take `apply-resume`'s deferred `failedTaskRefs`, which carry
+   `intent-unresolved` lines past the sweep floor; when every deferred line is one, they set
+   `forceTask` as `sweepFailure`'s `unresolvedOnly` does, so a fail-fast order opens the task
+   instead of reaching a fence with no cause.
+
+**Rationale**: the PRD already requires a task for a sweep-floor intent, so routing it to a fence
+that has no cause for it was a fault, not a policy. Under either policy, a line whose failure the
+order's unwind overtook must still be visible, and the incident is the object the ADR gives a line
+with no task.
+
+**Consequences**: two `switch` conditions and one `set` changed in `design/10`. The fence step's
+policy guard is widened. `create-manual-task` step 3 admits one more reason under `fail-fast`.
+There is no new reason, cause, column, operation or routing member.
+
+**Propagated**: `design/10` §3.6 (`heldPollFailure`, `resumeFailure`); `PRD.md` §6.4, §12 (AC 9, AC 11), §17.1; `DESIGN.md` §1.2; `design/06` §3.2
+(Cancellation-Fencing scope and dependencies), §3.6 (`inst-fence-failfast-incident`); `design/07`
+§3.1 (`Incident`, relationships), §3.2 (diagram, Incident Recorder, related components), §3.3
+(creation-port prose), §3.6 (`create-manual-task` `inst-cmt-policy`), §4.7, §4.8 item 1; `design/10`
+§3.6 (b) (`sweepFailure`, `sweepUnresolvedRefusal`, `onWave2` comments), (c) (`afterResolution`,
+`onFailFastSweep`, `failFastSweepTask`, description), §4.1 (Failure row); D-233, D-257, D-300.
+
+### D-331 (L) Generic task intake refuses while the invocation is not live
+
+**Accepted (2026-11-05).** *(PR #4787 fourth review; cites D-301, D-302, D-322)*
+
+**Context**: D-301 and D-302 routed the `invocation-dead` task's own `retry` to the gateway's
+not-live branch. The forward and compensation tasks of a dead instance still used the generic
+intake, which writes an `owf_task_resolution_request` row and signals `task-resolution-requested`
+with no liveness check. The signal goes nowhere. The `requested` row is settled only by
+`resolve-manual-task`, `verify-override`, the closure port or the re-drive settlement port, so
+after a re-drive the one-pending-request index (`inst-r7-one-request`) refuses every new request
+on that task `version-mismatch`.
+
+**Decision**:
+
+1. **Live read first.** For `retry`, `override` and `cancel`, the intake first reads the bound
+   invocation's status from the platform, as the gateway's live read does (`09 §3.6`
+   `inst-cs-live` step 2), and writes nothing in any branch.
+2. **Refusal when not live.** If the invocation is not live, the request is refused
+   `action-not-offered` (400, already registered in `07 §4.6` item 5, `inst-r7-refusals`). No row is written and no
+   signal is sent. The refusal names the instance's `invocation-dead` task, whose `retry` is the
+   re-drive (or, until the platform confirms the re-drive, the order cancel).
+3. **Unchanged routes.** The `invocation-dead` and `start-admission-stalled` `retry` routing is
+   unchanged. `assign` and `escalate` are applied in-process and are not affected.
+4. **Signal hold scoped.** `10 §4.4`'s signal-hold rule applies to live invocations. A
+   `task-resolution-requested` signal is never sent to an invocation that is not live.
+
+**Rationale**: the gateway already refuses to signal a dead invocation (D-322). Doing the same at
+the task intake keeps every `requested` row deliverable, so no orphan can hold the index.
+
+**Consequences**: one read added to the intake. `action-not-offered` gains a cause; no new
+reason, row, column or operation.
+
+**Propagated**: `design/07` §3.2 (*Resolution intake*), §3.3 (task `retry`, `override`, `cancel`
+routes), §4.4 (paragraph after the table), §4.6 (`inst-r7-one-request`); `design/09` §3.3 (route
+table); `design/10` §4.4 (signal delivery).
+
+### D-332 (L) `decide` answers infrastructure errors as infrastructure, `GenerationMismatch` as a divergence, and the library's non-assignee refusal as `not-assignee`; the route's guards stay permanently
+
+**Accepted (2026-11-05).** *(PR #4787 fourth review; amends D-318, D-323; refines Q-14)*
+
+**Context**: D-318 item 2 sent "every other engine error" of `decide` to the canonical `Internal`
+(500) and the `approval-unit-divergence` count, which pages. That set includes the library's
+`ApprovalError::Db`, "a database error a gear's retry loop must see typed (serialization failures
+…)" (`gears/bss/libs/approval/src/model.rs`, `db_err()`), and a failure of the subject's `collect`,
+which `refresh_if_stale` runs on every `approve` and `reject` (`engine.rs`) and which for the
+`order_version` subject reads Lifecycle's `get_version` over the SDK; `01 §4.9` answers exactly
+these 503. D-318 also mapped `GenerationMismatch` to `stale-generation` (409), though the adapter
+passes the unit generation it recorded, only a committed refresh moves it (`check_generation`,
+`store.refresh`), and a concurrent decision or reassignment meets `AlreadyDecided` or `Contended`
+in `load_pending` first: the mismatch is the `Refreshed` divergence, and the approver re-reading the
+inbox finds nothing to fix. Finally the route's `not-assignee` guard was temporary in `03 §3.3`
+and D-318 item 1 ("until the library carries the criterion") but kept in `03 §3.2`, D-323 item 6
+and PRD AC 4b, and the library's future refusal of a non-assignee had no mapping, so it would
+fall into the 500 breach.
+
+**Decision**:
+
+1. **Infrastructure errors.** `Db`, seen by the route's transaction retry classifier through
+   `ApprovalError::db_err()`, and a failure of the subject's `collect` roll the route back and are
+   answered by `01 §4.9`'s infrastructure mapping — a serialization or deadlock failure, a lock or
+   statement timeout or the dependency unavailable is the canonical `ServiceUnavailable` (503),
+   retried under the same key, any other the canonical `Internal` (500) — and are never counted
+   `approval-unit-divergence`. `01 §4.9` now lists an outbound dependency read inside the route's
+   transaction being unavailable among its 503 causes, and the adapter's `collect` carries a
+   Lifecycle unavailability as `ApprovalError::Store` with the reserved prefix
+   `dependency-unavailable:`, the only `Store` this subject raises. Products routes the library's `Db` to its retry classifier the same
+   way (`gears/bss/products/products/src/api/rest.rs`, `contention_db_err`).
+2. **`GenerationMismatch` is a breach** with `Refreshed` and `Pending`: `Internal` (500), nothing
+   recorded, counted `approval-unit-divergence`. `stale-generation` (409) keeps its other producers:
+   the route's own generation guard (D-308) and `AlreadyDecided` after a reassignment moved
+   `gate_generation`.
+3. **The route's guards stay permanently**, `not-assignee` included, as a second check in front of
+   the library, also once the library carries the named-user criterion; never a second authority.
+4. **The library's typed refusal of a non-assignee**, once the criterion lands with it, maps to
+   `not-assignee` (403). The named-user ask gains that typed refusal (an `ApprovalError` variant of
+   its own; today absent, `model.rs`).
+
+**Rationale**: a 500 that pages must mean a broken contract, not a contended database or a busy
+dependency, which the platform answers 503 so the caller retries; a mismatch only a refresh can
+cause is that refresh's divergence; a guard costs nothing in front of the authority and covers a
+mapping defect, and an authority's refusal needs a row in the mapping that wraps it.
+
+**Consequences**: no new reason, route, column or PDP pair (`not-assignee`, `stale-generation`,
+`ServiceUnavailable`, `Internal` exist); the named-user ask gains one typed refusal; inert while the
+stand-in is bound.
+
+**Propagated**: `design/01` §4.9 (503 causes); `PRD.md` §12 (AC 4b); `DESIGN.md` §4.4 (approval adapter divergence row);
+`UPSTREAM_REQS.md` §2.3 (named-user criterion: why, what this gear needs); `design/03` §3.2
+(one-path paragraph, port table `decide`), §3.3 (decision route), §4.4; `design/09` §4.1 (decision
+row); Q-14; D-318, D-323.
+
+### D-333 (L) `protocol_arms` is per order — the arms the order's bound version carries — and Lifecycle gates an upstream-started protocol per order
+
+**Accepted (2026-11-05).** *(PR #4787 fourth review, comment 4452627489 follow-up; supersedes D-312 item 2; amends D-275, D-319, D-320, D-323)*
+
+**Context**: D-312 gated an upstream-started protocol release-wide on the drain evidence, published
+by D-320 as the gear-wide `protocol_arms_ready` and computed on read by D-323. The review found
+three gaps: it is not latched — a start invocation created before the arm (an `owf_pending_start`
+row the *Start re-drive* resumes, `09 §3.6`) is pinned to its version and binds an arm-less
+version after the arm is listed; the drain has no bound or remedy, so one long-lived or stuck
+instance holds the release back; and its inputs — the declared-arm set and the map from a bound
+version to the arms its document carries — had no stated source, while computing it scans every
+tenant's bindings inside a `Gc` read scoped to one order. Lifecycle's progress read already carries
+the instance's `definition_version` (`09 §4.5`).
+
+**Decision**:
+
+1. **Per order.** The progress read carries `protocol_arms` instead of `protocol_arms_ready`: the
+   declared arms the document of the version the order's instance is bound to carries, projected
+   to Orders Lifecycle (`Gc`) only, no column of the view. It is fixed for the binding's life —
+   latched by construction — with no drain and no scan of other orders' or tenants' bindings;
+   empty for an order with no bound instance. It is stored, not computed on the read:
+   `start-instance` writes it once on `owf_definition_binding.protocol_arms` with the binding, so a
+   registry outage never changes an answer (a failed registry read is `retryable-failure` of the
+   start, with nothing written).
+2. **Its inputs.** The release configuration's declared-arm set names each declared arm and the
+   operation it calls (the operation step (1) of `10 §4.3` item 2 registers, e.g.
+   `settle-receiver-pause`); a version carries an arm when its document calls that operation — one
+   test, applied by the publish job to a candidate and by `start-instance` to the version it pins, which
+   reads that version's document from the platform registry (`/api/serverless-runtime/v1/functions`
+   `get`) under this gear's service identity, not under the caller's scope; a published version's
+   document never changes, so the answer may be kept in memory per version.
+3. **The ask becomes per order.** Lifecycle enables an upstream-started protocol for an order only
+   when that order's `protocol_arms` lists the arm and keeps its pre-arm behaviour for every other
+   order (`…-upreq-lifecycle-protocol-enable-on-arm-capability`, still `p2`).
+4. **The publish job's refusal stays** (D-319 item 2, D-323 item 1): new orders start on versions
+   carrying every declared arm, so the upstream's pre-arm path serves only orders bound before the
+   declaration and can be retired once they terminate.
+
+**Rationale**: a gate is held by the party that can read what it tests (D-312's rule); a per-order
+fact read on the order Lifecycle already reads needs no release-wide aggregate, and an immutable
+binding needs no latch.
+
+**Consequences**: one response member renamed and re-scoped (`protocol_arms_ready` →
+`protocol_arms`); one column, `owf_definition_binding.protocol_arms`, written once by
+`start-instance` after a registry `get` of the pinned version's document; Lifecycle's ask now keeps
+a pre-arm path per order; no new reason, route, table or PDP pair.
+
+**Propagated**: `design/01` §3.3 (`start-instance`), §3.7 (`owf_definition_binding`); `design/10` §3.3 (registry dependency row), §4.2 (*Bound versions*), §4.3 item 2,
+§4.7 (operation-change row); `design/09` §4.5 (projection row); `UPSTREAM_REQS.md` §2.4 (`…-upreq-lifecycle-protocol-enable-on-arm-capability`), §3;
+`ADR/0012` (*Confirmation*); D-275, D-312, D-319, D-320, D-323.
+
+### D-334 (L) Lifecycle Stage 4 dependencies: the version `header` gates readiness, and Stage 4 decisions are cited by branch
+
+**Accepted (2026-11-05).** *(PR #4787 fourth review; amends D-325, D-268)*
+
+**Context**: D-325 mirrored Lifecycle Stage 4 from `bss/orders-stage4`, which is not on `main`:
+`main`'s Lifecycle register ends at D-248 and `main`'s `OrderVersionView` has no `header`. Plan
+construction (`design/04` `inst-pc-read-order`) reads every order's market and payer from
+`OrderVersionView.header` (Lifecycle `bss/orders-stage4` D-262) with no probe, readiness item or
+fallback, while `actors`, the other Stage 4 field, is gated (D-281). Two rules for citing Stage 4
+decisions also disagreed: D-268 item 4 qualifies them by branch (`bss/orders-stage4` D-NNN), D-325
+item 1 only prefixes "Lifecycle"; the text followed D-325, so numbers that do not exist on `main`
+and may renumber again at merge were cited bare. `UPSTREAM_REQS.md` §2.4 also read "Lifecycle D-152
+and D-194", where D-194 is this gear's decision.
+
+**Decision**:
+
+1. **`header` is a readiness item.** Following `actors` (`design/03` §3.2, `design/01` §3.8,
+   D-281), the gear **MUST NOT** report ready until a startup probe of `get_version` or a declared
+   SDK capability shows `OrderVersionView.header`. It is an item of the `platform` release gate
+   (`design/01` §3.8 item 10), not conditional like `actors`, because every order's plan
+   construction reads it; there is no fallback read.
+2. **One citation rule.** D-268 item 4's branch qualifier is the rule: a Lifecycle Stage 4 decision
+   (D-249…D-266) is cited as Lifecycle `bss/orders-stage4` D-NNN, in the live docs and in this
+   register. D-325 item 1's prefix rule is withdrawn (its text stays as the record). Stage 3
+   citations (D-231…D-248, on `main`) are unchanged. Entry headers that already name the branch
+   (D-238, D-239, D-325) are left as written.
+3. **This gear's D-194.** `UPSTREAM_REQS.md` §2.4 reads "Lifecycle D-152 and this gear's D-194".
+
+**Rationale**: a field that exists only on an unpublished branch must gate readiness, as `actors`
+already does, or a `main` Lifecycle build fails plan construction for every order at run time. The
+branch qualifier is safer while Stage 4 is unpublished: it names where the number is valid and
+survives a renumbering at merge, as Stage 3's did (D-242).
+
+**Consequences**: one readiness item (`design/01` §3.8 item 10); no new reason, column, operation
+or ask.
+
+**Propagated**: `design/01` §3.8 (item 10); `design/04` §3.6 (`inst-pc-read-order`); citations in
+`PRD.md` §6.3 (359, 391); `DESIGN.md` §3.4 (Orders Lifecycle row); `UPSTREAM_REQS.md` §2.4
+(supersede-by-revoke, pre-hold state, version actors, deadline ask), §3; `design/02` §3.3 (intake
+table); `design/04` §2.1 (continuation item 9), §3.6 (`inst-pa-read-acceptance`,
+`inst-pa-return-eligible`, `inst-pc-read-order`, `inst-bf-call`, `inst-bf-if-key-mismatch`);
+`design/06` §3.6 (revoke sequence); D-238, D-239, D-240, D-267 and D-325 bodies and notes; D-268,
+D-325 notes.
+
+### D-335 (L) Register and dependency hygiene after #5536 merged: Stage 3 numbers, the contract's tuple and keys, the gear name
+
+**Accepted (2026-11-05).** *(PR #4787 fourth review; amends D-242, D-205, D-209, D-237, D-241; Q-08)*
+
+**Context**: Lifecycle's Stage 3 (PR #5536) is on `main`, with its `SUBSCRIPTIONS_CONTRACT.md`.
+Lifecycle D-247 item 2 says PR #5536 or Workflow #4787 text written before 2026-10-30 uses the old
+numbers, while its item 4 says Workflow's citations move in the accompanying Workflow change, and
+this gear's D-242 item 2 says they were updated in that change: D-237 (2026-10-27) already carries
+the new numbers, and read through D-247's table it would resolve wrongly. D-237, D-241 and D-242
+still described Stage 3 as the unmerged branch `bss/orders-stage3`. `UPSTREAM_REQS.md` §2.1 put
+the resource tenant inside the occupancy key and named `catalogSubscriptionProductKey` as the key,
+where the contract carries the resource tenant as its own tuple dimension
+(`(payerTenantId, resourceTenantId, overlapScopeKey)`) and keeps `catalog_subscription_product_key`
+distinct from the `overlap_scope_key` occupancy is keyed on; nothing linked the contract. The
+dependency tables named the Lifecycle gear `bss-orders-lifecycle` or `orders-lifecycle`; it is
+`bss-orders` (`gears/bss/orders/orders/src/gear.rs`), and slice 05 gave `report_spawn_signal` a
+two-argument signature.
+
+**Decision**:
+
+1. **Stage 3 numbers.** This register's citations of Lifecycle's Stage 3 decisions carry the new
+   numbers (D-231…D-248) whatever their date; Lifecycle D-247 item 2's old-number rule does not
+   apply to this register, per Lifecycle D-247 item 4. No Lifecycle document changes.
+2. **Merged, not a branch.** D-237, D-241 and D-242 cite Stage 3 as "on `main`, merged with PR
+   #5536" (D-243's form for PR #5259).
+3. **The tuple and the keys.** The resource tenant is a dimension of the capacity tuple beside
+   `overlap_scope_key`, not inside it; occupancy is keyed on `overlap_scope_key`, distinct from
+   `catalog_subscription_product_key`. `…-upreq-occupancy-resource-tenant` is answered on the
+   Orders side by the contract; Subscriptions' ratification stays open. `UPSTREAM_REQS.md` §2.1
+   links `../../orders/docs/SUBSCRIPTIONS_CONTRACT.md`.
+4. **Gear name and signature.** Dependency tables name the gear `bss-orders`;
+   `report_spawn_signal` takes `OrderRef`, the D-198 typed attempt/receiver/line/create-key
+   contribution and `CallMeta`, and returns `SpawnSignalResult { transition, spawn_signal_at,
+   grant_id, generation }` (Lifecycle `DESIGN.md` *Workflow SDK contract*).
+
+**Rationale**: a register that cites by number needs one stated numbering, and Lifecycle's own
+item 4 already moved Workflow's citations. The other items make statements match the merged
+documents they name.
+
+**Consequences**: one ask marked answered (`…-upreq-occupancy-resource-tenant`); no new reason,
+column, operation or ask.
+
+**Propagated**: `UPSTREAM_REQS.md` §1.2 (Orders Lifecycle row), §2.1 (contract link, `SUB-O5` row,
+*Overlap-presence read*, *Resource tenant in the occupancy tuple*); `DESIGN.md` §3.2 (component
+paragraph); `design/01` §3.4 dependency table; `design/02` dependency table (name, link text);
+`design/05` dependency table (name, signature); `design/07`, `design/08`, `design/09` dependency
+tables; D-237 header and rationale, D-241 and D-242 headers; D-205, D-209, D-242 and Q-08 notes.
 
 ## Open Questions
 
@@ -11016,6 +11584,13 @@ What remains of this question is Subscriptions' authored answer (`SUB-O5`, "neig
 written) and the `SUB-O1` reason value, now named by both Orders gears as
 `CancelReason::OrderCompensation { order_id, order_version }` accepted from draft and from active,
 with void as cancel-from-draft (Subscriptions SUB-D-11).
+
+**Amended by D-335 (2026-11-05)**: occupancy is keyed on `overlap_scope_key`, not on
+`catalogSubscriptionProductKey`: Lifecycle's `SUBSCRIPTIONS_CONTRACT.md` (on `main`, merged with
+PR #5536) carries `catalog_subscription_product_key` and `overlap_scope_key` as independent
+identities of each item key, and its capacity tuple is `(payerTenantId, resourceTenantId,
+overlapScopeKey)`, the resource tenant a dimension beside the key. `UPSTREAM_REQS.md` §2.1 carries
+the wording.
 
 ### Q-09: Do the Orders gears and Pricing converge on toolkit-db session advisory locks or on the `gears/bss/libs/coord` fenced lease for worker coordination?
 
@@ -11217,6 +11792,8 @@ is answered unrecorded for the approver to decide again.
 
 > **Amended by D-323 (2026-11-03)**: three binding items join the mapping, to design when the adapter binds and inert until then: (1) the `decisionEventId` record `decide` writes against the unit — the library's `approval_decision` row, keyed (`unit_id`, `actor`, `generation`), has no event id, so it is a store this gear adds; (2) the reassignment's read of `record-decision`'s settled `applied: false` answer under `{tenant}:{correlationId}:record-decision:{gateRef}:{decisionEventId}`, which decides between refusing `gate-not-open` and submitting a fresh unit; (3) whether the `order_version` subject's `validate_submit` and `lock` accept a second unit on the same `ref_id` after a unit of it was applied. `lookup_by_key` returns the unit mapped to the highest `gate_generation` under the key.
 
+> **Amended by D-332 (2026-11-05)**: in `decide`'s mapping `GenerationMismatch` joins `Refreshed` as a breach (`Internal`, 500, counted `approval-unit-divergence`), no longer `stale-generation`; `Db` and a failure of the subject's `collect` answer `01 §4.9`'s infrastructure mapping (503 when transient, retried under the same key), never counted; the library's typed refusal of a non-assignee, once the named-user criterion lands with it, is `not-assignee` (403), and the route keeps its own guards in front of the library.
+
 ### Q-15: What reopens dispatch after Lifecycle abandons a post-spawn pause control? *(closed by D-244)*
 
 **Owner**: Orders Lifecycle, with this gear.
@@ -11311,11 +11888,11 @@ register relies on is cited to a serverless-runtime file and line or registered 
 | D-279 | 04, 05, 06, 10 (`SUB-O11` asks for D-201's closed typed refusal codes; verified-expiry route inert until they land, macrocheese re-review R2, 2026-11-02) | `design/04` §2.2, §3.6; `design/05` §3.6, §3.7, §4.1; `design/06` §4.8; `design/10` §3.6, §4.1, §4.6; `UPSTREAM_REQS.md` §2.1 |
 | D-280 | 05 (PRD intent key: five components plus `[+{wave_attempt}]` and `[+c{comp_attempt}]` tails; AC 7j; `SUB-O13` tuple, macrocheese re-review R19, 2026-11-02) | `PRD.md` §6.3, §9.2, §12; `design/05` §1.1; `UPSTREAM_REQS.md` §2.1 |
 | D-281 | 01, 03 (stand-in texts qualified; AC 0b split into 0b and 0c; routing via the port; `library` binding refused until version actors; `barred-subjects-unavailable`, macrocheese re-review R20/R27, 2026-11-02) | `PRD.md` §5.1, §12, §13, §14, §16; `design/README.md`; `ADR/0007`; `design/01` §3.8, §4.9; `design/03` §1.1, §3.2, §3.3, §3.6, §3.7, §4.1; `UPSTREAM_REQS.md` §1.2, §2.3, §2.4 |
-| D-282 | 03, 09 (assign route on `gate_generation`, registered writer, port `reassign`; decision-route 404 vs recorded `not-assignee`; reassignment in scope, macrocheese re-review R21, 2026-11-02) | `DESIGN.md` §3.7; `design/03` §3.2, §3.3, §3.5, §3.7; `design/09` §3.2; `PRD.md` §5.2, §12, §15 |
+| D-282 | 03, 09 (assign route on `gate_generation`, registered writer, port `reassign`; decision-route 404 vs recorded `not-assignee`; reassignment in scope, macrocheese re-review R21, 2026-11-02) | `DESIGN.md` §3.7; `design/03` §3.2, §3.3, §3.5, §3.7; `design/09` §3.2; `PRD.md` §5.2, §12, §15; `UPSTREAM_REQS.md` §2.3 |
 | D-283 | 01, 04, 06 (drift: `failedTaskRefs` typed, `open-gates` round registered, twelve downstream ops, SDK pair, pass 0, park owners, ≥ 30-day receipts, activation limit, no compensation override, "zero lost" exception, macrocheese re-review R3/R4/R15/R28, 2026-11-02) | `ADR/0013`; `DESIGN.md` §1.2, §3.3, §3.5, §3.6, §3.7; `design/01` §3.3, §3.7; `design/04` §2.2, §4.3; `design/06` §3.7; `PRD.md` §1.3 |
 | D-284 | 04 (tolerated failure requires no post-begin `satisfied`; `satisfied_after_begin_at`, macrocheese re-review R25 independent check, 2026-11-02) | `DESIGN.md` §3.7; `design/04` §3.6, §3.7; `PRD.md` §12 |
 | D-285 | 04, 05, 06, 07, 10 (unknown code, denial, outage → `refusal_kind = unresolved`: task open, never exhausted, no acknowledgement; D-190 citations, macrocheese re-review R2 independent check, 2026-11-02) | `design/04` §2.2, §3.6; `design/05` §3.3, §3.6, §3.7, §4.1; `design/06` §3.6, §4.8; `design/07` §3.3, §3.6, §4.2, §4.4, §4.8; `design/10` §3.6, §4.1; `UPSTREAM_REQS.md` §2.1 |
-| D-286 | 03 (former assignee `not-assignee`, A → C → A `stale-generation`; contract clause (k); `reassign` fitted to the library engine, macrocheese re-review R21 independent check, 2026-11-02) | `PRD.md` §9.2, §12; `design/03` §3.2, §3.6; Q-14 |
+| D-286 | 03 (former assignee `not-assignee`, A → C → A `stale-generation`; contract clause (k); `reassign` fitted to the library engine, macrocheese re-review R21 independent check, 2026-11-02) | `PRD.md` §9.2, §12; `design/03` §3.2, §3.6; `UPSTREAM_REQS.md` §2.3; Q-14 |
 | D-287 | 01, 02, 07, 09 (*Start re-drive* gateway branch on `owf_pending_start.row_version`; past-`submitted` anomaly keeps its task open, macrocheese re-review R26 independent check, 2026-11-02) | `DESIGN.md` §3.7; `design/01` §3.8; `design/02` §3.7, §3.8; `design/07` §3.2, §3.3, §4.4; `design/09` §3.6 |
 | D-288 | 05, 06, 08 (revoke rows for every generation recorded after the fence; Lifecycle's source; reconcile guarded; diagram and ask drift, independent check of D-269, 2026-11-02) | `design/05` §3.7; `design/06` §3.2, §3.6; `design/08` §3.6; `UPSTREAM_REQS.md` §2.4 |
 | D-289 | 05, 06, 07, 08, 09, 10 (drift: `eligibilityTrigger` routing member, `Gc` `attempt_id` projection, control-task wording, one intent key form, macrocheese re-review R13/R19 independent check, 2026-11-02) | `ADR/0006`, `ADR/0012`; `DESIGN.md` §1.2; `design/05` §1.1, §3.3, §4.1; `design/06` §2.1; `design/07` §3.3; `design/08` §2.2; `design/09` §3.7, §4.2, §4.5; `design/10` §2.2; `UPSTREAM_REQS.md` §2.1 |
@@ -11355,6 +11932,16 @@ register relies on is cited to a serverless-runtime file and line or registered 
 | D-323 | 03, 09, 10 (the arm check from the declaration; `protocol_arms_ready` computed on read; the library binding's `decisionEventId` record, settled-answer read and second unit are Q-14 items; `lookup_by_key`, AC 4a/4b, anomaly, dependency row, second independent check H-N1..H-N9, 2026-11-03) | `PRD.md` §12; `DESIGN.md` §4.4; `UPSTREAM_REQS.md` §2.4; `design/03` §3.2; `design/09` §4.1, §4.5; `design/10` §4.2, §4.3, §4.7; `ADR/0012` |
 | D-324 | 05, 10 (an unresolved activation refusal no manual task covers is listed by every definition-called round until one does, so a ceiling during `failFastSweepTask`'s `createTasks` loses no line, independent check, 2026-11-03) | `design/05` §3.2, §3.3, §3.6, §4.5; `design/10` §3.6 |
 | D-325 | cross-cutting (Lifecycle Stage 4 final mirror: D-249…D-266 numbers, the guard's snapshot race and outcome shape, the delivered version read, 2026-11-03) | `PRD.md` §6.3; `DESIGN.md` §3.4; `design/02` §3.3; `design/03` §3.2; `design/04` §2.1, §3.6, §3.7; `UPSTREAM_REQS.md` §2.4, §3; D-238, D-239, D-240, D-242, D-267 |
+| D-326 | 01, 04, 10 (a port's breaker refusal or call deadline counts on that port's re-check ladder, only the operation-deadline cut and a Lifecycle read's breaker stay neutral; a re-drive's stamp older than the 120 s `recheck` duration resets the round, fourth review, 2026-11-05) | `design/01` §4.5; `design/04` §3.6, §3.7, §4.6, §4.8; `design/10` §3.6; D-321 |
+| D-327 | 01, 04, cross-cutting (overlap keys from `overlap_item_keys`, scalar only for a NULL legacy collection; new Lifecycle ask for them on `get_version`; release-gate item 11, fourth review, 2026-11-05) | `DESIGN.md` §3.4; `design/01` §3.8; `design/04` §3.6, §3.7, §4.7; `UPSTREAM_REQS.md` §2.1, §2.4, §2.5, §3; D-193, D-237 |
+| D-328 | 04, cross-cutting (own reservation in the merged contract's terms: `own_context` in, literal counts plus complete own-membership out, no subtraction; conformance v1 legacy / v2 protected, fourth review, 2026-11-05) | `design/04` §3.6; `UPSTREAM_REQS.md` §2.1, §2.2; D-227, D-237, D-268 |
+| D-329 | 05, 01, 10 (replacement grant: `replace_attempt` in Lifecycle's key, one registered 10 s deadline with 2 s per-call budgets, `receiver_closes` attestations kept across rounds, fourth review, 2026-11-05) | `design/01` §3.3; `design/05` §3.3, §3.6, §3.7; `design/10` §3.6 (b); `DESIGN.md` §3.7; `UPSTREAM_REQS.md` §2.4; D-243, D-296, D-313 |
+| D-330 | 06, 07, 10, PRD (sweep-floor intent gets its task under either policy; the fence's incident for a taskless line of any failure unwind; PRD exit list and §17.1 flowchart, fourth review, 2026-11-05) | `PRD.md` §6.4, §12, §17.1; `DESIGN.md` §1.2; `design/06` §3.2, §3.6; `design/07` §3.1, §3.2, §3.3, §3.6, §4.7, §4.8; `design/10` §3.6 (b), (c), §4.1; D-233, D-257, D-300 |
+| D-331 | 07, 09, 10 (generic task intake reads the invocation's status first and refuses `action-not-offered` while it is not live, fourth review, 2026-11-05) | `design/07` §3.2, §3.3, §4.4, §4.6; `design/09` §3.3; `design/10` §4.4; D-301, D-302, D-322 |
+| D-332 | 03, 09 (`decide`: `Db` and `collect` failure through `01 §4.9`, uncounted; `GenerationMismatch` a breach; library's typed non-assignee refusal → `not-assignee`; the route's guards stay permanently, fourth review, 2026-11-05) | `PRD.md` §12; `DESIGN.md` §4.4; `UPSTREAM_REQS.md` §2.3; `design/03` §3.2, §3.3, §4.4; `design/09` §4.1; Q-14; D-318, D-323 |
+| D-333 | 09, 10 (per-order `protocol_arms` from the bound version's document; declared-arm set names each arm's operation; Lifecycle gates per order with a pre-arm path; drain withdrawn, fourth review 4452627489, 2026-11-05) | `design/09` §4.5; `design/10` §4.2, §4.3; `UPSTREAM_REQS.md` §2.4, §3; `ADR/0012`; D-275, D-312, D-319, D-320, D-323 |
+| D-334 | cross-cutting (Lifecycle Stage 4 dependencies: `header` readiness gate, `bss/orders-stage4` citation rule, 2026-11-05) | `design/01` §3.8; `design/04` §3.6; `PRD.md` §6.3; `DESIGN.md` §3.4; `UPSTREAM_REQS.md` §2.4, §3; `design/02` §3.3; `design/06` §3.6; D-268, D-325 |
+| D-335 | cross-cutting (register and dependency hygiene after #5536: Stage 3 numbering, contract tuple and keys, gear `bss-orders`, 2026-11-05) | `UPSTREAM_REQS.md` §1.2, §2.1; `DESIGN.md` §3.2; `design/01`, `design/02`, `design/05`, `design/07`, `design/08`, `design/09` dependency tables; D-205, D-209, D-237, D-241, D-242; Q-08 |
 | D-240 | 04 Fulfillment plan (S4-11 pending-payment continuation, 2026-10-29) | `design/04` §2.1 |
 | D-239 | cross-cutting (Lifecycle Stage 4 wave 3 mirror, 2026-10-29) | `design/04`; `design/02`; `DESIGN.md` §3.4 |
 | D-232–D-236 | cross-cutting (PR #4787 comment of 2026-10-23, 2026-10-26) | `design/01` §3.7, §4.7, §4.9; `design/03` §3.3, §3.6, §3.7; `design/05` §3.2, §3.3, §3.6, §3.7, §4.1, §4.4, §4.5; `design/06` §3.2, §3.6, §4.8; `design/10` §3.6; `ADR/0008`; `PRD.md`; `UPSTREAM_REQS.md` §2.1, §2.4, §3, §4 |
@@ -11557,7 +12144,7 @@ register relies on is cited to a serverless-runtime file and line or registered 
 | D-224 | M Named-user approval criterion asked of the shared library and the common inbox; the stand-in is never bound to a profile that requires approval | `design/03` §2.2; `UPSTREAM_REQS.md` §2.3; D-197, Q-14 |
 | D-225 | M Approval valuation basis is the policy's explicit choice, computed by Rating and retained by Lifecycle; shared money representation | `design/03` §3.3; `UPSTREAM_REQS.md` §2.4, §2.5; D-198 |
 | D-226 | H Financial readiness is a four-way port answer behind `evaluate-payment-auth-eligibility`; Payments today, Billing when it lands; the re-check re-reads it as final permission | `design/04` §2.1, §3.3, §3.6, §3.7; `design/10` §3.6; `design/01` §4.9; D-89, D-223 |
-| D-227 | M `assessment_deadline_at` advisory beside `activation_deadline_at`; own reservation excluded on the overlap read; `retainedObligations[]` on every unwind report | `design/04` §3.6, §3.7; `design/06` §3.6; `UPSTREAM_REQS.md` §2.1, §2.2, §2.4; D-194 |
+| D-227 | M `assessment_deadline_at` advisory beside `activation_deadline_at`; own reservation never new demand on the overlap read (literal counts plus own-membership, no subtraction, D-328); `retainedObligations[]` on every unwind report | `design/04` §3.6, §3.7; `design/06` §3.6; `UPSTREAM_REQS.md` §2.1, §2.2, §2.4; D-194 |
 | D-228 | H Seller-policy payment wait; expiry runs `request-prefulfillment-cancel` or raises `payment-wait-expired`; nothing about money | `design/01` §3.7, §4.9; `design/04` §3.3, §3.6, §3.7; `design/07` §3.3, §4.4; `design/08` §3.3; `design/10` §3.6; D-109, D-223 |
 | D-229 | M Named-user condition in the request, `gate_generation`, `approval_gate × assign`, `not-assignee` / `stale-generation`, park on `assignee-unresolved`; projection is the common inbox's source adapter | `design/03` §3.2, §3.3, §3.6, §3.7; `design/09` §3.1; `design/01` §4.9; D-56, D-224 |
 | D-230 | M Valuation for the policy's chosen basis or `unavailable`, shared money representation; `tcv_minor` retired from the approval tables | `design/01` §3.7; `design/03` §3.3, §3.7; D-198, D-225 |
@@ -11612,11 +12199,11 @@ register relies on is cited to a serverless-runtime file and line or registered 
 | D-279 | M `SUB-O11` asks for closed typed activation refusal codes mapped by Lifecycle D-201; `verified-expiry` route inert until they land; `04` cites Lifecycle D-190 (amends D-195, D-257) | `design/04`, `design/05`, `design/06`, `design/10`; `UPSTREAM_REQS.md` |
 | D-280 | L PRD intent key = five components + optional `[+{wave_attempt}]`, `[+c{comp_attempt}]`; AC 7j; `SUB-O13` tuple adds `comp_attempt` (amends D-262) | `PRD.md`; `design/05`; `UPSTREAM_REQS.md` |
 | D-281 | M Stand-in texts name the flagged-seller park; AC 0c live, 0b deferred; `library` binding refused until `OrderVersionView.actors`; gate park `barred-subjects-unavailable` (amends D-265, D-267) | `PRD.md`; `design/README.md`; `ADR/0007`; `design/01`, `design/03`; `UPSTREAM_REQS.md` |
-| D-282 | M Assign route: `If-Match`/key on `gate_generation`, registered writer, port `reassign` (withdraw + submit); decision route 404, `not-assignee` recorded by `record-decision`; reassignment in scope (amends D-20, D-266) | `DESIGN.md`; `design/03`, `design/09`; `PRD.md` |
+| D-282 | M Assign route: `If-Match`/key on `gate_generation`, registered writer, port `reassign` (withdraw + submit); decision route 404, `not-assignee` recorded by `record-decision`; reassignment in scope (amends D-20, D-266) | `DESIGN.md`; `design/03`, `design/09`; `PRD.md`; `UPSTREAM_REQS.md` |
 | D-283 | L Drift: whitespace, ADR-0013 `failedTaskRefs`, `open-gates` round in the key register, stale counts and wording in `DESIGN.md`, `01`, `04`, `06`, PRD (amends ADR-0013) | `ADR/0013`; `DESIGN.md`; `design/01`, `design/04`, `design/06`; `PRD.md` |
 | D-284 | M Tolerated authorization failure only while no post-begin re-check observed `satisfied`; write-once `satisfied_after_begin_at` (amends D-272) | `DESIGN.md`; `design/04`; `PRD.md` |
 | D-285 | M Unknown activation refusal code, denial or outage → `refusal_kind = unresolved`: task open under either policy, never exhausted, no task cancel, never a fence cause, no acknowledgement; named grounds only → `line-execution-failed` (amends D-279) | `design/04`, `design/05`, `design/06`, `design/07`, `design/10`; `UPSTREAM_REQS.md` |
-| D-286 | M Former assignee refused `not-assignee` (404 at inbox); A → C → A is `stale-generation`; PRD §9.2 clause (k) `reassign`; library adapter as system actor, `gate_generation` mapped onto unit generations (amends D-282) | `PRD.md`; `design/03`; Q-14 |
+| D-286 | M Former assignee refused `not-assignee` (404 at inbox); A → C → A is `stale-generation`; PRD §9.2 clause (k) `reassign`; library adapter as system actor, `gate_generation` mapped onto unit generations (amends D-282) | `PRD.md`; `design/03`; `UPSTREAM_REQS.md`; Q-14 |
 | D-287 | M Stalled start's `retry` = gateway *Start re-drive* branch on `owf_pending_start.row_version`, no signal; past-`submitted` order with no instance counted `no-active-instance`, task kept open (amends D-278) | `DESIGN.md`; `design/01`, `design/02`, `design/07`, `design/09` |
 | D-288 | M Revoke rows for every generation not `revoked` incl. Lifecycle's current; empty row set never attested; late generation recorded with Lifecycle's source, predecessor closed; reconcile guarded on a compensating instance (amends D-269) | `design/05`, `design/06`, `design/08`; `UPSTREAM_REQS.md` |
 | D-289 | L Drift: `eligibilityTrigger` routing member; `Gc` sees `attempt_id` by task part; control task once while none open; intent key one form `{tenant}:{orderId}+{orderVersion}+{orderLineId}+{wave}+{intentKind}[+{wave_attempt}][+c{comp_attempt}]` (amends D-273, D-274, D-276, D-280) | `ADR/0006`, `ADR/0012`; `DESIGN.md`; `design/05`–`design/10`; `UPSTREAM_REQS.md` |
@@ -11648,7 +12235,7 @@ register relies on is cited to a serverless-runtime file and line or registered 
 | D-315 | L A reopen clears `sla_breached_at` with the recomputed `sla_deadline` (amends D-302, D-303) | `DESIGN.md`; `design/01`, `design/07` |
 | D-316 | L The re-check's defer ladder resets only at a round's first call (count and first-defer time), never on a `proceed` or `reject`; the readiness count carries over; at most 2 defers + 2 unavailable reads + the settling call per round (amends D-306, D-272) | `design/04`, `design/10` |
 | D-317 | L `failFastSweepTask` writes no `failureScope` and sets `arm: sweepTask`, whose `onCreate` `swept` case runs the tick's SLA check; `05 §4.5` item 6 excepts the sweep arm's unread `redispatch[]`; unresolved-line exit lists name another line's fail-fast failure and remediation exhaustion (amends D-300, D-304) | `PRD.md`; `UPSTREAM_REQS.md`; `design/04`, `design/05`, `design/06`, `design/07`, `design/10` |
-| D-318 | M The inbox route refuses `not-assignee` before forwarding and is the only path to the library; the port gains `decide`, mapping `AlreadyDecided`, `GenerationMismatch`, `Contended` and faulting `Refreshed` (`Internal`, `approval-unit-divergence`); a refused record escalates and a reassignment commits on a fresh unit; quorum 1 passed per call (amends D-282, D-286, D-308) | `PRD.md`; `DESIGN.md`; `design/03`, `design/09` |
+| D-318 | M The inbox route refuses `not-assignee` before forwarding and is the only path to the library; the port gains `decide`, mapping `AlreadyDecided`, `GenerationMismatch` (a breach since D-332), `Contended` and faulting `Refreshed` (`Internal`, `approval-unit-divergence`); a refused record escalates and a reassignment commits on a fresh unit; quorum 1 passed per call (amends D-282, D-286, D-308) | `PRD.md`; `DESIGN.md`; `design/03`, `design/09` |
 | D-319 | L The release-wide drain evidence is no non-terminal binding on a version lacking the arm; a candidate, a rollback included, lacking an arm an enabled upstream protocol depends on is refused; rule 1's target is the case's own task (amends D-275, D-311, D-312) | `design/10`; `ADR/0012` |
 | D-320 | L This gear publishes the drain evidence as `protocol_arms_ready` on the progress read (`Gc`); new `p2` ask: Lifecycle enables an upstream-started protocol only after reading it (amends D-312) | `UPSTREAM_REQS.md`; `design/01`, `design/09`, `design/10`; `ADR/0012` |
 | D-321 | L `owf_fulfillment_plan.recheck_ladder_seq`: the re-check's ladders reset at the round's entry when it differs from `evaluationSeq`, never skipped by a deadline-cut or breaker-refused first attempt; the five-call bound covers ladder answers only, a spent budget faults into the `invocation-dead` task; `sweepTask` unread after the unwind starts (amends D-316, D-317) | `design/04`, `design/10` |
@@ -11656,6 +12243,16 @@ register relies on is cited to a serverless-runtime file and line or registered 
 | D-323 | L The publish job refuses an arm-less candidate from the arm's declaration; `protocol_arms_ready` computed on each read, never dropping a listed arm; `decisionEventId` record, settled-answer read and second unit on one ref are Q-14 binding items; `lookup_by_key` takes the highest generation; AC 4a `version-mismatch`; route `not-assignee` only via the future common-inbox adapter; anomaly not a reason (amends D-318, D-319, D-320) | `PRD.md`; `DESIGN.md`; `UPSTREAM_REQS.md`; `design/03`, `design/09`, `design/10`; `ADR/0012` |
 | D-324 | L `inst-ri-handoff` lists an unresolved activation refusal of the line's current wave-2 attempt in `failed[]` on every definition-called round until a manual task covers it, so a lifetime ceiling cancelling `failFastSweepTask`'s un-checkpointed `createTasks` leaves no line without task or incident; a repeat is absorbed under the task's unique key (amends D-125, D-300, D-317) | `design/05`, `design/10` |
 | D-325 | L Lifecycle Stage 4 final mirrored: citations at D-249…D-266; the settled `acceptance-requirement-unevaluable` only on an `approved` snapshot, a race an unsettled `unavailable`; `AuthorizationOutcome { outcome }` mapped from the `eligibilitySeq` answer's readiness, `idempotency-mismatch` → `idempotency-key-conflict`; acceptance never gated by this gear; amend and record-acceptance development-only, `begin_fulfillment` engine-only; camelCase event members; `OrderVersionView` metadata, `header`, `actors`, `admin`; version-actors ask answered, D-259/D-261 asks open; this gear owns the payment and dwell alerts (amends D-238, D-239, D-240, D-242, D-267) | `PRD.md`; `DESIGN.md`; `design/02`, `design/03`, `design/04`; `UPSTREAM_REQS.md` |
+| D-326 | L re-check: identity/occupancy breaker refusal or call deadline is that port's `defer`, readiness's an unavailable read; only the operation-deadline cut and a Lifecycle read's breaker are ladder-neutral (may fault); round entry also resets on a stamp older than the 120 s `recheck` duration under the same `evaluationSeq` (a re-drive); `recheck` duration ≤ 120 s (amends D-321) | `design/01`, `design/04`, `design/10` |
+| D-327 | L re-check keys are `overlap_item_keys` values, scalar only for a NULL legacy collection, `[]` keyless, mixed/malformed/absent defers; new ask `…-upreq-lifecycle-version-overlap-keys`; release-gate item 11 refuses readiness until probed (amends D-193, D-237) | `DESIGN.md`; `design/01`, `design/04`; `UPSTREAM_REQS.md` |
+| D-328 | L `SUB-O5` own rights in contract terms: `own_context` in, three literal counts plus complete own-membership out, never subtracted; Lifecycle's protected decision composed unchanged; conformance v1 legacy / `activation-recheck-v2.json` protected; protected-purchase ask adopted by Lifecycle D-242, Subscriptions ratification open (amends D-227, D-237, D-268) | `design/04`; `UPSTREAM_REQS.md` |
+| D-329 | L Replacement grant: Lifecycle key `…:{predecessorGeneration}:{replaceAttempt}`, `replace_attempt` advanced only by a settled `grant-predecessor-unsettled`; one 10 s `deadline_ms`, closes sent while 2 + 2 + 2 s remain; closure attestations stored write-once in `receiver_closes` (amends D-243, D-296, D-313) | `design/01`, `design/05`, `design/10`; `DESIGN.md`; `UPSTREAM_REQS.md` |
+| D-330 | L A sweep-floor intent opens its line task under either policy; the fence records an incident for every failed or unresolved line with no task under fail-fast, and under remediate on an external activation or `order-binding-expired`; PRD exits and flowchart (amends D-233, D-257, D-300) | `PRD.md`; `DESIGN.md`; `design/06`, `design/07`, `design/10` |
+| D-331 | L Task `retry`/`override`/`cancel` read the invocation's status first and refuse `action-not-offered` with nothing written while it is not live (cites D-301, D-302, D-322) | `design/07`, `design/09`, `design/10` |
+| D-332 | L `decide`: `Db` and a `collect` failure answer `01 §4.9` (503 when transient, retried, uncounted); `GenerationMismatch` a breach with `Refreshed` (500, `approval-unit-divergence`); library's typed non-assignee refusal → `not-assignee` (403), asked of the library; the route's guards stay permanently (amends D-318, D-323) | `PRD.md`; `DESIGN.md`; `UPSTREAM_REQS.md`; `design/03`, `design/09` |
+| D-333 | L `protocol_arms` per order: the declared arms the bound version's document carries (arm = the operation it calls; registry `get`), fixed per binding, no drain or cross-tenant scan; Lifecycle enables per order, pre-arm path otherwise; publish-job refusal kept (supersedes D-312 item 2; amends D-275, D-319, D-320, D-323) | `design/09`, `design/10`; `UPSTREAM_REQS.md`; `ADR/0012` |
+| D-334 | L Stage 4 dependencies: `OrderVersionView.header` is a readiness item (startup probe or SDK capability, as `actors`); Stage 4 decisions cited as Lifecycle `bss/orders-stage4` D-NNN, D-325's prefix rule withdrawn; "this gear's D-194" (amends D-325, D-268) | `design/01`; `design/04`; `PRD.md`; `DESIGN.md`; `UPSTREAM_REQS.md`; `design/02`, `design/06` |
+| D-335 | L After #5536: Stage 3 citations carry new numbers whatever their date (Lifecycle D-247 item 4); Stage 3 "on `main`, merged with PR #5536"; resource tenant a tuple dimension beside `overlap_scope_key`, which is distinct from `catalog_subscription_product_key`; resource-tenant ask answered; contract linked; gear `bss-orders`; `report_spawn_signal` signature (amends D-242, D-205, D-209, D-237, D-241; Q-08) | `UPSTREAM_REQS.md`; `DESIGN.md`; `design/01`, `design/02`, `design/05`, `design/07`, `design/08`, `design/09` |
 
-Highest decision number used: **D-325**; highest question number: **Q-15**. Numbering is one continuous sequence across the whole
+Highest decision number used: **D-335**; highest question number: **Q-15**. Numbering is one continuous sequence across the whole
 register; there are no parts.
