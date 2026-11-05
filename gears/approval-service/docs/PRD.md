@@ -350,7 +350,7 @@ An auto-approved verdict **MUST** name the auto-approval rule. When the verifica
 
 - [ ] `p2` - **ID**: `cpt-cf-approval-service-fr-conditional-policies`
 
-The system **MUST** let an approval policy carry an optional condition, in the same expression language and over the same inputs as auto-approval rules. A policy applies only when its condition holds.
+The system **MUST** let an approval policy carry an optional condition, in the same expression language and over the same inputs as auto-approval rules. A policy applies only when its condition holds. Rules **MUST** be able to carry the same optional condition; a rule whose condition does not hold does not match.
 
 - **Rationale**: Approvers often depend on facts of the request, for example finance approval above an order amount, or a security team when infrastructure paths change.
 - **Actors**: `cpt-cf-approval-service-actor-admin`
