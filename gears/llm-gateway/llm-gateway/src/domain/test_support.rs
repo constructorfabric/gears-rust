@@ -37,6 +37,10 @@ use secrecy::SecretString;
 use tokio::sync::Notify;
 use toolkit::api::canonical_prelude::CanonicalError;
 use toolkit_security::{PlatformSecurityContext, SecurityContext, pep_properties};
+use usage_collector_sdk::{
+    AggregationResult, AggregationSpec, CreateUsageRecord, MetadataFilter, UsageCollectorClientV1,
+    UsageCollectorError, UsageRecord, UsageType, UsageTypeGtsId,
+};
 use uuid::Uuid;
 
 use super::Service;
@@ -1534,6 +1538,263 @@ impl UsageSink for FakeUsageSink {
     }
 }
 
+// ── Usage Collector fake ────────────────────────────────────────────────────
+
+/// Usage Collector errors as the SDK classifies them.
+pub mod uc_errors {
+    use usage_collector_sdk::{UsageCollectorError, ValidationReason};
+    use uuid::Uuid;
+
+    /// Retryable batch-level (or per-record) unavailability.
+    #[must_use]
+    pub fn unavailable() -> UsageCollectorError {
+        UsageCollectorError::ServiceUnavailable {
+            retry_after_seconds: None,
+            detail: "plugin unavailable (test)".to_owned(),
+        }
+    }
+
+    /// Permanent per-record validation failure.
+    #[must_use]
+    pub fn invalid_argument() -> UsageCollectorError {
+        UsageCollectorError::InvalidArgument {
+            resource_type: usage_collector_sdk::USAGE_RECORD_RESOURCE.to_owned(),
+            resource_name: None,
+            field: "metadata".to_owned(),
+            reason: ValidationReason::Validation,
+            detail: "unknown metadata key (test)".to_owned(),
+        }
+    }
+
+    /// Same dedup identity, different payload.
+    #[must_use]
+    pub fn conflict() -> UsageCollectorError {
+        UsageCollectorError::idempotency_conflict("resp_x", Uuid::nil())
+    }
+
+    /// PDP denial.
+    #[must_use]
+    pub fn permission_denied() -> UsageCollectorError {
+        UsageCollectorError::permission_denied("denied (test)")
+    }
+
+    /// Unclassified failure.
+    #[must_use]
+    pub fn internal() -> UsageCollectorError {
+        UsageCollectorError::Internal {
+            detail: "boom (test)".to_owned(),
+        }
+    }
+}
+
+/// Scripted answer of one `create_usage_records` call: the batch-level error,
+/// or per-record outcomes aligned with the input (`Ok(())` = accepted).
+pub type UcScript = Result<Vec<Result<(), UsageCollectorError>>, UsageCollectorError>;
+
+/// One observed `create_usage_records` call.
+#[derive(Debug, Clone)]
+pub struct UcCall {
+    /// Tokio time of the call (virtual under a paused clock).
+    pub at: tokio::time::Instant,
+    /// Subject of the calling context ([`SERVICE_SUBJECT`] for the service
+    /// identity).
+    pub subject: Uuid,
+    /// The submitted records, in order.
+    pub records: Vec<CreateUsageRecord>,
+}
+
+/// Usage Collector fake: records every `create_usage_records` call and
+/// answers from a script (accepting everything once the script is used up).
+/// Only `create_usage_records` is supported.
+#[derive(Default)]
+pub struct FakeUsageCollector {
+    script: Mutex<VecDeque<UcScript>>,
+    calls: Mutex<Vec<UcCall>>,
+    parked: AtomicBool,
+    panicking: AtomicBool,
+}
+
+impl FakeUsageCollector {
+    /// Collector that accepts everything.
+    #[must_use]
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    /// Queue the answers of the next calls, one per call.
+    pub fn script(&self, answers: impl IntoIterator<Item = UcScript>) {
+        self.script.lock().expect("script").extend(answers);
+    }
+
+    /// From now on every call hangs forever (an unreachable collector that
+    /// never answers); the call is still recorded.
+    pub fn park(&self) {
+        self.parked.store(true, Ordering::SeqCst);
+    }
+
+    /// From now on every call panics (a crashing client); the call is still
+    /// recorded.
+    pub fn panic_on_call(&self) {
+        self.panicking.store(true, Ordering::SeqCst);
+    }
+
+    /// The calls so far.
+    #[must_use]
+    pub fn calls(&self) -> Vec<UcCall> {
+        self.calls.lock().expect("calls").clone()
+    }
+
+    /// Records of every call, flattened in call order.
+    #[must_use]
+    pub fn submitted(&self) -> Vec<CreateUsageRecord> {
+        self.calls().into_iter().flat_map(|c| c.records).collect()
+    }
+
+    /// Idempotency keys (response ids) of every submitted record, in
+    /// submission order (retries repeat).
+    #[must_use]
+    pub fn submitted_keys(&self) -> Vec<String> {
+        self.submitted()
+            .iter()
+            .map(|r| r.idempotency_key.as_str().to_owned())
+            .collect()
+    }
+
+    /// Response ids (idempotency keys) accepted so far: records of calls
+    /// whose scripted outcome accepted them.
+    #[must_use]
+    pub fn delivered_keys(&self) -> Vec<String> {
+        self.calls
+            .lock()
+            .expect("calls")
+            .iter()
+            .flat_map(|c| {
+                c.records
+                    .iter()
+                    .map(|r| r.idempotency_key.as_str().to_owned())
+            })
+            .collect()
+    }
+
+    fn unsupported<T>() -> Result<T, UsageCollectorError> {
+        Err(UsageCollectorError::Internal {
+            detail: "not supported by the fake (test)".to_owned(),
+        })
+    }
+}
+
+#[async_trait]
+impl UsageCollectorClientV1 for FakeUsageCollector {
+    async fn create_usage_record(
+        &self,
+        _ctx: &SecurityContext,
+        _record: CreateUsageRecord,
+    ) -> Result<UsageRecord, UsageCollectorError> {
+        Self::unsupported()
+    }
+
+    async fn create_usage_records(
+        &self,
+        ctx: &SecurityContext,
+        records: Vec<CreateUsageRecord>,
+    ) -> Result<Vec<Result<UsageRecord, UsageCollectorError>>, UsageCollectorError> {
+        self.calls.lock().expect("calls").push(UcCall {
+            at: tokio::time::Instant::now(),
+            subject: ctx.subject_id(),
+            records: records.clone(),
+        });
+        assert!(
+            !self.panicking.load(Ordering::SeqCst),
+            "usage collector fake panics (test)"
+        );
+        if self.parked.load(Ordering::SeqCst) {
+            std::future::pending::<()>().await;
+        }
+        let scripted = self.script.lock().expect("script").pop_front();
+        match scripted {
+            Some(Err(err)) => Err(err),
+            Some(Ok(outcomes)) => Ok(records
+                .into_iter()
+                .zip(outcomes)
+                .map(|(record, outcome)| outcome.map(|()| record.into_usage_record()))
+                .collect()),
+            None => Ok(records
+                .into_iter()
+                .map(|record| Ok(record.into_usage_record()))
+                .collect()),
+        }
+    }
+
+    async fn get_usage_record(
+        &self,
+        _ctx: &SecurityContext,
+        _id: Uuid,
+    ) -> Result<UsageRecord, UsageCollectorError> {
+        Self::unsupported()
+    }
+
+    async fn query_aggregated_usage_records(
+        &self,
+        _ctx: &SecurityContext,
+        _gts_id: UsageTypeGtsId,
+        _query: &toolkit_odata::ODataQuery,
+        _metadata_filter: &[MetadataFilter],
+        _aggregation: AggregationSpec,
+    ) -> Result<AggregationResult, UsageCollectorError> {
+        Self::unsupported()
+    }
+
+    async fn list_usage_records(
+        &self,
+        _ctx: &SecurityContext,
+        _gts_id: UsageTypeGtsId,
+        _query: &toolkit_odata::ODataQuery,
+        _metadata_filter: &[MetadataFilter],
+    ) -> Result<toolkit_odata::Page<UsageRecord>, UsageCollectorError> {
+        Self::unsupported()
+    }
+
+    async fn deactivate_usage_record(
+        &self,
+        _ctx: &SecurityContext,
+        _id: Uuid,
+    ) -> Result<(), UsageCollectorError> {
+        Self::unsupported()
+    }
+
+    async fn create_usage_type(
+        &self,
+        _ctx: &SecurityContext,
+        _usage_type: UsageType,
+    ) -> Result<UsageType, UsageCollectorError> {
+        Self::unsupported()
+    }
+
+    async fn get_usage_type(
+        &self,
+        _ctx: &SecurityContext,
+        _gts_id: UsageTypeGtsId,
+    ) -> Result<UsageType, UsageCollectorError> {
+        Self::unsupported()
+    }
+
+    async fn list_usage_types(
+        &self,
+        _ctx: &SecurityContext,
+        _query: &toolkit_odata::ODataQuery,
+    ) -> Result<toolkit_odata::Page<UsageType>, UsageCollectorError> {
+        Self::unsupported()
+    }
+
+    async fn delete_usage_type(
+        &self,
+        _ctx: &SecurityContext,
+        _gts_id: UsageTypeGtsId,
+    ) -> Result<(), UsageCollectorError> {
+        Self::unsupported()
+    }
+}
+
 /// Wait until `cond` holds, polling on the tokio clock (so it also works with
 /// a paused clock, where the wait advances virtual time); panics after
 /// `within`.
@@ -1682,10 +1943,16 @@ impl Harness {
     /// The Quota Guard over the current fakes.
     #[must_use]
     pub fn quota_guard(&self) -> QuotaGuard {
+        self.quota_guard_with(self.sink.clone())
+    }
+
+    /// The Quota Guard over the current fakes, handing usage to `sink`.
+    #[must_use]
+    pub fn quota_guard_with(&self, sink: Arc<dyn UsageSink>) -> QuotaGuard {
         QuotaGuard::new(
             self.quota.clone(),
             self.identity.clone(),
-            self.sink.clone(),
+            sink,
             &self.quota_cfg,
             &self.timeouts,
         )
@@ -1696,6 +1963,13 @@ impl Harness {
     /// Build the service over the current fakes.
     #[must_use]
     pub fn service(&self) -> Arc<Service> {
+        self.service_with_quota(self.quota_guard())
+    }
+
+    /// Build the service over the current fakes with `quota` as its Quota
+    /// Guard.
+    #[must_use]
+    pub fn service_with_quota(&self, quota: QuotaGuard) -> Arc<Service> {
         Arc::new(Service::new(
             PolicyEnforcer::new(self.pdp.clone()),
             self.models.clone(),
@@ -1706,7 +1980,7 @@ impl Harness {
                 ProviderRulesRegistry::permissive()
                     .with_rules(OPENAI_TYPE, Arc::new(self.rules.clone())),
             ),
-            self.quota_guard(),
+            quota,
             &self.limits,
             &self.stream,
             &self.timeouts,

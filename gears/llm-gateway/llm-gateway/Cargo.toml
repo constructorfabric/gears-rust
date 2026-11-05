@@ -23,6 +23,7 @@ model-registry-sdk = { workspace = true }
 authz-resolver-sdk = { workspace = true }
 types-registry-sdk = { workspace = true }
 quota-enforcement-sdk = { workspace = true }
+usage-collector-sdk = { workspace = true }
 # S2S identity (`exchange_client_credentials`) for settle and usage delivery.
 authn-resolver-sdk = { package = "cf-gears-authn-resolver-sdk", version = "0.3.40", path = "../../system/authn-resolver/authn-resolver-sdk" }
 # Named by `#[toolkit::gear(deps = [...])]`.
@@ -30,6 +31,7 @@ types-registry = { workspace = true }
 authz-resolver = { workspace = true }
 authn-resolver = { workspace = true }
 quota-enforcement = { workspace = true }
+usage-collector = { workspace = true }
 
 anyhow = { workspace = true }
 async-trait = { workspace = true }

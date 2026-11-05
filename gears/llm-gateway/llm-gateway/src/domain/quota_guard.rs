@@ -16,6 +16,7 @@ use quota_enforcement_sdk::{
     QuotaEnforcementError, ReleaseLeaseRequest, SCOPE_USER, SubjectClaim, TenantId,
 };
 use rand::RngExt as _;
+use tokio_util::task::TaskTracker;
 use toolkit_canonical_errors::{CanonicalError, context::InvalidArgumentV1};
 use toolkit_macros::domain_model;
 use toolkit_security::SecurityContext;
@@ -159,6 +160,8 @@ struct Inner {
     backoff_jitter: f64,
     provider_sync: Duration,
     stream_max_duration: Duration,
+    /// Every detached settle/release job, so shutdown can wait for them.
+    jobs: TaskTracker,
 }
 
 /// The Quota Guard. Cheap to clone.
@@ -191,6 +194,7 @@ impl QuotaGuard {
                 backoff_jitter: DEFAULT_BACKOFF_JITTER,
                 provider_sync: timeouts.provider_sync,
                 stream_max_duration: timeouts.stream_max_duration,
+                jobs: TaskTracker::new(),
             }),
         }
     }
@@ -391,7 +395,22 @@ impl QuotaGuard {
         };
         let guard = self.clone();
         let span = tracing::Span::current();
-        runtime.spawn(async move { guard.run(job).await }.instrument(span));
+        runtime.spawn(
+            self.inner
+                .jobs
+                .track_future(async move { guard.run(job).await }.instrument(span)),
+        );
+    }
+
+    /// Resolves once every settle/release job handed off so far has finished
+    /// (its usage was passed to the sink). Call it once the producers
+    /// (requests in flight) are done: jobs spawned meanwhile are awaited too,
+    /// jobs spawned after it returns are not.
+    pub async fn settled(&self) {
+        let jobs = &self.inner.jobs;
+        jobs.close();
+        jobs.wait().await;
+        jobs.reopen();
     }
 
     async fn run(&self, job: Job) {
@@ -401,6 +420,7 @@ impl QuotaGuard {
             lease,
             usage,
             terminal_at,
+            provider_request_id,
         } = job;
         let actual_units = usage
             .as_ref()
@@ -422,6 +442,7 @@ impl QuotaGuard {
                     usage,
                     quantity_micro_credits: actual_units,
                     terminal_at,
+                    provider_request_id,
                 })
                 .await;
         }
@@ -632,6 +653,8 @@ struct Job {
     /// dispatched, release the lease and report nothing.
     usage: Option<Usage>,
     terminal_at: SystemTime,
+    /// Provider request id of the plugin outcome, for the usage report.
+    provider_request_id: Option<String>,
 }
 
 /// An acquired lease.
@@ -659,6 +682,9 @@ pub struct RequestQuota {
     dispatched: bool,
     /// Settle or release already handed to the background.
     done: bool,
+    /// Provider request id captured from the plugin outcome, for the usage
+    /// report.
+    provider_request_id: Option<String>,
 }
 
 impl RequestQuota {
@@ -677,7 +703,14 @@ impl RequestQuota {
             lease,
             dispatched: false,
             done: false,
+            provider_request_id: None,
         }
+    }
+
+    /// Record the provider request id of the plugin outcome (response,
+    /// terminal snapshot or provider error) so the usage report carries it.
+    pub fn set_provider_request_id(&mut self, provider_request_id: Option<String>) {
+        self.provider_request_id = provider_request_id;
     }
 
     /// Whether admission acquired a lease.
@@ -724,6 +757,7 @@ impl RequestQuota {
             lease: self.lease,
             usage,
             terminal_at: SystemTime::now(),
+            provider_request_id: self.provider_request_id.clone(),
         });
     }
 }

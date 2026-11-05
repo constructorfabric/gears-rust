@@ -44,7 +44,7 @@ fn hook() -> (TerminalHook, Calls) {
     let calls: Calls = Arc::default();
     let sink = Arc::clone(&calls);
     (
-        Box::new(move |usage| sink.lock().expect("calls").push(usage)),
+        Box::new(move |usage, _provider_request_id| sink.lock().expect("calls").push(usage)),
         calls,
     )
 }
@@ -111,6 +111,53 @@ async fn hook_calls(calls: &Calls) -> Vec<Usage> {
     }
     tokio::time::sleep(Duration::from_millis(50)).await;
     calls.lock().expect("calls").clone()
+}
+
+/// Hook that records the provider request id it is given.
+type RequestIds = Arc<Mutex<Vec<Option<String>>>>;
+
+fn request_id_hook() -> (TerminalHook, RequestIds) {
+    let seen: RequestIds = Arc::default();
+    let sink = Arc::clone(&seen);
+    (
+        Box::new(move |_usage, id| sink.lock().expect("seen").push(id)),
+        seen,
+    )
+}
+
+#[tokio::test]
+async fn the_hook_carries_the_provider_request_id_of_the_terminal_snapshot() {
+    use llm_gateway_sdk::models::core::ProviderDetails;
+    let (mut p, _calls) = params(Some(estimator()));
+    let (hook, seen) = request_id_hook();
+    p.on_terminal = Some(hook);
+    let mut done = ev_completed(0, "p", Some(provider_usage(dec(5, 1))));
+    if let StreamingEvent::Completed(e) = &mut done {
+        e.response.provider_details =
+            Some(ProviderDetails::default().with_provider_request_id("req_terminal"));
+    }
+    run(vec![done], p).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    assert_eq!(
+        *seen.lock().expect("seen"),
+        [Some("req_terminal".to_owned())]
+    );
+}
+
+#[tokio::test]
+async fn the_hook_gets_no_provider_request_id_when_the_terminal_has_none() {
+    let (mut p, _calls) = params(Some(estimator()));
+    let (hook, seen) = request_id_hook();
+    p.on_terminal = Some(hook);
+    run(
+        vec![ev_completed(0, "p", Some(provider_usage(dec(5, 1))))],
+        p,
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    assert_eq!(*seen.lock().expect("seen"), [None]);
 }
 
 // ── provider terminals with usage ───────────────────────────────────────────

@@ -4,4 +4,4 @@ pub mod model_registry;
 pub mod plugin_directory;
 pub mod service_identity;
 pub mod tool_schemas;
-pub mod usage_log;
+pub mod usage_collector;

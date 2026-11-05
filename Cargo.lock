@@ -3536,6 +3536,8 @@ dependencies = [
  "cf-gears-toolkit-security",
  "cf-gears-types-registry",
  "cf-gears-types-registry-sdk",
+ "cf-gears-usage-collector",
+ "cf-gears-usage-collector-sdk",
  "futures-core",
  "futures-util",
  "gts",

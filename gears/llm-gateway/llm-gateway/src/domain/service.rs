@@ -9,8 +9,8 @@ use std::time::Duration;
 use authz_resolver_sdk::PolicyEnforcer;
 use llm_gateway_sdk::{
     CreateResponseBody, EmbeddingRequest, EmbeddingResponse, InputItem, LlmGatewayError,
-    ProviderCallCtx, ProviderErrorCategory, ProviderFailure, ResponseEventStream, ResponseInput,
-    ResponseResource, TextFormatKind, Usage,
+    ProviderCallCtx, ProviderDetails, ProviderErrorCategory, ProviderFailure, ResponseEventStream,
+    ResponseInput, ResponseResource, TextFormatKind, Usage,
 };
 use model_registry_sdk::ModelInfoV1;
 use rust_decimal::Decimal;
@@ -27,6 +27,7 @@ use super::capability_checker::{CapabilityChecker, EffectiveEmbedding, Effective
 use super::output_validator::OutputValidator;
 use super::ports::{
     CredentialBroker, ModelResolver, PluginDirectory, ResolvedPlugin, ToolSchemaSource,
+    UsageProducers,
 };
 use super::provider_rules::ProviderRulesRegistry;
 use super::quota_guard::{Operation, QuotaGuard, Quote, RequestMeta, RequestQuota};
@@ -81,6 +82,19 @@ fn error_chain(err: &LlmGatewayError) -> String {
         source = cause.source();
     }
     text
+}
+
+/// The provider request id a provider error carries, if any.
+fn error_provider_request_id(err: &LlmGatewayError) -> Option<String> {
+    match err {
+        LlmGatewayError::Provider { details, .. } => details.provider_request_id.clone(),
+        _ => None,
+    }
+}
+
+/// The provider request id of response or embedding `provider_details`.
+fn details_request_id(details: Option<&ProviderDetails>) -> Option<String> {
+    details.and_then(|details| details.provider_request_id.clone())
 }
 
 /// Whether `err` maps to a 5xx response (DESIGN §4.1): a provider category
@@ -188,6 +202,11 @@ struct Prepared {
     quota: RequestQuota,
 }
 
+/// Semaphore permit count of a configured pool size.
+fn permits(max: usize) -> u32 {
+    u32::try_from(max).unwrap_or(u32::MAX)
+}
+
 /// Domain service running the request pipeline.
 #[domain_model]
 pub struct Service {
@@ -203,6 +222,9 @@ pub struct Service {
     max_tools: usize,
     inflight_sync: Arc<Semaphore>,
     inflight_streams: Arc<Semaphore>,
+    /// Capacity of the two pools (all permits available = nothing in flight).
+    max_inflight_sync: u32,
+    max_inflight_streams: u32,
     channel_capacity: usize,
     /// Bound of one sync or embeddings plugin call (`timeouts.provider_sync`),
     /// the base of the quota lease TTL.
@@ -238,6 +260,8 @@ impl Service {
             max_tools: limits.max_tools,
             inflight_sync: Arc::new(Semaphore::new(limits.max_inflight_sync)),
             inflight_streams: Arc::new(Semaphore::new(limits.max_inflight_streams)),
+            max_inflight_sync: permits(limits.max_inflight_sync),
+            max_inflight_streams: permits(limits.max_inflight_streams),
             channel_capacity: stream.channel_capacity,
             provider_sync: timeouts.provider_sync,
         }
@@ -314,10 +338,12 @@ impl Service {
             }
             Ok(Err(err)) => {
                 // A provider error carries no cost: nothing to commit.
+                quota.set_provider_request_id(error_provider_request_id(&err));
                 quota.settle(Usage::reported(0, 0, Decimal::ZERO));
                 return Err(err);
             }
         };
+        quota.set_provider_request_id(details_request_id(resource.provider_details.as_ref()));
         let usage = resource
             .usage
             .clone()
@@ -633,6 +659,7 @@ impl Service {
         let upstream = match started {
             Ok(upstream) => upstream,
             Err(err) => {
+                quota.set_provider_request_id(error_provider_request_id(&err));
                 quota.settle(Usage::reported(0, 0, Decimal::ZERO));
                 return Err(err);
             }
@@ -650,7 +677,10 @@ impl Service {
                 ignored_parameters,
                 slot: Some(slot),
                 estimator: Some(estimator),
-                on_terminal: Some(Box::new(move |usage| quota.settle(usage))),
+                on_terminal: Some(Box::new(move |usage, provider_request_id| {
+                    quota.set_provider_request_id(provider_request_id);
+                    quota.settle(usage);
+                })),
             },
         ))
     }
@@ -764,10 +794,12 @@ impl Service {
                 ));
             }
             Ok(Err(err)) => {
+                quota.set_provider_request_id(error_provider_request_id(&err));
                 quota.settle(Usage::reported(0, 0, Decimal::ZERO));
                 return Err(err);
             }
         };
+        quota.set_provider_request_id(details_request_id(response.provider_details.as_ref()));
         quota.settle(response.usage.clone());
 
         let mut ignored = std::mem::take(&mut response.ignored_parameters);
@@ -792,6 +824,29 @@ impl Service {
         self.create_embedding_traced(ctx, req)
             .await
             .map_err(|failure| failure.error)
+    }
+}
+
+#[async_trait::async_trait]
+impl UsageProducers for Service {
+    /// Waits until every in-flight slot (sync and stream) is free, then until
+    /// the background settles are done. Slots are released only after the
+    /// request handed its settle off, so no settle can still be missed.
+    /// While waiting, new requests queue behind the waiter and may get
+    /// `gateway_unavailable`: only the shutdown path calls this.
+    async fn quiescent(&self) {
+        // The semaphores are never closed: `acquire_many` cannot fail.
+        drop(
+            self.inflight_sync
+                .acquire_many(self.max_inflight_sync)
+                .await,
+        );
+        drop(
+            self.inflight_streams
+                .acquire_many(self.max_inflight_streams)
+                .await,
+        );
+        self.quota.settled().await;
     }
 }
 
@@ -827,5 +882,15 @@ mod service_quota_stream_tests;
 
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
+#[path = "service_quiescence_tests.rs"]
+mod service_quiescence_tests;
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 #[path = "service_timeout_tests.rs"]
 mod service_timeout_tests;
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+#[path = "service_usage_report_tests.rs"]
+mod service_usage_report_tests;

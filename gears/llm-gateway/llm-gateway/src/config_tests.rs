@@ -211,3 +211,152 @@ fn invalid_values_are_rejected_naming_the_key() {
         assert!(err.contains(key), "{err} should name {key}");
     }
 }
+
+// ── slice 5b: usage delivery and shutdown ───────────────────────────────────
+
+mod usage {
+    use std::time::Duration;
+
+    use super::{LlmGatewayConfig, cfg};
+    use crate::config::{ShutdownConfig, UsageConfig};
+
+    #[test]
+    fn usage_and_shutdown_defaults_are_sensible() {
+        let u = UsageConfig::default();
+        assert_eq!(
+            u.usage_type,
+            "gts.cf.core.uc.usage_record.v1~cf.llmgw.gateway.ai_credits.v1"
+        );
+        assert_eq!(u.buffer_capacity, 10_000);
+        assert_eq!(u.batch_size, 100);
+        assert_eq!(u.flush_interval, Duration::from_secs(1));
+        assert_eq!(u.retry_backoff, Duration::from_secs(1));
+        assert_eq!(u.max_internal_retries, 3);
+        assert_eq!(
+            ShutdownConfig::default().usage_drain_reserve,
+            Duration::from_secs(5)
+        );
+        LlmGatewayConfig::default()
+            .validate()
+            .expect("the defaults are valid");
+    }
+
+    #[test]
+    fn usage_settings_deserialize_and_keep_other_defaults() {
+        let c = cfg(serde_json::json!({
+            "usage": { "batch_size": 10, "flush_interval": "250ms", "buffer_capacity": 50 },
+            "shutdown": { "usage_drain_reserve": "8s" }
+        }));
+        assert_eq!(c.usage.batch_size, 10);
+        assert_eq!(c.usage.flush_interval, Duration::from_millis(250));
+        assert_eq!(c.usage.buffer_capacity, 50);
+        assert_eq!(c.usage.retry_backoff, Duration::from_secs(1));
+        assert_eq!(c.shutdown.usage_drain_reserve, Duration::from_secs(8));
+        c.validate().expect("valid");
+    }
+
+    #[test]
+    fn zero_internal_retries_is_allowed_and_means_no_retry() {
+        let c = cfg(serde_json::json!({ "usage": { "max_internal_retries": 0 } }));
+        assert_eq!(c.usage.max_internal_retries, 0);
+        c.validate().expect("0 disables internal retries");
+        let c = cfg(serde_json::json!({ "usage": { "max_internal_retries": 7 } }));
+        assert_eq!(c.usage.max_internal_retries, 7);
+        c.validate().expect("valid");
+    }
+
+    #[test]
+    fn unknown_usage_and_shutdown_keys_are_rejected() {
+        for value in [
+            serde_json::json!({ "usage": { "batch_sizee": 1 } }),
+            serde_json::json!({ "shutdown": { "usage_drain": "1s" } }),
+        ] {
+            assert!(serde_json::from_value::<LlmGatewayConfig>(value).is_err());
+        }
+    }
+
+    #[test]
+    fn invalid_usage_values_are_rejected_naming_the_key() {
+        let cases = [
+            (
+                serde_json::json!({ "usage": { "usage_type": " " } }),
+                "usage.usage_type",
+            ),
+            (
+                // A quota metric id is not a usage record derived id.
+                serde_json::json!({ "usage": {
+                    "usage_type": "gts.cf.core.qe.metric_type.v1~cf.llmgw.gateway.ai_credits.v1"
+                } }),
+                "usage.usage_type",
+            ),
+            (
+                serde_json::json!({ "usage": { "usage_type": "not a gts id" } }),
+                "usage.usage_type",
+            ),
+            (
+                serde_json::json!({ "usage": { "buffer_capacity": 0 } }),
+                "usage.buffer_capacity",
+            ),
+            (
+                serde_json::json!({ "usage": { "batch_size": 0 } }),
+                "usage.batch_size",
+            ),
+            (
+                // Usage Collector caps one batch at 100 records.
+                serde_json::json!({ "usage": { "batch_size": 101 } }),
+                "usage.batch_size",
+            ),
+            (
+                serde_json::json!({ "usage": { "flush_interval": "0s" } }),
+                "usage.flush_interval",
+            ),
+            (
+                serde_json::json!({ "usage": { "retry_backoff": "0s" } }),
+                "usage.retry_backoff",
+            ),
+            (
+                serde_json::json!({ "shutdown": { "usage_drain_reserve": "0s" } }),
+                "shutdown.usage_drain_reserve",
+            ),
+            (
+                // Leaves in-flight requests less than the stop timeout minus
+                // the margin and the maximum reserve.
+                serde_json::json!({ "shutdown": { "usage_drain_reserve": "21s" } }),
+                "shutdown.usage_drain_reserve",
+            ),
+        ];
+        for (value, key) in cases {
+            let err = cfg(value).validate().expect_err(key);
+            assert!(err.contains(key), "{err} should name {key}");
+        }
+    }
+
+    #[test]
+    fn the_largest_drain_reserve_leaves_a_quiescence_budget_inside_the_stop_timeout() {
+        let c = cfg(serde_json::json!({ "shutdown": { "usage_drain_reserve": "20s" } }));
+        c.validate().expect("20s is the largest valid reserve");
+        let budget = c.shutdown.quiescence_budget();
+        assert_eq!(budget, Duration::from_secs(7));
+        assert!(budget + c.shutdown.usage_drain_reserve < crate::module::GEAR_STOP_TIMEOUT);
+        assert_eq!(
+            ShutdownConfig::default().quiescence_budget(),
+            Duration::from_secs(22)
+        );
+    }
+
+    #[test]
+    fn the_gear_lifecycle_uses_the_stop_timeout_constant() {
+        assert_eq!(
+            crate::module::LlmGatewayModule::default().stop_timeout(),
+            crate::module::GEAR_STOP_TIMEOUT
+        );
+        assert_eq!(crate::module::GEAR_STOP_TIMEOUT, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn a_batch_of_exactly_the_collector_cap_is_valid() {
+        cfg(serde_json::json!({ "usage": { "batch_size": 100 } }))
+            .validate()
+            .expect("100 is the cap, not over it");
+    }
+}

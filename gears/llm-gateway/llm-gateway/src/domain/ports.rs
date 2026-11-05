@@ -156,13 +156,28 @@ pub struct UsageReport {
     pub usage: llm_gateway_sdk::Usage,
     /// The same quantity in metric units (micro-credits), rounded up.
     pub quantity_micro_credits: i64,
-    /// Stamped once at the terminal state.
+    /// Stamped once at the terminal state; becomes the usage record
+    /// `created_at`, reused unchanged on every delivery retry.
     pub terminal_at: std::time::SystemTime,
+    /// Request identifier assigned by the provider (the `provider_request_id`
+    /// of the response, embedding response, terminal snapshot or provider
+    /// error), when the plugin captured one.
+    pub provider_request_id: Option<String>,
 }
 
-/// Usage Reporter entry point (implemented in slice 5b).
+/// Usage Reporter entry point (`UsageCollectorReporter` in `infra`).
 #[async_trait]
 pub trait UsageSink: Send + Sync {
     /// Accept the usage of one terminal request. Must not block on delivery.
     async fn record(&self, report: UsageReport);
+}
+
+/// The producers of usage reports: requests in flight and their background
+/// settles. The Usage Reporter waits for them at shutdown so the usage of
+/// requests that end during the stop is still delivered.
+#[async_trait]
+pub trait UsageProducers: Send + Sync {
+    /// Resolves once no request is in flight and every background settle
+    /// handed off so far has finished (its usage reached [`UsageSink`]).
+    async fn quiescent(&self);
 }

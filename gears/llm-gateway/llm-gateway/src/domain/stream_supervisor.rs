@@ -48,8 +48,10 @@ use super::pricing::UsageEstimator;
 /// usage: `cost` is the AI credit quantity, `complete` / `estimated` follow
 /// the DESIGN usage table. Every terminal path calls it: a provider or
 /// synthesized terminal, a provider error, consumer disconnect and relay
-/// failure.
-pub type TerminalHook = Box<dyn FnOnce(Usage) + Send + 'static>;
+/// failure. The second argument is the provider request id carried by the
+/// terminal snapshot's provider details (`None` when the stream ended
+/// without a provider terminal or the plugin captured none).
+pub type TerminalHook = Box<dyn FnOnce(Usage, Option<String>) + Send + 'static>;
 
 /// What the relay saw so far; shared by the relay task, its terminal guard and
 /// the consumer side (which builds the terminal when the task dies).
@@ -135,9 +137,9 @@ struct TerminalGuard {
 }
 
 impl TerminalGuard {
-    fn finish(&mut self, usage: Usage) {
+    fn finish(&mut self, usage: Usage, provider_request_id: Option<String>) {
         if let Some(hook) = self.hook.take() {
-            hook(usage);
+            hook(usage, provider_request_id);
         }
     }
 }
@@ -145,7 +147,7 @@ impl TerminalGuard {
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         if let Some(hook) = self.hook.take() {
-            hook(self.basis.no_final());
+            hook(self.basis.no_final(), None);
         }
     }
 }
@@ -524,8 +526,9 @@ impl State {
                     .usage
                     .take()
                     .unwrap_or_else(|| self.no_final_usage());
-                let failed =
+                let mut failed =
                     self.own_terminal(ResponseStatus::Failed, Some(err.to_response_error()), usage);
+                failed.provider_details = response.provider_details.take();
                 return snapshot_event(StreamingEvent::Failed, failed);
             }
         }
@@ -548,6 +551,27 @@ fn now_secs() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
+}
+
+/// Provider request id carried by a terminal snapshot's provider details, or
+/// by the provider error of a failed terminal.
+fn terminal_provider_request_id(event: &StreamingEvent) -> Option<String> {
+    match event {
+        StreamingEvent::Completed(e)
+        | StreamingEvent::Incomplete(e)
+        | StreamingEvent::Failed(e) => e
+            .response
+            .provider_details
+            .as_ref()
+            .and_then(|details| details.provider_request_id.clone())
+            .or_else(|| {
+                e.response
+                    .error
+                    .as_ref()
+                    .and_then(|error| error.provider_request_id.clone())
+            }),
+        _ => None,
+    }
 }
 
 /// Usage carried by a terminal event (every terminal carries one).
@@ -626,9 +650,10 @@ async fn send_terminal(
     terminal: StreamingEvent,
 ) {
     let usage = terminal_usage(&terminal);
+    let provider_request_id = terminal_provider_request_id(&terminal);
     if state.emit(tx, terminal).await {
         if let Some(usage) = usage {
-            guard.finish(usage);
+            guard.finish(usage, provider_request_id);
         }
     } else {
         log_disconnect(&state.response_id);

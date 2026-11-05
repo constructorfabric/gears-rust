@@ -9,10 +9,11 @@ use tokio_util::sync::CancellationToken;
 use toolkit::api::OpenApiRegistryImpl;
 use toolkit::config::ConfigProvider;
 use toolkit::{ClientHub, Gear, GearCtx, RestApiCapability};
+use usage_collector_sdk::UsageCollectorClientV1;
 use uuid::Uuid;
 
 use super::LlmGatewayModule;
-use crate::domain::test_support::{CallLog, FakePdp, PdpMode};
+use crate::domain::test_support::{CallLog, FakePdp, FakeUsageCollector, PdpMode};
 
 struct StaticConfigProvider {
     root: serde_json::Value,
@@ -55,6 +56,8 @@ async fn init_fails_when_model_registry_client_is_missing() {
     let pdp: Arc<dyn AuthZResolverApi> =
         FakePdp::new(PdpMode::Permit, Arc::new(CallLog::default()));
     hub.register::<dyn AuthZResolverApi>(pdp);
+    let usage_collector: Arc<dyn UsageCollectorClientV1> = FakeUsageCollector::new();
+    hub.register::<dyn UsageCollectorClientV1>(usage_collector);
     let ctx = make_ctx(hub);
 
     let err = LlmGatewayModule::default()
@@ -81,5 +84,27 @@ fn register_rest_before_init_fails() {
     assert!(
         msg.contains("llm-gateway") && msg.contains("not initialized"),
         "{msg}"
+    );
+}
+
+#[tokio::test]
+async fn init_fails_when_usage_collector_client_is_missing() {
+    // Only the authz client is registered: the usage collector is checked
+    // right after it (before Model Registry), so the error must name it.
+    let hub = Arc::new(ClientHub::new());
+    let pdp: Arc<dyn AuthZResolverApi> =
+        FakePdp::new(PdpMode::Permit, Arc::new(CallLog::default()));
+    hub.register::<dyn AuthZResolverApi>(pdp);
+    let ctx = make_ctx(hub);
+
+    let err = LlmGatewayModule::default()
+        .init(&ctx)
+        .await
+        .expect_err("init must fail without a usage-collector client");
+
+    let chain = format!("{err:#}");
+    assert!(
+        chain.contains("llm-gateway") && chain.contains("usage-collector"),
+        "the error names the gear and the missing dependency: {chain}"
     );
 }

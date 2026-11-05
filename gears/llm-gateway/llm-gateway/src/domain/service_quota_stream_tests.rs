@@ -469,7 +469,9 @@ async fn a_relay_failure_settles_the_estimate_once() {
             ignored_parameters: Vec::new(),
             slot: None,
             estimator: Some(estimator),
-            on_terminal: Some(Box::new(move |usage| quota.settle(usage))),
+            on_terminal: Some(Box::new(move |usage, _provider_request_id| {
+                quota.settle(usage);
+            })),
         },
     );
     let events = collect(stream).await;
