@@ -10,19 +10,19 @@
 //! `GtsIdPattern`s (the wildcard grammar is enforced when a pattern is
 //! constructed), so a malformed pattern never reaches a subscription.
 //! Production delivery additionally checks consume permission on each concrete
-//! event type; selector matching alone is not an authorization decision.
+//! event tenant, topic, and type; selector matching alone is not authorization.
 
 use std::collections::HashMap;
 
 use async_trait::async_trait;
 use authz_resolver_sdk::{AccessRequest, EnforcerError, PolicyEnforcer};
 use toolkit::domain_model;
-use toolkit_security::SecurityContext;
+use toolkit_security::{SecurityContext, pep_properties};
 
 use gts::{GtsId, GtsIdPattern};
 use uuid::Uuid;
 
-use crate::domain::authz::event_type_resource;
+use crate::domain::authz::{TENANT_SCOPE_RESOURCE, event_type_resource, topic_resource};
 use crate::domain::error::DomainError;
 use crate::domain::model::{Event, FilterSpec, Interest};
 
@@ -41,7 +41,7 @@ pub trait EventFilter: Send + Sync {
     }
 }
 
-/// Combines subscription matching with a point decision on the delivered type.
+/// Combines subscription matching with tenant, topic, and concrete type decisions.
 /// A bare GTS selector includes descendants, but a grant on that selector's
 /// root need not include them. Never infer a descendant's permission from JOIN.
 #[domain_model]
@@ -79,24 +79,39 @@ impl EventFilter for AuthorizedInterestFilter {
         if !self.matches(event) {
             return Ok(false);
         }
-        let resource = event_type_resource(&event.r#type)?;
-        match self
-            .policy_enforcer
-            .access_scope_with(
-                &self.ctx,
-                &resource,
-                "consume",
-                None,
-                &AccessRequest::new()
-                    .resource_property("event_type_id", event.r#type.as_ref())
-                    .require_constraints(false),
-            )
-            .await
-        {
-            Ok(_) => Ok(true),
-            Err(EnforcerError::Denied { .. }) => Ok(false),
-            Err(error) => Err(error.into()),
+        // JOIN authorizes the requested interests, not an enduring grant. All
+        // three independent decisions use the stored event's tenant, so an
+        // allow in the caller's tenant cannot authorize another tenant's event.
+        let tenant_request = AccessRequest::new()
+            .resource_property(pep_properties::OWNER_TENANT_ID, event.tenant_id)
+            .require_constraints(false);
+        let checks = [
+            (TENANT_SCOPE_RESOURCE, tenant_request.clone()),
+            (
+                topic_resource(&event.topic),
+                tenant_request
+                    .clone()
+                    .resource_property("topic_id", event.topic.as_ref()),
+            ),
+            (
+                event_type_resource(&event.r#type)?,
+                tenant_request.resource_property("event_type_id", event.r#type.as_ref()),
+            ),
+        ];
+        for (resource, request) in checks {
+            match self
+                .policy_enforcer
+                .access_scope_with(&self.ctx, &resource, "consume", None, &request)
+                .await
+            {
+                Ok(_) => {}
+                Err(EnforcerError::Denied { .. }) => return Ok(false),
+                // An outage must terminate the batch without advancing progress;
+                // treating it as a denial would silently skip unread events.
+                Err(error) => return Err(error.into()),
+            }
         }
+        Ok(true)
     }
 }
 
