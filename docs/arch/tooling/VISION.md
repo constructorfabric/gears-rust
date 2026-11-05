@@ -294,6 +294,19 @@ tool stops managing that file, and the report shows it as a declared exception r
 Without that route a project edits a managed file and says nothing, and nobody can tell a deliberate
 change from a mistake.
 
+**An exception is the last resort, not the first.** Most one-line differences are not divergence but
+a **missing parameter**: `gears.mk` already lets a project override any setting from its own make
+file, and `Gears.toml` already carries the dylint skip list that belongs to this project. Where a
+convention anticipates what varies, the file stays managed and the project supplies a value. An
+exception is for what the convention did not anticipate — and a convention that collects many of
+them is a convention that needs a parameter.
+
+Taking one costs automatic application, not visibility: the tool still knows the version the file
+diverged from and still reports when upstream moves past it. It only stops writing. Whether
+something narrower than a whole file can be declared — a section, a key — is a design question,
+and nothing here forbids it, provided ownership is declared per unit in advance rather than inferred
+by comparing edits. That inference is the part section 5 rules out.
+
 **The loop is not a bot either, but a bot must be able to drive it.** That is a requirement, not a
 convenience. Section 2 shows that P4 fails on human attention, so the loop has value only if it runs
 without attention.
