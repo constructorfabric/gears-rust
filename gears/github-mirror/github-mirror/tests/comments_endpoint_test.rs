@@ -197,7 +197,11 @@ async fn repo_comments_cover_every_issue_oldest_first_by_default() {
     let ctx = common::caller_in(Uuid::new_v4());
     let service = service_with_repo_comments(&ctx).await;
 
-    let response = get(router_for(service, ctx), "/repos/acme/widget/issues/comments").await;
+    let response = get(
+        router_for(service, ctx),
+        "/repos/acme/widget/issues/comments",
+    )
+    .await;
 
     assert_eq!(response.status(), StatusCode::OK);
     let json = body_json(response).await;
@@ -246,7 +250,11 @@ async fn repo_comments_follow_sort_direction_and_since() {
         .iter()
         .map(|c| c["id"].as_i64().unwrap())
         .collect();
-    assert_eq!(ids, [3, 2], "comments updated before `since` must be left out");
+    assert_eq!(
+        ids,
+        [3, 2],
+        "comments updated before `since` must be left out"
+    );
 }
 
 #[tokio::test]

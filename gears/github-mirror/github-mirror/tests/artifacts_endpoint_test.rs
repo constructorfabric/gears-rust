@@ -99,7 +99,11 @@ async fn artifacts_are_listed_newest_first_in_githubs_shape() {
     let ctx = common::caller_in(Uuid::new_v4());
     let service = service_with_artifacts(&ctx).await;
 
-    let response = get(router_for(service, ctx), "/repos/acme/widget/actions/artifacts").await;
+    let response = get(
+        router_for(service, ctx),
+        "/repos/acme/widget/actions/artifacts",
+    )
+    .await;
 
     assert_eq!(response.status(), StatusCode::OK);
     let json = body_json(response).await;
@@ -136,7 +140,11 @@ async fn artifacts_of_unknown_repository_return_404() {
     let ctx = common::caller_in(Uuid::new_v4());
     let service = common::service("https://api.github.com").await;
 
-    let response = get(router_for(service, ctx), "/repos/acme/nope/actions/artifacts").await;
+    let response = get(
+        router_for(service, ctx),
+        "/repos/acme/nope/actions/artifacts",
+    )
+    .await;
 
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
 }

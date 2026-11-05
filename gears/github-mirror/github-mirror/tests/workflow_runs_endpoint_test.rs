@@ -219,14 +219,21 @@ async fn workflows_are_built_from_stored_runs_under_their_latest_name() {
     let ctx = common::caller_in(Uuid::new_v4());
     let service = service_with_two_workflows(&ctx).await;
 
-    let response = get(router_for(service, ctx), "/repos/acme/widget/actions/workflows").await;
+    let response = get(
+        router_for(service, ctx),
+        "/repos/acme/widget/actions/workflows",
+    )
+    .await;
 
     assert_eq!(response.status(), StatusCode::OK);
     let json = body_json(response).await;
     assert_eq!(json["total_count"], 2);
     let workflows = json["workflows"].as_array().expect("workflows");
     assert_eq!(workflows[0]["id"], 8);
-    assert_eq!(workflows[0]["name"], "Build", "a renamed workflow shows its newest name");
+    assert_eq!(
+        workflows[0]["name"], "Build",
+        "a renamed workflow shows its newest name"
+    );
     assert_eq!(workflows[1]["id"], 9);
     assert_eq!(workflows[1]["name"], "Release");
 }
@@ -237,7 +244,14 @@ async fn runs_of_one_workflow_leave_the_others_out() {
     let service = service_with_two_workflows(&ctx).await;
     let router = router_for(service, ctx);
 
-    let json = body_json(get(router.clone(), "/repos/acme/widget/actions/workflows/8/runs").await).await;
+    let json = body_json(
+        get(
+            router.clone(),
+            "/repos/acme/widget/actions/workflows/8/runs",
+        )
+        .await,
+    )
+    .await;
     assert_eq!(json["total_count"], 2);
     let runs = json["workflow_runs"].as_array().expect("workflow_runs");
     assert_eq!(runs[0]["run_number"], 201);
