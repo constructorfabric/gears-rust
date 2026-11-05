@@ -7,10 +7,13 @@ use tokio::sync::Notify;
 use toolkit_contract::runtime::config::{CredentialState, InternalTokenProvider};
 use toolkit_contract::wiring::ClientTuning;
 
-use super::*;
+use super::{GtsDeploymentOutcome, GtsDeploymentReport, publish};
+use crate::client_hub::ClientHub;
+use crate::config::ConfigProvider;
 use crate::discovery::{EndpointResolver, WireOutcome};
 use crate::gts_publication::{
-    DeclarationSource, GtsPublicationBackend, GtsPublicationExpired, GtsPublicationRequest,
+    DeclarationSource, GtsPublicationBackend, GtsPublicationDescriptor, GtsPublicationExpired,
+    GtsPublicationRequest,
 };
 
 const ENDPOINT: &str = "https://registry.example:8443";

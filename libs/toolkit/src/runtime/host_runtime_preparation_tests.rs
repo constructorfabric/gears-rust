@@ -44,12 +44,18 @@ pub(super) struct FakeRegistry {
     sent: Mutex<Vec<String>>,
 }
 
-/// Sets its flag when dropped.
-struct DropFlag(Arc<std::sync::atomic::AtomicBool>);
+/// Records cancellation only if the publication has not completed.
+struct DropFlag {
+    dropped: Arc<std::sync::atomic::AtomicBool>,
+    completed: bool,
+}
 
 impl Drop for DropFlag {
     fn drop(&mut self) {
-        self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        if !self.completed {
+            self.dropped
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
     }
 }
 
@@ -86,13 +92,16 @@ fn fake_backend(hub: &ClientHub) -> anyhow::Result<GtsPublicationBackend> {
                 match answer {
                     Answer::Admit => Ok(()),
                     Answer::HoldUntil(release) => {
-                        let flag = DropFlag(Arc::clone(&registry.dropped));
+                        let mut flag = DropFlag {
+                            dropped: Arc::clone(&registry.dropped),
+                            completed: false,
+                        };
                         registry
                             .held
                             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                         request.report_pending("base type absent");
                         release.notified().await;
-                        std::mem::forget(flag);
+                        flag.completed = true;
                         Ok(())
                     }
                     Answer::Refuse => anyhow::bail!("rejected"),
@@ -423,6 +432,12 @@ async fn a_pending_publication_holds_back_the_whole_application_group() {
 
     cancel.cancel();
     running.await.unwrap().unwrap();
+    assert!(!fake.dropped.load(std::sync::atomic::Ordering::SeqCst));
+    assert_eq!(
+        Arc::strong_count(&fake.dropped),
+        1,
+        "a completed publication releases its cancellation flag"
+    );
     let log = events.lock().clone();
     for gear in ["a", "b", "c", "nil", "registry"] {
         assert!(has(&events, &format!("stop:{gear}")), "{gear} stopped");
@@ -1089,7 +1104,7 @@ async fn a_cancelled_pre_init_phase_runs_no_hook() {
     assert!(events.lock().is_empty(), "{:?}", events.lock());
 }
 
-static EARLY: std::sync::Mutex<Vec<&'static str>> = std::sync::Mutex::new(Vec::new());
+static EARLY: std::sync::Mutex<Vec<&str>> = std::sync::Mutex::new(Vec::new());
 /// Held by every test that counts [`EARLY`]: the tests run in parallel.
 static EARLY_TESTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 

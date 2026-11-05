@@ -630,12 +630,17 @@ struct HeldRegistry {
     refuse: bool,
 }
 
-/// Sets its flag when dropped.
-struct DropFlag(Arc<std::sync::atomic::AtomicBool>);
+/// Records cancellation only if the publication has not completed.
+struct DropFlag {
+    dropped: Arc<std::sync::atomic::AtomicBool>,
+    completed: bool,
+}
 
 impl Drop for DropFlag {
     fn drop(&mut self) {
-        self.0.store(true, Ordering::SeqCst);
+        if !self.completed {
+            self.dropped.store(true, Ordering::SeqCst);
+        }
     }
 }
 
@@ -646,9 +651,12 @@ fn held_backend(hub: &ClientHub) -> anyhow::Result<crate::gts_publication::GtsPu
             let held = Arc::clone(&held);
             async move {
                 anyhow::ensure!(!held.refuse, "rejected: incompatible");
-                let flag = DropFlag(Arc::clone(&held.dropped));
+                let mut flag = DropFlag {
+                    dropped: Arc::clone(&held.dropped),
+                    completed: false,
+                };
                 held.release.notified().await;
-                std::mem::forget(flag);
+                flag.completed = true;
                 Ok(())
             }
         },
@@ -780,6 +788,12 @@ async fn an_oop_publishing_gear_is_neither_served_nor_advertised_before_admissio
 
     held.release.notify_one();
     assert!(poll_status(addr, "/published", 200, Duration::from_secs(5)).await);
+    assert!(!held.dropped.load(Ordering::SeqCst));
+    assert_eq!(
+        Arc::strong_count(&held.dropped),
+        1,
+        "a completed publication releases its cancellation flag"
+    );
     assert!(gear.handled.load(Ordering::SeqCst) >= 1);
     assert!(poll_status(addr, "/readyz", 200, Duration::from_secs(5)).await);
     let deadline = tokio::time::Instant::now() + Duration::from_secs(3);

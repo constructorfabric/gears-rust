@@ -272,7 +272,7 @@ impl Default for GtsPublicationOptions {
 }
 
 impl GtsPublicationOptions {
-    const FIELDS: &'static str = "timeout, retry_backoff, retry_backoff_max, batch_size";
+    const FIELDS: &str = "timeout, retry_backoff, retry_backoff_max, batch_size";
 
     /// The policy of `gear` in `config`; the default without a `gts_publication` section.
     ///

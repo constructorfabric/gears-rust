@@ -1188,7 +1188,10 @@ mod auth_disabled {
 /// manifest from the same local file and rendered master configuration, and
 /// the job opens no database.
 mod publication_config_tests {
-    use super::*;
+    use crate::bootstrap::config::AppConfig;
+    use crate::bootstrap::oop::{
+        OopRunOptions, build_oop_config_and_db, oop_publication_config_from, parse_rendered_config,
+    };
     use crate::gts_publication::{
         DeclarationSource, GtsPublicationBackend, GtsPublicationDescriptor, GtsPublicationInputs,
     };
