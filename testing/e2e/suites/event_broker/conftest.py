@@ -283,12 +283,15 @@ _TEMP_HOME = tempfile.mkdtemp(prefix="cf-gears-e2e-event-broker-")
 # ── Storage backend ───────────────────────────────────────────────────────
 #
 # The suite runs against any linked storage backend, chosen by `EB_E2E_BACKEND`:
-# `memory` (the default, what the committed config names), `sqlite` (a file in
-# the server's home directory), or a server in a sidecar container -
-# `postgres`, `mysql`, `mariadb` (both served by the MySQL backend) or `kafka`.
+# `memory` (the default), `sqlite` (a file in the server's home directory), or a
+# server in a sidecar container - `postgres`, `mysql`, `mariadb` (both served by
+# the MySQL backend) or `kafka`.
 # The make targets are `e2e-event-broker` (the whole suite) and
 # `e2e-event-broker-<backend>` (the `backend_sensitive` tests only).
 # Tests that need events to outlive the process run on every durable backend.
+# The committed config names sqlite with a file in the real home, so every
+# server the suite starts has that entry replaced (`patch_backend`), memory
+# included.
 
 MEMORY_BACKEND = "gts.cf.core.events.backend.v1~cf.core.backend.memory.v1~"
 POSTGRES_BACKEND = "gts.cf.core.events.backend.v1~cf.core.backend.postgres.v1~"
@@ -332,6 +335,8 @@ def _backend_block(sidecars, namespace: str, home_dir: str) -> tuple[str, str]:
     sidecars = list(sidecars.values() if isinstance(sidecars, dict) else sidecars)
     server = next((sc for sc in sidecars if sc.name == BACKEND), None)
     indent = "          "
+    if BACKEND == "memory":
+        return MEMORY_BACKEND, ""
     if BACKEND == "postgres":
         # Segments of 1000 events, so the retention test's batch fills one and
         # its expiry is observable; PostgreSQL expires whole sealed segments.
@@ -368,23 +373,30 @@ def _backend_block(sidecars, namespace: str, home_dir: str) -> tuple[str, str]:
     raise AssertionError(f"no backends entry for {BACKEND!r}")
 
 
+# The committed config's one registry entry, `backends.main`: a file in the
+# real home, which no test server may open.
+_COMMITTED_ENTRY = (
+    "        main:\n"
+    f'          type: "{SQLITE_BACKEND}"\n'
+    '          path: "${HOME}/.cf-gears-event-broker/event-broker/events.db"\n'
+)
+
+
 def patch_backend(config_text: str, sidecars, namespace: str, home_dir: str) -> str:
     """Point the committed config's one registry entry, `backends.main`, at `BACKEND`.
 
-    `sidecars` is whatever the caller holds - `GearTestEnv.sidecars` (a list)
-    or `RunningTestEnv.sidecars` (a dict); `namespace` and `home_dir` are the
-    server's own (see `_backend_block`).
+    Always replaces the entry, memory included. `sidecars` is whatever the
+    caller holds - `GearTestEnv.sidecars` (a list) or `RunningTestEnv.sidecars`
+    (a dict); `namespace` and `home_dir` are the server's own (see
+    `_backend_block`).
     """
-    if BACKEND == "memory":
-        return config_text
-    entry = f'        main:\n          type: "{MEMORY_BACKEND}"\n'
-    assert config_text.count(entry) == 1, (
-        "the committed config no longer names the memory backend where the "
-        "backend switch expects it"
+    assert config_text.count(_COMMITTED_ENTRY) == 1, (
+        "the committed config no longer names the sqlite backend entry the "
+        "backend switch replaces"
     )
     backend_type, settings = _backend_block(sidecars, namespace, home_dir)
     return config_text.replace(
-        entry, f'        main:\n          type: "{backend_type}"\n' + settings
+        _COMMITTED_ENTRY, f'        main:\n          type: "{backend_type}"\n' + settings
     )
 
 

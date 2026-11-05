@@ -101,9 +101,10 @@ runs:
             core.info(`Commented on #${open[0].number}`);
           } else {
             // Use only labels that already exist. Creating a label needs
-            // extra rights.
+            // extra rights, so `nightly` was created by hand. It lets
+            // `label:nightly` list every open nightly failure.
             const created = await github.rest.issues.create({
-              owner, repo, title, body, labels: ['bug', 'ci'],
+              owner, repo, title, body, labels: ['bug', 'ci', 'nightly'],
             });
             core.info(`Created #${created.data.number}`);
           }

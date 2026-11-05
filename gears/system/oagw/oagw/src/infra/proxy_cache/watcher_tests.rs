@@ -22,6 +22,7 @@ use uuid::Uuid;
 use super::{READ_TIMEOUT, WatchHealth, WatchState, WatchStatus, spawn};
 use crate::domain::model::Upstream;
 use crate::domain::ports::NoopMetrics;
+use crate::domain::repo::RepositoryError;
 use crate::infra::proxy_cache::change_log::{ChangeLog, LOG_KEY, MAX_CHANGES};
 use crate::infra::proxy_cache::testing::{
     BACKEND_LOG_KEY, CacheMetrics, ClusterFixture, ScriptedCache, connection_lost, facade, put_log,
@@ -56,6 +57,14 @@ impl Fixture {
         log: Option<&ChangeLog>,
         script: impl FnOnce(ScriptedCache) -> ScriptedCache,
     ) -> Self {
+        Self::start_serving_stale(log, Duration::ZERO, script).await
+    }
+
+    async fn start_serving_stale(
+        log: Option<&ChangeLog>,
+        max_stale: Duration,
+        script: impl FnOnce(ScriptedCache) -> ScriptedCache,
+    ) -> Self {
         let hub = Arc::new(ClientHub::new());
         let (cluster, scripted) =
             ClusterFixture::scripted(&hub, |cache| script(cache.with_manual_watch()));
@@ -65,7 +74,8 @@ impl Fixture {
         }
         let metrics = Arc::new(CacheMetrics::default());
         let cache = Arc::new(ProxyConfigCache::new(
-            std::time::Duration::from_secs(60),
+            Duration::from_secs(60),
+            max_stale,
             100,
             metrics.clone(),
         ));
@@ -225,6 +235,50 @@ async fn a_gap_empties_the_cache_and_rebases() {
     log.append(f.other, [Fixture::updated(&f.v)]);
     f.deliver(&log).await;
     assert_eq!(f.cached(), names(&["hold_u"]), "rebased");
+    f.stop().await;
+}
+
+/// Serving stale, a gap marks the entries stale: each is reloaded and
+/// answered only if its reload fails or is slow. A change still removes its
+/// entries.
+///
+/// ADR-0020: CACHE-LOG-002, CACHE-STALE-005.
+#[tokio::test]
+async fn serving_stale_a_gap_marks_the_cache_stale() {
+    let mut log = ChangeLog::new();
+    log.append(Uuid::new_v4(), [unrelated()]);
+    let f = Fixture::start_serving_stale(Some(&log), Duration::from_hours(1), |cache| cache).await;
+
+    log.append(f.other, (0..140).map(|_| unrelated()));
+    f.deliver(&log).await;
+    assert_eq!(f.cached(), names(&["hold_u", "hold_v"]), "kept");
+
+    let down = |_| async { Err(RepositoryError::Internal("database down".into())) }.boxed();
+    let stale = f
+        .cache
+        .aliases
+        .get_or_load(f.key(&f.u), down)
+        .await
+        .unwrap();
+    assert_eq!(
+        stale.as_ref(),
+        [f.u.clone()].as_slice(),
+        "stale on a failed reload"
+    );
+    let mut renamed = f.v.clone();
+    renamed.alias = "renamed".into();
+    let value = vec![renamed.clone()];
+    let fresh = f
+        .cache
+        .aliases
+        .get_or_load(f.key(&f.v), move |_| future::ready(Ok(value)).boxed())
+        .await
+        .unwrap();
+    assert_eq!(fresh.as_ref(), [renamed].as_slice(), "reloaded");
+
+    log.append(f.other, [Fixture::updated(&f.u)]);
+    f.deliver(&log).await;
+    assert_eq!(f.cached(), names(&["hold_v"]), "a change removes");
     f.stop().await;
 }
 
@@ -728,6 +782,7 @@ async fn stop_at_its_deadline_aborts_the_tasks_and_reports_the_watch_down() {
     let (cluster, scripted) = ClusterFixture::scripted(&hub, ScriptedCache::with_manual_watch);
     let cache = Arc::new(ProxyConfigCache::new(
         Duration::from_secs(60),
+        Duration::ZERO,
         100,
         Arc::new(NoopMetrics),
     ));

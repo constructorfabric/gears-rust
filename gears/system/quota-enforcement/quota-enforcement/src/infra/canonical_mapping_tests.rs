@@ -410,6 +410,125 @@ fn engine_failures_map_to_their_canonical_classes_and_leak_no_engine_detail() {
 }
 
 #[test]
+fn a_bulk_item_error_keeps_its_category_and_names_the_item() {
+    let field = CanonicalError::from(
+        DomainError::InvalidArgument {
+            field: "cap",
+            reason: "CAP_MUST_BE_NON_NEGATIVE",
+        }
+        .at_item(3),
+    );
+    assert_eq!(field.status_code(), 400);
+    let rendered = serde_json::to_string(&Problem::from(field)).expect("json");
+    assert!(rendered.contains("items[3].cap"), "{rendered}");
+
+    let precondition = CanonicalError::from(
+        DomainError::CapBelowConsumed {
+            new_cap: 5,
+            consumed: 9,
+        }
+        .at_item(1),
+    );
+    assert_eq!(
+        precondition.status_code(),
+        status(DomainError::CapBelowConsumed {
+            new_cap: 5,
+            consumed: 9
+        })
+    );
+    let rendered = serde_json::to_string(&Problem::from(precondition)).expect("json");
+    assert!(rendered.contains("items[1].cap"), "{rendered}");
+    assert!(rendered.contains("CAP_BELOW_CONSUMED"), "{rendered}");
+
+    let missing = CanonicalError::from(
+        DomainError::NotFound {
+            kind: ResourceKind::Quota,
+            id: Uuid::nil().to_string(),
+        }
+        .at_item(0),
+    );
+    assert_eq!(missing.status_code(), 404);
+    assert!(
+        missing.detail().starts_with("items[0]: "),
+        "{}",
+        missing.detail()
+    );
+
+    let internal = CanonicalError::from(DomainError::Internal("secret".to_owned()).at_item(2));
+    assert!(
+        !internal.detail().contains("items[2]") && !internal.detail().contains("secret"),
+        "an internal error stays opaque: {}",
+        internal.detail()
+    );
+}
+
+/// The variants the status table does not reach: each keeps its documented
+/// status and names its own precondition token or dependency on the wire.
+#[test]
+fn the_remaining_variants_map_to_their_status_and_their_own_token() {
+    let cases: Vec<(DomainError, u16, &str)> = vec![
+        (
+            DomainError::OverCommitNotAuthorized {
+                reserved: 5,
+                actual: 9,
+            },
+            400,
+            "OVER_COMMIT_NOT_AUTHORIZED",
+        ),
+        (
+            DomainError::MetricNotRegistered {
+                metric: "gts.m".to_owned(),
+            },
+            400,
+            "METRIC_NOT_REGISTERED",
+        ),
+        (
+            DomainError::MetricNotQuotaGated {
+                metric: "gts.m".to_owned(),
+            },
+            400,
+            "METRIC_NOT_QUOTA_GATED",
+        ),
+        (
+            DomainError::PolicyScopeOccupied {
+                scope: quota_enforcement_sdk::PolicyScope::Global,
+            },
+            409,
+            "POLICY_SCOPE_OCCUPIED",
+        ),
+        (
+            DomainError::InvalidPluginInstance {
+                kind: PluginKind::Storage,
+                gts_id: "gts.x".to_owned(),
+                reason: "bad".to_owned(),
+            },
+            503,
+            "plugin unavailable",
+        ),
+        (
+            DomainError::PluginClientNotRegistered {
+                kind: PluginKind::Storage,
+                gts_id: "gts.x".to_owned(),
+            },
+            503,
+            "plugin unavailable",
+        ),
+        (
+            DomainError::ClusterUnavailable("down".to_owned()),
+            503,
+            "cluster unavailable",
+        ),
+    ];
+    for (err, expected, token) in cases {
+        let label = format!("{err:?}");
+        let problem = Problem::from(CanonicalError::from(err));
+        assert_eq!(problem.status, Some(expected), "{label}");
+        let body = serde_json::to_string(&problem).expect("problem serializes");
+        assert!(body.contains(token), "{label}: {body}");
+    }
+}
+
+#[test]
 fn an_unknown_quota_or_operation_names_its_token_on_the_wire() {
     for (kind, token) in [
         (ResourceKind::Quota, "UNKNOWN_QUOTA"),

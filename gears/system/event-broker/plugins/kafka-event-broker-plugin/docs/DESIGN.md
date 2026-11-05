@@ -148,9 +148,10 @@ The attempt:
 
 1. Create the logs and fences topics if this instance has not yet.
 2. Open a producer with the topic's transactional id `<prefix>.log.<uuid>` (`init_transactions`): it fences every other provisioning of the topic until this call ends, so the compare-and-set below is one at a time per topic across processes.
-3. Catch up the logs topic (§3.3) and read the topic's record. If the claim does not accept its log id, `LogConflict`.
+3. Catch up the logs topic (§3.3) and read the topic's record. If `LogClaim::check` refuses it, its error: `LogConflict` for a foreign log id, `NotProvisioned` for a `Held` claim with no record.
 4. Look the Kafka topic up in the cluster metadata.
-   - Missing: create it (`CreateTopics` with the §2.1 configuration; `TopicAlreadyExists` is success) and answer **`Pending`** without claiming the log: the topic is not provisioned until a later call finds it ready. The gear calls again with the same claim.
+   - Missing under a `Held` claim: `NotProvisioned`, and nothing is created - a `Held` claim never creates.
+   - Missing otherwise: create it (`CreateTopics` with the §2.1 configuration; `TopicAlreadyExists` is success) and answer **`Pending`** without claiming the log: the topic is not provisioned until a later call finds it ready. The gear calls again with the same claim.
    - A partition without a leader: `Pending`.
 5. Bring the topic's configuration to the spec's if any owned setting differs (§6). `AlterConfigs` is the non-incremental one librdkafka's Rust binding offers, so it carries the whole owned set and resets any other topic setting to the broker default.
 6. Unless the stored record already says the same, write `{log id, partitions}` to the logs topic in a transaction of the producer from step 2, and commit. A producer fenced meanwhile by another provisioning cannot commit, so a lost race never overwrites the winner.
@@ -187,7 +188,15 @@ Bounds of a partition, from its watermarks `[low, stable)`:
 
 ### 5.5 query
 
-The matched range's first and last sequence and storage time, read from the partition (at most `limit` records), and one `segments` entry describing where the log lives: `kafka_topic`, `kafka_partition`, `log_start_offset`, `last_stable_offset`. Kafka keeps its segment files to itself, so there is nothing finer to report.
+The matched range's first and last event - their sequences and storage times (`LogAppendTime`) - and one `segments` entry describing where the log lives: `kafka_topic`, `kafka_partition`, `log_start_offset`, `last_stable_offset`. Kafka keeps its segment files to itself, so there is nothing finer to report.
+
+Transaction markers sit between events, so the last event is never found by offset arithmetic. The reads, bounded by the range and the last stable offset:
+
+- **first event**: a single-record read forward from the range's start;
+- **last event, `limit` covering the range**: read back from the range's end in windows growing x16 from 4 offsets, as for the ceiling (§5.4), until one holds an event;
+- **last event, `limit` smaller than the range**: a forward read of at most `limit` records from the first event.
+
+So an unbounded query never reads the range through. A read that `request_timeout_ms` cuts short is `Unavailable`, never a partial envelope.
 
 ### 5.6 watch
 

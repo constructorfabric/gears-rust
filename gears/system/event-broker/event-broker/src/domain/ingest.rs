@@ -10,9 +10,12 @@ use toolkit_gts::GtsInstanceId;
 use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
+use crate::domain::audit;
 use crate::domain::authz::{event_type_resource, tenant_authorized};
 use crate::domain::backend::BackendResolver;
 use crate::domain::error::{DomainError, ErrorCode};
+use crate::domain::idempotency::{ChainRun, ProducerIdempotencyOutcome};
+use crate::domain::producer_reset::ProducerResetScope;
 use event_broker_sdk::models::EventType;
 
 use crate::domain::model::{Event, Meta};
@@ -42,36 +45,27 @@ pub struct PublishRequest {
     pub meta: Option<Meta>,
 }
 
-/// Result of a batch publish - which events were accepted (in submission
-/// order) and which were rejected with a reason.
+/// Outcome of admitting a batch, all-or-nothing (feature 0001 §5.2): some
+/// event was newly enqueued, or every event was a duplicate - which the REST
+/// layer answers `200` rather than `202`. A stateless event is never a
+/// duplicate, so a batch carrying one is always `Accepted`.
 #[domain_model]
-#[derive(Debug, Clone, Default)]
-pub struct BatchResult {
-    pub accepted: Vec<Uuid>,
-    pub failed: Vec<(Uuid, String)>,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BatchAck {
+    Accepted,
+    Duplicate,
 }
 
-/// Outcome of admitting one event. Both variants carry the stamped event (the
-/// batch path needs it regardless); the distinction is whether the event was
-/// newly admitted or matched an idempotent duplicate - a lost-ack retry of the
-/// producer chain's current head - which the REST layer answers `200` (no new
-/// row written) rather than `202`.
+/// Outcome of admitting one event. Both variants carry the stamped event; the
+/// distinction is whether the event was newly admitted or matched an
+/// idempotent duplicate - a lost-ack retry of the producer chain's current
+/// head - which the REST layer answers `200` (no new row written) rather than
+/// `202`.
 #[domain_model]
 #[derive(Debug, Clone)]
 pub enum PublishAck {
     Accepted(Event),
     Duplicate(Event),
-}
-
-impl PublishAck {
-    /// The stamped event, discarding the accepted/duplicate distinction - for
-    /// callers (the batch loop) that only need the event.
-    #[must_use]
-    pub fn into_event(self) -> Event {
-        match self {
-            Self::Accepted(event) | Self::Duplicate(event) => event,
-        }
-    }
 }
 
 /// Dedup protocol mode a producer registers under (`ADR-0004`).
@@ -134,33 +128,6 @@ pub struct ProducerCursors {
     pub topics: Vec<ProducerTopicCursors>,
 }
 
-/// Which `evbk_producer_state` rows `IngestService::reset_producer` clears:
-/// the producer's chain on every topic, or on one.
-#[domain_model]
-#[derive(Debug, Clone)]
-pub enum ProducerResetScope {
-    All,
-    Topic { topic: String },
-}
-
-/// The optional selector a `:reset` request carries, before the domain decides
-/// which [`ProducerResetScope`] it means. Its own type so the REST layer hands
-/// it over without making the decision itself.
-#[domain_model]
-#[derive(Debug)]
-pub struct ProducerResetSelector {
-    pub topic: Option<String>,
-}
-
-impl From<ProducerResetSelector> for ProducerResetScope {
-    fn from(selector: ProducerResetSelector) -> Self {
-        match selector.topic {
-            Some(topic) => Self::Topic { topic },
-            None => Self::All,
-        }
-    }
-}
-
 #[async_trait]
 pub trait IngestService: Send + Sync {
     /// Validate, sequence, and enqueue one event for persistence
@@ -172,14 +139,14 @@ pub trait IngestService: Send + Sync {
     ) -> Result<PublishAck, DomainError>;
 
     /// Validate and enqueue a batch of events whose event types all resolve to
-    /// the same topic (`DESIGN.md:639`). Events name no topic themselves, so
+    /// the same topic (feature 0001 §5.2). Events name no topic themselves, so
     /// batch homogeneity is a property of the resolved types, not of a field
     /// the producer set.
     async fn publish_batch(
         &self,
         ctx: &SecurityContext,
         requests: Vec<PublishRequest>,
-    ) -> Result<BatchResult, DomainError>;
+    ) -> Result<BatchAck, DomainError>;
 
     /// Mint a fresh `producer_id` bound to `ctx`'s calling principal
     /// (`docs/openapi.yaml`'s `POST /v1/producers`).
@@ -293,12 +260,13 @@ impl<R> IngestServiceImpl<R> {
     /// publish request to a stream.
     ///
     /// # Errors
+    ///
     /// `DomainError::NotFound` with `EventTypeNotFound` when the type is not
-    /// registered.
+    /// registered; `DomainError::StorageUnavailable` when it cannot be read.
     async fn resolve_topic(&self, event_type: &GtsTypeId) -> Result<GtsInstanceId, DomainError> {
         self.spec_manager
             .get_event_type(event_type)
-            .await
+            .await?
             .map(|resolved| resolved.topic)
             .ok_or_else(|| DomainError::NotFound {
                 code: ErrorCode::EventTypeNotFound,
@@ -327,18 +295,26 @@ impl<R> IngestServiceImpl<R> {
     }
 }
 
-#[async_trait]
-impl<R> IngestService for IngestServiceImpl<R>
+/// One validated event, ready for the chain check and the enqueue: the
+/// stamped event and what the idempotency guard enqueues for it.
+struct PreparedPublish {
+    event: Event,
+    enqueue: crate::domain::idempotency::PublishEnqueue,
+}
+
+impl<R> IngestServiceImpl<R>
 where
-    R: crate::domain::idempotency::IdempotencyGuard + ProducerRegistry + Send + Sync + 'static,
+    R: ProducerRegistry + Send + Sync + 'static,
 {
-    async fn publish_event(
+    /// Everything a publish checks before its chain is: authorization, the
+    /// event and subject types, the topic and its provisioning, the producer,
+    /// the payload schema; then the stamped event and its ingest partition.
+    /// Writes nothing, so a batch prepares every event before enqueueing any.
+    async fn prepare_publish(
         &self,
         ctx: &SecurityContext,
         request: PublishRequest,
-    ) -> Result<PublishAck, DomainError> {
-        use crate::domain::idempotency::ProducerIdempotencyOutcome;
-
+    ) -> Result<PreparedPublish, DomainError> {
         // Reject non-event types, then authorize before topic/schema validation
         // (`docs/DESIGN.md`, Validation Pipeline step 1 and §3.3).
         let event_type_resource = event_type_resource(&request.r#type)?;
@@ -365,11 +341,13 @@ where
             })?;
         tenant_authorized(ctx, &self.policy_enforcer, "produce", request.tenant_id).await?;
 
-        // NOTE(perf): most first-level fields are deterministic per type (a few are type-overridden), so they could be checked without full schema validation.
+        // NOTE(perf): most first-level fields are deterministic per type (a few
+        // are type-overridden), so they could be checked without full schema
+        // validation.
         let event_type = self
             .spec_manager
             .get_event_type(&request.r#type)
-            .await
+            .await?
             .ok_or_else(|| DomainError::NotFound {
                 code: ErrorCode::EventTypeNotFound,
                 message: format!("event type '{}' is not registered", request.r#type),
@@ -381,7 +359,7 @@ where
         let topic = self
             .spec_manager
             .get_topic(&event_type.topic)
-            .await
+            .await?
             .ok_or_else(|| DomainError::NotFound {
                 code: ErrorCode::TopicNotFound,
                 message: format!("topic '{}' is not registered", event_type.topic),
@@ -405,12 +383,10 @@ where
             });
         }
 
-        // A chained/monotonic publish names a registered producer. Resolve it
-        // before running the chain check so an unknown `producer_id` - never
-        // registered, or aged out - is reported as a `404 ProducerNotFound`
-        // naming the producer, not as the `503` a downstream foreign-key
-        // failure in `check_and_enqueue` would otherwise surface
-        // (`DESIGN.md:1163`). The producer's own outbox recovers this into a
+        // A chained/monotonic publish names a registered producer. Resolving it
+        // before the chain check reports an unknown `producer_id` - never
+        // registered, or since deleted - as a `404 ProducerNotFound` naming the
+        // producer. The producer's own outbox recovers this into a
         // re-registration, so it is the producer resource that is named (not
         // the targeted topic). The same lookup yields the registered `mode`,
         // which the chain check needs to apply the right rule. A stateless
@@ -499,18 +475,44 @@ where
             });
         }
 
+        Ok(PreparedPublish {
+            event,
+            enqueue: request.build(),
+        })
+    }
+}
+
+#[async_trait]
+impl<R> IngestService for IngestServiceImpl<R>
+where
+    R: crate::domain::idempotency::IdempotencyGuard + ProducerRegistry + Send + Sync + 'static,
+{
+    async fn publish_event(
+        &self,
+        ctx: &SecurityContext,
+        request: PublishRequest,
+    ) -> Result<PublishAck, DomainError> {
+        let PreparedPublish { event, enqueue } = self.prepare_publish(ctx, request).await?;
+
         // `check_and_enqueue` is the one DB transaction spanning the
         // producer-chain check and the outbox insert - the backend append
         // happens later, out of transaction, when the outbox processor
         // drains the row.
-        match self.repo.check_and_enqueue(request.build()).await? {
+        match self.repo.check_and_enqueue(enqueue).await? {
             ProducerIdempotencyOutcome::Accept => {}
             ProducerIdempotencyOutcome::DuplicateIgnore => {
                 return Ok(PublishAck::Duplicate(event));
             }
-            ProducerIdempotencyOutcome::SequenceViolation { last_sequence } => {
+            // A single publish is a run of one (feature 0001 §5.2), so its
+            // violation names index 0.
+            ProducerIdempotencyOutcome::SequenceViolation {
+                producer_id,
+                last_sequence,
+            } => {
                 return Err(DomainError::SequenceViolation {
-                    topic: topic.id.to_string(),
+                    index: 0,
+                    producer_id,
+                    topic: event.topic.to_string(),
                     last_sequence,
                 });
             }
@@ -519,19 +521,11 @@ where
         Ok(PublishAck::Accepted(event))
     }
 
-    #[toolkit_macros::temporary(
-        tracking = "gears-rust#4347",
-        reason = "loops over `publish_event` per event instead of one \
-                  atomic multi-event append/idempotency-check - no shared \
-                  transaction spans the batch (see the comment above); must \
-                  become real batch-level append/check-and-record once a \
-                  transactional backend or outbox lands"
-    )]
     async fn publish_batch(
         &self,
         ctx: &SecurityContext,
         requests: Vec<PublishRequest>,
-    ) -> Result<BatchResult, DomainError> {
+    ) -> Result<BatchAck, DomainError> {
         let max = self.batch.max_size as usize;
         if requests.len() > max {
             return Err(DomainError::BatchTooLarge {
@@ -539,8 +533,14 @@ where
                 max,
             });
         }
+        // Feature 0001 §5.2 R1.
         if requests.is_empty() {
-            return Ok(BatchResult::default());
+            return Err(DomainError::EmptyBatch);
+        }
+        // Feature 0001 §5.2 R13, decided on the request as sent, before it is
+        // split into runs.
+        if let Some(index) = first_repeated_event_id(&requests) {
+            return Err(DomainError::DuplicateEventId { index });
         }
 
         // The payload byte bound is measured from the requests' own data. The
@@ -580,23 +580,43 @@ where
             }
         }
 
-        // Per-event durability is not rolled back on a mid-batch
-        // `SequenceViolation` (documented simplification of this in-memory
-        // backing - see `eb-rest-handlers`'s design.md; a real transactional
-        // backend would wrap the whole batch in one transaction instead).
-        // A batch is all-or-nothing: any one event's rejection (payload
-        // validation, sequence violation, ...) rejects the whole request with
-        // that error, rather than being swallowed into a per-event `failed`
-        // list behind a `202`. (Per-event durability of the events that ran
-        // before the failure is still not rolled back - the same documented
-        // simplification of this in-memory backing noted above; a transactional
-        // backend validates the batch before appending any of it.)
-        let mut result = BatchResult::default();
+        // All-or-nothing: every event is validated before any is enqueued, and
+        // the enqueue is one transaction that a chain violation rolls back.
+        let mut events = Vec::with_capacity(requests.len());
+        let mut enqueues = Vec::with_capacity(requests.len());
         for request in requests {
-            let stamped = self.publish_event(ctx, request).await?.into_event();
-            result.accepted.push(stamped.id);
+            let PreparedPublish { event, enqueue } = self.prepare_publish(ctx, request).await?;
+            events.push(event);
+            enqueues.push(enqueue);
         }
-        Ok(result)
+        // Feature 0001 §5.2 R3: each run's own shape, before any chain state
+        // is read. It needs each producer's mode, which preparing resolved. A
+        // single publish is a run of one that R3 does not gate; its chain
+        // decision refuses a non-advancing link on its own.
+        for run in ChainRun::split(&enqueues) {
+            if let Some(index) = run.first_malformed() {
+                return Err(DomainError::MalformedRun { index });
+            }
+        }
+        let outcomes = self.repo.check_and_enqueue_batch(enqueues).await?;
+        if outcomes.len() != events.len() {
+            return Err(DomainError::Internal(format!(
+                "the batch enqueue answered {} outcomes for {} events",
+                outcomes.len(),
+                events.len()
+            )));
+        }
+        // Every event a duplicate -> `200` (feature 0001 §5.2 "Outcome"). The
+        // pseudo-code's `last_seen_at` touch on `event_broker_producer` is not
+        // made: the column is not yet implemented (tracked in #5651).
+        if outcomes
+            .iter()
+            .all(|outcome| *outcome == ProducerIdempotencyOutcome::DuplicateIgnore)
+        {
+            Ok(BatchAck::Duplicate)
+        } else {
+            Ok(BatchAck::Accepted)
+        }
     }
 
     async fn register_producer(
@@ -672,7 +692,9 @@ where
                 resource: producer_id.to_string(),
             });
         }
-        self.repo.reset(producer_id, &scope).await
+        self.repo.reset(producer_id, &scope).await?;
+        audit::emit_producer_chain_reset(ctx, producer_id, &scope);
+        Ok(())
     }
 
     async fn list_topics(
@@ -685,7 +707,7 @@ where
         // convention and to keep a denial expressible; the specification
         // manager it reads from is the ctx-less Tier-1 boundary (it also
         // serves ctx-less retention/refresh workers).
-        Ok(self.spec_manager.list_topics().await)
+        self.spec_manager.list_topics().await
     }
 
     async fn list_topic_segments(
@@ -694,15 +716,15 @@ where
         topic_id: &GtsInstanceId,
         partition: i32,
     ) -> Result<crate::domain::model::TopicSegmentManifest, DomainError> {
-        let topic =
-            self.spec_manager
-                .get_topic(topic_id)
-                .await
-                .ok_or_else(|| DomainError::NotFound {
-                    code: ErrorCode::TopicNotFound,
-                    message: format!("topic '{topic_id}' is not registered"),
-                    resource: topic_id.to_string(),
-                })?;
+        let topic = self
+            .spec_manager
+            .get_topic(topic_id)
+            .await?
+            .ok_or_else(|| DomainError::NotFound {
+                code: ErrorCode::TopicNotFound,
+                message: format!("topic '{topic_id}' is not registered"),
+                resource: topic_id.to_string(),
+            })?;
         // Checked here rather than left to the backend: a backend reports an
         // unknown partition as not found, while a partition the topic does not
         // have is a malformed request.
@@ -741,11 +763,7 @@ where
                 end_sequence: Sequence::assigned(0),
                 start_time: None,
                 end_time: None,
-                segments: vec![serde_json::json!({
-                    "start_sequence": 0,
-                    "end_sequence": 0,
-                    "event_count": 0,
-                })],
+                segments: vec![],
             });
         };
         Ok(crate::domain::model::TopicSegmentManifest {
@@ -765,8 +783,16 @@ where
     ) -> Result<Vec<EventType>, DomainError> {
         // Same rationale as `list_topics`: event types are global resources,
         // read from the ctx-less Tier-1 specification manager.
-        Ok(self.spec_manager.list_event_types().await)
+        self.spec_manager.list_event_types().await
     }
+}
+
+/// The request index of the first event whose `id` an earlier event of the
+/// batch already carries (feature 0001 §5.2 R13): the repeat is named, not the
+/// event it repeats.
+fn first_repeated_event_id(requests: &[PublishRequest]) -> Option<usize> {
+    let mut seen = std::collections::HashSet::with_capacity(requests.len());
+    requests.iter().position(|request| !seen.insert(request.id))
 }
 
 /// `event_type.allowed_subject_types` pattern grammar (`DESIGN.md` §3.1) via

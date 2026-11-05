@@ -15,6 +15,7 @@ use tenant_resolver_sdk::{
     TenantId, TenantResolverError, TenantResolverPluginClient, TenantStatus,
 };
 use toolkit_canonical_errors::CanonicalError;
+use toolkit_gts::gts_id;
 use toolkit_odata::ast::{CompareOperator, Expr, Value};
 use toolkit_odata::{ODataQuery, Page, PageInfo};
 use toolkit_security::SecurityContext;
@@ -277,7 +278,7 @@ fn make_group(
 }
 
 fn service_with(mock: MockRgHierarchy) -> Service {
-    Service::new(Arc::new(mock))
+    Service::new(Arc::new(mock), vec![TENANT_RG_TYPE_PATH.to_owned()])
 }
 
 fn ctx() -> SecurityContext {
@@ -564,6 +565,30 @@ async fn get_descendants_returns_subtree() {
     assert_eq!(resp.descendants.len(), 2);
 }
 
+/// Rows whose type is not a configured tenant type are dropped even when RG
+/// returns them (the mock ignores the `type` predicate).
+#[tokio::test]
+async fn get_descendants_drops_non_tenant_types() {
+    let root = Uuid::now_v7();
+    let tenant_child = Uuid::now_v7();
+    let mut dept = make_group(Uuid::now_v7(), "Dept", Some(root), 1, None);
+    dept.code = gts_id!("cf.core.rg.type.v1~x.test._.dept.v1~").to_owned();
+    let mock = MockRgHierarchy::descendants_only(vec![
+        make_group(root, "Root", None, 0, None),
+        dept,
+        make_group(tenant_child, "Child", Some(root), 1, None),
+    ]);
+    let svc = service_with(mock);
+
+    let resp = svc
+        .get_descendants(&ctx(), TenantId(root), &GetDescendantsOptions::default())
+        .await
+        .unwrap();
+
+    let ids: Vec<TenantId> = resp.descendants.iter().map(|d| d.id).collect();
+    assert_eq!(ids, vec![TenantId(tenant_child)]);
+}
+
 #[tokio::test]
 async fn get_descendants_barrier_excludes_subtree() {
     let root = Uuid::now_v7();
@@ -812,7 +837,7 @@ async fn rg_error_propagates() {
         }
     }
 
-    let svc = Service::new(Arc::new(FailingRg));
+    let svc = Service::new(Arc::new(FailingRg), vec![TENANT_RG_TYPE_PATH.to_owned()]);
     let err = svc.get_tenant(&ctx(), TenantId(Uuid::now_v7())).await;
     assert!(
         matches!(err, Err(TenantResolverError::Internal(_))),
@@ -1158,4 +1183,137 @@ async fn list_groups_honours_tenant_id_eq_filter() {
         .await
         .unwrap();
     assert_eq!(page.items.len(), 2);
+}
+
+// -- Configured tenant types --
+
+/// Records the `$filter` of every RG call and returns empty pages.
+#[derive(Default)]
+struct CapturingRg {
+    filters: std::sync::Mutex<Vec<Expr>>,
+}
+
+impl CapturingRg {
+    fn record(&self, query: &ODataQuery) {
+        if let Some(f) = query.filter.as_deref() {
+            self.filters.lock().unwrap().push(f.clone());
+        }
+    }
+
+    fn empty_page<T>() -> Page<T> {
+        Page {
+            items: Vec::new(),
+            page_info: PageInfo {
+                next_cursor: None,
+                prev_cursor: None,
+                limit: 100,
+            },
+        }
+    }
+}
+
+#[async_trait]
+impl ResourceGroupReadHierarchy for CapturingRg {
+    async fn get_group_descendants(
+        &self,
+        _ctx: &SecurityContext,
+        _group_id: Uuid,
+        query: &ODataQuery,
+    ) -> Result<Page<ResourceGroupWithDepth>, CanonicalError> {
+        self.record(query);
+        Ok(Self::empty_page())
+    }
+
+    async fn get_group_ancestors(
+        &self,
+        _ctx: &SecurityContext,
+        _group_id: Uuid,
+        query: &ODataQuery,
+    ) -> Result<Page<ResourceGroupWithDepth>, CanonicalError> {
+        self.record(query);
+        Ok(Self::empty_page())
+    }
+
+    async fn list_groups(
+        &self,
+        _ctx: &SecurityContext,
+        query: &ODataQuery,
+    ) -> Result<Page<ResourceGroup>, CanonicalError> {
+        self.record(query);
+        Ok(Self::empty_page())
+    }
+
+    async fn get_group(
+        &self,
+        _ctx: &SecurityContext,
+        _id: Uuid,
+    ) -> Result<ResourceGroup, CanonicalError> {
+        unimplemented!("CapturingRg records filters only")
+    }
+
+    async fn list_memberships(
+        &self,
+        _ctx: &SecurityContext,
+        _query: &ODataQuery,
+    ) -> Result<Page<ResourceGroupMembership>, CanonicalError> {
+        unimplemented!("CapturingRg records filters only")
+    }
+}
+
+/// Collect every `type in (...)` value list found in `expr`.
+fn type_in_values(expr: &Expr, out: &mut Vec<Vec<String>>) {
+    match expr {
+        Expr::And(l, r) | Expr::Or(l, r) => {
+            type_in_values(l, out);
+            type_in_values(r, out);
+        }
+        Expr::Not(inner) => type_in_values(inner, out),
+        Expr::In(lhs, values) if matches!(lhs.as_ref(), Expr::Identifier(n) if n == "type") => {
+            out.push(
+                values
+                    .iter()
+                    .filter_map(|v| match v {
+                        Expr::Value(Value::String(s)) => Some(s.clone()),
+                        _ => None,
+                    })
+                    .collect(),
+            );
+        }
+        _ => {}
+    }
+}
+
+#[tokio::test]
+async fn configured_tenant_types_are_sent_as_type_in_filter() {
+    const CUSTOM: &str = gts_id!("cf.core.rg.type.v1~acme.core._.tenant.v1~");
+    let tenant_types = vec![CUSTOM.to_owned(), TENANT_RG_TYPE_PATH.to_owned()];
+    let rg = Arc::new(CapturingRg::default());
+    let svc = Service::new(rg.clone(), tenant_types.clone());
+
+    let id = TenantId(Uuid::now_v7());
+    // RG returns empty pages, so single-tenant lookups end in "not found"
+    // and the batch lookup is empty; the emitted filters are what matters.
+    assert!(matches!(
+        svc.get_tenant(&ctx(), id).await,
+        Err(TenantResolverError::TenantNotFound { .. })
+    ));
+    assert!(
+        svc.get_tenants(&ctx(), &[id], &GetTenantsOptions::default())
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(matches!(
+        svc.get_descendants(&ctx(), id, &GetDescendantsOptions::default())
+            .await,
+        Err(TenantResolverError::TenantNotFound { .. })
+    ));
+
+    let filters = rg.filters.lock().unwrap().clone();
+    assert_eq!(filters.len(), 3, "one RG call per lookup");
+    for f in &filters {
+        let mut found = Vec::new();
+        type_in_values(f, &mut found);
+        assert_eq!(found, vec![tenant_types.clone()], "filter: {f:?}");
+    }
 }

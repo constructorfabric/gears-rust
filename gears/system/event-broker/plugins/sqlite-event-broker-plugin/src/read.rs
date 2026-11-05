@@ -173,10 +173,10 @@ pub async fn current_heads(
 
 #[derive(sqlx::FromRow)]
 struct RangeFigures {
-    first: Option<i64>,
-    last: Option<i64>,
-    start_time: Option<i64>,
-    end_time: Option<i64>,
+    first: i64,
+    last: i64,
+    start_time: i64,
+    end_time: i64,
 }
 
 /// Segment introspection (feature 0003): the matched range's figures, and the
@@ -188,31 +188,40 @@ pub async fn query(
 ) -> Result<Vec<TopicSegment>, BackendError> {
     const OP: Operation = Operation::Query;
     let (topic, partition) = shared.partition(at, OP).await?;
-    let figures: RangeFigures = sqlx::query_as(
-        "SELECT MIN(sequence) AS first, MAX(sequence) AS last, MIN(sequence_time) AS start_time, \
-         MAX(sequence_time) AS end_time FROM \
+    // Two seeks on the primary key, never a scan of the range: the first
+    // matched event, and the last at most `limit - 1` sequences above it.
+    // Stored sequences have no gaps - append assigns them from the head up,
+    // the sweep removes them from the floor up - so `first + limit - 1` is
+    // the `limit`-th matched event.
+    let figures: Option<RangeFigures> = sqlx::query_as(
+        "SELECT f.sequence AS first, l.sequence AS last, f.sequence_time AS start_time, \
+         l.sequence_time AS end_time FROM \
          (SELECT sequence, sequence_time FROM evbk__event WHERE topic_uuid = ?1 AND partition = ?2 \
-          AND sequence >= ?3 AND sequence <= ?4 ORDER BY sequence LIMIT ?5)",
+          AND sequence >= ?3 AND sequence <= ?4 ORDER BY sequence ASC LIMIT 1) AS f \
+         JOIN evbk__event AS l ON l.topic_uuid = ?1 AND l.partition = ?2 AND l.sequence = \
+         (SELECT e.sequence FROM evbk__event AS e WHERE e.topic_uuid = ?1 AND e.partition = ?2 \
+          AND e.sequence >= f.sequence AND e.sequence <= MIN(?4, f.sequence + ?5 - 1) \
+          ORDER BY e.sequence DESC LIMIT 1)",
     )
     .bind(topic)
     .bind(partition)
     .bind(range.start_offset.map_or(i64::MIN, Sequence::as_i64))
     .bind(range.end_offset.map_or(i64::MAX, Sequence::as_i64))
     .bind(i64::from(range.limit))
-    .fetch_one(&shared.opened()?.pool)
+    .fetch_optional(&shared.opened()?.pool)
     .await
     .map_err(|e| error::map(OP, &e))?;
-    let (Some(first), Some(last)) = (figures.first, figures.last) else {
+    let Some(figures) = figures else {
         return Ok(Vec::new());
     };
     let (head, floor) = bounds(shared, topic, partition, OP).await?;
     Ok(vec![TopicSegment {
         topic: at.topic.to_string(),
         partition: at.partition.value(),
-        start_sequence: Sequence::assigned(first),
-        end_sequence: Sequence::assigned(last),
-        start_time: figures.start_time.map(clock::instant).transpose()?,
-        end_time: figures.end_time.map(clock::instant).transpose()?,
+        start_sequence: Sequence::assigned(figures.first),
+        end_sequence: Sequence::assigned(figures.last),
+        start_time: Some(clock::instant(figures.start_time)?),
+        end_time: Some(clock::instant(figures.end_time)?),
         segments: vec![serde_json::json!({ "from_sequence": floor + 1, "to_sequence": head })],
     }])
 }

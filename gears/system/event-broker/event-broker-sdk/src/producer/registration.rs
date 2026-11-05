@@ -72,7 +72,7 @@ impl ScopableEntity for Entity {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ProducerRegistration {
     pub(crate) slot: RegistrationSlot,
     pub(crate) producer_id: ProducerId,
@@ -120,7 +120,6 @@ impl ProducerRegistrationStore {
         Self { db }
     }
 
-    #[cfg(feature = "outbox")]
     pub(crate) async fn load(
         &self,
         slot: &RegistrationSlot,
@@ -185,11 +184,15 @@ impl ProducerRegistrationStore {
         Ok(registration)
     }
 
+    /// Moves the slot of `current` to `producer_id` under the next
+    /// generation, provided the slot still holds the generation of `current`.
+    /// A slot that moved on in the meantime is left as it is: the update
+    /// matches no row and the outcome is [`Replaced::Lost`].
     pub(crate) async fn replace_with_new_generation(
         &self,
         current: &ProducerRegistration,
         producer_id: ProducerId,
-    ) -> Result<ProducerRegistration, EventBrokerError> {
+    ) -> Result<Replaced, EventBrokerError> {
         let generation = current.generation + 1;
         let now = Utc::now();
         let conn = self.db.conn().map_err(map_db_err)?;
@@ -203,26 +206,42 @@ impl ProducerRegistrationStore {
                 sea_orm::sea_query::Expr::value(generation),
             )
             .col_expr(Column::UpdatedAt, sea_orm::sea_query::Expr::value(now))
-            .filter(current.slot.filter())
+            .filter(
+                current
+                    .slot
+                    .filter()
+                    .add(Column::Generation.eq(current.generation)),
+            )
             .secure()
             .scope_with(&AccessScope::allow_all())
             .exec(&conn)
             .await
             .map_err(map_scope_err)?;
-        if result.rows_affected != 1 {
-            return Err(EventBrokerError::Internal(format!(
-                "producer registration '{}' queue '{}' partition {} was not updated",
+        match result.rows_affected {
+            0 => Ok(Replaced::Lost),
+            1 => Ok(Replaced::Done(ProducerRegistration {
+                slot: current.slot.clone(),
+                producer_id,
+                mode: current.mode,
+                client_agent: current.client_agent.clone(),
+                generation,
+            })),
+            n => Err(EventBrokerError::Internal(format!(
+                "producer registration '{}' queue '{}' partition {} updated {n} rows",
                 current.slot.key, current.slot.queue, current.slot.partition
-            )));
+            ))),
         }
-        Ok(ProducerRegistration {
-            slot: current.slot.clone(),
-            producer_id,
-            mode: current.mode,
-            client_agent: current.client_agent.clone(),
-            generation,
-        })
     }
+}
+
+/// How a generation replace ended.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Replaced {
+    /// The slot moved to the new id; this is its stored registration.
+    Done(ProducerRegistration),
+    /// The slot left the expected generation before the update, so the new id
+    /// is not stored.
+    Lost,
 }
 
 impl ProducerRegistration {

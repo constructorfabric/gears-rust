@@ -5,6 +5,7 @@
 //! witnesses identify implementation routing; deployment must still satisfy
 //! the module certificate's operational environment and security policy.
 
+pub mod aead;
 mod backend;
 mod ecdsa;
 pub mod hash;
@@ -38,8 +39,8 @@ pub enum CryptoError {
     /// The native FIPS provider does not provide the requested algorithm.
     #[error("algorithm is unavailable under the configured crypto policy")]
     UnsupportedAlgorithm,
-    /// A signature key could not be generated or imported.
-    #[error("invalid signature key")]
+    /// A signature or AEAD key could not be generated or imported.
+    #[error("invalid key")]
     InvalidKey,
     /// The selected backend could not generate a signing key.
     #[error("native signing key generation failed")]
@@ -47,6 +48,9 @@ pub enum CryptoError {
     /// The selected backend could not produce a signature.
     #[error("native signing operation failed")]
     SigningFailed,
+    /// The selected backend could not seal a message.
+    #[error("native sealing operation failed")]
+    SealingFailed,
     /// A signature did not verify.
     #[error("invalid signature")]
     InvalidSignature,

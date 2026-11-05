@@ -53,7 +53,7 @@ pub mod internal_auth;
 pub mod internal_auth_cache;
 /// Configuration selecting how the platform plane authenticates.
 pub mod internal_auth_config;
-/// JWT decoding and claim validation backed by the crypto facade.
+/// JWT signing, decoding and claim validation backed by the crypto facade.
 #[cfg(feature = "jwt")]
 pub mod jwt;
 /// The types most gears need, re-exported for a single glob import.

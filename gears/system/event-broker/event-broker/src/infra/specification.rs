@@ -409,36 +409,26 @@ fn deserialize_row<T: serde::de::DeserializeOwned>(row: &spec_cache::Model) -> O
 
 #[async_trait]
 impl SpecificationManager for TypesRegistrySpecificationManager {
-    async fn get_topic(&self, id: &GtsInstanceId) -> Option<Topic> {
-        let row = match self.find_row(SpecKind::Topic, id.as_ref()).await {
-            Ok(row) => row?,
-            Err(err) => {
-                tracing::warn!(%err, topic_id = %id, "spec cache lookup failed while resolving topic");
-                return None;
-            }
+    async fn get_topic(&self, id: &GtsInstanceId) -> Result<Option<Topic>, DomainError> {
+        let Some(row) = self.find_row(SpecKind::Topic, id.as_ref()).await? else {
+            return Ok(None);
         };
-        let topic: Topic = deserialize_row(&row)?;
-        match self.read_topic_state(id).await {
-            Ok(Some(TopicState::Provisioned { partitions, .. })) => {
-                Some(with_backend_partitions(topic, i64::from(partitions)))
+        let Some(topic) = deserialize_row::<Topic>(&row) else {
+            return Ok(None);
+        };
+        Ok(Some(match self.read_topic_state(id).await? {
+            Some(TopicState::Provisioned { partitions, .. }) => {
+                with_backend_partitions(topic, i64::from(partitions))
             }
-            Ok(_) => Some(topic),
-            Err(err) => {
-                tracing::warn!(%err, topic_id = %id, "topic binding lookup failed while resolving topic");
-                Some(topic)
-            }
-        }
+            _ => topic,
+        }))
     }
 
-    async fn get_event_type(&self, id: &GtsTypeId) -> Option<EventType> {
-        let row = match self.find_row(SpecKind::EventType, id.as_ref()).await {
-            Ok(row) => row?,
-            Err(err) => {
-                tracing::warn!(%err, event_type_id = %id, "spec cache lookup failed while resolving event type");
-                return None;
-            }
+    async fn get_event_type(&self, id: &GtsTypeId) -> Result<Option<EventType>, DomainError> {
+        let Some(row) = self.find_row(SpecKind::EventType, id.as_ref()).await? else {
+            return Ok(None);
         };
-        deserialize_row::<EventTypeRecord>(&row).map(EventType::from)
+        Ok(deserialize_row::<EventTypeRecord>(&row).map(EventType::from))
     }
 
     async fn validate_event_data(
@@ -450,39 +440,26 @@ impl SpecificationManager for TypesRegistrySpecificationManager {
         crate::domain::specification::check_against_schema(&validator, event_type, data)
     }
 
-    async fn list_topics(&self) -> Vec<Topic> {
-        let topics: Vec<Topic> = match self.list_rows(SpecKind::Topic).await {
-            Ok(rows) => rows.iter().filter_map(deserialize_row).collect(),
-            Err(err) => {
-                tracing::warn!(%err, "spec cache list failed while listing topics");
-                return Vec::new();
-            }
-        };
-        let provisioned = self.provisioned_partitions().await.unwrap_or_else(|err| {
-            tracing::warn!(%err, "topic binding list failed while listing topics");
-            HashMap::new()
-        });
-        topics
+    async fn list_topics(&self) -> Result<Vec<Topic>, DomainError> {
+        let topics = self.resolved_topics().await?;
+        let provisioned = self.provisioned_partitions().await?;
+        Ok(topics
             .into_iter()
             .map(|topic| match provisioned.get(topic.id.as_ref()) {
                 Some(partitions) => with_backend_partitions(topic, *partitions),
                 None => topic,
             })
-            .collect()
+            .collect())
     }
 
-    async fn list_event_types(&self) -> Vec<EventType> {
-        match self.list_rows(SpecKind::EventType).await {
-            Ok(rows) => rows
-                .iter()
-                .filter_map(deserialize_row::<EventTypeRecord>)
-                .map(EventType::from)
-                .collect(),
-            Err(err) => {
-                tracing::warn!(%err, "spec cache list failed while listing event types");
-                Vec::new()
-            }
-        }
+    async fn list_event_types(&self) -> Result<Vec<EventType>, DomainError> {
+        Ok(self
+            .list_rows(SpecKind::EventType)
+            .await?
+            .iter()
+            .filter_map(deserialize_row::<EventTypeRecord>)
+            .map(EventType::from)
+            .collect())
     }
 
     async fn resolve_topic_id(&self, id: &GtsInstanceId) -> Result<i64, DomainError> {
@@ -577,6 +554,11 @@ mod tests {
     }
 
     async fn test_db() -> Arc<DBProvider<toolkit_db::DbError>> {
+        test_db_with_dsn().await.0
+    }
+
+    /// [`test_db`], with a DSN that reaches the same file.
+    async fn test_db_with_dsn() -> (Arc<DBProvider<toolkit_db::DbError>>, String) {
         let mut path = std::env::temp_dir();
         path.push(format!(
             "cf-eb-spec-cache-test-{}.db",
@@ -596,7 +578,7 @@ mod tests {
         run_migrations_for_testing(&db, Migrator::migrations())
             .await
             .expect("migrations");
-        Arc::new(DBProvider::new(db))
+        (Arc::new(DBProvider::new(db)), dsn)
     }
 
     /// Loads the given documents through the real load path, so every test here
@@ -632,6 +614,7 @@ mod tests {
         let topic = manager
             .get_topic(&GtsInstanceId::try_new(TOPIC_ID).unwrap())
             .await
+            .expect("the cache reads")
             .expect("a registered topic resolves");
         assert_eq!(topic.id.as_ref(), TOPIC_ID);
         assert_eq!(topic.description, "events this test publishes");
@@ -649,6 +632,7 @@ mod tests {
         let topic = manager
             .get_topic(&GtsInstanceId::try_new(TOPIC_ID).unwrap())
             .await
+            .expect("the cache reads")
             .expect("a registered topic resolves");
         assert_eq!(
             topic.settings.retention().value().duration,
@@ -679,6 +663,7 @@ mod tests {
         let event_type = manager
             .get_event_type(&GtsTypeId::try_new(EVENT_TYPE_ID).unwrap())
             .await
+            .expect("the cache reads")
             .expect("a derived event-type schema resolves");
         assert_eq!(event_type.id.as_ref(), EVENT_TYPE_ID);
         assert_eq!(event_type.topic.as_ref(), TOPIC_ID);
@@ -726,6 +711,7 @@ mod tests {
         let event_type = manager
             .get_event_type(&GtsTypeId::try_new(EVENT_TYPE_ID).unwrap())
             .await
+            .expect("the cache reads")
             .expect("it resolves");
         assert_eq!(
             event_type.partition_key, "/tenant_id",
@@ -752,6 +738,7 @@ mod tests {
         let listed: Vec<String> = manager
             .list_event_types()
             .await
+            .expect("the cache reads")
             .into_iter()
             .map(|event_type| event_type.id.as_ref().to_owned())
             .collect();
@@ -781,6 +768,7 @@ mod tests {
         let topic = delivery
             .get_topic(&GtsInstanceId::try_new(TOPIC_ID).unwrap())
             .await
+            .expect("the cache reads")
             .expect("the stored record resolves");
         assert_eq!(*topic.settings.partitions().value(), 4);
         assert_eq!(topic.settings.partitions().source(), Source::TypeEntry);
@@ -795,7 +783,69 @@ mod tests {
             "cf.core.events.topic.v1~example.eb.missing.topic.v1"
         ))
         .unwrap();
-        assert!(manager.get_topic(&missing).await.is_none());
+        let found = manager.get_topic(&missing).await;
+        assert!(matches!(found, Ok(None)), "{found:?}");
+    }
+
+    /// A cache that cannot be read says nothing about what is registered.
+    #[tokio::test]
+    async fn a_spec_cache_read_failure_is_an_error_not_not_found() {
+        let (db, dsn) = test_db_with_dsn().await;
+        super::bulk_load(&client_with(&[TOPIC_ID]), &db, &config(&json!({})))
+            .await
+            .expect("bulk_load");
+        let manager = super::TypesRegistrySpecificationManager::new(Arc::clone(&db));
+        crate::test_support::tables::drop_table(&dsn, "event_broker_spec_cache").await;
+
+        let topic = manager
+            .get_topic(&GtsInstanceId::try_new(TOPIC_ID).unwrap())
+            .await;
+        let Err(err) = topic else {
+            panic!("an unreadable cache must not answer: {topic:?}");
+        };
+        assert!(
+            matches!(&err, DomainError::StorageUnavailable { reason, source: Some(_) } if reason == "database scope resolution failed"),
+            "{err:?}"
+        );
+        let listed = manager.list_topics().await;
+        assert!(
+            matches!(&listed, Err(DomainError::StorageUnavailable { .. })),
+            "{listed:?}"
+        );
+    }
+
+    /// An unreadable cache says nothing about which event types are registered.
+    #[tokio::test]
+    async fn an_event_type_read_failure_is_an_error_not_not_found() {
+        let (db, dsn) = test_db_with_dsn().await;
+        let client: Arc<dyn types_registry_sdk::TypesRegistryClient> = Arc::new(
+            MockTypesRegistryClient::new()
+                .with_instances(vec![make_test_instance(TOPIC_ID, topic_document(TOPIC_ID))])
+                .with_type_schemas(vec![derived_event_type(
+                    EVENT_TYPE_ID,
+                    TOPIC_ID,
+                    json!({}),
+                    &[SUBJECT_TYPE],
+                )]),
+        );
+        super::bulk_load(&client, &db, &config(&json!({})))
+            .await
+            .expect("bulk_load");
+        let manager = super::TypesRegistrySpecificationManager::new(Arc::clone(&db));
+        crate::test_support::tables::drop_table(&dsn, "event_broker_spec_cache").await;
+
+        let event_type = manager
+            .get_event_type(&GtsTypeId::try_new(EVENT_TYPE_ID).unwrap())
+            .await;
+        assert!(
+            matches!(&event_type, Err(DomainError::StorageUnavailable { reason, source: Some(_) }) if reason == "database scope resolution failed"),
+            "{event_type:?}"
+        );
+        let listed = manager.list_event_types().await;
+        assert!(
+            matches!(&listed, Err(DomainError::StorageUnavailable { .. })),
+            "{listed:?}"
+        );
     }
 
     /// A load must preserve an already-assigned surrogate id, not renumber it.

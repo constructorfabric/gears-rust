@@ -491,7 +491,7 @@ where
             let topic = self
                 .spec_manager
                 .get_topic(&interest.topic)
-                .await
+                .await?
                 .ok_or_else(|| DomainError::NotFound {
                     code: ErrorCode::TopicNotFound,
                     message: format!("topic '{}' is not registered", interest.topic),
@@ -704,7 +704,7 @@ where
             let topic = self
                 .spec_manager
                 .get_topic(&target.topic)
-                .await
+                .await?
                 .ok_or_else(|| DomainError::NotFound {
                     code: ErrorCode::TopicNotFound,
                     message: format!("topic '{}' is not registered", target.topic),

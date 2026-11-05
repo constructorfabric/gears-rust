@@ -50,9 +50,9 @@ use crate::domain::delivery::{
 use crate::domain::error::DomainError;
 use crate::domain::id_parse::{parse_consumer_group_id, parse_topic_id, parse_type_id};
 use crate::domain::ingest::{
-    IngestService, ProducerCursors as DomainProducerCursors, ProducerMode as DomainProducerMode,
-    ProducerRegistrationInput, ProducerResetScope, ProducerTopicCursors, PublishAck,
-    PublishRequest,
+    BatchAck, IngestService, ProducerCursors as DomainProducerCursors,
+    ProducerMode as DomainProducerMode, ProducerRegistrationInput, ProducerTopicCursors,
+    PublishAck, PublishRequest,
 };
 use crate::domain::model::{
     BarrierMode as DomainBarrierMode, ConsumerGroup as DomainConsumerGroup,
@@ -60,6 +60,7 @@ use crate::domain::model::{
     FilterSpec, Interest, Meta, Subscription as DomainSubscription,
     TenantTraversalDepth as DomainDepth, Topic as DomainTopic, TopicSegmentManifest,
 };
+use crate::domain::producer_reset::ProducerResetScope;
 use crate::domain::streaming::frames::{
     ControlCode as DomainControlCode, Frame, Position as DomainPosition,
 };
@@ -252,6 +253,17 @@ impl From<PublishAck> for IngestOutcome {
         match ack {
             PublishAck::Accepted(_) => IngestOutcome::Accepted,
             PublishAck::Duplicate(_) => IngestOutcome::Duplicate,
+        }
+    }
+}
+
+/// An all-duplicate batch stored nothing new, so it answers `Duplicate` the
+/// way REST answers `200`.
+impl From<BatchAck> for IngestOutcome {
+    fn from(ack: BatchAck) -> Self {
+        match ack {
+            BatchAck::Accepted => IngestOutcome::Accepted,
+            BatchAck::Duplicate => IngestOutcome::Duplicate,
         }
     }
 }
@@ -522,14 +534,12 @@ impl EventBrokerApi for LocalBroker {
             .iter()
             .map(PublishRequest::try_from)
             .collect::<Result<Vec<_>, _>>()?;
-        // All-or-nothing: any rejection is a `DomainError` for the whole batch;
-        // the per-event `BatchResult` is not surfaced on success (matching the
-        // REST contract), so an `Ok` is one `Accepted`.
-        self.ingest
+        let ack = self
+            .ingest
             .publish_batch(ctx, requests)
             .await
             .map_err(to_sdk_err)?;
-        Ok(IngestOutcome::Accepted)
+        Ok(ack.into())
     }
 
     async fn get_producer_cursors(

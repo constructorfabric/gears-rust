@@ -244,12 +244,13 @@ async fn producer_stateless_publish_sends_typed_event() -> TestResult {
     Ok(())
 }
 
-/// A producer can wait for broker-side persistence when the caller needs it.
+/// A persisted publish reports `Accepted` while the in-process broker
+/// confirms no durable write, and the event still reaches storage.
 ///
 /// Preconditions: the producer uses the same direct setup as normal publishing.
-/// Expected: `publish_persisted` returns `Persisted`.
+/// Expected: `publish_persisted` returns `Accepted` and the event is stored.
 #[tokio::test]
-async fn producer_persisted_publish_waits_for_storage() -> TestResult {
+async fn producer_persisted_publish_reports_accepted_until_sync_publish_lands() -> TestResult {
     let harness = harness_with(orders_catalog()).await;
     let broker = harness.broker();
 
@@ -265,9 +266,7 @@ async fn producer_persisted_publish_waits_for_storage() -> TestResult {
 
     let outcome = producer.publish_persisted(order_created()).await?;
 
-    // The in-process broker admits synchronously and persists asynchronously, so
-    // it honestly reports `Accepted` rather than claiming a durable `Persisted`
-    // (see `LocalBroker`); the event still reaches storage.
+    // #5655: the in-process broker confirms no durable write until synchronous publish lands.
     assert_eq!(outcome, IngestOutcome::Accepted);
     wait_for_stored(&harness, ORDERS_TOPIC, 1).await;
 

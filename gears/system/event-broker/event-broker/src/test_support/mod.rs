@@ -50,6 +50,7 @@ pub mod pause;
 pub mod request;
 pub mod response;
 pub mod single_backend;
+pub mod tables;
 pub mod type_registry;
 
 pub use authz_doubles::DenyingAuthZ;

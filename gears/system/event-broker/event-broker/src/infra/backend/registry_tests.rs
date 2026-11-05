@@ -161,6 +161,75 @@ async fn a_topic_naming_an_entry_this_registry_lacks_falls_back_to_its_route() {
     assert!(Arc::ptr_eq(&stale, &fresh));
 }
 
+/// ADR-0008 failure 2: a fallback reads another entry's backend, where the
+/// topic's log most likely is not, so it is warned about once per topic and
+/// recorded entry, naming only validated names.
+#[tracing_test::traced_test]
+#[tokio::test]
+async fn a_topic_naming_a_missing_entry_is_warned_once() {
+    let previous = config(&json!({
+        "backends": {
+            "main": { "type": MEMORY_BACKEND },
+            "retired": { "type": MEMORY_BACKEND, "store": SENTINEL },
+        },
+        "backend_routing": { TOPIC_TYPE: "main", AUDIT_TOPIC: "retired", ORDERS_TOPIC: "retired" },
+    }));
+    let current = config(&json!({
+        "backends": {
+            "main": { "type": MEMORY_BACKEND },
+            "audit": { "type": MEMORY_BACKEND, "store": SENTINEL },
+        },
+        "backend_routing": { TOPIC_TYPE: "main", AUDIT_TOPIC: "audit" },
+    }));
+    let registry = Registry::build(deployment(&current), &memory_only(), Role::Standalone)
+        .await
+        .expect("every entry builds");
+
+    let stale_audit = topic(&previous, AUDIT_TOPIC);
+    let resolved: Vec<_> = (0..3).map(|_| registry.resolve(&stale_audit)).collect();
+    let stale_orders = registry.resolve(&topic(&previous, ORDERS_TOPIC));
+
+    let audit = registry.resolve(&topic(&current, AUDIT_TOPIC));
+    let main = registry.resolve(&topic(&current, ORDERS_TOPIC));
+    let [first, second, third] = resolved.as_slice() else {
+        panic!("three resolutions, got {}", resolved.len());
+    };
+    for backend in [first, second, third] {
+        assert!(Arc::ptr_eq(backend, &audit), "the route's entry answers");
+    }
+    assert!(
+        Arc::ptr_eq(&stale_orders, &main),
+        "the route's entry answers"
+    );
+    logs_assert(|lines: &[&str]| {
+        let warned: Vec<&str> = lines
+            .iter()
+            .copied()
+            .filter(|line| line.contains(" WARN "))
+            .collect();
+        let [audit_line, orders_line] = warned.as_slice() else {
+            return Err(format!("expected two warnings, got {warned:?}"));
+        };
+        let expected = [
+            (
+                audit_line,
+                format!("topic={AUDIT_TOPIC} recorded=retired chosen=audit"),
+            ),
+            (
+                orders_line,
+                format!("topic={ORDERS_TOPIC} recorded=retired chosen=main"),
+            ),
+        ];
+        for (line, fields) in expected {
+            let message = "topic names a backend entry this registry lacks";
+            if !line.contains(&format!("{message} {fields}")) || line.contains(SENTINEL) {
+                return Err(format!("expected '{message} {fields}', got {line}"));
+            }
+        }
+        Ok(())
+    });
+}
+
 /// C1. The error names the entry, its type and what the build links.
 #[tokio::test]
 async fn an_entry_whose_type_no_linked_provider_serves_stops_the_build() {

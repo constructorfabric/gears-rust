@@ -2,6 +2,7 @@
 
 use std::time::Duration;
 
+use super::BackendError;
 use super::ids::LogId;
 use crate::GtsInstanceId;
 
@@ -9,8 +10,9 @@ use crate::GtsInstanceId;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TopicSpec {
     pub topic: GtsInstanceId,
-    /// From the topic's resolved settings; the backend partitions keys into
-    /// this many.
+    /// The count to create the log with; the backend partitions keys into
+    /// this many. For a log the backend already holds, it is the count the
+    /// backend reported when it provisioned that log.
     pub partitions: u32,
     /// From the topic's resolved settings; the backend enforces it on its own
     /// schedule.
@@ -49,21 +51,50 @@ pub enum Replacing {
     Nothing,
     /// The attempt being replaced.
     Log(LogId),
+    /// The log is already held under `new`: apply the settings only, never
+    /// create. A backend holding nothing for the topic answers
+    /// [`BackendError::NotProvisioned`] and creates nothing.
+    Held,
 }
 
 impl LogClaim {
-    /// Whether a backend holding `stored` accepts this claim: when nothing is
-    /// stored, when the stored id is the one being replaced, or when it is
-    /// already `new` (the same attempt, continued). Anything else is a
-    /// [`BackendError::LogConflict`](super::BackendError::LogConflict).
+    /// Whether a backend holding nothing for the topic may create its log
+    /// under this claim; `false` for [`Replacing::Held`]. A backend that
+    /// creates before it reads what it holds skips the create when this is
+    /// `false`.
     #[must_use]
-    pub fn accepts(&self, stored: Option<LogId>) -> bool {
-        match stored {
-            None => true,
-            Some(id) if id == self.new => true,
-            Some(id) => self.replacing == Replacing::Log(id),
+    pub fn allows_creation(&self) -> bool {
+        self.replacing != Replacing::Held
+    }
+
+    /// The compare-and-set every backend applies to what it holds for the
+    /// topic, `stored`, before acting on the claim for `operation`: accepted
+    /// when the stored id is already `new` (the same attempt, continued), when
+    /// it is the one being replaced, or when nothing is stored and the claim
+    /// allows creation.
+    ///
+    /// # Errors
+    ///
+    /// [`BackendError::NotProvisioned`] for a [`Replacing::Held`] claim over
+    /// nothing; [`BackendError::LogConflict`] for any other stored id.
+    pub fn check(&self, operation: &str, stored: Stored) -> Result<(), BackendError> {
+        match (self.replacing, stored) {
+            (Replacing::Held, Stored::Nothing) => Err(BackendError::not_provisioned(operation)),
+            (_, Stored::Nothing) => Ok(()),
+            (_, Stored::Log(id)) if id == self.new => Ok(()),
+            (Replacing::Log(replaced), Stored::Log(id)) if id == replaced => Ok(()),
+            (_, Stored::Log(_)) => Err(BackendError::log_conflict(operation)),
         }
     }
+}
+
+/// What a backend holds for a topic when it checks a [`LogClaim`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stored {
+    /// The backend holds no log for the topic.
+    Nothing,
+    /// The backend holds the topic's log under this id.
+    Log(LogId),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

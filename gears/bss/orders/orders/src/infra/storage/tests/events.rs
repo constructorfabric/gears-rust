@@ -1405,9 +1405,19 @@ async fn every_event_is_stored_whatever_the_broker_partition_count() -> anyhow::
             .all(|p| p.outcome == DeliveredOutcome::Accepted && !p.ack_lost),
         "no duplicate or sequence-violation answer"
     );
+    // A leased processor also raises `attempts` for as long as it holds a partition's lease:
+    // acquiring it counts one attempt as a crash marker, and the release after an idle poll or
+    // the acknowledgement resets it. The test workers re-poll every 200 ms, so a processor in
+    // the middle of an idle poll is not a retry. A real retry records `last_error` and gives the
+    // lease up; a crash leaves `attempts > 0` on a lease nobody renews, which expires. Taking an
+    // expired lease over adds to the attempts the crash left, so a live lease above one attempt
+    // is a crash too: only a single attempt on a live lease is the healthy in-flight state.
     let errors = count(
         &env.pg,
-        "SELECT count(*) AS n FROM toolkit_outbox_processor WHERE last_error IS NOT NULL OR attempts > 0",
+        "SELECT count(*) AS n FROM toolkit_outbox_processor \
+         WHERE last_error IS NOT NULL \
+            OR attempts > 1 \
+            OR (attempts = 1 AND (locked_by IS NULL OR locked_until < now()))",
     )
     .await;
     assert_eq!(errors, 0, "no retry or error is visible on the queue");

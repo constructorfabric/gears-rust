@@ -93,3 +93,60 @@ async fn entries_naming_different_stores_do_not_share() {
         "expected NotProvisioned, got {missing:?}"
     );
 }
+
+fn single_process() -> serde_json::Map<String, serde_json::Value> {
+    let mut map = serde_json::Map::new();
+    map.insert("single_process".to_owned(), serde_json::Value::Bool(true));
+    map
+}
+
+#[tokio::test]
+async fn memory_refuses_cluster_roles_without_single_process() {
+    for role in [Role::Ingest, Role::Delivery] {
+        let built = MemoryBackendProvider::default()
+            .build(&BuildContext::new(&serde_json::Map::new(), role))
+            .await;
+        let Err(event_broker_sdk::backend::BackendError::InvalidConfig { detail }) = built else {
+            panic!(
+                "{role:?}: expected InvalidConfig, got {:?}",
+                built.map(|_| ())
+            );
+        };
+        assert_eq!(
+            detail,
+            "the memory backend holds events in this process only; outside `standalone` it needs \
+             `single_process: true`, for tests that run every role in one process",
+            "{role:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn memory_builds_in_cluster_roles_with_single_process() {
+    for role in [Role::Ingest, Role::Delivery] {
+        let backend = MemoryBackendProvider::default()
+            .build(&BuildContext::new(&single_process(), role))
+            .await
+            .unwrap_or_else(|err| panic!("{role:?}: builds with `single_process: true`: {err}"));
+        assert_eq!(
+            backend.provision(&spec(), &claim()).await.unwrap(),
+            Provisioning::Ready { partitions: 2 },
+            "{role:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn memory_builds_standalone_by_default() {
+    let backend = MemoryBackendProvider::default()
+        .build(&BuildContext::new(
+            &serde_json::Map::new(),
+            Role::Standalone,
+        ))
+        .await
+        .unwrap_or_else(|err| panic!("standalone builds from empty settings: {err}"));
+    assert_eq!(
+        backend.provision(&spec(), &claim()).await.unwrap(),
+        Provisioning::Ready { partitions: 2 }
+    );
+}
