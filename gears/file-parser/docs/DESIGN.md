@@ -134,6 +134,7 @@ Currently supported:
 **Known limitations of `KreuzbergParser` (kreuzberg 4.9.4 through 4.10.4)**:
 - PPTX multi-slide presentations: slides are emitted as `##` headings rather than distinct nodes; `PageBreak` blocks between slides are not produced.
 - PPTX tables: structured `Table` blocks are not produced; table cell content is extracted as plain paragraphs.
+- Inline styles: `ir_convert.rs` maps kreuzberg `TextAnnotation`s of kind bold / italic / underline / strikethrough (byte offsets into the node text) to `InlineStyle` on `Inline::Text` for paragraphs, headings, titles and list items. Other annotation kinds (links, code, colour, size) are ignored. Table cells carry no annotations in kreuzberg's `GridCell`, so their text is passed through as kreuzberg renders it (DOCX bold appears as literal `**text**`).
 <!-- fdd-id-content -->
 
 #### kreuzberg Version Pin

@@ -422,3 +422,76 @@ async fn test_docx_parser_table_edge_cases() {
     );
     assert_eq!(cell_text(&table.rows[4].cells[0]), "Espa\u{f1}ol");
 }
+
+fn collect(
+    blocks: &[file_parser::domain::ir::ParsedBlock],
+    out: &mut Vec<(String, file_parser::domain::ir::InlineStyle)>,
+) {
+    for b in blocks {
+        match b {
+            file_parser::domain::ir::ParsedBlock::Paragraph { inlines }
+            | file_parser::domain::ir::ParsedBlock::Heading { inlines, .. } => {
+                for i in inlines {
+                    if let file_parser::domain::ir::Inline::Text { text, style } = i {
+                        out.push((text.clone(), style.clone()));
+                    }
+                }
+            }
+            file_parser::domain::ir::ParsedBlock::ListItem { blocks, .. } => collect(blocks, out),
+            _ => {}
+        }
+    }
+}
+
+#[allow(clippy::non_ascii_literal)]
+#[tokio::test]
+async fn test_docx_parser_preserves_inline_styles() {
+    use file_parser::domain::ir::InlineStyle;
+    use file_parser::domain::markdown::MarkdownRenderer;
+
+    let parser = KreuzbergParser::new();
+    let test_file = get_test_file_path("test_file_styled_runs.docx");
+    assert!(test_file.exists(), "test fixture missing: {test_file:?}");
+    let doc = parser.parse_local_path(&test_file, None).await.unwrap();
+
+    let mut segs = Vec::new();
+    collect(&doc.blocks, &mut segs);
+    let style_of = |t: &str| {
+        segs.iter()
+            .find(|(text, _)| text == t)
+            .unwrap_or_else(|| panic!("no inline with text {t:?} in {segs:?}"))
+            .1
+            .clone()
+    };
+
+    let bold = style_of("bolded");
+    assert!(bold.bold && !bold.italic && !bold.underline && !bold.strike);
+    let italic = style_of("italicised");
+    assert!(italic.italic && !italic.bold && !italic.underline && !italic.strike);
+    let underline = style_of("underlined");
+    assert!(underline.underline && !underline.bold && !underline.italic && !underline.strike);
+    let strike = style_of("struck");
+    assert!(strike.strike && !strike.bold && !strike.italic && !strike.underline);
+    let both = style_of("bolditalic");
+    assert!(both.bold && both.italic && !both.underline && !both.strike);
+    // multibyte run: byte offsets must land on the right characters
+    assert!(style_of("жирный").bold);
+    // styled run inside a list item
+    assert!(style_of("itembold").bold);
+    // unstyled neighbours stay plain
+    assert_eq!(style_of("plain "), InlineStyle::default());
+    assert_eq!(style_of("item "), InlineStyle::default());
+
+    let md = MarkdownRenderer::render_doc(&doc);
+    for expected in [
+        "**bolded**",
+        "*italicised*",
+        "__underlined__",
+        "~~struck~~",
+        "***bolditalic***",
+        "**жирный**",
+        "**itembold**",
+    ] {
+        assert!(md.contains(expected), "markdown lacks {expected:?}:\n{md}");
+    }
+}
