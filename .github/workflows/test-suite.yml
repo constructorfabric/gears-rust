@@ -129,3 +129,36 @@ jobs:
           path: test-results/*.xml
           if-no-files-found: warn
           retention-days: 14
+
+      # macOS only (#5710): the hosted macOS runner sometimes fails file
+      # operations with OS errors on unrelated files: "Illegal byte sequence
+      # (os error 92)" on reading a checked-in Cargo.toml, SQLite "disk I/O
+      # error", "Bus error: 10", fresh binaries that "cannot execute". Disk is
+      # not full when it happens. Keep the kernel's storage messages from a
+      # failed or cancelled run, so the cause can be pinned down and reported.
+      # `log show` needs no sudo on the hosted image.
+      - name: Collect macOS kernel storage log
+        if: ${{ (failure() || cancelled()) && runner.os == 'macOS' }}
+        shell: bash
+        run: |
+          out="$RUNNER_TEMP/macos-kernel-log"
+          mkdir -p "$out"
+          df -h "$GITHUB_WORKSPACE" > "$out/df.txt" 2>&1 || true
+          log show --last 3h --style compact --predicate 'process == "kernel"' \
+            > "$out/kernel.log" 2>&1 || true
+          grep -iE 'apfs|nvme|disk[0-9]|I/O error|checksum|corrupt' "$out/kernel.log" \
+            > "$out/kernel-storage.log" || true
+          gzip -f "$out/kernel.log"
+          echo "Kernel storage lines: $(wc -l < "$out/kernel-storage.log")"
+          # Errors only, without the sandbox noise every macOS boot produces.
+          grep -iE 'error|fail|corrupt|checksum' "$out/kernel-storage.log" \
+            | grep -viE 'sandbox|MACF' | tail -40 || true
+
+      - name: Upload macOS kernel storage log
+        if: ${{ (failure() || cancelled()) && runner.os == 'macOS' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: macos-kernel-log
+          path: ${{ runner.temp }}/macos-kernel-log/
+          if-no-files-found: warn
+          retention-days: 14
