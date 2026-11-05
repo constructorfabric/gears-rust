@@ -34,7 +34,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ windows-latest, macos-latest ]
+        os: [ macos-latest ]  # TEMP repro: macOS only
     uses: ./.github/workflows/test-suite.yml
     with:
       os: ${{ matrix.os }}
