@@ -81,3 +81,19 @@ fn publishing_a_type_that_is_not_an_event_type_is_refused_before_the_pep() {
         .is_ok()
     );
 }
+
+#[test]
+fn event_and_topic_resources_advertise_the_target_tenant_property() {
+    use toolkit_security::pep_properties::OWNER_TENANT_ID;
+    let topic =
+        toolkit_gts::GtsInstanceId::try_new("gts.cf.core.events.topic.v1~x.eb.orders.acme.v1")
+            .unwrap();
+    for resource in [
+        super::topic_resource(&topic),
+        event_type_resource(&GtsTypeId::new(EVENT_BASE)).unwrap(),
+        event_type_interest_resource(&pattern(EVENT_BASE)).unwrap(),
+        event_type_interest_resource(&pattern("gts.cf.core.events.*")).unwrap(),
+    ] {
+        assert!(resource.supported_properties().contains(&OWNER_TENANT_ID));
+    }
+}
