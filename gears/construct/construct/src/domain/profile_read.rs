@@ -19,6 +19,7 @@ use super::error::DomainError;
 use super::plan::NodeKey;
 use super::planner::processing::ProcessingContexts;
 use super::profile::Category;
+use super::subject_reach::reach;
 use super::subject_settings::{SubjectKey, SubjectSettingsReader};
 
 /// The policy property that names a profile category.
@@ -183,12 +184,9 @@ fn named_categories<'a>(values: impl IntoIterator<Item = &'a ScopeValue>) -> Has
 }
 
 /// What one constraint of a policy scope grants on the profile at `key`:
-/// nothing when it does not reach it, otherwise the categories it names, or
-/// every category when it names none. A constraint reaches the profile only
-/// when it names the profile's tenant, so a grant is always bound to it; one
-/// that names only a subject or categories grants nothing. A filter that
-/// cannot be decided in memory (a group or tenant-subtree filter) grants
-/// nothing, and so does a filter on a property the profile has not.
+/// nothing when it does not [`reach`] it, otherwise the categories it names,
+/// or every category when it names none. A filter on a property the profile
+/// has not grants nothing.
 ///
 /// Reading profiles is a permission of its own, which the platform grants to
 /// the applications and agents that act for the tenant's subjects: a
@@ -196,30 +194,15 @@ fn named_categories<'a>(values: impl IntoIterator<Item = &'a ScopeValue>) -> Has
 /// it. A policy may narrow that to named subjects with a resource id filter.
 fn granted_by(constraint: &ScopeConstraint, key: SubjectKey) -> Option<HashSet<Category>> {
     let mut named: Option<HashSet<Category>> = None;
-    let mut tenant_named = false;
-    for filter in constraint.filters() {
-        if !filter.is_representable_in_memory() {
+    for filter in reach(constraint, key)? {
+        if filter.property() != CATEGORY_PROPERTY {
             return None;
         }
-        let values = filter.values();
-        let holds = |id: Uuid| values.iter().any(|value| value.as_uuid() == Some(id));
-        match filter.property() {
-            pep_properties::OWNER_TENANT_ID if !holds(key.tenant_id) => return None,
-            pep_properties::RESOURCE_ID if !holds(key.subject_id) => return None,
-            pep_properties::OWNER_TENANT_ID => tenant_named = true,
-            pep_properties::RESOURCE_ID => {}
-            CATEGORY_PROPERTY => {
-                let these = named_categories(&values);
-                named = Some(match named {
-                    Some(before) => before.intersection(&these).copied().collect(),
-                    None => these,
-                });
-            }
-            _ => return None,
-        }
-    }
-    if !tenant_named {
-        return None;
+        let these = named_categories(filter.values());
+        named = Some(match named {
+            Some(before) => before.intersection(&these).copied().collect(),
+            None => these,
+        });
     }
     Some(named.unwrap_or_else(|| Category::ALL.into_iter().collect()))
 }

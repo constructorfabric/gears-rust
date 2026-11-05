@@ -40,11 +40,21 @@ fn router_in(
     caller: Uuid,
     home: Uuid,
 ) -> Router {
+    router_with(chain, resolver, caller, home, Duration::from_secs(20))
+}
+
+fn router_with(
+    chain: &Chain,
+    resolver: Arc<dyn AuthZResolverApi>,
+    caller: Uuid,
+    home: Uuid,
+    budget: Duration,
+) -> Router {
     let manage = ManageFacts::new(
         Arc::new(chain.processing()),
         Arc::new(Contexts(chain.contexts)),
         PolicyEnforcer::new(resolver),
-        Duration::from_secs(20),
+        budget,
     );
     register_manage_route(Router::new(), &OpenApiRegistryImpl::new(), Arc::new(manage))
         .layer(Extension(context_of(caller, home)))
@@ -57,14 +67,14 @@ fn app_router(chain: &Chain, resolver: Arc<dyn AuthZResolverApi>) -> Router {
 
 /// The subject calling for itself, and an application calling for it in the subject's tenant: the router of each,
 /// with the path it calls.
-fn both_callers(chain: &Chain) -> [(Router, String); 2] {
+fn both_callers(chain: &Chain, resolver: &Arc<dyn AuthZResolverApi>) -> [(Router, String); 2] {
     [
         (
-            router(chain, Arc::new(AllowResolver), SUBJECT),
+            router(chain, Arc::clone(resolver), SUBJECT),
             format!("/construct/v1/subjects/{SUBJECT}/facts/manage"),
         ),
         (
-            app_router(chain, Arc::new(AllowResolver)),
+            app_router(chain, Arc::clone(resolver)),
             format!("/construct/v1/subjects/{SUBJECT}/facts/manage?tenant={TENANT}"),
         ),
     ]
@@ -87,6 +97,35 @@ impl AuthZResolverApi for TenantWideResolver {
             );
         }
         Ok(response)
+    }
+}
+
+/// Allows like [`AllowResolver`] but narrows the grant to another subject.
+struct AnotherSubjectResolver;
+
+#[async_trait]
+impl AuthZResolverApi for AnotherSubjectResolver {
+    async fn evaluate(
+        &self,
+        ctx: PlatformSecurityContext,
+        mut request: EvaluationRequest,
+    ) -> Result<EvaluationResponse, CanonicalError> {
+        request.resource.id = Some(Uuid::new_v4());
+        AllowResolver.evaluate(ctx, request).await
+    }
+}
+
+/// Never answers.
+struct HangingResolver;
+
+#[async_trait]
+impl AuthZResolverApi for HangingResolver {
+    async fn evaluate(
+        &self,
+        _ctx: PlatformSecurityContext,
+        _request: EvaluationRequest,
+    ) -> Result<EvaluationResponse, CanonicalError> {
+        std::future::pending().await
     }
 }
 
@@ -167,15 +206,9 @@ async fn the_subject_gets_what_was_stored() {
 async fn a_subject_the_caller_may_not_act_for_answers_as_one_that_does_not_exist() {
     let chain = Chain::new(adding_rust(1), &[Ok(Written::Stored)]);
 
-    for (resolver, caller) in [
-        (
-            Arc::new(DenyResolver) as Arc<dyn AuthZResolverApi>,
-            Uuid::new_v4(),
-        ),
-        (Arc::new(DenyResolver) as Arc<dyn AuthZResolverApi>, SUBJECT),
-    ] {
+    for caller in [Uuid::new_v4(), SUBJECT] {
         let (status, body) = post(
-            router(&chain, resolver, caller),
+            router(&chain, Arc::new(DenyResolver), caller),
             SUBJECT,
             &said("I also know Rust."),
         )
@@ -285,6 +318,28 @@ async fn an_unreachable_profile_answers_unavailable() {
 }
 
 #[tokio::test]
+async fn a_policy_service_that_does_not_answer_within_the_budget_answers_unavailable() {
+    let chain = Chain::new(adding_rust(1), &[Ok(Written::Stored)]);
+
+    let (status, body) = post(
+        router_with(
+            &chain,
+            Arc::new(HangingResolver),
+            SUBJECT,
+            TENANT,
+            Duration::from_millis(50),
+        ),
+        SUBJECT,
+        &said("I also know Rust."),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(chain.reads(), 0);
+    assert!(chain.writer.plans().is_empty());
+}
+
+#[tokio::test]
 async fn every_answer_of_the_route_is_no_store_with_the_security_headers() {
     let chain = Chain::new(adding_rust(1), &[Ok(Written::Stored)]);
 
@@ -378,6 +433,74 @@ async fn an_application_with_the_permission_manages_the_facts_of_a_subject_in_th
 }
 
 #[tokio::test]
+async fn a_caller_with_the_permission_manages_another_subject_of_its_own_tenant() {
+    let chain = Chain::new(adding_rust(1), &[Ok(Written::Stored)]);
+
+    let (status, body) = post(
+        router(&chain, Arc::new(AllowResolver), AGENT),
+        SUBJECT,
+        &said("I also know Rust."),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let plans = chain.writer.plans();
+    let [plan] = plans.as_slice() else {
+        panic!("one plan, got {plans:?}");
+    };
+    assert_eq!(
+        (plan.tenant_id, plan.subject_id, &plan.origin),
+        (TENANT, SUBJECT, &Origin::Agent { agent: AGENT })
+    );
+}
+
+#[tokio::test]
+async fn the_subject_naming_a_tenant_is_authorized_for_that_tenant() {
+    let chain = Chain::new(adding_rust(1), &[Ok(Written::Stored)]);
+    let resolver = Arc::new(RecordingResolver::default());
+
+    let (status, body) = post_for_tenant(
+        router(&chain, Arc::clone(&resolver) as _, SUBJECT),
+        TENANT,
+        &said("I also know Rust."),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let contexts: Vec<_> = resolver
+        .asked
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(_, _, context, _)| *context)
+        .collect();
+    assert_eq!(contexts, [Some(TENANT)]);
+
+    let (status, body) = post_for_tenant(
+        router_in(&chain, Arc::new(OwnTenantOnlyResolver), SUBJECT, APP_HOME),
+        TENANT,
+        &said("I also know Rust."),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(chain.writer.plans().len(), 1);
+}
+
+#[tokio::test]
+async fn a_grant_narrowed_to_another_subject_refuses_every_caller() {
+    let chain = Chain::new(adding_rust(1), &[Ok(Written::Stored)]);
+
+    for (caller, uri) in both_callers(&chain, &(Arc::new(AnotherSubjectResolver) as _)) {
+        let (status, body) = post_to(caller, &uri, &said("I also know Rust.")).await;
+
+        assert_eq!(status, StatusCode::NOT_FOUND, "{uri}: {body}");
+    }
+    assert!(chain.writer.plans().is_empty());
+    assert!(chain.model.requests().is_empty());
+}
+
+#[tokio::test]
 async fn a_grant_that_names_only_the_tenant_covers_every_subject_in_it() {
     let chain = Chain::new(adding_rust(1), &[Ok(Written::Stored)]);
 
@@ -452,7 +575,7 @@ async fn an_application_asks_the_policy_service_about_the_named_tenant() {
 async fn the_subject_and_an_application_both_read_and_write_as_construct() {
     let chain = Chain::new(adding_rust(2), &[Ok(Written::Stored)]);
 
-    for (caller, uri) in both_callers(&chain) {
+    for (caller, uri) in both_callers(&chain, &(Arc::new(AllowResolver) as _)) {
         let (status, body) = post_to(caller, &uri, &said("I also know Rust.")).await;
 
         assert_eq!(status, StatusCode::OK, "{uri}: {body}");
@@ -488,10 +611,10 @@ async fn without_a_processing_context_no_caller_stores_anything() {
     let mut chain = Chain::new(adding_rust(2), &[Ok(Written::Stored)]);
     chain.contexts = false;
 
-    for (caller, uri) in both_callers(&chain) {
+    for (caller, uri) in both_callers(&chain, &(Arc::new(AllowResolver) as _)) {
         let (status, body) = post_to(caller, &uri, &said("I also know Rust.")).await;
 
-        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{uri}: {body}");
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{uri}: {body}");
     }
     assert_eq!(chain.reads(), 0);
     assert!(chain.writer.plans().is_empty());

@@ -102,16 +102,28 @@ pub async fn manage_facts(
     if let Some((field, limit)) = req.field_past_its_limit() {
         return Err(too_long(field, limit));
     }
-    let managed = manage
-        .manage(
-            &ctx,
-            query.tenant,
-            subject_id,
-            req.message,
-            req.conversation,
-        )
-        .await
-        .map_err(|error| for_facts(error, subject_id))?;
+    // The error is mapped, and so logged, inside this span, so the log names
+    // the caller, the subject and the tenant.
+    let span = tracing::info_span!(
+        "manage_facts",
+        %subject_id,
+        caller = %ctx.subject_id(),
+        tenant_id = %ManageFacts::tenant_of(&ctx, query.tenant)
+    );
+    let managed = async {
+        manage
+            .manage(
+                &ctx,
+                query.tenant,
+                subject_id,
+                req.message,
+                req.conversation,
+            )
+            .await
+            .map_err(|error| for_facts(error, subject_id))
+    }
+    .instrument(span)
+    .await?;
     Ok(Json(ManageFactsResponse::from(managed)))
 }
 

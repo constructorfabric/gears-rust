@@ -247,7 +247,11 @@ pub fn assemble(
             hand_off: Arc::new(DroppingHandOff::new(Arc::new(LogIntakeEvents))),
             worker: None,
             profile,
-            manage: Arc::new(ManageFacts::not_configured(contexts, policy_enforcer)),
+            manage: Arc::new(ManageFacts::not_configured(
+                contexts,
+                policy_enforcer,
+                MANAGE_BUDGET,
+            )),
         });
     };
     let (hand_off, queue) = record_queue(cfg.config().processing.queue_capacity);

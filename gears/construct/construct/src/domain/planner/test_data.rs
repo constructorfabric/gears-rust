@@ -205,7 +205,9 @@ impl ProcessingContexts for Contexts {
                 AccessScope::for_tenant(tenant_id),
             ))
         } else {
-            Err(DomainError::Unavailable("no token".to_owned()))
+            Err(DomainError::NotConfigured(
+                "no processing identity".to_owned(),
+            ))
         }
     }
 }

@@ -4,15 +4,16 @@ use std::time::Duration;
 use authz_resolver_sdk::PolicyEnforcer;
 use authz_resolver_sdk::models::TenantMode;
 use authz_resolver_sdk::pep::{AccessRequest, ResourceType};
-use tokio::time::Instant;
+use tokio::time::{Instant, timeout_at};
 use toolkit_macros::domain_model;
-use toolkit_security::{AccessScope, ScopeConstraint, SecurityContext, pep_properties};
+use toolkit_security::{AccessScope, SecurityContext, pep_properties};
 use uuid::Uuid;
 
 use super::agent::AgentMessage;
 use super::processing::{Managed, NothingStored, Processing, ProcessingContexts};
 use crate::domain::error::DomainError;
 use crate::domain::profile_read::not_visible;
+use crate::domain::subject_reach::reach;
 use crate::domain::subject_settings::SubjectKey;
 
 pub(crate) const SUBJECT_FACTS_RESOURCE: ResourceType = ResourceType::from_static(
@@ -34,37 +35,15 @@ pub struct ManageFacts {
     budget: Duration,
 }
 
-/// Whether one constraint of a policy scope reaches the subject at `key`. It must name the subject's tenant, so a
-/// grant is always bound to it, and it may narrow the grant to named subjects. A filter that cannot be decided in
-/// memory, or one on another property, reaches nothing.
+/// Whether a policy scope reaches the subject at `key`: one of its constraints [`reach`]es it with no other filter.
 ///
 /// Managing facts is a permission of its own, which the platform grants to the applications and agents that act for
 /// the tenant's subjects: a constraint that names only the tenant reaches every subject in it.
-fn reaches_by(constraint: &ScopeConstraint, key: SubjectKey) -> bool {
-    let mut tenant_named = false;
-    for filter in constraint.filters() {
-        if !filter.is_representable_in_memory() {
-            return false;
-        }
-        let values = filter.values();
-        let holds = |id: Uuid| values.iter().any(|value| value.as_uuid() == Some(id));
-        match filter.property() {
-            pep_properties::OWNER_TENANT_ID if holds(key.tenant_id) => tenant_named = true,
-            pep_properties::RESOURCE_ID if holds(key.subject_id) => {}
-            _ => return false,
-        }
-    }
-    tenant_named
-}
-
-/// Whether a policy scope reaches the subject at `key`: one of its constraints does. The request asks with
-/// constraints required, so an unconstrained scope is the platform allowing everything.
 fn reaches(scope: &AccessScope, key: SubjectKey) -> bool {
-    scope.is_unconstrained()
-        || scope
-            .constraints()
-            .iter()
-            .any(|constraint| reaches_by(constraint, key))
+    scope
+        .constraints()
+        .iter()
+        .any(|constraint| reach(constraint, key).is_some_and(|rest| rest.is_empty()))
 }
 
 impl ManageFacts {
@@ -86,32 +65,38 @@ impl ManageFacts {
     }
 
     /// Manage-facts for a deployment without record processing: a caller the platform lets act for the subject is
-    /// answered not configured.
+    /// answered not configured. `budget` bounds the policy call.
     #[must_use]
     pub fn not_configured(
         contexts: Arc<dyn ProcessingContexts>,
         policy_enforcer: PolicyEnforcer,
+        budget: Duration,
     ) -> Self {
         Self {
             processing: None,
             contexts,
             policy_enforcer,
-            budget: Duration::ZERO,
+            budget,
         }
     }
 
-    /// Takes `message`, with the agent's recent `conversation`, for `subject_id` in `tenant`, or else in the caller's
-    /// own tenant. The agent in the plan's origin is the caller the platform authenticated.
+    /// The tenant a call is about: the one named, or else the caller's own.
+    #[must_use]
+    pub fn tenant_of(ctx: &SecurityContext, tenant: Option<Uuid>) -> Uuid {
+        tenant.unwrap_or_else(|| ctx.subject_tenant_id())
+    }
+
+    /// Takes `message`, with the agent's recent `conversation`, for `subject_id` in the tenant of
+    /// [`Self::tenant_of`]. The agent in the plan's origin is the caller the platform authenticated.
     ///
-    /// The subject itself needs the permission to manage its own facts. Any other caller, an application or an agent
-    /// acting for the subject, needs the permission to manage facts on the subject in that tenant. For either caller the
-    /// profile is then read and the facts are written as Construct, through [`ProcessingContexts`], as record
-    /// processing reads and writes them, so one identity writes every profile.
+    /// Every caller, the subject itself or an application or agent acting for it, needs the permission to manage
+    /// facts on the subject in that tenant. The profile is then read and the facts are written as Construct, through
+    /// [`ProcessingContexts`], as record processing reads and writes them, so one identity writes every profile.
     ///
     /// # Errors
     ///
-    /// [`DomainError::Forbidden`] when the subject may not manage its own facts, and [`DomainError::NotVisible`] when
-    /// another caller may not act for the subject in the tenant, both answered like a subject that does not exist.
+    /// [`DomainError::NotVisible`] when the caller may not act for the subject in the tenant, answered like a subject
+    /// that does not exist. [`DomainError::Unavailable`] when the policy service does not answer within the budget.
     /// Not configured when the deployment does not configure record processing. The errors of
     /// [`ProcessingContexts::for_tenant`] and [`Processing::manage`].
     ///
@@ -127,7 +112,7 @@ impl ManageFacts {
     ) -> Result<Managed, DomainError> {
         let deadline = Instant::now() + self.budget;
         let key = SubjectKey {
-            tenant_id: tenant.unwrap_or_else(|| ctx.subject_tenant_id()),
+            tenant_id: Self::tenant_of(ctx, tenant),
             subject_id,
         };
         let message = AgentMessage {
@@ -137,20 +122,13 @@ impl ManageFacts {
             message,
             conversation,
         };
-        if ctx.subject_id() == subject_id && key.tenant_id == ctx.subject_tenant_id() {
-            self.policy_enforcer
-                .access_scope_with(
-                    ctx,
-                    &SUBJECT_FACTS_RESOURCE,
-                    actions::MANAGE,
-                    Some(subject_id),
-                    &AccessRequest::new()
-                        .resource_property(pep_properties::OWNER_TENANT_ID, key.tenant_id),
+        timeout_at(deadline, self.authorize(ctx, key))
+            .await
+            .map_err(|_| {
+                DomainError::Unavailable(
+                    "the policy service did not answer within the budget".to_owned(),
                 )
-                .await?;
-        } else {
-            self.authorize_for_subject(ctx, key).await?;
-        }
+            })??;
         let processing = self.processing()?;
         if message.message.trim().is_empty() {
             return Ok(Managed::NothingStored(NothingStored::NoChange));
@@ -168,12 +146,8 @@ impl ManageFacts {
         })
     }
 
-    /// Whether the platform lets `ctx` manage the facts of the subject at `key`, a subject other than itself.
-    async fn authorize_for_subject(
-        &self,
-        ctx: &SecurityContext,
-        key: SubjectKey,
-    ) -> Result<(), DomainError> {
+    /// Whether the platform lets `ctx` manage the facts of the subject at `key`.
+    async fn authorize(&self, ctx: &SecurityContext, key: SubjectKey) -> Result<(), DomainError> {
         // Constraints are required, so an answer without them is a refusal, never a grant on every subject.
         let request = AccessRequest::new()
             .require_constraints(true)
@@ -203,7 +177,7 @@ impl ManageFacts {
 
 #[cfg(test)]
 mod tests {
-    use toolkit_security::{ScopeFilter, ScopeValue};
+    use toolkit_security::{ScopeConstraint, ScopeFilter, ScopeValue};
 
     use super::*;
 
@@ -272,5 +246,10 @@ mod tests {
                 "{constraint:?}"
             );
         }
+    }
+
+    #[test]
+    fn an_unconstrained_scope_reaches_nothing() {
+        assert!(!reaches(&AccessScope::allow_all(), key()));
     }
 }

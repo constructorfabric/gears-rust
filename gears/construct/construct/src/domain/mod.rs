@@ -21,6 +21,7 @@ pub mod record_intake;
 pub mod refusal;
 pub mod sensitive_data;
 pub mod settings_scope;
+pub(crate) mod subject_reach;
 pub mod subject_settings;
 
 #[cfg(test)]
