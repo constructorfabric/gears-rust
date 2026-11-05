@@ -1300,11 +1300,15 @@ Rules:
 
 #### Pass-through error format
 
-On the pass-through routes (§ 3.3), Gateway errors are rendered in the error format of the route's provider API instead of a Problem, so that OpenAI and Anthropic SDK clients parse them as ordinary API errors. The HTTP status and retry semantics are those of the table above.
+On the pass-through routes (§ 3.3), Gateway errors are rendered in the error format of the route's provider API instead of a Problem, so that OpenAI and Anthropic SDK clients parse them as ordinary API errors. The HTTP status is that of the table above. The official SDKs retry automatically (two extra attempts by default) on 408, 409, 429, and 5xx regardless of the error code, so the retry semantics of the table are conveyed with the `x-should-retry` header, which both SDKs obey.
 
 - OpenAI route: `{"error": {"message", "type", "code", "param"}}`. `code` is the Gateway code from the table above (for example `capability_not_supported`); `type` is `invalid_request_error` for 4xx and `server_error` for 5xx; `param` is set when known.
 - Anthropic route: `{"type": "error", "error": {"type", "message"}}`. `error.type` is the Anthropic error type that matches the HTTP status (`invalid_request_error`, `authentication_error`, `permission_error`, `not_found_error`, `rate_limit_error`, `api_error`, `overloaded_error`); the Gateway code is included in `message` as a `<code>: ` prefix.
 - Both formats carry the response `id` in the `x-llm-gateway-response-id` header and `retry_after` in the `Retry-After` header when available; provider keys, request content, and internal error chains are never included.
+- Every pass-through error response carries `x-should-retry`, set from the Retry column of the table above for the error's code (for provider errors relayed with the provider's status and body, the code the plugin maps the error to):
+  - `x-should-retry: true` for `Yes` (`credentials_unavailable`, `model_resolution_unavailable`, `quota_check_unavailable`, `gateway_unavailable`, `provider_unavailable`) and for `rate_limited`, together with `Retry-After` when known.
+  - `x-should-retry: false` for every other code, including `quota_exceeded` (a retry before the quota resets only repeats the pipeline and the Quota Enforcement lease call), `provider_error` and `internal` (`Depends`: the SDK cannot tell whether a retry helps), `output_validation_error` (409; a retry is a new paid generation and stays at the caller's discretion), and `context_length_exceeded`.
+
 - After an SSE stream has started, a Gateway failure is delivered in-band as one provider-native error event (OpenAI Responses `error`, OpenAI Chat Completions an `error` object in a `data:` chunk, Anthropic `event: error`) with the same body, and the stream is closed.
 
 ### 4.2 Security Considerations
@@ -1390,7 +1394,7 @@ The gear relies on platform tracing and structured logging. Traces: one span per
   - Capability: a model without the matching pass-through capability is rejected with `capability_not_supported` before quota admission, credential retrieval, and any provider call.
   - Stateless guard: each denylisted field of each route is rejected with `capability_not_supported` without a provider call; `store=false` is sent on OpenAI Responses and Chat Completions requests, including when the consumer sends `store=true`; paths outside the endpoint allowlist are not routed.
   - Usage: usage is read from native JSON responses and from the final usage event of native streams (with `stream_options.include_usage` requested for OpenAI); Gateway usage is added to the native `usage` object in both cases; a stream that ends without final usage reports the estimate marked incomplete; the quota lease amount is computed from the native output limit, or from the model's maximum output when the request has none; `count_tokens` acquires no lease and reports no cost.
-  - Errors: Gateway errors are rendered in the OpenAI and Anthropic error formats with the HTTP status of § 4.1, before and after the stream starts; provider errors are relayed with the provider status and body.
+  - Errors: Gateway errors are rendered in the OpenAI and Anthropic error formats with the HTTP status of § 4.1, before and after the stream starts; provider errors are relayed with the provider status and body; every error response carries `x-should-retry` as specified in § 4.1, and the official SDKs do not retry `quota_exceeded`, `provider_error`, `internal`, or `output_validation_error`.
   - SDK compatibility: the official OpenAI and Anthropic SDKs, pointed at the Gateway with a mock provider, complete sync and streaming calls with the platform bearer token (Anthropic through `auth_token`) and parse Gateway errors as ordinary API errors.
 - **Performance**: pre-release overhead benchmark with a fixed-latency provider stub at 1 000 concurrent requests; streaming soak tests; rolling-restart test under load. These are the only evidence for the PRD success criteria (§ 4.6).
 - **Live provider tests**: opt-in, outside CI, per plugin.
