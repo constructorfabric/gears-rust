@@ -13,14 +13,15 @@
 #   curl http://127.0.0.1:8080/docs        # Swagger UI (enable_docs: true)
 #
 # Topics and event types are `types-registry` entities, seeded here via its
-# `entities:` startup config (the same mechanism operators use via its
-# `POST /types-registry/v1/entities` REST API at runtime). They are entities of
-# different *kinds*: a topic is an instance, an event type is a derived type
-# schema. `event-broker` reads them during its start phase - after
-# `types-registry` has committed them, which is why the load is not in `init()`
-# - and re-reads them on the cadence
-# `workers.specification_refresh_interval_secs` sets, so a topic registered
-# while the process runs becomes resolvable without a restart.
+# `entities:` startup config. They are entities of different *kinds*: a topic
+# is an instance, an event type is a derived type schema. `event-broker` reads
+# them during its start phase - after `types-registry` has committed them -
+# and re-reads them on the cadence
+# `workers.specification_refresh_interval_secs` sets. The platform route
+# `POST /types-registry/v2/platform/entities`, which requires the internal
+# token, admits asynchronously (202, with an operation to poll); an entity it
+# admits while the process runs becomes resolvable at the first refresh after
+# its admission, without a restart.
 
 server:
   home_dir: "~/.cf-gears-event-broker"
@@ -33,6 +34,17 @@ database:
 
 gears:
   types-registry:
+    # The platform API the event broker reads topics and event types through is
+    # published only with a registry database. It persists under `home_dir`, in
+    # `types-registry/types_registry.db`: a restart applies edits to the seeds
+    # below but never deletes an entry removed from them, and refuses to boot
+    # when a changed event type cannot be shown to be backward compatible with
+    # the stored one.
+    database:
+      engine: sqlite
+      file: "types_registry.db"
+      params:
+        busy_timeout: "5000"
     config:
       entities:
         # A topic is an *instance* of the topic base type, carrying the stream's

@@ -7,7 +7,7 @@ use event_broker_sdk::EventBrokerApi;
 use toolkit::client_hub::ClientHub;
 use toolkit_db::outbox::{Outbox, Partitions};
 use toolkit_security::SecurityContext;
-use types_registry_sdk::testing::{MockTypesRegistryClient, make_test_instance};
+use types_registry_sdk::PlatformTypesRegistryApi;
 use uuid::Uuid;
 
 use crate::api::rest::routes::test_router;
@@ -28,7 +28,7 @@ use event_broker_sdk::backend::Backend;
 use memory_event_broker_plugin::MemoryBackend;
 
 /// Seeds a `TypesRegistrySpecificationManager` from `registry`'s
-/// `Topic`/`EventType` fixtures via a `MockTypesRegistryClient`, run through
+/// `Topic`/`EventType` fixtures via a `MockTypesRegistry`, run through
 /// the same startup bulk-load path production uses (`module.rs::serve()`) -
 /// not a direct in-memory insert, so harness-backed tests exercise the real
 /// `types-registry`-to-cache pipeline (eb-single-process-implementation D2
@@ -37,35 +37,30 @@ async fn seeded_spec_manager(
     db: Arc<toolkit_db::DBProvider<toolkit_db::DbError>>,
     registry: Option<super::type_registry::StaticTypesRegistry>,
     live: Option<(
-        Arc<dyn types_registry_sdk::TypesRegistryClient>,
+        Arc<dyn PlatformTypesRegistryApi>,
         crate::config::EventBrokerConfig,
     )>,
 ) -> Arc<dyn SpecificationManager> {
-    // A caller-supplied registry client (for example the real `types-registry` service another
-    // gear registered its contract into) is loaded unchanged, under that deployment's config.
+    // A caller-supplied registry client (for example one holding another gear's own contract) is
+    // loaded unchanged, under that deployment's config.
     if let Some((client, config)) = live {
         crate::infra::specification::bulk_load(&client, &db, &config)
             .await
             .expect("SpecificationManager bulk-load must not fail");
         return Arc::new(TypesRegistrySpecificationManager::new(db));
     }
-    let mut instances = Vec::new();
-    let (schemas, config) = if let Some(registry) = registry {
-        for document in registry.topics {
-            let id = document["id"]
-                .as_str()
-                .expect("a topic document names its id");
-            instances.push(make_test_instance(id, document.clone()));
-        }
-        (registry.event_types, registry.config)
+    let (client, config): (Arc<dyn PlatformTypesRegistryApi>, _) = if let Some(registry) = registry
+    {
+        (
+            registry_holding(&registry.topics, &registry.event_types),
+            registry.config,
+        )
     } else {
-        (Vec::new(), StaticTypesRegistry::empty_config())
+        (
+            registry_holding(&[], &[]),
+            StaticTypesRegistry::empty_config(),
+        )
     };
-    let client: Arc<dyn types_registry_sdk::TypesRegistryClient> = Arc::new(
-        MockTypesRegistryClient::new()
-            .with_instances(instances)
-            .with_type_schemas(schemas),
-    );
     crate::infra::specification::bulk_load(&client, &db, &config)
         .await
         .expect("SpecificationManager bulk-load must not fail");
@@ -138,7 +133,7 @@ const PROVISIONING_LIMITS: ProvisioningLimits = ProvisioningLimits {
 
 use super::api_v1::ApiV1;
 use super::authz_doubles::AllowAllAuthZ;
-use super::type_registry::StaticTypesRegistry;
+use super::type_registry::{StaticTypesRegistry, registry_holding};
 
 /// Arms/disarms the publish faults on a [`FaultInjectingIngest`]. Cloneable and
 /// cheap - the harness keeps one and hands it out via
@@ -464,7 +459,7 @@ impl EventBrokerHarness {
 pub struct EventBrokerHarnessBuilder {
     type_registry: Option<StaticTypesRegistry>,
     types_registry_client: Option<(
-        Arc<dyn types_registry_sdk::TypesRegistryClient>,
+        Arc<dyn PlatformTypesRegistryApi>,
         crate::config::EventBrokerConfig,
     )>,
     policy_enforcer: Option<PolicyEnforcer>,
@@ -509,17 +504,17 @@ impl EventBrokerHarnessBuilder {
         self
     }
 
-    /// Loads topics and event types from `client` - typically the real `types-registry`
-    /// service a producing gear registered its own contract into - through the same startup
-    /// bulk-load production runs, instead of from static fixtures. `topic_partitions` is the
-    /// deployment's per-topic partition configuration, since a topic carries no count.
+    /// Loads topics and event types from `client` - typically a registry holding a producing gear's
+    /// own contract - through the same startup bulk-load production runs, instead of from static
+    /// fixtures. `topic_partitions` is the deployment's per-topic partition configuration, since a
+    /// topic carries no count.
     ///
     /// # Panics
     /// Panics if the partition configuration does not deserialize.
     #[must_use]
     pub fn with_types_registry_client(
         mut self,
-        client: Arc<dyn types_registry_sdk::TypesRegistryClient>,
+        client: Arc<dyn PlatformTypesRegistryApi>,
         topic_partitions: &[(&str, u32)],
     ) -> Self {
         let topics: serde_json::Map<String, serde_json::Value> = topic_partitions

@@ -850,7 +850,7 @@ async fn serve_binds_the_real_producer_and_stops_its_workers() -> anyhow::Result
     toolkit_db::migration_runner::run_migrations_for_testing(&db, gear.migrations()).await?;
     let harness = event_broker::test_support::EventBrokerHarness::builder()
         .with_types_registry_client(
-            crate::infra::events::test_support::registry_client(),
+            crate::infra::events::test_support::platform_registry(),
             &[(crate::infra::events::TOPIC, 4)],
         )
         .build()
@@ -919,7 +919,7 @@ async fn store_loss_stops_readiness_without_a_restart_loop() -> anyhow::Result<(
     toolkit_db::migration_runner::run_migrations_for_testing(&db, gear.migrations()).await?;
     let harness = event_broker::test_support::EventBrokerHarness::builder()
         .with_types_registry_client(
-            crate::infra::events::test_support::registry_client(),
+            crate::infra::events::test_support::platform_registry(),
             &[(crate::infra::events::TOPIC, 4)],
         )
         .build()

@@ -1,8 +1,11 @@
 //! GTS documents for the Orders event contract (DESIGN §4.7): the Orders topic instance, the
-//! abstract order-event base and the eleven final event types. Orders registers them at init;
-//! Event Broker loads them from `types-registry` and the producer prepares them before
+//! abstract order-event base and the eleven final event types. They are GTS inventory entries
+//! that `types-registry` seeds at its own init, before the `init` of any gear that depends on
+//! it; Event Broker loads them from `types-registry` and the producer prepares them before
 //! readiness. The schemas are the published contract consumers validate against.
+use event_broker_sdk::gts::TopicV1;
 use serde_json::{Value, json};
+use toolkit_gts::gts_instance;
 
 use bss_orders_sdk::catalog::OrderState;
 
@@ -347,13 +350,14 @@ fn concrete() -> Vec<(&'static str, &'static str, Value)> {
     ]
 }
 
-/// The Orders topic instance (an instance of `gts.cf.core.events.topic.v1~`). Retention is the
-/// broker's configured default; the partition count is broker deployment configuration.
-pub fn topic_instance() -> Value {
-    json!({
-        "id": TOPIC,
-        "description": "Orders internal lifecycle events: platform-root tenancy, one partition stream per order (D-95, D-200).",
-    })
+// The Orders topic instance (an instance of `gts.cf.core.events.topic.v1~`). Retention is the
+// broker's configured default; the partition count is broker deployment configuration.
+gts_instance! {
+    TopicV1 {
+        id: gts_id!("cf.core.events.topic.v1~cf.bss.orders.events.v1"),
+        description: "Orders internal lifecycle events: platform-root tenancy, one partition stream per order (D-95, D-200).".to_owned(),
+        retention: None,
+    }
 }
 
 /// The abstract Orders event base: narrows `data` to the common summary. It declares no
@@ -397,9 +401,47 @@ pub fn final_types() -> Vec<Value> {
         .collect()
 }
 
-/// Every event-contract document Orders registers, base before derived types.
-pub fn documents() -> Vec<Value> {
-    let mut documents = vec![topic_instance(), abstract_base()];
-    documents.extend(final_types());
-    documents
+/// The final type `id` out of [`final_types`]. Every caller passes an `EventKind::TYPE_ID` that
+/// [`concrete`] lists; a miss yields `null`, which the registry refuses at its init.
+fn final_type(id: &str) -> Value {
+    let uri = gts_uri(id);
+    final_types()
+        .into_iter()
+        .find(|document| document["$id"] == uri.as_str())
+        .unwrap_or(Value::Null)
 }
+
+toolkit_gts::inventory::submit! {
+    toolkit_gts::InventoryTypeSchema {
+        type_id: EVENT_BASE,
+        schema_fn: || abstract_base().to_string(),
+    }
+}
+
+macro_rules! submit_final_types {
+    ($($kind:ident),+ $(,)?) => {$(
+        toolkit_gts::inventory::submit! {
+            toolkit_gts::InventoryTypeSchema {
+                type_id: <super::payload::$kind as super::payload::EventKind>::TYPE_ID,
+                schema_fn: || {
+                    final_type(<super::payload::$kind as super::payload::EventKind>::TYPE_ID)
+                        .to_string()
+                },
+            }
+        }
+    )+};
+}
+
+submit_final_types!(
+    OrderSubmitted,
+    OrderApproved,
+    OrderRejected,
+    OrderAmended,
+    OrderHeld,
+    OrderResumed,
+    OrderCancelled,
+    OrderExpired,
+    OrderCompleted,
+    OrderFulfillmentFailed,
+    OrderAcceptanceRecorded,
+);

@@ -1,10 +1,10 @@
 //! Keeps the specification cache following what `types-registry` holds.
 //!
-//! `types-registry` commits configuration-seeded entities once, during the
-//! platform's `post_init`, and offers no change feed, so the broker re-reads on
-//! a cadence instead: a topic or an event type registered after startup becomes
-//! resolvable at the next pass, without a restart. Watching for change events,
-//! and later a registration-time hook, are the two stages after this one.
+//! `types-registry` offers no change feed, so the broker re-reads on a cadence
+//! instead: a topic or an event type admitted into the registry's database
+//! after startup becomes resolvable at the next pass, without a restart.
+//! Watching for change events, and later a registration-time hook, are the two
+//! stages after this one.
 //!
 //! Driven rather than self-scheduling: the caller decides the cadence and one
 //! pass does one load, so a test forces passes instead of sleeping and hoping a
@@ -19,7 +19,7 @@ use std::time::Duration;
 
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use types_registry_sdk::TypesRegistryClient;
+use types_registry_sdk::PlatformTypesRegistryApi;
 
 use crate::config::EventBrokerConfig;
 use crate::domain::backend::BackendResolver;
@@ -48,7 +48,7 @@ pub enum ProvisioningWait {
 }
 
 pub struct SpecificationRefreshWorker {
-    client: Arc<dyn TypesRegistryClient>,
+    client: Arc<dyn PlatformTypesRegistryApi>,
     db: Arc<toolkit_db::DBProvider<toolkit_db::DbError>>,
     config: EventBrokerConfig,
     tick: Duration,
@@ -66,7 +66,7 @@ impl SpecificationRefreshWorker {
     /// database handle, the configuration resolution folds in, and a cadence.
     #[must_use]
     pub fn new(
-        client: Arc<dyn TypesRegistryClient>,
+        client: Arc<dyn PlatformTypesRegistryApi>,
         db: Arc<toolkit_db::DBProvider<toolkit_db::DbError>>,
         config: EventBrokerConfig,
         tick: Duration,

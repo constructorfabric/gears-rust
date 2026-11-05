@@ -14,13 +14,15 @@ use event_broker_sdk::{Event, PartitionRange, Position, Sequence, TopicSegment};
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
 use toolkit_gts::GtsInstanceId;
-use types_registry_sdk::testing::{MockTypesRegistryClient, make_test_instance};
+use types_registry_sdk::PlatformTypesRegistryApi;
+use types_registry_sdk::testing_platform::MockTypesRegistry;
 
 use super::{ProvisioningWait, SpecificationRefreshWorker};
 use crate::domain::specification::{ProvisioningLimits, SpecificationManager, TopicState};
 use crate::infra::specification::TypesRegistrySpecificationManager;
 use crate::test_support::SingleBackendResolver;
 use crate::test_support::StaticTypesRegistry;
+use crate::test_support::type_registry::registry_holding;
 
 const TOPIC_ID: &str = "gts.cf.core.events.topic.v1~example.eb.refresh.topic.v1";
 
@@ -60,8 +62,7 @@ async fn test_db() -> Arc<toolkit_db::DBProvider<toolkit_db::DbError>> {
 #[tokio::test]
 async fn a_topic_registered_after_the_first_pass_resolves_after_the_next_one() {
     let db = test_db().await;
-    let empty: Arc<dyn types_registry_sdk::TypesRegistryClient> =
-        Arc::new(MockTypesRegistryClient::new());
+    let empty: Arc<dyn PlatformTypesRegistryApi> = Arc::new(MockTypesRegistry::new());
     let config = StaticTypesRegistry::empty_config();
     let manager = TypesRegistrySpecificationManager::new(Arc::clone(&db));
     let topic_id = GtsInstanceId::try_new(TOPIC_ID).expect("a valid GTS instance id");
@@ -83,10 +84,7 @@ async fn a_topic_registered_after_the_first_pass_resolves_after_the_next_one() {
         "nothing was registered when the first pass ran"
     );
 
-    let registered: Arc<dyn types_registry_sdk::TypesRegistryClient> = Arc::new(
-        MockTypesRegistryClient::new()
-            .with_instances(vec![make_test_instance(TOPIC_ID, topic_document())]),
-    );
+    let registered: Arc<dyn PlatformTypesRegistryApi> = registry_holding(&[topic_document()], &[]);
     SpecificationRefreshWorker::new(registered, Arc::clone(&db), config, Duration::from_mins(1))
         .run_once()
         .await;
@@ -105,10 +103,7 @@ async fn a_topic_registered_after_the_first_pass_resolves_after_the_next_one() {
 #[tokio::test]
 async fn a_second_forced_pass_does_not_renumber_what_it_still_finds() {
     let db = test_db().await;
-    let client: Arc<dyn types_registry_sdk::TypesRegistryClient> = Arc::new(
-        MockTypesRegistryClient::new()
-            .with_instances(vec![make_test_instance(TOPIC_ID, topic_document())]),
-    );
+    let client: Arc<dyn PlatformTypesRegistryApi> = registry_holding(&[topic_document()], &[]);
     let worker = || {
         SpecificationRefreshWorker::new(
             Arc::clone(&client),
@@ -139,10 +134,7 @@ async fn a_second_forced_pass_does_not_renumber_what_it_still_finds() {
 #[tokio::test]
 async fn a_failing_pass_leaves_the_previous_load_in_place() {
     let db = test_db().await;
-    let client: Arc<dyn types_registry_sdk::TypesRegistryClient> = Arc::new(
-        MockTypesRegistryClient::new()
-            .with_instances(vec![make_test_instance(TOPIC_ID, topic_document())]),
-    );
+    let client: Arc<dyn PlatformTypesRegistryApi> = registry_holding(&[topic_document()], &[]);
     let manager = TypesRegistrySpecificationManager::new(Arc::clone(&db));
     let topic_id = GtsInstanceId::try_new(TOPIC_ID).expect("a valid GTS instance id");
 
@@ -157,8 +149,7 @@ async fn a_failing_pass_leaves_the_previous_load_in_place() {
 
     // A client that answers nothing at all, standing in for a registry that
     // has become unreachable between passes.
-    let unreachable: Arc<dyn types_registry_sdk::TypesRegistryClient> =
-        Arc::new(MockTypesRegistryClient::new());
+    let unreachable: Arc<dyn PlatformTypesRegistryApi> = Arc::new(MockTypesRegistry::new());
     SpecificationRefreshWorker::new(
         unreachable,
         Arc::clone(&db),
@@ -282,10 +273,7 @@ async fn provisioning_worker(
     TypesRegistrySpecificationManager,
 ) {
     let db = test_db().await;
-    let client: Arc<dyn types_registry_sdk::TypesRegistryClient> = Arc::new(
-        MockTypesRegistryClient::new()
-            .with_instances(vec![make_test_instance(TOPIC_ID, topic_document())]),
-    );
+    let client: Arc<dyn PlatformTypesRegistryApi> = registry_holding(&[topic_document()], &[]);
     let worker = SpecificationRefreshWorker::new(
         client,
         Arc::clone(&db),

@@ -12,7 +12,7 @@ scenarios/consumer/stream/1.08-guardrail-sse-from-stream-endpoint.md
 
 :stream serves multipart/mixed only; :sse serves text/event-stream only.
 A client that sends an incompatible Accept header receives 406 Not Acceptable
-before any subscription lookup is attempted — no subscription needs to exist.
+before any subscription lookup is attempted - no subscription needs to exist.
 """
 
 from __future__ import annotations

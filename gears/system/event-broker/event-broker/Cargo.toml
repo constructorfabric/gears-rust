@@ -52,7 +52,9 @@ workspace = true
 # `gts_id!(...)` literals.
 event-broker-sdk = { workspace = true }
 gts = { workspace = true }
-types-registry-sdk = { workspace = true }
+# `rest-client`: the resolving client `#[toolkit::consumes]` registers when no
+# in-process registry publishes the platform API.
+types-registry-sdk = { workspace = true, features = ["rest-client"] }
 
 cluster = { workspace = true }
 cluster-sdk = { workspace = true }
@@ -194,9 +196,9 @@ tracing-test = { workspace = true }
 # rather than in-process mocks.
 reqwest = { workspace = true, features = ["json", "stream"] }
 tempfile = { workspace = true }
-# `types_registry_sdk::testing::MockTypesRegistryClient` - the SDK's own
-# ready-made in-memory test double, reused rather than hand-rolled
-# (`eb-gts-type-registration`).
+# `types_registry_sdk::testing_platform::MockTypesRegistry` - the SDK's own
+# in-memory `PlatformTypesRegistryApi` test double, reused rather than
+# hand-rolled.
 types-registry-sdk = { workspace = true, features = ["test-util"] }
 # `cf-gears-standalone-cluster-plugin` moved to [dependencies] above (also
 # needed by src/bin/server.rs); regular dependencies are available to tests

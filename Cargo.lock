@@ -2150,6 +2150,7 @@ dependencies = [
  "cf-gears-types-registry-sdk",
  "futures",
  "governor",
+ "gts",
  "opentelemetry",
  "opentelemetry_sdk",
  "parking_lot",

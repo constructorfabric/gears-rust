@@ -197,14 +197,18 @@ async fn broker_exposes_registered_order_topic_and_event_type() -> TestResult {
         vec![ORDER_SUBJECT]
     );
     // The composed contract is the base event's `data` branch narrowed by this
-    // type's schema. The harness seeds a minimal stand-in base (`test_support`),
-    // so its `data` branch is just the nullable-object type; a full deployment's
-    // base additionally carries the description/default the SDK declares.
+    // type's schema. The harness registers the base the SDK declares, so the
+    // first branch is that base's own `data` member.
     assert_eq!(
         event_type.data_schema,
         json!({
             "allOf": [
-                { "type": ["object", "null"] },
+                {
+                    "additionalProperties": true,
+                    "default": null,
+                    "description": "Event payload, validated at ingest against the resolved schema of the event's type. The only field where UTF-8 (or any non-ASCII bytes) is permitted; all other event fields are ASCII per platform convention. May be absent for body-less events (e.g., notification-only events whose semantics are fully carried by `type` + `subject`).",
+                    "type": ["object", "null"],
+                },
                 order_created_schema(),
             ],
         })
