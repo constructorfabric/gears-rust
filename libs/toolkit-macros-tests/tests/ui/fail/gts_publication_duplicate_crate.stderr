@@ -1,0 +1,5 @@
+error: crate listed twice in `crates`
+ --> tests/ui/fail/gts_publication_duplicate_crate.rs:4:58
+  |
+4 | #[gear(name = "x", gts_publication(crates = [some_crate, some_crate], publisher = some::adapter))]
+  |                                                          ^^^^^^^^^^

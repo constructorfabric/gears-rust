@@ -1,4 +1,7 @@
+use std::collections::VecDeque;
+
 use parking_lot::Mutex;
+use tokio::sync::{Notify, oneshot};
 
 use crate::contracts::RegisterGrpcServiceFn;
 
@@ -13,47 +16,123 @@ pub struct GearInstallers {
 #[derive(Default)]
 pub struct GrpcInstallerData {
     pub gears: Vec<GearInstallers>,
+    /// Whether a later batch may follow ([`GrpcInstallerStore::publish_late`]):
+    /// the application group's services, installed once it has started. An
+    /// empty initial batch with more to come still needs a listener.
+    pub more_batches: bool,
 }
 
-/// Runtime-owned store for gRPC service installers.
-///
-/// This replaces the previous global static storage with a proper
-/// runtime-scoped type that gets injected into the `grpc-hub` gear.
+/// A batch of installers published after the hub started serving. The hub
+/// installs it on its running listener, then [`ack`](Self::ack)s it.
+pub struct LateBatch {
+    pub gears: Vec<GearInstallers>,
+    ack: oneshot::Sender<anyhow::Result<()>>,
+}
+
+impl LateBatch {
+    /// Report whether the batch is installed and callable.
+    pub fn ack(self, result: anyhow::Result<()>) {
+        // The publisher stopped waiting: nothing to report to.
+        drop(self.ack.send(result));
+    }
+}
+
+/// Runtime-owned gRPC installers: the hub takes system services before serving,
+/// then installs and acknowledges application services on the same listener.
+/// Each batch runs once; earlier installers are never rerun.
 pub struct GrpcInstallerStore {
-    inner: Mutex<Option<GrpcInstallerData>>,
+    inner: Mutex<Inner>,
+    late_published: Notify,
+}
+
+#[derive(Default)]
+struct Inner {
+    initial: Option<GrpcInstallerData>,
+    initial_set: bool,
+    late: VecDeque<LateBatch>,
+    closed: bool,
 }
 
 impl GrpcInstallerStore {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            inner: Mutex::new(None),
+            inner: Mutex::new(Inner::default()),
+            late_published: Notify::new(),
         }
     }
 
-    /// Set installers once. Fails if already initialized.
+    /// Set the initial batch once. Fails if already set.
     ///
     /// # Errors
-    /// Returns an error if installers have already been initialized.
+    /// Returns an error if the initial batch has already been set.
     pub fn set(&self, data: GrpcInstallerData) -> anyhow::Result<()> {
         let mut guard = self.inner.lock();
-        if guard.is_some() {
+        if guard.initial_set {
             anyhow::bail!("gRPC installers already initialized");
         }
-        *guard = Some(data);
+        guard.initial_set = true;
+        guard.initial = Some(data);
         Ok(())
     }
 
-    /// Consume and return all installers grouped by gear.
+    /// Consume and return the initial batch.
     pub fn take(&self) -> Option<GrpcInstallerData> {
-        let mut guard = self.inner.lock();
-        guard.take()
+        self.inner.lock().initial.take()
     }
 
-    /// Check if installers are present (optional helper).
+    /// Check if the initial batch is absent (optional helper).
     #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
-        self.inner.lock().is_none()
+        self.inner.lock().initial.is_none()
+    }
+
+    /// Publish a late batch for the running hub. The receiver resolves with
+    /// the hub's [`LateBatch::ack`]; it errs when the hub drops the batch
+    /// without installing it.
+    ///
+    /// # Errors
+    /// The store is closed: no more batches are accepted.
+    pub fn publish_late(
+        &self,
+        gears: Vec<GearInstallers>,
+    ) -> anyhow::Result<oneshot::Receiver<anyhow::Result<()>>> {
+        let (ack, installed) = oneshot::channel();
+        {
+            let mut guard = self.inner.lock();
+            anyhow::ensure!(!guard.closed, "gRPC installer store is closed");
+            guard.late.push_back(LateBatch { gears, ack });
+        }
+        self.late_published.notify_waiters();
+        Ok(installed)
+    }
+
+    /// The next late batch; `None` once the store is closed and drained.
+    // cancel-safe: a batch is popped and returned under the lock with no await
+    // in between, so a future dropped at its await loses no batch.
+    pub async fn next_late(&self) -> Option<LateBatch> {
+        loop {
+            let published = self.late_published.notified();
+            tokio::pin!(published);
+            published.as_mut().enable();
+            {
+                let mut guard = self.inner.lock();
+                if let Some(batch) = guard.late.pop_front() {
+                    return Some(batch);
+                }
+                if guard.closed {
+                    return None;
+                }
+            }
+            published.await;
+        }
+    }
+
+    /// No more late batches: [`next_late`](Self::next_late) ends once the
+    /// queued ones are taken.
+    pub fn close(&self) {
+        self.inner.lock().closed = true;
+        self.late_published.notify_waiters();
     }
 }
 
@@ -62,3 +141,7 @@ impl Default for GrpcInstallerStore {
         Self::new()
     }
 }
+
+#[cfg(test)]
+#[path = "grpc_installers_tests.rs"]
+mod grpc_installers_tests;

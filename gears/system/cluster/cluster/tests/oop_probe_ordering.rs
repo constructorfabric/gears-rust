@@ -60,19 +60,12 @@ use grpc_hub as _;
 /// Released by the test to let the start phase complete.
 static START_GATE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(0);
 
-/// Posted by the gate gear the instant its `start` has recorded its observation,
-/// before it blocks on [`START_GATE`]. The test acquires it to establish a
-/// happens-before with [`CLUSTER_WAS_STARTED_FIRST`]: without it the polling
-/// thread can reach the ordering assertion before the spawned lifecycle task has
-/// even reached the gate gear's `start`, reading the atomic's default `false`
-/// (the framework guarantees the *ordering* - `run_start_phase` awaits each gear
-/// in `gears_by_system_priority` order - so the only way the flag reads `false`
-/// is a test that reads it too early, which is what flaked under CI load).
+/// Posted by the gate gear in `start`, before it blocks on [`START_GATE`]. The
+/// test acquires it before reading the observation recorded in the gear's `init`.
 static GATE_REACHED_START: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(0);
 
-/// What the gate gear saw when its own `start` ran — the Profile 1 ordering
-/// observation, recorded rather than assumed (see [`StartGate`]).
-static CLUSTER_WAS_STARTED_FIRST: std::sync::atomic::AtomicBool =
+/// Whether cluster had bound its profiles before the application gear's `init`.
+static CLUSTER_WAS_STARTED_BEFORE_INIT: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
 /// A gear whose only behaviour is to make the start phase observably long.
@@ -80,28 +73,29 @@ static CLUSTER_WAS_STARTED_FIRST: std::sync::atomic::AtomicBool =
 /// It is not a stand-in for cluster — cluster's own gear starts in this same
 /// process, from this same config, and publishes its profiles before this gear is
 /// reached (cluster is `system`-tier, so the topological order puts it first).
-/// This gear exists only to keep the *phase* from finishing, so the pre-attach
+/// This gear exists only to keep the *phase* from finishing, so the mid-startup
 /// probe assertions are taken at a known point rather than a lucky one.
 /// It also carries a second observation, cheap because this gear is already in the
 /// right place to make it: **cluster's `start` runs before a non-`system` gear's
-/// `start` with no `deps` edge anywhere in this process.** Neither gear declares
-/// `deps`, and `run_start_phase` iterates `gears_by_system_priority()`
-/// (`host_runtime.rs:838`), which puts every `system`-capability gear ahead of every
-/// other one (`registry.rs:290-304`). That is what lets a consumer omit
-/// `deps = [cluster]` — which it must, because `deps` naming an unlinked gear is a
-/// hard `RegistryError::UnknownDependency` and a Profile 3 consumer links no cluster
-/// gear (`tests/consumer_wiring.rs`). The claim is load-bearing enough to measure
+/// `init` with no `deps` edge anywhere in this process.** The system group starts
+/// before application preparation. This lets a consumer omit `deps = [cluster]`,
+/// which is fatal in Profile 3 because that consumer links no cluster gear
+/// (`tests/consumer_wiring.rs`). The claim is load-bearing enough to measure
 /// rather than cite.
 #[toolkit::gear(name = "d1-start-gate", capabilities = [stateful])]
 #[derive(Default)]
-struct StartGate {
-    hub: std::sync::OnceLock<Arc<toolkit::client_hub::ClientHub>>,
-}
+struct StartGate;
 
 #[async_trait]
 impl toolkit::Gear for StartGate {
     async fn init(&self, ctx: &GearCtx) -> anyhow::Result<()> {
-        drop(self.hub.set(ctx.client_hub()));
+        let hub = ctx.client_hub();
+        // A registered client alone proves nothing: the profile becomes
+        // resolvable only after cluster's `start` has bound its backends.
+        let published = hub
+            .try_get::<dyn cluster_sdk::ClusterClient>()
+            .is_some_and(|client| client.cache_backend("orders").is_ok());
+        CLUSTER_WAS_STARTED_BEFORE_INIT.store(published, Ordering::SeqCst);
         Ok(())
     }
 }
@@ -109,23 +103,8 @@ impl toolkit::Gear for StartGate {
 #[async_trait]
 impl toolkit::contracts::RunnableCapability for StartGate {
     async fn start(&self, _cancel: CancellationToken) -> anyhow::Result<()> {
-        // Recorded before blocking: has cluster already published, even though this
-        // gear declares no dependency on it? A bound profile is the proof - the
-        // client is registered in cluster's `init`, so its mere presence would prove
-        // nothing about the *start* order, while a resolvable `orders` backend only
-        // exists after cluster's `start` published it.
-        if let Some(hub) = self.hub.get() {
-            let published = hub
-                .try_get::<dyn cluster_sdk::ClusterClient>()
-                .is_some_and(|client| client.cache_backend("orders").is_ok());
-            CLUSTER_WAS_STARTED_FIRST.store(published, std::sync::atomic::Ordering::SeqCst);
-        }
-
-        // Announce that `start` has run and the observation is recorded, so the
-        // test can read `CLUSTER_WAS_STARTED_FIRST` with a happens-before rather
-        // than racing the spawned lifecycle task to it. Posted before the block
-        // below, so the test's ordering assertion is unblocked while the phase is
-        // still held open here.
+        // Publish the init observation before blocking, so the test can read it
+        // while application startup remains held open.
         GATE_REACHED_START.add_permits(1);
 
         // Blocks until the test grants a permit. `forget` so a second start (there
@@ -381,20 +360,15 @@ async fn probes_serve_before_start_completes_and_all_four_answer_after() {
 
     let lifecycle = tokio::spawn(run_oop_serving(run, serve));
 
-    // 0. Wait until the start phase has provably reached the gate gear (and so has
-    //    already run - and awaited to completion - every earlier gear, cluster
-    //    among them, since `run_start_phase` is sequential and system-first). This
-    //    is the happens-before every "during startup" assertion below relies on:
-    //    the gate gear is now parked inside its `start`, holding the phase open, so
-    //    the probe states are a genuine mid-startup snapshot and
-    //    `CLUSTER_WAS_STARTED_FIRST` is recorded rather than still at its default.
+    // 0. Wait for application `start`: cluster has started and the init
+    //    observation is recorded; the gate holds this snapshot stable.
     tokio::time::timeout(Duration::from_secs(10), GATE_REACHED_START.acquire())
         .await
         .expect("the start phase must reach the gate gear within 10s")
         .expect("the gate-reached semaphore is never closed")
         .forget();
 
-    // 1. Liveness answers while the start phase is still blocked on the gate. This
+    // 1. Liveness answers while application `start` is still blocked on the gate. This
     //    is the criterion's "binds probes before `start`", and it is checked
     //    against a phase that provably has not returned rather than against a
     //    stopwatch.
@@ -407,51 +381,56 @@ async fn probes_serve_before_start_completes_and_all_four_answer_after() {
          test proves nothing about ordering"
     );
 
-    // 2. `/readyz` and `/health` answer too, and say `starting`: `startup_complete`
-    //    does not flip until the composed routes are published, which is after the
-    //    start phase. A pod in this state is live and out of rotation, which is
-    //    exactly ADR-0005's `Starting`.
+    // 2. The process remains Starting while the application group is held, even
+    //    though cluster's system group is already healthy.
     let readyz = await_status(addr, "/readyz", 503, Duration::from_secs(5)).await;
     assert!(
         readyz.contains("\"state\":\"starting\"") && readyz.contains("\"ready\":false"),
         "/readyz should report the framework's Starting body before start completes, got: {readyz}"
     );
-    // `/health` is the diagnostic plane and answers on the same listener. Cluster's
-    // own composite check is not in the registry yet (it is collected during router
-    // composition), so this is the framework's empty report - a 200, not a 503.
-    let health = await_status(addr, "/health", 200, Duration::from_secs(5)).await;
     assert!(
-        !health.is_empty(),
-        "/health should return a report body before start completes"
+        readyz.contains(toolkit::runtime::PREPARATION_GATE),
+        "application startup must still hold readiness, got: {readyz}"
+    );
+    // Cluster's own check is registered with the early system routes.
+    let health = await_body(
+        addr,
+        "/health",
+        200,
+        |body| body.contains("cluster"),
+        Duration::from_secs(20),
+    )
+    .await;
+    assert!(
+        health.contains("\"status\":\"healthy\""),
+        "cluster must be healthy before application startup completes, got: {health}"
     );
 
-    // 3. Gear routes and the OpenAPI document are published at attach, so before
-    //    it they are `503 starting` rather than 404 - the framework serving a
-    //    "not yet" instead of a "never".
-    let (status, _) = http_get(addr, "/openapi.json").await.expect("connects");
+    // 3. System routes and their OpenAPI document are already available.
+    let (status, body) = http_get(addr, "/openapi.json").await.expect("connects");
     assert_eq!(
-        status, 503,
-        "/openapi.json should be 503 starting until the composed routes attach"
+        status, 200,
+        "system OpenAPI must be available before application startup completes"
     );
-
-    // 4. The Profile 1 ordering fact, observed by the gate gear rather than cited:
-    //    cluster had already published its profiles by the time a non-`system`
-    //    gear's `start` ran, with no `deps` edge in this process. This is what
-    //    makes `deps = [cluster]` unnecessary - and it must be unnecessary, because
-    //    it is fatal in Profile 3 (`tests/consumer_wiring.rs`). The read is safe
-    //    because step 0 already synchronized on the gate gear having recorded it.
+    let spec: serde_json::Value = serde_json::from_str(&body).expect("OpenAPI JSON");
     assert!(
-        CLUSTER_WAS_STARTED_FIRST.load(Ordering::SeqCst),
-        "cluster's `start` must precede a non-system gear's `start` by tier alone; \
-         `gears_by_system_priority` is what orders them, not a dependency edge"
+        spec["openapi"].is_string(),
+        "the system endpoint must serve an OpenAPI document, got: {body}"
     );
 
-    // 5. Release the gate: the start phase completes, the router composes, routes
-    //    and the spec attach.
+    // 4. Cluster profiles were bound before application `init`, without `deps`.
+    //    Step 0 synchronized this read with the gate gear's observation.
+    assert!(
+        CLUSTER_WAS_STARTED_BEFORE_INIT.load(Ordering::SeqCst),
+        "cluster's system-group `start` must precede application `init`, \
+         without a dependency edge"
+    );
+
+    // 5. Release the gate: application startup completes and final routes attach.
     START_GATE.add_permits(1);
 
-    // 6. Wait for a report computed *after* router composition - identified by
-    //    cluster's own component appearing in it, not by a sleep. This is what
+    // 6. Cluster's own component must still appear with the final routes attached,
+    //    so an empty report cannot satisfy the check. This is what
     //    makes the next assertion attributable to cluster rather than to an empty
     //    registry: `compose_oop_router` collects `RestApiCapability::healthcheck`
     //    from every REST-capable gear, so `cluster` in `components` means
@@ -469,10 +448,8 @@ async fn probes_serve_before_start_completes_and_all_four_answer_after() {
         "cluster's composite check should report healthy over one standalone profile, got: {health}"
     );
 
-    // 7. `/readyz` reports 200 `ready`, and now it is cluster's composite readiness
-    //    driving it: `ClusterReadiness` reports `Starting` while the registry is at
-    //    generation 0, so a `ready` verdict means the cluster gear's `start`
-    //    published its profiles and the standalone cache probe passed (§4.4).
+    // 7. `/readyz` reports 200 `ready` only after application startup completes,
+    //    with cluster's composite readiness also passing (§4.4).
     let readyz = await_body(
         addr,
         "/readyz",

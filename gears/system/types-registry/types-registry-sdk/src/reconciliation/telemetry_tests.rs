@@ -373,9 +373,15 @@ async fn a_deadline_passes_exhaustion_and_a_read_failure_are_distinct_stops() {
     assert_eq!(row.field("dependency_id"), Some(BASE));
     drop(capture);
 
-    // Read failure.
+    // A permanent read refusal stops immediately rather than spending retry passes.
     let fake = MockTypesRegistry::new();
-    fake.inject(Fault::on(Call::BatchGet).fail(CanonicalError::internal(SENTINEL).create()));
+    fake.inject(
+        Fault::on(Call::BatchGet).fail(
+            crate::gts::TypeResource::invalid_argument()
+                .with_field_violation("publisher", SENTINEL, "VALIDATION_FAILED")
+                .create(),
+        ),
+    );
     let capture = Capture::install(LevelFilter::INFO);
     assert_eq!(
         unsettled(run(&fake, &[doc(A)], &one_pass()).await),

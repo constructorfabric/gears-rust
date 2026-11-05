@@ -1,0 +1,5 @@
+error: duplicate `crates` in `gts_publication(...)`
+ --> tests/ui/fail/gts_publication_duplicate_arg.rs:3:54
+  |
+3 | #[gear(name = "x", gts_publication(crates = [crate], crates = [crate], publisher = some::adapter))]
+  |                                                      ^^^^^^

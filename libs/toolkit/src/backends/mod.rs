@@ -90,7 +90,9 @@ pub trait OopBackend: Send + Sync {
     /// Spawn an `OoP` gear instance.
     async fn spawn(&self, config: OopSpawnConfig) -> Result<()>;
 
-    /// Shutdown all spawned instances (called during stop phase).
+    /// Stop every spawned instance and wait for it to end: the runtime calls
+    /// it when startup fails after a spawn, and at shutdown. The runtime waits
+    /// at most its shutdown deadline, then stops its in-process gears anyway.
     async fn shutdown_all(&self);
 }
 
@@ -116,9 +118,10 @@ impl OopBackend for LocalProcessBackend {
     }
 
     async fn shutdown_all(&self) {
-        // The LocalProcessBackend already handles shutdown via its cancellation token
-        // when the token is triggered, it automatically stops all instances.
-        // This method is a no-op because the backend's internal shutdown task handles it.
+        // Stops and joins every instance still tracked, now: a failed startup
+        // ends its children without cancelling the host's (possibly borrowed)
+        // token. The cancellation task stops whatever is left on shutdown.
+        self.stop_all().await;
     }
 }
 

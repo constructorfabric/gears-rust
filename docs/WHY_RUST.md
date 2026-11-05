@@ -104,7 +104,7 @@ Those benefits are not free. Rust and framework-heavy stacks have real adoption 
 
 (*) Gears middleware consists of three large layers:
 - **Toolkit** — reusable Rust libraries for API construction, data access, auth integration, observability, transport, testing, and other cross-cutting platform concerns.
-- **System Gears** — platform-level capabilities such as events, tenant and authentication resolvers, type registries, serverless/runtime support, and other shared XaaS services.
+- **Core gears** — platform-level capabilities such as events, tenant and authentication resolvers, type registries, serverless/runtime support, and other shared XaaS services.
 - **Domain Gears** — product/business capabilities such as chat, credential storage, file parsing, approval flows, and other feature-level libraries.
 
 Gears Toolkit internals can be complex because they encode reusable XaaS infrastructure. Individual Gear libraries are usually simpler: they model a concrete business capability inside established platform boundaries, with tenancy, API wiring, validation, and safety checks already provided by the stack.
@@ -488,7 +488,7 @@ Compared with Go/C# alternatives, this is not about one ecosystem being incapabl
 Gears offer a set of useful capabilities for building modern XaaS systems:
 
 - **Gear-owned migrations** — gears own their database migrations and run them as part of the runtime lifecycle, so schema ownership follows capability ownership.
-- **Cluster primitives** — the cluster system gear provides common cross-instance coordination primitives: distributed cache, leader election, distributed locks, and service discovery. Operators can bind each primitive to the right backend for the deployment (in-process, Postgres, Redis, Kubernetes, NATS, etcd), while consumers keep the same facade-style API and get startup validation when a backend cannot satisfy required guarantees.
+- **Cluster primitives** — the Cluster core gear provides common cross-instance coordination primitives: distributed cache, leader election, distributed locks, and service discovery. Operators can bind each primitive to the right backend for the deployment (in-process, Postgres, Redis, Kubernetes, NATS, etcd), while consumers keep the same facade-style API and get startup validation when a backend cannot satisfy required guarantees.
 - **Transactional outbox** — reliable async message production with per-partition ordering, transactional or leased processing modes, retry/reject semantics, and graceful cancellation.
 - **HTTP client** — `toolkit-http` provides a standard outbound HTTP client with rustls TLS, pooling, timeouts, retries with exponential backoff, User-Agent injection, fail-fast concurrency limiting, response size limits, and transparent gzip/brotli/deflate decompression. Redirects are restricted by default: the client follows only same-origin redirects (plus an optional host allowlist), blocks HTTPS-to-HTTP downgrades, and strips credential headers such as `Authorization` and `Cookie` when a redirect changes origin. It does not filter private or internal destination addresses, and it allows plain HTTP unless built with `fips` or configured with `deny_insecure_http()`.
 - **SSE streaming** — toolkit support for typed server-sent events gives gears a standard way to expose streaming APIs without inventing one-off protocols.

@@ -1,0 +1,10 @@
+error[E0425]: cannot find function `gts_declarations` in crate `::toolkit`
+ --> tests/ui/fail/gts_publication_crate_without_inventory.rs:6:1
+  |
+6 | / #[toolkit::gear(
+7 | |     name = "missing-inventory",
+8 | |     gts_publication(crates = [toolkit], publisher = publisher)
+9 | | )]
+  | |__^ not found in `::toolkit`
+  |
+  = note: this error originates in the attribute macro `toolkit::gear` (in Nightly builds, run with -Z macro-backtrace for more info)

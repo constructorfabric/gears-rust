@@ -30,6 +30,10 @@ use crate::models::{
 pub mod submit;
 use submit::{Failure, Stop, await_registration, bounded, deadline_after, jittered};
 
+mod outcome;
+pub use outcome::{Outcomes, ReconcileOutcome, ReconcilePendingCause, ReconcileStop};
+use outcome::{retryable, transport_failure};
+
 mod telemetry;
 pub use telemetry::error_fields;
 use telemetry::{Run, StopReason, operation_id_of};
@@ -54,10 +58,11 @@ pub struct ReconcileOptions {
     pub retry_backoff_max: Duration,
     /// Budget of the whole call, every pass and poll included.
     pub deadline: Duration,
-    /// End the call once a pass admits nothing new and every identifier still wanted
-    /// waits on a dependency: only another writer could store that dependency. For a
-    /// caller whose desired set is complete, so a missing dependency fails at once;
-    /// conflicts and unavailability still retry under the remaining passes.
+    /// An adapter's caller-owned deadline; never reconstructed from a remaining duration.
+    pub(crate) absolute_deadline: Option<Instant>,
+    /// Stop when a pass admits nothing and only missing dependencies remain:
+    /// progress requires another writer. Use for a complete desired set;
+    /// conflicts and unavailability still retry.
     pub stop_when_stalled: bool,
 }
 
@@ -69,15 +74,14 @@ impl Default for ReconcileOptions {
             retry_backoff: Duration::from_millis(200),
             retry_backoff_max: Duration::from_secs(5),
             deadline: Duration::from_secs(60),
+            absolute_deadline: None,
             stop_when_stalled: false,
         }
     }
 }
 
-/// The [`ReconcileOptions::deadline`] for a gear that publishes its own entities at
-/// startup — a plugin's instance, a root type — and waits for their admission before it
-/// binds anything. With several registry instances on one database an admission can wait
-/// up to a minute for another instance's outbox, so this is twice the default deadline.
+/// Startup publication budget, twice the default, to allow for cross-instance
+/// outbox scheduling on a shared database.
 pub const STARTUP_PUBLICATION_DEADLINE: Duration = Duration::from_secs(120);
 
 /// Successful reconciliation: all desired identifiers are admitted.
@@ -92,100 +96,6 @@ pub enum Reconciliation {
 mod report;
 pub use report::ReconcileReport;
 
-/// Reconciliation stop reason.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum ReconcileStop {
-    /// No identifiers remain to submit.
-    Completed,
-    /// Pass limit reached with pending identifiers.
-    PassesExhausted,
-    /// Whole-call deadline reached.
-    Deadline,
-    /// Entity read failed.
-    ReadFailed,
-    /// A permanent submission refusal; no further batches or passes run.
-    InvalidInput,
-    /// A pass admitted nothing and only dependencies remain; see
-    /// [`ReconcileOptions::stop_when_stalled`].
-    Stalled,
-}
-
-impl ReconcileStop {
-    /// Parse a wire stop label; unknown labels return `None`.
-    #[must_use]
-    pub fn from_wire(value: &str) -> Option<Self> {
-        match value {
-            "completed" => Some(Self::Completed),
-            "passes_exhausted" => Some(Self::PassesExhausted),
-            "deadline" => Some(Self::Deadline),
-            "read_failed" => Some(Self::ReadFailed),
-            "invalid_input" => Some(Self::InvalidInput),
-            "stalled" => Some(Self::Stalled),
-            _ => None,
-        }
-    }
-
-    /// Stable `reconcile_finished.stop` label.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Completed => "completed",
-            Self::PassesExhausted => "passes_exhausted",
-            Self::Deadline => "deadline",
-            Self::ReadFailed => "read_failed",
-            Self::InvalidInput => "invalid_input",
-            Self::Stalled => "stalled",
-        }
-    }
-}
-
-/// One desired identifier's outcome.
-#[derive(Debug, Clone)]
-pub enum ReconcileOutcome {
-    /// Registered, or already present with the desired content.
-    Admitted,
-    /// Terminal refusal; decode registry reasons with [`AdmissionFailure::from_canonical`].
-    Rejected(CanonicalError),
-    /// Not settled by this call.
-    Pending(ReconcilePendingCause),
-}
-
-/// Why an identifier is still pending.
-#[derive(Debug, Clone)]
-pub enum ReconcilePendingCause {
-    /// Something it depends on is not registered yet.
-    Dependency(CanonicalError),
-    /// A concurrent writer changed it; the next pass re-reads.
-    Conflict(CanonicalError),
-    /// The registry could not be reached or did not answer in time.
-    Unavailable(CanonicalError),
-    /// Call-level refusal (e.g. auth/permission); this call does not submit it again, a
-    /// later one may once its cause is fixed.
-    Refused(CanonicalError),
-    /// Unjudged after invalid input; used only when no earlier outcome is known.
-    Skipped,
-}
-
-impl ReconcilePendingCause {
-    /// Transport/availability failure maps to Unavailable; other call failures to Refused.
-    pub(crate) fn of(error: CanonicalError) -> Self {
-        if transport_failure(&error) {
-            Self::Unavailable(error)
-        } else {
-            Self::Refused(error)
-        }
-    }
-}
-
-impl ReconcileOutcome {
-    /// Whether another call could change this outcome.
-    #[must_use]
-    pub fn is_settled(&self) -> bool {
-        !matches!(self, Self::Pending(_))
-    }
-}
-
 /// Reconcile desired documents, tracing the call and each submitted batch.
 pub async fn reconcile<'d, A, I>(
     api: &A,
@@ -199,9 +109,28 @@ where
     A: PlatformTypesRegistryApi + ?Sized,
     I: IntoIterator<Item = &'d (GtsId, JsonDocument)>,
 {
+    reconcile_with_progress(api, ctx, publisher, desired, options, cancel, |_| {}).await
+}
+
+/// The same reconciliation, with a snapshot before each retrying pass.
+pub async fn reconcile_with_progress<'d, A, I>(
+    api: &A,
+    ctx: &PlatformSecurityContext,
+    publisher: &PublisherContext,
+    desired: I,
+    options: &ReconcileOptions,
+    cancel: &CancellationToken,
+    on_pending: impl FnMut(&ReconcileReport) + Send,
+) -> Result<Reconciliation, CanonicalError>
+where
+    A: PlatformTypesRegistryApi + ?Sized,
+    I: IntoIterator<Item = &'d (GtsId, JsonDocument)>,
+{
     // The whole-call budget starts now, before any preparation.
     let started = Instant::now();
-    let deadline = deadline_after(started, options.deadline);
+    let deadline = options
+        .absolute_deadline
+        .map_or_else(|| deadline_after(started, options.deadline), Ok);
     let span = tracing::info_span!(
         "reconcile",
         reconcile_id = %Uuid::new_v4(),
@@ -220,7 +149,7 @@ where
         wanted,
         outcomes,
     };
-    run(api, ctx, publisher, cancel, options, prepared)
+    run(api, ctx, publisher, cancel, options, prepared, on_pending)
         .instrument(span)
         .await
 }
@@ -240,6 +169,7 @@ async fn run<A: PlatformTypesRegistryApi + ?Sized>(
     cancel: &CancellationToken,
     options: &ReconcileOptions,
     prepared: Prepared<'_>,
+    mut on_pending: impl FnMut(&ReconcileReport) + Send,
 ) -> Result<Reconciliation, CanonicalError> {
     // The guard reports the call's end, whichever way it ends, dropped included.
     let desired = prepared.wanted.len() + prepared.outcomes.len();
@@ -280,6 +210,17 @@ async fn run<A: PlatformTypesRegistryApi + ?Sized>(
             && only_dependencies(&wanted, &run.outcomes)
         {
             end = PassEnd::Stop(ReconcileStop::Stalled);
+        }
+        if matches!(end, PassEnd::Next) {
+            let report = ReconcileReport {
+                stop: ReconcileStop::Retrying,
+                outcomes: run.outcomes.values().cloned().collect(),
+            };
+            if !report.is_transient() {
+                end = PassEnd::Stop(ReconcileStop::Rejected);
+            } else if pass < options.passes.get() && Instant::now() < deadline {
+                on_pending(&report);
+            }
         }
         // Each later pause doubles, up to the maximum.
         if pass > 1 {
@@ -331,7 +272,11 @@ fn stopped_between_passes(stopped: Stop, wanted: &Wanted<'_>, run: &mut Run) -> 
         Stop::Cancelled => PassEnd::Cancelled,
         Stop::Deadline(_) => {
             let cause = ReconcilePendingCause::Unavailable(stopped.into_error());
-            mark_unsettled(wanted, &mut run.outcomes, &cause);
+            for (key, (id, _)) in wanted {
+                run.outcomes
+                    .entry(key.clone())
+                    .or_insert_with(|| (id.clone(), ReconcileOutcome::Pending(cause.clone())));
+            }
             PassEnd::Stop(ReconcileStop::Deadline)
         }
     }
@@ -475,9 +420,6 @@ fn record(
 /// Desired documents not yet settled, by canonical identifier: submission order is stable.
 type Wanted<'d> = BTreeMap<String, (GtsId, &'d JsonDocument)>;
 
-/// Outcomes so far, by canonical identifier.
-pub type Outcomes = BTreeMap<String, (GtsId, ReconcileOutcome)>;
-
 struct Current {
     content: JsonDocument,
     resource_version: u64,
@@ -552,8 +494,15 @@ impl<A: PlatformTypesRegistryApi + ?Sized> Call<'_, A> {
                 return PassEnd::Stop(ReconcileStop::Deadline);
             }
             Ok(Err(e)) => {
+                let retry = transport_failure(&e)
+                    && !matches!(&e, CanonicalError::Aborted { ctx, .. }
+                        if ctx.reason == crate::reason::aborted::RECONCILIATION_PROTOCOL_ERROR);
                 mark_unsettled(wanted, &mut run.outcomes, &ReconcilePendingCause::of(e));
-                return PassEnd::Stop(ReconcileStop::ReadFailed);
+                return if retry {
+                    PassEnd::Next
+                } else {
+                    PassEnd::Stop(ReconcileStop::ReadFailed)
+                };
             }
         };
         let candidates = compare(wanted, &mut run.outcomes, &current);
@@ -945,26 +894,6 @@ fn cover(
             (candidate.gts_id.clone(), outcome)
         })
         .collect()
-}
-
-/// Transport/registry availability failures retain [`ReconcilePendingCause::Unavailable`].
-fn transport_failure(error: &CanonicalError) -> bool {
-    retryable(error)
-        || matches!(
-            error,
-            CanonicalError::DeadlineExceeded { .. } | CanonicalError::ResourceExhausted { .. }
-        )
-}
-
-/// Transport failures worth repeating under the same key and request.
-fn retryable(error: &CanonicalError) -> bool {
-    matches!(
-        error,
-        CanonicalError::Aborted { .. }
-            | CanonicalError::ServiceUnavailable { .. }
-            | CanonicalError::Internal { .. }
-            | CanonicalError::Unknown { .. }
-    )
 }
 
 /// Classify candidate outcomes by admission-failure reason.

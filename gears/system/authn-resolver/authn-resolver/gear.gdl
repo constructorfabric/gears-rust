@@ -4,7 +4,7 @@ gdl_version = "1.0"
 #
 # Gearbox product metadata for the authn-resolver gear.
 #
-# Projected from #[toolkit::gear]: id, runtime_caps (system), colocated_deps
+# Projected from #[toolkit::gear]: id, runtime_caps (none), colocated_deps
 # (types-registry).
 
 gear(

@@ -164,9 +164,31 @@ pub(super) async fn presence_loop(
     heartbeat_interval: Duration,
     cancel: CancellationToken,
 ) {
+    let (_no_updates, updates) = tokio::sync::watch::channel(info);
+    presence_loop_with_updates(directory, updates, heartbeat_interval, cancel).await;
+}
+
+/// A registration in flight beside the heartbeats.
+type RegistrationFuture =
+    std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send>>;
+
+/// [`presence_loop`] with replaceable registration info (e.g. updated `OpenAPI`).
+/// Updates register immediately alongside heartbeats and replace any update in
+/// flight. Periodic registration and heartbeat self-heal wait for that attempt;
+/// if it fails, periodic registration retries with the latest info.
+pub(super) async fn presence_loop_with_updates(
+    directory: Arc<dyn DirectoryClient>,
+    mut updates: tokio::sync::watch::Receiver<RegisterInstanceInfo>,
+    heartbeat_interval: Duration,
+    cancel: CancellationToken,
+) {
+    let mut info = updates.borrow_and_update().clone();
     if !register_once_with_backoff(&directory, &info, &cancel).await {
         return;
     }
+    // An update sent during the first registration is picked up below.
+    let mut updates_open = true;
+    let mut refresh: Option<RegistrationFuture> = None;
 
     // `tokio::time::interval` panics on a zero period; clamp defensively.
     let heartbeat_interval = heartbeat_interval.max(Duration::from_secs(1));
@@ -181,6 +203,35 @@ pub(super) async fn presence_loop(
     loop {
         tokio::select! {
             () = cancel.cancelled() => return,
+            changed = updates.changed(), if updates_open => {
+                if changed.is_err() {
+                    // No more updates: keep presence with the current info.
+                    updates_open = false;
+                    continue;
+                }
+                info = updates.borrow_and_update().clone();
+                let directory = Arc::clone(&directory);
+                let update = info.clone();
+                refresh = Some(Box::pin(async move { directory.register_instance(update).await }));
+            }
+            registered = async {
+                match refresh.as_mut() {
+                    Some(in_flight) => in_flight.await,
+                    None => std::future::pending().await,
+                }
+            },
+                if refresh.is_some() =>
+            {
+                refresh = None;
+                if let Err(e) = registered {
+                    tracing::warn!(
+                        gear = %info.gear,
+                        instance = %info.instance_id,
+                        error = %e,
+                        "updated registration failed; the periodic re-registration retries it"
+                    );
+                }
+            }
             _ = heartbeat.tick() => {
                 if let Err(e) = directory.send_heartbeat(&info.gear, &info.instance_id).await {
                     tracing::warn!(
@@ -189,14 +240,17 @@ pub(super) async fn presence_loop(
                         error = %e,
                         "heartbeat failed; re-registering to self-heal"
                     );
-                    if !register_once_with_backoff(&directory, &info, &cancel).await {
+                    // A refresh in flight registers the latest info already.
+                    if refresh.is_none()
+                        && !register_once_with_backoff(&directory, &info, &cancel).await
+                    {
                         return;
                     }
                 } else {
                     tracing::trace!(gear = %info.gear, "heartbeat sent");
                 }
             }
-            _ = reregister.tick() => {
+            _ = reregister.tick(), if refresh.is_none() => {
                 if !register_once_with_backoff(&directory, &info, &cancel).await {
                     return;
                 }

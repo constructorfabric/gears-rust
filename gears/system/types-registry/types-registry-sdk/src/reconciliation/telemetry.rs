@@ -4,7 +4,7 @@
 use toolkit_canonical_errors::{CanonicalError, InvalidArgument};
 use uuid::Uuid;
 
-use super::{Outcomes, ReconcileOutcome, ReconcilePendingCause, ReconcileStop};
+use super::outcome::{Outcomes, ReconcileOutcome, ReconcilePendingCause, ReconcileStop};
 use crate::gts::OPERATION_RESOURCE_TYPE;
 use crate::item_failure::{AdmissionFailure, context};
 
@@ -157,6 +157,8 @@ pub enum StopReason {
     ReadFailed,
     InvalidInput,
     Stalled,
+    Rejected,
+    Retrying,
     Cancelled,
     InvalidDeadline,
 }
@@ -170,6 +172,8 @@ impl From<ReconcileStop> for StopReason {
             ReconcileStop::ReadFailed => Self::ReadFailed,
             ReconcileStop::InvalidInput => Self::InvalidInput,
             ReconcileStop::Stalled => Self::Stalled,
+            ReconcileStop::Rejected => Self::Rejected,
+            ReconcileStop::Retrying => Self::Retrying,
         }
     }
 }
@@ -184,6 +188,8 @@ impl StopReason {
             Self::ReadFailed => "read_failed",
             Self::InvalidInput => "invalid_input",
             Self::Stalled => "stalled",
+            Self::Rejected => "rejected",
+            Self::Retrying => "retrying",
             Self::Cancelled => "cancelled",
             Self::InvalidDeadline => "invalid_deadline",
         }

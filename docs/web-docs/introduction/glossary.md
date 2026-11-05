@@ -21,6 +21,9 @@ A quick reference for the terms used across these docs.
 
 - **Gear** — a vertically-sliced, self-contained unit of capability with a public contract, lifecycle, and optional API.
 - **Toolkit** — the reusable low-level substrate (`libs/`) every gear builds on.
+- **Core gear** — any gear under `gears/system/`, including its plugins. The directory may be renamed to `gears/core/` in the future.
+- **System gear group** — gears declaring the `system` capability; starts before application preparation. Currently Types Registry, Service Discovery, Cluster and gRPC Hub.
+- **Application gear group** — all gears without the `system` capability, including the other core gears and business gears.
 - **Contract / SDK** — the stable public interface (a transport-agnostic trait plus models and errors) that other gears or apps depend on.
 - **Implementation** — the API, business logic, and infrastructure behind a contract.
 - **Application** — what assembles multiple gears into one runnable system.
@@ -40,7 +43,7 @@ A quick reference for the terms used across these docs.
 ## Type system
 
 - **GTS (Global Type System)** — a system for versioned, globally identified, schema-validated type definitions and instances; the basis of Gears' extension model.
-- **Types Registry** — the system gear that stores GTS schemas and instances for discovery.
+- **Types Registry** — the core gear in the system gear group that stores GTS schemas and instances for discovery.
 
 ## Tooling
 

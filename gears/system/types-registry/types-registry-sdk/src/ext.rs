@@ -54,10 +54,10 @@ use crate::models::{
     ListEntitiesRequest, ListEntitiesResponse, Projection, PublisherContext, ReadOptions,
     TypeSchema,
 };
-use crate::reconcile::{ReconcileOptions, Reconciliation, reconcile};
+use crate::reconciliation::{ReconcileOptions, Reconciliation, reconcile};
 
 pub use crate::models::MAX_BATCH_GET_KEYS;
-pub use crate::reconcile::submit::{POLL_INTERVAL_INITIAL, POLL_INTERVAL_MAX};
+pub use crate::reconciliation::submit::{POLL_INTERVAL_INITIAL, POLL_INTERVAL_MAX};
 
 /// Page limit preventing endless traversal and unbounded accumulation.
 pub const MAX_LIST_PAGES: usize = 1_000;
@@ -80,7 +80,9 @@ pub trait PlatformTypesRegistryApiExt: PlatformTypesRegistryApi {
     /// unattributed refusals stay pending.
     /// Unjudged entities keep earlier outcomes or become
     /// [`Skipped`](crate::ReconcilePendingCause::Skipped). Admission and polling failures
-    /// do not stop remaining batches.
+    /// do not stop remaining batches. Transient entity-read failures retry within the
+    /// same pass limit and deadline. A terminal item rejection stops further passes
+    /// after the current pass's batches, retaining all observed outcomes.
     ///
     /// Accepted writes are never rolled back, including on cancellation or drop.
     /// Use `cancel` and `options.deadline` rather than an outer timeout.

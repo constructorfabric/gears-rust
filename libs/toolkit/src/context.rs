@@ -26,6 +26,8 @@ pub struct GearCtx {
     client_hub: Arc<crate::client_hub::ClientHub>,
     cancellation_token: CancellationToken,
     internal_token_provider: Option<InternalTokenProvider>,
+    /// This gear's admitted GTS manifest; see [`GearCtx::gts_publication_manifest`].
+    gts_publication_manifest: Option<Arc<crate::gts_publication::GtsManifest>>,
     #[cfg(feature = "db")]
     db: Option<DbProvider>,
 }
@@ -41,6 +43,9 @@ pub struct GearContextBuilder {
     client_hub: Arc<crate::client_hub::ClientHub>,
     root_token: CancellationToken,
     internal_token_provider: Option<InternalTokenProvider>,
+    /// Admitted manifests by gear, filled once the application group's
+    /// publication is admitted and before any application `init`.
+    gts_publication_manifests: GtsAdmittedManifests,
     #[cfg(feature = "db")]
     db_manager: Option<Arc<DbManager>>, // internal only, never exposed to gears
 }
@@ -58,6 +63,7 @@ impl GearContextBuilder {
             client_hub,
             root_token,
             internal_token_provider: None,
+            gts_publication_manifests: GtsAdmittedManifests::default(),
             #[cfg(feature = "db")]
             db_manager: None,
         }
@@ -68,6 +74,13 @@ impl GearContextBuilder {
     pub fn with_internal_token_provider(mut self, provider: Option<InternalTokenProvider>) -> Self {
         self.internal_token_provider = provider;
         self
+    }
+
+    /// The store the runtime fills with each gear's admitted manifest; every
+    /// context built afterwards reads its gear's manifest from it.
+    #[must_use]
+    pub(crate) fn gts_admitted_manifests(&self) -> GtsAdmittedManifests {
+        self.gts_publication_manifests.clone()
     }
 
     /// Attach a `DbManager` used by [`for_gear`](Self::for_gear) to resolve
@@ -92,6 +105,20 @@ impl GearContextBuilder {
         self.internal_token_provider.as_ref()
     }
 
+    /// Build the context of a gear's `pre_init`: like [`for_gear`](Self::for_gear),
+    /// but with no database handle and no admitted GTS manifest, since the
+    /// gear's group is neither migrated nor published yet.
+    pub(crate) fn for_gear_before_migrations(&self, gear_name: &str) -> GearCtx {
+        GearCtx::new(
+            Arc::<str>::from(gear_name),
+            self.instance_id,
+            self.config_provider.clone(),
+            self.client_hub.clone(),
+            self.root_token.child_token(),
+        )
+        .with_internal_token_provider(self.internal_token_provider.clone())
+    }
+
     /// Build a gear-scoped context, resolving the `DbHandle` for the given
     /// gear when the `db` feature is enabled.
     ///
@@ -111,6 +138,10 @@ impl GearContextBuilder {
             self.root_token.child_token(),
         )
         .with_internal_token_provider(self.internal_token_provider.clone());
+        let ctx = match self.gts_publication_manifests.get(gear_name) {
+            Some(manifest) => ctx.with_gts_publication_manifest(manifest),
+            None => ctx,
+        };
         #[cfg(feature = "db")]
         let ctx = if let Some(mgr) = &self.db_manager
             && let Some(handle) = mgr.get(gear_name).await?
@@ -120,6 +151,33 @@ impl GearContextBuilder {
             ctx
         };
         Ok(ctx)
+    }
+}
+
+/// Each gear's admitted GTS manifest, by gear name. Written once by the
+/// runtime when the application group's publication is admitted; the
+/// manifests are never rebuilt from the configuration afterwards.
+#[derive(Clone, Default)]
+pub(crate) struct GtsAdmittedManifests(
+    Arc<
+        parking_lot::RwLock<
+            std::collections::HashMap<String, Arc<crate::gts_publication::GtsManifest>>,
+        >,
+    >,
+);
+
+impl GtsAdmittedManifests {
+    /// Record `manifest` as admitted for its publisher gear.
+    pub(crate) fn insert(&self, manifest: Arc<crate::gts_publication::GtsManifest>) {
+        self.0
+            .write()
+            .insert(manifest.publisher_name().to_owned(), manifest);
+    }
+
+    /// The admitted manifest of `gear`, if any.
+    #[must_use]
+    fn get(&self, gear: &str) -> Option<Arc<crate::gts_publication::GtsManifest>> {
+        self.0.read().get(gear).cloned()
     }
 }
 
@@ -147,6 +205,7 @@ impl GearCtx {
             config_provider,
             cancellation_token,
             internal_token_provider: None,
+            gts_publication_manifest: None,
             #[cfg(feature = "db")]
             db: None,
         }
@@ -183,6 +242,34 @@ impl GearCtx {
     #[must_use]
     pub fn internal_token_provider(&self) -> Option<InternalTokenProvider> {
         self.internal_token_provider.clone()
+    }
+
+    /// Attach this gear's admitted GTS manifest: the runtime's, after the barrier.
+    pub(crate) fn with_gts_publication_manifest(
+        mut self,
+        manifest: Arc<crate::gts_publication::GtsManifest>,
+    ) -> Self {
+        self.gts_publication_manifest = Some(manifest);
+        self
+    }
+
+    /// The documents of this gear's `gts_publication(...)`, admitted before `init`.
+    /// Plugins bind scoped clients to its instances. This is the published manifest,
+    /// never rebuilt from configuration.
+    ///
+    /// # Errors
+    /// No `gts_publication(...)` declaration, or no admitted manifest in this context
+    /// (e.g. during `pre_init` or outside the runtime).
+    pub fn gts_publication_manifest(
+        &self,
+    ) -> anyhow::Result<Arc<crate::gts_publication::GtsManifest>> {
+        self.gts_publication_manifest.clone().ok_or_else(|| {
+            anyhow::anyhow!(
+                "gear '{}' has no admitted GTS manifest: it declares no `gts_publication(...)`, or the \
+                 runtime did not publish it",
+                self.gear_name
+            )
+        })
     }
 
     /// Attach the per-gear database entrypoint.
@@ -400,6 +487,7 @@ impl GearCtx {
             client_hub: self.client_hub.clone(),
             cancellation_token: self.cancellation_token.clone(),
             internal_token_provider: self.internal_token_provider.clone(),
+            gts_publication_manifest: self.gts_publication_manifest.clone(),
             #[cfg(feature = "db")]
             db: None,
         }
@@ -511,6 +599,42 @@ mod tests {
 
         let config = result.unwrap();
         assert_eq!(config, TestConfig::default());
+    }
+
+    /// The `pre_init` context carries neither the database handle nor the
+    /// admitted GTS manifest that the later contexts of the same gear carry.
+    #[tokio::test]
+    async fn the_context_before_migrations_has_no_database_and_no_admitted_manifest() {
+        let builder = GearContextBuilder::new(
+            Uuid::new_v4(),
+            Arc::new(MockConfigProvider::new()),
+            Arc::new(crate::client_hub::ClientHub::default()),
+            CancellationToken::new(),
+        );
+        #[cfg(feature = "db")]
+        let (builder, _dir) = {
+            let dir = tempfile::TempDir::new().unwrap();
+            let dsn = format!("sqlite://{}", dir.path().join("gear.db").display());
+            let figment = figment::Figment::new().merge(figment::providers::Serialized::defaults(
+                json!({ "gears": { "test_gear": { "database": { "dsn": dsn } } } }),
+            ));
+            let manager = DbManager::from_figment(figment, dir.path().to_path_buf()).unwrap();
+            (builder.with_db_manager(Arc::new(manager)), dir)
+        };
+        builder.gts_admitted_manifests().insert(Arc::new(
+            crate::gts_publication::GtsManifest::build("test_gear", "1.0.0", Vec::new()).unwrap(),
+        ));
+
+        let later = builder.for_gear("test_gear").await.unwrap();
+        assert!(later.gts_publication_manifest().is_ok());
+        #[cfg(feature = "db")]
+        assert!(later.db().is_some());
+
+        let early = builder.for_gear_before_migrations("test_gear");
+        assert!(early.gts_publication_manifest().is_err());
+        #[cfg(feature = "db")]
+        assert!(early.db().is_none());
+        assert_eq!(early.gear_name(), "test_gear");
     }
 
     #[tokio::test]

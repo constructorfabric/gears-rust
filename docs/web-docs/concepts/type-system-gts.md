@@ -36,5 +36,5 @@ This is what lets vendors extend the domain model without forking the framework,
 
 ## See also
 
-- [Types Registry](../../capabilities/system-gears/) — the system gear that stores GTS schemas.
+- [Types Registry](../../capabilities/core-gears/) — the core gear in the system gear group that stores GTS schemas.
 - [GTS reference](https://github.com/GlobalTypeSystem/gts-rust) — the type-system specification.

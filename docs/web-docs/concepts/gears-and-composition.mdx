@@ -28,7 +28,7 @@ Gears are organized into exactly three tiers, with a one-way dependency directio
 Service gears   (gears/)          business capabilities
       │  depend on
       ▼
-System gears    (gears/system/)   control plane: gateway, authn/authz, tenancy, …
+Core gears      (gears/system/)   control plane: gateway, authn/authz, tenancy, …
       │  depend on
       ▼
 Toolkit         (libs/)           runtime substrate: REST, DB, security, observability
@@ -36,10 +36,16 @@ Toolkit         (libs/)           runtime substrate: REST, DB, security, observa
 
 - **Toolkit** (`libs/`) — the low-level substrate: API middleware, DB access, error
   definitions, transport, security primitives, observability, and macros.
-- **System gears** (`gears/system/`) — the control plane (API gateway, authn/authz
+- **Core gears** (`gears/system/`) — the control plane (API gateway, authn/authz
   resolvers, tenant resolver, type registry, …). They are ordinary gears, so they can be
   replaced.
 - **Service gears** (`gears/`) — your business capabilities, built on the platform.
+
+Core gears include every gear and plugin under `gears/system/`; the directory may be
+renamed to `gears/core/` in the future. Startup groups are selected by capability:
+the **system gear group** contains gears declaring `system`, while every other gear
+belongs to the **application gear group**. See
+[the system capability](../runtime-and-lifecycle/#the-system-capability).
 
 Adding a gear never requires editing a central switchboard — dependency ordering is a
 platform guarantee, not an application convention.

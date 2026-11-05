@@ -26,8 +26,12 @@
 //! gear's crate — the inventory is process-global, so entries land in
 //! `types-registry` regardless of which crate declares them.
 //!
+//! A crate whose gear publishes its own declarations declares a collector of
+//! its own and uses the [`local`] macros instead; see that module.
+//!
 //! [Global Type System]: https://github.com/hypernetix/gts-spec
 
+pub mod local;
 pub mod permission;
 pub mod plugin;
 

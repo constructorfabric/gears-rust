@@ -1,7 +1,7 @@
 //! The gear against the real types-registry gear, in the platform's phase
 //! order: every `init` runs while the registry is still in configuration
 //! mode (type lookups answer "not found"), and the registry turns ready in
-//! its `post_init`, before the policy engine's.
+//! its legacy finalization, before the policy engine's `post_init`.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 mod common;
@@ -83,7 +83,7 @@ async fn a_builtin_over_a_concrete_type_starts_and_is_checked_once_the_registry_
     let client = hub.get::<dyn TypesRegistryClient>().unwrap();
     assert!(
         client.get_type_schema(KNOWN_TYPE).await.is_err(),
-        "before its post_init the registry answers no type lookup"
+        "before legacy finalization the registry answers no type lookup"
     );
     let ctx = gear_ctx_over(&builtin_over(KNOWN_TYPE), Arc::clone(&hub)).await;
     let engine = PolicyEngine::default();
@@ -92,9 +92,12 @@ async fn a_builtin_over_a_concrete_type_starts_and_is_checked_once_the_registry_
         .await
         .expect("init must not ask the registry before it is ready");
 
-    registry.post_init(&system()).await.expect("registry ready");
+    registry
+        .legacy_finalize_after_application_init(&system())
+        .await
+        .expect("registry ready");
     engine
-        .post_init(&system())
+        .post_init(&ctx)
         .await
         .expect("the concrete type is known");
 }
@@ -111,8 +114,11 @@ async fn a_builtin_over_an_unknown_concrete_type_fails_startup_in_post_init() {
     let engine = PolicyEngine::default();
     engine.init(&ctx).await.expect("init");
 
-    registry.post_init(&system()).await.expect("registry ready");
-    let err = engine.post_init(&system()).await.expect_err("unknown type");
+    registry
+        .legacy_finalize_after_application_init(&system())
+        .await
+        .expect("registry ready");
+    let err = engine.post_init(&ctx).await.expect_err("unknown type");
     let message = format!("{err:#}");
     assert!(
         message.contains("built-in policies rejected") && message.contains("RESOURCE_TYPE_UNKNOWN"),

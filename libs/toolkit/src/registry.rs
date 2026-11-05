@@ -25,6 +25,7 @@ pub enum Capability {
     System(Arc<dyn contracts::SystemCapability>),
     GrpcHub(Arc<dyn contracts::GrpcHubCapability>),
     GrpcService(Arc<dyn contracts::GrpcServiceCapability>),
+    GtsPublication(Arc<dyn crate::gts_publication::GtsPublicationCapability>),
 }
 
 impl std::fmt::Debug for Capability {
@@ -38,6 +39,9 @@ impl std::fmt::Debug for Capability {
             Capability::System(_) => write!(f, "System(<impl SystemCapability>)"),
             Capability::GrpcHub(_) => write!(f, "GrpcHub(<impl GrpcHubCapability>)"),
             Capability::GrpcService(_) => write!(f, "GrpcService(<impl GrpcServiceCapability>)"),
+            Capability::GtsPublication(_) => {
+                write!(f, "GtsPublication(<impl GtsPublicationCapability>)")
+            }
         }
     }
 }
@@ -134,6 +138,18 @@ impl CapTag for GrpcServiceCap {
     }
 }
 
+/// Tag for querying `GtsPublicationCapability`.
+pub struct GtsPublicationCap;
+impl CapTag for GtsPublicationCap {
+    type Out = dyn crate::gts_publication::GtsPublicationCapability;
+    fn try_get(cap: &Capability) -> Option<&Arc<Self::Out>> {
+        match cap {
+            Capability::GtsPublication(v) => Some(v),
+            _ => None,
+        }
+    }
+}
+
 /// A set of capabilities that a gear provides.
 #[derive(Clone)]
 pub struct CapabilitySet {
@@ -186,6 +202,7 @@ impl CapabilitySet {
                 Capability::System(_) => "system",
                 Capability::GrpcHub(_) => "grpc_hub",
                 Capability::GrpcService(_) => "grpc",
+                Capability::GtsPublication(_) => "gts_publication",
             })
             .collect()
     }
@@ -239,6 +256,13 @@ impl GearEntry {
     pub fn caps(&self) -> &CapabilitySet {
         &self.caps
     }
+
+    /// Whether this gear has the `system` capability, and so belongs to the
+    /// system group that starts before the application group is prepared.
+    #[must_use]
+    pub fn is_system(&self) -> bool {
+        self.caps.has::<SystemCap>()
+    }
 }
 
 impl std::fmt::Debug for GearEntry {
@@ -285,26 +309,6 @@ impl GearRegistry {
     #[must_use]
     pub fn gears(&self) -> &[GearEntry] {
         &self.gears
-    }
-
-    /// Returns gears ordered by system priority.
-    /// System gears come first, followed by non-system gears.
-    /// Within each group, the original topological order is preserved.
-    #[must_use]
-    pub fn gears_by_system_priority(&self) -> Vec<&GearEntry> {
-        let mut system_mods = Vec::new();
-        let mut non_system_mods = Vec::new();
-
-        for entry in &self.gears {
-            if entry.caps.has::<SystemCap>() {
-                system_mods.push(entry);
-            } else {
-                non_system_mods.push(entry);
-            }
-        }
-
-        system_mods.extend(non_system_mods);
-        system_mods
     }
 
     /// Discover via inventory, have registrators fill the builder, then build & topo-sort.
@@ -424,6 +428,17 @@ impl RegistryBuilder {
             .entry(name)
             .or_default()
             .push(Capability::System(m));
+    }
+
+    pub fn register_gts_publication_with_meta(
+        &mut self,
+        name: &'static str,
+        m: Arc<dyn crate::gts_publication::GtsPublicationCapability>,
+    ) {
+        self.capabilities
+            .entry(name)
+            .or_default()
+            .push(Capability::GtsPublication(m));
     }
 
     pub fn register_grpc_hub_with_meta(
@@ -551,6 +566,32 @@ impl RegistryBuilder {
         Ok(())
     }
 
+    /// A system gear runs before the application group is prepared, so it
+    /// cannot depend on an application gear.
+    fn validate_system_deps(&self) -> Result<(), RegistryError> {
+        let is_system = |name: &str| {
+            self.capabilities
+                .get(name)
+                .is_some_and(|caps| caps.iter().any(|cap| matches!(cap, Capability::System(_))))
+        };
+        let mut names: Vec<_> = self.deps.keys().copied().collect();
+        names.sort_unstable();
+        for gear in names {
+            if !is_system(gear) {
+                continue;
+            }
+            for dep in self.deps[gear] {
+                if self.core.contains_key(dep) && !is_system(dep) {
+                    return Err(RegistryError::SystemDependsOnApplication {
+                        gear: gear.to_owned(),
+                        depends_on: (*dep).to_owned(),
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Build dependency graph and return gear names, adjacency list, and index mapping.
     fn build_dependency_graph(&self) -> Result<DependencyGraph, RegistryError> {
         let names: Vec<&'static str> = self.core.keys().copied().collect();
@@ -643,6 +684,7 @@ impl RegistryBuilder {
 
         // 2) Build dependency graph
         let (names, adj, _idx) = self.build_dependency_graph()?;
+        self.validate_system_deps()?;
 
         // 3) Cycle detection using DFS with path tracking
         if let Some(cycle_path) = Self::detect_cycle_with_path(&names, &adj) {
@@ -727,6 +769,28 @@ pub enum RegistryError {
         #[source]
         source: anyhow::Error,
     },
+    #[error("GTS publication setup failed for gear '{gear}'")]
+    Publication {
+        gear: &'static str,
+        #[source]
+        source: anyhow::Error,
+    },
+    /// Two publishing gears declare one GTS id; the source names both.
+    #[error("GTS publication setup failed: a GTS id has two publishers")]
+    GtsOwnership {
+        #[source]
+        source: anyhow::Error,
+    },
+    /// A GTS publication of the application group failed (refused or expired):
+    /// no application gear initialized. Returned after the system group, which
+    /// keeps serving, is shut down.
+    #[error(
+        "the application group did not start: {}",
+        .failures.iter().map(|e| format!("{e:#}")).collect::<Vec<_>>().join("; ")
+    )]
+    ApplicationGroupNotStarted {
+        failures: Vec<crate::gts_publication::GtsPublicationError>,
+    },
     #[error("start failed for '{gear}'")]
     Start {
         gear: &'static str,
@@ -806,6 +870,11 @@ pub enum RegistryError {
     UnknownGear(String),
     #[error("gear '{gear}' depends on unknown '{depends_on}'")]
     UnknownDependency { gear: String, depends_on: String },
+    #[error(
+        "system gear '{gear}' depends on application gear '{depends_on}'; \
+         the system group starts before the application group is prepared"
+    )]
+    SystemDependsOnApplication { gear: String, depends_on: String },
     #[error("cyclic dependency detected: {}", path.join(" -> "))]
     CycleDetected { path: Vec<&'static str> },
     #[error("missing deps for '{0}'")]

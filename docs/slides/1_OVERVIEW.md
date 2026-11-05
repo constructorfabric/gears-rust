@@ -45,7 +45,7 @@ Constructor Gears is a **secure, modular XaaS development framework and middlewa
 
 - **Toolkit libraries** for reusable platform building blocks — OData, canonical
   errors, secure DB ORM, API middleware, security, and more
-- **System gears** for platform and control-plane capabilities — events, API
+- **Core gears** for platform and control-plane capabilities — events, API
   gateway, auth, tenant resolution, registries, and outbound integration
 - **Domain gears** for business capabilities — GenAI, OSS, and BSS services with
   ready-to-use public APIs
@@ -87,7 +87,7 @@ Constructor Gears deliberately does **not**:
 
 1. **Secure by default (defense-in-depth)** — security is structural, not opt-in, validated at build time.
 2. **Architecture enforced at compile time** - use custom lint rules via `cargo gears lint`
-3. **Three-tier gears hierarchy** — toolkit, System gears, Service gears.
+3. **Three-tier gears hierarchy** — toolkit, Core gears, Service gears.
 4. **Composable libraries, vendor-controlled deployment** — own API + DB, SDK facades local vs. remote.
 5. **Local-first shift-left development** - run and test everything locally, LLM-friendly
 6. **Pre-integrated XaaS backbone** — tenancy, licensing, quota, usage, events — all replaceable via plugins.
@@ -154,7 +154,7 @@ Repository-specific architecture lints (via `cargo gears lint`) make the design 
 | Tier | Path | Role |
 |------|------|------|
 | **Toolkit** | `libs/` | Low-level substrate: API middleware, DB access, errors, transport, security, observability, macros |
-| **System gears** | `gears/system/` | Control plane: API gateway, authn/authz, tenancy, events, resource groups, type registry |
+| **Core gears** | `gears/system/` | Control plane: API gateway, authn/authz, tenancy, events, resource groups, type registry |
 | **Service gears** | `gears/` | Business/domain: serverless runtime, GenAI subsystems, chat, file parser |
 
 All tiers follow the **same** Toolkit patterns, SDK conventions, and security model.
@@ -348,7 +348,7 @@ The **logical model stays identical** regardless of the physical boundary.
 
 Constructor Gears favors **explicit, reproducible composition** over opaque runtime magic.
 
-- **Core system gears** are linked into the host binary and discovered via `inventory`
+- **Core gears** are linked into the host binary and discovered via `inventory`
 - **Optional gears/plugins** are included by Cargo feature flags such as
   `mini-chat`, `static-authn`, `static-authz`, `static-credstore`
 - **Feature flags decide what code is present**; runtime config decides which vendor,
@@ -369,8 +369,8 @@ pre_init → DB migration → init → post_init(barrier)
         → REST wiring → gRPC wiring → start → ... → stop
 ```
 
-- System gears run first where required
-- `post_init` begins only after **all** `init` hooks complete
+- The system gear group (gears with the `system` capability) completes first, then the application gear group
+- `post_init` begins only after **all** `init` hooks of its group complete
 - Shutdown runs in **reverse dependency order** with a graceful-stop deadline
 - **Cancellation tokens** propagate so background work cooperates with shutdown
 

@@ -1,0 +1,5 @@
+error: unknown attribute parameter
+ --> tests/ui/fail/stage_removed.rs:4:20
+  |
+4 | #[gear(name = "x", stage = application)]
+  |                    ^^^^^^^^^^^^^^^^^^^
