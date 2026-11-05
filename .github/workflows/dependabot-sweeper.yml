@@ -48,13 +48,7 @@ on:
       - .github/scripts/test_dependabot_sweeper.py
       - .github/workflows/dependabot-sweeper.yml
 
-permissions:
-  contents: read
-  # Dry-run reads PRs and their checks with GITHUB_TOKEN; writes use the App token.
-  pull-requests: read
-  checks: read
-  actions: read  # workflow runs for the head SHA
-  statuses: read  # statusCheckRollup includes commit statuses
+permissions: {}
 
 concurrency:
   # PR test runs get their own group: a pending run in a shared group would cancel a pending sweep.
@@ -85,6 +79,13 @@ jobs:
       !((inputs.live == true || vars.DEPENDABOT_SWEEPER_MODE == 'live') && vars.DEPS_BOT_APP_ID != '')
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    # Dry-run reads PRs and their checks with GITHUB_TOKEN; it never writes.
+    permissions:
+      contents: read
+      pull-requests: read
+      checks: read
+      actions: read  # workflow runs for the head SHA
+      statuses: read  # statusCheckRollup includes commit statuses
     steps:
       # Default branch only: never check out or run PR code.
       - name: Checkout default branch
@@ -107,6 +108,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     environment: deps-bot
+    # Writes use the App token minted below; GITHUB_TOKEN only needs to check out the repo.
+    permissions:
+      contents: read
     steps:
       # Default branch only: never check out or run PR code.
       - name: Checkout default branch
