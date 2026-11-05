@@ -175,3 +175,5 @@ serial_test = { workspace = true }
 toolkit-db = { workspace = true, features = ["sqlite"] }
 tracing-subscriber = { workspace = true }
 tracing-test = { workspace = true, features = ["no-env-filter"] }
+# Drives the outbound InternalAuthInterceptor in the OoP bootstrap tests.
+tonic = { workspace = true }

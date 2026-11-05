@@ -199,6 +199,38 @@ impl RestApiCapability for TestAuthGear {
     }
 }
 
+/// An enabled reverse proxy whose kube `internal_auth` has no `present` block
+/// could never authenticate its `DirectoryService` polls. It must fail `init`,
+/// before the gateway reports ready, rather than start with the proxy off.
+#[tokio::test]
+async fn init_rejects_enabled_proxy_without_outbound_credential() {
+    let config = json!({
+        "api-gateway": {
+            "config": {
+                "bind_addr": "0.0.0.0:8080",
+                "auth_disabled": true,
+                "gateway_proxy": {
+                    "enabled": true,
+                    "directory_endpoint": "http://127.0.0.1:50051"
+                },
+                "internal_auth": {
+                    "provider": "kube",
+                    "verify": { "audiences": ["toolkit-internal"] }
+                }
+            }
+        }
+    });
+
+    let err = api_gateway::ApiGateway::default()
+        .init(&create_api_gateway_ctx(config))
+        .await
+        .expect_err("init must refuse a proxy with no outbound credential");
+    assert!(
+        err.to_string().contains("internal_auth.present.token_path"),
+        "the error must point at the missing block: {err:#}"
+    );
+}
+
 #[tokio::test]
 async fn test_auth_disabled_mode() {
     // Create api-gateway with auth disabled

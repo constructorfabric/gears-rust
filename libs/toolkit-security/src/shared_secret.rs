@@ -73,6 +73,22 @@ pub enum InvalidSharedSecret {
     RedactedPlaceholder,
 }
 
+/// Check that `secret` is usable as a shared platform-plane secret, on either
+/// side: the inbound validator ([`SharedSecretInternalAuthenticator::try_new`])
+/// and the outbound credential that attaches it.
+///
+/// # Errors
+///
+/// Returns [`InvalidSharedSecret`] if the secret is empty or is the
+/// [`REDACTED_PLACEHOLDER`].
+pub fn validate_shared_secret(secret: &SecretString) -> Result<(), InvalidSharedSecret> {
+    match secret.expose_secret() {
+        "" => Err(InvalidSharedSecret::Empty),
+        REDACTED_PLACEHOLDER => Err(InvalidSharedSecret::RedactedPlaceholder),
+        _ => Ok(()),
+    }
+}
+
 impl SharedSecretInternalAuthenticator {
     /// Build an authenticator that accepts exactly `secret` and resolves valid
     /// callers to [`PlatformIdentity::Shared`] with the label `peer_name`.
@@ -85,11 +101,8 @@ impl SharedSecretInternalAuthenticator {
     /// an empty secret matches an empty token — so anyone sending the internal
     /// header with no value would authenticate as `peer_name`.
     pub fn try_new(secret: SecretString, peer_name: String) -> Result<Self, InvalidSharedSecret> {
-        match secret.expose_secret() {
-            "" => Err(InvalidSharedSecret::Empty),
-            REDACTED_PLACEHOLDER => Err(InvalidSharedSecret::RedactedPlaceholder),
-            _ => Ok(Self { secret, peer_name }),
-        }
+        validate_shared_secret(&secret)?;
+        Ok(Self { secret, peer_name })
     }
 }
 
@@ -142,6 +155,23 @@ mod tests {
             )
             .unwrap_err(),
             InvalidSharedSecret::RedactedPlaceholder
+        );
+    }
+
+    #[test]
+    fn validate_shared_secret_applies_the_same_rules_standalone() {
+        // The outbound side runs this without building an authenticator.
+        assert_eq!(
+            validate_shared_secret(&SecretString::from("")),
+            Err(InvalidSharedSecret::Empty)
+        );
+        assert_eq!(
+            validate_shared_secret(&SecretString::from(REDACTED_PLACEHOLDER)),
+            Err(InvalidSharedSecret::RedactedPlaceholder)
+        );
+        assert_eq!(
+            validate_shared_secret(&SecretString::from("real-secret")),
+            Ok(())
         );
     }
 

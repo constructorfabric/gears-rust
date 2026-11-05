@@ -12,8 +12,8 @@ pub mod windows_named_pipe;
 pub use windows_named_pipe::{NamedPipeConnection, NamedPipeIncoming, create_named_pipe_incoming};
 
 pub use internal_auth::{
-    InternalAuthInterceptor, attach_internal_token_grpc, build_internal_auth_interceptor,
-    extract_internal_token_grpc,
+    InternalAuthInterceptor, OutboundCredentialError, OutboundCredentialSource,
+    attach_internal_token_grpc, build_outbound_interceptor, extract_internal_token_grpc,
 };
 pub use internal_auth_server::{
     DEFAULT_EXEMPT_PREFIXES, InternalAuthEnforcement, InternalAuthGrpcLayer,

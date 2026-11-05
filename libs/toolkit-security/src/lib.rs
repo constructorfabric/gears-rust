@@ -87,10 +87,12 @@ pub use internal_auth_cache::{
 };
 pub use internal_auth_config::{
     BuiltAuthenticator, DEFAULT_INTERNAL_PEER_NAME, InternalAuthConfig, InvalidInternalAuth,
+    KubePresent, KubeVerify,
 };
 pub use route_auth::RouteAuth;
 pub use shared_secret::{
     InvalidSharedSecret, REDACTED_PLACEHOLDER, SharedSecretInternalAuthenticator,
+    validate_shared_secret,
 };
 
 pub use bin_codec::{
