@@ -250,9 +250,10 @@ async fn a_legacy_only_registry_serves_only_legacy_and_is_not_discovered() {
             .is_none()
     );
     assert!(hub.try_get_local::<dyn TypesRegistryApi>().is_none());
+    let consumer_hub = hub.for_gear(CONSUMER);
     assert!(
-        hub.has_remote_proxy::<dyn PlatformTypesRegistryApi>()
-            && hub.has_remote_proxy::<dyn TypesRegistryApi>(),
+        consumer_hub.has_remote_proxy::<dyn PlatformTypesRegistryApi>()
+            && consumer_hub.has_remote_proxy::<dyn TypesRegistryApi>(),
         "the consumer's resolving clients are wired"
     );
     // The legacy client keeps serving the legacy catalogue.
