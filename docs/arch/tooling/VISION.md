@@ -61,10 +61,10 @@ This document uses these terms with one meaning each.
 | **reference** | Upstream keeps the file. The repository holds only a pin. An upgrade changes the pin and nothing else, because the content is not here to change. |
 | **generate** | Upstream supplies a rule, not a file. The tool derives the content, and it can derive the same content again at any time. An upgrade runs the rule again. |
 | **copy** | Upstream supplies the file itself. The tool cannot derive the content. An upgrade replaces the whole file with a newer version from upstream. |
-| **managed file** | A file that the tool generated or copied, and still owns. A person does not edit it; a project that needs different content declares an exception, and the tool stops managing that file. Everything else in the repository is project-owned, and the tool does not write it. |
+| **managed file** | A file that the tool generated or copied, and still owns. A person does not edit it; a project that needs different content declares an exception, and the tool stops managing that file. The split is about ownership, not authorship: everything else is project-owned, and setup may write a project-owned file once as a starting point without managing it afterwards. |
 | **profile** | A named preset of conventions. A convenient starting selection, not a separate product. |
 | **bot** | An automation that runs the tool without attention and then delivers the result, usually as a pull request. The integrating project selects it and runs it. |
-| **update wiring** | The files in a repository that let a bot drive the tool: the scheduled job, the pull-request check, and the updater configuration for the pins. |
+| **update wiring** | The files in a repository that let a bot drive the tool: the scheduled job, the pull-request check, and the updater configuration for the pins. Setup writes them once; they are project-owned, carry no pin, and are never managed. |
 | **drift** | The repository no longer agrees with the conventions it declared, at the versions it pinned. A pin that upstream has moved past is not drift. |
 
 Reference, generate and copy are an order of preference, best first. A reference leaves no copy to
@@ -108,7 +108,8 @@ repository and keep any of it.
 
 ## 3. How far they are covered today
 
-No problem in section 2 is untouched. Five mechanisms cover parts of them: `cargo gears`, the shared
+Eight of the nine problems in section 2 are touched by something; P6 is not. Five mechanisms cover
+parts of them: `cargo gears`, the shared
 make rules in `.gears-dna/gears.mk`, Constructor Studio (`cfs`) with the `studio-kit-gears` kit,
 Gearbox with GDL, and PR #5326, open on the date above. Each has a different owner, a different
 release cycle and a different manifest, and each stops at a different place.
@@ -160,9 +161,9 @@ that work changes `gears-rust` before it changes any new project.
 
 A maintainer starts a gear repository. They pick a profile and adjust it: document-first development
 yes, FIPS no. Setup writes the layout, the build and CI wiring, the lint and toolchain
-configuration, the Studio setup and the update wiring, with a pin for each convention. The report
-ends by naming the two tools missing from their machine. Nothing is hidden: the selection is a file
-in the repository, and so is every pin.
+configuration and the Studio setup, with a pin for each convention, and hands over a working update
+wiring that the project owns from then on. The report ends by naming the two tools missing from
+their machine. Nothing is hidden: the selection is a file in the repository, and so is every pin.
 
 A week later a developer adds a gear and runs the check before pushing. The crate is there, but the
 DESIGN document and the descriptor the declared conventions call for are not — the parts a new gear
@@ -197,8 +198,13 @@ That is scaffolding, not a separate responsibility.
 And it installs the update wiring, because delivery belongs to the integrator and a new project
 would otherwise start with no automation at all. The wiring is what lets a bot drive the tool: it
 puts the update on a schedule, runs the check on every change, and tells the updater the project
-already uses about the new pins. It is a working default, not an example in a README — and the
-project owns it from the first day, free to change the schedule, the bot, or remove it.
+already uses about the new pins. It is a working default, not an example in a README.
+
+Setup writes that wiring once and hands it over. It is project-owned from the first day — no pin, no
+management, and the project is free to change the schedule, change the bot, or remove it. That is
+the one thing setup writes and does not keep: everything else it installs stays managed and pinned.
+The cost is deliberate, and section 9 names it as a risk: wiring a project removed is wiring that
+delivers nothing.
 
 ### Conformance validation
 
@@ -323,7 +329,7 @@ Each promise is bounded by what the tool actually controls.
 
 | | It promises | It does not promise |
 |---|---|---|
-| **Setup** | The selected conventions and their wiring are in place, each with a pin, and anything missing is named | A green build. That needs tools installed, services configured and code written |
+| **Setup** | Every selected convention is installed and pinned, a working update wiring is handed over, and anything missing is named | A green build. That needs tools installed, services configured and code written |
 | **Validation** | A truthful answer within its footprint, with the five states above kept apart and every gap in its own knowledge visible | That the repository is good — only that it is, or is not, what the project said it would be |
 | **Update** | Pins and managed files move reproducibly; an upgrade it cannot apply is reported as not applied, with the reason | That every upstream change applies by itself, or that anything delivers it |
 
