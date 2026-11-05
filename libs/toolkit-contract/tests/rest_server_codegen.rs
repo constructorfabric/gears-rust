@@ -101,6 +101,12 @@ pub trait PairApi: Send + Sync {
 
     #[idempotency(SafeRead)]
     async fn probe(&self, ctx: SecurityContext) -> Result<PairResponse, PairError>;
+
+    #[idempotency(SafeRead)]
+    async fn list_probes(&self, ctx: SecurityContext) -> Result<Vec<PairResponse>, PairError>;
+
+    #[idempotency(SafeRead)]
+    async fn ping(&self, ctx: SecurityContext) -> Result<(), PairError>;
 }
 
 #[rest_contract(base_path = "/api/pair/v1")]
@@ -129,6 +135,14 @@ pub trait PairApiRest: PairApi {
     #[exposed]
     #[anonymous]
     async fn probe(&self, ctx: SecurityContext) -> Result<PairResponse, PairError>;
+
+    // `Vec<T>` Ok type: exercises the array-aware response builder.
+    #[get("/probes")]
+    async fn list_probes(&self, ctx: SecurityContext) -> Result<Vec<PairResponse>, PairError>;
+
+    // Unit Ok type: exercises the schema-less `.json_response(..)` branch.
+    #[get("/ping")]
+    async fn ping(&self, ctx: SecurityContext) -> Result<(), PairError>;
 }
 
 /// Echoes each path segment back under the name the handler bound it to, so a
@@ -166,6 +180,14 @@ impl PairApi for PairService {
             tenant: "probe".to_owned(),
             order: "probe".to_owned(),
         })
+    }
+
+    async fn list_probes(&self, _ctx: SecurityContext) -> Result<Vec<PairResponse>, PairError> {
+        Ok(Vec::new())
+    }
+
+    async fn ping(&self, _ctx: SecurityContext) -> Result<(), PairError> {
+        Ok(())
     }
 }
 
@@ -442,4 +464,41 @@ async fn openapi_lists_path_params_in_url_order() {
         .collect();
 
     assert_eq!(names, vec!["tenant_id", "order_id"]);
+}
+
+/// `OpenAPI` 3.1 requires `description` on every Response object, and utoipa 6
+/// drops an empty one when serializing. Each of the macro's three response
+/// branches (plain schema, `Vec<T>` array, unit) must therefore register a
+/// non-empty description.
+#[tokio::test]
+async fn every_generated_response_has_a_non_empty_description() {
+    let (_, spec) = start_generated_server().await;
+
+    for (path, item) in spec["paths"].as_object().expect("paths must be an object") {
+        for (method, operation) in item.as_object().expect("path item must be an object") {
+            let Some(responses) = operation.get("responses").and_then(|r| r.as_object()) else {
+                continue;
+            };
+            for (status, response) in responses {
+                assert!(
+                    response["description"]
+                        .as_str()
+                        .is_some_and(|d| !d.is_empty()),
+                    "{method} {path} response {status} must have a non-empty description"
+                );
+            }
+        }
+    }
+
+    // Pin each macro branch explicitly.
+    for (path, branch) in [
+        ("/api/pair/v1/probe", "plain schema"),
+        ("/api/pair/v1/probes", "Vec<T> array"),
+        ("/api/pair/v1/ping", "unit"),
+    ] {
+        assert_eq!(
+            spec["paths"][path]["get"]["responses"]["200"]["description"], "OK",
+            "{branch} branch ({path}) must describe its 200 response as `OK`"
+        );
+    }
 }

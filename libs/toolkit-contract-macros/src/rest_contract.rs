@@ -1556,6 +1556,10 @@ fn generate_method_route(method: &RestMethodModel, model: &RestContractModel) ->
     // `Ok` type (`Result<(), E>`) has no schema and is not a `ResponseApiDto`,
     // so it uses the schema-less `.json_response(..)` — matching the generated
     // handler, which wraps the unit value in `Json(())` (200 + `null` body).
+    // The 200 description must be non-empty: OpenAPI 3.1 requires `description`
+    // on every Response object and utoipa 6 omits empty strings when
+    // serializing, which would leave the response invalid; hence "OK".
+    // (Path-param and request-body descriptions are optional, so their `""` stays.)
     let response_registration = match &method.result_types {
         Some((ok_ty, _)) if !is_unit_type(ok_ty) => {
             // A `Vec<T>` Ok type must register the ITEM, not the vector:
