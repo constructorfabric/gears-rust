@@ -237,7 +237,7 @@ Orders Workflow marks its contract `p1`, but its multi-party, escalation, and in
 
 - [ ] `p3` - **ID**: `cpt-cf-approval-service-upreq-bss-library-parity`
 
-Before it can replace `cf-gears-bss-approval`, the future gear **MUST** support multi-item approval units, exclusion of the submitter and every item author, quorum fixed at submission, re-vote after business-content drift, and a feed for the BSS Approvals Inbox (`ApprovalSourceV1`).
+Before it can replace `cf-gears-bss-approval`, the future gear **MUST** support multi-item approval units, exclusion of the requester and every item author, quorum fixed at submission, re-vote after business-content drift, and a feed for the BSS Approvals Inbox (`ApprovalSourceV1`).
 
 - **Rationale**: Pricing and Products decide approval units inside their own transactions today; replacement is future scope.
 - **Source**: `gears/bss/libs/approval/README.md`; `cpt-cf-bss-approvals-fr-one-inbox`

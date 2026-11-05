@@ -397,14 +397,14 @@ After every committed change that can alter verdicts (decision, rule, policy, au
 
 - [ ] `p1` - **ID**: `cpt-cf-approval-service-fr-submit-decision`
 
-The system **MUST** let any user who holds the approve permission for the opportunity in the scope tenant, as decided by the PDP for that opportunity and projection, record an `approve` or `deny` decision for (opportunity, projection, subject). A decision **MAY** reference the open request for that (opportunity, projection, subject), which binds an approve to the request's context fingerprint. An approve without a request (a standing approval) **MUST** be rejected unless the opportunity allows standing approvals; a deny never needs a request. An approve decision counts toward every applicable policy that has no approver list or lists its actor.
+The system **MUST** let any user who holds the approve permission for the opportunity in the scope tenant, as decided by the PDP for that opportunity and projection, record an `approve` or `deny` decision for (opportunity, projection, subject). A decision **MAY** reference the open request for that (opportunity, projection, subject), which binds an approve to the request's context fingerprint. An approve without a request (a standing approval) **MUST** be rejected unless the opportunity allows standing approvals; a deny never needs a request. An approve decision counts toward every applicable policy that has no approver list or lists its approver.
 
 The scope tenant of a decision **MUST** follow the opportunity's decision authority:
 
 - **Subject tenant** (default): the subject tenant or one of its ancestors.
 - **Resource tenant** (owner-only): for approve decisions, the resource tenant or one of its ancestors only, and only when the resource tenant is the subject tenant or one of its ancestors; otherwise approval cannot be granted (cross-branch sharing is future scope). Deny decisions remain possible at the subject tenant or its ancestors, because restricting is always allowed within a tenant's own scope.
 
-Every decision **MUST** record the actor, the scope tenant, the time, and a mandatory reason.
+Every decision **MUST** record the approver, the scope tenant, the time, and a mandatory reason.
 
 Decisions **MUST** follow this lifecycle:
 
@@ -418,7 +418,7 @@ Decisions **MUST** follow this lifecycle:
 
 Only `active` decisions apply. At most one `active` decision **MUST** exist per approver and (opportunity, projection, subject, scope tenant). An approver **MUST** only supersede their own decision; another approver's deny **MUST** be revoked before it stops applying. Between approvers, any applicable active deny wins over any number of approvals. Every transition **MUST** trigger reconciliation of affected open requests (`cpt-cf-approval-service-fr-request-reconciliation`); a later verification with the register option opens a new request.
 
-The system **MUST** reject a decision whose actor is the subject or the requester.
+The system **MUST** reject a decision whose approver is the subject or the requester.
 
 - **Rationale**: Who may approve is an authorization question, answered by the PDP per opportunity, so business approvers need no special role in this service. Owner-only authority lets a resource owner, such as the tenant that owns a shared model, keep approval of inherited resources to itself.
 - **Actors**: `cpt-cf-approval-service-actor-approver`, `cpt-cf-approval-service-actor-admin`
@@ -464,7 +464,7 @@ Verification **MUST** return one of these outcomes, each with a machine-readable
 | `invalid` | `false` | Unknown opportunity, an unaccepted projection or subject type, or invalid context attributes. |
 | `unavailable` | `false` | The verdict cannot be established reliably (fail closed). |
 
-Every verdict **MUST** identify what produced it: the rule (with layer and scope tenant), the auto-approval rule, or the decisions (with actor and time), and for `pending` the open request and its unmet policy requirements. Every `approved` and `not_required` verdict **MUST** carry an approval lease (`cpt-cf-approval-service-fr-approval-lease`). Every verdict **MUST** carry a version that increases monotonically whenever a change affecting it is committed, so callers can reject results older than one they have seen.
+Every verdict **MUST** identify what produced it: the rule (with layer and scope tenant), the auto-approval rule, or the decisions (with approver and time), and for `pending` the open request and its unmet policy requirements. Every `approved` and `not_required` verdict **MUST** carry an approval lease (`cpt-cf-approval-service-fr-approval-lease`). Every verdict **MUST** carry a version that increases monotonically whenever a change affecting it is committed, so callers can reject results older than one they have seen.
 
 - **Rationale**: Verification is the only runtime integration point for gears and must be explainable to administrators, approvers, and users.
 - **Actors**: `cpt-cf-approval-service-actor-integrated-gear`, `cpt-cf-approval-service-actor-requester`
@@ -568,7 +568,7 @@ The check permission **MUST NOT** imply the approve permission. Registration, re
 
 - [ ] `p1` - **ID**: `cpt-cf-approval-service-fr-audit-trail`
 
-The system **MUST** record every registration, rule, policy, and auto-approval change, decision, revocation, automatic approval, and request change in an append-only audit trail with actor, scope tenant, previous and new state, reason where required, and time.
+The system **MUST** record every registration, rule, policy, and auto-approval change, decision, revocation, automatic approval, and request change in an append-only audit trail with the identity that made the change, scope tenant, previous and new state, reason where required, and time.
 
 - **Rationale**: Compliance and support need a complete history of who governed what and why.
 - **Actors**: `cpt-cf-approval-service-actor-admin`
@@ -606,7 +606,7 @@ The system **MUST** let the requester or the gear that opened a request escalate
 
 The system **MUST** let holders of the approve permission record decisions on a subject group from the Group Source. Gears **MUST** keep sending individual subjects and **MUST NOT** pass group information in verification calls. Verification **MUST** treat a decision on any group containing the subject as applicable. An applicable deny for the subject or any of its groups **MUST** win over any approve.
 
-The separation-of-duties check **MUST** reject a group decision whose actor is a member of the group.
+The separation-of-duties check **MUST** reject a group decision whose approver is a member of the group.
 
 - **Rationale**: Administrators approve teams at once while gears stay unaware of groups.
 - **Actors**: `cpt-cf-approval-service-actor-admin`, `cpt-cf-approval-service-actor-group-source`
@@ -624,7 +624,7 @@ The system **MUST** let an approver or administrator set an expiry time on a dec
 
 - [ ] `p2` - **ID**: `cpt-cf-approval-service-fr-access-review`
 
-The system **MUST** report the active approve decisions within a tenant scope with their age, actor, reason, and expiry.
+The system **MUST** report the active approve decisions within a tenant scope with their age, approver, reason, and expiry.
 
 - **Rationale**: SOX, ISO 27001, and SOC 2 expect standing access to be reviewed periodically.
 - **Actors**: `cpt-cf-approval-service-actor-admin`
@@ -968,7 +968,7 @@ Context attributes and justifications **MUST** be tenant-scoped, readable only b
 - [ ] Every request closure, whatever its cause, publishes a request event in the subject tenant and the requester's tenant, and the requester and the opening gear can read the outcome by request ID.
 - [ ] A caller correlation ID is echoed in verdicts and request events, and decision-produced verdicts carry the decision reasons.
 - [ ] Decisions and runtime governance changes without a reason are rejected.
-- [ ] A decision whose actor is the subject or the requester is rejected.
+- [ ] A decision whose approver is the subject or the requester is rejected.
 - [ ] A request closes when its verdict is no longer `pending`.
 - [ ] After a broad rule or policy change, every affected open request whose verdict is no longer `pending` is closed within the reconciliation bound, while verification without the register option writes nothing.
 - [ ] After a policy change, recorded approvals stay active and count toward the current policies; a relaxation closes affected open requests as `approved`.
