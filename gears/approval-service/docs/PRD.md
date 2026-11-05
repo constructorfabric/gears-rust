@@ -176,8 +176,8 @@ The service **MUST NOT** perform, orchestrate, or wait for the protected operati
 ### 4.1 In Scope
 
 - **p1**: opportunity registration with mandatory default action, mandatory standing approval setting, context attributes, and decision authority; resource projections; subjects; layered firewall-style rules; separate check and approve permissions; live approval policies with minimum approvals, mandatory approvers, and narrowed approver lists; decisions with mandatory reason and separation of duties; approval requests raised by verification, bound to context fingerprints; request reconciliation; synchronous explainable verification and batch verification; correlation ID and decision reasons in verdicts; approval leases; SDK with bounded cache; tenant hierarchy; administrator browsing and approver inbox; bulk decisions; audit trail; durable change and request events.
-- **p2**: auto-approval rules; conditional policies; staged policies; group approvers; policy snapshot per request; subject-type selectors on rules; request escalation; decisions on behalf of an approver; subject group decisions; decision expiry; access review report.
-- **p3**: periodic recertification campaigns; delegable (overridable) ancestor rules.
+- **p2**: auto-approval rules; conditional policies; staged policies; group approvers; policy snapshot per request; subject-type selectors on rules; request escalation; decisions on behalf of an approver; subject group decisions; decision expiry; access review report; governance versions with drafts, comparison, and rollback.
+- **p3**: periodic recertification campaigns; delegable (overridable) ancestor rules; second-administrator review of governance changes; trial mode and previews of governance changes.
 
 ### 4.2 Out of Scope
 
@@ -197,7 +197,7 @@ Candidates without a committed priority:
 
 - Replacing `cf-gears-bss-approval` (`cpt-cf-approval-service-upreq-bss-library-parity`), after assessing multi-item approval units, exclusion of all item authors, and the BSS Approvals Inbox feed.
 - A decision covering all versions of a resource.
-- Rule hygiene: warnings for shadowed or redundant rules, and simulation of a proposed rule, policy, or auto-approval change.
+- Rule hygiene: warnings for shadowed or redundant rules.
 - Break-glass: time-limited, audited emergency bypass with alerting.
 - Audit export to a SIEM.
 - Per-tenant quotas on projections and requests.
@@ -302,6 +302,26 @@ In p1, policies are live: verification and open requests **MUST** use the curren
 - **Rationale**: Purchase orders, pull requests, and production changes need four-eyes approval and mandatory sign-off, such as a finance lead or a repository owner. Live policies keep p1 simple: an open request gets the same verdict as a new one.
 - **Actors**: `cpt-cf-approval-service-actor-admin`, `cpt-cf-approval-service-actor-platform-vendor`
 - **Covers**: `cpt-cf-approval-service-upreq-multi-party-gates`
+
+#### Governance Versions and Rollback
+
+- [ ] `p2` - **ID**: `cpt-cf-approval-service-fr-governance-versions`
+
+The system **MUST** keep every change to runtime rules and policies as a new version of that rule or policy, with the author, the time, the reason, and the identity that put it into effect. Administrators **MUST** be able to save a change as a draft, validate it with every error listed at once, and put it into effect separately; a draft **MUST NOT** affect verdicts. A version put into effect **MUST** apply from the next verification, without restart. Administrators **MUST** be able to compare two versions and to roll back to an earlier version in one action, recorded as a new version. A change based on an outdated version **MUST** be rejected. Rules and policies **MUST** be declarative data, so that an administration UI can edit them in forms and show them back in the same form.
+
+(p3) A tenant **MAY** require that a change is put into effect only after a second administrator approves it; until then the current version stays in effect.
+
+- **Rationale**: Administrators change governance while requests are in flight; they need to test changes before they matter, see who changed what and why, and undo a bad change at once.
+- **Actors**: `cpt-cf-approval-service-actor-admin`, `cpt-cf-approval-service-actor-platform-vendor`
+
+#### Trial Mode and Preview of Governance Changes
+
+- [ ] `p3` - **ID**: `cpt-cf-approval-service-fr-governance-trial`
+
+The system **MUST** let administrators evaluate a draft rule or policy against sample facts without any effect. The system **MUST** let a rule or policy run in trial mode on real verifications: its would-be outcome **MUST** be reported to administrators, separately from real verdicts, and **MUST NOT** change any verdict, open a request, or appear as a refusal. Switching from trial mode to enforced **MUST** take effect from the next verification.
+
+- **Rationale**: A new restriction can block a whole tenant; administrators need to see its effect on real traffic before it applies.
+- **Actors**: `cpt-cf-approval-service-actor-admin`
 
 #### Group Approvers
 
@@ -984,6 +1004,8 @@ Context attributes and justifications **MUST** be tenant-scoped, readable only b
 - [ ] Verification sustains 1,000 calls/s from 8 parallel clients with 1,000,000 approval decisions stored, on PostgreSQL and on MariaDB.
 - [ ] Verification returns `unavailable` with `mayProceed = false` when a dependency fails.
 - [ ] Every governance change commits atomically with its audit record and durable event record, and its event reaches the Event Broker at least once after commit.
+- [ ] (p2) A rule or policy change saved as a draft does not affect verdicts; a version put into effect applies from the next verification; a rollback restores the earlier behaviour in one action and appears in the history.
+- [ ] (p3) A rule or policy in trial mode never changes a verdict, and its would-be outcome is reported to administrators.
 - [ ] (p2) An auto-approval never overrides a `deny` rule or a deny decision, and never satisfies a policy of an ancestor of its scope tenant.
 - [ ] (p2) Policy changes do not alter the policies fixed for an open request.
 - [ ] (p2) In a staged policy, an approval counts toward a stage only after the previous stage is satisfied.
