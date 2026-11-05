@@ -168,7 +168,7 @@ Realises `cpt-cf-quota-enforcement-seq-quota-create`.
 7. [x] - `p1` - **IF** the reduced or newly numeric cap is strictly below the active period's consumed amount (consumption type) or the in-flight count (allocation type) - `inst-qup-guard-if`
    1. [x] - `p1` - **RETURN** `CAP_BELOW_CONSUMED` (`DomainError::CapBelowConsumed`); the operator first issues credits, then reduces the cap - `inst-qup-guard`
 8. [x] - `p1` - Enqueue `quota-changed (change_kind='updated')` in the same transaction (I11) - `inst-qup-event`
-9. [x] - `p1` - **RETURN** success; the SDK path is `QuotaManagerApi::update_quota(id, patch)` returning `()` - `inst-qup-return`
+9. [x] - `p1` - **RETURN** success; the SDK path is `QuotaManagerApi::update_quota(req)` with `UpdateQuotaRequest { quota_id, patch }`, returning `()` - `inst-qup-return`
 
 ### Quota Deactivation Cascade
 

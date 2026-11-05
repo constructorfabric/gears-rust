@@ -82,7 +82,7 @@ applies the foundation admission and tenant-isolation machinery unchanged.
 
 - **PRD**: [PRD.md](../PRD.md) (§5.10 Quota Snapshot Read API, §1.4 glossary "Quota Snapshot",
   §5.12 tenant isolation)
-- **Design**: [DESIGN.md](../DESIGN.md) (REST endpoint inventory, `QuotaEnforcementClientV1` SDK trait, storage-plugin
+- **Design**: [DESIGN.md](../DESIGN.md) (REST endpoint inventory, `QuotaEnforcementApi` SDK trait, storage-plugin
   snapshot-read group, §3.3 error model, `cpt-cf-quota-enforcement-seq-end-user-snapshot`)
 - **Decomposition**: [DECOMPOSITION.md](../DECOMPOSITION.md) (§2.8)
 - **ADR**: [ADR-0007 Declarative GTS projection contracts](../ADR/0007-cpt-cf-quota-enforcement-adr-projection-contracts.md)
@@ -239,7 +239,7 @@ surface it **MUST** return a `Problem` envelope on every error and never a Decis
 `cpt-cf-quota-enforcement-constraint-security-context`
 
 **Touches**:
-- API: `POST /v1/quota-enforcement/snapshot`; `QuotaEnforcementClientV1::snapshot`;
+- API: `POST /v1/quota-enforcement/snapshot`; `QuotaEnforcementApi::snapshot`;
   storage `bulk_read_quota_snapshot(pairs, page)`
 - DB: reads `quotas`, `quota_allocation_counters`, and `quota_consumption_counters`; no new tables
   (DECOMPOSITION §2.8)

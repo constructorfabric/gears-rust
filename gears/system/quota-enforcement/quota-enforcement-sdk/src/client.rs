@@ -98,7 +98,7 @@ pub trait QuotaManagerApi: Send + Sync {
     /// credit, or for a Quota the scope shows but that belongs to another
     /// tenant; `FailedPrecondition` for a deactivated Quota or a closed period;
     /// `Aborted` on a payload mismatch, and `Aborted`
-    /// (`LEASE_CONTENTION_TIMEOUT`) as for [`QuotaEnforcementClientV1::debit`].
+    /// (`LEASE_CONTENTION_TIMEOUT`) as for [`QuotaEnforcementApi::debit`].
     #[idempotency(IdempotentWrite)]
     async fn credit(
         &self,
