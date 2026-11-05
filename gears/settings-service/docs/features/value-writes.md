@@ -165,6 +165,7 @@ Throughout, `tenant` omitted means the caller's own tenant, which for a platform
    3. [x] - `p1` - Record its outcome: the old and new value, scope and operation on success, or the error that rejected it; a failing change stores nothing and does not stop the others, and every rejected entry — at the gate, at validation or at commit — publishes `event_value_change_failed` under the batch's change set - `inst-vw-batch-7`
 6. [x] - `p1` - Evict the local cache for every committed change, then publish the committed keys under the change set id - `inst-vw-batch-8`
 7. [x] - `p1` - **RETURN** `200` with one entry per change; the status reflects that every item was answered, and the caller reads the outcomes - `inst-vw-batch-9`
+8. [x] - `p1` - On every exit, **IF** the caller is non-interactive and a batch entry's declaration requires step-up → count `settings_step_up_total` by `operation` `batch` and `result` `service_principal` for the refusal made before the entries are judged - `inst-vw-batch-11`
 
 ### Revert a Value
 
@@ -289,7 +290,7 @@ Throughout, `tenant` omitted means the caller's own tenant, which for a platform
 
 - [x] `p1` - **ID**: `cpt-cf-settings-service-algo-value-writes-commit`
 
-**Input**: A declaration, a target tenant, the new value or a removal, the `If-Match` tag the caller presented, the actor and the change set id
+**Input**: A declaration, a target tenant, the new value or a removal, the `If-Match` tag the caller presented, the actor and the change set id, and the kind of change for the per-type counter
 
 **Output**: The committed change with its old and new value and new tag, or the reason it stored nothing
 
@@ -304,6 +305,7 @@ Throughout, `tenant` omitted means the caller's own tenant, which for a platform
 8. [x] - `p1` - Evict the local cache for the key at the target, key-wide when the scope class is `cascading`, so descendants re-resolve lazily - `inst-vw-commit-8`
 9. [x] - `p1` - Publish `event_value_changed` through the Change Publisher port, and on a rejection `event_value_change_failed` with the reason and the change set id — minted before the gate, so a refusal at the gate carries it too — so a failed change is a durable notification an operator can join to its request; a validation failure's reason is its field and code only, never the message, which may name part of the submitted value; count the outcome on `settings_value_writes_total` - `inst-vw-commit-9`
 10. [x] - `p1` - **RETURN** the old value, the new value, the scope and the new tag - `inst-vw-commit-10`
+11. [x] - `p1` - On every exit of this algorithm, count `settings_changes_committed_total` by `change_type` — the kind of change from the Input: `clone` for a cloned value, else `set` for the `create` and `change` operations of step 6 (an adopted staged secret included), `revert`, `remove` — and `outcome` beside `settings_value_writes_total`: `committed` after the durable commit of step 7, `rejected` on a rejection at the gate, at validation or at commit, never inside the transaction; an entry whose kind cannot be determined — an unrecognised operation, a refusal on its text — counts on `settings_value_writes_total` only; a batch counts each entry it judges - `inst-vw-commit-11`
 
 ### Value State Tag
 
@@ -484,7 +486,7 @@ A write to a `secret`-trait declaration **MUST** hand the plaintext to the Secre
 
 - [x] `p1` - **ID**: `cpt-cf-settings-service-dod-value-writes-observability`
 
-Every committed change **MUST** publish `event_value_changed` and every rejected one — at the gate, at validation or at commit — `event_value_change_failed` with its reason and its change set id — for a validation failure the field and code only, since the event travels further than the answer and the value may be a credential or personal data — and the service **MUST** expose `settings_value_writes_total` by result, `settings_value_write_failure_ratio` for the platform dashboards, and `settings_step_up_total` by operation and result.
+Every committed change **MUST** publish `event_value_changed` and every rejected one — at the gate, at validation or at commit — `event_value_change_failed` with its reason and its change set id — for a validation failure the field and code only, since the event travels further than the answer and the value may be a credential or personal data — and the service **MUST** expose `settings_value_writes_total` by result, from which the platform dashboards derive `settings_value_write_failure_ratio` (not emitted by the gear), and `settings_step_up_total` by operation and result, with `settings_changes_committed_total` by `change_type` and `outcome` as the per-type breakdown of the first.
 
 **Implements**:
 - `cpt-cf-settings-service-algo-value-writes-commit`
@@ -532,3 +534,6 @@ Every committed change **MUST** publish `event_value_changed` and every rejected
 - [x] An overwrite by a platform administrator over a row a tenant set withholds the new setter from the tenant reader, and an overwrite by the tenant over a platform-set row shows it
 - [x] The effective value embedded in a validate, revert or remove response is rendered for the reader: the scopes above its tenant collapsed into one `above` entry, `source_scope` and `fallback_scope` absent when above, and a setter off the path from the reader tenant to the entry's scope withheld
 - [x] Set, batch and clone responses carry no provenance and are unchanged
+- [x] A set, a revert, a remove and a clone each count one change of their type on `settings_changes_committed_total`, `committed` or `rejected`, and a batch of three counts three; an entry refused on its text counts on `settings_value_writes_total` only
+- [x] A batch by a non-interactive caller touching a declaration that requires step-up counts one `settings_step_up_total` outcome under `batch`/`service_principal`
+- [x] A change whose commit fails counts `rejected`, not `committed`

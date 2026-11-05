@@ -27,6 +27,7 @@ pub(crate) use crate::api::rest::setting_filter::unsupported;
 use crate::domain::category::visibility;
 use crate::domain::declaration::{BrowseNarrowing, Declaration};
 use crate::domain::error::DomainError;
+use crate::domain::ports::SecurityMetrics;
 use crate::domain::resolution::{EffectiveValue, SUBTREE_BUDGET, ScopeTarget, subtree_too_large};
 use crate::domain::search::{Corpus, Needle};
 use crate::domain::value::{ReviewRequest, review_binding};
@@ -34,10 +35,7 @@ use crate::field;
 use crate::gear::ConcreteResolver;
 use crate::log_text::LogSafe;
 
-const READ: &str = "read";
-
-/// The entitlement that unmasks `pii` values on the administrative surface.
-const READ_UNMASKED: &str = "read_unmasked";
+const READ: authz::Operation = authz::Operation::Read;
 
 /// The optional `tenant` query parameter: the target scope as a tenant id.
 #[derive(Debug, Default, Deserialize)]
@@ -154,9 +152,7 @@ pub(crate) async fn may_read_pii(
     enforcer: &authz_resolver_sdk::PolicyEnforcer,
     ctx: &SecurityContext,
 ) -> bool {
-    authz::access_scope(enforcer, ctx, &resource::VALUE, READ_UNMASKED, None)
-        .await
-        .is_ok()
+    authz::may_read_unmasked(enforcer, ctx).await
 }
 
 // @cpt-dod:cpt-cf-settings-service-dod-value-resolution-rest-read-surface:p1
@@ -173,6 +169,7 @@ pub async fn get_setting(
     Extension(resolver): Extension<Arc<ConcreteResolver>>,
     Extension(db): Extension<Arc<toolkit_db::DBProvider<toolkit_db::DbError>>>,
     Extension(enforcer): Extension<Arc<authz_resolver_sdk::PolicyEnforcer>>,
+    Extension(security): Extension<Arc<dyn SecurityMetrics>>,
     Path(key): Path<String>,
     Query(params): Query<TenantParam>,
 ) -> ApiResult<impl IntoResponse> {
@@ -184,7 +181,15 @@ pub async fn get_setting(
     // @cpt-begin:cpt-cf-settings-service-flow-value-resolution-admin-read:p1:inst-vr-aread-3
     // A denied or unobtainable decision is a denial: `access_scope` maps both
     // to the unauthorized outcome, which answers 403.
-    let scope = authz::access_scope(&enforcer, &ctx, &resource::VALUE, READ, None).await?;
+    let scope = authz::access_scope(
+        &enforcer,
+        security.as_ref(),
+        &ctx,
+        &resource::VALUE,
+        READ,
+        None,
+    )
+    .await?;
     // @cpt-end:cpt-cf-settings-service-flow-value-resolution-admin-read:p1:inst-vr-aread-3
     // @cpt-end:cpt-cf-settings-service-flow-value-resolution-admin-read:p1:inst-vr-aread-2
     let target = gate_target(&resolver, &ctx, requested).await?;
@@ -546,6 +551,7 @@ pub async fn browse_settings(
     Extension(resolver): Extension<Arc<ConcreteResolver>>,
     Extension(db): Extension<Arc<toolkit_db::DBProvider<toolkit_db::DbError>>>,
     Extension(enforcer): Extension<Arc<authz_resolver_sdk::PolicyEnforcer>>,
+    Extension(security): Extension<Arc<dyn SecurityMetrics>>,
     Query(params): Query<BrowseParams>,
     OData(query): OData,
 ) -> ApiResult<impl IntoResponse> {
@@ -569,8 +575,15 @@ pub async fn browse_settings(
     // secure scope, so a setting the caller may not read is absent from the
     // page and from the count and the page still comes back full — the
     // candidate batch, its evaluation and the refill happen in the query.
-    let scope: AccessScope =
-        authz::access_scope(&enforcer, &ctx, &resource::VALUE, READ, None).await?;
+    let scope: AccessScope = authz::access_scope(
+        &enforcer,
+        security.as_ref(),
+        &ctx,
+        &resource::VALUE,
+        READ,
+        None,
+    )
+    .await?;
     // @cpt-end:cpt-cf-settings-service-flow-value-resolution-admin-browse:p1:inst-vr-browse-3
     // @cpt-end:cpt-cf-settings-service-flow-value-resolution-admin-browse:p1:inst-vr-browse-2
     let target = gate_target(&resolver, &ctx, requested).await?;
@@ -757,6 +770,7 @@ pub async fn list_review(
     Extension(resolver): Extension<Arc<ConcreteResolver>>,
     Extension(db): Extension<Arc<toolkit_db::DBProvider<toolkit_db::DbError>>>,
     Extension(enforcer): Extension<Arc<authz_resolver_sdk::PolicyEnforcer>>,
+    Extension(security): Extension<Arc<dyn SecurityMetrics>>,
     Query(params): Query<TenantParam>,
     OData(query): OData,
 ) -> ApiResult<impl IntoResponse> {
@@ -788,8 +802,15 @@ pub async fn list_review(
     // @cpt-begin:cpt-cf-settings-service-flow-value-resolution-review-list:p1:inst-vr-review-2
     // One decision on the value resource for the whole page; its constraints
     // narrow the settings the rows may belong to, in the page query.
-    let scope: AccessScope =
-        authz::access_scope(&enforcer, &ctx, &resource::VALUE, READ, None).await?;
+    let scope: AccessScope = authz::access_scope(
+        &enforcer,
+        security.as_ref(),
+        &ctx,
+        &resource::VALUE,
+        READ,
+        None,
+    )
+    .await?;
     // @cpt-end:cpt-cf-settings-service-flow-value-resolution-review-list:p1:inst-vr-review-2
     // @cpt-begin:cpt-cf-settings-service-flow-value-resolution-review-list:p1:inst-vr-review-3
     let target = gate_target(&resolver, &ctx, requested).await?;
@@ -919,13 +940,17 @@ mod setting_handlers_tests;
 /// the target is outside its subtree or standalone; 404 when no declaration
 /// exists at the key or it is outside the caller's administrative domain; 503
 /// when the store cannot answer.
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one extractor per extension the handler reads"
+)]
 pub async fn get_history(
     Extension(ctx): Extension<SecurityContext>,
     Extension(resolver): Extension<Arc<ConcreteResolver>>,
     Extension(db): Extension<Arc<toolkit_db::DBProvider<toolkit_db::DbError>>>,
     Extension(enforcer): Extension<Arc<authz_resolver_sdk::PolicyEnforcer>>,
     Extension(names): Extension<Arc<crate::infra::actor_names::ActorNameResolver>>,
+    Extension(security): Extension<Arc<dyn SecurityMetrics>>,
     Path(key): Path<String>,
     Query(params): Query<TenantParam>,
     OData(query): OData,
@@ -942,7 +967,15 @@ pub async fn get_history(
     // @cpt-end:cpt-cf-settings-service-flow-audit-store-history:p1:inst-as-hist-1
     // @cpt-begin:cpt-cf-settings-service-flow-audit-store-history:p1:inst-as-hist-2
     // @cpt-begin:cpt-cf-settings-service-flow-audit-store-history:p1:inst-as-hist-3
-    let scope = authz::access_scope(&enforcer, &ctx, &resource::VALUE, READ, None).await?;
+    let scope = authz::access_scope(
+        &enforcer,
+        security.as_ref(),
+        &ctx,
+        &resource::VALUE,
+        READ,
+        None,
+    )
+    .await?;
     // @cpt-end:cpt-cf-settings-service-flow-audit-store-history:p1:inst-as-hist-3
     // @cpt-end:cpt-cf-settings-service-flow-audit-store-history:p1:inst-as-hist-2
     // @cpt-begin:cpt-cf-settings-service-flow-audit-store-history:p1:inst-as-hist-4
@@ -983,9 +1016,14 @@ pub async fn get_history(
         .into());
     }
     // @cpt-end:cpt-cf-settings-service-flow-audit-store-history:p1:inst-as-hist-6
-    let page = crate::infra::storage::audit_store::AuditStore
-        .history(&conn, &scope, key.as_str(), target.tenant_id(root), &query)
-        .await?;
+    let page = crate::infra::storage::audit_store::AuditStore::history(
+        &conn,
+        &scope,
+        key.as_str(),
+        target.tenant_id(root),
+        &query,
+    )
+    .await?;
     let values_are_pii = declaration.data_classification == "pii";
     // A `pii` image keeps its class after the setting is declassified, so it
     // asks for the entitlement as much as a `pii` setting or actor does.

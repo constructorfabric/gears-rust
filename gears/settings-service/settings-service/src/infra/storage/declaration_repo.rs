@@ -744,6 +744,45 @@ impl DeclarationRepository for DeclarationRepo {
         }
         Ok(tallies)
     }
+
+    async fn count_by_source_status<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+    ) -> Result<HashMap<(String, String), u64>, DomainError> {
+        let rows = DeclarationEntity::find()
+            .secure()
+            .scope_with(scope)
+            .project_all(conn, |q| {
+                q.select_only()
+                    .column(declaration::Column::Source)
+                    .column(declaration::Column::Status)
+                    .column_as(Expr::col(declaration::Column::Id).count(), "n")
+                    .group_by(declaration::Column::Source)
+                    .group_by(declaration::Column::Status)
+                    .into_model::<SourceStatusRow>()
+            })
+            .await
+            .map_err(db_error)?;
+        Ok(rows
+            .into_iter()
+            .map(|row| {
+                (
+                    (row.source, row.status),
+                    u64::try_from(row.n).unwrap_or_default(),
+                )
+            })
+            .collect())
+    }
+}
+
+/// One group of the inventory: the declarations sharing a source and a status,
+/// and how many there are.
+#[derive(Debug, sea_orm::FromQueryResult)]
+struct SourceStatusRow {
+    source: String,
+    status: String,
+    n: i64,
 }
 
 /// One group of the tally: the declarations of a category sharing a mode and

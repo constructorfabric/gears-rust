@@ -1,6 +1,6 @@
 //! Persistence port over `setting_values`.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use async_trait::async_trait;
 use toolkit_db::secure::DBRunner;
@@ -206,6 +206,20 @@ pub trait ValueRepository: Send + Sync {
         scope: &AccessScope,
         source: &str,
     ) -> Result<u64, DomainError>;
+
+    /// How many subject-less rows there are per `(scope_class, scope_kind)` —
+    /// what the values gauge reports: the class of the row's declaration, and
+    /// whether the row sits at the `root` tenant (platform) or at another
+    /// (tenant). A pair with none is absent; the caller reads that as zero.
+    ///
+    /// # Errors
+    /// [`DomainError`] when the read fails.
+    async fn count_by_scope_kind<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        root: Uuid,
+    ) -> Result<HashMap<(String, &'static str), u64>, DomainError>;
 
     /// A page of the rows flagged for review at the request's tenants, whose
     /// declaration passes the visibility predicate, the `hidden` exclusion, the

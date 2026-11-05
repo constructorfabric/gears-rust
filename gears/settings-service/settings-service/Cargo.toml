@@ -1,7 +1,7 @@
 # Created: 2026-08-12 by Virtuozzo International GmbH
 [package]
 name = "cf-gears-settings-service"
-version = "0.1.10"
+version = "0.1.11"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
@@ -94,6 +94,9 @@ tokio = { workspace = true, features = ["macros", "rt", "test-util"] }
 tracing-test = { workspace = true, features = ["no-env-filter"] }
 # The metadata type id in AM's client trait, for the recording AM double.
 gts = { workspace = true }
+# The in-memory metric exporter: the OpenTelemetry bindings' tests read back
+# the instrument names, labels and histogram boundaries the meter exported.
+opentelemetry_sdk = { workspace = true, features = ["testing"] }
 # The SQL query recorder: the impact walk pins its round trips as a count of
 # statements, which no timing assertion could do without flaking.
 toolkit-db = { workspace = true, features = ["test-support"] }
