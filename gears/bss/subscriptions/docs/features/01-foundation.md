@@ -237,7 +237,7 @@ Explicit fail-fast or exhausted remediation reconciles uncertain lines and compe
 | preparing | explicit cancel / cancelled | Explicit subscription cancellation during preparation: withdrawal of preparation and cancellation in one transaction under the SUB-D-57 fence; confirmed-order rights additionally need capture/consumption fencing and recorded financial remedy. Withdrawal alone returns `draft`. |
 | draft | immediate cancel / cancelled | No supplied service; confirmed-order rights additionally need capture/consumption fencing and recorded financial remedy under the agreed cancellation contract. |
 | active | suspend / suspended | Authorized Policy decision and supported non-destructive pause capability; atomically retain the same occupancy place and publish restriction intent. Observe provider pause completion after the commit; no resource deletion. |
-| suspended | resume / active | Policy and applicable payment/term/resource guards; atomically convert its retained unchanged-key place to active without another slot. A pending trial conversion keeps its service restriction through resume; only a later guarded conversion may replace it (SUB-D-66). Entitlements access remains separately observable. |
+| suspended | resume / active | All blocking suspension causes resolved or explicitly discharged, plus Policy and applicable payment/term/resource guards; atomically convert its retained unchanged-key place to active without another slot. A pending trial conversion keeps its service restriction through resume; only a later guarded conversion may replace it (SUB-D-66). Entitlements access remains separately observable. |
 | active or suspended | cancel / cancelled | Accepted reason/mode, service-stop and retention disposition; release normal occupancy only at applied cancel commit. |
 | cancelled | archive / archived | Archive dwell, operational-data completion and evidence-retention constraints. |
 
@@ -249,7 +249,7 @@ If suspension wins before commit, recover any staged external work without apply
 
 Once enabled, a draft edit changes only draft composition and its revision, preserves acquisition/delta evidence and emits no activated service, usable grants or billable facts. A composition change never implicitly activates or resumes the target. Single-item wrappers apply only their explicitly supported source-state/profile combinations; they do not bypass this matrix.
 
-Manual renew permits suspended only for a documented blocked-renewal recovery. Transfer and confirmAcceptance are unavailable. Unschedule requires a pending supported cancellation intent and, for confirmed cancellation, the additional pre-cutoff versioned-confirmation guard. Trial-specific guards are in feature 06.
+Manual renew permits suspended only for a documented blocked-renewal recovery. Automatic term-boundary renewal during a collection-driven suspension follows feature 04: apply the accepted renewal election and normal settlement/cancellation guards, retain suspension and its billing posture on success, and attach a separate renewal cause if its grace later exhausts. Neither path implicitly resumes access. Transfer and confirmAcceptance are unavailable. Unschedule requires a pending supported cancellation intent and, for confirmed cancellation, the additional pre-cutoff versioned-confirmation guard. Trial-specific guards are in feature 06.
 
 ## 5. Definitions of Done
 
