@@ -465,6 +465,7 @@ async fn log_event_does_not_carry_its_own_trace_id_field() {
     let capture = FieldCapture::default();
     let events = capture.0.clone();
     let subscriber = tracing_subscriber::registry().with(capture);
+    crate::test_tracing::keep_interest_shared();
     let _guard = tracing::subscriber::set_default(subscriber);
 
     // A 5xx with a `traceparent` present — so the OLD code path would have put a
@@ -609,6 +610,7 @@ async fn resolves_trace_id_from_active_otel_span_when_no_traceparent() {
     // thread-local default applies across the awaited request future.
     let subscriber =
         tracing_subscriber::registry().with(tracing_opentelemetry::layer().with_tracer(tracer));
+    crate::test_tracing::keep_interest_shared();
     let _guard = tracing::subscriber::set_default(subscriber);
 
     let problem: Problem = CanonicalError::internal("boom").create().into();

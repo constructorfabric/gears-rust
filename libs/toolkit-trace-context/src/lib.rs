@@ -507,6 +507,15 @@ mod resolver_tests {
         header(&format!("00-{OTHER_TRACE}-b7ad6b7169203331-01"))
     }
 
+    /// Keeps a second dispatcher registered for the whole binary. With only one, tracing-core
+    /// computes a callsite's interest from the registering thread's default, so a test without a
+    /// capture can cache `never` for a callsite another test's capture needs. Call it before
+    /// installing a thread-local subscriber (`set_default` / `with_default`).
+    fn keep_interest_shared() {
+        static SHARED: std::sync::OnceLock<tracing::Dispatch> = std::sync::OnceLock::new();
+        SHARED.get_or_init(|| tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default()));
+    }
+
     /// Run `f` inside an active `OTel` span wired like production, so
     /// `current_trace_id()` resolves to a real span id.
     fn in_active_span<R>(f: impl FnOnce() -> R) -> R {
@@ -514,6 +523,7 @@ mod resolver_tests {
         let tracer = provider.tracer("trace-context-test");
         let subscriber =
             tracing_subscriber::registry().with(tracing_opentelemetry::layer().with_tracer(tracer));
+        keep_interest_shared();
         tracing::subscriber::with_default(subscriber, || tracing::info_span!("unit").in_scope(f))
     }
 

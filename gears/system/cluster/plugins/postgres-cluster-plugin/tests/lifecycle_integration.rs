@@ -51,6 +51,7 @@ fn scoped_warn_capture() -> (
         .with_writer(SharedWriter(std::sync::Arc::clone(&buf)))
         .with_max_level(tracing::Level::WARN)
         .finish();
+    keep_interest_shared();
     let guard = tracing::subscriber::set_default(subscriber);
     (guard, buf)
 }
@@ -487,4 +488,13 @@ async fn pg_life_008_drop_during_panic_unwind_degrades_to_warning() {
         captured(&warns).contains("skipping debug panic to avoid double-panic abort"),
         "PG-LIFE-008: the panic-unwind drop must log the double-panic-avoidance WARN"
     );
+}
+
+/// Keeps a second dispatcher registered for the whole binary. With only one, tracing-core
+/// computes a callsite's interest from the registering thread's default, so a test without a
+/// capture can cache `never` for a callsite another test's capture needs. Call it before
+/// installing a thread-local subscriber (`set_default` / `with_default`).
+fn keep_interest_shared() {
+    static SHARED: std::sync::OnceLock<tracing::Dispatch> = std::sync::OnceLock::new();
+    SHARED.get_or_init(|| tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default()));
 }
