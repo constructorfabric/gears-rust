@@ -176,7 +176,7 @@ The service **MUST NOT** perform, orchestrate, or wait for the protected operati
 ### 4.1 In Scope
 
 - **p1**: opportunity registration with mandatory default action, mandatory standing approval setting, context attributes, and decision authority; resource projections; subjects; layered firewall-style rules; separate check and approve permissions; live approval policies with minimum approvals, mandatory approvers, and narrowed approver lists; decisions with mandatory reason and separation of duties; approval requests raised by verification, bound to context fingerprints; request reconciliation; synchronous explainable verification and batch verification; correlation ID and decision reasons in verdicts; approval leases; SDK with bounded cache; tenant hierarchy; administrator browsing and approver inbox; bulk decisions; audit trail; durable change and request events; refusal and denial reasons; self-managed tenant barriers.
-- **p2**: auto-approval rules; conditional policies; staged policies; group approvers; policy snapshot per request; subject-type selectors on rules; request escalation; decisions on behalf of an approver; subject group decisions; decision expiry; access review report; governance versions with drafts, comparison, and rollback.
+- **p2**: auto-approval rules; conditional policies; staged policies; group approvers; policy snapshot per request; subject-type selectors on rules; request escalation; decisions on behalf of an approver; subject group decisions; decision expiry; access review report; governance versions with drafts, comparison, and rollback; approver exclusions.
 - **p3**: periodic recertification campaigns; delegable (overridable) ancestor rules; second-administrator review of governance changes; trial mode and previews of governance changes.
 
 ### 4.2 Out of Scope
@@ -444,6 +444,15 @@ The system **MUST** reject a decision whose approver is the subject or the reque
 - **Rationale**: Who may approve is an authorization question, answered by the PDP per opportunity, so business approvers need no special role in this service. Owner-only authority lets a resource owner, such as the tenant that owns a shared model, keep approval of inherited resources to itself.
 - **Actors**: `cpt-cf-approval-service-actor-approver`, `cpt-cf-approval-service-actor-admin`
 - **Covers**: `cpt-cf-approval-service-upreq-lifecycle`
+
+#### Approver Exclusions
+
+- [ ] `p2` - **ID**: `cpt-cf-approval-service-fr-approver-exclusions`
+
+An opportunity **MAY** declare context attributes that name people involved in the request, for example a pull request author or a refund preparer. A policy **MUST** be able to exclude the people named in such attributes from approving. The system **MUST** reject a decision by an excluded person with the separation-of-duties reason, in addition to the subject and the requester.
+
+- **Rationale**: Four-eyes control requires that the person who prepared or authored the work never approves it, even when that person is not the requester.
+- **Actors**: `cpt-cf-approval-service-actor-admin`, `cpt-cf-approval-service-actor-approver`
 
 #### Decisions on Behalf of an Approver
 
@@ -1036,6 +1045,7 @@ Context attributes and justifications **MUST** be tenant-scoped, readable only b
 - [ ] Every verdict that does not let the operation proceed carries a reason category, a reason code, and a message; refusals are logged without context attribute values.
 - [ ] (p2) A rule or policy change saved as a draft does not affect verdicts; a version put into effect applies from the next verification; a rollback restores the earlier behaviour in one action and appears in the history.
 - [ ] (p3) A rule or policy in trial mode never changes a verdict, and its would-be outcome is reported to administrators.
+- [ ] (p2) A person named in an excluding context attribute cannot approve the request.
 - [ ] Ancestor runtime rules, policies, and decisions do not apply behind a self-managed barrier, while configuration file rules apply to every tenant.
 - [ ] (p2) An auto-approval never overrides a `deny` rule or a deny decision, and never satisfies a policy of an ancestor of its scope tenant.
 - [ ] (p2) Policy changes do not alter the policies fixed for an open request.
