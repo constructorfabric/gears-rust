@@ -114,6 +114,18 @@ A name somebody can move later is not a pin.
 
 ---
 
+## When a project needs something different
+
+**Usually it is a missing parameter, not a difference.** `gears.mk` settings are overridable from the project's own make file; `Gears.toml` carries this project's dylint skip list. The file stays managed, the project supplies a value.
+
+**When the convention did not anticipate it**, the project declares an exception and the tool stops writing that file — but not reporting it. You still see the version you diverged from, and when upstream moves past it.
+
+> An exception costs **automatic application**, not visibility.
+
+A convention that collects many exceptions is a convention that needs a parameter.
+
+---
+
 ## So why does this need a tool at all?
 
 A reference works for the **build rules** and for **CI**.
@@ -137,9 +149,9 @@ and shrink copying to the residue Rust leaves no alternative for.
 | It owns | Somebody else owns |
 |---|---|
 | Repository-level conformance: **presence and placement** | **Content and correctness** — `cfs`, Gearbox, dylint, `cargo-deny` |
-| Installing conventions | Installing software — the platform, the runner image, the package manager |
+| Installing conventions | Obtaining and running software — an unattended job must not |
 | A command you run | Running a bot, hosting a service, opening pull requests |
-| Checking that a check is wired | Deciding that check's verdict |
+| Checking that a check is wired | Deciding a verdict its owner already decides |
 
 One report may carry all of it. **Aggregating a verdict is not recomputing it** —
 every finding is attributed, and the tool never answers on an owner's behalf.
@@ -150,12 +162,12 @@ every finding is attributed, and the tool never answers on an owner's behalf.
 
 | | It promises | It does **not** promise |
 |---|---|---|
-| **Setup** | The chosen conventions and their wiring are in place, each pinned; anything missing is named | A green build |
+| **Setup** | Every convention installed and pinned, update wiring handed over, anything missing named | A green build |
 | **Validation** | A truthful answer inside its footprint, with gaps in its own knowledge visible | That the repository is *good* |
 | **Update** | Pins and managed files move reproducibly; what it cannot apply is reported as **not applied** | That every change applies by itself |
 
-**A configured check is not a passing check.**
-An unrun check is never reported as a passing one.
+**A configured check is not a passing check**, and an unrun one is never reported as passing.
+A repository on 1.2 while upstream ships 1.3 is **conformant, not drifting**.
 
 ---
 

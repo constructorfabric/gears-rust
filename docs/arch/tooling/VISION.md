@@ -260,12 +260,12 @@ answer — a validator that did not run, a check it has no access to — it says
 never reported as a passing one**, and a convention the project never took is reported as unselected
 rather than failed. A reader should be able to tell what was checked, what was not, and why.
 
-**It installs conventions. It does not install software.** Obtaining a program depends on the
-platform, the runner image and the user's package manager, and a tool that does it becomes a package
-manager. The split already exists here: `gears.mk` has `install-tools`, `cargo gears tools
-check-version` verifies minimums. The tool takes the check half — it reports the missing tool, its
-required version and the installed one, and stops. It may start a program to read its version, never
-to do the work.
+**It installs conventions. It does not obtain software.** Not because fetching a program is hard —
+plenty of tools do it — but because an unattended job that fetches and runs arbitrary programs is
+exactly the execution boundary the bot contract depends on. The split already exists here:
+`gears.mk` has `install-tools`, `cargo gears tools check-version` verifies minimums. The tool takes
+the check half — it reports the missing tool, its required version and the installed one, and stops.
+It may start a program to read its version, never to do the work.
 
 ### The update loop
 
@@ -413,6 +413,8 @@ letting the check report the gap — a declaration plus a backlog, not a rewrite
 repository** is out of scope today.
 
 The rest divides into what an extension may add later, and what an extension must not add either.
+The second list is not about difficulty or sequencing. Each entry there would change what the tool
+is, so "later" is not the answer to any of them.
 
 | Capability | Status | Who owns it, or why not |
 |---|---|---|
@@ -424,8 +426,8 @@ The rest divides into what an extension may add later, and what an extension mus
 | Adopting an unrelated repository that does not use Gears | Out of scope today | A later question; the first version serves Gears projects |
 | Rewriting an existing repository to match a convention it declared | Out of scope today | The check reports the gap; closing it is the team's work, not a silent edit |
 | A three-way merge of upstream and local edits to one managed file | Excluded by design | It fails quietly. A project that needs different content declares an exception instead; an upgrade that needs a real transformation states what it changes |
-| Installing tooling | Excluded by design | The platform, the runner image or the user's package manager |
-| A second implementation of another validator's judgement | Excluded by design | `cfs`, Gearbox, dylint and `cargo-deny` keep their own verdicts |
+| Obtaining and executing software as part of a run | Excluded by design | It breaks the execution boundary the bot contract rests on: a job that fires unattended must not fetch and run arbitrary programs. Naming what is missing, and the command that installs it, is already in scope |
+| Re-deciding a verdict another validator owns | Excluded by design | Two answers to one question is worse than none. A domain with **no** owner is not this case — a check for it is ordinary extension territory |
 | Any runtime responsibility | Excluded by design | This tool works at development time only |
 | Operating a bot, hosting a service, owning pull-request delivery | Excluded by design | The integrating project |
 | Replacing `cargo`, `make` or the CI provider | Excluded by design | They stay; the tool only wires and checks them |
