@@ -237,7 +237,7 @@ Explicit fail-fast or exhausted remediation reconciles uncertain lines and compe
 | preparing | explicit cancel / cancelled | Explicit subscription cancellation during preparation: withdrawal of preparation and cancellation in one transaction under the SUB-D-57 fence; confirmed-order rights additionally need capture/consumption fencing and recorded financial remedy. Withdrawal alone returns `draft`. |
 | draft | immediate cancel / cancelled | No supplied service; confirmed-order rights additionally need capture/consumption fencing and recorded financial remedy under the agreed cancellation contract. |
 | active | suspend / suspended | Authorized Policy decision and supported non-destructive pause capability; atomically retain the same occupancy place and publish restriction intent. Observe provider pause completion after the commit; no resource deletion. |
-| suspended | resume / active | Policy and applicable payment/term/resource guards; atomically convert its retained unchanged-key place to active without another slot. Entitlements access remains separately observable. |
+| suspended | resume / active | Policy and applicable payment/term/resource guards; atomically convert its retained unchanged-key place to active without another slot. A pending trial conversion keeps its service restriction through resume; only a later guarded conversion may replace it (SUB-D-66). Entitlements access remains separately observable. |
 | active or suspended | cancel / cancelled | Accepted reason/mode, service-stop and retention disposition; release normal occupancy only at applied cancel commit. |
 | cancelled | archive / archived | Archive dwell, operational-data completion and evidence-retention constraints. |
 
