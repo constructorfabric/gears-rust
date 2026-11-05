@@ -54,6 +54,29 @@ jobs:
           large-packages: true
           swap-storage: true
 
+      # GitHub-hosted macOS images carry extra Xcode versions, the Android SDK,
+      # .NET and simulator runtimes that the tests never use. The test build needs
+      # ~90 GiB on macOS (75 GiB of test binaries, 14 GiB of trybuild output;
+      # measured locally 2026-11-05), and nightly runs died with the disk full (#5710).
+      - name: Free disk space (macOS)
+        if: runner.os == 'macOS' && runner.environment == 'github-hosted'
+        shell: bash
+        continue-on-error: true
+        run: |
+          df -h /
+          active="$(cd "$(xcode-select -p)/../.." && pwd -P)"
+          echo "Active developer dir: $(xcode-select -p) -> keeping $active"
+          for app in /Applications/Xcode*.app; do
+            [ -e "$app" ] || continue
+            [ -L "$app" ] && continue
+            [ "$(cd "$app" && pwd -P)" = "$active" ] && continue
+            echo "Removing $app"
+            sudo rm -rf "$app"
+          done
+          sudo rm -rf "${ANDROID_HOME:-$HOME/Library/Android/sdk}" "$HOME/.dotnet" /usr/local/share/dotnet
+          xcrun simctl runtime delete all 2>/dev/null || true
+          df -h /
+
       - name: Force LF in working tree (w/a for Windows)
         if: runner.os == 'Windows'
         shell: bash
@@ -115,9 +138,33 @@ jobs:
           shared-key: pr-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml') }}
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
 
+      # Samples free disk once a minute for the rest of the job; the report step
+      # below prints the low point.
+      - name: Start disk sampler (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          # shellcheck disable=SC2016  # single quotes are intentional: expanded by the inner bash
+          nohup bash -c 'while :; do echo "$(date -u +%H:%M:%S) $(df -k / | awk "NR==2 {print \$4}")"; sleep 60; done' \
+            > "$RUNNER_TEMP/df-samples.log" 2>&1 &
+
       - name: cargo test (no macros)
         shell: bash
         run: tools/scripts/with_rust_annotations.sh make test-no-macros
+
+      # Runs on failure too: a failed night is exactly when these numbers matter.
+      - name: Disk usage report (macOS)
+        if: ${{ !cancelled() && runner.os == 'macOS' }}
+        shell: bash
+        run: |
+          df -h /
+          du -sh target target/debug/deps target/tests 2>/dev/null || true
+          if [ -s "$RUNNER_TEMP/df-samples.log" ]; then
+            low=$(awk '{print $2}' "$RUNNER_TEMP/df-samples.log" | sort -n | head -1)
+            gib=$(awk -v k="$low" 'BEGIN { printf "%.1f", k / 1048576 }')
+            echo "Lowest free disk during the run: ${gib} GiB"
+            echo "macOS disk: lowest free space during the test run: **${gib} GiB** (samples: $(wc -l < "$RUNNER_TEMP/df-samples.log"))" >> "$GITHUB_STEP_SUMMARY"
+          fi
 
       # test-report.yml turns this into GitHub checks, because this job cannot
       # write checks on fork PRs. Runs on failure too, so failed tests show up.
