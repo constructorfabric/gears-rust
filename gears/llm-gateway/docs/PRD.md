@@ -296,7 +296,7 @@ Gateway acts as a processor — consumers own request/response data; Gateway own
 ### 4.2 Out of Scope
 
 - Conversation state storage — consumers provide full context per request
-- Provider-side conversation state: `previous_response_id`, `store=true` (not applicable to pass-through APIs, whose native requests the Gateway does not restrict; see `cpt-cf-llm-gateway-fr-pass-through-apis-v1`)
+- Provider-side conversation state: `previous_response_id`, `store=true`, including on pass-through APIs (`cpt-cf-llm-gateway-fr-pass-through-apis-v1`)
 - Tool execution — Gateway returns tool calls for consumer to execute. This includes web search: Gateway does not run searches itself; `cf_gears:web_search` is executed by providers that support it
 - Gateway-side content caching or response deduplication (provider-side prompt caching controls are in scope)
 
@@ -555,7 +555,14 @@ Gateway errors on pass-through APIs, including `capability_not_supported`, **MUS
 
 Whether a model can be called through a pass-through API is part of the model capabilities in Model Registry: a model declares which pass-through APIs (OpenAI, Anthropic) it supports, and an administrator can disable that capability per model. The system **MUST** send a pass-through request only to a model whose capabilities include the matching pass-through API; otherwise the system **MUST** return a `capability_not_supported` error without calling the provider.
 
-Granting a model a pass-through capability is a trust decision of the administrator. Apart from the model substitution, the usage request, and the usage enrichment described here, the system **MUST NOT** restrict or modify the native request based on its content; it reads only the fields needed for routing and the quota estimate (`model`, `stream`, output limit, input text). The unified API rules on disabled capabilities, generation parameter policy (model defaults, override and extra-parameter gates), provider-side state (`store`, `previous_response_id`, background requests), and provider-executed tools do not apply to pass-through requests. The system still never executes tools and keeps no conversation state itself.
+Granting a model a pass-through capability is a trust decision of the administrator. Apart from the model substitution, the usage request, the usage enrichment, and the stateless rules described here, the system **MUST NOT** restrict or modify the native request based on its content; it reads only the fields needed for routing and the quota estimate (`model`, `stream`, output limit, input text). The unified API rules on disabled capabilities, generation parameter policy (model defaults, override and extra-parameter gates), and provider-executed tools do not apply to pass-through requests. The system still never executes tools and keeps no conversation state itself.
+
+Pass-through requests **MUST** be stateless, like requests to the unified API:
+
+- Only an allowlist of stateless endpoints is exposed: OpenAI `POST /v1/responses`, `POST /v1/chat/completions`, `POST /v1/embeddings`; Anthropic `POST /v1/messages`, `POST /v1/messages/count_tokens`. All other provider endpoints (files, uploads, vector stores, assistants and threads, conversations, containers, batches, retrieval or deletion of stored responses and completions) are not available.
+- The system **MUST** reject, with `capability_not_supported` and without calling the provider, requests that contain a field from the denylist of stateful fields: fields that create or reference provider-side state (for example `previous_response_id`, `conversation`, background requests, stored prompts, references to stored items or uploaded files, containers, and tools backed by provider-side stores or containers).
+- The system **MUST** always request that the provider does not store the request or response (for example, `store=false` for OpenAI), regardless of the value sent by the consumer.
+- Provider beta-feature headers are forwarded only for an allowlist of values, so that stateful beta features (for example the Anthropic Files API) cannot be enabled.
 
 The consumer sends the Gateway's model identifier in the native `model` field. The system **MUST** replace it with the provider's model identifier before calling the provider and **MUST** return the Gateway's model identifier in the `model` fields of the native response and stream events.
 
@@ -1210,11 +1217,11 @@ LLM Gateway exposes a REST API (documented in DESIGN.md) and the `llm-gateway-sd
 **Preconditions**: Model available for tenant; the model's capabilities include the pass-through API of the route (OpenAI or Anthropic).
 
 **Flow**:
-1. Consumer built for the OpenAI or Anthropic API (for example, with the provider's SDK pointed at the Gateway and the platform bearer token as credentials) sends a request in the provider's native format to the matching pass-through API
+1. Consumer built for the OpenAI or Anthropic API (for example, with the provider's SDK pointed at the Gateway and the platform bearer token as credentials) sends a request in the provider's native format to an allowlisted endpoint of the matching pass-through API
 2. Gateway resolves model info via Model Registry by the request's `model` field
-3. Gateway checks that the model's capabilities include the pass-through API of the route
+3. Gateway checks that the model's capabilities include the pass-through API of the route and that the request contains no field from the denylist of stateful fields
 4. Gateway checks the quota, selects the provider plugin, fetches the provider API key, and calls the plugin (as in UC-001, steps 4–7)
-5. Plugin replaces the `model` field with the provider's model identifier and forwards the native request to the provider via OAGW without translating it to the unified API
+5. Plugin replaces the `model` field with the provider's model identifier, requests that the provider does not store the request or response, and forwards the native request to the provider via OAGW without translating it to the unified API
 6. Plugin reads usage from the provider's native response and computes cost in AI credits
 7. Gateway reports usage and returns the provider's native response, with the Gateway's model identifier in `model` and enriched with Gateway usage (cost in AI credits, usage completeness); for a streaming request, returns the provider's native event stream with Gateway usage added to the event that carries the final usage
 
@@ -1222,6 +1229,8 @@ LLM Gateway exposes a REST API (documented in DESIGN.md) and the `llm-gateway-sd
 
 **Alternative Flows**:
 - **Model does not support the pass-through API**: Gateway returns capability_not_supported without calling the provider.
+- **Stateful request**: the request contains a field from the denylist of stateful fields (e.g. `previous_response_id`, a file reference, a container); Gateway returns capability_not_supported without calling the provider.
+- **Endpoint not allowlisted**: the provider endpoint is not exposed; Gateway returns a not-found error.
 - **Common failures**: invalid model, no plugin for provider, credentials unavailable, unapproved destination, quota exhausted or unavailable are handled as in UC-001; streaming interruptions are handled as in UC-002.
 - **Error format**: every Gateway error is returned in the error format of the route's provider API, not in the unified error format; provider errors are returned with the provider's status code and native error body.
 
@@ -1232,6 +1241,7 @@ LLM Gateway exposes a REST API (documented in DESIGN.md) and the `llm-gateway-sd
 - The native response carries Gateway usage: cost in AI credits and usage completeness
 - Gateway errors are parsed by the provider's SDK as ordinary API errors
 - The consumer's credentials are never forwarded to the provider
+- No provider-side state can be created or referenced through a pass-through API: the provider is always asked not to store requests and responses, and stateful fields and endpoints are rejected
 
 ## 9. Acceptance Criteria
 
