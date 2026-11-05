@@ -189,6 +189,7 @@ The service **MUST NOT** perform, orchestrate, or wait for the protected operati
 - Notification delivery, reminders, and escalation timers.
 - Delegation and proxy approvals.
 - Electronic signatures on decisions.
+- Admitting several operations as one all-or-nothing unit, and the behaviour of a product without this service; the platform admission gate and the gear own both.
 
 ### 4.3 Future Scope
 
