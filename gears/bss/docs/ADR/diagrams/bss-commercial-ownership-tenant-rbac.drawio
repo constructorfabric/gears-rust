@@ -1,0 +1,191 @@
+<?xml version='1.0' encoding='utf-8'?>
+<mxfile host="app.diagrams.net">
+  <diagram id="bss-boundaries" name="BSS ownership and tenant RBAC">
+    <mxGraphModel page="1" pageWidth="1200" pageHeight="790" grid="1" gridSize="10">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+        <mxCell id="n1" value="Who owns what — and who can access it" style="text;html=1;whiteSpace=wrap;overflow=hidden;align=left;verticalAlign=top;fontFamily=Arial;fontSize=32;fontColor=#172b4d;fontStyle=1;spacing=0;" vertex="1" parent="1">
+          <mxGeometry as="geometry" x="32" y="24" width="1136" height="46.2" />
+        </mxCell>
+        <mxCell id="n2" value="BSS commercial ownership · Tenant-scoped RBAC" style="text;html=1;whiteSpace=wrap;overflow=hidden;align=left;verticalAlign=top;fontFamily=Arial;fontSize=21;fontColor=#52627a;fontStyle=0;spacing=0;" vertex="1" parent="1">
+          <mxGeometry as="geometry" x="32" y="72" width="1136" height="31.35" />
+        </mxCell>
+        <mxCell id="n3" value="" style="rounded=1;arcSize=10;fillColor=#f3f7ff;strokeColor=#c1d3ed;strokeWidth=1.4;" vertex="1" parent="1">
+          <mxGeometry as="geometry" x="32" y="144" width="248" height="484" />
+        </mxCell>
+        <mxCell id="n4" value="" style="rounded=1;arcSize=10;fillColor=#f2f9f6;strokeColor=#b5d6c8;strokeWidth=1.4;" vertex="1" parent="1">
+          <mxGeometry as="geometry" x="340" y="144" width="470" height="484" />
+        </mxCell>
+        <mxCell id="n5" value="" style="rounded=1;arcSize=10;fillColor=#f7f5fc;strokeColor=#d0c7e6;strokeWidth=1.4;" vertex="1" parent="1">
+          <mxGeometry as="geometry" x="870" y="144" width="298" height="484" />
+        </mxCell>
+        <mxCell id="n6" value="ACCOUNT MANAGEMENT" style="text;html=1;whiteSpace=wrap;overflow=hidden;align=left;verticalAlign=top;fontFamily=Arial;fontSize=17;fontColor=#315a8b;fontStyle=1;spacing=0;" vertex="1" parent="1">
+          <mxGeometry as="geometry" x="52" y="164" width="208" height="25.950000000000003" />
+        </mxCell>
+        <mxCell id="n7" value="BSS" style="text;html=1;whiteSpace=wrap;overflow=hidden;align=left;verticalAlign=top;fontFamily=Arial;fontSize=19;fontColor=#24624f;fontStyle=1;spacing=0;" vertex="1" parent="1">
+          <mxGeometry as="geometry" x="360" y="164" width="430" height="28.650000000000002" />
+        </mxCell>
+        <mxCell id="n8" value="AUTHORIZATION" style="text;html=1;whiteSpace=wrap;overflow=hidden;align=left;verticalAlign=top;fontFamily=Arial;fontSize=19;fontColor=#654a91;fontStyle=1;spacing=0;" vertex="1" parent="1">
+          <mxGeometry as="geometry" x="890" y="164" width="258" height="28.650000000000002" />
+        </mxCell>
+        <mxCell id="n9" value="Commercial responsibility" style="text;html=1;whiteSpace=wrap;overflow=hidden;align=left;verticalAlign=top;fontFamily=Arial;fontSize=17;fontColor=#52627a;fontStyle=0;spacing=0;" vertex="1" parent="1">
+          <mxGeometry as="geometry" x="360" y="194" width="430" height="25.950000000000003" />
+        </mxCell>
+        <mxCell id="n10" value="Tenant-scoped RBAC" style="text;html=1;whiteSpace=wrap;overflow=hidden;align=left;verticalAlign=top;fontFamily=Arial;fontSize=17;fontColor=#52627a;fontStyle=0;spacing=0;" vertex="1" parent="1">
+          <mxGeometry as="geometry" x="890" y="194" width="258" height="25.950000000000003" />
+        </mxCell>
+        <mxCell id="n11" value="" style="rounded=1;arcSize=10;fillColor=#ffffff;strokeColor=#c1d3ed;strokeWidth=1.4;" vertex="1" parent="1">
+          <mxGeometry as="geometry" x="52" y="242" width="208" height="112" />
+        </mxCell>
+        <mxCell id="n12" value="Tenants" style="text;html=1;whiteSpace=wrap;overflow=hidden;align=left;verticalAlign=top;fontFamily=Arial;fontSize=23;fontColor=#172b4d;fontStyle=1;spacing=0;" vertex="1" parent="1">
+          <mxGeometry as="geometry" x="68" y="258" width="176" height="34.05" />
+        </mxCell>
+        <mxCell id="n13" value="Identity, status&lt;br&gt;and hierarchy" style="text;html=1;whiteSpace=wrap;overflow=hidden;align=left;verticalAlign=top;fontFamily=Arial;fontSize=18;fontColor=#172b4d;fontStyle=0;spacing=0;" vertex="1" parent="1">
+          <mxGeometry as="geometry" x="68" y="295" width="176" height="51.6" />
+        </mxCell>
+        <mxCell id="n14" value="Works independently&lt;br&gt;of BSS." style="text;html=1;whiteSpace=wrap;overflow=hidden;align=left;verticalAlign=top;fontFamily=Arial;fontSize=20;fontColor=#315a8b;fontStyle=1;spacing=0;" vertex="1" parent="1">
+          <mxGeometry as="geometry" x="52" y="412" width="208" height="57.0" />
+        </mxCell>
+        <mxCell id="n15" value="Commercial agreements&lt;br&gt;are owned by BSS." style="text;html=1;whiteSpace=wrap;overflow=hidden;align=left;verticalAlign=top;fontFamily=Arial;fontSize=18;fontColor=#52627a;fontStyle=0;spacing=0;" vertex="1" parent="1">
+          <mxGeometry as="geometry" x="52" y="483" width="208" height="51.6" />
+        </mxCell>
+        <mxCell id="n16" value="" style="rounded=1;arcSize=10;fillColor=#ffffff;strokeColor=#b5d6c8;strokeWidth=1.4;" vertex="1" parent="1">
+          <mxGeometry as="geometry" x="360" y="242" width="205" height="112" />
+        </mxCell>
+        <mxCell id="n17" value="Commercial&lt;br&gt;relationships" style="text;html=1;whiteSpace=wrap;overflow=hidden;align=left;verticalAlign=top;fontFamily=Arial;fontSize=21;fontColor=#172b4d;fontStyle=1;spacing=0;" vertex="1" parent="1">
+          <mxGeometry as="geometry" x="376" y="257" width="173" height="59.7" />
+        </mxCell>
+        <mxCell id="n18" value="Who may pay for whom" style="text;html=1;whiteSpace=wrap;overflow=hidden;align=left;verticalAlign=top;fontFamily=Arial;fontSize=16;fontColor=#52627a;fontStyle=0;spacing=0;" vertex="1" parent="1">
+          <mxGeometry as="geometry" x="376" y="321" width="173" height="24.6" />
+        </mxCell>
+        <mxCell id="n19" value="" style="rounded=1;arcSize=10;fillColor=#ffffff;strokeColor=#b5d6c8;strokeWidth=1.4;" vertex="1" parent="1">
+          <mxGeometry as="geometry" x="585" y="242" width="205" height="112" />
+        </mxCell>
+        <mxCell id="n20" value="Billing accounts" style="text;html=1;whiteSpace=wrap;overflow=hidden;align=left;verticalAlign=top;fontFamily=Arial;fontSize=21;fontColor=#172b4d;fontStyle=1;spacing=0;" vertex="1" parent="1">
+          <mxGeometry as="geometry" x="601" y="257" width="173" height="31.35" />
+        </mxCell>
+        <mxCell id="n21" value="Each belongs to&lt;br&gt;one payer tenant" style="text;html=1;whiteSpace=wrap;overflow=hidden;align=left;verticalAlign=top;fontFamily=Arial;fontSize=18;fontColor=#52627a;fontStyle=0;spacing=0;" vertex="1" parent="1">
+          <mxGeometry as="geometry" x="601" y="294" width="173" height="51.6" />
+        </mxCell>
+        <mxCell id="n22" value="" style="rounded=1;arcSize=10;fillColor=#ffffff;strokeColor=#86bba5;strokeWidth=1.4;" vertex="1" parent="1">
+          <mxGeometry as="geometry" x="360" y="410" width="430" height="86" />
+        </mxCell>
+        <mxCell id="n23" value="Orders &amp;amp; subscriptions" style="text;html=1;whiteSpace=wrap;overflow=hidden;align=left;verticalAlign=top;fontFamily=Arial;fontSize=23;fontColor=#172b4d;fontStyle=1;spacing=0;" vertex="1" parent="1">
+          <mxGeometry as="geometry" x="378" y="422" width="394" height="34.05" />
+        </mxCell>
+        <mxCell id="n24" value="Resource tenant · Seller · Payer / account" style="text;html=1;whiteSpace=wrap;overflow=hidden;align=left;verticalAlign=top;fontFamily=Arial;fontSize=18;fontColor=#172b4d;fontStyle=0;spacing=0;" vertex="1" parent="1">
+          <mxGeometry as="geometry" x="378" y="458" width="394" height="27.3" />
+        </mxCell>
+        <mxCell id="n25" value="" style="rounded=1;arcSize=10;fillColor=#ffffff;strokeColor=#b5d6c8;strokeWidth=1.4;" vertex="1" parent="1">
+          <mxGeometry as="geometry" x="360" y="548" width="430" height="58" />
+        </mxCell>
+        <mxCell id="n26" value="Charges &amp;amp; invoices" style="text;html=1;whiteSpace=wrap;overflow=hidden;align=left;verticalAlign=top;fontFamily=Arial;fontSize=21;fontColor=#172b4d;fontStyle=1;spacing=0;" vertex="1" parent="1">
+          <mxGeometry as="geometry" x="378" y="555" width="394" height="31.35" />
+        </mxCell>
+        <mxCell id="n27" value="Retain the original financial assignment" style="text;html=1;whiteSpace=wrap;overflow=hidden;align=left;verticalAlign=top;fontFamily=Arial;fontSize=16;fontColor=#52627a;fontStyle=0;spacing=0;" vertex="1" parent="1">
+          <mxGeometry as="geometry" x="378" y="582" width="394" height="24.6" />
+        </mxCell>
+        <mxCell id="n28" value="" style="rounded=1;arcSize=10;fillColor=#ffffff;strokeColor=#d0c7e6;strokeWidth=1.4;" vertex="1" parent="1">
+          <mxGeometry as="geometry" x="890" y="242" width="258" height="112" />
+        </mxCell>
+        <mxCell id="n29" value="User permissions" style="text;html=1;whiteSpace=wrap;overflow=hidden;align=left;verticalAlign=top;fontFamily=Arial;fontSize=22;fontColor=#172b4d;fontStyle=1;spacing=0;" vertex="1" parent="1">
+          <mxGeometry as="geometry" x="906" y="258" width="226" height="32.7" />
+        </mxCell>
+        <mxCell id="n30" value="Role + tenant scope&lt;br&gt;+ allowed action" style="text;html=1;whiteSpace=wrap;overflow=hidden;align=left;verticalAlign=top;fontFamily=Arial;fontSize=18;fontColor=#172b4d;fontStyle=0;spacing=0;" vertex="1" parent="1">
+          <mxGeometry as="geometry" x="906" y="296" width="226" height="51.6" />
+        </mxCell>
+        <mxCell id="n31" value="" style="rounded=1;arcSize=10;fillColor=#ffffff;strokeColor=#b1a0ce;strokeWidth=1.4;" vertex="1" parent="1">
+          <mxGeometry as="geometry" x="890" y="410" width="258" height="86" />
+        </mxCell>
+        <mxCell id="n32" value="PDP decision" style="text;html=1;whiteSpace=wrap;overflow=hidden;align=left;verticalAlign=top;fontFamily=Arial;fontSize=23;fontColor=#172b4d;fontStyle=1;spacing=0;" vertex="1" parent="1">
+          <mxGeometry as="geometry" x="906" y="422" width="226" height="34.05" />
+        </mxCell>
+        <mxCell id="n33" value="Permission AND tenant match" style="text;html=1;whiteSpace=wrap;overflow=hidden;align=left;verticalAlign=top;fontFamily=Arial;fontSize=16;fontColor=#172b4d;fontStyle=0;spacing=0;" vertex="1" parent="1">
+          <mxGeometry as="geometry" x="906" y="458" width="226" height="24.6" />
+        </mxCell>
+        <mxCell id="n34" value="" style="rounded=1;arcSize=10;fillColor=#ffffff;strokeColor=#d0c7e6;strokeWidth=1.4;" vertex="1" parent="1">
+          <mxGeometry as="geometry" x="890" y="548" width="258" height="58" />
+        </mxCell>
+        <mxCell id="n35" value="PEP / SecureORM" style="text;html=1;whiteSpace=wrap;overflow=hidden;align=left;verticalAlign=top;fontFamily=Arial;fontSize=21;fontColor=#172b4d;fontStyle=1;spacing=0;" vertex="1" parent="1">
+          <mxGeometry as="geometry" x="906" y="555" width="226" height="31.35" />
+        </mxCell>
+        <mxCell id="n36" value="Enforce decision &amp;amp; constraints" style="text;html=1;whiteSpace=wrap;overflow=hidden;align=left;verticalAlign=top;fontFamily=Arial;fontSize=16;fontColor=#52627a;fontStyle=0;spacing=0;" vertex="1" parent="1">
+          <mxGeometry as="geometry" x="906" y="582" width="226" height="24.6" />
+        </mxCell>
+        <mxCell id="e37" edge="1" parent="1" style="edgeStyle=none;rounded=0;endArrow=block;endFill=1;strokeColor=#64748b;strokeWidth=1.7;">
+          <mxGeometry as="geometry" relative="1">
+            <mxPoint as="sourcePoint" x="260" y="292" />
+            <mxPoint as="targetPoint" x="360" y="292" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="n38" value="tenant IDs" style="text;html=1;whiteSpace=wrap;overflow=hidden;align=center;verticalAlign=top;fontFamily=Arial;fontSize=16;fontColor=#475569;fontStyle=0;spacing=0;" vertex="1" parent="1">
+          <mxGeometry as="geometry" x="265" y="265" width="90" height="24.6" />
+        </mxCell>
+        <mxCell id="e39" edge="1" parent="1" style="edgeStyle=none;rounded=0;endArrow=block;endFill=1;strokeColor=#64748b;strokeWidth=1.7;">
+          <mxGeometry as="geometry" relative="1">
+            <mxPoint as="sourcePoint" x="462" y="354" />
+            <mxPoint as="targetPoint" x="462" y="410" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="n40" value="validate" style="text;html=1;whiteSpace=wrap;overflow=hidden;align=center;verticalAlign=top;fontFamily=Arial;fontSize=16;fontColor=#475569;fontStyle=0;spacing=0;" vertex="1" parent="1">
+          <mxGeometry as="geometry" x="469" y="370" width="85" height="24.6" />
+        </mxCell>
+        <mxCell id="e41" edge="1" parent="1" style="edgeStyle=none;rounded=0;endArrow=block;endFill=1;strokeColor=#64748b;strokeWidth=1.7;">
+          <mxGeometry as="geometry" relative="1">
+            <mxPoint as="sourcePoint" x="687" y="354" />
+            <mxPoint as="targetPoint" x="687" y="410" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="n42" value="assign" style="text;html=1;whiteSpace=wrap;overflow=hidden;align=center;verticalAlign=top;fontFamily=Arial;fontSize=16;fontColor=#475569;fontStyle=0;spacing=0;" vertex="1" parent="1">
+          <mxGeometry as="geometry" x="696" y="370" width="80" height="24.6" />
+        </mxCell>
+        <mxCell id="e43" edge="1" parent="1" style="edgeStyle=none;rounded=0;endArrow=block;endFill=1;strokeColor=#64748b;strokeWidth=1.7;">
+          <mxGeometry as="geometry" relative="1">
+            <mxPoint as="sourcePoint" x="575" y="496" />
+            <mxPoint as="targetPoint" x="575" y="548" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="n44" value="record" style="text;html=1;whiteSpace=wrap;overflow=hidden;align=center;verticalAlign=top;fontFamily=Arial;fontSize=16;fontColor=#475569;fontStyle=0;spacing=0;" vertex="1" parent="1">
+          <mxGeometry as="geometry" x="590" y="510" width="82" height="24.6" />
+        </mxCell>
+        <mxCell id="e45" edge="1" parent="1" style="edgeStyle=none;rounded=0;endArrow=block;endFill=1;strokeColor=#64748b;strokeWidth=1.7;">
+          <mxGeometry as="geometry" relative="1">
+            <mxPoint as="sourcePoint" x="1019" y="354" />
+            <mxPoint as="targetPoint" x="1019" y="410" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e46" edge="1" parent="1" style="edgeStyle=none;rounded=0;endArrow=block;endFill=1;strokeColor=#64748b;strokeWidth=1.7;">
+          <mxGeometry as="geometry" relative="1">
+            <mxPoint as="sourcePoint" x="790" y="453" />
+            <mxPoint as="targetPoint" x="890" y="453" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="n47" value="object facts" style="text;html=1;whiteSpace=wrap;overflow=hidden;align=center;verticalAlign=top;fontFamily=Arial;fontSize=16;fontColor=#475569;fontStyle=0;spacing=0;" vertex="1" parent="1">
+          <mxGeometry as="geometry" x="794" y="425" width="92" height="24.6" />
+        </mxCell>
+        <mxCell id="e48" edge="1" parent="1" style="edgeStyle=none;rounded=0;endArrow=block;endFill=1;strokeColor=#64748b;strokeWidth=1.7;">
+          <mxGeometry as="geometry" relative="1">
+            <mxPoint as="sourcePoint" x="1019" y="496" />
+            <mxPoint as="targetPoint" x="1019" y="548" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="n49" value="Object facts identify the resource, seller or payer tenant of the requested object." style="text;html=1;whiteSpace=wrap;overflow=hidden;align=left;verticalAlign=top;fontFamily=Arial;fontSize=17;fontColor=#52627a;fontStyle=0;spacing=0;" vertex="1" parent="1">
+          <mxGeometry as="geometry" x="340" y="644" width="828" height="25.950000000000003" />
+        </mxCell>
+        <mxCell id="n50" value="" style="rounded=1;arcSize=10;fillColor=#f8fafc;strokeColor=#e2e8f0;strokeWidth=1.4;" vertex="1" parent="1">
+          <mxGeometry as="geometry" x="32" y="690" width="544" height="72" />
+        </mxCell>
+        <mxCell id="n51" value="One effective payer per subscription.&lt;br&gt;Different subscriptions may have different payers." style="text;html=1;whiteSpace=wrap;overflow=hidden;align=left;verticalAlign=top;fontFamily=Arial;fontSize=18;fontColor=#172b4d;fontStyle=0;spacing=0;" vertex="1" parent="1">
+          <mxGeometry as="geometry" x="50" y="701" width="508" height="51.6" />
+        </mxCell>
+        <mxCell id="n52" value="" style="rounded=1;arcSize=10;fillColor=#f8fafc;strokeColor=#e2e8f0;strokeWidth=1.4;" vertex="1" parent="1">
+          <mxGeometry as="geometry" x="600" y="690" width="568" height="72" />
+        </mxCell>
+        <mxCell id="n53" value="Billing accounts are not separate RBAC scopes.&lt;br&gt;Commercial eligibility alone never grants access." style="text;html=1;whiteSpace=wrap;overflow=hidden;align=left;verticalAlign=top;fontFamily=Arial;fontSize=18;fontColor=#172b4d;fontStyle=0;spacing=0;" vertex="1" parent="1">
+          <mxGeometry as="geometry" x="618" y="701" width="532" height="51.6" />
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>
