@@ -51,8 +51,9 @@ class GearTestEnv:
 
     # Server
     port: int = 8086
-    health_path: str = "/healthz"
-    health_timeout: int = 60
+    # Tests need completed preparation; lifecycle scenarios can opt into /healthz.
+    health_path: str = "/readyz"
+    health_timeout: int = 15
     env: dict[str, str] = field(default_factory=dict)
 
     # Sidecars

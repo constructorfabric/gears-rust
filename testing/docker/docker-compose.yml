@@ -36,6 +36,7 @@ services:
       # `true` here against `cors_enabled: false` there - so reviving the line
       # would quietly switch CORS on for the whole e2e lane.
       - RUST_LOG=info
+      - APP__GEARS__API_GATEWAY__CONFIG__ADVERTISE_URI=http://file-parser-api:8086
     depends_on:
       mock:
         condition: service_healthy

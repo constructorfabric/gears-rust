@@ -54,6 +54,8 @@ PY_REQUIREMENTS := testing/requirements.txt testing/e2e/requirements.txt
 
 OPENAPI_PORT ?= 8087
 OPENAPI_URL ?= http://127.0.0.1:$(OPENAPI_PORT)/openapi.json
+# Bootstrap can serve a partial document before application routes are attached.
+OPENAPI_READY_URL ?= $(patsubst %/openapi.json,%/readyz,$(OPENAPI_URL))
 OPENAPI_OUT ?= docs/api/api.json
 OPENAPI_CONFIG ?= config/e2e-local.yaml
 
@@ -321,7 +323,7 @@ else
 	@command -v curl >/dev/null || (echo "curl is required to generate OpenAPI spec" && exit 1)
 	@echo "Starting cf-gears-example-server to generate OpenAPI spec..."
 	@mkdir -p $$(dirname "$(if $(GEAR),$(GEAR_OPENAPI_TMP),$(OPENAPI_OUT))") && \
-	$(call start_server_and_wait,$(EXAMPLE_SERVER_DEBUG_BINARY) --config $(OPENAPI_CONFIG) --port $(OPENAPI_PORT),$(OPENAPI_URL),300) && \
+	$(call start_server_and_wait,$(EXAMPLE_SERVER_DEBUG_BINARY) --config $(OPENAPI_CONFIG) --port $(OPENAPI_PORT),$(OPENAPI_READY_URL),300) && \
 	echo "Fetching OpenAPI spec..." && \
 	curl -fsS "$(OPENAPI_URL)" -o "$(if $(GEAR),$(GEAR_OPENAPI_TMP),$(OPENAPI_OUT))" && \
 	if [ -n "$(GEAR)" ]; then \
@@ -336,7 +338,7 @@ else
 	@command -v curl >/dev/null || (echo "curl is required to generate OpenAPI spec" && exit 1)
 	@echo "Starting cf-gears-example-server to generate OpenAPI spec..."
 	@mkdir -p $$(dirname "$(OPENAPI_OUT)") && \
-	$(call start_server_and_wait,$(EXAMPLE_SERVER_DEBUG_BINARY) --config $(OPENAPI_CONFIG) --port $(OPENAPI_PORT),$(OPENAPI_URL),300) && \
+	$(call start_server_and_wait,$(EXAMPLE_SERVER_DEBUG_BINARY) --config $(OPENAPI_CONFIG) --port $(OPENAPI_PORT),$(OPENAPI_READY_URL),300) && \
 	echo "Fetching OpenAPI spec..." && \
 	curl -fsS "$(OPENAPI_URL)" -o "$(OPENAPI_OUT)" && \
 	echo "Sorting OpenAPI JSON for deterministic ordering..." && \

@@ -114,9 +114,12 @@ pub struct ApiGateway {
     /// REST providers. Write-once/read-many, so `OnceLock` (lock-free reads),
     /// matching `healthcheck_registry`/`health_router`; unset until the server binds.
     pub(crate) bound_endpoint: OnceLock<String>,
+    /// Live router replaced as probes, system routes and application routes become available.
     pub(crate) bootstrap_routes: Arc<ArcSwap<Router>>,
+    /// Early HTTP server task, transferred to the gateway lifecycle when it starts.
     pub(crate) bootstrap_task:
         Mutex<Option<tokio_util::task::AbortOnDropHandle<anyhow::Result<()>>>>,
+    /// Stops the early HTTP listener during shutdown or failed startup cleanup.
     pub(crate) bootstrap_cancel: OnceLock<CancellationToken>,
 }
 

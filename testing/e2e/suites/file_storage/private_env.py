@@ -300,9 +300,10 @@ def private_server(
     gear_env = GearTestEnv(
         config_patch=_make_config_patch(server_port, extra_config_yaml, home_dir=home_dir),
         port=server_port,
-        health_path="/healthz",
-        health_timeout=60,
-        env={"RUST_LOG": os.environ.get("RUST_LOG", "info,file_storage=debug")},
+        env={
+            "RUST_LOG": os.environ.get("RUST_LOG", "info,file_storage=debug"),
+            "APP__GEARS__API_GATEWAY__CONFIG__ADVERTISE_URI": base_url,
+        },
         sidecars=[sidecar],
         log_suffix=log_suffix,
     )

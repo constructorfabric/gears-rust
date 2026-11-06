@@ -145,8 +145,8 @@ def pytest_collection_modifyitems(items):
 
     The problem: pytest-timeout charges FIXTURE SETUP against whichever test
     triggers it. The session-scoped `test_env` starts a database container
-    (image pull included) and waits up to 90s for the server to become
-    healthy, so the first test to run would blow pytest.ini's 10s budget
+    (image pull included) and waits up to 15s for the server to become
+    ready, so the first test to run would blow pytest.ini's 10s budget
     through no fault of its own.
 
     The fix is `func_only`, NOT a bigger number. `func_only=True` moves
@@ -161,7 +161,7 @@ def pytest_collection_modifyitems(items):
 
     Session setup keeps its own bounds and its own diagnostics: READY_TIMEOUT
     (60s) and DOCKER_TIMEOUT (120s) in `lib/sidecars.py`, `health_timeout`
-    (90s) in the orchestrator. Those report *what* stalled; a pytest-timeout
+    (15s) in the orchestrator. Those report *what* stalled; a pytest-timeout
     kill mid-setup only dumps stacks.
 
     An explicit @pytest.mark.timeout on a test wins — that is how the
@@ -204,8 +204,6 @@ def gear_test_env() -> GearTestEnv:
         config_path=CONFIG,
         config_patch=_patch_config,
         port=SERVER_PORT,
-        health_path="/healthz",
-        health_timeout=90,
         env={"RUST_LOG": os.environ.get(
             "RUST_LOG",
             "info,cf_gears_usage_collector=debug,"
