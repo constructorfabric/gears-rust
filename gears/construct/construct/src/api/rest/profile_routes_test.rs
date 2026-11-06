@@ -111,7 +111,8 @@ async fn a_profile_reads_as_its_categories_with_each_facts_property_origin_and_t
                 "entity_kind": "skill",
                 "facts": [{
                     "fact_id": "construct:t:fact-1",
-                    "properties": { "skills": { "name": "Rust", "level": "expert" } },
+                    "property": "skills",
+                    "value": { "name": "Rust", "level": "expert" },
                     "origin": { "kind": "agent" },
                     "stored_at": "2026-10-21T10:00:00Z",
                     "produced_at": "2026-10-21T09:59:00Z",

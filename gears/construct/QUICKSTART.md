@@ -179,7 +179,7 @@ curl -s "http://127.0.0.1:8087/cf/construct/v1/subjects/5d1f2c3a-8b4e-4c6d-9a1b-
 Response `200`, once a record was processed:
 
 ```json
-{"subject_id":"5d1f2c3a-8b4e-4c6d-9a1b-2c3d4e5f6a7b","categories":[{"entity_kind":"skill","facts":[{"fact_id":"construct:00000000-df51-5b42-9538-d2b56b7ee953:0b7c...","properties":{"skills":{"name":"Rust"}},"origin":{"kind":"connector"},"stored_at":"2026-09-10T09:13:07Z","produced_at":"2026-09-10T09:13:05Z"}]}]}
+{"subject_id":"5d1f2c3a-8b4e-4c6d-9a1b-2c3d4e5f6a7b","categories":[{"entity_kind":"skill","facts":[{"fact_id":"construct:00000000-df51-5b42-9538-d2b56b7ee953:0b7c...","property":"skills","value":{"name":"Rust"},"origin":{"kind":"connector"},"stored_at":"2026-09-10T09:13:07Z","produced_at":"2026-09-10T09:13:05Z"}]}]}
 ```
 
 A subject without facts answers `{"subject_id":"…","categories":[]}`; a subject the caller may not act for answers `404`.

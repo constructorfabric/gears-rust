@@ -239,9 +239,12 @@ impl From<Category> for EntityKindDto {
 pub struct ProfileFactDto {
     /// The fact's id, the graph node key.
     pub fact_id: String,
-    /// The fact's property, by its plain key, with its value.
-    #[schema(value_type = Object)]
-    pub properties: serde_json::Map<String, serde_json::Value>,
+    /// The fact's property, by its plain key, such as `skills`. A category
+    /// has several properties, so this names which one the fact holds.
+    pub property: String,
+    /// The property's value: a string, or an object for a property with
+    /// fields, such as `{"name": "Rust"}` for a skill.
+    pub value: serde_json::Value,
     pub origin: OriginDto,
     #[serde(with = "time::serde::rfc3339")]
     #[schema(value_type = String, format = DateTime)]
@@ -274,11 +277,10 @@ pub struct ProfileDto {
 
 impl From<StoredFact> for ProfileFactDto {
     fn from(fact: StoredFact) -> Self {
-        let mut properties = serde_json::Map::new();
-        properties.insert(fact.property, fact.value);
         Self {
             fact_id: fact.node_key.0,
-            properties,
+            property: fact.property,
+            value: fact.value,
             origin: OriginDto {
                 kind: fact.origin.into(),
             },
