@@ -297,7 +297,7 @@ fn read_routes(router: Router, openapi: &dyn OpenApiRegistry) -> Router {
         .error_503(openapi)
         .register(router, openapi);
 
-    let router = OperationBuilder::get(format!("{BASE}/nodes/count"))
+    let router = OperationBuilder::get(format!("{BASE}/nodes:count"))
         .operation_id("graph_storage.count_nodes")
         .summary("Count a listing")
         .description(
@@ -305,8 +305,9 @@ fn read_routes(router: Router, openapi: &dyn OpenApiRegistry) -> Router {
              `$filter`, across all its pages. Exact up to the deployment's \
              `projection_count_max`; past it the answer is that ceiling with \
              `capped: true`. A count has no pages, so `$orderby`, `$top`, \
-             `cursor` and `$select` are refused. A node whose key is `count` \
-             is read through the listing, not `GET /nodes/{node_key}`",
+             `cursor` and `$select` are refused. A custom-method suffix rather \
+             than a `/count` segment, so every node key, `count` included, \
+             keeps its own path",
         )
         .tag(API_TAG)
         .authenticated()

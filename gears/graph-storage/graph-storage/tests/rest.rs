@@ -645,9 +645,9 @@ async fn a_walk_takes_a_direction_and_discriminators_and_reads_name_them() {
     );
 }
 
-/// `GET /nodes/count` answers the listing's total, and refuses the options a
-/// count has no use for rather than ignoring them. A node keyed like the
-/// route is still listed (#5108 point 1, #5529 item 2).
+/// `GET /nodes:count` answers the listing's total, and refuses the options a
+/// count has no use for rather than ignoring them (#5108 point 1, #5529
+/// item 2).
 #[tokio::test]
 async fn a_listing_has_a_count_beside_it() {
     let stand = Stand::new(Harness::allowed());
@@ -655,7 +655,7 @@ async fn a_listing_has_a_count_beside_it() {
     let (status, body) = stand.post("/ingest", &ingest_body()).await;
     assert_eq!(status, StatusCode::OK, "{body}");
 
-    let (status, counted) = stand.get("/nodes/count").await;
+    let (status, counted) = stand.get("/nodes:count").await;
     assert_eq!(status, StatusCode::OK, "{counted}");
     assert_eq!(counted["count"], 2, "{counted}");
     assert_eq!(counted["capped"], false, "{counted}");
@@ -664,20 +664,41 @@ async fn a_listing_has_a_count_beside_it() {
         "{counted}"
     );
 
-    let (status, problem) = stand.get("/nodes/count?$orderby=node_key").await;
+    let (status, problem) = stand.get("/nodes:count?$orderby=node_key").await;
     assert_eq!(
         status,
         StatusCode::BAD_REQUEST,
         "a count has no order: {problem}"
     );
-    let (status, problem) = stand.get("/nodes/count?limit=5").await;
+    let (status, problem) = stand.get("/nodes:count?limit=5").await;
     assert_eq!(
         status,
         StatusCode::BAD_REQUEST,
         "nor a page size: {problem}"
     );
+}
 
-    // The static segment does not swallow other keys.
-    let (status, node) = stand.get("/nodes/rest-a").await;
+/// The count is a custom method, not a path segment, so no node key loses
+/// its path to it: a node keyed `count` is read and deleted at
+/// `/nodes/count` like any other. A static `/nodes/count` route took the
+/// whole path, every method included -- a `DELETE` answered 405 and never
+/// reached the node.
+#[tokio::test]
+async fn a_node_keyed_count_is_read_and_deleted_by_its_path() {
+    let stand = Stand::new(Harness::allowed());
+    seed(&stand).await;
+    let body = serde_json::json!({
+        "nodes": [{"node_key": "count", "type_id": conformance::OWNED, "name": "keyed count"}]
+    });
+    let (status, answer) = stand.post("/ingest", &body).await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+
+    let (status, node) = stand.get("/nodes/count").await;
     assert_eq!(status, StatusCode::OK, "{node}");
+    assert_eq!(node["node_key"], "count", "{node}");
+
+    let (status, answer) = stand.delete("/nodes/count").await;
+    assert!(status.is_success(), "{status}: {answer}");
+    let (status, gone) = stand.get("/nodes/count").await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{gone}");
 }

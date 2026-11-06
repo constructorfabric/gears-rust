@@ -152,7 +152,7 @@ pub struct GraphStorageConfig {
     pub traversal_max_edges_scanned: u64,
     pub search_max_arm_limit: u32,
     pub projection_max_page: u32,
-    /// The most rows a count of a listing counts exactly (`GET /nodes/count`).
+    /// The most rows a count of a listing counts exactly (`GET /nodes:count`).
     ///
     /// Past it the answer is this number with `capped` set, so the cost of a
     /// count is bounded by configuration rather than by the size of the

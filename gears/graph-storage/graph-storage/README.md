@@ -163,7 +163,7 @@ Each is the shipped behaviour, with the contract that fixes it.
   scans too. A page carries no total and there is no offset: the platform
   pages by cursor and refuses `$count` and `$skip` by design
   (`toolkit::api::odata`). The total is a call of its own: `GET
-  /nodes/count` (`count_nodes` in process) takes the listing's
+  /nodes:count` (`count_nodes` in process) takes the listing's
   `type_pattern` and `$filter` and answers how many rows all its pages hold,
   exactly up to `projection_count_max` (10 000 by default) and as that
   ceiling with `capped: true` past it -- it reads the matching ids, so its
@@ -212,10 +212,6 @@ Each is the shipped behaviour, with the contract that fixes it.
 What the documents require and this iteration does not yet deliver, so a
 reader is not left to discover it. Each is marked in the documents where it
 bites ("Found while building the prototype").
-
-- *A node keyed `count` cannot be read by `GET /nodes/{node_key}`*: the
-  static route `GET /nodes/count` answers that path. It is read through the
-  listing (`$filter=node_key eq 'count'`) or in process.
 
 **Deferred features** (the API and schema leave room; nothing is built): content
 chunking and heavy-content offload; labels; change events; the admission layer
