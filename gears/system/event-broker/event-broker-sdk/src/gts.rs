@@ -12,6 +12,8 @@
 //! macro emits here, not from `docs/schemas/`. The two files under
 //! `docs/schemas/` are generated from this module and held to it by
 //! `gts_tests`, so per-field keywords live in the schemars attributes below.
+//! Gears declare event types with `#[gts_type_schema(base = EventV1, ..)]`;
+//! the derived struct's fields define the event's `data` contract.
 
 use gts::{GtsInstanceId, GtsTypeId, SELF_ID_REF};
 use schemars::JsonSchema;
@@ -148,7 +150,7 @@ pub struct EventMeta {
     traits_schema = inline(EventTraits),
     gts_abstract = true,
 )]
-pub struct EventV1 {
+pub struct EventV1<D> {
     /// Client-provided unique event identifier (UUID).
     pub id: Uuid,
     /// Full GTS event-type identifier. The event is an instance of that derived type. ASCII only.
@@ -183,8 +185,7 @@ pub struct EventV1 {
     pub trace_parent: Option<String>,
     /// Event payload, validated at ingest against the resolved schema of the event's type. The only field where UTF-8 (or any non-ASCII bytes) is permitted; all other event fields are ASCII per platform convention. May be absent for body-less events (e.g., notification-only events whose semantics are fully carried by `type` + `subject`).
     #[serde(default)]
-    #[schemars(with = "Option<serde_json::Map<String, serde_json::Value>>")]
-    pub data: Option<serde_json::Value>,
+    pub data: Option<D>,
     /// Server-stamped partition for the event, surfaced on read. Computed at ingest via the partition contract. Producers MUST NOT supply this field on publish; doing so is rejected with 400 BadRequest.
     #[schemars(range(min = 0), extend("readOnly" = true))]
     pub partition: i32,
@@ -238,55 +239,6 @@ pub fn data_contract(resolved: &serde_json::Value) -> serde_json::Value {
     let mut branches = Vec::new();
     collect(resolved, 0, &mut branches);
     serde_json::json!({ "allOf": branches })
-}
-
-/// Assembles the derived event-type schema document for `type_id`: the payload
-/// contract as a narrowing of the base's `data` member, and the governing
-/// metadata as `x-gts-traits`.
-///
-/// Test fixtures and the mock register event types through this rather than
-/// storing a bare payload schema, so what they hold is the same shape
-/// `types-registry` provisions - which means the shape it will actually admit.
-///
-/// A `data_schema` with no constraints of its own is rendered as the base's own
-/// `["object", "null"]` rather than passed through as an empty schema. An empty
-/// schema admits any JSON value, which is *wider* than the base's member, and a
-/// derived type may only narrow: registration refuses the document with
-/// "Schema at '$.data' changes type incompatibly". A caller stating no
-/// constraints means "whatever the base allows", and that is what this writes.
-#[must_use]
-pub fn derived_event_type_schema(
-    type_id: &str,
-    topic: &str,
-    data_schema: serde_json::Value,
-    allowed_subject_types: &[&str],
-) -> serde_json::Value {
-    serde_json::json!({
-        "$id": format!("{}{type_id}", toolkit_gts::GTS_ID_URI_PREFIX),
-        "$schema": "http://json-schema.org/draft-07/schema#",
-        "x-gts-traits": {
-            "topic": topic,
-            "allowed_subject_types": allowed_subject_types,
-            "partition_key": TENANT_POINTER,
-        },
-        "type": "object",
-        "allOf": [
-            { "$ref": toolkit_gts::gts_uri!("cf.core.events.event.v1~") },
-            {
-                "type": "object",
-                "properties": {
-                    "data": if data_schema
-                        .as_object()
-                        .is_some_and(serde_json::Map::is_empty)
-                    {
-                        serde_json::json!({ "type": ["object", "null"] })
-                    } else {
-                        data_schema
-                    },
-                },
-            },
-        ],
-    })
 }
 
 /// Consumer-group resource type - PEP/error matching only, no schema

@@ -25,13 +25,13 @@ use std::sync::Arc;
 use event_broker_sdk::gts::{EventV1, TopicV1};
 use gts::GtsTypeId;
 use serde_json::{Value as JsonValue, json};
-use toolkit_gts::{GTS_ID_URI_PREFIX, GtsInstanceId, GtsSchema};
+use toolkit_gts::{GTS_ID_URI_PREFIX, GtsInstanceId, GtsSchema, gts_type_schema};
 use types_registry_sdk::testing_platform::MockTypesRegistry;
 
 use crate::config::EventBrokerConfig;
 
 const TOPIC_BASE: &str = TopicV1::TYPE_ID;
-const EVENT_BASE: &str = EventV1::TYPE_ID;
+const EVENT_BASE: &str = EventV1::<()>::TYPE_ID;
 
 /// The backend every fixture deployment names. A fixture never builds it
 /// through configuration - the harness builds the memory backend directly - but
@@ -39,28 +39,19 @@ const EVENT_BASE: &str = EventV1::TYPE_ID;
 const MEMORY_BACKEND: &str =
     toolkit_gts::gts_id!("cf.core.events.backend.v1~cf.core.backend.memory.v1~");
 
-/// A derived event-type schema document, built by the same helper the
-/// production fixtures use, so what a test registers is the shape
-/// `types-registry` provisions.
-///
-/// # Panics
-/// Panics if `type_id` is not a well-formed GTS type identifier.
-#[must_use]
-pub fn derived_event_type(
-    type_id: &str,
-    topic: &str,
-    data_schema: JsonValue,
-    allowed_subject_types: &[&str],
-) -> JsonValue {
-    GtsTypeId::try_new(type_id)
-        .unwrap_or_else(|err| panic!("'{type_id}' is not a valid GTS type id: {err}"));
-    event_broker_sdk::gts::derived_event_type_schema(
-        type_id,
-        topic,
-        data_schema,
-        allowed_subject_types,
-    )
-}
+// The abstract template supplies the event envelope without materializing a
+// publishable type from the process inventory. The catalog fills fixture metadata
+// and payload constraints on the macro-generated document.
+#[gts_type_schema(
+    dir_path = "schemas",
+    base = EventV1,
+    type_id = toolkit_gts::gts_id!("cf.core.events.event.v1~x.eb.fixtures.template.v1~"),
+    description = "Parameterized event fixture envelope.",
+    properties = "",
+    gts_abstract = true,
+)]
+#[schemars(extend("additionalProperties" = true))]
+struct FixtureEventV1;
 
 /// A registry holding the broker's two base types (`TOPIC_BASE` and
 /// `EVENT_BASE`, as `event-broker-sdk` declares them), the `topics` instance
@@ -210,12 +201,26 @@ impl StaticTypesRegistry {
                     })
                     .unwrap_or_default();
                 let data_schema = entry.get("data_schema").cloned().unwrap_or(json!({}));
-                let mut body = event_broker_sdk::gts::derived_event_type_schema(
-                    id,
-                    topic,
-                    data_schema,
-                    &allowed,
-                );
+                let mut body = FixtureEventV1::gts_schema_with_refs();
+                let envelope = body
+                    .as_object_mut()
+                    .expect("the macro emits an object schema");
+                envelope.remove("description");
+                envelope.remove("x-gts-abstract");
+                body["$id"] = json!(format!("{GTS_ID_URI_PREFIX}{id}"));
+                body["x-gts-traits"] = json!({
+                    "topic": topic,
+                    "allowed_subject_types": allowed,
+                    "partition_key": "/tenant_id",
+                });
+                body["allOf"][1]["properties"]["data"] = if data_schema
+                    .as_object()
+                    .is_some_and(serde_json::Map::is_empty)
+                {
+                    EventV1::<()>::gts_schema_with_refs()["properties"]["data"].clone()
+                } else {
+                    data_schema
+                };
                 // The standard builder fixes the pointer at the tenant. An
                 // entry may override it, which is how a fixture exercises a
                 // type that groups by a payload member.
@@ -242,6 +247,12 @@ impl StaticTypesRegistry {
             }))
             .expect("fixture configuration deserializes"),
         }
+    }
+
+    /// Generated event-type schema documents held by this fixture catalog.
+    #[must_use]
+    pub fn event_type_schemas(&self) -> &[JsonValue] {
+        &self.event_types
     }
 
     /// The configuration a fixture-free harness runs with: no topics named, so

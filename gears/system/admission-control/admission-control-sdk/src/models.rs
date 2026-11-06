@@ -435,48 +435,60 @@ impl From<&RefusalCause> for RefusalEventCause {
     }
 }
 
-/// One refusal or shadow finding, as published under
-/// [`REFUSAL_EVENT_TYPE`](crate::gts::REFUSAL_EVENT_TYPE): one event per
-/// (operation, policy) pair. Property values are never carried, only names.
-///
-/// This is the event's `data`. The correlation identifier, the instant and the
-/// resource tenant travel in the broker envelope (`subject`, `occurred_at`,
-/// `tenant_id`), so they are not repeated here.
-///
-/// The event type's `data` schema is generated from this type. Optional
-/// fields are omitted rather than `null`, so their schemas name the inner
-/// type and never admit `null`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-pub struct RefusalEvent {
-    /// Calling enforcing gear.
-    pub enforcing_gear: String,
-    /// Action requested.
-    pub action: String,
-    /// GTS type identifier of the target resource.
-    pub resource_type: String,
-    /// Target resource identifier, where the request named one.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(with = "Uuid")]
-    pub resource_id: Option<Uuid>,
-    /// Subject, from the security context.
-    pub subject_id: Uuid,
-    /// Subject's tenant, from the security context.
-    pub subject_tenant_id: Uuid,
-    /// `false` for a shadow finding (the operation was not refused by it).
-    pub enforced: bool,
-    /// Refusal cause.
-    pub cause: RefusalEventCause,
-    /// For a could-not-run refusal: the failure condition.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(with = "FailureCondition")]
-    pub condition: Option<FailureCondition>,
-    /// For a policy refusal or shadow finding: the responsible document.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(with = "PolicyReference")]
-    pub policy: Option<PolicyReference>,
-    /// Names of every supplied property (never values).
-    #[serde(default)]
-    pub property_names: Vec<String>,
+// The wire payload and its GTS declaration share fields and serde annotations.
+macro_rules! refusal_event_payload {
+    ($(#[$attr:meta])* pub struct $name:ident;) => {
+        $(#[$attr])*
+        pub struct $name {
+            /// Calling enforcing gear.
+            pub enforcing_gear: String,
+            /// Action requested.
+            pub action: String,
+            /// GTS type identifier of the target resource.
+            pub resource_type: String,
+            /// Target resource identifier, where the request named one.
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            #[schemars(with = "Uuid")]
+            pub resource_id: Option<Uuid>,
+            /// Subject, from the security context.
+            pub subject_id: Uuid,
+            /// Subject's tenant, from the security context.
+            pub subject_tenant_id: Uuid,
+            /// `false` for a shadow finding (the operation was not refused by it).
+            pub enforced: bool,
+            /// Refusal cause.
+            pub cause: RefusalEventCause,
+            /// For a could-not-run refusal: the failure condition.
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            #[schemars(with = "FailureCondition")]
+            pub condition: Option<FailureCondition>,
+            /// For a policy refusal or shadow finding: the responsible document.
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            #[schemars(with = "PolicyReference")]
+            pub policy: Option<PolicyReference>,
+            /// Names of every supplied property (never values).
+            #[serde(default)]
+            pub property_names: Vec<String>,
+        }
+    };
+}
+pub(crate) use refusal_event_payload;
+
+refusal_event_payload! {
+    /// One refusal or shadow finding, as published under
+    /// [`REFUSAL_EVENT_TYPE`](crate::gts::REFUSAL_EVENT_TYPE): one event per
+    /// (operation, policy) pair. Property values are never carried, only names.
+    ///
+    /// This is the event's `data`. The correlation identifier, the instant and the
+    /// resource tenant travel in the broker envelope (`subject`, `occurred_at`,
+    /// `tenant_id`), so they are not repeated here.
+    ///
+    /// The event type's `data` schema is declared by
+    /// [`RefusalEventV1`](crate::gts::RefusalEventV1), which must name the same
+    /// fields (tested). Optional fields are omitted rather than `null`, so their
+    /// schemas name the inner type and never admit `null`.
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+    pub struct RefusalEvent;
 }
 
 #[cfg(test)]
