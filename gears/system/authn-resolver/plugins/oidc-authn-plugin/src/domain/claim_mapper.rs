@@ -6,6 +6,7 @@
 use authn_resolver_sdk::AuthNResolverError;
 use toolkit_macros::domain_model;
 use toolkit_security::SecurityContext;
+use toolkit_security::context::SecurityContextBuilder;
 use tracing::debug;
 use uuid::Uuid;
 
@@ -229,20 +230,47 @@ pub fn map_with_bearer_with_options(
     bearer_token: Option<&str>,
     metrics: &AuthNMetrics,
 ) -> Result<SecurityContext> {
-    map_with_bearer_opts(claims, config, options, bearer_token, metrics, true, None)
+    map_with_bearer_opts(claims, config, options, bearer_token, metrics, None)
+}
+
+/// Identity information for service-account mapping.
+#[domain_model]
+#[derive(Clone, Copy)]
+pub(crate) struct S2sMapping<'a> {
+    /// Service-account classification when the token omits a subject type.
+    pub default_subject_type: &'a str,
 }
 
 /// Internal mapping implementation with optional first-party tracking.
+/// The context expires at the verified JWT `exp`, if any.
 pub(crate) fn map_with_bearer_opts(
     claims: &Claims,
     config: &ClaimMapperConfig,
     options: &ClaimMapperOptions,
     bearer_token: Option<&str>,
     metrics: &AuthNMetrics,
-    // False for S2S tokens: skip first-party ratio tracking and allow subject-type fallback.
-    track_first_party: bool,
-    default_subject_type: Option<&str>,
+    // S2S tokens skip first-party ratio tracking and allow subject-type fallback.
+    s2s: Option<S2sMapping<'_>>,
 ) -> Result<SecurityContext> {
+    let (builder, jwt_expiry) =
+        prepare_with_bearer(claims, config, options, bearer_token, metrics, s2s)?;
+    build(match jwt_expiry {
+        Some(expiry) => builder.expires_at(expiry),
+        None => builder,
+    })
+}
+
+/// Everything [`map_with_bearer_opts`] maps except the expiry, which is
+/// returned beside the builder as the verified JWT `exp`: a caller with a
+/// further deadline sets the earlier one, then calls [`build`].
+pub(crate) fn prepare_with_bearer(
+    claims: &Claims,
+    config: &ClaimMapperConfig,
+    options: &ClaimMapperOptions,
+    bearer_token: Option<&str>,
+    metrics: &AuthNMetrics,
+    s2s: Option<S2sMapping<'_>>,
+) -> Result<(SecurityContextBuilder, Option<time::OffsetDateTime>)> {
     let subject_id = extract_subject_id_with_claim(claims, &config.subject_id)?;
     let subject_tenant_id = extract_tenant_id(claims, &config.subject_tenant_id, metrics)?;
     let mut subject_type = config
@@ -255,18 +283,31 @@ pub(crate) fn map_with_bearer_opts(
         }
     }
     let app_type = detect_app_type(claims, &options.first_party_clients);
-    if track_first_party {
+    if s2s.is_none() {
         metrics.observe_first_party_auth(matches!(app_type, AppType::FirstParty));
     }
     let token_scopes = extract_scopes_with_claim(claims, app_type, &config.token_scopes);
-    if !track_first_party && subject_type.is_none() {
-        subject_type = default_subject_type.map(str::to_owned);
+    if subject_type.is_none()
+        && let Some(s2s) = &s2s
+    {
+        subject_type = Some(s2s.default_subject_type.to_owned());
     }
 
     let mut builder = SecurityContext::builder()
         .subject_id(subject_id)
         .subject_tenant_id(subject_tenant_id)
         .token_scopes(token_scopes);
+
+    // These claims have already passed JWT validation. Keep the actual exp,
+    // without validation leeway.
+    let jwt_expiry = claims
+        .get("exp")
+        .map(|exp| {
+            exp.as_i64()
+                .and_then(|seconds| time::OffsetDateTime::from_unix_timestamp(seconds).ok())
+                .ok_or_else(|| unauthorized("invalid credential expiry"))
+        })
+        .transpose()?;
 
     if let Some(subject_type_value) = subject_type.as_deref() {
         builder = builder.subject_type(subject_type_value);
@@ -276,6 +317,14 @@ pub(crate) fn map_with_bearer_opts(
         builder = builder.bearer_token(token.to_owned());
     }
 
+    Ok((builder, jwt_expiry))
+}
+
+/// The context a [`prepare_with_bearer`] builder describes.
+///
+/// # Errors
+/// Returns `Internal` only if security-context construction fails unexpectedly.
+pub(crate) fn build(builder: SecurityContextBuilder) -> Result<SecurityContext> {
     builder
         .build()
         .map_err(|e| AuthNResolverError::Internal(format!("failed to build security context: {e}")))

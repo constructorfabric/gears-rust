@@ -13,12 +13,15 @@ pub enum AuthNResolverError {
     #[error("no plugin available")]
     NoPluginAvailable,
 
-    /// The plugin is not available yet.
+    /// Transient dependency failure: plugin not ready, unreachable `IdP`,
+    /// exhausted retries or open circuit breaker. Allows retry
+    /// and fallback to a still-usable cached result.
     #[error("service unavailable: {0}")]
     ServiceUnavailable(String),
 
-    /// Client credentials exchange failed (e.g., invalid credentials,
-    /// `IdP` unreachable, token endpoint error).
+    /// Non-transient exchange failure: rejected credentials, non-retryable
+    /// endpoint status, malformed response or unusable token.
+    /// Unreachable `IdP` dependencies use [`Self::ServiceUnavailable`].
     #[error("token acquisition failed: {0}")]
     TokenAcquisitionFailed(String),
 

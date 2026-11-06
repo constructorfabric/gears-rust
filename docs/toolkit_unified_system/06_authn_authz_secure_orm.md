@@ -98,8 +98,9 @@ pub async fn list_users(
 | `subject_id` | Yes | Unique subject identifier (from token `sub` claim) |
 | `subject_tenant_id` | Yes | Tenant the subject belongs to |
 | `subject_type` | No | GTS type identifier (e.g., `gts.cf.core.security.subject_user.v1~`) |
-| `token_scopes` | Yes | Capability restrictions (`["*"]` for first-party apps) |
+| `token_scopes` | No | Capability restrictions (`["*"]` for first-party apps). Defaults to an empty list, which grants no token scopes. |
 | `bearer_token` | No | Original token wrapped in `SecretString`, available to an in-process PDP. The evaluation request skips this field during serialization. |
+| `expires_at` | No | Verified or exchanged credential expiry (UTC). Revocation may happen earlier. A credential with unknown expiry can be reused only within a finite cache window. |
 
 ## AuthZ: PolicyEnforcer (PEP)
 

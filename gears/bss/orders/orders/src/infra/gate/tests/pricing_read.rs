@@ -91,7 +91,7 @@ fn authority_over(resolver: FakeResolver) -> Arc<dyn CommercialAuthority> {
     // The principal's home tenant is not the seller: the catalog must still be the seller's.
     // Production wraps the authority once in `CatalogBinding::new`; the double does the same.
     Arc::new(DeadlineAuthority::new(
-        Arc::new(AuthnAuthority::new(Arc::new(resolver), &[identity])),
+        Arc::new(AuthnAuthority::new(Arc::new(resolver), &[identity]).unwrap()),
         AUTHORITY_EXCHANGE_DEADLINE,
     ))
 }
@@ -354,7 +354,7 @@ fn counted_authority() -> (Arc<FakeResolver>, Arc<dyn CommercialAuthority>) {
         client_secret: secrecy::SecretString::from("x"),
         scopes: Vec::new(),
     };
-    let authority = Arc::new(AuthnAuthority::new(resolver.clone(), &[identity]));
+    let authority = Arc::new(AuthnAuthority::new(resolver.clone(), &[identity]).unwrap());
     (resolver, authority)
 }
 

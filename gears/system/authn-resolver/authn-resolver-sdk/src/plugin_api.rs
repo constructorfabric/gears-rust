@@ -7,7 +7,7 @@
 use async_trait::async_trait;
 
 use crate::error::AuthNResolverError;
-use crate::models::{AuthenticationResult, ClientCredentialsRequest};
+use crate::models::{AuthenticationRequest, AuthenticationResult, ClientCredentialsRequest};
 
 /// Plugin API trait for `AuthN` resolver implementations.
 ///
@@ -18,19 +18,22 @@ use crate::models::{AuthenticationResult, ClientCredentialsRequest};
 /// metrics) may be added at the gateway level in the future.
 #[async_trait]
 pub trait AuthNResolverPluginClient: Send + Sync {
-    /// Authenticate a bearer token and return the validated identity.
+    /// Validate `request.bearer_token` and return the validated identity.
     ///
-    /// # Arguments
+    /// # Caching
     ///
-    /// * `bearer_token` - The raw bearer token string
+    /// Honour [`crate::RequestCacheControl`] when serving cached validations.
+    /// To allow caller reuse, set `AuthenticationResult::cache_control` (default no-store)
+    /// with a deadline bounded by credential expiry and an optional refresh tag.
     ///
     /// # Errors
     ///
     /// - `Unauthorized` if the token is invalid, expired, or malformed
+    /// - `ServiceUnavailable` for transient dependency failures
     /// - `Internal` for unexpected errors
     async fn authenticate(
         &self,
-        bearer_token: &str,
+        request: &AuthenticationRequest,
     ) -> Result<AuthenticationResult, AuthNResolverError>;
 
     /// Exchange client credentials for an `AuthenticationResult`.
@@ -45,9 +48,17 @@ pub trait AuthNResolverPluginClient: Send + Sync {
     /// `OAuth2` `scope` parameter. Plugins that do not interact with an
     /// `IdP` (e.g., static dev plugins) may ignore this field.
     ///
+    /// # Caching
+    ///
+    /// Honour `request.cache_control` ([`crate::RequestCacheControl`]), including
+    /// refresh requests. Opt into caller reuse via `AuthenticationResult::cache_control`
+    /// (default no-store). Set `SecurityContext::expires_at` to the token's
+    /// original absolute expiry; cache hits must not extend it.
+    ///
     /// # Errors
     ///
-    /// - `TokenAcquisitionFailed` if credentials are invalid or `IdP` is unreachable
+    /// - `TokenAcquisitionFailed` if credentials are rejected or the obtained token is unusable
+    /// - `ServiceUnavailable` if the `IdP` is unreachable (transient)
     /// - `Internal` for unexpected errors
     async fn exchange_client_credentials(
         &self,

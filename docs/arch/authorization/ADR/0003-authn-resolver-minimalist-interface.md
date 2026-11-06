@@ -59,6 +59,8 @@ pub trait AuthNResolverPluginClient: Send + Sync {
 - Caching strategy (plugin decision)
 - Discovery mechanisms (OIDC, custom)
 
+**Amendment (#5566).** `authenticate` takes an `AuthenticationRequest` with the bearer token and cache policy. Plugins that cache results must honour requests for fresh validation or a result provably newer than the supplied `CacheTag`.
+
 ### Consequences
 
 **Good:**

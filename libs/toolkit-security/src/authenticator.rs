@@ -43,10 +43,10 @@ pub enum AuthNError {
 
 /// Re-validates a raw bearer token and reconstructs a [`SecurityContext`].
 ///
-/// Implementations perform a full validation on every call — there is no
-/// trusted-peer fast path (zero-trust; see `cpt-cf-adr-two-plane-auth`). The transport layer
-/// stays generic over this trait; the concrete `AuthNResolverClient` adapter
-/// is supplied at the gear/bootstrap layer.
+/// Validate the bearer token regardless of peer identity (`cpt-cf-adr-two-plane-auth`).
+/// An adapter may reuse a successful validation of the same token within a finite,
+/// producer-authorized window bounded by known credential expiry. Gear bootstrap
+/// supplies the adapter to the transport.
 ///
 /// The returned future is `Send` so the trait can be used from Axum/Tower
 /// middleware running on a multi-threaded runtime.

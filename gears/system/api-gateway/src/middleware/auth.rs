@@ -7,7 +7,7 @@ use std::{
 
 use crate::middleware::common;
 
-use authn_resolver_sdk::{AuthNResolverClient, AuthNResolverError};
+use authn_resolver_sdk::{AuthNResolverClient, AuthNResolverError, AuthenticationRequest};
 use toolkit_canonical_errors::CanonicalError;
 use toolkit_gateway::ProxyRegistry;
 use toolkit_http_middleware::{admit_platform, retain_route_plane};
@@ -365,7 +365,9 @@ pub async fn authn_middleware(
                 return response;
             };
 
-            match state.authn_client.authenticate(token).await {
+            // Validate every request: `new` forbids a plugin-cached result.
+            let request = AuthenticationRequest::new(token);
+            match state.authn_client.authenticate(&request).await {
                 Ok(result) => {
                     log_auth_succeeded(req.method(), path.as_str(), &result.security_context);
                     req.extensions_mut().insert(result.security_context);

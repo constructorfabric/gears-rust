@@ -103,11 +103,7 @@ fn make_discovery(client: crate::infra::idp_http::IdpHttpClient) -> Arc<OidcDisc
 }
 
 fn make_request(client_id: &str, client_secret: &str) -> ClientCredentialsRequest {
-    ClientCredentialsRequest {
-        client_id: client_id.to_owned(),
-        client_secret: SecretString::from(client_secret),
-        scopes: vec![],
-    }
+    ClientCredentialsRequest::new(client_id.to_owned(), SecretString::from(client_secret))
 }
 
 fn make_request_with_scopes(
@@ -115,11 +111,8 @@ fn make_request_with_scopes(
     client_secret: &str,
     scopes: &[&str],
 ) -> ClientCredentialsRequest {
-    ClientCredentialsRequest {
-        client_id: client_id.to_owned(),
-        client_secret: SecretString::from(client_secret),
-        scopes: scopes.iter().map(|scope| (*scope).to_owned()).collect(),
-    }
+    ClientCredentialsRequest::new(client_id.to_owned(), SecretString::from(client_secret))
+        .with_scopes(authn_resolver_sdk::ScopeSet::new(scopes).unwrap())
 }
 
 struct CountingOidcServer {
@@ -187,8 +180,8 @@ fn spawn_counting_oidc_server_with_issuer_suffix(
 }
 
 #[test]
-fn normalizes_scopes_by_trimming_deduping_and_sorting() {
-    let request = make_request_with_scopes("svc", "secret", &[" write ", "read", "read", ""]);
+fn normalizes_scopes_by_deduping_and_sorting() {
+    let request = make_request_with_scopes("svc", "secret", &["write", "read", "read"]);
     let identity = TokenClient::cache_identity(&request);
 
     assert_eq!(identity.normalized_scopes, "read write");
@@ -197,7 +190,7 @@ fn normalizes_scopes_by_trimming_deduping_and_sorting() {
 #[test]
 fn cache_identity_reuses_scope_permutations() {
     let first = make_request_with_scopes("svc", "secret", &["write", "read"]);
-    let second = make_request_with_scopes("svc", "secret", &[" read ", "write", "read"]);
+    let second = make_request_with_scopes("svc", "secret", &["read", "write", "read"]);
 
     assert_eq!(
         TokenClient::cache_identity(&first).key,
@@ -222,6 +215,23 @@ fn cache_identity_isolates_credentials_and_scope_sets() {
     );
 }
 
+#[test]
+fn normalized_scopes_match_the_sdk_canonical_form() {
+    let request = make_request_with_scopes("svc", "secret", &["write", "Read", "read", "write"]);
+    let sdk = authn_resolver_sdk::ScopeSet::new(["read", "write", "Read"]).unwrap();
+
+    assert_eq!(
+        TokenClient::cache_identity(&request).normalized_scopes,
+        sdk.to_string()
+    );
+}
+
+#[test]
+fn idp_default_scopes_have_an_empty_normalized_form() {
+    let request = make_request("svc", "secret");
+    assert_eq!(TokenClient::cache_identity(&request).normalized_scopes, "");
+}
+
 #[tokio::test]
 async fn post_to_unreachable_endpoint_returns_idp_unreachable() {
     let client = crate::infra::idp_http::IdpHttpClient::insecure_for_tests_with_timeout(
@@ -232,7 +242,7 @@ async fn post_to_unreachable_endpoint_returns_idp_unreachable() {
     let tc = TokenClient::new(client, discovery, config, default_retry_policy_config());
 
     let request = make_request("svc", "secret");
-    let scopes = TokenClient::normalize_scopes(&request.scopes);
+    let scopes = TokenClient::normalize_scopes(request.scopes.as_ref());
     let endpoint =
         url::Url::parse("http://127.0.0.1:1/token").expect("test endpoint URL should parse");
     let result = tc
@@ -253,7 +263,7 @@ async fn post_to_endpoint_with_unsuccessful_status_returns_typed_error() -> anyh
     let tc = TokenClient::new(client, discovery, config, default_retry_policy_config());
     let endpoint = url::Url::parse(&token_endpoint.endpoint())?;
     let request = make_request("svc", "secret");
-    let scopes = TokenClient::normalize_scopes(&request.scopes);
+    let scopes = TokenClient::normalize_scopes(request.scopes.as_ref());
 
     let result = tc
         .post_client_credentials(&endpoint, &request, &scopes)
@@ -281,7 +291,7 @@ async fn post_to_endpoint_with_invalid_json_returns_parse_failure() -> anyhow::R
     let tc = TokenClient::new(client, discovery, config, default_retry_policy_config());
     let endpoint = url::Url::parse(&server.url("/token"))?;
     let request = make_request("svc", "secret");
-    let scopes = TokenClient::normalize_scopes(&request.scopes);
+    let scopes = TokenClient::normalize_scopes(request.scopes.as_ref());
 
     let result = tc
         .post_client_credentials(&endpoint, &request, &scopes)
@@ -315,7 +325,7 @@ async fn token_endpoint_breaker_opens_after_retryable_failure_and_blocks_host() 
         .with_circuit_breakers(Arc::clone(&breakers));
     let endpoint_url = url::Url::parse(&endpoint)?;
     let request = make_request("svc", "secret");
-    let scopes = TokenClient::normalize_scopes(&request.scopes);
+    let scopes = TokenClient::normalize_scopes(request.scopes.as_ref());
 
     let first = tc
         .post_client_credentials(&endpoint_url, &request, &scopes)
@@ -354,14 +364,20 @@ async fn cache_hit_returns_without_network() {
     tc.cache.insert(
         &identity.key,
         CachedToken {
-            access_token: "cached-jwt".to_owned(),
+            token: ExchangedToken {
+                access_token: SecretString::from("cached-jwt"),
+                expires_at: Some(OffsetDateTime::now_utc() + Duration::from_secs(600)),
+                cache_until: OffsetDateTime::now_utc() + Duration::from_secs(300),
+                obtained: Instant::now(),
+                obtained_wall: OffsetDateTime::now_utc(),
+            },
             fetched_at: Instant::now(),
             effective_ttl: Duration::from_mins(5),
         },
     );
 
     let result = tc.exchange(&request, &issuer_trust).await;
-    assert_eq!(result.unwrap(), "cached-jwt");
+    assert_eq!(result.unwrap().access_token.expose_secret(), "cached-jwt");
 }
 
 #[tokio::test]
@@ -397,7 +413,7 @@ async fn concurrent_same_key_miss_uses_single_token_endpoint_call() -> anyhow::R
             .await
             .expect("single-flight task should join")
             .expect("single-flight exchange should succeed");
-        assert_eq!(token, "single-flight-token");
+        assert_eq!(token.access_token.expose_secret(), "single-flight-token");
     }
 
     assert_eq!(
@@ -447,18 +463,18 @@ async fn single_flight_cleanup_preserves_reacquired_gate() {
     let tc = TokenClient::new(client, discovery, config, default_retry_policy_config());
     let key = "svc-key";
 
-    let first = tc.single_flight_gate(key);
-    let second = tc.single_flight_gate(key);
+    let first = SingleFlightLease::acquire(&tc.in_flight, key);
+    let second = SingleFlightLease::acquire(&tc.in_flight, key);
 
-    tc.release_single_flight_gate(key, &first);
+    drop(first);
     let stored = tc
         .in_flight
         .get(key)
         .expect("reacquired gate should remain registered");
-    assert!(Arc::ptr_eq(stored.value(), &second));
+    assert!(std::ptr::eq(Arc::as_ptr(stored.value()), second.gate()));
 
     drop(stored);
-    tc.release_single_flight_gate(key, &second);
+    drop(second);
     assert!(!tc.in_flight.contains_key(key));
 }
 
@@ -481,7 +497,7 @@ async fn retries_transient_5xx_then_succeeds() -> anyhow::Result<()> {
     let endpoint_url = url::Url::parse(&endpoint)?;
 
     let request = make_request("svc", "secret");
-    let scopes = TokenClient::normalize_scopes(&request.scopes);
+    let scopes = TokenClient::normalize_scopes(request.scopes.as_ref());
     let token = tc
         .post_client_credentials(&endpoint_url, &request, &scopes)
         .await?;
@@ -510,7 +526,7 @@ async fn retries_429_using_retry_after_capped_by_max_backoff() -> anyhow::Result
     let endpoint_url = url::Url::parse(&endpoint)?;
 
     let request = make_request("svc", "secret");
-    let scopes = TokenClient::normalize_scopes(&request.scopes);
+    let scopes = TokenClient::normalize_scopes(request.scopes.as_ref());
     let start = Instant::now();
     let token = tc
         .post_client_credentials(&endpoint_url, &request, &scopes)
@@ -553,7 +569,7 @@ async fn token_post_lost_after_sending_is_not_sent_again() -> anyhow::Result<()>
     let tc = TokenClient::new(client, discovery, config, no_backoff_retries(3));
     let endpoint_url = url::Url::parse(&format!("http://{}/token", endpoint.addr))?;
     let request = make_request("svc", "secret");
-    let scopes = TokenClient::normalize_scopes(&request.scopes);
+    let scopes = TokenClient::normalize_scopes(request.scopes.as_ref());
 
     let result = tc
         .post_client_credentials(&endpoint_url, &request, &scopes)
@@ -581,7 +597,7 @@ async fn token_body_stall_is_an_idp_failure() -> anyhow::Result<()> {
     let tc = TokenClient::new(client, discovery, config, no_backoff_retries(0));
     let endpoint_url = url::Url::parse(&format!("http://{}/token", endpoint.addr))?;
     let request = make_request("svc", "secret");
-    let scopes = TokenClient::normalize_scopes(&request.scopes);
+    let scopes = TokenClient::normalize_scopes(request.scopes.as_ref());
 
     let result = tc
         .post_client_credentials(&endpoint_url, &request, &scopes)
@@ -591,5 +607,332 @@ async fn token_body_stall_is_an_idp_failure() -> anyhow::Result<()> {
         matches!(result, Err(AuthNError::IdpUnreachable)),
         "{result:?}"
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn lower_cache_preserves_original_lifetime_and_refresh_always_bypasses_it()
+-> anyhow::Result<()> {
+    let server = spawn_counting_oidc_server_with_issuer_suffix(Duration::ZERO, "")?;
+    let discovery_url = server.discovery_url();
+    let calls = server.token_calls();
+    let client = crate::infra::idp_http::IdpHttpClient::insecure_for_tests();
+    let tc = TokenClient::new(
+        client.clone(),
+        make_discovery(client),
+        make_s2s_config(&discovery_url),
+        default_retry_policy_config(),
+    );
+    let trust = make_issuer_trust(discovery_url);
+    let request = make_request("svc", "secret");
+    let first = tc.exchange(&request, &trust).await?;
+    let hit = tc.exchange(&request, &trust).await?;
+    assert_eq!(
+        first.access_token.expose_secret(),
+        hit.access_token.expose_secret()
+    );
+    assert_eq!(
+        first.expires_at, hit.expires_at,
+        "OAuth expiry must not slide on a cache hit"
+    );
+    assert_eq!(
+        first.cache_until, hit.cache_until,
+        "reuse policy must not slide either"
+    );
+    assert_eq!(
+        (first.obtained, first.obtained_wall),
+        (hit.obtained, hit.obtained_wall),
+        "a hit keeps the acquisition's clock readings"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    for tag in [
+        None,
+        Some(authn_resolver_sdk::CacheTag::new("unknown-replica")),
+    ] {
+        let refresh = make_request("svc", "secret")
+            .with_cache_control(RequestCacheControl::Refresh { replacing: tag });
+        tc.exchange(&refresh, &trust).await?;
+    }
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        3,
+        "tagged and unconditional refresh both contact IdP"
+    );
+    Ok(())
+}
+
+fn counting_client(server: &CountingOidcServer) -> (TokenClient, IssuerTrustConfig) {
+    let client = crate::infra::idp_http::IdpHttpClient::insecure_for_tests();
+    let tc = TokenClient::new(
+        client.clone(),
+        make_discovery(client),
+        make_s2s_config(server.discovery_url()),
+        default_retry_policy_config(),
+    );
+    (tc, make_issuer_trust(server.discovery_url()))
+}
+
+/// A counting server whose token endpoint signals `entered` on each request
+/// and answers only once the test sends on `release`.
+struct GatedOidcServer {
+    counting: CountingOidcServer,
+    entered: std::sync::mpsc::Receiver<()>,
+    release: std::sync::mpsc::Sender<()>,
+}
+
+fn spawn_gated_oidc_server() -> GatedOidcServer {
+    let server = MockServer::start();
+    let base_url = server.base_url();
+    let token_calls = Arc::new(AtomicUsize::new(0));
+    let discovery_body = json!({
+        "issuer": base_url,
+        "jwks_uri": format!("{base_url}/certs"),
+        "token_endpoint": format!("{base_url}/token"),
+    });
+    server.mock(move |when, then| {
+        when.method(GET).path("/.well-known/openid-configuration");
+        then.status(200)
+            .header("content-type", "application/json")
+            .json_body(discovery_body);
+    });
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let release_rx = std::sync::Mutex::new(release_rx);
+    let token_calls_for_mock = Arc::clone(&token_calls);
+    server.mock(move |when, then| {
+        when.method(POST).path("/token");
+        then.respond_with(move |_| {
+            token_calls_for_mock.fetch_add(1, Ordering::SeqCst);
+            match entered_tx.send(()) {
+                Ok(()) | Err(_) => {}
+            }
+            match release_rx.lock().unwrap().recv() {
+                Ok(()) | Err(_) => {}
+            }
+            HttpMockResponse::builder()
+                .status(200)
+                .header("content-type", "application/json")
+                .body(
+                    json!({
+                        "access_token": "single-flight-token",
+                        "token_type": "Bearer",
+                        "expires_in": 300,
+                    })
+                    .to_string(),
+                )
+                .build()
+        });
+    });
+    GatedOidcServer {
+        counting: CountingOidcServer {
+            server,
+            token_calls,
+        },
+        entered: entered_rx,
+        release: release_tx,
+    }
+}
+
+#[tokio::test]
+async fn cancelled_exchanges_return_their_single_flight_lease() -> anyhow::Result<()> {
+    let GatedOidcServer {
+        counting: server,
+        entered,
+        release,
+    } = spawn_gated_oidc_server();
+    let (tc, trust) = counting_client(&server);
+    let tc = Arc::new(tc);
+    let trust = Arc::new(trust);
+    let request = make_request("svc", "secret");
+
+    // Cancelled while holding the gate: the token endpoint was entered and
+    // does not answer until the holder is gone.
+    let holder = {
+        let (tc, trust, request) = (Arc::clone(&tc), Arc::clone(&trust), request.clone());
+        tokio::spawn(async move { tc.exchange(&request, &trust).await })
+    };
+    tokio::task::spawn_blocking(move || entered.recv_timeout(Duration::from_secs(5))).await??;
+    assert_eq!(tc.in_flight.len(), 1, "the holder leases the gate");
+    holder.abort();
+    assert!(holder.await.is_err_and(|error| error.is_cancelled()));
+    assert!(tc.in_flight.is_empty(), "the holder's lease was returned");
+    release.send(())?;
+
+    // Cancelled while waiting for the gate, which another caller holds.
+    let key = TokenClient::cache_identity(&request).key;
+    let other = SingleFlightLease::acquire(&tc.in_flight, &key);
+    let held = other.gate().mutex.lock().await;
+    let refresh = make_request("svc", "secret").with_cache_control(RequestCacheControl::refresh());
+    let mut waiter = Box::pin(tc.exchange(&refresh, &trust));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(10), &mut waiter)
+            .await
+            .is_err(),
+        "waits while the gate is held"
+    );
+    let gate = Arc::clone(tc.in_flight.get(&key).unwrap().value());
+    assert_eq!(Arc::strong_count(&gate), 4, "map, other, waiter, here");
+    drop(waiter);
+    assert_eq!(
+        Arc::strong_count(&gate),
+        3,
+        "the waiter's lease was returned"
+    );
+    drop(held);
+    drop(other);
+    drop(gate);
+    assert!(tc.in_flight.is_empty());
+    Ok(())
+}
+
+#[test]
+fn exchanged_and_cached_tokens_redact_the_access_token_in_debug() {
+    let token = ExchangedToken {
+        access_token: SecretString::from("sentinel-access-token"),
+        expires_at: None,
+        cache_until: OffsetDateTime::now_utc(),
+        obtained: Instant::now(),
+        obtained_wall: OffsetDateTime::now_utc(),
+    };
+    let cached = CachedToken {
+        token: token.clone(),
+        fetched_at: Instant::now(),
+        effective_ttl: Duration::from_secs(1),
+    };
+
+    for rendered in [
+        format!("{token:?}"),
+        format!("{cached:?}"),
+        format!("{cached:#?}"),
+    ] {
+        assert!(!rendered.contains("sentinel-access-token"), "{rendered}");
+    }
+}
+
+#[tokio::test]
+async fn token_lifetime_starts_before_the_token_request() -> anyhow::Result<()> {
+    let delay = Duration::from_secs(1);
+    let server = spawn_counting_oidc_server_with_issuer_suffix(delay, "")?;
+    let (tc, trust) = counting_client(&server);
+    // Warm discovery so only the token request takes time below.
+    tc.exchange(&make_request("warm-up", "secret"), &trust)
+        .await?;
+
+    let before = OffsetDateTime::now_utc();
+    let token = tc.exchange(&make_request("svc", "secret"), &trust).await?;
+
+    // The endpoint answers `expires_in: 300` after `delay`. Anchored after the
+    // response, both deadlines would be at least `before + delay + 300s`.
+    let bound = before + Duration::from_secs(300) + delay / 2;
+    assert!(token.expires_at.unwrap() < bound, "{:?}", token.expires_at);
+    assert!(token.cache_until < bound, "{:?}", token.cache_until);
+    Ok(())
+}
+
+#[tokio::test]
+async fn lower_cache_entry_past_either_wall_deadline_is_not_served() -> anyhow::Result<()> {
+    let now = OffsetDateTime::now_utc();
+    let past = now - Duration::from_secs(1);
+    let future = now + Duration::from_secs(300);
+    for (expires_at, cache_until) in [(Some(past), future), (Some(future), past), (None, past)] {
+        let server = spawn_counting_oidc_server_with_issuer_suffix(Duration::ZERO, "")?;
+        let (tc, trust) = counting_client(&server);
+        let request = make_request("svc", "secret");
+        let identity = TokenClient::cache_identity(&request);
+        // Fresh by the monotonic TTL; only the wall deadlines have passed.
+        tc.cache.insert(
+            &identity.key,
+            CachedToken {
+                token: ExchangedToken {
+                    access_token: SecretString::from("stale-jwt"),
+                    expires_at,
+                    cache_until,
+                    obtained: Instant::now(),
+                    obtained_wall: now,
+                },
+                fetched_at: Instant::now(),
+                effective_ttl: Duration::from_mins(5),
+            },
+        );
+
+        let token = tc.exchange(&request, &trust).await?;
+
+        assert_eq!(token.access_token.expose_secret(), "single-flight-token");
+        assert_eq!(
+            server.token_calls().load(Ordering::SeqCst),
+            1,
+            "expires_at {expires_at:?}, cache_until {cache_until}"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+#[tracing_test::traced_test]
+async fn refresh_replaces_the_lower_cache_entry_and_is_logged_as_a_refresh() -> anyhow::Result<()> {
+    let server = spawn_counting_oidc_server_with_issuer_suffix(Duration::ZERO, "")?;
+    let calls = server.token_calls();
+    let (tc, trust) = counting_client(&server);
+    let first = tc.exchange(&make_request("svc", "secret"), &trust).await?;
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    let refresh = make_request("svc", "secret").with_cache_control(RequestCacheControl::refresh());
+    let refreshed = tc.exchange(&refresh, &trust).await?;
+    let hit = tc.exchange(&make_request("svc", "secret"), &trust).await?;
+
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        2,
+        "the follow-up was a cache hit"
+    );
+    assert!(refreshed.cache_until > first.cache_until);
+    assert_eq!(
+        hit.cache_until, refreshed.cache_until,
+        "serves the refreshed token"
+    );
+    assert_eq!(hit.expires_at, refreshed.expires_at);
+    assert!(logs_contain("S2S token refresh requested"));
+    assert!(logs_contain("tagged=false"));
+    Ok(())
+}
+
+#[tokio::test]
+#[tracing_test::traced_test]
+async fn unrepresentable_expires_in_fails_and_is_logged() -> anyhow::Result<()> {
+    let server = MockServer::start();
+    let base_url = server.base_url();
+    server.mock(|when, then| {
+        when.method(GET).path("/.well-known/openid-configuration");
+        then.status(200).json_body(json!({
+            "issuer": base_url,
+            "jwks_uri": format!("{base_url}/certs"),
+            "token_endpoint": format!("{base_url}/token"),
+        }));
+    });
+    server.mock(|when, then| {
+        when.method(POST).path("/token");
+        then.status(200).json_body(json!({
+            "access_token": "never-cached",
+            "token_type": "Bearer",
+            "expires_in": u64::MAX,
+        }));
+    });
+    let client = crate::infra::idp_http::IdpHttpClient::insecure_for_tests();
+    let tc = TokenClient::new(
+        client.clone(),
+        make_discovery(client),
+        make_s2s_config(server.base_url()),
+        default_retry_policy_config(),
+    );
+    let trust = make_issuer_trust(server.base_url());
+
+    let result = tc.exchange(&make_request("svc", "secret"), &trust).await;
+
+    assert!(matches!(result, Err(AuthNError::TokenResponseParseFailed)));
+    assert!(logs_contain(
+        "S2S token lifetime is out of the representable range"
+    ));
+    assert!(logs_contain("field=\"expires_in\""));
+    assert!(!logs_contain("never-cached"));
     Ok(())
 }

@@ -51,5 +51,6 @@ tracing = { workspace = true }
 [dev-dependencies]
 # `gts_id!` for the registry error scope the selection tests fail with.
 toolkit-gts = { workspace = true }
+secrecy = { workspace = true }
 types-registry-sdk = { workspace = true, features = ["test-util"] }
 tokio = { workspace = true, features = ["macros", "rt", "test-util"] }

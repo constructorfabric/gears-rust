@@ -25,7 +25,9 @@ use crate::config::{SettingsServiceConfig, StepUpConfig};
 use crate::domain::stepup::{StepUpRefusal, StepUpRequirement, StepUpSubject, StepUpVerifier};
 
 /// Admits the tokens it was given, each as the platform subject the test
-/// names, and refuses everything else as unauthorized.
+/// names, and refuses everything else as unauthorized. A request that would
+/// let the plugin serve a cached result is an internal error: a step-up is
+/// always a fresh verification.
 struct FixedResolver {
     admitted: HashMap<String, Uuid>,
 }
@@ -34,19 +36,26 @@ struct FixedResolver {
 impl AuthNResolverClient for FixedResolver {
     async fn authenticate(
         &self,
-        bearer_token: &str,
+        request: &authn_resolver_sdk::AuthenticationRequest,
     ) -> Result<AuthenticationResult, AuthNResolverError> {
+        if request.cache_control != authn_resolver_sdk::RequestCacheControl::refresh() {
+            return Err(AuthNResolverError::Internal(format!(
+                "expected a fresh verification, got {:?}",
+                request.cache_control
+            )));
+        }
+        let bearer_token = secrecy::ExposeSecret::expose_secret(&request.bearer_token);
         let subject = self
             .admitted
             .get(bearer_token)
             .ok_or_else(|| AuthNResolverError::Unauthorized("unknown token".to_owned()))?;
-        Ok(AuthenticationResult {
-            security_context: SecurityContext::builder()
+        Ok(AuthenticationResult::new(
+            SecurityContext::builder()
                 .subject_id(*subject)
                 .subject_tenant_id(Uuid::nil())
                 .build()
                 .expect("context"),
-        })
+        ))
     }
 
     async fn exchange_client_credentials(
@@ -431,7 +440,7 @@ struct DownResolver(fn() -> AuthNResolverError);
 impl AuthNResolverClient for DownResolver {
     async fn authenticate(
         &self,
-        _bearer_token: &str,
+        _request: &authn_resolver_sdk::AuthenticationRequest,
     ) -> Result<AuthenticationResult, AuthNResolverError> {
         Err((self.0)())
     }

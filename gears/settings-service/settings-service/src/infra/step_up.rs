@@ -21,6 +21,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use authn_resolver_sdk::AuthNResolverClient;
 use authn_resolver_sdk::AuthNResolverError;
+use authn_resolver_sdk::AuthenticationRequest;
 use serde_json::Value;
 use toolkit::ClientHub;
 
@@ -168,9 +169,11 @@ impl StepUpVerifier for AuthnStepUpVerifier {
         // @cpt-begin:cpt-cf-settings-service-algo-value-writes-step-up:p1:inst-vw-su-2
         // The platform validates the token as it validates every session
         // token — same trust store, same key cache, no address of our own.
+        // A step-up must be a fresh verification, which `new` requests.
+        let request = AuthenticationRequest::new(token);
         let authenticated = self
             .resolver()?
-            .authenticate(token)
+            .authenticate(&request)
             .await
             .map_err(|e| match e {
                 // The resolver looked at the token and said no.
