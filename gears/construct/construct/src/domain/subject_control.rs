@@ -315,14 +315,17 @@ impl SubjectControlService {
                 category: fact.category,
             });
         }
+        // @cpt-begin:cpt-cf-construct-algo-subject-control-delete:p1:inst-del-close
         // A fact already gone may still have an open request left by an
         // earlier delete whose close failed; this closes it.
         let closed = close_on_delete(
             self.ports.reviews.as_ref(),
             self.ports.review_events.as_ref(),
+            &self.ports.writes,
             &scope,
             key,
             fact_id,
+            matches!(removed, Removed::Removed(_)),
         )
         .await
         .map_err(|err| match err {
@@ -342,6 +345,7 @@ impl SubjectControlService {
             Removed::Gone if closed => Ok(()),
             Removed::Gone => Err(no_such_fact(fact_id)),
         }
+        // @cpt-end:cpt-cf-construct-algo-subject-control-delete:p1:inst-del-close
     }
 
     /// A subject's data, for the data protection officer of the caller's

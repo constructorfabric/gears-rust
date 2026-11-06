@@ -152,8 +152,9 @@ The DESIGN lists the view, the delete and the export. The single-fact read is ad
 - The subject gets 204; the fact is not served from the next read.
 
 **Error Scenarios**:
-- Another subject, a refusal, or a fact the subject does not have: 404, and nothing is written.
+- Another subject, a refusal, or a fact the subject does not have: 404, and nothing is written. A fact already gone that still has an open review request: the request closes, and 204.
 - The profile kept changing past the reruns: 503, and the fact stays.
+- The fact is deleted, but its open review request could not be closed: 503; a repeat finds the fact gone and closes it.
 - No processing identity: 501.
 
 **Steps**:
@@ -217,10 +218,11 @@ The DESIGN lists the view, the delete and the export. The single-fact read is ad
 
 **Steps**:
 1. [x] - `p1` - Start the budget (20 seconds). Run `cpt-cf-construct-algo-subject-control-owner-only` for `delete`, and build Construct's context for the tenant, both cut off when the budget runs out (unavailable, nothing written) - `inst-del-own`
-2. [x] - `p1` - Read the subject's facts as in `cpt-cf-construct-algo-subject-control-read-facts`, cut off when the budget runs out; **IF** the budget ran out, unavailable, and nothing is written. **IF** no live fact has the id, no such fact, and nothing is written - `inst-del-read`
+2. [x] - `p1` - Read the subject's facts as in `cpt-cf-construct-algo-subject-control-read-facts`, cut off when the budget runs out; **IF** the budget ran out, unavailable, and nothing is written. **IF** no live fact has the id, nothing is written, and the delete goes on to step 6 with the fact gone - `inst-del-read`
 3. [x] - `p1` - Build a plan with one step that removes the fact, of its category, with the subject as origin and the version just read, and write it through the profile writer, for at most 90 seconds. **IF** the writer fails or runs out, read the facts once more: the fact gone counts as stored; otherwise unavailable, as the delete may have landed - `inst-del-write`
-4. [x] - `p1` - **IF** the writer stored it, record a delete event with the fact's id and category. **RETURN** done. On a conflict, log it at debug level, pause briefly (growing, jittered), and go back to step 2, at most `processing.max_reruns` times and while the budget lasts; no pause follows the last write - `inst-del-stored`
+4. [x] - `p1` - **IF** the writer stored it, record a delete event with the fact's id and category, and go on to step 6. On a conflict, log it at debug level, pause briefly (growing, jittered), and go back to step 2, at most `processing.max_reruns` times and while the budget lasts; no pause follows the last write - `inst-del-stored`
 5. [x] - `p1` - **RETURN** unavailable: the profile kept changing - `inst-del-give-up`
+6. [x] - `p1` - Close the fact's open review request, if it has one, as `cpt-cf-construct-dod-review-queue-subject-control` says: as deleted by the subject, or as a reviewer's resolution recorded on it whose write is in the profile; **IF** the request store fails, unavailable, and a repeat closes it. **RETURN** done when the fact was removed or a request was closed; otherwise no such fact - `inst-del-close`
 
 ### Cut a Page
 

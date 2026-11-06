@@ -400,17 +400,17 @@ async fn the_open_request_on_a_fact_closes_by_the_fact_claimed_or_not() {
         reason: None,
     };
 
+    let (found, recorded) = store
+        .open_request_on(&scope, key, &NodeKey("construct:t:a".to_owned()))
+        .await
+        .unwrap()
+        .unwrap();
     let closed = store
-        .close_open_on(&scope, key, &NodeKey("construct:t:a".to_owned()), &deleted)
+        .close_open(&scope, found.key(), recorded.as_ref(), &deleted)
         .await
         .unwrap();
     let nothing = store
-        .close_open_on(
-            &scope,
-            key,
-            &NodeKey("construct:t:zzz".to_owned()),
-            &deleted,
-        )
+        .open_request_on(&scope, key, &NodeKey("construct:t:zzz".to_owned()))
         .await
         .unwrap();
     let under_review = store.under_review(&scope, key).await.unwrap();
@@ -420,7 +420,9 @@ async fn the_open_request_on_a_fact_closes_by_the_fact_claimed_or_not() {
         Some(ReviewStatus::Closed(deleted)),
         "the subject's delete closes a request a reviewer holds"
     );
-    assert_eq!(nothing, None);
+    assert_eq!(found.id, claimed.id);
+    assert_eq!(recorded, None, "the claim recorded nothing");
+    assert!(nothing.is_none());
     assert_eq!(
         under_review
             .into_iter()
@@ -428,6 +430,58 @@ async fn the_open_request_on_a_fact_closes_by_the_fact_claimed_or_not() {
             .collect::<Vec<_>>(),
         ["construct:t:b"],
         "the closed one and another subject's are not"
+    );
+}
+
+#[tokio::test]
+async fn the_subjects_close_reads_what_the_claim_recorded_and_takes_nothing_it_did_not_read() {
+    let store = store().await;
+    let key = key();
+    let scope = tenant(key);
+    let request = opened(&store, new(key, "construct:t:a", 0)).await;
+    let claim = ClaimId(Uuid::new_v4());
+    claim_at(&store, &request, claim, 10).await;
+    let deleted = Closed {
+        outcome: ReviewOutcome::Deleted,
+        by: key.subject_id,
+        at: at(20),
+        reason: None,
+    };
+    let corrected = Closed {
+        outcome: ReviewOutcome::Corrected(NodeKey("construct:t:new".to_owned())),
+        by: Uuid::new_v4(),
+        at: at(15),
+        reason: None,
+    };
+    assert!(
+        store
+            .pend(&scope, request.key(), claim, &corrected)
+            .await
+            .unwrap()
+    );
+
+    let (_, recorded) = store
+        .open_request_on(&scope, key, &NodeKey("construct:t:a".to_owned()))
+        .await
+        .unwrap()
+        .unwrap();
+    let unread = store
+        .close_open(&scope, request.key(), None, &deleted)
+        .await
+        .unwrap();
+    let read = store
+        .close_open(&scope, request.key(), recorded.as_ref(), &corrected)
+        .await
+        .unwrap();
+
+    assert_eq!(recorded.as_ref(), Some(&corrected));
+    assert_eq!(
+        unread, None,
+        "a close that did not see the claim's record takes nothing"
+    );
+    assert_eq!(
+        read.map(|request| request.status),
+        Some(ReviewStatus::Closed(corrected))
     );
 }
 
@@ -678,6 +732,9 @@ async fn a_bad_filter_or_cursor_is_the_callers_mistake() {
     let bad_open_filter = store
         .open_page(&scope, key.tenant_id, &filtered("state eq 'open'"))
         .await;
+    let selected = ODataQuery::new().with_select(vec!["id".to_owned()]);
+    let subject_select = store.subject_page(&scope, key, &selected).await;
+    let open_select = store.open_page(&scope, key.tenant_id, &selected).await;
 
     assert!(
         matches!(
@@ -707,6 +764,15 @@ async fn a_bad_filter_or_cursor_is_the_callers_mistake() {
         ),
         "the reviewers' list has no state field: {bad_open_filter:?}"
     );
+    for selected in [subject_select, open_select] {
+        assert!(
+            matches!(
+                selected,
+                Err(DomainError::InvalidQuery(QueryError::Select(_)))
+            ),
+            "refused, not dropped: {selected:?}"
+        );
+    }
 }
 
 /// A row as an operator's hand or an old version could leave it, inserted

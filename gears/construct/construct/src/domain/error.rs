@@ -50,11 +50,11 @@ pub enum DomainError {
     #[error("Review conflict: {0}")]
     ReviewConflict(ReviewConflict),
 
-    /// A reviewer's corrected value is for another property than the fact's,
-    /// or its property's schema does not take it. The message names the rule,
-    /// never the value.
-    #[error("Invalid value: {0}")]
-    InvalidValue(String),
+    /// A reviewer's correction is for another property than the fact's
+    /// (`property`), or its property's schema does not take the value
+    /// (`value`). The rule never repeats the value.
+    #[error("Invalid {field}: {rule}")]
+    InvalidValue { field: &'static str, rule: String },
 
     /// A correction the checks or Admission did not let through; nothing was
     /// stored.

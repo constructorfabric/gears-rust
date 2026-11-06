@@ -288,7 +288,7 @@ async fn a_correction_answers_the_closed_request_with_the_new_facts_id() {
         tenant.reviewer(),
         Method::POST,
         &resolution(&id),
-        Some(json!({ "outcome": "corrected", "properties": { "skills": { "name": "Go" } } })),
+        Some(json!({ "outcome": "corrected", "property": "skills", "value": { "name": "Go" } })),
     )
     .await;
 
@@ -319,7 +319,7 @@ async fn a_correction_admission_refuses_is_422_and_the_request_stays_open() {
         tenant.routes(Arc::new(AllowResolver), Uuid::new_v4(), off),
         Method::POST,
         &resolution(&id),
-        Some(json!({ "outcome": "corrected", "properties": { "skills": { "name": "Go" } } })),
+        Some(json!({ "outcome": "corrected", "property": "skills", "value": { "name": "Go" } })),
     )
     .await;
 
@@ -336,7 +336,7 @@ async fn a_correction_admission_refuses_is_422_and_the_request_stays_open() {
         "{}",
         answer.body
     );
-    assert_eq!(violation["subject"], json!("properties"));
+    assert_eq!(violation["subject"], json!("value"));
     assert!(tenant.reviews.all()[0].is_open());
 }
 
@@ -348,29 +348,30 @@ async fn a_body_that_does_not_fit_its_outcome_is_400_naming_the_field() {
     for (body, field) in [
         (json!({ "outcome": "rejected" }), "reason"),
         (json!({ "outcome": "rejected", "reason": "  " }), "reason"),
-        (json!({ "outcome": "corrected" }), "properties"),
+        (json!({ "outcome": "corrected" }), "property"),
         (
-            json!({ "outcome": "deleted", "properties": { "skills": { "name": "Go" } } }),
-            "properties",
+            json!({ "outcome": "corrected", "property": "skills" }),
+            "value",
         ),
         (
-            json!({ "outcome": "corrected", "properties": { "skills": { "name": "" } } }),
-            "properties",
+            json!({ "outcome": "deleted", "property": "skills", "value": { "name": "Go" } }),
+            "property",
+        ),
+        (
+            json!({ "outcome": "rejected", "reason": "x", "value": { "name": "Go" } }),
+            "value",
+        ),
+        (
+            json!({ "outcome": "corrected", "property": "skills", "value": { "name": "" } }),
+            "value",
+        ),
+        (
+            json!({ "outcome": "corrected", "property": "roles", "value": { "title": "Lead" } }),
+            "property",
         ),
         (
             json!({ "outcome": "rejected", "reason": "x".repeat(1001) }),
             "reason",
-        ),
-        (
-            json!({ "outcome": "corrected", "properties": {} }),
-            "properties",
-        ),
-        (
-            json!({
-                "outcome": "corrected",
-                "properties": { "skills": { "name": "Go" }, "roles": { "title": "Lead" } }
-            }),
-            "properties",
         ),
     ] {
         let answer = send(
@@ -425,7 +426,7 @@ async fn a_held_or_unclosed_request_is_409_with_a_reason_a_client_tells_apart() 
     let id = tenant.flagged().await;
     let reject = || Some(json!({ "outcome": "rejected", "reason": "it is right" }));
     let correct =
-        Some(json!({ "outcome": "corrected", "properties": { "skills": { "name": "Go" } } }));
+        Some(json!({ "outcome": "corrected", "property": "skills", "value": { "name": "Go" } }));
 
     tenant.reviews.hold_first(time::OffsetDateTime::now_utc());
     let held = send(tenant.reviewer(), Method::POST, &resolution(&id), reject()).await;

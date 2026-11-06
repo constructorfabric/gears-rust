@@ -518,8 +518,8 @@ pub struct FlagFactRequest {
 }
 
 /// A reviewer's decision on an open review request. `reason` is required to
-/// reject; `properties` is required to correct, and only there: the fact's
-/// own property with its new value.
+/// reject; `property` and `value` are required to correct, and only there:
+/// the fact's own property, as a fact names it, and its new value.
 #[derive(Debug)]
 #[toolkit_macros::api_dto(request)]
 #[serde(deny_unknown_fields)]
@@ -529,9 +529,12 @@ pub struct ResolutionRequest {
     #[serde(default)]
     #[schema(max_length = 1000)]
     pub reason: Option<String>,
+    /// The fact's property, such as `skills`.
     #[serde(default)]
-    #[schema(value_type = Option<Object>)]
-    pub properties: Option<serde_json::Map<String, serde_json::Value>>,
+    pub property: Option<String>,
+    /// The new value: a string, or an object for a property with fields.
+    #[serde(default)]
+    pub value: Option<serde_json::Value>,
 }
 
 /// Why a resolution's body does not fit its outcome: the field and the rule.
@@ -550,28 +553,28 @@ impl TryFrom<ResolutionRequest> for Resolution {
             Ok(reason) => reason,
             Err(rule) => return mistake("reason", rule.description()),
         };
-        match (body.outcome, body.properties) {
-            (ReviewOutcomeDto::Rejected, None) => match reason {
+        match (body.outcome, body.property, body.value) {
+            (ReviewOutcomeDto::Rejected, None, None) => match reason {
                 Some(reason) => Ok(Self::Rejected { reason }),
                 None => mistake("reason", "a rejection needs a reason"),
             },
-            (ReviewOutcomeDto::Deleted, None) => Ok(Self::Deleted { reason }),
-            (ReviewOutcomeDto::Corrected, Some(properties)) => {
-                let mut properties = properties.into_iter();
-                match (properties.next(), properties.next()) {
-                    (Some((property, value)), None) => Ok(Self::Corrected {
-                        property,
-                        value,
-                        reason,
-                    }),
-                    _ => mistake("properties", "a correction sets exactly one property"),
-                }
+            (ReviewOutcomeDto::Deleted, None, None) => Ok(Self::Deleted { reason }),
+            (ReviewOutcomeDto::Corrected, Some(property), Some(value)) => Ok(Self::Corrected {
+                property,
+                value,
+                reason,
+            }),
+            (ReviewOutcomeDto::Corrected, None, _) => {
+                mistake("property", "a correction needs the fact's property")
             }
-            (ReviewOutcomeDto::Corrected, None) => {
-                mistake("properties", "a correction needs the new value")
+            (ReviewOutcomeDto::Corrected, Some(_), None) => {
+                mistake("value", "a correction needs the new value")
             }
-            (ReviewOutcomeDto::Rejected | ReviewOutcomeDto::Deleted, Some(_)) => {
-                mistake("properties", "only a correction takes properties")
+            (ReviewOutcomeDto::Rejected | ReviewOutcomeDto::Deleted, Some(_), _) => {
+                mistake("property", "only a correction takes a property")
+            }
+            (ReviewOutcomeDto::Rejected | ReviewOutcomeDto::Deleted, None, Some(_)) => {
+                mistake("value", "only a correction takes a value")
             }
         }
     }

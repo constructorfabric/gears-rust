@@ -408,8 +408,8 @@ pub fn register_review_queue_routes(
         .summary("Resolve an open review request")
         .description(
             "Close an open review request of the caller's tenant as `rejected` (with a \
-             `reason`), `deleted`, or `corrected` (with `properties`: the fact's own property \
-             and its new value). A correction passes the sensitive-data checks and Admission \
+             `reason`), `deleted`, or `corrected` (with `property`, the fact's own property, \
+             and its new `value`). A correction passes the sensitive-data checks and Admission \
              and gives the fact a new id; when they refuse it, 422 and the request stays \
              open. A correction of a fact that is gone closes the request as deleted. Needs \
              the permission to resolve review requests; without it, 403. An unknown \

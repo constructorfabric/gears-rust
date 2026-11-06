@@ -122,7 +122,7 @@ pub fn for_settings(e: DomainError) -> CanonicalError {
         | DomainError::ProfileFull(_)
         | DomainError::NoSuchReviewRequest(_)
         | DomainError::ReviewConflict(_)
-        | DomainError::InvalidValue(_)
+        | DomainError::InvalidValue { .. }
         | DomainError::NotStored(_)
         | DomainError::Database(_)) => e.into(),
     }
@@ -189,7 +189,7 @@ pub fn for_export(e: DomainError) -> CanonicalError {
         | DomainError::NotVisible(_)
         | DomainError::NoSuchReviewRequest(_)
         | DomainError::ReviewConflict(_)
-        | DomainError::InvalidValue(_)
+        | DomainError::InvalidValue { .. }
         | DomainError::NotStored(_)
         | DomainError::Database(_)) => e.into(),
     }
@@ -243,7 +243,7 @@ pub fn for_facts(e: DomainError, subject_id: Uuid) -> CanonicalError {
         | DomainError::ProfileFull(_)
         | DomainError::NoSuchReviewRequest(_)
         | DomainError::ReviewConflict(_)
-        | DomainError::InvalidValue(_)
+        | DomainError::InvalidValue { .. }
         | DomainError::NotStored(_)
         | DomainError::Database(_)) => e.into(),
     }
@@ -267,7 +267,7 @@ pub fn bad_resolution(mistake: &crate::api::rest::dto::BodyMistake) -> Canonical
 fn not_stored(reason: crate::domain::review_queue::NotStored, rest: bool) -> CanonicalError {
     tracing::info!(reason = reason.name(), "construct correction not stored");
     let error = ReviewRequestError::failed_precondition().with_precondition_violation(
-        "properties",
+        "value",
         "the correction was not stored; the review request stays open",
         reason.name(),
     );
@@ -312,7 +312,7 @@ pub fn for_reviews(e: DomainError) -> CanonicalError {
         | DomainError::NoSuchFact(_)
         | DomainError::NoSuchReviewRequest(_)
         | DomainError::ReviewConflict(_)
-        | DomainError::InvalidValue(_)
+        | DomainError::InvalidValue { .. }
         | DomainError::Internal(_)
         | DomainError::ProfileFull(_)
         | DomainError::Database(_)) => e.into(),
@@ -391,18 +391,19 @@ impl From<DomainError> for CanonicalError {
                     .with_resource("review_request")
                     .create()
             }
-            // A second open request on a fact, or a request already closed:
-            // the message names only ids the caller sent.
+            // A second open request on a fact, a request already closed, or a
+            // resolution that was written but not closed: the message names
+            // the request and fact ids, and a correction's new fact id.
             DomainError::ReviewConflict(conflict) => {
                 tracing::info!(%conflict, "construct review request conflict");
                 ReviewRequestError::aborted(conflict.to_string())
                     .with_reason(conflict.reason())
                     .create()
             }
-            DomainError::InvalidValue(rule) => {
-                tracing::info!(rule = %rule, "construct correction value refused");
+            DomainError::InvalidValue { field, rule } => {
+                tracing::info!(field, rule = %rule, "construct correction value refused");
                 ReviewRequestError::invalid_argument()
-                    .with_field_violation("properties", rule, "invalid_value")
+                    .with_field_violation(field, rule, "invalid_value")
                     .create()
             }
             // The correction is refused by the checks or Admission; the

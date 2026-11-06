@@ -20,7 +20,7 @@ use uuid::Uuid;
 
 use crate::domain::DbProvider;
 use crate::domain::error::DomainError;
-use crate::domain::pagination::{DEFAULT_LIMIT, MAX_LIMIT, PageError, QueryError};
+use crate::domain::pagination::{DEFAULT_LIMIT, MAX_LIMIT, PageError, QueryError, no_select};
 use crate::domain::plan::NodeKey;
 use crate::domain::profile::Category;
 use crate::domain::review_queue::{
@@ -217,12 +217,13 @@ struct OpenFact {
 }
 
 /// Which open request a close may take.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CloseGuard {
     /// Only one held by this claim: a reviewer's resolution.
     HeldBy(ClaimId),
-    /// Held or not: the subject's delete.
-    Any,
+    /// Held or not, while what its claim recorded is still this pending
+    /// text: the subject's delete.
+    Recorded(Option<String>),
 }
 
 /// The review requests table. Every call runs on the runner and under the
@@ -456,10 +457,11 @@ impl SeaOrmReviewRequestRepository {
     ) -> Result<bool, DomainError> {
         // @cpt-begin:cpt-cf-construct-algo-review-queue-close:p1:inst-close-update
         // @cpt-begin:cpt-cf-construct-state-review-queue-request:p1:inst-state-close
-        let mut only = open().add(of_request(key));
-        if let CloseGuard::HeldBy(claim) = guard {
-            only = only.add(Column::ClaimId.eq(claim.0));
-        }
+        let only = open().add(of_request(key)).add(match guard {
+            CloseGuard::HeldBy(claim) => Column::ClaimId.eq(claim.0),
+            CloseGuard::Recorded(Some(text)) => Column::Pending.eq(text),
+            CloseGuard::Recorded(None) => Column::Pending.is_null(),
+        });
         let updated = ReviewRequestEntity::update_many()
             .secure()
             .scope_with(scope)
@@ -492,26 +494,31 @@ impl SeaOrmReviewRequestRepository {
         // @cpt-end:cpt-cf-construct-algo-review-queue-close:p1:inst-close-update
     }
 
-    /// The id of the open request on the subject's fact, if there is one.
+    /// The open request on the subject's fact, if there is one, with what
+    /// its claim recorded.
     ///
     /// # Errors
     ///
-    /// When the database fails.
+    /// When the database fails, or the row cannot be read.
     pub async fn open_on<C: DBRunner>(
         &self,
         conn: &C,
         scope: &AccessScope,
         key: SubjectKey,
         fact_id: &NodeKey,
-    ) -> Result<Option<Uuid>, DomainError> {
-        Ok(ReviewRequestEntity::find()
+    ) -> Result<Option<(ReviewRequest, Option<Closed>)>, DomainError> {
+        let Some(row) = ReviewRequestEntity::find()
             .secure()
             .scope_with(scope)
             .filter(of_subject(key).add(Column::OpenFactId.eq(fact_id.0.clone())))
             .one(conn)
             .await
             .map_err(map_scope_error)?
-            .map(|row| row.id))
+        else {
+            return Ok(None);
+        };
+        let recorded = pending_of(&row)?;
+        Ok(Some((request_of(row)?, recorded)))
     }
 
     /// The facts of the subject's open requests, without reading the rest of
@@ -580,6 +587,7 @@ impl SeaOrmReviewRequestRepository {
         key: SubjectKey,
         query: &ODataQuery,
     ) -> Result<Page<ReviewRequest>, DomainError> {
+        no_select(query).map_err(DomainError::InvalidQuery)?;
         let select = ReviewRequestEntity::find()
             .secure()
             .scope_with(scope)
@@ -609,6 +617,7 @@ impl SeaOrmReviewRequestRepository {
         tenant_id: Uuid,
         query: &ODataQuery,
     ) -> Result<Page<ReviewRequest>, DomainError> {
+        no_select(query).map_err(DomainError::InvalidQuery)?;
         let select = ReviewRequestEntity::find()
             .secure()
             .scope_with(scope)
@@ -746,22 +755,25 @@ impl ReviewRequests for ReviewRequestStore {
             .await
     }
 
-    async fn close_open_on(
+    async fn open_request_on(
         &self,
         scope: &AccessScope,
         key: SubjectKey,
         fact_id: &NodeKey,
+    ) -> Result<Option<(ReviewRequest, Option<Closed>)>, DomainError> {
+        let conn = self.db.conn().map_err(DomainError::from)?;
+        self.repo.open_on(&conn, scope, key, fact_id).await
+    }
+
+    async fn close_open(
+        &self,
+        scope: &AccessScope,
+        key: RequestKey,
+        recorded: Option<&Closed>,
         closed: &Closed,
     ) -> Result<Option<ReviewRequest>, DomainError> {
-        let conn = self.db.conn().map_err(DomainError::from)?;
-        let Some(id) = self.repo.open_on(&conn, scope, key, fact_id).await? else {
-            return Ok(None);
-        };
-        let request = RequestKey {
-            tenant_id: key.tenant_id,
-            id,
-        };
-        self.close_and_read(scope, request, closed, CloseGuard::Any)
+        let recorded = recorded.map(pending_text).transpose()?;
+        self.close_and_read(scope, key, closed, CloseGuard::Recorded(recorded))
             .await
     }
 

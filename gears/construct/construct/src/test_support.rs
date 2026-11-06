@@ -1396,6 +1396,9 @@ pub struct MemoryReviews {
     pub deleted_while_written: std::sync::atomic::AtomicBool,
     /// Fail a reviewer's close as unavailable, and nothing else.
     pub close_fails: std::sync::atomic::AtomicBool,
+    /// Close each request as deleted by its subject right before a claim
+    /// records a write, so the record finds it closed.
+    pub deleted_before_pend: std::sync::atomic::AtomicBool,
     /// The scope of each read of the facts under review.
     pub under_review_scopes: std::sync::Mutex<Vec<AccessScope>>,
     /// What each request's claim recorded, by request id.
@@ -1611,6 +1614,22 @@ impl crate::domain::review_queue::ReviewRequests for MemoryReviews {
         pending: &crate::domain::review_queue::Closed,
     ) -> Result<bool, DomainError> {
         self.check()?;
+        if self
+            .deleted_before_pend
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            let subject = |r: &crate::domain::review_queue::ReviewRequest| r.subject_id;
+            let by = self.all().iter().find(|r| r.key() == key).map(subject);
+            self.close_where(
+                |r, _| r.key() == key,
+                &crate::domain::review_queue::Closed {
+                    outcome: crate::domain::review_queue::ReviewOutcome::Deleted,
+                    by: by.unwrap_or_default(),
+                    at: time::OffsetDateTime::now_utc(),
+                    reason: None,
+                },
+            );
+        }
         let held = self.requests.lock().unwrap().iter().any(|(request, held)| {
             request.key() == key && request.is_open() && held.is_some_and(|(id, _)| id == claim.0)
         });
@@ -1670,15 +1689,43 @@ impl crate::domain::review_queue::ReviewRequests for MemoryReviews {
         ))
     }
 
-    async fn close_open_on(
+    async fn open_request_on(
         &self,
         _scope: &AccessScope,
         key: SubjectKey,
         fact_id: &crate::domain::plan::NodeKey,
+    ) -> Result<
+        Option<(
+            crate::domain::review_queue::ReviewRequest,
+            Option<crate::domain::review_queue::Closed>,
+        )>,
+        DomainError,
+    > {
+        self.check()?;
+        let Some(request) = self
+            .all()
+            .into_iter()
+            .find(|r| r.is_open() && r.subject() == key && &r.fact_id == fact_id)
+        else {
+            return Ok(None);
+        };
+        let recorded = self.pending.lock().unwrap().get(&request.id).cloned();
+        Ok(Some((request, recorded)))
+    }
+
+    async fn close_open(
+        &self,
+        _scope: &AccessScope,
+        key: crate::domain::review_queue::RequestKey,
+        recorded: Option<&crate::domain::review_queue::Closed>,
         closed: &crate::domain::review_queue::Closed,
     ) -> Result<Option<crate::domain::review_queue::ReviewRequest>, DomainError> {
         self.check()?;
-        Ok(self.close_where(|r, _| r.subject() == key && &r.fact_id == fact_id, closed))
+        let now = self.pending.lock().unwrap().get(&key.id).cloned();
+        if now.as_ref() != recorded {
+            return Ok(None);
+        }
+        Ok(self.close_where(|r, _| r.key() == key, closed))
     }
 
     async fn latest_on(

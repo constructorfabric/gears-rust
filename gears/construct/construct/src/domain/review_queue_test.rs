@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use authz_resolver_sdk::{AuthZResolverApi, PolicyEnforcer};
 use serde_json::{Value, json};
 use toolkit_odata::ODataQuery;
-use toolkit_security::SecurityContext;
+use toolkit_security::{AccessScope, SecurityContext};
 use uuid::Uuid;
 
 use crate::domain::admission::{Admission, AdmissionPorts};
@@ -23,7 +23,7 @@ use crate::domain::profile_writes::{SubjectFacts, SubjectProfiles};
 use crate::domain::record_intake::DropReason;
 use crate::domain::review_queue::{
     CLAIM_HOLD, Corrections, NotStored, Resolution, ReviewConflict, ReviewOutcome,
-    ReviewQueueEvent, ReviewQueueService, ReviewRequest, ReviewStatus, ReviewText,
+    ReviewQueueEvent, ReviewQueueService, ReviewRequest, ReviewStatus, ReviewText, close_on_delete,
 };
 use crate::domain::sensitive_data::{SensitiveDataCheck, SensitiveDataChecks, SensitiveDataKind};
 use crate::domain::subject_settings::{SubjectKey, SubjectSettings};
@@ -748,11 +748,20 @@ async fn a_correction_takes_only_the_facts_property_with_a_value_its_schema_take
     let bad_value = resolve("skills", json!({ "name": "" })).await;
 
     assert!(
-        matches!(other_property, Err(DomainError::InvalidValue(_))),
+        matches!(
+            other_property,
+            Err(DomainError::InvalidValue {
+                field: "property",
+                ..
+            })
+        ),
         "{other_property:?}"
     );
     assert!(
-        matches!(bad_value, Err(DomainError::InvalidValue(_))),
+        matches!(
+            bad_value,
+            Err(DomainError::InvalidValue { field: "value", .. })
+        ),
         "{bad_value:?}"
     );
     assert!(fixture.writer.plans().is_empty());
@@ -929,6 +938,115 @@ async fn a_failed_write_found_in_the_profile_closes_the_request() {
     );
 }
 
+#[tokio::test]
+async fn a_rejection_whose_close_failed_gives_its_claim_back() {
+    let fixture = Fixture::new(0);
+    let request = fixture.flagged().await;
+    fixture.reviews.close_fails.store(true, Ordering::SeqCst);
+
+    let failed = fixture
+        .service()
+        .resolve(&fixture.reviewer(), request.id, Fixture::reject())
+        .await;
+    let held = fixture.reviews.held();
+    fixture.reviews.close_fails.store(false, Ordering::SeqCst);
+    let again = fixture
+        .service()
+        .resolve(&fixture.reviewer(), request.id, Fixture::reject())
+        .await
+        .unwrap();
+
+    // It wrote nothing, so it neither says it was stored nor holds the request.
+    assert!(
+        matches!(failed, Err(DomainError::Unavailable(_))),
+        "{failed:?}"
+    );
+    assert_eq!(held, [false], "the claim is given back");
+    assert_eq!(
+        outcome_of(&again),
+        &ReviewOutcome::Rejected,
+        "resolved at once"
+    );
+    assert!(fixture.writer.plans().is_empty());
+}
+
+#[tokio::test]
+async fn a_request_closed_before_its_write_was_recorded_answers_closed_not_held() {
+    let fixture = Fixture::new(0);
+    let request = fixture.flagged().await;
+    fixture
+        .reviews
+        .deleted_before_pend
+        .store(true, Ordering::SeqCst);
+
+    let refused = fixture
+        .service()
+        .resolve(
+            &fixture.reviewer(),
+            request.id,
+            Resolution::Deleted { reason: None },
+        )
+        .await;
+
+    assert!(
+        matches!(
+            refused,
+            Err(DomainError::ReviewConflict(ReviewConflict::Closed(id))) if id == request.id
+        ),
+        "{refused:?}"
+    );
+    assert!(fixture.writer.plans().is_empty(), "nothing written");
+}
+
+#[tokio::test]
+async fn the_subjects_delete_after_a_landed_correction_closes_the_request_as_the_correction() {
+    let fixture = Fixture::new(0);
+    let request = fixture.flagged().await;
+    fixture.reviews.close_fails.store(true, Ordering::SeqCst);
+    let unclosed = fixture
+        .service()
+        .resolve(&fixture.reviewer(), request.id, Fixture::corrected("Go"))
+        .await;
+    let Err(DomainError::ReviewConflict(ReviewConflict::NotClosed {
+        outcome: ReviewOutcome::Corrected(new_key),
+        ..
+    })) = unclosed
+    else {
+        panic!("{unclosed:?}");
+    };
+    fixture.reviews.close_fails.store(false, Ordering::SeqCst);
+    let writes = ProfileWrites::new(
+        Arc::clone(&fixture.profile) as _,
+        Arc::clone(&fixture.writer) as _,
+        Arc::new(ServiceIdentity::new(Uuid::new_v4())),
+        2,
+    );
+
+    // The subject deletes the corrected fact, which the correction already
+    // replaced: it finds it gone.
+    let closed = close_on_delete(
+        fixture.reviews.as_ref(),
+        fixture.events.as_ref(),
+        &writes,
+        &AccessScope::allow_all(),
+        request.subject(),
+        &request.fact_id,
+        false,
+    )
+    .await
+    .unwrap();
+
+    assert!(closed);
+    let ReviewStatus::Closed(done) = fixture.status() else {
+        panic!("closed");
+    };
+    assert_eq!(
+        (done.outcome, done.by),
+        (ReviewOutcome::Corrected(new_key), fixture.reviewer),
+        "closed as the reviewer's correction, not as the subject's delete"
+    );
+}
+
 #[tracing_test::traced_test]
 #[tokio::test]
 async fn a_correction_whose_close_failed_is_closed_as_it_by_the_next_resolution() {
@@ -1018,8 +1136,15 @@ async fn a_write_that_may_have_landed_keeps_the_claim() {
         )
         .await;
 
+    // Not a plain 503: a retry now would find the request held.
     assert!(
-        matches!(failed, Err(DomainError::Unavailable(_))),
+        matches!(
+            failed,
+            Err(DomainError::ReviewConflict(ReviewConflict::NotClosed {
+                outcome: ReviewOutcome::Deleted,
+                ..
+            }))
+        ),
         "{failed:?}"
     );
     assert_eq!(
