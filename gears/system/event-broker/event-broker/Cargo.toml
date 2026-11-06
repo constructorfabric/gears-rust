@@ -23,7 +23,7 @@ autobins = false
 # router-driving side modules (`request`/`response`) additionally need `http`
 # + `tower`, and the fixtures need `types-registry-sdk`'s `test-util`, so the
 # feature pulls those in (they are otherwise dev-only).
-test-utils = ["dep:http", "dep:tower", "types-registry-sdk/test-util"]
+test-utils = ["dep:http", "dep:tower", "dep:schemars", "types-registry-sdk/test-util"]
 # Gates the engine-matrix tests (`tests/*_backends_test.rs`), which need a
 # Docker daemon for their PostgreSQL and MySQL servers (or the servers
 # `EB_TEST_POSTGRES_URL` / `EB_TEST_MYSQL_URL` name), so a default `cargo test`
@@ -41,6 +41,7 @@ path = "src/bin/server.rs"
 workspace = true
 
 [dependencies]
+schemars = { workspace = true, optional = true }
 # A concrete topic and a concrete event type are both derived GTS type schemas,
 # so the broker models neither itself: the identifier wrapper comes from `gts`,
 # the resolved type schema from `types-registry-sdk`, and the DTO shapes the API

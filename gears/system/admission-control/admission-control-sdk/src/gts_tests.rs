@@ -57,7 +57,20 @@ fn event() -> RefusalEvent {
 type Mutation = fn(&mut Value);
 
 fn validator() -> jsonschema::Validator {
-    jsonschema::validator_for(&refusal_event_data_schema()).unwrap()
+    let mut store = gts::GtsStore::new();
+    store
+        .register_schema(
+            EventV1::<()>::TYPE_ID,
+            &EventV1::<()>::gts_schema_with_refs(),
+        )
+        .unwrap();
+    store
+        .register_schema(REFUSAL_EVENT_TYPE, &RefusalEventV1::gts_schema_with_refs())
+        .unwrap();
+    let resolved = store
+        .validate_schema_with(REFUSAL_EVENT_TYPE, gts::GtsRefValidation::None)
+        .unwrap();
+    jsonschema::validator_for(&event_broker_sdk::gts::data_contract(&resolved.schema)).unwrap()
 }
 
 #[test]
@@ -114,7 +127,7 @@ fn the_data_schema_refuses_what_no_event_serializes_to() {
     let validator = validator();
     let valid = serde_json::to_value(event()).unwrap();
     assert!(validator.is_valid(&valid));
-    let mutations: [(&str, Mutation); 7] = [
+    let mutations: [(&str, Mutation); 9] = [
         ("unknown cause", |e| e["cause"] = "bogus".into()),
         ("unknown condition", |e| e["condition"] = "bogus".into()),
         ("null optional", |e| e["resource_id"] = Value::Null),
@@ -128,6 +141,10 @@ fn the_data_schema_refuses_what_no_event_serializes_to() {
         ("property values instead of names", |e| {
             e["property_names"] = serde_json::json!([{ "name": "x" }]);
         }),
+        ("undeclared property", |e| {
+            e["property_value"] = "secret".into();
+        }),
+        ("null data", |e| *e = Value::Null),
     ];
     for (case, mutate) in mutations {
         let mut invalid = valid.clone();
@@ -137,12 +154,21 @@ fn the_data_schema_refuses_what_no_event_serializes_to() {
 }
 
 #[test]
-fn the_data_schema_is_self_contained() {
-    // Embedded under the event base's `data`: a `$ref` to generated
-    // definitions, or a nested `$schema`, would not resolve there.
-    let text = refusal_event_data_schema().to_string();
-    assert!(!text.contains("$ref"), "{text}");
-    assert!(!text.contains("$schema"), "{text}");
+fn the_macro_registers_exactly_one_refusal_schema() {
+    let entries: Vec<_> = toolkit_gts::inventory::iter::<toolkit_gts::InventoryTypeSchema>
+        .into_iter()
+        .filter(|entry| entry.type_id == REFUSAL_EVENT_TYPE)
+        .collect();
+    let [entry] = entries.as_slice() else {
+        panic!(
+            "expected exactly one refusal schema, found {}",
+            entries.len()
+        );
+    };
+    assert_eq!(
+        serde_json::from_str::<Value>(&(entry.schema_fn)()).unwrap(),
+        RefusalEventV1::gts_schema_with_refs()
+    );
 }
 
 #[test]

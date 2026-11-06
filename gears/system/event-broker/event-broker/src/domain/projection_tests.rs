@@ -28,18 +28,10 @@ const ORDER_TYPE: &str = "gts.cf.core.events.event.v1~example.proj.shop.order.v1
 const ORDER_EU_TYPE: &str =
     "gts.cf.core.events.event.v1~example.proj.shop.order.v1~example.proj.shop.order_eu.v1~";
 
-/// `description` of the base event's `data` member. It is the ancestor branch of
-/// every composed payload contract, spelled out here so that changing the base
-/// surfaces as a failure in these tests.
-const BASE_DATA_DESCRIPTION: &str = "Event payload, validated at ingest against the resolved schema of the event's type. The only field where UTF-8 (or any non-ASCII bytes) is permitted; all other event fields are ASCII per platform convention. May be absent for body-less events (e.g., notification-only events whose semantics are fully carried by `type` + `subject`).";
-
 /// The base event's `data` member as `data_contract` composes it into the first
 /// branch of a payload contract.
 fn base_data_member() -> serde_json::Value {
     json!({
-        "additionalProperties": true,
-        "default": null,
-        "description": BASE_DATA_DESCRIPTION,
         "type": ["object", "null"],
     })
 }

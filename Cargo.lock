@@ -2783,6 +2783,7 @@ dependencies = [
  "opentelemetry_sdk",
  "rand 0.10.3",
  "reqwest",
+ "schemars 1.2.3",
  "sea-orm",
  "sea-orm-migration",
  "serde",
