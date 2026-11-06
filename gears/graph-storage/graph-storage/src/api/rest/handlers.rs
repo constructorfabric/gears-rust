@@ -355,10 +355,7 @@ pub async fn project_nodes(
     Query(params): Query<ProjectionTypeParams>,
     OData(query): OData,
 ) -> ApiResult<Json<toolkit_odata::Page<dto::GraphNodeRowDto>>> {
-    let patterns: Vec<String> = params
-        .type_pattern
-        .map(|raw| raw.split(',').map(|p| p.trim().to_owned()).collect())
-        .unwrap_or_default();
+    let patterns = params.patterns();
     let page = services.project_nodes(&ctx, &patterns, query).await?;
     Ok(Json(page.map_items(dto::GraphNodeRowDto::from)))
 }
@@ -374,10 +371,7 @@ pub async fn count_nodes(
     Query(params): Query<ProjectionTypeParams>,
     OData(query): OData,
 ) -> ApiResult<Json<dto::GraphNodeCountDto>> {
-    let patterns: Vec<String> = params
-        .type_pattern
-        .map(|raw| raw.split(',').map(|p| p.trim().to_owned()).collect())
-        .unwrap_or_default();
+    let patterns = params.patterns();
     let count = services.count_nodes(&ctx, &patterns, query).await?;
     Ok(Json(count.into()))
 }
@@ -391,6 +385,18 @@ pub async fn count_nodes(
 pub struct ProjectionTypeParams {
     /// Comma-separated GTS identifier patterns.
     pub type_pattern: Option<String>,
+}
+
+impl ProjectionTypeParams {
+    /// The patterns, split on commas and trimmed. The one reading of the
+    /// parameter for the listing and its count, which must narrow alike.
+    #[must_use]
+    pub fn patterns(&self) -> Vec<String> {
+        self.type_pattern
+            .as_deref()
+            .map(|raw| raw.split(',').map(|p| p.trim().to_owned()).collect())
+            .unwrap_or_default()
+    }
 }
 
 #[tracing::instrument(skip_all, fields(user.id = %ctx.subject_id()))]
@@ -501,4 +507,22 @@ pub async fn revision(
 ) -> ApiResult<Json<dto::GraphRevisionDto>> {
     let revision = services.revision(&ctx).await?;
     Ok(Json(revision.into()))
+}
+
+#[cfg(test)]
+mod projection_type_params_tests {
+    use super::ProjectionTypeParams;
+
+    #[test]
+    fn patterns_are_split_on_commas_and_trimmed() {
+        let params = ProjectionTypeParams {
+            type_pattern: Some("gts.a.* , gts.b.v1~".to_owned()),
+        };
+        assert_eq!(params.patterns(), ["gts.a.*", "gts.b.v1~"]);
+        assert!(
+            ProjectionTypeParams { type_pattern: None }
+                .patterns()
+                .is_empty()
+        );
+    }
 }
