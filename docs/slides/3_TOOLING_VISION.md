@@ -75,8 +75,8 @@ None of this was found by a check. It was found by looking.
 |---|---|
 | `cargo gears` | no make driver, CI, lint config or SDLC setup |
 | `gears.mk` | a person copies the file by hand |
-| Studio + kit | not the repository, the build or CI |
-| Gearbox + GDL | local paths, no version resolution |
+| `cfs` + kit | not the repository, the build or CI |
+| Gearbox + GDL | resolves versions; nobody publishes a known-good set |
 | PR #5326 | adapts the kit to a project, not a project to conventions |
 
 Different owners, release cycles and manifests — and **nothing owns the repository itself**.
@@ -100,7 +100,7 @@ The product is the arc, not any one step: **set up → check → update → chec
 
 ## What a convention is, concretely
 
-**Installed and pinned** — build rules (`gears.mk`, 32 targets) · CI (30 workflows, 4 composite actions, 24 pipeline scripts) · Rust lint and toolchain (6 config files) · dependency baseline (256 deps, ~125 lints) · document-first development (the Studio kit) · agent configuration (5 vendors, one source) · platform guidelines (`guidelines/DNA`) · repository boilerplate
+**Installed and pinned** — build rules (`gears.mk`, 32 targets) · CI (30 workflows, 4 composite actions, 24 pipeline scripts) · Rust lint and toolchain (6 config files) · dependency baseline (256 deps, ~125 lints) · document-first development (the `cfs` kit) · agent configuration (5 vendors, one source) · platform guidelines (`guidelines/DNA`) · repository boilerplate
 
 **Checked only — nothing is installed** — repository layout · gear layout: the crate, `gear.gdl`, the documents, the workspace entry, the publish settings
 
@@ -147,11 +147,11 @@ It does **not** work for `clippy.toml`, `rustfmt.toml`, `deny.toml`,
 > Rust has no `extends`, no parent manifest, no remote configuration inheritance.
 > `[workspace.lints]` stops at the workspace.
 
-Those files have to be copied — which is exactly what `gears-rust` does today,
-and why no existing scaffolding platform solves this for us.
+Each has to exist **locally and complete** — which is why `gears-rust` copies them.
 
-**The mandate:** reference what can be referenced, generate what can be generated,
-and shrink copying to the residue Rust leaves no alternative for.
+**But local is not the same as copied.** Where a file has a parameter surface — an ignored advisory in `deny.toml`, a licence exception, a threshold — upstream gives the base and the project gives its values. Copying is what remains where there is nothing to parameterise.
+
+**The mandate:** reference what can be referenced, generate what can be generated, and shrink copying to the files with no parameter surface at all.
 
 ---
 
@@ -199,11 +199,13 @@ teams keep copying by hand — or a green check comes to mean *"nothing ran"*.
 
 ## What we have to decide
 
-1. **Where do the conventions live?** A pin needs something to point at. Nothing publishes `gears.mk` under tags today, and CI is not reusable. **This vision is inert until somebody does that work** — and it changes `gears-rust` first.
+1. **Where do the conventions live, and who puts them there?** A pin needs something to point at. Nothing publishes `gears.mk` under tags today, and CI is not reusable. **Step zero, and it needs a named owner** — before the tool, and it changes `gears-rust` first.
 2. **Which direction is the default?** PR #5326's facades adapt the kit to the build system a project already has. This vision gives a project the build system it should have. Both can exist; only one can be the default.
 3. **How granular is the convention menu?** Too fine and no two projects compare;
    too coarse and the choice is useless.
 4. **Where is the boundary** with `cargo gears`, `cfs` and Gearbox?
+
+**Gearbox has offered to be the pilot** — outside `gears-rust`, five files copied by hand (P9), and it needs only part of the conventions (P6).
 
 ---
 

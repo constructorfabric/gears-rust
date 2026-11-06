@@ -27,8 +27,8 @@ the architecture, the commands, the file formats or the implementation; those be
 and in the ADRs after it. It is written for the maintainers of `gears-rust`, `cargo-gears`,
 `gearbox` and the `studio-kit-gears` kit.
 
-**How to read it.** About thirty-five minutes end to end, and section 4 is half of that. Skip section 3
-if you already know what `cargo gears`, `gears.mk`, Studio and Gearbox each cover today. If you only
+**How to read it.** About forty minutes end to end, and section 4 is half of that. Skip section 3
+if you already know what `cargo gears`, `gears.mk`, `cfs` and Gearbox each cover today. If you only
 need the decisions, read this block, the scenario at the top of section 4, and section 6.
 Section 1 is a glossary of ordinary words used narrowly — skim it and come back to it rather than
 trying to hold it. If you want the concrete shape first, the table at the end of section 1 and the
@@ -58,6 +58,7 @@ This document uses these terms with one meaning each.
 |---|---|
 | **convention** | A rule or a configuration that a Gears project follows. |
 | **the tool** | The Gears CLI that this document describes. |
+| **`cfs`** | Constructor Studio, the document-first SDLC tool, and the `studio-kit-gears` kit it carries. Written `cfs` throughout, because Gearbox ships a separate product called Gearbox Studio and the bare word names neither. |
 | **upstream** | The source that owns a convention and releases new versions of it. |
 | **pin** | What a repository records to select one exact version of a convention. It has to designate content that cannot change afterwards; a name somebody can move later is not a pin. |
 | **install** | The tool puts a convention into a repository: it writes the pin, and any file that the convention generates or copies. The word never means obtaining a program. |
@@ -82,7 +83,7 @@ selection would look like this:
 |---|---|---|
 | **Build rules** | the `Makefile` driver and `gears.mk` with its 32 targets | referenced by pin; the 74 targets in `gears-rust.mk` stay the project's |
 | **CI pipeline** | the 30 workflows, the 4 composite actions, the 24 pipeline scripts under `tools/scripts/` | referenced by tag; the triggers and the secrets stay the project's |
-| **Rust lint and toolchain** | `clippy.toml`, `rustfmt.toml`, `deny.toml`, `rust-toolchain.toml`, `.config/nextest.toml`, `.cargo/config.toml` | copied, and replaced whole under a version check |
+| **Rust lint and toolchain** | `clippy.toml`, `rustfmt.toml`, `deny.toml`, `rust-toolchain.toml`, `.config/nextest.toml`, `.cargo/config.toml` | generated from an upstream base plus the project's own values where the file has them — an ignored advisory, a licence exception, a threshold; copied and replaced whole under a version check where it has none |
 | **Dependency and lint baseline** | the 256 `[workspace.dependencies]` entries and the ~125 `[workspace.lints]` settings | generated from a shared source; Cargo has no cross-repository mechanism, so that source is new work |
 | **Repository layout** | the rule that `gears/`, `libs/`, `apps/` and the document roots are where a Gears repository puts them | setup creates the directories; after that there is no file to manage, and the rule is what the check answers |
 | **Gear layout** | the rule that states the complete set a gear carries: the crate, the `gear.gdl` descriptor, its documents, its workspace entry, its publish settings | nothing is written — the tool creates no gear. The check answers presence and placement; Gearbox still owns what the descriptor says, and `cfs` what the documents say |
@@ -110,12 +111,12 @@ Section 3 then shows how far each problem is covered today.
 |---|---|---|---|
 | **P1** · Bootstrap | create a correct repository — only copy one | `cargo gears new` makes an application workspace. Nothing makes the make driver, CI, lint configuration, documentation layout or SDLC setup | The conventions are written down in no single place. They live in a working repository, and you cannot apply a working repository to a different one |
 | **P2** · CI reproduction | reproduce CI | The checks that make Gears code reviewable have no portable form: `dylint` via `cargo gears lint` with a per-project skip list, `cargo-deny` in two configurations, clippy with `cargo-hack` passes, `shear` on a pinned nightly, `nextest` with JUnit enrichment, FIPS and database suites, GTS and API-contract checks | They live across `gears.mk`, `gears-rust.mk`, `Gears.toml` and 30 workflow files, together with every pinned tool version and action SHA. A new project rebuilds all of it, or runs weaker checks and learns later |
-| **P3** · SDLC reproduction | reproduce the SDLC pipeline | Studio reproduces the document-first order well — PRD, DESIGN, ADR, DECOMPOSITION, FEATURE, then code with `cpt-*` markers, then design-led review. But that pipeline is one half of a repository | The build, CI and lint configuration are the other half, and nothing carries the two together. A team assembles them separately and must know how they fit first. Agent files Studio does not own drift with no signal |
+| **P3** · SDLC reproduction | reproduce the SDLC pipeline | `cfs` reproduces the document-first order well — PRD, DESIGN, ADR, DECOMPOSITION, FEATURE, then code with `cpt-*` markers, then design-led review. But that pipeline is one half of a repository | The build, CI and lint configuration are the other half, and nothing carries the two together. A team assembles them separately and must know how they fit first. Agent files `cfs` does not own drift with no signal |
 | **P4** · Staying current | stay current | For almost every part the upgrade path is a person who notices a change in `gears-rust` and copies the files again | `gears.mk` gains targets, lint rules change, pinned tool and action versions move, templates are revised. Projects fall behind with no signal |
 | **P5** · Conformance signal | tell whether a repository is still correct | Nothing reports a repository that moved away: an edited managed file, a deleted workflow, a gear in the wrong place, a missing tool. It still builds, and a reviewer sees one change rather than the whole shape | `artifacts.toml` holds 37 `[[ignore]]` blocks, 13 of them recording that a module has no PRD or DESIGN — conformance debt kept as suppressions. The `toolkit-pr-review` prompt exists five times, once per vendor, and four copies no longer match. `cfs` stopped with an unclear error on an uninitialised `guidelines/DNA`, which is why PR #5326 adds `ensure-dna.py` |
 | **P6** · All or nothing | take only part of the conventions | Adoption means copying `gears-rust`, which gives everything. No list of conventions, no name for any one, no way to state which a project follows | An application project needs neither the gear document pipeline nor descriptor coverage; a single-gear project needs neither FIPS nor database suites. Each selects a subset by hand and records nothing. This also blocks P5: you cannot check against a standard never stated |
 | **P7** · Gear completeness | state the complete set of parts a gear needs | A gear needs its five documents, the layered crate, the SDK crate, a `gear.gdl` descriptor, two workspace member entries, an alias in `[workspace.dependencies]`, registration in `artifacts.toml`, and publish settings for release-plz. No document holds that list | A developer learns it by reading another gear and copying what that one happens to have. Hence 13 of the `[[ignore]]` blocks, and four example gears with no descriptor. This is the developer's half of P5: nobody states what "complete" means, so intent is not enough |
-| **P8** · Version alignment | know which gear versions work together | Inside this repository `[workspace.dependencies]` aligns 256 entries. An application outside receives no such file and picks each version alone | Rust offers no mechanism; Maven has a BOM and Spring publishes one. Gearbox owns the problem and has the artefact, `product.lock`, but registry sources and version resolution are not built, so an outside application has no resolved set to start from |
+| **P8** · Version alignment | know which gear versions work together | Inside this repository `[workspace.dependencies]` aligns 256 entries. An application outside receives no such file and picks each version alone | Resolution is not the gap. Gearbox resolves gear versions from `path`, `git` and `registry` sources, and for a registry it lets cargo do the work, so ranges, authentication, mirrors and offline mode come from cargo. The gap is that **no set of versions known to work together is published**. `product.lock` pins the resolved set of one product; it is not a shared list. Maven has a BOM and Spring publishes one; Rust has neither the mechanism nor the list |
 | **P9** · Portability | leave `gears-rust` and keep any of it | The conventions, kit, rules and documents are written from inside this repository | The kit's facades pointed at this repository's Makefile targets and paths, which is why PR #5326 adds `cf-gears-init` to discover what another project has. An outside repository starts with `cargo gears new` and stops: no make driver, no CI, no statement of which rules apply |
 
 One of these fails for a reason worth naming on its own. P4 is not hard to compute — copying a newer
@@ -143,19 +144,22 @@ release cycle and a different manifest, and each stops at a different place.
 |---|---|---|
 | **P1** · Bootstrap | `cargo gears new` (pinned at 0.0.8) creates an application workspace and generates modules, configs and servers from `Gears.toml` | It writes no make driver, no CI, no lint configuration, no documentation layout and no SDLC setup, and knows nothing about repository conventions or review |
 | **P2** · CI reproduction | `.gears-dna/gears.mk`, version 1.1.0, holds 32 reusable targets — the only part of the build system prepared for reuse | A person copies that file by hand; its own header says *"Do not edit a copy of this file. To update it, replace it with a newer version from the source."* The other 30 workflows, 74 targets and every pinned version stay in `gears-rust` |
-| **P3** · SDLC reproduction | Studio covers it: its skills own the artifacts, the kit carries templates, rules, checklists, codebase rules and stage routers, and Studio manages its own agent configuration | It covers documents and prompts only. The repository, the build and CI stay outside it, and agent files that Studio does not own stay with whoever wrote them |
+| **P3** · SDLC reproduction | `cfs` covers it: its skills own the artifacts, the kit carries templates, rules, checklists, codebase rules and stage routers, and `cfs` manages its own agent configuration | It covers documents and prompts only. The repository, the build and CI stay outside it, and agent files that `cfs` does not own stay with whoever wrote them |
 | **P4** · Staying current | The kit has a version and a lockfile, so a tool performs its upgrade. `gears.mk` is versioned too, but its upgrade path is an instruction in its own header | Only the kit's is mechanised. For the build rules, CI and lint configuration, the upgrade is a person who notices and copies again |
 | **P5** · Conformance signal | `cfs`, Gearbox, dylint and `cargo-deny` each judge their own area | Nobody checks the repository as a whole, so debt is recorded as suppressions instead of reported |
 | **P6** · All or nothing | Nothing | The conventions have no names and no list, so a project cannot state a subset |
-| **P7** · Gear completeness | `cargo gears generate module` creates the crate | Nothing states the documents, the descriptor, the workspace entries and the publish settings that must follow |
-| **P8** · Version alignment | Gearbox reads a catalogue from the 64 `gear.gdl` descriptors, resolves a product and writes `product.lock` | Sources are local paths and version resolution is not built, so a consumer outside this repository cannot use it. Composition also cannot see a gear without a descriptor, and Gearbox ships no migration tool by decision |
+| **P7** · Gear completeness | Two generators create part of a gear: `cargo gears generate module` writes the crate, and Gearbox's `gearbox/gear/scaffold` writes `gear.gdl`, `Cargo.toml` and `src/lib.rs`. `gearbox validate` then reports a gear crate with no descriptor, a descriptor whose library name does not match its crate, and a descriptor that repeats the `#[toolkit::gear]` attribute | Neither generator states the documents, the workspace entries or the publish settings that must follow, and the two produce different subsets. Nothing holds the whole list, so neither a developer nor a check can name what is missing |
+| **P8** · Version alignment | Gearbox reads a catalogue from the 64 `gear.gdl` descriptors, resolves versions from `path`, `git` and `registry` sources, and writes `product.lock` | `product.lock` is one product's resolved set, not a published list a new application can start from. Composition also cannot see a gear without a descriptor. A migration tool is absent from the current prototype rather than ruled out |
 | **P9** · Portability | PR #5326 adds `scripts/ci-commands.toml`, `scripts/project-paths.toml` and a `cf-gears-init` workflow that discovers a project's own commands and paths | It adapts the kit to a project. It gives the project no conventions, no CI and no build system |
 
-Two facts outlive this snapshot. Two of the four mechanisms in use generate an application, from
-different manifests: `cargo gears` from `Gears.toml`, Gearbox from `gear.gdl` with `product.gdl`.
-Three files therefore describe one gear, under one rule — each fact has exactly one owner.
+Two facts outlive this snapshot. The first is a manifest in two places. `Gears.toml` for
+`cargo gears` and `product.gdl` for Gearbox both state which gears make up an application, and both
+tools generate a runnable application from that statement. One product, two manifests, two owners.
+One level down the split is already disciplined: a gear's facts are divided between the
+`#[toolkit::gear]` attribute and its `gear.gdl` descriptor, and Gearbox rejects a descriptor that
+repeats the attribute. The rule exists and holds for a gear. It is the product that has no owner.
 
-And a long list belongs to none of the five. It holds the 30 workflows, the thirteen lint, audit,
+The second is a long list that belongs to none of the five. It holds the 30 workflows, the thirteen lint, audit,
 toolchain and test configuration files, the `gears/` + `libs/` + `apps/` layout with its 20 gears
 and 37 libraries, the `guidelines/DNA` submodule, and the document set under each gear.
 
@@ -172,15 +176,30 @@ carries them forward. Setup happens once. The other two happen for the life of t
 versioned `gears.mk` that a pin resolves, and for CI, through reusable workflows that a pin selects.
 It does not work for `clippy.toml`, `rustfmt.toml`, `deny.toml`, `rust-toolchain.toml`,
 `.config/nextest.toml` or `.cargo/config.toml`: Rust has no `extends`, no parent manifest and no
-remote configuration inheritance, and `[workspace.lints]` stops at the workspace. Those files have
-to be copied, which is why `gears-rust` copies them and why no scaffolding platform solves this for
-us. The mandate follows. **Reference what can be referenced. Generate what can be generated. Reduce
-copying to the files Rust leaves no alternative for.** That set is small and listable, so replacing
-a whole file under a version check is enough for it.
+remote configuration inheritance, and `[workspace.lints]` stops at the workspace. Each of those
+files has to exist locally and complete, which is why `gears-rust` copies them and why no
+scaffolding platform solves this for us.
 
-One precondition is not ours to meet. The conventions have to live where a pin can select them, and
-somebody has to put them there. Section 3 records that on the date above neither place existed, and
-that work changes `gears-rust` before it changes any new project.
+Local is not the same as copied. Where a file has a parameter surface the convention can declare —
+the ignored advisories and licence exceptions in `deny.toml`, a lint threshold, a skip list —
+upstream supplies the base, the project supplies its values, and the tool writes the combined file.
+That is order 2, and the file keeps upgrading. A copy is what remains where there is nothing to
+parameterise: `rust-toolchain.toml` is one pin, and a project needing a different one has diverged
+rather than configured. The cost of getting this wrong is concrete. **Under copying, a project that
+needs one extra ignored advisory in `deny.toml` declares an exception for the whole file, and then
+stops receiving upgrades to all of it.**
+
+The mandate follows. **Reference what can be referenced. Generate what can be generated. Reduce
+copying to the files with no parameter surface at all.** That set is small and listable, so
+replacing a whole file under a version check is enough for it — and section 7 measures how small it
+gets.
+
+One precondition is not ours to meet, and it is step zero rather than a parallel track. The
+conventions have to live where a pin can select them, and somebody has to put them there. Until
+`gears.mk` is published under fixed versions and the workflows are reusable, the tool can only
+copy, and most of this document describes something it cannot do yet. Section 3 records that on the
+date above neither place existed. That work changes `gears-rust` before it changes any new project,
+it is not this document's to assign, and it needs a named owner before anything here starts.
 
 ### Scenario: one repository, start to finish
 
@@ -190,14 +209,14 @@ after them.*
 
 A maintainer starts a gear repository. They pick a profile and adjust it: document-first development
 yes, FIPS no. Setup writes the layout, the build and CI wiring, the lint and toolchain
-configuration and the Studio setup, with a pin for each convention, and hands over a working update
+configuration and the `cfs` setup, with a pin for each convention, and hands over a working update
 wiring that the project owns from then on. The report ends by naming the two tools missing from
 their machine. Nothing is hidden: the selection is a file in the repository, and so is every pin.
 
 A week later a developer adds a gear and runs the check before pushing. The crate is there, but the
 DESIGN document and the descriptor the declared conventions call for are not — the parts a new gear
 needs that nobody had written down for them. That absence is the tool's own finding; once the files
-exist, whether they are any good is Studio's and Gearbox's verdict, reported where those tools
+exist, whether they are any good is `cfs`'s and Gearbox's verdict, reported where those tools
 already report. The check also runs on the pull request, so the answer does not depend on anyone
 remembering.
 
@@ -219,7 +238,7 @@ rest repeat for the life of the repository, and the last is what makes the third
 
 The tool takes an empty repository to a working one. It installs the directory layout, the make
 driver and the project make file, the CI workflows, and the configuration for lint, format, audit,
-toolchain and tests. It sets Studio up. It records a pin for every convention that it installs.
+toolchain and tests. It sets `cfs` up. It records a pin for every convention that it installs.
 
 Setup also includes the AI wiring: the skills and prompts for review, document generation and code
 generation, plus the agent configuration that connects them to whatever agent the developer runs.
@@ -259,9 +278,14 @@ almost nothing reads as perfect.
 **A declared convention replaces a gear generator.** A generator applies "documents before code"
 once, to a developer who already meant to follow it. A convention that CI enforces applies it
 permanently, to everybody, and it also reaches the gears that already exist and are wrong — section 2
-names four. The tool creates no gear and judges no gear's content. `cargo gears generate module`
-creates the crate and the author writes the descriptor; the tool reports that a declared part is
-absent, and Gearbox says whether the one that exists is right.
+names four. The tool creates no gear and judges no gear's content.
+
+There are two generators, not one. `cargo gears generate module` creates the crate, and Gearbox's
+own `gearbox/gear/scaffold` writes `gear.gdl`, `Cargo.toml` and `src/lib.rs` from Gearbox Studio.
+That is the argument for a check rather than a third generator: **the convention states what a
+complete gear is, and both generators produce that list.** One statement, two producers, and a
+developer who used neither still gets the same answer. The tool reports that a declared part is
+absent; Gearbox says whether the part that exists is right.
 
 **It owns repository-level conformance. Domain judgements stay with their owners.** The line is
 presence and placement against content and correctness. That a declared convention requires a DESIGN
@@ -270,6 +294,15 @@ tool established by installing that convention. Whether an existing DESIGN docum
 and traceable is `cfs`'s judgement, descriptor correctness is Gearbox's, crate layering is dylint's,
 dependency policy is `cargo-deny`'s. A second implementation of any of those gives a project two
 answers to one question.
+
+Part of the gear check is therefore already written, by somebody else. `gearbox validate` reports a
+gear crate with no descriptor, a descriptor whose library name does not match its crate, and a
+descriptor that repeats what the `#[toolkit::gear]` attribute already says. Those are Gearbox's
+verdicts, and the tool writes none of them a second time. What it does for them is what it does for
+clippy: it checks that `gearbox validate` is configured and reachable for whoever runs it, and
+leaves the running and the verdict where they are. Composition pins follow the same line.
+`product.gdl` holds pins of its own, and moving one means resolving again and writing a new
+`product.lock`, so Gearbox moves those pins and the update loop here does not.
 
 **It configures other tools. It does not run them.** That is the whole of the relationship. Setup
 writes `clippy.toml` and the workflow that calls clippy; `make` and CI invoke it; dylint decides
@@ -313,9 +346,17 @@ contract change its code depends on. The tool does not edit what the project own
 apply those upgrades: it names what the project has to change first, and reports them as not
 applied. A repository is never left partly upgraded with no account of what happened.
 
-One model is rejected outright: a **three-way merge of upstream changes into a managed file that the
-project edited**. Section 5 gives the reason — that merge fails quietly, producing no conflict
-markers and a file that is still wrong.
+One model is rejected: a **three-way merge of upstream changes into a managed file that the project
+edited**. A merge is not quiet by nature, and the reason has to be stated precisely. Gearbox merges
+its product templates against a stored base and reports every conflict it cannot resolve. That is a
+defensible mechanism, and the rule it obeys is the right one: **no merge without a stored base and
+an explicit result.**
+
+A second condition decides this tool. A merge that produces no textual conflict can still produce a
+wrong file. Gearbox survives that because a template must render and the code must build, so a bad
+merge is caught downstream. **Nothing downstream checks a `clippy.toml`.** A wrong `deny.toml`
+passes every gate the repository has until it lets something through. For files with no such
+verification, a declared exception is the better answer than a merge.
 
 Read that narrowly: it forbids silently reconciling two sets of edits to one file. It does not
 forbid a future versioned migration that states what it changes and why, nor a project from
@@ -326,16 +367,18 @@ change from a mistake.
 
 **An exception is the last resort, not the first.** Most one-line differences are not divergence but
 a **missing parameter**: `gears.mk` already lets a project override any setting from its own make
-file, and `Gears.toml` already carries the dylint skip list that belongs to this project. Where a
-convention anticipates what varies, the file stays managed and the project supplies a value. An
-exception is for what the convention did not anticipate — and a convention that collects many of
-them is a convention that needs a parameter.
+file, and `Gears.toml` already carries the dylint skip list that belongs to this project. The same
+route is what turns a copied configuration file into a generated one — an ignored advisory in
+`deny.toml` is a parameter, not a divergence. Where a convention anticipates what varies, the file
+stays managed and the project supplies a value. An exception is for what the convention did not
+anticipate — and a convention that collects many of them is a convention that needs a parameter.
 
 Taking one costs automatic application, not visibility: the tool still knows the version the file
 diverged from and still reports when upstream moves past it. It only stops writing. Whether
 something narrower than a whole file can be declared — a section, a key — is a design question,
 and nothing here forbids it, provided ownership is declared per unit in advance rather than inferred
-by comparing edits. That inference is the part section 5 rules out.
+by comparing edits. Inferring it is the part ruled out above: that is a merge without a base, under
+another name.
 
 **The loop is not a bot either, but a bot must be able to drive it.** That is a requirement, not a
 convenience. Section 2 shows that P4 fails on human attention, so the loop has value only if it runs
@@ -395,9 +438,10 @@ concretely:
 |---|---|
 | `gears.mk` carries 32 targets and a header telling you to replace the file by hand | the same file, resolved by a pin |
 | 30 workflows live here and are copied outward | the same pipeline, called by tag; this repository holds callers like anybody else |
-| thirteen lint, audit, toolchain and test configs are copied, then diverge quietly | copied still, but replaced whole under a version check, with divergence declared rather than inferred |
+| thirteen lint, audit, toolchain and test configs are copied, then diverge quietly | generated from a base plus this project's values where they have any, copied where they have none, and divergence declared rather than inferred |
 | the kit upgrades; nothing else does | every convention carries a pin, and one job proposes the bumps |
 | the complete set of parts a gear carries is folklore; four example gears have no `gear.gdl` | the gear layout convention names the set, and the check reports what is missing before review |
+| the Rust version has two owners: this repository's `rust-toolchain.toml`, and a constant in Gearbox copied from it by hand | the toolchain convention publishes the version, and Gearbox resolves it instead of copying it |
 | conformance debt collects as 37 `[[ignore]]` blocks | the check reports it where people read it |
 
 Nothing in that column is new behaviour for the build or for CI. `make` still runs the targets and
@@ -457,6 +501,12 @@ Three starting points are not the same problem. A **new repository** is the prim
 letting the check report the gap — a declaration plus a backlog, not a rewrite. An **unrelated
 repository** is out of scope today.
 
+Gearbox is the concrete second case, and its maintainers have offered it as the first one to try
+this on. It lives outside `gears-rust`, and it holds hand-copied `clippy.toml`, `deny.toml`,
+`rustfmt.toml`, `rust-toolchain.toml` and `Makefile` — P9 portability, in files. It also needs a
+subset and not the whole set: no gear documents, no FIPS. That makes it the test of P6 all or
+nothing as well, on a repository nobody has to invent.
+
 The rest divides into what an extension may add later, and what an extension must not add either.
 The second list is not about difficulty or sequencing. Each entry there would change what the tool
 is, so "later" is not the answer to any of them.
@@ -470,7 +520,7 @@ is, so "later" is not the answer to any of them.
 | Migrating a consumer across a breaking platform change | Out of scope today | Would be a versioned codemod; nobody owns it yet |
 | Adopting an unrelated repository that does not use Gears | Out of scope today | A later question; the first version serves Gears projects |
 | Rewriting an existing repository to match a convention it declared | Out of scope today | The check reports the gap; closing it is the team's work, not a silent edit |
-| A three-way merge of upstream and local edits to one managed file | Excluded by design | It fails quietly. A project that needs different content declares an exception instead; an upgrade that needs a real transformation states what it changes |
+| A three-way merge of upstream and local edits to one managed file | Excluded by design | Not because merging is unsound — a merge with a stored base and a reported conflict is defensible, and Gearbox does it for product templates. Because a clean merge can still give a wrong file, and for a `clippy.toml` or a `deny.toml` nothing downstream would catch it. A project that needs different content declares an exception instead; an upgrade that needs a real transformation states what it changes |
 | Obtaining and executing software as part of a run | Excluded by design | It breaks the execution boundary the bot contract rests on: a job that fires unattended must not fetch and run arbitrary programs. Naming what is missing, and the command that installs it, is already in scope |
 | Re-deciding a verdict another validator owns | Excluded by design | Two answers to one question is worse than none. A domain with **no** owner is not this case — a check for it is ordinary extension territory |
 | Any runtime responsibility | Excluded by design | This tool works at development time only |
@@ -495,8 +545,8 @@ Seven observations about tools people use every day. Each one decided something 
   directories from the app config, and never overwrites one that exists. Where a project must
   diverge, give it a declared exception, or it edits the file and says nothing.
 - **Upgrades are explicit transformations, not merges.** `ng update`, `nx migrate` and
-  `rails app:update` ship versioned steps owned by whoever caused the change. A three-way merge
-  fails quietly instead: no conflict markers, and the file still wrong.
+  `rails app:update` ship versioned steps owned by whoever caused the change. A merge with no
+  stored base and no report fails quietly instead: no conflict markers, and the file still wrong.
 - **The road is a default, not a mandate.** Netflix's Paved Road is followed by default and left
   deliberately. A tool that fails a project for a convention it never took is a tool teams route
   around.

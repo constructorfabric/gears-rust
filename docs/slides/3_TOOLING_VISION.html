@@ -132,12 +132,12 @@ which is why PR #5326 has to add <code>ensure-dna.py</code>.</li>
 <td>a person copies the file by hand</td>
 </tr>
 <tr>
-<td>Studio + kit</td>
+<td><code>cfs</code> + kit</td>
 <td>not the repository, the build or CI</td>
 </tr>
 <tr>
 <td>Gearbox + GDL</td>
-<td>local paths, no version resolution</td>
+<td>resolves versions; nobody publishes a known-good set</td>
 </tr>
 <tr>
 <td>PR #5326</td>
@@ -160,7 +160,7 @@ The other two happen for the <strong>life of the project</strong>.</p>
 </section>
 </foreignObject></svg><svg data-marpit-svg="" viewBox="0 0 1280 720"><foreignObject width="1280" height="720"><section id="8" data-paginate="true" data-theme="rose-pine-moon" lang="en-US" data-marpit-pagination="8" style="--paginate:true;--theme:rose-pine-moon;" data-marpit-pagination-total="16">
 <h2 id="what-a-convention-is-concretely">What a convention is, concretely</h2>
-<p><strong>Installed and pinned</strong> — build rules (<code>gears.mk</code>, 32 targets) · CI (30 workflows, 4 composite actions, 24 pipeline scripts) · Rust lint and toolchain (6 config files) · dependency baseline (256 deps, ~125 lints) · document-first development (the Studio kit) · agent configuration (5 vendors, one source) · platform guidelines (<code>guidelines/DNA</code>) · repository boilerplate</p>
+<p><strong>Installed and pinned</strong> — build rules (<code>gears.mk</code>, 32 targets) · CI (30 workflows, 4 composite actions, 24 pipeline scripts) · Rust lint and toolchain (6 config files) · dependency baseline (256 deps, ~125 lints) · document-first development (the <code>cfs</code> kit) · agent configuration (5 vendors, one source) · platform guidelines (<code>guidelines/DNA</code>) · repository boilerplate</p>
 <p><strong>Checked only — nothing is installed</strong> — repository layout · gear layout: the crate, <code>gear.gdl</code>, the documents, the workspace entry, the publish settings</p>
 <blockquote>
 <p>A project takes the subset it wants — that is <strong>P6</strong>.<br />
@@ -200,10 +200,9 @@ A name somebody can move later is not a pin.</p>
 <p>Rust has no <code>extends</code>, no parent manifest, no remote configuration inheritance.<br />
 <code>[workspace.lints]</code> stops at the workspace.</p>
 </blockquote>
-<p>Those files have to be copied — which is exactly what <code>gears-rust</code> does today,<br />
-and why no existing scaffolding platform solves this for us.</p>
-<p><strong>The mandate:</strong> reference what can be referenced, generate what can be generated,<br />
-and shrink copying to the residue Rust leaves no alternative for.</p>
+<p>Each has to exist <strong>locally and complete</strong> — which is why <code>gears-rust</code> copies them.</p>
+<p><strong>But local is not the same as copied.</strong> Where a file has a parameter surface — an ignored advisory in <code>deny.toml</code>, a licence exception, a threshold — upstream gives the base and the project gives its values. Copying is what remains where there is nothing to parameterise.</p>
+<p><strong>The mandate:</strong> reference what can be referenced, generate what can be generated, and shrink copying to the files with no parameter surface at all.</p>
 </section>
 </foreignObject></svg><svg data-marpit-svg="" viewBox="0 0 1280 720"><foreignObject width="1280" height="720"><section id="12" data-paginate="true" data-theme="rose-pine-moon" lang="en-US" data-marpit-pagination="12" style="--paginate:true;--theme:rose-pine-moon;" data-marpit-pagination-total="16">
 <h2 id="boundaries--what-it-will-not-do">Boundaries — what it will not do</h2>
@@ -283,12 +282,13 @@ teams keep copying by hand — or a green check comes to mean <em>&quot;nothing 
 </foreignObject></svg><svg data-marpit-svg="" viewBox="0 0 1280 720"><foreignObject width="1280" height="720"><section id="15" data-paginate="true" data-theme="rose-pine-moon" lang="en-US" data-marpit-pagination="15" style="--paginate:true;--theme:rose-pine-moon;" data-marpit-pagination-total="16">
 <h2 id="what-we-have-to-decide">What we have to decide</h2>
 <ol>
-<li><strong>Where do the conventions live?</strong> A pin needs something to point at. Nothing publishes <code>gears.mk</code> under tags today, and CI is not reusable. <strong>This vision is inert until somebody does that work</strong> — and it changes <code>gears-rust</code> first.</li>
+<li><strong>Where do the conventions live, and who puts them there?</strong> A pin needs something to point at. Nothing publishes <code>gears.mk</code> under tags today, and CI is not reusable. <strong>Step zero, and it needs a named owner</strong> — before the tool, and it changes <code>gears-rust</code> first.</li>
 <li><strong>Which direction is the default?</strong> PR #5326's facades adapt the kit to the build system a project already has. This vision gives a project the build system it should have. Both can exist; only one can be the default.</li>
 <li><strong>How granular is the convention menu?</strong> Too fine and no two projects compare;<br />
 too coarse and the choice is useless.</li>
 <li><strong>Where is the boundary</strong> with <code>cargo gears</code>, <code>cfs</code> and Gearbox?</li>
 </ol>
+<p><strong>Gearbox has offered to be the pilot</strong> — outside <code>gears-rust</code>, five files copied by hand (P9), and it needs only part of the conventions (P6).</p>
 </section>
 </foreignObject></svg><svg data-marpit-svg="" viewBox="0 0 1280 720"><foreignObject width="1280" height="720"><section id="16" data-paginate="true" data-class="lead" data-theme="rose-pine-moon" lang="en-US" class="lead" data-marpit-pagination="16" style="--paginate:true;--class:lead;--theme:rose-pine-moon;" data-marpit-pagination-total="16">
 <h1 id="discussion">Discussion</h1>
