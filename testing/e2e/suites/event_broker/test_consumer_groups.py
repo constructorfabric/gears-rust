@@ -40,7 +40,7 @@ async def test_create_anonymous_group_returns_201(api):
 
 
 async def test_create_anonymous_group_no_body_returns_201(api):
-    """scenario: consumer/groups/1.01 — the request body is optional."""
+    """scenario: consumer/groups/1.01 - the request body is optional."""
     async with api() as client:
         resp = await client.post("/consumer-groups")
     assert resp.status_code == 201
@@ -283,7 +283,7 @@ async def test_cross_tenant_get_anonymous_group_returns_403(api):
 
     Tenant A creates an anonymous group; tenant B's GET on that group must
     return 403, not 200.  In standalone mode auth is disabled so the server
-    returns 200 — hence strict xfail.
+    returns 200 - hence strict xfail.
     """
     async with api() as client:
         create_resp = await client.post("/consumer-groups")
@@ -292,7 +292,7 @@ async def test_cross_tenant_get_anonymous_group_returns_403(api):
 
         # In a real deployment this request would carry a different tenant's
         # bearer token.  Standalone auth is disabled so this is indistinguishable
-        # from the owning tenant — the test is here to document the contract.
+        # from the owning tenant - the test is here to document the contract.
         get_resp = await client.get(f"/consumer-groups/{group_id}")
     assert get_resp.status_code == 403
     body = get_resp.json()

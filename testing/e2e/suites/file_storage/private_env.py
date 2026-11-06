@@ -24,6 +24,7 @@ import os
 import re
 import socket
 import subprocess
+import tempfile
 import time
 from pathlib import Path
 
@@ -205,19 +206,35 @@ class FileStorageSidecar:
             self._log_fh = None
 
 
-def _make_config_patch(server_port: int, extra_yaml: str | None):
+def _make_config_patch(server_port: int, extra_yaml: str | None, *, home_dir: Path):
     """Build the ``GearTestEnv.config_patch`` callback.
 
     Regex-on-YAML-text (``pyyaml`` is not an e2e dependency). Overrides
-    ``storage_root``, ``sidecar_base_url``, ``signing_key_pkcs8`` and
-    ``bind_addr``; when ``extra_yaml`` is given it is appended right after the
-    ``finalize_internal_secret`` line of the file-storage block.
+    ``home_dir``, the gRPC ``listen_addr``, ``storage_root``, ``sidecar_base_url``,
+    ``signing_key_pkcs8`` and ``bind_addr``. Any ``extra_yaml`` is appended
+    right after the ``finalize_internal_secret`` line of the file-storage block.
     """
 
     def patch(config_text: str, gear_env) -> str:
         sidecar = next(sc for sc in gear_env.sidecars if sc.name == FileStorageSidecar.name)
         root = Path(sidecar.storage_root).as_posix()
         url = f"http://localhost:{sidecar.port}"
+        # Isolate databases from the shared server and earlier local runs.
+        config_text, count = re.subn(
+            r"(home_dir\s*:\s*).*",
+            lambda m: f'{m.group(1)}"{home_dir.as_posix()}"',
+            config_text,
+            count=1,
+        )
+        assert count == 1, "server.home_dir missing from lifecycle base config"
+        # The shared server already owns the base config's gRPC UDS path.
+        config_text, count = re.subn(
+            r"(listen_addr\s*:\s*).*",
+            r'\1"127.0.0.1:0"',
+            config_text,
+            count=1,
+        )
+        assert count == 1, "grpc-hub listen_addr missing from lifecycle base config"
         config_text = re.sub(
             r"(storage_root\s*:\s*).*",
             lambda m: f'{m.group(1)}"{root}"',
@@ -279,8 +296,9 @@ def private_server(
         control_base_url=base_url,
         extra_vars=sidecar_vars,
     )
+    home_dir = Path(tempfile.mkdtemp(prefix="cf-fs-e2e-home-"))
     gear_env = GearTestEnv(
-        config_patch=_make_config_patch(server_port, extra_config_yaml),
+        config_patch=_make_config_patch(server_port, extra_config_yaml, home_dir=home_dir),
         port=server_port,
         health_path="/healthz",
         health_timeout=60,

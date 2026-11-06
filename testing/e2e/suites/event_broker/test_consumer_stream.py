@@ -280,7 +280,7 @@ async def test_positions_not_set_returns_409(api):
         assert sub_resp.status_code == 201
         sub_id = str(sub_resp.json()["id"])
 
-        # No SEEK performed — stream must reject.
+        # No SEEK performed - stream must reject.
         stream_resp = await client.get(
             f"/events:stream?subscription_id={sub_id}",
             headers={"Accept": "multipart/mixed"},
@@ -350,7 +350,7 @@ async def test_terminated_subscription_returns_410(api):
             assert stream_resp.status_code == 410
 
 
-# 1.07 and 1.08 are covered by test_stream_guardrails.py — not duplicated here.
+# 1.07 and 1.08 are covered by test_stream_guardrails.py - not duplicated here.
 # 1.09 (SSE happy path) is covered by test_publish_consume.py.
 
 

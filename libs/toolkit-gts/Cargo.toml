@@ -30,3 +30,6 @@ inventory = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 schemars = { workspace = true, features = ["derive"] }
+
+[dev-dependencies]
+declarations_fixture = { package = "cf-gears-toolkit-gts-declarations-fixture", path = "../toolkit-gts-macros/tests/fixtures/declaring-crate" }

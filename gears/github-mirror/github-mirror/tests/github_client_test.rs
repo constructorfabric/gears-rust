@@ -1986,18 +1986,23 @@ async fn a_403_with_only_retry_after_is_retried_as_a_rate_limit() {
 
 #[tokio::test]
 async fn a_403_with_only_an_exhausted_quota_is_retried_as_a_rate_limit() {
-    let reset = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("the clock is after 1970")
-        .as_secs()
-        + 2;
     let server = MockServer::start_async().await;
     let limited = server
-        .mock_async(move |when, then| {
+        .mock_async(|when, then| {
             when.method("GET").path("/repos/acme/limited");
-            then.status(403)
-                .header("x-ratelimit-remaining", "0")
-                .header("x-ratelimit-reset", reset.to_string());
+            then.respond_with(|_| {
+                // Start the quota window when the response is sent, after client setup.
+                let reset = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("the clock is after 1970")
+                    .as_secs()
+                    + 2;
+                httpmock::HttpMockResponse::builder()
+                    .status(403)
+                    .header("x-ratelimit-remaining", "0")
+                    .header("x-ratelimit-reset", reset.to_string())
+                    .build()
+            });
         })
         .await;
     served_after_one_rate_limited_answer(&server, limited).await;

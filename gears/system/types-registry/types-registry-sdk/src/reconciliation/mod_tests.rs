@@ -691,6 +691,65 @@ async fn an_unreachable_registry_leaves_identifiers_pending_unavailable() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn temporary_read_failures_recover_within_the_reconciliation_budget() {
+    let fake = MockTypesRegistry::new();
+    fake.inject(
+        Fault::on(Call::BatchGet)
+            .first(2)
+            .fail(CanonicalError::service_unavailable().create()),
+    );
+
+    let outcomes = admitted(run(&fake, vec![doc(A)]).await);
+
+    assert!(matches!(outcomes[A], ReconcileOutcome::Admitted));
+    assert_eq!(fake.content(A), Some(doc(A).1));
+}
+
+#[tokio::test(start_paused = true)]
+async fn read_retries_share_one_deadline() {
+    let fake = MockTypesRegistry::new();
+    fake.inject(
+        Fault::on(Call::BatchGet)
+            .delay(Duration::from_secs(3))
+            .fail(CanonicalError::service_unavailable().create()),
+    );
+    let options = ReconcileOptions {
+        deadline: Duration::from_secs(5),
+        ..options()
+    };
+    let started = tokio::time::Instant::now();
+
+    let outcomes = unsettled_by(
+        run_with(&fake, vec![doc(A)], &options).await,
+        ReconcileStop::Deadline,
+    );
+
+    assert_eq!(started.elapsed(), options.deadline);
+    assert!(matches!(outcomes[A], ReconcileOutcome::Pending(_)));
+    assert!(fake.submissions().is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_rejection_stops_retrying_other_pending_identifiers() {
+    let fake = MockTypesRegistry::new();
+    fake.reject(A, AdmissionFailureReason::InvalidSchema);
+    fake.depends_on(B, BASE);
+    let started = tokio::time::Instant::now();
+    let outcomes = unsettled_by(
+        run(&fake, vec![doc(A), doc(B)]).await,
+        ReconcileStop::Rejected,
+    );
+
+    assert!(matches!(outcomes[A], ReconcileOutcome::Rejected(_)));
+    assert!(matches!(
+        outcomes[B],
+        ReconcileOutcome::Pending(ReconcilePendingCause::Dependency(_))
+    ));
+    assert!(started.elapsed() < options().retry_backoff);
+    assert_eq!(fake.submissions().len(), 1);
+}
+
+#[tokio::test(start_paused = true)]
 async fn an_equal_identifier_settles_at_once_and_a_later_read_failure_cannot_downgrade_it() {
     let fake = MockTypesRegistry::new();
     fake.depends_on(B, BASE);
@@ -704,7 +763,7 @@ async fn an_equal_identifier_settles_at_once_and_a_later_read_failure_cannot_dow
 
     let outcomes = unsettled_by(
         run(&fake, vec![(a, content), (gid(B), json!({}))]).await,
-        ReconcileStop::ReadFailed,
+        ReconcileStop::PassesExhausted,
     );
 
     assert!(
@@ -997,11 +1056,8 @@ async fn throttling_honors_the_hint_and_reuses_the_identical_submission() {
 
 #[tokio::test(start_paused = true)]
 async fn throttling_wait_is_bounded_by_the_whole_call_deadline() {
-    // A later pass reports the expired budget; the last pass keeps the registry's answer.
-    for (what, passes, budget_reported) in [
-        ("default passes", options(), true),
-        ("one pass", one_pass(), false),
-    ] {
+    // The stop reports the shared deadline; each item keeps the registry's last answer.
+    for (what, passes) in [("default passes", options()), ("one pass", one_pass())] {
         let fake = MockTypesRegistry::new();
         fake.inject(Fault::on(Call::Register).fail(throttled(30)));
         let options = ReconcileOptions {
@@ -1021,11 +1077,7 @@ async fn throttling_wait_is_bounded_by_the_whole_call_deadline() {
             panic!("{what}: temporary throttling: {:?}", outcomes[A]);
         };
         assert!(
-            if budget_reported {
-                matches!(error, CanonicalError::DeadlineExceeded { .. })
-            } else {
-                matches!(error, CanonicalError::ResourceExhausted { .. })
-            },
+            matches!(error, CanonicalError::ResourceExhausted { .. }),
             "{what}: {error:?}"
         );
         assert_eq!(fake.calls(Call::Register), 1, "{what}");
@@ -1465,7 +1517,7 @@ mod cover {
 
     use super::*;
     use crate::models::{RegisterItem, RegistrationItemResult, RegistrationOutcome};
-    use crate::reconcile::cover;
+    use crate::reconciliation::cover;
 
     fn candidate(id: &str) -> RegisterItem {
         RegisterItem {

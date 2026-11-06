@@ -1,0 +1,5 @@
+error: missing required arg `from = "provider-gear-name"`
+  --> tests/ui/fail/consumes_list_entry_without_from.rs:11:46
+   |
+11 | #[consumes(contract = [FooApi(from = "foo"), BarApi])]
+   |                                              ^^^^^^

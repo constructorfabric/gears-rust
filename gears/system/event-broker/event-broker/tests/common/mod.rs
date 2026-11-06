@@ -171,8 +171,20 @@ database:
   servers: {{}}
 
 gears:
+  # The broker reads topics and event types through the platform API, which the
+  # registry publishes only with a database.
   types-registry:
+    database:
+      engine: sqlite
+      file: "types_registry.db"
     config:
+      # The fixtures' event types and topics use vendor `x`; it is open in
+      # their `x.eb` namespace only.
+      registration_policy:
+        "gts.cf.core.events.event.v1~x.eb.*":
+          allowed_vendors: [x]
+        "gts.cf.core.events.topic.v1~x.eb.*":
+          allowed_vendors: [x]
       entities: [{entities}]
 
   cluster:

@@ -28,3 +28,13 @@ syn = { workspace = true }
 # marker form inside `type_id = ...` / `id: ...` / `"id": ...` args.
 gts-id = { workspace = true }
 gts = { workspace = true }
+
+[dev-dependencies]
+# Path-only dev dependencies keep the macro -> runtime test cycle out of the
+# published manifest. The renamed runtime dependency also exercises macro paths.
+gts_kit = { package = "cf-gears-toolkit-gts", path = "../toolkit-gts" }
+declarations_fixture = { package = "cf-gears-toolkit-gts-declarations-fixture", path = "tests/fixtures/declaring-crate" }
+trybuild = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+schemars = { workspace = true }

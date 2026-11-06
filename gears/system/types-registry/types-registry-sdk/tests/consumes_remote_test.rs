@@ -222,6 +222,8 @@ async fn a_host_without_the_registry_reaches_it_only_through_the_directory() {
     })));
     let host = tokio::spawn(runtime.run_gear_phases());
 
+    // The proxies belong to the consuming gear, so read them through its view.
+    let hub = hub.for_gear(CONSUMER);
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     while !(hub.has_remote_proxy::<dyn PlatformTypesRegistryApi>()
         && hub.has_remote_proxy::<dyn TypesRegistryApi>())

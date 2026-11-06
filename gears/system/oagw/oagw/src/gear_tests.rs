@@ -15,7 +15,6 @@ use credstore_sdk::CredStoreClientV1;
 use oagw_sdk::api::ServiceGatewayClientV1;
 use serde_json::{Value, json};
 use tenant_resolver_sdk::{TenantId, TenantResolverClient};
-use toolkit::runtime::{GearManager, GrpcInstallerStore, SystemContext};
 use toolkit::{ClientHub, ConfigProvider, GearCtx};
 use toolkit_canonical_errors::CanonicalError;
 use toolkit_db::{DBProvider, Db};
@@ -330,13 +329,7 @@ async fn post_init_provisions_registry_instances_into_the_root_tenant() {
     let gear = init(&context(json!({ "config": {} }), None, hub))
         .await
         .expect("init");
-    gear.post_init(&SystemContext::new(
-        Uuid::new_v4(),
-        Arc::new(GearManager::new()),
-        Arc::new(GrpcInstallerStore::new()),
-    ))
-    .await
-    .expect("post_init");
+    gear.post_init(&post_init_ctx()).await.expect("post_init");
 
     let cp = control_plane(&gear);
     let ctx = provisioning_ctx(root).unwrap();
@@ -385,12 +378,9 @@ fn one_upstream_registry(upstream_id: Uuid, route_id: Uuid) -> MockTypesRegistry
     ])
 }
 
-fn system_context() -> SystemContext {
-    SystemContext::new(
-        Uuid::new_v4(),
-        Arc::new(GearManager::new()),
-        Arc::new(GrpcInstallerStore::new()),
-    )
+/// The context of `post_init`, which reads nothing from it.
+fn post_init_ctx() -> GearCtx {
+    context(json!({ "config": {} }), None, Arc::new(ClientHub::new()))
 }
 
 async fn health(gear: &OutboundApiGatewayGear, ctx: &GearCtx) -> toolkit::HealthcheckStatus {
@@ -431,7 +421,7 @@ async fn on_a_database_start_reconciles_in_the_background() {
     let cluster = ClusterFixture::standalone(&hub);
     let ctx = context(database_section(), Some(file.open().await), hub);
     let gear = init(&ctx).await.expect("init");
-    gear.post_init(&system_context()).await.expect("post_init");
+    gear.post_init(&post_init_ctx()).await.expect("post_init");
 
     let cp = control_plane(&gear);
     let pctx = provisioning_ctx(root).unwrap();
@@ -505,7 +495,7 @@ async fn a_held_lease_delays_neither_startup_nor_shutdown() {
     let cluster = ClusterFixture::standalone(&hub);
     let ctx = context(database_section(), Some(db), hub);
     let gear = init(&ctx).await.expect("init");
-    gear.post_init(&system_context()).await.expect("post_init");
+    gear.post_init(&post_init_ctx()).await.expect("post_init");
     gear.start(tokio_util::sync::CancellationToken::new())
         .await
         .expect("start");
@@ -552,7 +542,7 @@ async fn in_memory_post_init_reconciles_and_start_spawns_nothing() {
     );
     let ctx = context(json!({ "config": {} }), None, hub);
     let gear = init(&ctx).await.expect("init");
-    gear.post_init(&system_context()).await.expect("post_init");
+    gear.post_init(&post_init_ctx()).await.expect("post_init");
     assert_eq!(health(&gear, &ctx).await, HealthcheckStatus::Healthy);
     gear.start(tokio_util::sync::CancellationToken::new())
         .await
@@ -725,7 +715,7 @@ async fn booting_twice_through_the_lifecycle_leaves_the_rows_unchanged() {
         let cluster = ClusterFixture::standalone(&hub);
         let ctx = context(database_section(), Some(file.open().await), hub);
         let gear = init(&ctx).await.expect("init");
-        gear.post_init(&system_context()).await.expect("post_init");
+        gear.post_init(&post_init_ctx()).await.expect("post_init");
         gear.start(tokio_util::sync::CancellationToken::new())
             .await
             .expect("start");
@@ -892,7 +882,7 @@ async fn a_second_start_after_stop_reconciles_again() {
     let cluster = ClusterFixture::standalone(&hub);
     let ctx = context(database_section(), Some(db.clone()), hub);
     let gear = init(&ctx).await.expect("init");
-    gear.post_init(&system_context()).await.expect("post_init");
+    gear.post_init(&post_init_ctx()).await.expect("post_init");
     let root_token = tokio_util::sync::CancellationToken::new();
     let cp = control_plane(&gear);
     let pctx = provisioning_ctx(root).unwrap();
@@ -949,7 +939,7 @@ async fn cancelling_the_start_token_ends_the_task() {
     let cluster = ClusterFixture::standalone(&hub);
     let ctx = context(database_section(), Some(file.open().await), hub);
     let gear = init(&ctx).await.expect("init");
-    gear.post_init(&system_context()).await.expect("post_init");
+    gear.post_init(&post_init_ctx()).await.expect("post_init");
     let root_token = tokio_util::sync::CancellationToken::new();
     gear.start(root_token.clone()).await.expect("start");
 
@@ -1197,7 +1187,7 @@ async fn on_a_database_start_connects_the_cache_to_the_cluster_change_log() {
     let cluster = ClusterFixture::standalone(&hub);
     let ctx = context(database_section(), Some(db.clone()), Arc::clone(&hub));
     let gear = init(&ctx).await.expect("init");
-    gear.post_init(&system_context()).await.expect("post_init");
+    gear.post_init(&post_init_ctx()).await.expect("post_init");
     gear.start(tokio_util::sync::CancellationToken::new())
         .await
         .expect("start");
@@ -1272,7 +1262,7 @@ async fn start_error(wire: impl FnOnce(&Arc<ClientHub>) -> ClusterFixture) -> an
     let cluster = wire(&hub);
     let ctx = context(database_section(), Some(file.open().await), hub);
     let gear = init(&ctx).await.expect("init");
-    gear.post_init(&system_context()).await.expect("post_init");
+    gear.post_init(&post_init_ctx()).await.expect("post_init");
     let err = gear
         .start(tokio_util::sync::CancellationToken::new())
         .await
@@ -1328,7 +1318,7 @@ fn settling_hub(root: Uuid) -> Arc<ClientHub> {
 
 /// `post_init` and `start` (returning at once) on `gear`.
 async fn boot(gear: &OutboundApiGatewayGear) {
-    gear.post_init(&system_context()).await.expect("post_init");
+    gear.post_init(&post_init_ctx()).await.expect("post_init");
     tokio::time::timeout(
         std::time::Duration::from_secs(1),
         gear.start(tokio_util::sync::CancellationToken::new()),

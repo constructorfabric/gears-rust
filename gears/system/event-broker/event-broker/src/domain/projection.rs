@@ -8,7 +8,8 @@
 //! ([`event_broker_sdk::models`]) instead - computed here, once, from the
 //! registered schema. The DTOs are the wire contract and so belong to the SDK;
 //! deriving them from a schema is broker-side work and belongs here, where the
-//! registry's resolved-schema model is already a dependency.
+//! registry's materialized documents (resolved schema, effective traits) are
+//! already a dependency.
 //!
 //! Every failure here is [`DomainError::Internal`]. A resolved schema reaching
 //! the broker without a trait its base declares `required` is a registration
@@ -18,13 +19,14 @@
 use event_broker_sdk::gts::data_contract;
 use event_broker_sdk::models::{EventType, Topic};
 use gts::GtsIdPattern;
-use types_registry_sdk::{GtsInstance, GtsTypeSchema};
+use types_registry_sdk::{Instance, TypeSchema};
 
 use toolkit_utils::iso8601_duration::{Iso8601Duration, Iso8601DurationError};
 
 use crate::domain::error::DomainError;
 use crate::domain::event_type::{
-    partition_key as event_type_partition_key, topic as event_type_topic,
+    effective_traits, partition_key as event_type_partition_key, resolved_schema,
+    topic as event_type_topic,
 };
 
 /// Projects a registered topic instance onto the API's topic shape.
@@ -36,19 +38,21 @@ use crate::domain::event_type::{
 /// # Errors
 /// Returns [`DomainError::Internal`] when the document carries no string
 /// `description`, or a `retention` that is not an ISO 8601 duration.
-pub fn topic(instance: &GtsInstance) -> Result<Topic, DomainError> {
+pub fn topic(instance: &Instance) -> Result<Topic, DomainError> {
     let broken = |detail: &str| DomainError::Internal(format!("{} {detail}", instance.id.as_ref()));
 
     let description = instance
-        .object
-        .get("description")
+        .content
+        .as_ref()
+        .and_then(|content| content.get("description"))
         .and_then(serde_json::Value::as_str)
         .map(str::to_owned)
         .ok_or_else(|| broken("carries no string `description`"))?;
 
     let retention = instance
-        .object
-        .get("retention")
+        .content
+        .as_ref()
+        .and_then(|content| content.get("retention"))
         .filter(|value| !value.is_null())
         .and_then(serde_json::Value::as_str)
         .map(str::parse::<Iso8601Duration>)
@@ -69,15 +73,16 @@ pub fn topic(instance: &GtsInstance) -> Result<Topic, DomainError> {
 /// Projects a resolved event type schema onto the API's event-type shape.
 ///
 /// # Errors
-/// Returns [`DomainError::Internal`] when the schema resolves to no `topic`
-/// trait, to one that is not a well-formed GTS instance identifier, or to no
-/// `partition_key` trait - the base declares a default for the last, so an
-/// absent value means the chain never carried the base's trait schema.
-pub fn event_type(schema: &GtsTypeSchema) -> Result<EventType, DomainError> {
+///
+/// Returns [`DomainError::Internal`] when the schema carries no effective traits
+/// or resolved schema, or resolves to no `topic` trait, to one that is not a
+/// well-formed GTS instance identifier, or to no `partition_key` trait - the
+/// base declares a default for the last, so an absent value means the chain
+/// never carried the base's trait schema.
+pub fn event_type(schema: &TypeSchema) -> Result<EventType, DomainError> {
     let topic = event_type_topic(schema)?;
 
-    let allowed_subject_types = schema
-        .effective_traits()
+    let allowed_subject_types = effective_traits(schema)?
         .get("allowed_subject_types")
         .and_then(serde_json::Value::as_array)
         .map(|values| {
@@ -89,14 +94,20 @@ pub fn event_type(schema: &GtsTypeSchema) -> Result<EventType, DomainError> {
         .unwrap_or_default();
 
     let partition_key = event_type_partition_key(schema)?;
+    let data_schema = data_contract(resolved_schema(schema)?);
 
     Ok(EventType {
         id: schema.type_id.clone(),
         topic,
-        description: schema.description.clone(),
+        description: schema
+            .content
+            .as_ref()
+            .and_then(|content| content.get("description"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
         allowed_subject_types,
         partition_key,
-        data_schema: data_contract(&schema.effective_schema()),
+        data_schema,
     })
 }
 

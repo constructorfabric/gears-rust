@@ -9,8 +9,34 @@
 //! 2. **Strict loading**: Requires configuration to be present and valid.
 //!    - Used by `gear_config_required`
 //!    - Returns errors when configuration is missing or invalid
+//!
+//! Both loaders hide the framework-owned [`GTS_PUBLICATION_CONFIG_KEY`] entry of the
+//! `config` section from the gear's typed configuration, so a gear config with
+//! `#[serde(deny_unknown_fields)]` accepts it; the runtime reads it from the raw
+//! [`ConfigProvider`]. Every other key, unknown business fields included, still reaches
+//! the gear's deserializer.
 
 use serde::de::DeserializeOwned;
+
+/// `gears.<gear>.config.gts_publication`: the gear's GTS publication policy, owned by
+/// the runtime ([`crate::gts_publication::GtsPublicationOptions`]) and removed from the
+/// typed gear configuration.
+pub const GTS_PUBLICATION_CONFIG_KEY: &str = "gts_publication";
+
+/// Deserialize a gear's `config` section without the framework-owned keys.
+fn typed_config<T: DeserializeOwned>(
+    gear_name: &str,
+    config_section: &serde_json::Value,
+) -> Result<T, ConfigError> {
+    let mut section = config_section.clone();
+    if let Some(obj) = section.as_object_mut() {
+        obj.remove(GTS_PUBLICATION_CONFIG_KEY);
+    }
+    serde_json::from_value(section).map_err(|e| ConfigError::InvalidConfig {
+        gear: gear_name.to_owned(),
+        cause: e,
+    })
+}
 
 /// Configuration error for typed config operations
 #[derive(thiserror::Error, Debug)]
@@ -47,6 +73,7 @@ pub trait ConfigProvider: Send + Sync {
 /// - If the gear value is not an object → returns `Ok(T::default())`
 /// - If the gear has no "config" field → returns `Ok(T::default())`
 /// - If "config" is present but invalid → returns `Err(ConfigError::InvalidConfig)`
+/// - The framework-owned `config.gts_publication` entry is not part of `T`
 ///
 /// Use this for gears that can operate with default configuration.
 ///
@@ -72,13 +99,7 @@ pub fn gear_config_or_default<T: DeserializeOwned + Default>(
     };
 
     // Config section exists, try to parse it
-    let config: T =
-        serde_json::from_value(config_section.clone()).map_err(|e| ConfigError::InvalidConfig {
-            gear: gear_name.to_owned(),
-            cause: e,
-        })?;
-
-    Ok(config)
+    typed_config(gear_name, config_section)
 }
 
 /// Strict configuration loader that requires configuration to be present.
@@ -88,6 +109,7 @@ pub fn gear_config_or_default<T: DeserializeOwned + Default>(
 /// - If the gear value is not an object → returns `Err(ConfigError::InvalidGearStructure)`
 /// - If the gear has no "config" field → returns `Err(ConfigError::MissingConfigSection)`
 /// - If "config" is present but invalid → returns `Err(ConfigError::InvalidConfig)`
+/// - The framework-owned `config.gts_publication` entry is not part of `T`
 ///
 /// Use this for gears that cannot operate without explicit configuration.
 ///
@@ -117,13 +139,7 @@ pub fn gear_config_required<T: DeserializeOwned>(
             gear: gear_name.to_owned(),
         })?;
 
-    let config: T =
-        serde_json::from_value(config_section.clone()).map_err(|e| ConfigError::InvalidConfig {
-            gear: gear_name.to_owned(),
-            cause: e,
-        })?;
-
-    Ok(config)
+    typed_config(gear_name, config_section)
 }
 
 #[cfg(test)]
@@ -358,6 +374,73 @@ mod tests {
         if let Err(ConfigError::InvalidConfig { gear, .. }) = result {
             assert_eq!(gear, "bad_config_gear");
         }
+    }
+
+    // ========== The framework-owned `gts_publication` entry ==========
+
+    /// A gear config as strict as the real resolver/plugin/AM configs.
+    #[derive(Debug, PartialEq, Deserialize, Default)]
+    #[serde(deny_unknown_fields)]
+    struct StrictConfig {
+        #[serde(default)]
+        vendor: String,
+    }
+
+    fn strict_provider(config: &serde_json::Value) -> MockConfigProvider {
+        let mut provider = MockConfigProvider::new();
+        provider
+            .gears
+            .insert("strict_gear".to_owned(), json!({ "config": config }));
+        provider
+    }
+
+    #[test]
+    fn strict_gear_config_accepts_the_gts_publication_section() {
+        let provider = strict_provider(&json!({
+            "vendor": "acme",
+            "gts_publication": { "timeout": "5s", "batch_size": 3 },
+        }));
+        let required: StrictConfig = gear_config_required(&provider, "strict_gear").unwrap();
+        let lenient: StrictConfig = gear_config_or_default(&provider, "strict_gear").unwrap();
+        assert_eq!(required.vendor, "acme");
+        assert_eq!(lenient.vendor, "acme");
+        // The runtime still reads the section from the raw provider.
+        assert_eq!(
+            provider.get_gear_config("strict_gear").unwrap()["config"][GTS_PUBLICATION_CONFIG_KEY]
+                ["batch_size"],
+            3
+        );
+    }
+
+    #[test]
+    fn strict_gear_config_still_rejects_an_unknown_business_field() {
+        let provider = strict_provider(&json!({
+            "vendor": "acme",
+            "gts_publication": { "batch_size": 3 },
+            "vendro": "typo",
+        }));
+        for result in [
+            gear_config_required::<StrictConfig>(&provider, "strict_gear"),
+            gear_config_or_default::<StrictConfig>(&provider, "strict_gear"),
+        ] {
+            let err = result.unwrap_err();
+            assert!(
+                matches!(&err, ConfigError::InvalidConfig { gear, cause }
+                    if gear == "strict_gear" && cause.to_string().contains("unknown field `vendro`")),
+                "{err}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_the_gts_publication_key_is_hidden() {
+        // `consumer_wiring` keeps reaching the gear's deserializer, as before.
+        let provider = strict_provider(&json!({ "consumer_wiring": {} }));
+        let err = gear_config_required::<StrictConfig>(&provider, "strict_gear").unwrap_err();
+        assert!(
+            err.to_string().contains("unknown field `consumer_wiring`"),
+            "{err}"
+        );
     }
 
     // ========== Tests for ConfigError display messages ==========

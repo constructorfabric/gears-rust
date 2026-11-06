@@ -20,9 +20,9 @@ marks it `✓`.
 
 - **Toolkit substrate** — runtime, secure ORM, canonical errors, REST/OpenAPI, OData,
   observability, gRPC transport, GTS. See [Toolkit](../toolkit/).
-- **System gears** — API Gateway, Service Discovery, AuthN/AuthZ resolvers, Tenant Resolver,
-  Outbound API Gateway, Types Registry, Nodes Registry, Resource Group, gRPC Hub. See
-  [System gears](../system-gears/).
+- **Core gears** — API Gateway, Service Discovery, AuthN/AuthZ resolvers, Tenant Resolver,
+  Outbound API Gateway, Types Registry, Nodes Registry, Resource Group, gRPC Hub and Cluster. See
+  [Core gears](../core-gears/).
 - **Service gears (examples)** — File Parser, Credentials Store, Mini Chat, Simple User
   Settings. See [Reusable service gears](../service-gears/).
 
@@ -30,7 +30,6 @@ marks it `✓`.
 
 These are designed and documented in the framework but **not yet implemented**:
 
-- **Cluster plane** — leader election, distributed locks, distributed cache.
 - **GenAI gears** — Chat Engine, LLM Gateway, Models / Prompts / AI Agents registries, MCP
   Registry, Agent Memory, Web Search Gateway, URL Crawler, Model Scheduler, Local Search Index.
 - **Serverless gears** — Serverless Gateway & Runtimes, Durable Objects.

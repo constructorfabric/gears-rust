@@ -38,7 +38,16 @@ GEARS_JUNIT_ENRICH := tools/scripts/junit_enrich.py
 # Keep in sync with the `Install cargo-shear` step in shear-nightly.yml.
 SHEAR_VERSION ?= 1.13.1
 
+# shellcheck-py version installed into the venv by `make setup` (ships the shellcheck binary).
+# Keep in sync with the `Install shellcheck` step in githooks.yml.
+SHELLCHECK_PY_VERSION ?= 0.11.0.1
+
 CI := 1
+
+# Auto-install git hooks on any make run (idempotent, silent unless it installs something;
+# skipped in CI or with GEARS_NO_HOOKS=1; see .githooks/install.sh).
+_HOOKS_MSG := $(shell sh $(dir $(lastword $(MAKEFILE_LIST))).githooks/install.sh --quiet 2>/dev/null)
+$(if $(_HOOKS_MSG),$(info $(_HOOKS_MSG)))
 
 # Python helper scripts must run inside a repository-managed virtual environment.
 # PYTHON_BOOTSTRAP (gears.mk) is used only to create that environment;
@@ -46,10 +55,13 @@ CI := 1
 PY_ENV_DIR ?= .venv
 ifeq ($(OS),Windows_NT)
 PYTHON ?= $(PY_ENV_DIR)/Scripts/python
+SHELLCHECK ?= $(PY_ENV_DIR)/Scripts/shellcheck
 else
 PYTHON ?= $(PY_ENV_DIR)/bin/python
+SHELLCHECK ?= $(PY_ENV_DIR)/bin/shellcheck
 endif
-PY_ENV_STAMP := $(PY_ENV_DIR)/.requirements-stamp
+# The stamp name carries the shellcheck pin, so bumping SHELLCHECK_PY_VERSION re-runs py-env.
+PY_ENV_STAMP := $(PY_ENV_DIR)/.requirements-stamp-shellcheck-$(SHELLCHECK_PY_VERSION)
 PY_REQUIREMENTS := testing/requirements.txt testing/e2e/requirements.txt
 
 OPENAPI_PORT ?= 8087
@@ -78,7 +90,7 @@ GTS_VALIDATOR_MIN_VERSION ?= 0.16.1
 
 # -------- Set up --------
 
-.PHONY: setup py-env
+.PHONY: setup py-env shellcheck install-hooks uninstall-hooks
 
 py-env: $(PY_ENV_STAMP)
 	$(call print_target_banner)
@@ -88,11 +100,27 @@ $(PY_ENV_STAMP): $(PY_REQUIREMENTS)
 	$(PYTHON_BOOTSTRAP) -m venv $(PY_ENV_DIR)
 	$(PYTHON) -m pip install --upgrade pip
 	$(PYTHON) -m pip install -r testing/requirements.txt -r testing/e2e/requirements.txt
+	$(PYTHON) -m pip install shellcheck-py==$(SHELLCHECK_PY_VERSION)
 	@mkdir -p $(dir $(PY_ENV_STAMP))
 	@cat $(PY_REQUIREMENTS) > $(PY_ENV_STAMP)
 
+## Lint the git hook scripts with the pinned shellcheck (installed by setup)
+shellcheck: py-env
+	$(call print_target_banner)
+	@$(SHELLCHECK) -s sh -x .githooks/install.sh .githooks/lib.sh .githooks/pre-commit .githooks/pre-push .githooks/tests/run.sh
+
+## Install git hooks (pre-commit, pre-push) as symlinks into the git hooks dir
+install-hooks:
+	$(call print_target_banner)
+	@sh .githooks/install.sh
+
+## Remove the git hooks installed by install-hooks (only symlinks into .githooks)
+uninstall-hooks:
+	$(call print_target_banner)
+	@sh .githooks/install.sh --uninstall
+
 ## Install all required development tools
-setup: .setup-stamp py-env
+setup: .setup-stamp py-env install-hooks
 	$(call print_target_banner)
 
 # Re-run setup when a makefile changes (prerequisites are set at the end of this file),
@@ -459,7 +487,7 @@ test-eb-kafka: install-tools
 TOOLKIT_DB_LANES := toolkit-db-sqlite toolkit-db-pg toolkit-db-pgq toolkit-db-mysql
 INTEGRATION_LANES := $(TOOLKIT_DB_LANES) users-info-pg usage-collector-pg usage-collector-ch \
 	types-registry-db oagw-db oagw-cluster cluster-pg cluster-redis rg-pg settings-service-pg \
-	pricing-pg coord-pg products-pg ledger-pg orders-pg eb-gear-db
+	pricing-pg coord-pg products-pg ledger-pg orders-pg eb-gear-db quota-enforcement-pg
 
 ## toolkit-db on SQLite; the examples must still build after the tests.
 lane_args_toolkit-db-sqlite = -p cf-gears-toolkit-db --features sqlite,integration
@@ -656,6 +684,11 @@ lane_args_ledger-pg = -p cf-gears-bss-ledger --run-ignored ignored-only -E 'not 
 ## lib tests. The unit tier (`make test`) keeps the tests that need neither.
 ## `--no-fail-fast` for the reason the pricing lane gives.
 lane_args_orders-pg = -p cf-gears-bss-orders --features gate-dev-stubs --run-ignored all --no-fail-fast
+
+## The Quota Enforcement storage plugin's PostgreSQL suites (Docker required;
+## each test spins up its own postgres container via testcontainers): the row
+## locks, NOWAIT stripes and idempotency races SQLite cannot show.
+lane_args_quota-enforcement-pg = -p cf-gears-quota-enforcement-storage-plugin --features postgres
 
 # run_lane(lane): the lane's nextest run, then its post command if it has one.
 run_lane = $(call nextest_run,$(1),$(lane_args_$(1)),$(lane_env_$(1)))$(if $(lane_post_$(1)),$(newline)$(lane_post_$(1)))

@@ -3,7 +3,7 @@ use std::fmt;
 
 use toolkit_canonical_errors::{CanonicalError, Problem};
 
-use super::{ReconcileOutcome, ReconcilePendingCause, ReconcileStop};
+use super::outcome::{ReconcileOutcome, ReconcilePendingCause, ReconcileStop};
 use crate::GtsId;
 use crate::gts::{OPERATION_RESOURCE_TYPE, OperationResource};
 use crate::precondition::RECONCILIATION_INCOMPLETE;
@@ -22,6 +22,24 @@ pub struct ReconcileReport {
 }
 
 impl ReconcileReport {
+    /// Whether every unresolved identifier can be retried without changing its input.
+    pub(crate) fn is_transient(&self) -> bool {
+        !matches!(
+            self.stop,
+            ReconcileStop::InvalidInput | ReconcileStop::Rejected
+        ) && self.outcomes.values().all(|outcome| {
+            matches!(
+                outcome,
+                ReconcileOutcome::Admitted
+                    | ReconcileOutcome::Pending(
+                        ReconcilePendingCause::Dependency(_)
+                            | ReconcilePendingCause::Conflict(_)
+                            | ReconcilePendingCause::Unavailable(_)
+                    )
+            )
+        })
+    }
+
     /// Decode the report; unrelated, malformed or unknown formats return `None`.
     #[must_use]
     pub fn from_canonical(error: &CanonicalError) -> Option<Self> {
@@ -93,9 +111,14 @@ impl fmt::Display for ReconcileReport {
             ReconcileOutcome::Rejected(_) => (r + 1, p),
             ReconcileOutcome::Pending(_) => (r, p + 1),
         });
+        let state = if self.stop == ReconcileStop::Retrying {
+            "pending"
+        } else {
+            "stopped"
+        };
         write!(
             f,
-            "reconciliation stopped ({}) with {rejected} rejected and {pending} pending of {} identifiers",
+            "reconciliation {state} ({}) with {rejected} rejected and {pending} pending of {} identifiers",
             self.stop.as_str(),
             self.outcomes.len()
         )

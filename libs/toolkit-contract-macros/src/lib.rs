@@ -61,8 +61,9 @@ pub fn grpc_contract(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// Applied on a module struct in the provider crate; generates an inherent
 /// `wire_<contract_snake>` async method that validates the contract IR,
 /// reads typed wiring config, and registers the appropriate Local/REST/gRPC
-/// client. See `toolkit_contract_macros::provides` for the full attribute
-/// surface.
+/// client. `contract = [sdk::Api(local = ...), sdk::OtherApi(...)]` provides
+/// several contracts from one attribute. See `toolkit_contract_macros::provides`
+/// for the full attribute surface.
 #[proc_macro_attribute]
 pub fn provides(attr: TokenStream, item: TokenStream) -> TokenStream {
     let attr = parse_macro_input!(attr as provides::ProvidesAttr);
@@ -79,8 +80,10 @@ pub fn provides(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// Applied on the gear struct (alongside `#[toolkit::gear]`). Emits a
 /// `ConsumerRegistration` that the runtime's
 /// proxy-wiring phase replays: a compile-time local impl wins, otherwise a
-/// directory-resolving REST client is registered. Does NOT inject a topo-sort
-/// dependency — see `toolkit_contract_macros::consumes` docs.
+/// directory-resolving REST client is registered.
+/// `contract = [sdk::Api, sdk::OtherApi(from = "other")]` consumes several
+/// contracts from one attribute. Does NOT inject a topo-sort dependency — see
+/// `toolkit_contract_macros::consumes` docs.
 #[proc_macro_attribute]
 pub fn consumes(attr: TokenStream, item: TokenStream) -> TokenStream {
     let attr = parse_macro_input!(attr as consumes::ConsumesAttr);

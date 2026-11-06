@@ -54,6 +54,29 @@ jobs:
           large-packages: true
           swap-storage: true
 
+      # GitHub-hosted macOS images carry extra Xcode versions, the Android SDK,
+      # .NET and simulator runtimes that the tests never use. The test build needs
+      # ~90 GiB on macOS (75 GiB of test binaries, 14 GiB of trybuild output;
+      # measured locally 2026-11-05), and nightly runs died with the disk full (#5710).
+      - name: Free disk space (macOS)
+        if: runner.os == 'macOS' && runner.environment == 'github-hosted'
+        shell: bash
+        continue-on-error: true
+        run: |
+          df -h "$GITHUB_WORKSPACE"
+          active="$(cd "$(xcode-select -p)/../.." && pwd -P)"
+          echo "Active developer dir: $(xcode-select -p) -> keeping $active"
+          for app in /Applications/Xcode*.app; do
+            [ -e "$app" ] || continue
+            [ -L "$app" ] && continue
+            [ "$(cd "$app" && pwd -P)" = "$active" ] && continue
+            echo "Removing $app"
+            sudo rm -rf "$app"
+          done
+          sudo rm -rf "${ANDROID_HOME:-$HOME/Library/Android/sdk}" "$HOME/.dotnet" /usr/local/share/dotnet
+          xcrun simctl runtime delete all 2>/dev/null || true
+          df -h "$GITHUB_WORKSPACE"
+
       - name: Force LF in working tree (w/a for Windows)
         if: runner.os == 'Windows'
         shell: bash
@@ -66,7 +89,7 @@ jobs:
 
       - name: Install protoc
         if: runner.environment == 'github-hosted'
-        uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
+        uses: taiki-e/install-action@68a389c788b2cd04016ce8c80ee23b80d2ab3d68 # v2.88.1
         with:
           tool: protoc@3.34.1
 
@@ -83,7 +106,7 @@ jobs:
 
       - name: Install nextest
         if: runner.environment == 'github-hosted'
-        uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
+        uses: taiki-e/install-action@68a389c788b2cd04016ce8c80ee23b80d2ab3d68 # v2.88.1
         with:
           tool: nextest
 
@@ -115,9 +138,33 @@ jobs:
           shared-key: pr-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml') }}
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
 
+      # Samples free disk once a minute for the rest of the job; the report step
+      # below prints the low point.
+      - name: Start disk sampler (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          # shellcheck disable=SC2016  # single quotes are intentional: expanded by the inner bash
+          nohup bash -c 'while :; do echo "$(date -u +%H:%M:%S) $(df -k "$GITHUB_WORKSPACE" | awk "NR==2 {print \$4}")"; sleep 60; done' \
+            > "$RUNNER_TEMP/df-samples.log" 2>&1 &
+
       - name: cargo test (no macros)
         shell: bash
         run: tools/scripts/with_rust_annotations.sh make test-no-macros
+
+      # Runs on failure too: a failed night is exactly when these numbers matter.
+      - name: Disk usage report (macOS)
+        if: ${{ !cancelled() && runner.os == 'macOS' }}
+        shell: bash
+        run: |
+          df -h "$GITHUB_WORKSPACE"
+          du -sh target target/debug/deps target/tests 2>/dev/null || true
+          if [ -s "$RUNNER_TEMP/df-samples.log" ]; then
+            low=$(awk '{print $2}' "$RUNNER_TEMP/df-samples.log" | sort -n | head -1)
+            gib=$(awk -v k="$low" 'BEGIN { printf "%.1f", k / 1048576 }')
+            echo "Lowest free disk during the run: ${gib} GiB"
+            echo "macOS disk: lowest free space during the test run: **${gib} GiB** (samples: $(wc -l < "$RUNNER_TEMP/df-samples.log"))" >> "$GITHUB_STEP_SUMMARY"
+          fi
 
       # test-report.yml turns this into GitHub checks, because this job cannot
       # write checks on fork PRs. Runs on failure too, so failed tests show up.
@@ -127,5 +174,38 @@ jobs:
         with:
           name: rust-tests-${{ runner.os }}
           path: test-results/*.xml
+          if-no-files-found: warn
+          retention-days: 14
+
+      # macOS only (#5710): the hosted macOS runner sometimes fails file
+      # operations with OS errors on unrelated files: "Illegal byte sequence
+      # (os error 92)" on reading a checked-in Cargo.toml, SQLite "disk I/O
+      # error", "Bus error: 10", fresh binaries that "cannot execute". Disk is
+      # not full when it happens. Keep the kernel's storage messages from a
+      # failed or cancelled run, so the cause can be pinned down and reported.
+      # `log show` needs no sudo on the hosted image.
+      - name: Collect macOS kernel storage log
+        if: ${{ (failure() || cancelled()) && runner.os == 'macOS' }}
+        shell: bash
+        run: |
+          out="$RUNNER_TEMP/macos-kernel-log"
+          mkdir -p "$out"
+          df -h "$GITHUB_WORKSPACE" > "$out/df.txt" 2>&1 || true
+          log show --last 3h --style compact --predicate 'process == "kernel"' \
+            > "$out/kernel.log" 2>&1 || true
+          grep -iE 'apfs|nvme|disk[0-9]|I/O error|checksum|corrupt' "$out/kernel.log" \
+            > "$out/kernel-storage.log" || true
+          gzip -f "$out/kernel.log"
+          echo "Kernel storage lines: $(wc -l < "$out/kernel-storage.log")"
+          # Errors only, without the sandbox noise every macOS boot produces.
+          grep -iE 'error|fail|corrupt|checksum' "$out/kernel-storage.log" \
+            | grep -viE 'sandbox|MACF' | tail -40 || true
+
+      - name: Upload macOS kernel storage log
+        if: ${{ (failure() || cancelled()) && runner.os == 'macOS' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: macos-kernel-log
+          path: ${{ runner.temp }}/macos-kernel-log/
           if-no-files-found: warn
           retention-days: 14

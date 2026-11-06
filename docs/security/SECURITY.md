@@ -197,7 +197,7 @@ Hierarchical multi-tenancy with a **single-root tree topology** (exactly one ten
 - **Barriers** — child tenants set `self_managed = true` to create a privacy barrier. Parents cannot see that subtree's business data by default; `BarrierMode` controls per-resource-type relaxation (e.g., billing ignores barriers while tasks respect them).
 - **`tenant_closure` table** — materialized `(ancestor_id, descendant_id, barrier, descendant_status)` enables efficient `in_tenant_subtree` predicate compilation to SQL subqueries.
 
-**Tenant Resolver** is a plugin-based system gear providing tenant graph operations (get, ancestors, descendants, `is_ancestor`) via `TenantResolverClient`:
+**Tenant Resolver** is a plugin-based core gear providing tenant graph operations (get, ancestors, descendants, `is_ancestor`) via `TenantResolverClient`:
 
 - **Plugin architecture** — gateway discovers a backend plugin by GTS vendor string; routes all calls through `TenantResolverPluginClient`. Built-in plugins: `static-tr-plugin` (in-memory tree from config), `single-tenant-tr-plugin` (enforces `ctx.subject_tenant_id()` as the only tenant).
 - **Barrier-aware traversal** — ancestor/descendant walks respect `self_managed` barriers and use visited sets for cycle safety.

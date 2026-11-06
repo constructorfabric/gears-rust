@@ -314,6 +314,8 @@ struct State {
     protocol: Protocol,
     strict: Option<Strict>,
     calls: HashMap<Call, u32>,
+    caller_contexts: HashMap<Call, Vec<SecurityContext>>,
+    platform_calls: HashMap<Call, u32>,
     reads: Vec<EntityKey>,
     resolver: Resolver,
 }
@@ -482,6 +484,31 @@ impl MockTypesRegistry {
         self.state.lock().calls.get(&call).copied().unwrap_or(0)
     }
 
+    /// Request-plane contexts passed to `call`, cloned on entry in call order, including failed
+    /// and cancelled calls. Platform calls contribute no context; write methods return an empty
+    /// vector.
+    #[must_use]
+    pub fn caller_contexts(&self, call: Call) -> Vec<SecurityContext> {
+        self.state
+            .lock()
+            .caller_contexts
+            .get(&call)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Platform-plane calls of `call`, counted on entry, including failed and cancelled calls.
+    /// [`Self::calls`] counts both planes together.
+    #[must_use]
+    pub fn platform_calls(&self, call: Call) -> u32 {
+        self.state
+            .lock()
+            .platform_calls
+            .get(&call)
+            .copied()
+            .unwrap_or(0)
+    }
+
     /// Every key batch reads asked for, in order.
     #[must_use]
     pub fn reads(&self) -> Vec<EntityKey> {
@@ -521,12 +548,27 @@ impl MockTypesRegistry {
 
 impl MockTypesRegistry {
     /// Records the call, enforces strict mode, and applies the first admitting rule: its delay,
-    /// then its failure. The rule is chosen atomically, before any await.
-    async fn enter(&self, call: Call, keys: &[EntityKey]) -> Option<CanonicalError> {
+    /// then its failure. `caller` is present only for the request plane. Recording and rule
+    /// selection happen atomically, before any await.
+    async fn enter(
+        &self,
+        call: Call,
+        keys: &[EntityKey],
+        caller: Option<&SecurityContext>,
+    ) -> Option<CanonicalError> {
         let (delay, failure) = {
             let mut guard = self.state.lock();
             let state = &mut *guard;
             *state.calls.entry(call).or_default() += 1;
+            if let Some(caller) = caller {
+                state
+                    .caller_contexts
+                    .entry(call)
+                    .or_default()
+                    .push(caller.clone());
+            } else {
+                *state.platform_calls.entry(call).or_default() += 1;
+            }
             if call == Call::BatchGet {
                 state.reads.extend(keys.iter().cloned());
             }
@@ -1010,10 +1052,11 @@ impl MockTypesRegistry {
     /// The batch read both contracts serve.
     async fn read_batch(
         &self,
+        caller: Option<&SecurityContext>,
         request: BatchGetEntitiesRequest,
     ) -> Result<BatchGetEntitiesResponse, CanonicalError> {
         let keys: Vec<EntityKey> = request.items.iter().map(|i| i.key.clone()).collect();
-        if let Some(error) = self.enter(Call::BatchGet, &keys).await {
+        if let Some(error) = self.enter(Call::BatchGet, &keys, caller).await {
             return Err(error);
         }
         if request.items.is_empty() || request.items.len() > crate::models::MAX_BATCH_GET_KEYS {
@@ -1065,9 +1108,10 @@ impl MockTypesRegistry {
     /// The discovery page both contracts serve.
     async fn read_page(
         &self,
+        caller: Option<&SecurityContext>,
         query: ListEntitiesRequest,
     ) -> Result<ListEntitiesResponse, CanonicalError> {
-        if let Some(error) = self.enter(Call::List, &[]).await {
+        if let Some(error) = self.enter(Call::List, &[], caller).await {
             return Err(error);
         }
         let fields = query.projection.normalized();
@@ -1150,7 +1194,7 @@ impl PlatformTypesRegistryApi for MockTypesRegistry {
         _ctx: &PlatformSecurityContext,
         request: BatchGetEntitiesRequest,
     ) -> Result<BatchGetEntitiesResponse, CanonicalError> {
-        self.read_batch(request).await
+        self.read_batch(None, request).await
     }
 
     async fn list_entities(
@@ -1158,7 +1202,7 @@ impl PlatformTypesRegistryApi for MockTypesRegistry {
         _ctx: &PlatformSecurityContext,
         request: ListEntitiesRequest,
     ) -> Result<ListEntitiesResponse, CanonicalError> {
-        self.read_page(request).await
+        self.read_page(None, request).await
     }
 
     async fn register_entities(
@@ -1172,7 +1216,7 @@ impl PlatformTypesRegistryApi for MockTypesRegistry {
             .iter()
             .map(|i| EntityKey::GtsId(i.gts_id.clone()))
             .collect();
-        let failure = self.enter(Call::Register, &keys).await;
+        let failure = self.enter(Call::Register, &keys, None).await;
         {
             let mut state = self.state.lock();
             state.submissions.push((key.clone(), request.clone()));
@@ -1245,7 +1289,7 @@ impl PlatformTypesRegistryApi for MockTypesRegistry {
         request: DeleteEntitiesRequest,
     ) -> Result<DeletionOperation, CanonicalError> {
         let keys: Vec<EntityKey> = request.items.iter().map(|i| i.key.clone()).collect();
-        if let Some(error) = self.enter(Call::Delete, &keys).await {
+        if let Some(error) = self.enter(Call::Delete, &keys, None).await {
             return Err(error);
         }
         if request.items.is_empty() {
@@ -1288,7 +1332,7 @@ impl PlatformTypesRegistryApi for MockTypesRegistry {
         _ctx: &PlatformSecurityContext,
         operation_id: Uuid,
     ) -> Result<Operation, CanonicalError> {
-        if let Some(error) = self.enter(Call::GetOperation, &[]).await {
+        if let Some(error) = self.enter(Call::GetOperation, &[], None).await {
             return Err(error);
         }
         self.operation(operation_id, true)
@@ -1300,18 +1344,18 @@ impl PlatformTypesRegistryApi for MockTypesRegistry {
 impl TypesRegistryApi for MockTypesRegistry {
     async fn batch_get_entities(
         &self,
-        _ctx: &SecurityContext,
+        ctx: &SecurityContext,
         request: BatchGetEntitiesRequest,
     ) -> Result<BatchGetEntitiesResponse, CanonicalError> {
-        self.read_batch(request).await
+        self.read_batch(Some(ctx), request).await
     }
 
     async fn list_entities(
         &self,
-        _ctx: &SecurityContext,
+        ctx: &SecurityContext,
         request: ListEntitiesRequest,
     ) -> Result<ListEntitiesResponse, CanonicalError> {
-        self.read_page(request).await
+        self.read_page(Some(ctx), request).await
     }
 }
 

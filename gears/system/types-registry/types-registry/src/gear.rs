@@ -19,7 +19,7 @@ use types_registry_sdk::{
     TypesRegistryClient,
 };
 
-use crate::config::TypesRegistryConfig;
+use crate::config::{RegistryMode, TypesRegistryConfig};
 use crate::domain::admission::OperationDispatch;
 use crate::domain::legacy_local_client::TypesRegistryLocalClient;
 use crate::domain::local_client::LocalClient;
@@ -35,7 +35,9 @@ use crate::infra::storage::Repos;
 
 /// Types Registry gear: REST, managed storage, inventory seeding and admission worker.
 ///
-/// Both contracts are provided locally and over REST (SPEC §8.4). The registry's own host
+/// Both contracts are provided locally and over REST (SPEC §8.4), except under
+/// `mode: legacy_only` ([`RegistryMode::LegacyOnly`]), which keeps only the legacy client
+/// and v1 routes and stays out of the service directory. The registry's own host
 /// always wires them `Local` — its configuration admits no `client_wiring` — and only past
 /// the seed barrier; a consumer elsewhere reaches them through the SDK's resolving clients.
 #[toolkit::provides(
@@ -52,12 +54,16 @@ use crate::infra::storage::Repos;
 )]
 #[toolkit::gear(
     name = "types-registry",
+    // `system`: admits the GTS documents every application gear waits for,
+    // so it is initialized, seeded and served before the application group
+    // is prepared.
     capabilities = [system, db, rest, stateful],
     // Leave five seconds before the host's hard shutdown deadline. An admission
     // cut short keeps its outbox message, so the next boot's lease redelivers it.
     lifecycle(entry = "serve", stop_timeout = "30s", await_ready)
 )]
 pub struct TypesRegistryGear {
+    mode: OnceLock<RegistryMode>,
     service: OnceLock<Arc<TypesRegistryService>>,
     /// The database-backed path. Absent when no database is bound to this gear.
     registry: OnceLock<Arc<RegistryService>>,
@@ -69,6 +75,7 @@ pub struct TypesRegistryGear {
 impl Default for TypesRegistryGear {
     fn default() -> Self {
         Self {
+            mode: OnceLock::new(),
             service: OnceLock::new(),
             registry: OnceLock::new(),
             local_client: OnceLock::new(),
@@ -104,6 +111,11 @@ async fn held_while<T: Send + Sync + 'static>(
 }
 
 impl TypesRegistryGear {
+    /// The configured mode; [`RegistryMode::Full`] before `init`.
+    fn mode(&self) -> RegistryMode {
+        self.mode.get().copied().unwrap_or_default()
+    }
+
     fn seeded(ctx: &GearCtx) -> anyhow::Result<Arc<LocalClient>> {
         let seeded = ctx.client_hub().get::<SeededClient>().map_err(|_| {
             anyhow::anyhow!("types-registry wires its APIs only past the seed barrier")
@@ -221,6 +233,10 @@ impl TypesRegistryGear {
 impl Gear for TypesRegistryGear {
     async fn init(&self, ctx: &GearCtx) -> anyhow::Result<()> {
         let cfg: TypesRegistryConfig = ctx.config_or_default()?;
+        let mode = cfg.mode;
+        self.mode
+            .set(mode)
+            .map_err(|_| anyhow::anyhow!("{} gear already initialized", Self::MODULE_NAME))?;
 
         // Build admission instruments eagerly from ToolKit's configured provider.
         let metrics_prefix = cfg.metrics.effective_prefix(Self::MODULE_NAME);
@@ -272,10 +288,20 @@ impl Gear for TypesRegistryGear {
             configured_count = static_entities.len(),
             "types_registry seed set"
         );
-        // The same declarations seed the database path; until T38 the two catalogues
-        // are independent and nothing mirrors later writes between them. Copied only
-        // when a database is bound, before the legacy catalogue consumes them.
-        let seeded = ctx.db().map(|db| {
+        // Until T38, legacy and database catalogues share seeds but not later writes.
+        // Copy before legacy consumes them, only with a database in full mode.
+        let db = match (mode, ctx.db()) {
+            (RegistryMode::LegacyOnly, Some(_)) => {
+                tracing::warn!(
+                    "types_registry runs legacy_only: no seeding or admission over its bound \
+                     database, and neither PlatformTypesRegistryApi nor TypesRegistryApi is \
+                     provided here"
+                );
+                None
+            }
+            (_, db) => db,
+        };
+        let seeded = db.map(|db| {
             let documents: Vec<serde_json::Value> = inventory_entries
                 .iter()
                 .chain(&static_entities)
@@ -333,7 +359,7 @@ impl Gear for TypesRegistryGear {
                 ctx.cancellation_token(),
             )
             .await?;
-        } else {
+        } else if mode == RegistryMode::Full {
             tracing::warn!(
                 "types_registry has no database bound: POST /entities, GET /operations/{{id}} and \
                  GET /entities/{{key}} will report service unavailable. Bind one under \
@@ -366,9 +392,13 @@ impl Gear for TypesRegistryGear {
 
 #[async_trait]
 impl SystemCapability for TypesRegistryGear {
-    /// Validate and enter ready mode after all gears finish `init()` and register types.
-    async fn post_init(&self, _sys: &toolkit::runtime::SystemContext) -> anyhow::Result<()> {
-        info!("types_registry post_init: switching to ready mode");
+    /// Validate legacy registrations and enter ready mode after all application
+    /// `init`s. Ordinary system `post_init` is too early. Removed with in-memory mode.
+    async fn legacy_finalize_after_application_init(
+        &self,
+        _sys: &toolkit::runtime::SystemContext,
+    ) -> anyhow::Result<()> {
+        info!("types_registry legacy finalization: switching to ready mode");
 
         let service = self
             .service
@@ -430,6 +460,11 @@ impl DatabaseCapability for TypesRegistryGear {
 }
 
 impl RestApiCapability for TypesRegistryGear {
+    /// A legacy-only registry must not be discovered as the new contracts' provider.
+    fn advertised_in_directory(&self) -> bool {
+        self.mode() != RegistryMode::LegacyOnly
+    }
+
     fn register_rest(
         &self,
         _ctx: &GearCtx,
@@ -447,8 +482,12 @@ impl RestApiCapability for TypesRegistryGear {
         // Where no database is bound there is no `RegistryService`, and the
         // database-backed routes must still exist so a caller gets a problem
         // document naming the cause rather than a 404 suggesting the API changed.
-        let registry = self.registry.get().cloned();
-        let router = crate::api::rest::routes::register_routes(router, openapi, service, registry);
+        let router = if self.mode() == RegistryMode::LegacyOnly {
+            crate::api::rest::routes::register_legacy_routes(router, openapi, service)
+        } else {
+            let registry = self.registry.get().cloned();
+            crate::api::rest::routes::register_routes(router, openapi, service, registry)
+        };
 
         info!("Types registry REST routes registered successfully");
         Ok(router)

@@ -1,0 +1,10 @@
+error[E0433]: cannot find `__toolkit_gts_inventory` in `crate`
+ --> tests/ui/local_macro_without_declaration.rs:2:1
+  |
+2 | / gts_kit::local::gts_instance_raw!({
+3 | |     "id": gts_kit::gts_id!("test.cf.local_fixture.widget.v1~test.cf.local_fixture.undeclared.v1"),
+4 | |     "name": "undeclared",
+5 | | });
+  | |__^ could not find `__toolkit_gts_inventory` in the crate root
+  |
+  = note: this error originates in the macro `gts_kit::local::gts_instance_raw` (in Nightly builds, run with -Z macro-backtrace for more info)

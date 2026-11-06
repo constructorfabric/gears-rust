@@ -5,6 +5,8 @@
 //! - Consumers fetch by *interface type* (trait object): `get::<dyn my::Api>()`.
 //! - For plugin-like scenarios, multiple implementations of the same interface can coexist
 //!   under different scopes (e.g. selected by GTS instance ID).
+//! - Remote proxies wired by `#[toolkit::consumes]` belong to the consuming gear: each gear
+//!   reads the hub through its own view ([`ClientHub::for_gear`]) and gets its own proxy.
 //!
 //! Implementation details:
 //! - Key = type name. We use `type_name::<T>()`, which works for `T = dyn Trait`.
@@ -118,30 +120,105 @@ type ClientMap = HashMap<TypeKey, Boxed>;
 /// Internal map type for the scoped client hub.
 type ScopedClientMap = HashMap<ScopedKey, Boxed>;
 
-/// Type-safe registry of clients keyed by interface type.
+/// Key of a consumer-wiring proxy: the contract type and the gear that owns
+/// the proxy. `owner = None` is a process-wide proxy.
+#[derive(Clone, Eq, PartialEq, Hash, Debug)]
+struct ProxyKey {
+    type_key: TypeKey,
+    owner: Option<Arc<str>>,
+}
+
+/// Registrations shared by every view of one hub.
 #[derive(Default)]
-pub struct ClientHub {
+struct Storage {
     map: RwLock<ClientMap>,
     scoped_map: RwLock<ScopedClientMap>,
-    /// Types registered by consumer wiring as a discovery-resolving remote
-    /// proxy rather than a genuine in-process implementation.
+    /// Discovery-resolving proxies registered by consumer wiring, kept apart
+    /// from `map` so a proxy is never mistaken for an in-process impl.
     ///
-    /// The hub is keyed by type alone, so a proxy and a local impl are
-    /// indistinguishable once stored. Consumer wiring needs to tell them apart:
-    /// finding a *proxy* under a contract does not mean the dependency is
-    /// satisfied locally, and treating it as such marks the dependency
-    /// readiness-resolved while the provider is still absent.
-    remote_proxies: RwLock<std::collections::HashSet<TypeKey>>,
+    /// Keyed by owner because each consumer wires the contract with its own
+    /// `consumer_wiring.<dep>` settings (endpoint, timeout, retry, TLS). One
+    /// proxy per contract would hand every consumer the settings of whichever
+    /// wired first.
+    proxies: RwLock<HashMap<ProxyKey, Boxed>>,
+}
+
+/// Type-safe registry of clients keyed by interface type.
+///
+/// A hub is shared storage plus an optional owner gear. [`Self::for_gear`]
+/// returns a view of the same storage owned by a gear; `GearCtx::client_hub`
+/// hands each gear its own view. Plain and scoped registrations are shared by
+/// all views. Remote proxies registered through a view belong to its owner.
+#[derive(Default)]
+pub struct ClientHub {
+    storage: Arc<Storage>,
+    owner: Option<Arc<str>>,
 }
 
 impl ClientHub {
     #[inline]
     #[must_use]
     pub fn new() -> Self {
-        Self {
-            map: RwLock::new(HashMap::new()),
-            scoped_map: RwLock::new(HashMap::new()),
-            remote_proxies: RwLock::new(std::collections::HashSet::new()),
+        Self::default()
+    }
+
+    /// A view of this hub's storage owned by `gear`.
+    ///
+    /// Local and scoped registrations are shared with every other view. A
+    /// remote proxy registered through the view is seen only by this view and
+    /// does not replace another gear's proxy for the same contract.
+    #[must_use]
+    pub fn for_gear(&self, gear: impl Into<Arc<str>>) -> Arc<Self> {
+        Arc::new(Self {
+            storage: Arc::clone(&self.storage),
+            owner: Some(gear.into()),
+        })
+    }
+
+    /// The gear that owns this view, or `None` for the process-wide hub.
+    #[must_use]
+    pub fn owner(&self) -> Option<&str> {
+        self.owner.as_deref()
+    }
+
+    fn proxy_key<T: ?Sized + 'static>(&self) -> ProxyKey {
+        ProxyKey {
+            type_key: TypeKey::of::<T>(),
+            owner: self.owner.clone(),
+        }
+    }
+
+    /// Local impl first, then this owner's proxy, then the process-wide proxy.
+    fn lookup<T>(&self) -> Result<Arc<T>, ClientHubError>
+    where
+        T: ?Sized + Send + Sync + 'static,
+    {
+        let type_key = TypeKey::of::<T>();
+        let downcast = |boxed: &Boxed| {
+            boxed
+                .downcast_ref::<Arc<T>>()
+                .cloned()
+                .ok_or_else(|| ClientHubError::TypeMismatch {
+                    type_key: type_key.clone(),
+                })
+        };
+        if let Some(boxed) = self.storage.map.read().get(&type_key) {
+            return downcast(boxed);
+        }
+        let proxies = self.storage.proxies.read();
+        let mut key = ProxyKey {
+            type_key: type_key.clone(),
+            owner: self.owner.clone(),
+        };
+        if key.owner.is_some()
+            && let Some(boxed) = proxies.get(&key)
+        {
+            return downcast(boxed);
+        }
+        key.owner = None;
+        match proxies.get(&key) {
+            Some(boxed) => downcast(boxed),
+            None => Err(ClientHubError::NotFound { type_key }),
         }
     }
 }
@@ -150,16 +227,14 @@ impl ClientHub {
     /// Register a client under the interface type `T`.
     /// `T` can be a trait object like `dyn my_gear::api::MyClient`.
     ///
-    /// Clears any remote-proxy mark for `T`, so a local impl registered after a
-    /// directory proxy wins in [`Self::try_get_local`] rather than being shadowed.
+    /// The registration is shared by every view and wins over any remote
+    /// proxy for `T` in [`Self::get`], also when it is registered after one.
     pub fn register<T>(&self, client: Arc<T>)
     where
         T: ?Sized + Send + Sync + 'static,
     {
-        let type_key = TypeKey::of::<T>();
-        self.remote_proxies.write().remove(&type_key);
-        let mut w = self.map.write();
-        w.insert(type_key, Box::new(client));
+        let mut w = self.storage.map.write();
+        w.insert(TypeKey::of::<T>(), Box::new(client));
     }
 
     /// Register a scoped client under the interface type `T`.
@@ -174,11 +249,14 @@ impl ClientHub {
             type_key: TypeKey::of::<T>(),
             scope,
         };
-        let mut w = self.scoped_map.write();
+        let mut w = self.storage.scoped_map.write();
         w.insert(key, Box::new(client));
     }
 
     /// Fetch a client by interface type `T`.
+    ///
+    /// Returns, in order: a local registration, this view's remote proxy, a
+    /// process-wide remote proxy.
     ///
     /// # Errors
     /// Returns `ClientHubError::NotFound` if no client is registered for the type.
@@ -187,49 +265,33 @@ impl ClientHub {
     where
         T: ?Sized + Send + Sync + 'static,
     {
-        let type_key = TypeKey::of::<T>();
-        let r = self.map.read();
-
-        let boxed = r.get(&type_key).ok_or(ClientHubError::NotFound {
-            type_key: type_key.clone(),
-        })?;
-
-        // Stored value is exactly `Arc<T>`; downcast is safe and cheap.
-        if let Some(arc_t) = boxed.downcast_ref::<Arc<T>>() {
-            return Ok(arc_t.clone());
-        }
-        Err(ClientHubError::TypeMismatch { type_key })
+        self.lookup::<T>()
     }
 
     /// Try to fetch a client by interface type `T`.
     ///
-    /// Returns `None` if no client is registered for the type or if the stored
-    /// type doesn't match. This sees every registration, proxies included — use
-    /// [`Self::try_get_local`] when the answer needs to mean "satisfied
-    /// in-process".
+    /// Same lookup order as [`Self::get`]; returns `None` if nothing is
+    /// registered or the stored type doesn't match. Use [`Self::try_get_local`]
+    /// when the answer needs to mean "satisfied in-process".
+    #[must_use]
     pub fn try_get<T>(&self) -> Option<Arc<T>>
     where
         T: ?Sized + Send + Sync + 'static,
     {
-        let type_key = TypeKey::of::<T>();
-        let r = self.map.read();
-        let boxed = r.get(&type_key)?;
-        boxed.downcast_ref::<Arc<T>>().cloned()
+        self.lookup::<T>().ok()
     }
 
     /// Register a client that is a discovery-resolving proxy to a *remote*
     /// provider, not an in-process implementation.
     ///
-    /// Stored exactly like [`Self::register`]; the difference is that the type
-    /// is remembered as remote so [`Self::try_get_local`] will not report it as
-    /// a local implementation.
+    /// The proxy belongs to this view's owner, or is process-wide when the hub
+    /// has no owner. It never hides a local registration of `T`.
     pub fn register_remote_proxy<T>(&self, client: Arc<T>)
     where
         T: ?Sized + Send + Sync + 'static,
     {
-        let type_key = TypeKey::of::<T>();
-        self.remote_proxies.write().insert(type_key.clone());
-        self.map.write().insert(type_key, Box::new(client));
+        let key = self.proxy_key::<T>();
+        self.storage.proxies.write().insert(key, Box::new(client));
     }
 
     /// Try to fetch a client by interface type `T`, ignoring remote proxies.
@@ -237,38 +299,34 @@ impl ClientHub {
     /// This is the short-circuit probe for consumer wiring: a compile-time
     /// (local) registration takes priority over a discovery-based proxy, so the
     /// wiring closure asks whether a *local* implementation exists before
-    /// registering one of its own.
-    ///
-    /// Using plain [`Self::try_get`] here would be wrong when two consumers in
-    /// one process depend on the same contract: whichever wires second would
-    /// find the first one's proxy, conclude the dependency is local, and mark
-    /// it readiness-resolved — turning `/readyz` green before the provider
-    /// exists.
+    /// registering one of its own. Seeing a proxy here would let a consumer
+    /// report its dependency as local and turn `/readyz` green before the
+    /// provider exists.
+    #[must_use]
     pub fn try_get_local<T>(&self) -> Option<Arc<T>>
     where
         T: ?Sized + Send + Sync + 'static,
     {
-        let type_key = TypeKey::of::<T>();
-        if self.remote_proxies.read().contains(&type_key) {
-            return None;
-        }
-        let r = self.map.read();
-        let boxed = r.get(&type_key)?;
+        let r = self.storage.map.read();
+        let boxed = r.get(&TypeKey::of::<T>())?;
         boxed.downcast_ref::<Arc<T>>().cloned()
     }
 
-    /// Whether a remote proxy is already registered for interface type `T`.
+    /// Whether this view already holds a remote proxy for interface type `T`:
+    /// its owner's proxy, or the process-wide one for a hub without an owner.
     ///
-    /// Lets consumer wiring reuse an existing proxy instead of building and
-    /// registering a second identical one for the same contract.
+    /// Another gear's proxy does not count, so each consumer builds a proxy
+    /// from its own wiring settings.
     #[must_use]
     pub fn has_remote_proxy<T>(&self) -> bool
     where
         T: ?Sized + Send + Sync + 'static,
     {
-        self.remote_proxies.read().contains(&TypeKey::of::<T>())
+        self.storage
+            .proxies
+            .read()
+            .contains_key(&self.proxy_key::<T>())
     }
-
     /// Fetch a scoped client by interface type `T` and scope.
     ///
     /// # Errors
@@ -282,7 +340,7 @@ impl ClientHub {
             type_key: TypeKey::of::<T>(),
             scope: scope.clone(),
         };
-        let r = self.scoped_map.read();
+        let r = self.storage.scoped_map.read();
 
         let boxed = r.get(&key).ok_or_else(|| ClientHubError::ScopedNotFound {
             type_key: key.type_key.clone(),
@@ -301,6 +359,7 @@ impl ClientHub {
     /// Try to fetch a scoped client by interface type `T` and scope.
     ///
     /// Returns `None` if not found or if the stored type doesn't match.
+    #[must_use]
     pub fn try_get_scoped<T>(&self, scope: &ClientScope) -> Option<Arc<T>>
     where
         T: ?Sized + Send + Sync + 'static,
@@ -309,24 +368,33 @@ impl ClientHub {
             type_key: TypeKey::of::<T>(),
             scope: scope.clone(),
         };
-        let r = self.scoped_map.read();
+        let r = self.storage.scoped_map.read();
         let boxed = r.get(&key)?;
 
         boxed.downcast_ref::<Arc<T>>().cloned()
     }
 
-    /// Remove a client by interface type; returns the removed client if it was present.
+    /// Remove a local client by interface type; returns the removed client if
+    /// it was present. Remote proxies are not touched.
+    #[expect(
+        clippy::must_use_candidate,
+        reason = "callers remove for the side effect and may drop the client"
+    )]
     pub fn remove<T>(&self) -> Option<Arc<T>>
     where
         T: ?Sized + Send + Sync + 'static,
     {
         let type_key = TypeKey::of::<T>();
-        let mut w = self.map.write();
+        let mut w = self.storage.map.write();
         let boxed = w.remove(&type_key)?;
         boxed.downcast::<Arc<T>>().ok().map(|b| *b)
     }
 
     /// Remove a scoped client by interface type + scope; returns the removed client if it was present.
+    #[expect(
+        clippy::must_use_candidate,
+        reason = "callers remove for the side effect and may drop the client"
+    )]
     pub fn remove_scoped<T>(&self, scope: &ClientScope) -> Option<Arc<T>>
     where
         T: ?Sized + Send + Sync + 'static,
@@ -335,25 +403,32 @@ impl ClientHub {
             type_key: TypeKey::of::<T>(),
             scope: scope.clone(),
         };
-        let mut w = self.scoped_map.write();
+        let mut w = self.storage.scoped_map.write();
         let boxed = w.remove(&key)?;
         boxed.downcast::<Arc<T>>().ok().map(|b| *b)
     }
 
     /// Clear everything (useful in tests).
     pub fn clear(&self) {
-        self.map.write().clear();
-        self.scoped_map.write().clear();
+        self.storage.map.write().clear();
+        self.storage.scoped_map.write().clear();
+        self.storage.proxies.write().clear();
     }
 
     /// Introspection: (total entries).
+    #[must_use]
     pub fn len(&self) -> usize {
-        self.map.read().len() + self.scoped_map.read().len()
+        self.storage.map.read().len()
+            + self.storage.scoped_map.read().len()
+            + self.storage.proxies.read().len()
     }
 
     /// Check if the hub is empty.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.map.read().is_empty() && self.scoped_map.read().is_empty()
+        self.storage.map.read().is_empty()
+            && self.storage.scoped_map.read().is_empty()
+            && self.storage.proxies.read().is_empty()
     }
 }
 
@@ -428,21 +503,80 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_late_local_registration_clears_the_remote_mark_and_wins() {
+    async fn a_late_local_registration_wins_over_the_proxy() {
         // A consumer wires a directory proxy under the contract first...
         let hub = ClientHub::new();
-        hub.register_remote_proxy::<dyn TestApi>(Arc::new(ImplA(1)));
-        assert!(hub.has_remote_proxy::<dyn TestApi>());
-        assert!(hub.try_get_local::<dyn TestApi>().is_none());
+        let view = hub.for_gear("orders");
+        view.register_remote_proxy::<dyn TestApi>(Arc::new(ImplA(1)));
+        assert!(view.try_get_local::<dyn TestApi>().is_none());
 
         // ...then the real in-process provider registers its local impl. It must
-        // win: the remote mark is cleared and `try_get_local` now sees the impl.
+        // win in every view, the proxy owner's included.
         hub.register::<dyn TestApi>(Arc::new(ImplA(2)));
-        assert!(!hub.has_remote_proxy::<dyn TestApi>());
-        let local = hub
+        let local = view
             .try_get_local::<dyn TestApi>()
             .expect("the late local registration must be visible as local");
         assert_eq!(local.id().await, 2);
+        assert_eq!(view.get::<dyn TestApi>().unwrap().id().await, 2);
+    }
+
+    #[tokio::test]
+    async fn each_gear_gets_its_own_proxy() {
+        let hub = ClientHub::new();
+        let a = hub.for_gear("a");
+        let b = hub.for_gear("b");
+        a.register_remote_proxy::<dyn TestApi>(Arc::new(ImplA(1)));
+
+        assert!(a.has_remote_proxy::<dyn TestApi>());
+        assert!(!b.has_remote_proxy::<dyn TestApi>());
+        assert!(b.try_get::<dyn TestApi>().is_none());
+        assert!(hub.try_get::<dyn TestApi>().is_none());
+
+        b.register_remote_proxy::<dyn TestApi>(Arc::new(ImplA(2)));
+        assert_eq!(a.get::<dyn TestApi>().unwrap().id().await, 1);
+        assert_eq!(b.get::<dyn TestApi>().unwrap().id().await, 2);
+    }
+
+    #[tokio::test]
+    async fn a_view_falls_back_to_the_process_wide_proxy() {
+        let hub = ClientHub::new();
+        hub.register_remote_proxy::<dyn TestApi>(Arc::new(ImplA(1)));
+        let view = hub.for_gear("orders");
+
+        assert_eq!(view.get::<dyn TestApi>().unwrap().id().await, 1);
+        // It is not this gear's proxy, so wiring builds one of its own.
+        assert!(!view.has_remote_proxy::<dyn TestApi>());
+
+        view.register_remote_proxy::<dyn TestApi>(Arc::new(ImplA(2)));
+        assert_eq!(view.get::<dyn TestApi>().unwrap().id().await, 2);
+        assert_eq!(hub.get::<dyn TestApi>().unwrap().id().await, 1);
+    }
+
+    #[tokio::test]
+    async fn removing_the_local_impl_leaves_the_proxy() {
+        let hub = ClientHub::new();
+        hub.register_remote_proxy::<dyn TestApi>(Arc::new(ImplA(1)));
+        hub.register::<dyn TestApi>(Arc::new(ImplA(2)));
+
+        assert!(hub.remove::<dyn TestApi>().is_some());
+        assert!(hub.try_get_local::<dyn TestApi>().is_none());
+        assert!(hub.has_remote_proxy::<dyn TestApi>());
+        assert_eq!(hub.get::<dyn TestApi>().unwrap().id().await, 1);
+    }
+
+    #[test]
+    fn views_share_local_and_scoped_registrations() {
+        let hub = ClientHub::new();
+        let view = hub.for_gear("orders");
+        let scope = ClientScope::new("pricing");
+        view.register::<str>(Arc::from("local"));
+        view.register_scoped::<str>(scope.clone(), Arc::from("scoped"));
+
+        assert_eq!(view.owner(), Some("orders"));
+        assert_eq!(hub.owner(), None);
+        assert_eq!(&*hub.get::<str>().unwrap(), "local");
+        assert_eq!(&*hub.get_scoped::<str>(&scope).unwrap(), "scoped");
+        assert_eq!(&*hub.for_gear("billing").get::<str>().unwrap(), "local");
     }
 
     #[tokio::test]

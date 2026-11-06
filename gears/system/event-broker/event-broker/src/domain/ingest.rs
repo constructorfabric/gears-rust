@@ -326,6 +326,10 @@ where
                 None,
                 &AccessRequest::new()
                     .resource_property("event_type_id", request.r#type.as_ref())
+                    .resource_property(
+                        toolkit_security::pep_properties::OWNER_TENANT_ID,
+                        request.tenant_id,
+                    )
                     .require_constraints(false),
             )
             .await

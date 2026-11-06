@@ -128,3 +128,5 @@ time = { workspace = true, features = ["macros"] }
 chrono = { workspace = true }
 # Database configuration for the host-runtime boot tests (T31).
 figment = { workspace = true }
+# The `OoP` serving lifecycle for the bootstrap-endpoint test.
+toolkit = { workspace = true, features = ["bootstrap"] }

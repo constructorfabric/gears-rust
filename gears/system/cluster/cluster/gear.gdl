@@ -6,8 +6,8 @@ gdl_version = "1.3"
 #
 # Projected from #[toolkit::gear]: id and runtime_caps. The attribute declares
 # `capabilities = [stateful, system, grpc, rest]`, and all four are read -- not
-# just `stateful`. `system` is why this gear starts before any application
-# consumer; `grpc` and `rest` are the surfaces the deployable model added, and
+# just `stateful`. `system` is why this gear starts before application
+# preparation; `grpc` and `rest` are the surfaces the deployable model added, and
 # they are the reason a consumer is no longer pinned to this gear's process.
 #
 # `cluster_providers` is projected too -- from the with_*_provider calls in

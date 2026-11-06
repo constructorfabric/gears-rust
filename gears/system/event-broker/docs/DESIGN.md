@@ -319,8 +319,8 @@ classDiagram
 
 **Key Domain Entities**:
 
-- **Topic** (an instance of `gts.cf.core.events.topic.v1~`): A named logical event stream, identified by the instance's own GTS identifier. It carries the stream's own data - `id`, `description`, `retention` - and declares no traits. A topic is divided into **partitions**, whose count is broker configuration, resolved per topic from its resolved settings and handed to the backend with the topic ([feature 0007 §2.6](features/0007-storage-backend-api.md#26-provision-query-maintain)). All sequencing, offsets, and ordering semantics are scoped to a single `(topic, partition)`. Persistence properties are determined by the chosen storage backend (e.g., a backend over process memory loses its log on restart; one over a durable medium keeps it). Registered in `types_registry` by its owning gear, not via REST.
-- **Event Type** (a derived type schema under `gts.cf.core.events.event.v1~`): Defines the payload contract for a category of events by narrowing the base event schema, plus the trait metadata governing them - owning topic, allowed subject types. Registered in `types_registry` by its owning gear, not via REST.
+- **Topic** (an instance of `gts.cf.core.events.topic.v1~`): A named logical event stream, identified by the instance's own GTS identifier. It carries the stream's own data - `id`, `description`, `retention` - and declares no traits. A topic is divided into **partitions**, whose count is broker configuration, resolved per topic from its resolved settings and handed to the backend with the topic ([feature 0007 §2.6](features/0007-storage-backend-api.md#26-provision-query-maintain)). All sequencing, offsets, and ordering semantics are scoped to a single `(topic, partition)`. Persistence properties are determined by the chosen storage backend (e.g., a backend over process memory loses its log on restart; one over a durable medium keeps it). Declared by its owning gear in the GTS inventory, seeded through the registry's `entities:` configuration, or written through its platform API; never created through the broker's REST API.
+- **Event Type** (a derived type schema under `gts.cf.core.events.event.v1~`): Defines the payload contract for a category of events by narrowing the base event schema, plus the trait metadata governing them - owning topic, allowed subject types. Declared by its owning gear in the GTS inventory, seeded through the registry's `entities:` configuration, or written through its platform API; never created through the broker's REST API.
 - **Event** (`gts.cf.core.events.event.v1~`): An immutable record in a `(topic, partition)` log. The `partition` is **backend-assigned**: ingest resolves the partition key - the member the event type's partition-key pointer names, which defaults to `tenant_id`, so a tenant's events are totally ordered unless its type says otherwise - and the backend maps that key to a partition ([feature 0007 §2.2](features/0007-storage-backend-api.md#22-append); [`ADR/0002-partition-selection.md`](ADR/0002-partition-selection.md), under revision); producers set neither `partition` nor a routing key on publish input. The `sequence` (formerly `offset`) is the **broker-logical, consumer-visible ordering key** returned by the storage backend boundary, monotonic within `(topic, partition)` and starting from 1 on a fresh partition (see [§ Offset Semantics](#offset-semantics) and [ADR-0001](ADR/0001-offset-semantics.md)). Backends may use native positions internally (Kafka offset / DB row sequence / file segment offset / etc.) but MUST translate them before exposing `sequence`. `sequence_time` records when the backend assigned the public sequence. The producer chain `meta.producer_id` / `meta.previous` / `meta.sequence` lives inside the publish-input `meta` block (chained / monotonic modes; absent in stateless), is used for ingest-side dedup, and is stripped from the consumer read projection. See §3.2 "Producer Modes" and §3.6 "Two Sequences".
 - **Subscription** (`gts.cf.core.events.subscription.v1~`): An **ephemeral** resource representing a single consumer instance. Lives in the cache (ClusterCapabilities-backed), not in the broker's database. Has a UUID identity, a TTL (`session_timeout`), and a list of assigned `(topic, partition)` pairs across one or more topics. When session expires, the subscription is removed from its group automatically. Subscriptions never outlive the consumer process.
 - **ConsumerGroup** (`gts.cf.core.events.consumer_group.v1~`): A GTS-typed consumer group identifier. **Persistent broker resource** stored in `event_broker_consumer_group` (one row per registered group). Two creation paths, one table - but each path is exclusive to one of the two GTS-instance shapes:
@@ -358,7 +358,7 @@ A named, partitioned log of events identified by a GTS topic identifier. See [`s
 
 **Base type**: `gts.cf.core.events.topic.v1~`. It declares the members every topic carries: `id` and `description`, both required, and an optional `retention`.
 
-A concrete topic is an **instance** of that base, for example `gts.cf.core.events.topic.v1~vendor.users.v1`. It is registered in `types_registry` by whichever gear owns it, at that owner's init; the broker registers only the base type. Events are instances of their event type; the topic is the stream those events land in.
+A concrete topic is an **instance** of that base, for example `gts.cf.core.events.topic.v1~vendor.users.v1`. It is declared by its owning gear in the GTS inventory, seeded through the registry's `entities:` configuration, or written through its platform API; the broker registers nothing, and `event-broker-sdk` declares the base type in the inventory. Events are instances of their event type; the topic is the stream those events land in.
 
 **A topic carries the stream's own data, and nothing else.** What it is called, what it is for, and how long its events are kept are properties of the stream, so they live on the topic. How many partitions the broker gives it and which backend stores them are the broker's concerns, configured there - the partition count per topic in the resolved settings, the storing backend per `backend_routing` ([feature 0005 §2.2](features/0005-backend-registry-and-routing.md#22-backend-routing)); see §4.1 "Deployment Modes". A topic declares no traits.
 
@@ -399,9 +399,10 @@ There is no mechanism to grow or shrink partitions on a live topic; the migratio
 #### Event Type
 
 A concrete event type is a **derived GTS type schema** chained under `gts.cf.core.events.event.v1~`, not a
-resource the broker stores. It is registered in `types_registry` by whichever gear or application owns it, at that
-owner's init; the broker registers only the base type. A published event is an instance of the derived type, and
-the derived schema *is* the payload contract, narrowing the base's `data` member.
+resource the broker stores. It is declared by its owning gear in the GTS inventory, seeded through the registry's
+`entities:` configuration, or written through its platform API; the broker registers nothing, and
+`event-broker-sdk` declares the base type in the inventory. A published event is an instance of the derived type,
+and the derived schema *is* the payload contract, narrowing the base's `data` member.
 
 The metadata governing a type lives in its `x-gts-traits`, whose shape the base declares in
 `x-gts-traits-schema`. Trait keywords are schema-only, so none of these can appear in a published event - a
@@ -768,29 +769,37 @@ Shared by both ingest and delivery. Owns topic/event-type metadata.
 
 Responsibilities:
 - Load and cache topic and event type specifications
-- Validate specification state transitions (topics and types are append-only — no deletions of active specs)
-- Provide indexed lookups by GTS identifier, UUID, or internal ID
-- Hash-based change detection for cache invalidation
+- Keep every specification it has loaded: a load upserts and never deletes a cached topic or
+  event type
+- Look up a topic or event type by GTS identifier, and resolve an identifier to its cache row's
+  internal ID
+- Recompile a payload validator when its `data_schema` fingerprint changes
 - Compile and cache JSON Schemas for event type validation
 
 Key methods:
-- `register_topic(spec) → Result<Topic>`
-- `register_event_type(spec) → Result<EventType>`
-- `get_topic(gts_id) → Option<Topic>`
-- `get_event_type(gts_id) → Option<EventType>`
+- `get_topic(id) → Result<Option<Topic>>`
+- `get_event_type(id) → Result<Option<EventType>>`
 - `validate_event_data(event_type, data) → Result<()>`
+- `list_topics() → Result<Vec<Topic>>`
+- `list_event_types() → Result<Vec<EventType>>`
+- `resolve_topic_id(id) → Result<i64>`
+- `resolve_event_type_id(id) → Result<i64>`
+- `topic_state(id) → Result<Option<TopicState>>`
+- `provision_topics(backends, limits) → usize`
 
-**Current implementation status** (`eb-gts-type-registration`): `cf.core.events.topic.v1~`/
-`cf.core.events.event_type.v1~` are registered as base GTS type schemas in `event-broker-sdk`
-(`#[gts_type_schema(..., base = true)]`), discoverable via the process-wide `toolkit-gts` inventory
-and auto-seeded into `types-registry` at startup. `SpecificationManager` itself has a real,
-`types-registry`-backed production implementation (`infra/specification.rs`'s
-`TypesRegistrySpecificationManager`, resolving `TypesRegistryClient` via `ClientHub`) - it queries
-`register_instances`/`get_instance`/`list_instances` directly per call, with no caching,
-hash-based change detection, or indexed UUID lookup yet (all still aspirational, as described above).
-This supersedes the previously-stale `infra/type_provisioning.rs`/`#4346`/`#4347` pointer (that file
-was a dead, never-called placeholder stub and has been deleted - those tickets never actually tracked
-this work). Cursor storage is durable and SeaORM-backed (`Storage`'s `impl CursorRepo` in
+**Current implementation status** (`eb-gts-type-registration`): `cf.core.events.topic.v1~` and
+`cf.core.events.event.v1~` are base GTS type schemas declared in `event-broker-sdk`
+(`#[gts_type_schema(..., base = true)]`), which `types-registry` seeds from the process-wide
+`toolkit-gts` inventory at startup. `SpecificationManager`'s production implementation
+is `infra/specification.rs`'s `TypesRegistrySpecificationManager`, which serves topics and event
+types from the gear database's specification cache (`event_broker_spec_cache`). `bulk_load` fills
+that cache from `types-registry` through `PlatformTypesRegistryApi`, resolved from `ClientHub`, at
+start and on the `workers.specification_refresh_interval_secs` cadence. It sees only the registry's
+database catalogue, which the GTS inventory, the registry's `entities:` configuration and
+platform-API writes fill; an entity registered through the legacy `TypesRegistryClient` is not
+visible to it. Compiled payload validators are keyed by a fingerprint of their `data_schema`, so a
+changed schema recompiles; lookups are by GTS identifier, with no lookup by UUID.
+Cursor storage is durable and SeaORM-backed (`Storage`'s `impl CursorRepo` in
 `infra/storage/facade.rs`), and events go straight to the topic's `backend::Backend`, resolved
 through `backend_routing` ([feature 0005 §2.2](features/0005-backend-registry-and-routing.md#22-backend-routing)); the old
 `TopicRepo`/`EventRepo` traits and the `InMemoryDomainRepo` that once backed them no longer exist.
@@ -863,10 +872,10 @@ A single backend type may have many registry entries. Each entry is built once p
 
 ##### Backend Type Registration (GTS Type Extension)
 
-Storage backends are GTS types that **extend a common base type**. The event broker registers the base type at `init()`:
+Storage backends are GTS types that **extend a common base type**:
 
 ```text
-Base type (registered by event broker):
+Base type:
   gts.cf.core.events.backend.v1~
 
 Concrete types (each named by its plugin's provider; illustrative):
@@ -1738,11 +1747,11 @@ Wildcards are supported in granted resource patterns.
 
 | Operation | Action | PEP resource type | Resource property |
 |---|---|---|---|
-| Publish | `produce` | Event type | `event_type_id` |
-| JOIN a topic | `consume` | Topic id | `topic_id` |
-| JOIN an exact event-type interest | `consume` | Event type | `event_type_id` |
-| JOIN a wildcard interest | `consume` | `gts.cf.core.events.event.v1~` | `event_type_id` (the pattern) |
-| Deliver a matching event | `consume` | Event type | `event_type_id` |
+| Publish | `produce` | Event type | `event_type_id`, `owner_tenant_id` |
+| JOIN a topic | `consume` | Topic id | `topic_id`, `owner_tenant_id` |
+| JOIN an exact event-type interest | `consume` | Event type | `event_type_id`, `owner_tenant_id` |
+| JOIN a wildcard interest | `consume` | `gts.cf.core.events.event.v1~` | `event_type_id` (the pattern), `owner_tenant_id` |
+| Deliver a matching event | `consume` | Tenant request, topic id, event type (three checks) | `owner_tenant_id` on all; `topic_id` / `event_type_id` on their respective checks |
 | JOIN, get or list a named group | `consume` | Group id | `consumer_group_id` |
 | Delete a named group | `manage` | Group id | `consumer_group_id` |
 | Create a group | `define` | `gts.cf.core.events.consumer_group.v1~` | — |
@@ -1752,16 +1761,28 @@ valid GTS id. They currently require a grant covering the whole event family.
 Checking whether a narrower grant covers the requested pattern is not yet
 implemented. Tenant scope is checked separately on `gts.cf.core.events.request.v1~`.
 
+Every topic and event-type descriptor advertises `owner_tenant_id`. Publish
+checks carry the input event's tenant; JOIN topic and type checks carry the
+interest's tenant. These properties describe the requested event-data scope,
+not ownership of a global type schema. The policy must evaluate the named
+permission in that target tenant and deny if its scope does not include it;
+a separate tenant-authority allow never broadens an event or topic grant.
+Named consumer groups remain shared resources identified by their globally
+unique GTS instance and are checked independently of event-data tenant scope.
+
 Before authorization, publishing a type outside the event family returns
 `404 EventTypeNotFound`. A JOIN pattern that neither covers nor is covered by
 the event family returns `400 BadTypePattern`.
 
-Delivery checks `consume` for each matching event using the stream caller's
-security context, including derived types matched by a parent selector.
+Delivery checks `consume` independently on the tenant request, topic, and
+concrete event type for each matching event, using the stream caller's security
+context and the stored event's `tenant_id` as `owner_tenant_id` on all three.
+This includes derived types matched by a parent selector.
 Denied events count as examined but are not delivered. If evaluation returns an error,
 the stream closes with `teardown`; the current batch is neither emitted nor
 reported as progress, so it can be replayed. Decisions are not cached: each
-matching event requires one PEP evaluation.
+matching event requires all three PEP evaluations to allow. Revoking any of
+the three permissions takes effect on subsequent matching events.
 
 **Subject_type is enforced on two independent dimensions**:
 1. **Authorization** (the `subject_type:produce` / `subject_type:consume` permission above) — *capability*: can the principal write or read events whose subject is of this type?
@@ -1795,7 +1816,7 @@ Both must pass on publish; both must pass at subscribe. They cover different con
   - `(subject_type_resource, "consume", subject_type_pattern)` — for each entry in `subscription.subject_types` (if present)
 - Combined `AccessScope` from the group + topic + event_type + subject_type checks is cached with the subscription. Every subsequent poll applies these constraints to the read query.
 
-**Stream / seek / leave** — no re-check. Authorization is done at JOIN; the cached AccessScope governs all subsequent reads. `subscription_id` is the bearer of authority for follow-up operations. There is no separate `manage` permission — subscription create / list / read / seek / leave are gated by the same `consume` permission.
+**Stream / seek / leave** — follow-up operations check the caller's authority over the subscription tenant. During streaming, each matching event additionally passes the independent tenant, topic, and concrete event-type consume checks described above. JOIN decisions are not cached as enduring delivery authority. There is no separate `manage` permission for subscriptions.
 
 **Current implementation status** (`gears-rust#4516`, `eb-authz-enforcement`): the publish and JOIN
 paths above are implemented exactly to the subset `docs/openapi.yaml` documents — `event_type:produce`
@@ -1810,8 +1831,9 @@ tracked as its own follow-up. Tenant scope is enforced via its own `authz-resolv
 allowing) is entirely the deployed authz-resolver plugin/policy's concern, mirroring `oagw`'s
 `bind.rs::validate_bind_constraints` precedent. The cached-`AccessScope`-on-JOIN / row-level-read-filtering model
 described above is also not yet implemented: today's checks are a pass/fail gate only
-(`require_constraints(false)`), and `stream`/`seek`/`leave` genuinely do no re-check, matching this
-section's "no re-check" line, but with no `AccessScope` to constrain them either.
+(`require_constraints(false)`). Delivery rechecks tenant, topic, and concrete
+event permissions per matching event as described above; it does not rely on
+cached JOIN decisions or SQL predicates for those checks.
 
 **Define path** — ABI / operator registration time:
 - `(topic_resource, "define", topic.id)` for each topic being registered
@@ -1826,7 +1848,7 @@ section's "no re-check" line, but with no `AccessScope` to constrain them either
 
 | Dependency | Purpose |
 |---|---|
-| `types_registry` | GTS schema and instance registration for topics, event types, subject types, and named consumer groups; named-consumer-group provisioning at startup. |
+| `types_registry` | The GTS schemas and instances of topics and event types the broker reads, and the named consumer-group instances it provisions at startup. Read through `PlatformTypesRegistryApi`; an in-process registry publishes it only with a database bound, and without one the broker never becomes ready (`/readyz` 503). |
 | `tenant-resolver` | Tenant scoping and hierarchy resolution; provides `ROOT_TENANT_ID` for inter-service traffic. |
 | `authz-resolver` | `PolicyEnforcer` PEP for all per-(resource, action) authorization decisions. |
 | `api_ingress` | REST API hosting at the platform's HTTP entry point. |
@@ -2124,7 +2146,7 @@ In cluster mode:
   - Dispatchers rebuild their routing table from `DirectoryService` on every refresh. All dispatcher instances converge on the same instance membership within one refresh.
 - **Partition heads** reach delivery from each backend's own `watch` ([feature 0007 §4.2](features/0007-storage-backend-api.md#42-head-watch)) - they do NOT pass through the dispatcher or the cluster. This means multiple dispatcher instances require no shared state for wake-ups.
 - **Worker leader election** uses `cluster.leader_election()` — only one node runs the `reaper` cluster-wide (`evbk.worker.reaper`).
-- All instances share the same database, which holds the broker's metadata; events live in the storage backends the `backends` registry names. Beyond the database, the external dependencies are the ClusterCapabilities provider and those backends.
+- All instances share the same database, which holds the broker's metadata; events live in the storage backends the `backends` registry names. Beyond the database, the external dependencies are the ClusterCapabilities provider and those backends; the broker also needs `types-registry`'s platform API (§3.4).
 
 #### Deployment Variants
 
@@ -2301,8 +2323,8 @@ modules:
     workers:
       reaper_interval_secs: 60
       # How often ingest re-reads types-registry and re-resolves what it holds,
-      # so a topic registered while the process runs becomes resolvable without
-      # a restart.
+      # so a topic admitted into the registry's database while the process runs
+      # becomes resolvable without a restart.
       specification_refresh_interval_secs: 60
 ```
 

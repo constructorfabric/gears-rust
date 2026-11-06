@@ -1,0 +1,7 @@
+error[E0433]: cannot find `types_registry_sdk` in the crate root
+ --> tests/ui/fail/gts_publication_default_publisher_needs_the_sdk.rs:9:1
+  |
+9 | #[gear(name = "x", gts_publication(crates = [crate]))]
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ could not find `types_registry_sdk` in the list of imported crates
+  |
+  = note: this error originates in the attribute macro `gear` (in Nightly builds, run with -Z macro-backtrace for more info)
