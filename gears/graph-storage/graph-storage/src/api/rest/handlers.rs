@@ -515,10 +515,12 @@ mod projection_type_params_tests {
 
     #[test]
     fn patterns_are_split_on_commas_and_trimmed() {
+        // The split does not read the patterns, so plain words stand in for
+        // GTS identifiers, which the architecture lints keep out of literals.
         let params = ProjectionTypeParams {
-            type_pattern: Some("gts.a.* , gts.b.v1~".to_owned()),
+            type_pattern: Some("first , second".to_owned()),
         };
-        assert_eq!(params.patterns(), ["gts.a.*", "gts.b.v1~"]);
+        assert_eq!(params.patterns(), ["first", "second"]);
         assert!(
             ProjectionTypeParams { type_pattern: None }
                 .patterns()
