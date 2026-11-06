@@ -842,14 +842,12 @@ impl HostRuntime {
     fn build_gts_manifests(&self) -> Result<Vec<GtsPublicationPlan>, RegistryError> {
         let mut manifests = Vec::new();
         for entry in self.registry.gears() {
-            crate::gts_publication::validate_gear_publication_config(
-                entry,
-                self.gears_cfg.as_ref(),
-            )
-            .map_err(|source| RegistryError::Publication {
-                gear: entry.name,
-                source,
-            })?;
+            entry
+                .validate_gts_publication_config(self.gears_cfg.as_ref())
+                .map_err(|source| RegistryError::Publication {
+                    gear: entry.name,
+                    source,
+                })?;
             let Some(publication) = entry.caps.query::<GtsPublicationCap>() else {
                 continue;
             };

@@ -114,13 +114,8 @@ pub struct ApiGateway {
     /// REST providers. Write-once/read-many, so `OnceLock` (lock-free reads),
     /// matching `healthcheck_registry`/`health_router`; unset until the server binds.
     pub(crate) bound_endpoint: OnceLock<String>,
-    /// Live router replaced as probes, system routes and application routes become available.
-    pub(crate) bootstrap_routes: Arc<ArcSwap<Router>>,
-    /// Early HTTP server task, transferred to the gateway lifecycle when it starts.
-    pub(crate) bootstrap_task:
-        Mutex<Option<tokio_util::task::AbortOnDropHandle<anyhow::Result<()>>>>,
-    /// Stops the early HTTP listener during shutdown or failed startup cleanup.
-    pub(crate) bootstrap_cancel: OnceLock<CancellationToken>,
+    /// Early HTTP listener, route publication and startup cleanup.
+    bootstrap: bootstrap::BootstrapServer,
 }
 
 impl Default for ApiGateway {
@@ -140,9 +135,7 @@ impl Default for ApiGateway {
             registered_handlers: DashMap::new(),
             proxy_registry: Arc::new(toolkit_gateway::ProxyRegistry::new()),
             bound_endpoint: OnceLock::new(),
-            bootstrap_routes: Arc::new(ArcSwap::from_pointee(Router::new())),
-            bootstrap_task: Mutex::new(None),
-            bootstrap_cancel: OnceLock::new(),
+            bootstrap: bootstrap::BootstrapServer::default(),
         }
     }
 }
@@ -268,9 +261,7 @@ impl ApiGateway {
             registered_handlers: DashMap::new(),
             proxy_registry: Arc::new(toolkit_gateway::ProxyRegistry::new()),
             bound_endpoint: OnceLock::new(),
-            bootstrap_routes: Arc::new(ArcSwap::from_pointee(Router::new())),
-            bootstrap_task: Mutex::new(None),
-            bootstrap_cancel: OnceLock::new(),
+            bootstrap: bootstrap::BootstrapServer::default(),
         }
     }
 
@@ -874,12 +865,12 @@ impl ApiGateway {
 
         self.start_key_pruner(&cancel);
 
-        if self.bootstrap_cancel.get().is_some() {
+        if self.bootstrap.cancellation_token().is_some() {
             if cfg.gateway_proxy.enabled {
                 self.start_proxy_sync(&cfg, cancel.clone());
             }
             ready.notify();
-            return self.serve_bootstrap_rest(cancel).await;
+            return self.bootstrap.serve(cancel).await;
         }
 
         // Bind the main socket.
@@ -1280,11 +1271,10 @@ impl ApiGateway {
         if !bootstrap {
             *self.final_router.lock() = Some(router.clone());
         }
-        if let Some(cancel) = self.bootstrap_cancel.get() {
+        if let Some(cancel) = self.bootstrap.cancellation_token() {
             self.start_key_pruner(cancel);
             // Materialize routes once; direct Router dispatch would rebuild them per request.
-            self.bootstrap_routes
-                .store(Arc::new(router.clone().with_state(())));
+            self.bootstrap.publish(router.clone());
         }
     }
 
@@ -1351,7 +1341,7 @@ impl ApiGateway {
 #[async_trait]
 impl toolkit::Gear for ApiGateway {
     async fn init(&self, ctx: &toolkit::context::GearCtx) -> anyhow::Result<()> {
-        if self.bootstrap_cancel.get().is_none() {
+        if self.bootstrap.cancellation_token().is_none() {
             self.configure_transport(ctx).await?;
         }
         let cfg = self.get_cached_config();
@@ -1380,9 +1370,28 @@ impl toolkit::contracts::ApiGatewayCapability for ApiGateway {
         hc_registry: Arc<toolkit::RestHealthcheckRegistry>,
         cancel: CancellationToken,
     ) -> anyhow::Result<Option<Router>> {
-        self.bootstrap_rest(ctx, hc_registry, cancel)
-            .await
-            .map(Some)
+        self.configure_transport(ctx).await?;
+        let cfg = self.get_cached_config();
+        let base = self.rest_prepare(ctx, Router::new(), Arc::clone(&hc_registry))?;
+        let mut probes = Router::new().fallback(|| async { bootstrap::starting_response() });
+        if matches!(
+            cfg.health.serve,
+            HealthServeMode::Main | HealthServeMode::Both
+        ) {
+            probes = probes.merge(Self::health_routes(
+                hc_registry,
+                Duration::from_millis(cfg.healthcheck_timeout_ms),
+            ));
+        }
+        let prefix = Self::normalize_prefix_path(&cfg.prefix_path)?;
+        self.bootstrap.publish(Self::apply_prefix(probes, &prefix));
+        let addr = Self::parse_bind_address(&cfg.bind_addr)?;
+        let listener = tokio::net::TcpListener::bind(addr).await?;
+        let bound = listener.local_addr()?;
+        let health_bound = self.bind_health_listener(&cfg).await?;
+        self.bootstrap.start(listener, health_bound, cancel)?;
+        self.publish_bound_endpoint(&cfg, bound);
+        Ok(Some(base))
     }
 
     fn rest_finalize_bootstrap(
@@ -1396,7 +1405,7 @@ impl toolkit::contracts::ApiGatewayCapability for ApiGateway {
     }
 
     async fn rest_shutdown_bootstrap(&self) -> anyhow::Result<()> {
-        self.shutdown_bootstrap_rest().await
+        self.bootstrap.shutdown().await
     }
 
     fn bound_endpoint(&self) -> Option<String> {

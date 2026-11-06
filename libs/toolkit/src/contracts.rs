@@ -3,6 +3,7 @@ use axum::Router;
 use tokio_util::sync::CancellationToken;
 
 pub use crate::api::openapi_registry::OpenApiRegistry;
+pub use crate::grpc_registration::RegisterGrpcServiceFn;
 
 /// Infrastructure that starts before application preparation: types registry,
 /// service discovery, cluster and gRPC hub.
@@ -254,21 +255,6 @@ pub trait RunnableCapability: Send + Sync {
     ///
     /// See trait-level documentation for the full shutdown contract.
     async fn stop(&self, deadline_token: CancellationToken) -> anyhow::Result<()>;
-}
-
-/// Represents a gRPC service registration callback used by the gRPC hub.
-///
-/// Each gear that exposes gRPC services provides one or more of these.
-/// The `register` closure adds the service into the provided `RoutesBuilder`.
-#[cfg(feature = "otel")]
-pub struct RegisterGrpcServiceFn {
-    pub service_name: &'static str,
-    pub register: Box<dyn Fn(&mut tonic::service::RoutesBuilder) + Send + Sync>,
-}
-
-#[cfg(not(feature = "otel"))]
-pub struct RegisterGrpcServiceFn {
-    pub service_name: &'static str,
 }
 
 /// gRPC Service capability: gears that export gRPC services.

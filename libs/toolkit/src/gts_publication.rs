@@ -97,33 +97,6 @@ use crate::config::{ConfigError, ConfigProvider, gear_config_or_default, gear_co
 use toolkit_gts::local::DeclarationMerge;
 pub use toolkit_gts::local::DeclarationSource;
 
-/// Validate publication capabilities/configuration for startup and deployment jobs.
-pub(crate) fn validate_gear_publication_config(
-    entry: &crate::registry::GearEntry,
-    config: &dyn ConfigProvider,
-) -> anyhow::Result<()> {
-    if entry.caps.has::<crate::registry::GtsPublicationCap>() {
-        anyhow::ensure!(
-            !entry.is_system(),
-            "a system gear initializes before the GTS barrier, so it cannot \
-             publish GTS documents with `gts_publication(...)`"
-        );
-    } else {
-        anyhow::ensure!(
-            config
-                .get_gear_config(entry.name)
-                .and_then(|gear| gear.get("config"))
-                .and_then(|config| config.get(crate::config::GTS_PUBLICATION_CONFIG_KEY))
-                .is_none(),
-            "gears.{}.config.{} is set, but this gear publishes no GTS \
-             documents: it declares no `gts_publication(...)`",
-            entry.name,
-            crate::config::GTS_PUBLICATION_CONFIG_KEY
-        );
-    }
-    Ok(())
-}
-
 /// Effective gear configuration for `entities`, without gear state, DB or clients.
 /// The same configuration must produce the same runtime and deployment manifest.
 pub struct GtsPublicationInputs<'a> {

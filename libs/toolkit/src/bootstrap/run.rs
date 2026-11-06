@@ -278,7 +278,7 @@ fn validate_deployment_configuration(
     config: &dyn crate::config::ConfigProvider,
 ) -> Result<()> {
     for entry in registry.gears() {
-        crate::gts_publication::validate_gear_publication_config(entry, config)?;
+        entry.validate_gts_publication_config(config)?;
     }
     Ok(())
 }

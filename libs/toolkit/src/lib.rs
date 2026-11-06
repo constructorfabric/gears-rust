@@ -120,6 +120,7 @@ pub use toolkit_utils::var_expand;
 
 // Core gear contracts and traits
 pub mod contracts;
+mod grpc_registration;
 // Type-safe API operation builder
 pub mod api;
 pub use api::{
