@@ -1183,9 +1183,30 @@ async fn insert_node_row(
         .await;
     match inserted {
         Ok(model) => Ok(Some(model.id)),
-        Err(toolkit_db::secure::ScopeError::Db(sea_orm::DbErr::RecordNotFound(_))) => Ok(None),
+        Err(error) if lost_insert_race(&error) => Ok(None),
         Err(error) => Err(map_scope_err(error)),
     }
+}
+
+/// Whether an `INSERT ... ON CONFLICT DO NOTHING RETURNING` lost its race:
+/// the conflict elided the insert, so `RETURNING` produced no row.
+///
+/// The one place that reads the error as the race, for every insert that
+/// settles one (`insert_node_row`, `insert_phantom`, the edge insert). On a
+/// backend with `RETURNING` -- PostgreSQL, the only one this store runs on --
+/// `SeaORM` reports the empty answer from `exec_with_returning` as
+/// `RecordNotFound`: its returning select found nothing. `RecordNotInserted`
+/// is what a backend *without* `RETURNING` says, so here it would be
+/// something else, and it surfaces as an error.
+/// `an_elided_insert_that_asks_for_its_row_reports_record_not_found` pins the
+/// variant against the server, which is why it is decided here once rather
+/// than spelled out at each insert.
+#[must_use]
+pub fn lost_insert_race(error: &toolkit_db::secure::ScopeError) -> bool {
+    matches!(
+        error,
+        toolkit_db::secure::ScopeError::Db(sea_orm::DbErr::RecordNotFound(_))
+    )
 }
 
 /// The row another batch inserted under this key while this one was about
@@ -1314,15 +1335,7 @@ async fn insert_phantom(
         Ok(model) => Ok(model.id),
         // Nothing was inserted, so somebody else got there first. Read their
         // row and use it -- the endpoint the edge names is that node.
-        // `DO NOTHING` returns no row, and on a backend with `RETURNING` --
-        // PostgreSQL, the only one this store runs on -- SeaORM reports that
-        // from `exec_with_returning` as `RecordNotFound`: its returning
-        // select found nothing. That is the one variant taken as the race;
-        // `RecordNotInserted` is what a backend *without* `RETURNING` says,
-        // so here it would be something else, and it surfaces as an error.
-        // `an_elided_insert_that_asks_for_its_row_reports_record_not_found`
-        // pins the variant against the server.
-        Err(toolkit_db::secure::ScopeError::Db(sea_orm::DbErr::RecordNotFound(_))) => {
+        Err(error) if lost_insert_race(&error) => {
             let settled = node::Entity::find()
                 .secure()
                 .scope_with(scope)
@@ -1421,7 +1434,7 @@ async fn upsert_edge(
             .await;
         match inserted {
             Ok(_) => return Ok(ItemOutcome::Inserted),
-            Err(toolkit_db::secure::ScopeError::Db(sea_orm::DbErr::RecordNotFound(_))) => {}
+            Err(error) if lost_insert_race(&error) => {}
             Err(error) => return Err(map_scope_err(error)),
         }
         edge::Entity::find()
@@ -1954,20 +1967,23 @@ async fn lost_edge_delete(
 /// compare-and-set, and this delete settles as the no-op that ordered before
 /// the revive. Only a live row with another id is a key taken again. Pure,
 /// so each arm is pinned by a unit case rather than by the race.
-fn lost_edge_verdict(read_id: i64, found: Option<(i64, bool)>) -> Option<bool> {
+fn lost_edge_verdict(read_id: i64, found: Option<EdgeState>) -> Option<bool> {
     match found {
-        Some((id, false)) if id == read_id => Some(true),
-        other => other.map(|(_, tombstoned)| tombstoned),
+        Some(EdgeState {
+            id,
+            deleted_at: None,
+        }) if id == read_id => Some(true),
+        other => other.map(|row| row.deleted_at.is_some()),
     }
 }
 
-/// The row under `key` now and whether it is tombstoned: `None` when no row
-/// holds the key.
+/// The row under `key` now, with its tombstone: `None` when no row holds the
+/// key.
 async fn edge_state(
     scope: &AccessScope,
     tx: &impl DBRunner,
     key: &str,
-) -> Result<Option<(i64, bool)>, TxStoreError> {
+) -> Result<Option<EdgeState>, TxStoreError> {
     Ok(edge::Entity::find()
         .secure()
         .scope_with(scope)
@@ -1979,8 +1995,7 @@ async fn edge_state(
         .await
         .map_err(map_scope_err)?
         .into_iter()
-        .next()
-        .map(|row| (row.id, row.deleted_at.is_some())))
+        .next())
 }
 
 /// Settle an edge delete whose endpoint is not visible, although the edge
@@ -2007,7 +2022,7 @@ async fn endpoint_hidden(
 ) -> Result<DeleteOutcome, TxStoreError> {
     let tombstoned = edge_state(scope, tx, key)
         .await?
-        .map(|(_, tombstoned)| tombstoned);
+        .map(|row| row.deleted_at.is_some());
     hidden_endpoint_verdict(tombstoned)?;
     let revision = current_revision(scope, tx).await?;
     Ok(DeleteOutcome {
@@ -2583,27 +2598,41 @@ mod no_op_verdict_tests {
 
 #[cfg(test)]
 mod lost_edge_verdict_tests {
-    use super::lost_edge_verdict;
+    use super::{EdgeState, lost_edge_verdict};
+
+    fn live(id: i64) -> EdgeState {
+        EdgeState {
+            id,
+            deleted_at: None,
+        }
+    }
+
+    fn tombstoned(id: i64) -> EdgeState {
+        EdgeState {
+            id,
+            deleted_at: Some(time::OffsetDateTime::UNIX_EPOCH),
+        }
+    }
 
     /// The row the delete read, live again: tombstoned and revived after the
     /// read. The delete ordered before the revive, so it is a no-op.
     #[test]
     fn the_same_row_live_again_settles_as_a_no_op() {
-        assert_eq!(lost_edge_verdict(7, Some((7, false))), Some(true));
+        assert_eq!(lost_edge_verdict(7, Some(live(7))), Some(true));
     }
 
     /// Another row live under the key: the one the delete read was purged
     /// and the key taken again, which stays a conflict.
     #[test]
     fn another_live_row_under_the_key_stays_a_conflict() {
-        assert_eq!(lost_edge_verdict(7, Some((8, false))), Some(false));
+        assert_eq!(lost_edge_verdict(7, Some(live(8))), Some(false));
     }
 
     /// A tombstone settles and no row is absent, whatever row was read.
     #[test]
     fn a_tombstone_settles_and_no_row_is_absent() {
-        assert_eq!(lost_edge_verdict(7, Some((7, true))), Some(true));
-        assert_eq!(lost_edge_verdict(7, Some((8, true))), Some(true));
+        assert_eq!(lost_edge_verdict(7, Some(tombstoned(7))), Some(true));
+        assert_eq!(lost_edge_verdict(7, Some(tombstoned(8))), Some(true));
         assert_eq!(lost_edge_verdict(7, None), None);
     }
 }

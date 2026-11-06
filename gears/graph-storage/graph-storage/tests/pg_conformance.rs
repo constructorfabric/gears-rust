@@ -2345,11 +2345,12 @@ pg_case!(
 ///
 /// Phantom creation relies on it: two batches naming one new endpoint race,
 /// the loser's insert is elided, and the loser must read the winner's row
-/// rather than fail. On a backend with `RETURNING` the elision surfaces as
-/// `RecordNotFound` -- the returning select found no row -- and that is the
-/// only variant the phantom path accepts as one. Were an ORM upgrade to
-/// report it differently, this is where it shows, not as a batch that fails
-/// only when two producers happen to collide.
+/// rather than fail; so must a node or an edge inserted twice. On a backend
+/// with `RETURNING` the elision surfaces as `RecordNotFound` -- the returning
+/// select found no row -- and every insert that settles a race asks
+/// `lost_insert_race` whether this is that. The answer is checked here, on the
+/// server: were an ORM upgrade to report it differently, this is where it
+/// shows, not as a batch that fails only when two producers happen to collide.
 #[tokio::test]
 async fn an_elided_insert_that_asks_for_its_row_reports_record_not_found() {
     use graph_storage::infra::storage::entity::graph_meta;
@@ -2385,6 +2386,11 @@ async fn an_elided_insert_that_asks_for_its_row_reports_record_not_found() {
     assert!(
         matches!(elided, Err(sea_orm::DbErr::RecordNotFound(_))),
         "an elided insert with RETURNING must report RecordNotFound, got {elided:?}"
+    );
+    let error = toolkit_db::secure::ScopeError::Db(elided.expect_err("elided"));
+    assert!(
+        graph_storage::infra::store::ingest::lost_insert_race(&error),
+        "every insert that settles a race reads this error as one: {error:?}"
     );
 }
 
