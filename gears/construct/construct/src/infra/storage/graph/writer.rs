@@ -1,6 +1,7 @@
 use std::collections::BTreeSet;
 use std::num::NonZeroU32;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -8,6 +9,7 @@ use construct_sdk::gts::{HAS_FACT_TYPE, PROFILE_ROOT_TYPE};
 use graph_storage_sdk::GraphStorageClientV1;
 use graph_storage_sdk::models::{EdgeSpec, IngestOptions, IngestOutcome, IngestRequest, NodeSpec};
 use time::OffsetDateTime;
+use tokio_retry::strategy::{ExponentialBackoff, jitter};
 use toolkit_canonical_errors::CanonicalError;
 use toolkit_security::SecurityContext;
 use uuid::Uuid;
@@ -29,12 +31,19 @@ use crate::domain::subject_settings::SubjectKey;
 /// committed nothing and can be sent again.
 const SERIALIZATION: &str = "SERIALIZATION";
 
-/// How many times one write is sent while its result is unknown.
+/// How many times one write is sent in all, the send that checks a refusal
+/// after an unknown result included.
 pub const DEFAULT_ATTEMPTS: NonZeroU32 = NonZeroU32::MIN.saturating_add(2);
-/// The pause before the second send; it doubles for every later one, and a
-/// random share of it is added, so writers that failed together do not come
-/// back together.
-const FIRST_PAUSE: Duration = Duration::from_millis(100);
+
+/// The pauses between sends of one write: 100 ms before the second, doubling
+/// for every later one. A random share of each is added, so writers that
+/// failed together do not come back together.
+///
+/// `ExponentialBackoff` raises its base to the power of the send, so the base
+/// is 2 and the factor scales it to 100 ms.
+pub(super) fn pauses() -> ExponentialBackoff {
+    ExponentialBackoff::from_millis(2).factor(50)
+}
 
 /// Removes a fact from graph storage once the write that dropped it has
 /// committed. Soft delete until graph storage ships a hard delete (#5194);
@@ -133,7 +142,8 @@ impl GraphPlanWriter {
         self
     }
 
-    /// Replace [`DEFAULT_CALL_TIMEOUT`] for the profile read and each send.
+    /// Replace [`DEFAULT_CALL_TIMEOUT`] for the profile read, each send, and
+    /// the whole cleanup of removed facts after a write.
     #[must_use]
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
@@ -160,19 +170,24 @@ impl GraphPlanWriter {
     /// timeout. The first that fails ends the cleanup: it and the rest stay
     /// listed on the root, and a later write finishes them.
     async fn remove(&self, ctx: &SecurityContext, keys: &BTreeSet<NodeKey>) {
+        // Outside the cleanup, so the timeout can still tell how far it got.
+        let done = AtomicUsize::new(0);
         let cleanup = async {
-            for (done, key) in keys.iter().enumerate() {
+            for key in keys {
                 if let Err(err) = self.ports.removal.remove(ctx, key).await {
-                    return Err((done, key, err));
+                    return Err((key, err));
                 }
+                done.fetch_add(1, Ordering::Relaxed);
             }
             Ok(())
         };
-        match tokio::time::timeout(self.timeout, cleanup).await {
+        let finished = tokio::time::timeout(self.timeout, cleanup).await;
+        let left = keys.len() - done.load(Ordering::Relaxed);
+        match finished {
             Ok(Ok(())) => {}
-            Ok(Err((done, key, err))) => unfinished(key, &err, keys.len() - done),
+            Ok(Err((key, err))) => unfinished(key, &err, left),
             Err(_) => tracing::warn!(
-                listed = keys.len(),
+                left,
                 timeout = ?self.timeout,
                 "removed facts stay listed on the root until a later write finishes them"
             ),
@@ -180,21 +195,23 @@ impl GraphPlanWriter {
     }
 
     /// Send the ingest, again with the same idempotency key while its result
-    /// is unknown, with a growing, jittered pause between sends.
+    /// is unknown, with a growing, jittered pause between sends, and at most
+    /// `attempts` sends in all.
     ///
     /// A send without an answer keeps running in graph storage, which cannot
     /// cut off a statement it has started. A later send of the same request
     /// can miss that send's receipt, wait for the root, and lose the
     /// compare-and-set to it. So once a result was unknown, a refused
     /// compare-and-set is sent once more with the same key: when the earlier
-    /// send committed, its receipt now answers stored.
+    /// send committed, its receipt now answers stored. That send counts
+    /// toward `attempts`; with none left, the result stays unknown.
     async fn ingest(
         &self,
         ctx: &SecurityContext,
         request: IngestRequest,
     ) -> Result<Written, DomainError> {
         let mut attempt = 1;
-        let mut pause = FIRST_PAUSE;
+        let mut pauses = pauses();
         let mut unknown = false;
         let mut replayed = false;
         loop {
@@ -206,6 +223,13 @@ impl GraphPlanWriter {
                 Sent::Stored => return Ok(Written::Stored),
                 Sent::Failed(err) => return Err(err),
                 Sent::Refused if unknown && !replayed => {
+                    if attempt >= self.attempts.get() {
+                        return Err(DomainError::Unavailable(format!(
+                            "graph storage profile write: result unknown after {attempt} \
+                             sends: refused after a send without an answer"
+                        )));
+                    }
+                    attempt += 1;
                     replayed = true;
                     tracing::warn!(
                         idempotency_key = ?request.idempotency_key,
@@ -229,9 +253,9 @@ impl GraphPlanWriter {
                 error = %failed,
                 "profile write sent again with its idempotency key"
             );
-            tokio::time::sleep(pause + jitter(pause)).await;
+            let pause = pauses.next().unwrap_or(Duration::MAX);
+            tokio::time::sleep(pause.saturating_add(jitter(pause))).await;
             attempt += 1;
-            pause = pause.saturating_mul(2);
             // @cpt-end:cpt-cf-construct-algo-profile-writer-write:p1:inst-write-ingest
         }
     }
@@ -284,12 +308,6 @@ fn classify(
         // No answer in time: the write may or may not have committed.
         Err(_) => Sent::Unknown(format!("no answer within {timeout:?}")),
     }
-}
-
-/// A random share of `pause`, up to all of it.
-pub(super) fn jitter(pause: Duration) -> Duration {
-    let millis = u64::try_from(pause.as_millis()).unwrap_or(u64::MAX);
-    Duration::from_millis(rand::random_range(0..=millis))
 }
 
 /// Whether a failed send can be sent again as it is, with its key: graph
@@ -518,13 +536,16 @@ impl PlanWriter for GraphPlanWriter {
                 OffsetDateTime::now_utc(),
             )
         };
-        let waiting = pending(&stored);
         let Batch { request, listed } = match build(&stored) {
             // @cpt-begin:cpt-cf-construct-algo-profile-writer-write:p1:inst-write-full
             // Facts listed for removal count until their delete has run, and
             // only a stored write runs it. Run those deletes now and build
             // once more, so failed deletes do not keep the profile full.
-            Err(DomainError::ProfileFull(_)) if !waiting.is_empty() => {
+            Err(DomainError::ProfileFull(full)) => {
+                let waiting = pending(&stored);
+                if waiting.is_empty() {
+                    return Err(DomainError::ProfileFull(full));
+                }
                 self.remove(ctx, &waiting).await;
                 let stored = self.read(ctx, &subject).await?;
                 if stored.version != expected {

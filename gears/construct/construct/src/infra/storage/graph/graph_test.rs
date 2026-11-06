@@ -38,7 +38,7 @@ use super::reader::{GraphProfileSource, MAX_FACTS, MAX_PROFILE_NODES};
 use super::root::{PayloadCounter, Root, root_key};
 use super::types::GraphTypes;
 use super::writer::{
-    DEFAULT_ATTEMPTS, FactRemoval, GraphPlanWriter, SoftDelete, WriterPorts, jitter, resendable,
+    DEFAULT_ATTEMPTS, FactRemoval, GraphPlanWriter, SoftDelete, WriterPorts, pauses, resendable,
 };
 use super::{DEFAULT_CALL_TIMEOUT, graph_error};
 use crate::domain::error::DomainError;
@@ -86,6 +86,11 @@ impl AuthZResolverApi for AllowInOwnTenant {
 
 /// Graph storage's real service over its in-memory store.
 fn graph_storage() -> Arc<dyn GraphStorageClientV1> {
+    graph_storage_with(GraphStorageConfig::default())
+}
+
+/// [`graph_storage`] with its configuration.
+fn graph_storage_with(config: GraphStorageConfig) -> Arc<dyn GraphStorageClientV1> {
     let store = Arc::new(FakeGraphStore::new());
     let engine = Arc::new(FakeGraphEngine::new(Arc::clone(&store)));
     let embedding = EmbeddingCoordinator::new(
@@ -94,9 +99,7 @@ fn graph_storage() -> Arc<dyn GraphStorageClientV1> {
         8 * 1024,
     );
     let services = Arc::new(GraphServices::new(
-        GraphStorageConfig::default()
-            .validated()
-            .expect("the default configuration is valid"),
+        config.validated().expect("the configuration is valid"),
         store,
         engine,
         PolicyEnforcer::new(Arc::new(AllowInOwnTenant)),
@@ -1403,6 +1406,63 @@ async fn a_refusal_is_replayed_once_at_most() {
     );
 }
 
+#[tokio::test(start_paused = true)]
+async fn the_send_that_checks_a_refusal_counts_toward_the_attempts() {
+    let profiles = Profiles::new();
+    let scripted = Scripted::over(Arc::clone(&profiles.client));
+    scripted.script([
+        Ingest::Fail(unavailable),
+        Ingest::Fail(cas_conflict),
+        Ingest::Fail(unavailable),
+        Ingest::Fail(unavailable),
+    ]);
+
+    let written = profiles
+        .scripted_writer(&scripted)
+        .write(&profiles.ctx, &profiles.plan(None, vec![add_skill("Rust")]))
+        .await;
+
+    assert!(
+        matches!(written, Err(DomainError::Unavailable(_))),
+        "{written:?}"
+    );
+    assert_eq!(
+        scripted.ingest_calls.load(Ordering::SeqCst),
+        DEFAULT_ATTEMPTS.get(),
+        "sent, refused, checked: the last send"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_refusal_on_the_last_send_after_an_unknown_one_stays_unknown() {
+    let profiles = Profiles::new();
+    profiles.given(None, vec![add_skill("Rust")]).await;
+    let scripted = Scripted::over(Arc::clone(&profiles.client));
+    scripted.script([
+        Ingest::Fail(unavailable),
+        Ingest::Fail(unavailable),
+        Ingest::Fail(cas_conflict),
+    ]);
+
+    let written = profiles
+        .scripted_writer(&scripted)
+        .write(
+            &profiles.ctx,
+            &profiles.plan(Some(1), vec![add_skill("Go")]),
+        )
+        .await;
+
+    // An earlier send may have landed, and no send is left to check it.
+    assert!(
+        matches!(written, Err(DomainError::Unavailable(_))),
+        "{written:?}"
+    );
+    assert_eq!(
+        scripted.ingest_calls.load(Ordering::SeqCst),
+        DEFAULT_ATTEMPTS.get()
+    );
+}
+
 #[tokio::test]
 async fn a_replayed_refusal_after_another_write_is_a_conflict() {
     let profiles = Profiles::new();
@@ -1631,14 +1691,13 @@ async fn a_read_without_an_answer_in_time_is_unavailable() {
 }
 
 #[test]
-fn the_pause_carries_a_random_share_of_up_to_all_of_it() {
-    let pause = Duration::from_millis(100);
+fn the_pauses_start_at_100_ms_and_double() {
+    let first: Vec<Duration> = pauses().take(4).collect();
 
-    let draws: Vec<Duration> = (0..200).map(|_| jitter(pause)).collect();
-
-    assert!(draws.iter().all(|draw| *draw <= pause), "{draws:?}");
-    let distinct: BTreeSet<_> = draws.iter().collect();
-    assert!(distinct.len() > 1, "random, not fixed: {distinct:?}");
+    assert_eq!(
+        first,
+        [100, 200, 400, 800].map(Duration::from_millis).to_vec()
+    );
 }
 
 #[test]
@@ -1787,11 +1846,34 @@ async fn a_value_its_type_refuses_stores_nothing() {
 
     let result = profiles.writer().write(&profiles.ctx, &plan).await;
 
-    assert!(
-        matches!(result, Err(DomainError::Internal(_))),
-        "{result:?}"
-    );
+    let Err(DomainError::Internal(message)) = result else {
+        panic!("{result:?}");
+    };
+    // Graph storage's validation error names the value it refused; the
+    // message must not carry it on.
+    assert!(!message.contains("guru"), "{message}");
     assert_eq!(profiles.read().await.version, None, "nothing landed");
+}
+
+#[tokio::test]
+async fn graph_storage_that_takes_fewer_nodes_than_a_profile_read_names_its_setting() {
+    let profiles = Profiles {
+        client: graph_storage_with(GraphStorageConfig {
+            traversal_max_nodes: MAX_PROFILE_NODES - 1,
+            ..GraphStorageConfig::default()
+        }),
+        ..Profiles::new()
+    };
+
+    let read = profiles
+        .reader()
+        .read(&profiles.ctx, profiles.tenant, profiles.subject)
+        .await;
+
+    let Err(DomainError::Internal(message)) = read else {
+        panic!("{read:?}");
+    };
+    assert!(message.contains("traversal_max_nodes"), "{message}");
 }
 
 #[tokio::test]

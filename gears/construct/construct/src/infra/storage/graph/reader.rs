@@ -6,12 +6,13 @@ use async_trait::async_trait;
 use construct_sdk::gts::{HAS_FACT_TYPE, PROFILE_ROOT_TYPE};
 use graph_storage_sdk::GraphStorageClientV1;
 use graph_storage_sdk::models::{NodeView, TraverseRequest, TruncationReason};
+use toolkit_canonical_errors::CanonicalError;
 use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
 use super::fact::fact_of;
 use super::root::{ProfileVersion, Root, root_key};
-use super::{ContextSubject, DEFAULT_CALL_TIMEOUT, bounded, subject_in_context};
+use super::{ContextSubject, DEFAULT_CALL_TIMEOUT, graph_error, subject_in_context, unanswered};
 use crate::domain::error::DomainError;
 use crate::domain::plan::NodeKey;
 use crate::domain::planner::processing::ProfileSource;
@@ -19,7 +20,9 @@ use crate::domain::profile::{FactCount, FullProfile, Profile};
 use crate::domain::subject_settings::SubjectKey;
 
 /// The most nodes one profile read takes: the root and its facts. Graph
-/// storage's own ceiling for a traversal is 1000 by default.
+/// storage's ceiling for a traversal, `traversal_max_nodes`, is 1000 by
+/// default and must not be set lower for Construct: graph storage refuses a
+/// read that asks for more, see [`read_refused`].
 pub const MAX_PROFILE_NODES: u32 = 1000;
 
 /// The most facts one profile holds: every fact, the root besides, has to fit
@@ -35,14 +38,27 @@ pub(crate) struct Stored {
     pub facts: Vec<NodeView>,
 }
 
+/// A failed profile read. Out of range is graph storage refusing the read's
+/// node budget: its `traversal_max_nodes` is set below what one profile read
+/// takes, which only the deployment can mend.
+fn read_refused(err: &CanonicalError) -> DomainError {
+    match err {
+        CanonicalError::OutOfRange { .. } => DomainError::internal(format!(
+            "graph storage takes fewer nodes in one traversal than a profile read needs \
+             ({MAX_PROFILE_NODES}); set its traversal_max_nodes to {MAX_PROFILE_NODES} or more: {err}"
+        )),
+        _ => graph_error("profile read", err),
+    }
+}
+
 /// Read the root and every node one has-fact edge from it, in one traversal.
 ///
 /// # Errors
 ///
 /// [`DomainError::ProfileFull`] when the profile is larger than one read
-/// takes; internal when graph storage cut the read short for another reason;
-/// unavailable when graph storage does not answer in time; any other
-/// failure as [`super::graph_error`] maps it.
+/// takes; internal when graph storage cut the read short for another reason
+/// or refuses the read's node budget; unavailable when graph storage does not
+/// answer in time; any other failure as [`super::graph_error`] maps it.
 pub(crate) async fn read_stored(
     client: &dyn GraphStorageClientV1,
     versions: &dyn ProfileVersion,
@@ -60,7 +76,10 @@ pub(crate) async fn read_stored(
         node_type_patterns: Vec::new(),
         max_nodes: Some(MAX_PROFILE_NODES),
     };
-    let response = bounded(timeout, "profile read", client.traverse(ctx, request)).await?;
+    let response = tokio::time::timeout(timeout, client.traverse(ctx, request))
+        .await
+        .map_err(|_| unanswered("profile read", timeout))?
+        .map_err(|err| read_refused(&err))?;
     // @cpt-end:cpt-cf-construct-algo-profile-writer-read:p1:inst-read-traverse
 
     // @cpt-begin:cpt-cf-construct-algo-profile-writer-read:p1:inst-read-root

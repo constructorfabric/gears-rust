@@ -26,6 +26,9 @@ const PLANNED_TYPES: [&str; 2] = [CHAT_MESSAGE_TYPE, ENRICHMENT_FACT_CANDIDATE_T
 const USER_ROLE: &str = "user";
 
 /// Reads a subject's profile and its version from graph storage.
+///
+/// It checks only that the subject is in the context's tenant. Whether the caller may read this subject's profile is
+/// decided before it is called.
 #[async_trait]
 pub trait ProfileSource: Send + Sync {
     /// # Errors
@@ -49,6 +52,9 @@ pub enum Written {
 }
 
 /// Stores an admitted plan in one write, expecting the profile version the plan was built on.
+///
+/// It checks only that the subject is in the context's tenant. Whether the caller may change this subject's profile is
+/// decided before it is called.
 #[async_trait]
 pub trait PlanWriter: Send + Sync {
     /// # Errors

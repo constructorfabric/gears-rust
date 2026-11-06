@@ -1,10 +1,11 @@
 use std::collections::HashSet;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use construct_sdk::profile_types::graph_types;
 use graph_storage_sdk::GraphStorageClientV1;
 use graph_storage_sdk::models::TypeRegistration;
+use parking_lot::Mutex;
 use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
@@ -44,9 +45,7 @@ impl GraphTypes {
     }
 
     fn done(&self, tenant_id: Uuid) -> bool {
-        self.registered
-            .lock()
-            .is_ok_and(|registered| registered.contains(&tenant_id))
+        self.registered.lock().contains(&tenant_id)
     }
 
     /// Make sure the types exist in the context's tenant.
@@ -98,9 +97,7 @@ impl GraphTypes {
             Ok(Err(err)) => return Err(graph_error("type registration", &err)),
             Err(_) => return Err(unanswered("type registration", self.timeout)),
         }
-        if let Ok(mut registered) = self.registered.lock() {
-            registered.insert(tenant_id);
-        }
+        self.registered.lock().insert(tenant_id);
         Ok(())
         // @cpt-end:cpt-cf-construct-algo-profile-writer-write:p1:inst-write-register
     }

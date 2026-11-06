@@ -35,7 +35,6 @@ bytes = { workspace = true }
 
 # The profile: graph storage's in-process client
 graph-storage-sdk = { workspace = true }
-rand = { workspace = true }
 
 # Record types: the types registry resolves a record's type and base types
 types-registry-sdk = { workspace = true }
@@ -45,6 +44,7 @@ jsonschema = { workspace = true }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 futures = { workspace = true }
+parking_lot = { workspace = true }
 tracing = { workspace = true }
 inventory = { workspace = true }
 serde = { workspace = true }
@@ -53,6 +53,7 @@ axum = { workspace = true, features = ["macros"] }
 uuid = { workspace = true, features = ["v4"] }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
+tokio-retry = { workspace = true }
 serde_json = { workspace = true }
 hex = { workspace = true }
 time = { workspace = true }
