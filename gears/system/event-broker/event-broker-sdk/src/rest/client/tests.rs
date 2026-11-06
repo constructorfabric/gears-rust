@@ -96,3 +96,80 @@ async fn a_single_publish_answered_200_is_reported_as_duplicate() {
         (IngestOutcome::Duplicate, IngestOutcome::Duplicate)
     );
 }
+
+/// A sample event the publish tests send.
+fn sample_event() -> Event {
+    Event {
+        id: uuid::Uuid::from_u128(0x0190_f1a2_0000_7000_8000_0000_0000_0d01),
+        type_id: crate::GtsTypeId::new("gts.cf.core.events.event.v1~x.eb.sdk.placed.v1~"),
+        tenant_id: uuid::Uuid::from_u128(0x0190_f1a2_0000_7000_a000_0000_0000_0d02),
+        source: "sdk-test".to_owned(),
+        subject: "order-1".to_owned(),
+        subject_type: crate::GtsTypeId::new("gts.x.eb.sdk.order.v1~"),
+        occurred_at: chrono::Utc
+            .with_ymd_and_hms(2026, 10, 1, 12, 0, 0)
+            .single()
+            .expect("a valid timestamp"),
+        trace_parent: None,
+        data: None,
+        partition: None,
+        sequence: None,
+        sequence_time: None,
+        meta: None,
+    }
+}
+
+#[tokio::test]
+async fn publish_sync_sends_prefer_wait_and_reports_201_as_persisted() {
+    use std::sync::{Arc, Mutex};
+
+    let seen: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let captured = Arc::clone(&seen);
+    let base_url = serve(Router::new().route(
+        "/event-broker/v1/events",
+        post(move |headers: axum::http::HeaderMap| {
+            let captured = Arc::clone(&captured);
+            async move {
+                *captured.lock().expect("prefer capture") = headers
+                    .get("Prefer")
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_owned);
+                StatusCode::CREATED
+            }
+        }),
+    ))
+    .await;
+
+    let broker = RestBroker::new(base_url)
+        .expect("build the client")
+        .with_sync_wait(std::time::Duration::from_secs(7));
+
+    let outcome = broker
+        .publish_sync(&SecurityContext::anonymous(), &sample_event())
+        .await
+        .expect("a 201 is a success");
+
+    assert_eq!(outcome, IngestOutcome::Persisted);
+    assert_eq!(
+        seen.lock().expect("prefer capture").as_deref(),
+        Some("wait=7"),
+        "publish_sync must send the configured Prefer: wait=N"
+    );
+}
+
+#[tokio::test]
+async fn publish_sync_reports_202_as_accepted() {
+    let base_url = serve(Router::new().route(
+        "/event-broker/v1/events",
+        post(|| async { StatusCode::ACCEPTED }),
+    ))
+    .await;
+    let broker = RestBroker::new(base_url).expect("build the client");
+
+    let outcome = broker
+        .publish_sync(&SecurityContext::anonymous(), &sample_event())
+        .await
+        .expect("a 202 is a success");
+
+    assert_eq!(outcome, IngestOutcome::Accepted);
+}

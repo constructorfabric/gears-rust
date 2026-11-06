@@ -6,6 +6,28 @@
 //! topic and that key, so every event of one key drains in publish order; the
 //! storage backend maps the key to a topic partition when it stores the event
 //! (feature 0007 §4.1).
+//!
+//! # Three partition spaces, deliberately distinct
+//!
+//! An event passes through three *different* notions of "partition"; they are
+//! not interchangeable and only the first is this gear's to choose:
+//!
+//! - **Ingest outbox partition** - [`outbox_partition_for`], `murmur3(topic:key)
+//!   % outbox_partitions`. Purely an ordering lane on the write path: the
+//!   outbox sequences within one partition, so co-locating a key's events in
+//!   one lane is what preserves their publish order on the way to the backend.
+//!   It is the partition a row is `enqueue`d under and the one a
+//!   [`fence_key`] names (with the outbox identity). It is **not** a topic
+//!   partition and carries no meaning past the append.
+//! - **Backend / topic partition** - assigned by the storage backend from the
+//!   event's partition key when it appends, not by ingest. This is the real
+//!   partition an event lives in.
+//! - **Delivery partition** - what a consumer streams; it *is* the backend
+//!   topic partition, read back on the delivery path. Ingest has no say in it.
+//!
+//! A synchronous publish's trace spans whatever ingest partitions its admitted
+//! rows fall in; the trace completes only once every one of them has been
+//! appended, independently of how the backend later partitions them.
 
 use std::fmt;
 
@@ -73,6 +95,18 @@ pub struct IngestPayload {
     pub key: String,
     /// No partition, no sequence: both are the backend's to assign.
     pub event: Event,
+    /// Whether this row backs a synchronous `Prefer: wait=N` publish (feature
+    /// 0007 §4.1). The outbox worker appends a sync row with [`Flush::Sync`] so
+    /// the stored event is immediately readable once the publish is answered
+    /// `201` (AC-2, S2); an async row stays [`Flush::Async`]. The wait itself is
+    /// resolved through the row's outbox trace (`crate::domain::sync_wait`), not
+    /// through the payload. Skipped when `false`, so an async row's payload is
+    /// byte-identical to before this field existed.
+    ///
+    /// [`Flush::Sync`]: event_broker_sdk::backend::Flush::Sync
+    /// [`Flush::Async`]: event_broker_sdk::backend::Flush::Async
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub stored_wait: bool,
 }
 
 /// The ingest outbox partition an event of `topic` with partition-key value

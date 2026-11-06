@@ -41,6 +41,11 @@ pub mod module_boot;
     dead_code,
     reason = "general-purpose harness API surface, not all of it exercised yet"
 )]
+pub mod never_storing_backend;
+#[allow(
+    dead_code,
+    reason = "general-purpose harness API surface, not all of it exercised yet"
+)]
 pub mod outbox_rows;
 pub mod pause;
 #[allow(
@@ -67,6 +72,11 @@ pub use gear_db::GearDb;
     reason = "general-purpose harness API surface, not all of it exercised yet"
 )]
 pub use harness::{EventBrokerHarness, EventBrokerHarnessBuilder};
+#[allow(
+    unused_imports,
+    reason = "general-purpose harness API surface, not all of it exercised yet"
+)]
+pub use never_storing_backend::NeverStoringBackend;
 pub use outbox_rows::outbox_queue_partitions;
 pub use pause::PausePoint;
 #[allow(

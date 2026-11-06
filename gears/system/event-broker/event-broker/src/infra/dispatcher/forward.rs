@@ -19,9 +19,14 @@ use crate::config::MAX_REQUEST_BODY_BYTES;
 
 /// Idle-read timeout on the proxied response body (design.md D9): reset on
 /// every byte received (heartbeat or data), not tied to total connection
-/// duration. 60s sits comfortably above the consumer SDK's own ~50s
-/// self-heal window (`DESIGN.md:1825`).
-const IDLE_READ_TIMEOUT: Duration = Duration::from_mins(1);
+/// duration. It also bounds the wait for the *response head*, so it must sit
+/// above the two things a dispatched route can legitimately hold before its
+/// first byte: the consumer SDK's ~50s stream self-heal window
+/// (`DESIGN.md:1825`) and - sending nothing until it resolves - a synchronous
+/// `Prefer: wait=N` publish, capped at
+/// `config::checks::MAX_CLUSTER_INGEST_WAIT_SECS` (60s) on a `cluster_ingest`
+/// upstream. 90s keeps a ~30s margin over that cap for the enqueue and response.
+const IDLE_READ_TIMEOUT: Duration = Duration::from_secs(90);
 
 /// Bound on the TCP connect to a resolved instance. Unlike the idle-read
 /// timeout this covers only the handshake, so a short value cannot cut off a

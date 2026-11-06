@@ -68,12 +68,81 @@ pub enum PublishAck {
     Duplicate(Event),
 }
 
+/// Outcome of a synchronous publish (`Prefer: wait=N`, DESIGN.md:1335): the
+/// backend stored every admitted event within N (`201 Created`), N elapsed
+/// first with the events still enqueued to be stored later (`202 Accepted`),
+/// or every event was a duplicate so nothing was enqueued and there was
+/// nothing to wait for (`200 OK`). An append failure is retried, never
+/// answered, so it surfaces as `TimedOut`, not an error.
+#[domain_model]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyncPublishAck {
+    Stored,
+    TimedOut,
+    Duplicate,
+}
+
 /// Dedup protocol mode a producer registers under (`ADR-0004`).
 #[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProducerMode {
     Chained,
     Monotonic,
+}
+
+/// A synchronous-publish trace: a per-publish UUID the broker mints and the
+/// waiting request subscribes to (feature 0007 §4.1). Never on the wire.
+#[domain_model]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SyncTrace(Uuid);
+
+impl SyncTrace {
+    /// A fresh trace. A v4 (random) UUID rather than a time-ordered v7, so new
+    /// trace rows do not cluster at the tail of the outbox's non-unique `trace`
+    /// index (where an ack's countdown could gap-lock the next insert).
+    #[must_use]
+    pub fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+
+    /// The underlying id, for subscribing and for stamping the outbox row.
+    #[must_use]
+    pub fn id(self) -> Uuid {
+        self.0
+    }
+}
+
+impl Default for SyncTrace {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// How a prepared publish is stamped onto the outbox: an async publish records
+/// nothing, a synchronous publish rides a [`SyncTrace`] its waiting request is
+/// told the completion of. An enum rather than an `Option<Uuid>` argument, the
+/// gear's convention for a parameter with two distinct meanings.
+#[domain_model]
+#[derive(Debug, Clone, Copy)]
+pub enum OutboxStamp {
+    Async,
+    Sync(SyncTrace),
+}
+
+impl OutboxStamp {
+    /// Whether this is a synchronous publish (the outbox row is flushed
+    /// `Flush::Sync` and the batch is enqueued under its trace).
+    const fn is_sync(self) -> bool {
+        matches!(self, Self::Sync(_))
+    }
+
+    /// The trace to enqueue the row under, if any.
+    const fn trace(self) -> Option<Uuid> {
+        match self {
+            Self::Sync(trace) => Some(trace.0),
+            Self::Async => None,
+        }
+    }
 }
 
 /// Input to `IngestService::register_producer` - this codebase's convention
@@ -147,6 +216,37 @@ pub trait IngestService: Send + Sync {
         ctx: &SecurityContext,
         requests: Vec<PublishRequest>,
     ) -> Result<BatchAck, DomainError>;
+
+    /// [`publish_event`](Self::publish_event), held until the backend stores
+    /// the event or `wait` elapses (`Prefer: wait=N`, DESIGN.md:1335). `wait`
+    /// is the requested hold, clamped to the broker's configured ceiling; pass
+    /// `Duration::MAX` to hold for as long as the broker allows. A duplicate is
+    /// answered at once, never waited on.
+    async fn publish_event_sync(
+        &self,
+        ctx: &SecurityContext,
+        request: PublishRequest,
+        wait: std::time::Duration,
+    ) -> Result<SyncPublishAck, DomainError>;
+
+    /// [`publish_batch`](Self::publish_batch), held until the backend stores
+    /// every admitted event of the batch or `wait` elapses. The hold applies
+    /// to the batch as a whole and is clamped like
+    /// [`publish_event_sync`](Self::publish_event_sync); an all-duplicate batch
+    /// is answered at once.
+    async fn publish_batch_sync(
+        &self,
+        ctx: &SecurityContext,
+        requests: Vec<PublishRequest>,
+        wait: std::time::Duration,
+    ) -> Result<SyncPublishAck, DomainError>;
+
+    /// The ceiling a `Prefer: wait=N` hold is clamped to
+    /// (`config::PublishConfig::max_wait_secs`). The REST layer reports the
+    /// applied wait with `Preference-Applied: wait=<seconds>` (RFC 7240 §3), so
+    /// a client can tell a synchronous `202` from a preference the broker
+    /// ignored; the value is whole seconds, as the header carries.
+    fn max_sync_wait(&self) -> std::time::Duration;
 
     /// Mint a fresh `producer_id` bound to `ctx`'s calling principal
     /// (`docs/openapi.yaml`'s `POST /v1/producers`).
@@ -252,6 +352,17 @@ pub struct IngestServiceImpl<R> {
     /// partition is taken modulo, so it has to be the count the group's queue
     /// was registered with.
     outbox_partitions: crate::domain::outbox::OutboxPartitions,
+    /// How a synchronous publish learns its events were stored: it subscribes
+    /// to the publish's outbox trace before the enqueue commits and awaits its
+    /// completion (`domain::sync_wait::SyncWaitRegistry`, feature 0007 §4.1).
+    /// Cross-instance through the outbox's own notifier, so a publish whose rows
+    /// drain on another instance still resolves.
+    sync_wait: std::sync::Arc<dyn crate::domain::sync_wait::SyncWaitRegistry>,
+    /// The ceiling a `Prefer: wait=N` hold is clamped to
+    /// (`config::PublishConfig::max_wait_secs`): the broker never holds a
+    /// publish open longer than the operator allows, so the service that does
+    /// the waiting owns the cap rather than each caller carrying it.
+    sync_wait_max: std::time::Duration,
 }
 
 impl<R> IngestServiceImpl<R> {
@@ -275,6 +386,19 @@ impl<R> IngestServiceImpl<R> {
             })
     }
 
+    /// The requested synchronous-publish hold, never beyond the broker's
+    /// configured ceiling (`Prefer: wait=N` is capped by configuration).
+    fn clamp_wait(&self, wait: std::time::Duration) -> std::time::Duration {
+        wait.min(self.sync_wait_max)
+    }
+
+    // Each argument is a distinct, fully-required dependency and this is the
+    // single construction site (via `build_handler_state`), so a deps-struct
+    // would add indirection without preventing any real mistake.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "each is a distinct fully-required dependency, built at one site"
+    )]
     #[must_use]
     pub fn new(
         repo: std::sync::Arc<R>,
@@ -283,6 +407,8 @@ impl<R> IngestServiceImpl<R> {
         backend_resolver: std::sync::Arc<dyn BackendResolver>,
         batch: crate::config::BatchConfig,
         outbox_partitions: crate::domain::outbox::OutboxPartitions,
+        sync_wait: std::sync::Arc<dyn crate::domain::sync_wait::SyncWaitRegistry>,
+        sync_wait_max: std::time::Duration,
     ) -> Self {
         Self {
             repo,
@@ -291,6 +417,8 @@ impl<R> IngestServiceImpl<R> {
             backend_resolver,
             batch,
             outbox_partitions,
+            sync_wait,
+            sync_wait_max,
         }
     }
 }
@@ -314,6 +442,7 @@ where
         &self,
         ctx: &SecurityContext,
         request: PublishRequest,
+        stamp: OutboxStamp,
     ) -> Result<PreparedPublish, DomainError> {
         // Reject non-event types, then authorize before topic/schema validation
         // (`docs/DESIGN.md`, Validation Pipeline step 1 and §3.3).
@@ -455,6 +584,10 @@ where
             topic: topic.id.clone(),
             key,
             event: event.clone(),
+            // A sync row is flushed `Flush::Sync` by the worker so a `201`'s
+            // event is immediately readable; the wait itself rides the outbox
+            // trace below, not the payload.
+            stored_wait: stamp.is_sync(),
         })
         .map_err(|e| DomainError::Internal(format!("serialize ingest outbox payload: {e}")))?;
 
@@ -463,6 +596,11 @@ where
             payload,
             crate::domain::outbox::INGEST_PAYLOAD_TYPE,
         );
+        // Enqueue under the publish's trace, so the admitted rows become one
+        // traced outbox batch the waiting publish is told the completion of.
+        if let Some(trace) = stamp.trace() {
+            request = request.trace(trace);
+        }
         if let Some(meta) = event.meta.clone() {
             request = request.chain(crate::domain::idempotency::ProducerChainCheck {
                 producer_id: meta.producer_id,
@@ -480,52 +618,19 @@ where
             enqueue: request.build(),
         })
     }
-}
 
-#[async_trait]
-impl<R> IngestService for IngestServiceImpl<R>
-where
-    R: crate::domain::idempotency::IdempotencyGuard + ProducerRegistry + Send + Sync + 'static,
-{
-    async fn publish_event(
-        &self,
-        ctx: &SecurityContext,
-        request: PublishRequest,
-    ) -> Result<PublishAck, DomainError> {
-        let PreparedPublish { event, enqueue } = self.prepare_publish(ctx, request).await?;
-
-        // `check_and_enqueue` is the one DB transaction spanning the
-        // producer-chain check and the outbox insert - the backend append
-        // happens later, out of transaction, when the outbox processor
-        // drains the row.
-        match self.repo.check_and_enqueue(enqueue).await? {
-            ProducerIdempotencyOutcome::Accept => {}
-            ProducerIdempotencyOutcome::DuplicateIgnore => {
-                return Ok(PublishAck::Duplicate(event));
-            }
-            // A single publish is a run of one (feature 0001 §5.2), so its
-            // violation names index 0.
-            ProducerIdempotencyOutcome::SequenceViolation {
-                producer_id,
-                last_sequence,
-            } => {
-                return Err(DomainError::SequenceViolation {
-                    index: 0,
-                    producer_id,
-                    topic: event.topic.to_string(),
-                    last_sequence,
-                });
-            }
-        }
-
-        Ok(PublishAck::Accepted(event))
-    }
-
-    async fn publish_batch(
+    /// Everything a batch publish checks and prepares before any row is
+    /// written (feature 0001 §5.2): the size and payload bounds, the
+    /// repeated-id and single-topic rules, each event's own preparation
+    /// (stamped with `trace`), and each run's shape (R3). Writes nothing, so
+    /// the caller runs the one enqueue transaction. Shared by the async and
+    /// synchronous batch paths.
+    async fn prepare_batch(
         &self,
         ctx: &SecurityContext,
         requests: Vec<PublishRequest>,
-    ) -> Result<BatchAck, DomainError> {
+        stamp: OutboxStamp,
+    ) -> Result<Vec<crate::domain::idempotency::PublishEnqueue>, DomainError> {
         let max = self.batch.max_size as usize;
         if requests.len() > max {
             return Err(DomainError::BatchTooLarge {
@@ -582,11 +687,9 @@ where
 
         // All-or-nothing: every event is validated before any is enqueued, and
         // the enqueue is one transaction that a chain violation rolls back.
-        let mut events = Vec::with_capacity(requests.len());
         let mut enqueues = Vec::with_capacity(requests.len());
         for request in requests {
-            let PreparedPublish { event, enqueue } = self.prepare_publish(ctx, request).await?;
-            events.push(event);
+            let PreparedPublish { enqueue, .. } = self.prepare_publish(ctx, request, stamp).await?;
             enqueues.push(enqueue);
         }
         // Feature 0001 §5.2 R3: each run's own shape, before any chain state
@@ -598,12 +701,65 @@ where
                 return Err(DomainError::MalformedRun { index });
             }
         }
+        Ok(enqueues)
+    }
+}
+
+#[async_trait]
+impl<R> IngestService for IngestServiceImpl<R>
+where
+    R: crate::domain::idempotency::IdempotencyGuard + ProducerRegistry + Send + Sync + 'static,
+{
+    async fn publish_event(
+        &self,
+        ctx: &SecurityContext,
+        request: PublishRequest,
+    ) -> Result<PublishAck, DomainError> {
+        let PreparedPublish { event, enqueue } = self
+            .prepare_publish(ctx, request, OutboxStamp::Async)
+            .await?;
+
+        // `check_and_enqueue` is the one DB transaction spanning the
+        // producer-chain check and the outbox insert - the backend append
+        // happens later, out of transaction, when the outbox processor
+        // drains the row.
+        match self.repo.check_and_enqueue(enqueue).await? {
+            ProducerIdempotencyOutcome::Accept => {}
+            ProducerIdempotencyOutcome::DuplicateIgnore => {
+                return Ok(PublishAck::Duplicate(event));
+            }
+            // A single publish is a run of one (feature 0001 §5.2), so its
+            // violation names index 0.
+            ProducerIdempotencyOutcome::SequenceViolation {
+                producer_id,
+                last_sequence,
+            } => {
+                return Err(DomainError::SequenceViolation {
+                    index: 0,
+                    producer_id,
+                    topic: event.topic.to_string(),
+                    last_sequence,
+                });
+            }
+        }
+
+        Ok(PublishAck::Accepted(event))
+    }
+
+    async fn publish_batch(
+        &self,
+        ctx: &SecurityContext,
+        requests: Vec<PublishRequest>,
+    ) -> Result<BatchAck, DomainError> {
+        let enqueues = self
+            .prepare_batch(ctx, requests, OutboxStamp::Async)
+            .await?;
+        let expected = enqueues.len();
         let outcomes = self.repo.check_and_enqueue_batch(enqueues).await?;
-        if outcomes.len() != events.len() {
+        if outcomes.len() != expected {
             return Err(DomainError::Internal(format!(
-                "the batch enqueue answered {} outcomes for {} events",
+                "the batch enqueue answered {} outcomes for {expected} events",
                 outcomes.len(),
-                events.len()
             )));
         }
         // Every event a duplicate -> `200` (feature 0001 §5.2 "Outcome"). The
@@ -617,6 +773,93 @@ where
         } else {
             Ok(BatchAck::Accepted)
         }
+    }
+
+    async fn publish_event_sync(
+        &self,
+        ctx: &SecurityContext,
+        request: PublishRequest,
+        wait: std::time::Duration,
+    ) -> Result<SyncPublishAck, DomainError> {
+        let wait = self.clamp_wait(wait);
+        // A fresh per-publish trace: the row is enqueued under it and the outbox
+        // tells us once it is stored (feature 0007 §4.1).
+        let trace = SyncTrace::new();
+        let PreparedPublish { event, enqueue } = self
+            .prepare_publish(ctx, request, OutboxStamp::Sync(trace))
+            .await?;
+
+        // Subscribe before the enqueue commits, so the completion can never be
+        // missed; a duplicate (no row enqueued) drops it with no statement.
+        let waiter = self.sync_wait.subscribe(trace.id());
+        match self.repo.check_and_enqueue(enqueue).await? {
+            ProducerIdempotencyOutcome::Accept => {}
+            // A duplicate wrote no row and is already durable: `200`, no wait.
+            ProducerIdempotencyOutcome::DuplicateIgnore => return Ok(SyncPublishAck::Duplicate),
+            ProducerIdempotencyOutcome::SequenceViolation {
+                producer_id,
+                last_sequence,
+            } => {
+                return Err(DomainError::SequenceViolation {
+                    index: 0,
+                    producer_id,
+                    topic: event.topic.to_string(),
+                    last_sequence,
+                });
+            }
+        }
+
+        Ok(if waiter.stored(wait).await {
+            SyncPublishAck::Stored
+        } else {
+            SyncPublishAck::TimedOut
+        })
+    }
+
+    async fn publish_batch_sync(
+        &self,
+        ctx: &SecurityContext,
+        requests: Vec<PublishRequest>,
+        wait: std::time::Duration,
+    ) -> Result<SyncPublishAck, DomainError> {
+        let wait = self.clamp_wait(wait);
+        let trace = SyncTrace::new();
+        let enqueues = self
+            .prepare_batch(ctx, requests, OutboxStamp::Sync(trace))
+            .await?;
+        let expected = enqueues.len();
+
+        // Subscribe before the enqueue commits, so the batch's completion can
+        // never be missed; an all-duplicate batch drops it with no statement.
+        let waiter = self.sync_wait.subscribe(trace.id());
+        let outcomes = self.repo.check_and_enqueue_batch(enqueues).await?;
+        if outcomes.len() != expected {
+            return Err(DomainError::Internal(format!(
+                "the batch enqueue answered {} outcomes for {expected} events",
+                outcomes.len(),
+            )));
+        }
+        // Only admitted events are enqueued under the trace, so only they are
+        // waited on; an all-duplicate batch admits none (no traced batch is
+        // enqueued) and is answered `200` at once (feature 0001 §5.2
+        // "Outcome").
+        let admitted = outcomes
+            .iter()
+            .filter(|outcome| **outcome == ProducerIdempotencyOutcome::Accept)
+            .count();
+        if admitted == 0 {
+            return Ok(SyncPublishAck::Duplicate);
+        }
+
+        Ok(if waiter.stored(wait).await {
+            SyncPublishAck::Stored
+        } else {
+            SyncPublishAck::TimedOut
+        })
+    }
+
+    fn max_sync_wait(&self) -> std::time::Duration {
+        self.sync_wait_max
     }
 
     async fn register_producer(

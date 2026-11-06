@@ -64,7 +64,7 @@ use std::time::Duration;
 use chrono::Utc;
 use sea_orm::sea_query::Expr;
 use sea_orm::{ColumnTrait, Condition, DbBackend, DbErr, EntityTrait, QueryFilter, Set, SqlErr};
-use toolkit_db::outbox::{Outbox, OutboxError, Wake};
+use toolkit_db::outbox::{Outbox, OutboxError, Records, RecordsBuilder, Wake};
 use toolkit_db::secure::{
     ScopeError, SecureEntityExt, SecureUpdateExt, TxConfig, TxIsolationLevel, secure_insert,
 };
@@ -334,26 +334,9 @@ impl Attempt {
             pauses.after_head_read.pass().await;
         }
 
-        // Every event that is not a duplicate is enqueued in request order, so
-        // events of one key drain in the order they were sent; a stateless
-        // event is never a duplicate.
-        let mut outcomes = Vec::with_capacity(requests.len());
-        let mut wake = Wake::empty();
-        for (request, duplicate) in requests.into_iter().zip(duplicate) {
-            if duplicate {
-                outcomes.push(ProducerIdempotencyOutcome::DuplicateIgnore);
-                continue;
-            }
-            match enqueue(tx, &outbox, request).await {
-                Ok(enqueued) => wake += enqueued,
-                Err(err) => {
-                    // The transaction rolls back, so its rows never commit.
-                    wake.discard();
-                    return Err(err);
-                }
-            }
-            outcomes.push(ProducerIdempotencyOutcome::Accept);
-        }
+        // Enqueue every non-duplicate row, in request order; a rollback takes
+        // its rows with it.
+        let (outcomes, wake) = enqueue_admitted(tx, &outbox, requests, &duplicate).await?;
 
         for (run, read, to) in head_writes {
             let written = match read {
@@ -382,6 +365,84 @@ async fn read_head(tx: &DbTx<'_>, run: &ChainRun) -> Result<ChainHead, AttemptEr
         .one(tx)
         .await?;
     Ok(row.map_or(ChainHead::Absent, |row| ChainHead::At(row.last_sequence)))
+}
+
+/// Enqueues every non-duplicate request of one attempt, in request order, and
+/// returns the per-request outcomes alongside the combined [`Wake`]. On any
+/// error the accumulated wake is discarded, since the transaction rolls back.
+///
+/// A synchronous publish (every request carries the same trace, set by the
+/// ingest service) becomes one traced outbox batch, so the waiting publish is
+/// told once every admitted row is stored (feature 0007 §4.1); an all-duplicate
+/// batch enqueues nothing - `Records::build` refuses an empty traced batch, and
+/// there is nothing to wait on anyway. An asynchronous publish enqueues each row
+/// on its own, the byte-for-byte path of every publish before synchronous
+/// publish existed.
+async fn enqueue_admitted(
+    tx: &DbTx<'_>,
+    outbox: &Outbox,
+    requests: Vec<PublishEnqueue>,
+    duplicate: &[bool],
+) -> Result<(Vec<ProducerIdempotencyOutcome>, Wake), AttemptError> {
+    let trace = requests.iter().find_map(|request| request.trace);
+    let count = requests.len();
+    let mut outcomes = Vec::with_capacity(count);
+    let mut wake = Wake::empty();
+    let rows = requests.into_iter().zip(duplicate.iter().copied());
+
+    if let Some(trace) = trace {
+        let mut admitted = Vec::with_capacity(count);
+        for (request, duplicate) in rows {
+            outcomes.push(if duplicate {
+                ProducerIdempotencyOutcome::DuplicateIgnore
+            } else {
+                admitted.push((request.ingest_partition, request.payload));
+                ProducerIdempotencyOutcome::Accept
+            });
+        }
+        if !admitted.is_empty() {
+            let trace = trace.to_string();
+            let mut batch = Records::to(crate::domain::outbox::INGEST_QUEUE_NAME)
+                .payload_type(crate::domain::outbox::INGEST_PAYLOAD_TYPE)
+                .trace(&trace);
+            for (partition, payload) in admitted {
+                batch = batch.push(partition, payload);
+            }
+            match enqueue_traced(tx, outbox, batch).await {
+                Ok(enqueued) => wake += enqueued,
+                Err(err) => {
+                    wake.discard();
+                    return Err(err);
+                }
+            }
+        }
+    } else {
+        for (request, duplicate) in rows {
+            if duplicate {
+                outcomes.push(ProducerIdempotencyOutcome::DuplicateIgnore);
+                continue;
+            }
+            match enqueue(tx, outbox, request).await {
+                Ok(enqueued) => wake += enqueued,
+                Err(err) => {
+                    wake.discard();
+                    return Err(err);
+                }
+            }
+            outcomes.push(ProducerIdempotencyOutcome::Accept);
+        }
+    }
+    Ok((outcomes, wake))
+}
+
+/// Validates and enqueues one traced batch of admitted rows.
+async fn enqueue_traced(
+    tx: &DbTx<'_>,
+    outbox: &Outbox,
+    batch: RecordsBuilder<'_>,
+) -> Result<Wake, AttemptError> {
+    let records = batch.build()?;
+    Ok(outbox.enqueue_batch(tx, records).await?)
 }
 
 /// One request's payload as one ingest outbox row.

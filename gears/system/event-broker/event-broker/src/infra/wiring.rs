@@ -45,7 +45,10 @@ use crate::infra::storage::Storage;
 // single wiring path (called once from `module.rs`), so a builder or deps-struct
 // would add indirection without preventing any real mistake - the same call as
 // `DeliveryServiceImpl::new`, which carries the identical justification.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each is a distinct fully-required dependency, wired at one site"
+)]
 #[must_use]
 pub fn build_handler_state(
     storage: Arc<Storage>,
@@ -57,9 +60,13 @@ pub fn build_handler_state(
     leases: Arc<InProcessStreamLeases>,
     batch: BatchConfig,
     outbox_partitions: OutboxPartitions,
+    sync_wait_max: std::time::Duration,
     streaming: StreamingConfig,
     heartbeat_interval: std::time::Duration,
 ) -> HandlerState {
+    // The wait registry is `Storage` itself - it holds the ingest outbox whose
+    // trace machinery a synchronous publish subscribes to.
+    let sync_wait: Arc<dyn crate::domain::sync_wait::SyncWaitRegistry> = storage.clone();
     let ingest: Arc<dyn IngestService> = Arc::new(IngestServiceImpl::new(
         Arc::clone(&storage),
         policy_enforcer.clone(),
@@ -67,6 +74,8 @@ pub fn build_handler_state(
         Arc::clone(&backend_resolver),
         batch,
         outbox_partitions,
+        sync_wait,
+        sync_wait_max,
     ));
     let delivery_impl = DeliveryServiceImpl::new(
         storage,
