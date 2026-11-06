@@ -551,6 +551,8 @@ The system **MUST** provide pass-through APIs for the OpenAI and Anthropic APIs,
 
 Pass-through requests go through the same Gateway pipeline as requests to the unified API: authorization, model resolution, capability check, quota enforcement, provider credential retrieval, streaming supervision, usage tracking and reporting, and request traceability. Only the request and response format differs: the Gateway does not translate them to the unified API. The response **MUST** be enriched with Gateway usage (cost in AI credits and usage completeness), added to the provider's native usage object; in streaming, to the event that carries the final usage.
 
+The native response body carries only the provider's own id, so every pass-through response, success or error, sync or streaming, **MUST** return the Gateway response `id` (the gateway request identifier, `cpt-cf-llm-gateway-fr-request-traceability-v1`) in a response header, so that the consumer can correlate the call with its usage, cost, and logs.
+
 Gateway errors on pass-through APIs, including `capability_not_supported`, **MUST** be returned in the error format of the corresponding provider API (OpenAI or Anthropic), so that clients built for those APIs handle them as ordinary API errors.
 
 Whether a model can be called through a pass-through API is part of the model capabilities in Model Registry: a model declares which pass-through APIs (OpenAI, Anthropic) it supports, and an administrator can disable that capability per model. The system **MUST** send a pass-through request only to a model whose capabilities include the matching pass-through API; otherwise the system **MUST** return a `capability_not_supported` error without calling the provider.
