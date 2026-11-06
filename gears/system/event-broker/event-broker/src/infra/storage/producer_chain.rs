@@ -1,21 +1,57 @@
-//! The producer-chain transaction behind `Storage::check_and_enqueue`: read
-//! the `(producer, topic)` head, let the domain decide, enqueue the accepted
-//! event, then move the head with a compare-and-set.
+//! The producer-chain transaction behind `Storage::check_and_enqueue` and
+//! `Storage::check_and_enqueue_batch`: split the requests into runs, one per
+//! `(producer, topic)` (feature 0001 §5.2); read each run's head and let the
+//! domain decide the run against it (R4 chained, R5 monotonic); enqueue every
+//! event that is not a duplicate, in request order; then move each advancing
+//! run's head to its last `sequence`. A single publish is a run of one.
 //!
-//! The head write is the transaction's last statement and is conditional on
-//! the head it read: an existing head moves only while `last_sequence` still
-//! equals the head read, and a first head is a plain `INSERT` that loses to a
-//! concurrent first insert on the primary key. Either way a writer that got
-//! there first leaves this attempt with nothing written; the attempt rolls
-//! back (taking its outbox row with it) and the whole transaction runs again,
-//! re-reading the head and answering duplicate, `412` or accept against it.
-//! On `PostgreSQL` (read committed) and `MySQL` (an `UPDATE` reads the latest
-//! committed row) a concurrent second `UPDATE` waits for the first to commit,
-//! then re-checks its condition and changes nothing. `SQLite` has one writer
-//! at a time, so there the transaction takes the write lock before it reads
-//! (see [`take_write_lock`]) and the compare-and-set always holds. Database
+//! A batch is one transaction. The first run that breaks its chain ends the
+//! transaction with an error, so it rolls back and the batch leaves nothing
+//! enqueued and no head moved; a duplicate enqueues nothing and the batch goes
+//! on.
+//!
+//! On `PostgreSQL` and `MySQL` each head is read with a locking read
+//! (`SELECT ... FOR UPDATE`), so no other writer moves it before this
+//! transaction commits, and the `last_sequence` a `412` reports is the
+//! committed head. An absent head locks nothing, so a first head can still
+//! race: it is a plain `INSERT` that loses to a concurrent first insert on the
+//! primary key. An existing head moves with a compare-and-set against the
+//! head read, which the lock makes hold. Either way a writer that got there
+//! first leaves this attempt with nothing written; the attempt rolls back
+//! (taking its outbox rows with it) and the whole transaction runs again,
+//! re-reading the heads and answering duplicate, `412` or accept against
+//! them. `SQLite` has one writer at a time and renders no row lock, so there
+//! the transaction takes the write lock before it reads (see
+//! [`take_write_lock`]) and the compare-and-set always holds. Database
 //! contention (deadlock, serialization failure, `SQLite` busy) is retried by
 //! the same loop.
+//!
+//! On `MySQL` the transaction runs at read committed, not the server's default
+//! repeatable read. Under repeatable read a locking read that finds no row
+//! takes a gap lock, and gap locks do not conflict with each other but do
+//! block an insert into the gap: concurrent first publishes whose keys fall in
+//! one gap all read, then all wait on each other's gap at their `INSERT`, and
+//! the deadlock detector aborts all but one per round - more rounds than the
+//! retry budget once a burst outgrows it. Read committed takes record locks
+//! only, so a first-publish race ends as on `PostgreSQL`: the later `INSERT`
+//! fails on the primary key once the earlier one commits, and the attempt
+//! runs again. Nothing here needs a repeatable snapshot: every head read is a
+//! locking read, which reads the latest committed row at any level. The
+//! ingest outbox registration already runs its writes at read committed, so
+//! this asks nothing new of the binary log format. `PostgreSQL` keeps its
+//! default read committed, which takes no gap locks, and `SQLite` is
+//! serializable whatever it is told.
+//!
+//! A batch locks heads in request order (the order of each run's first
+//! event), not in a sorted one, because the `412` names the first violating
+//! run in request order (feature 0001 §5.2 "Outcome"): reading in that order
+//! decides each run as its head is read and stops at the first violation,
+//! where a sorted order would have to read every head before deciding any.
+//! Two concurrent batches touching the same heads in opposite orders can
+//! deadlock on `PostgreSQL` and `MySQL`; the database detects it and aborts
+//! one, which is contention and is retried like any other, from a fresh
+//! transaction. Producers do not normally create that case (one producer id
+//! is one writer), so the retry covers it.
 //!
 //! The first head is not an `INSERT ... ON CONFLICT DO NOTHING`: on `MySQL`
 //! sea-query renders that as `ON DUPLICATE KEY UPDATE <pk> = <pk>`, and with
@@ -29,25 +65,61 @@ use chrono::Utc;
 use sea_orm::sea_query::Expr;
 use sea_orm::{ColumnTrait, Condition, DbBackend, DbErr, EntityTrait, QueryFilter, Set, SqlErr};
 use toolkit_db::outbox::{Outbox, OutboxError, Wake};
-use toolkit_db::secure::{ScopeError, SecureEntityExt, SecureUpdateExt, secure_insert};
+use toolkit_db::secure::{
+    ScopeError, SecureEntityExt, SecureUpdateExt, TxConfig, TxIsolationLevel, secure_insert,
+};
 use toolkit_db::{Db, DbError, DbTx};
+use toolkit_gts::GtsInstanceId;
 use toolkit_security::AccessScope;
+use uuid::Uuid;
 
 use crate::domain::error::DomainError;
-use crate::domain::idempotency::{ProducerChainCheck, ProducerIdempotencyOutcome, PublishEnqueue};
+use crate::domain::idempotency::{
+    ChainHead, ChainRun, ProducerIdempotencyOutcome, PublishEnqueue, RunDecision,
+};
 use crate::infra::storage::entity::{producer, producer_sequence};
 
-/// Attempts one publish gets at the chain transaction, the first included.
-/// A lost compare-and-set is answered by the retry (another writer committed,
-/// so the re-read head decides), so more than two attempts are only needed
-/// under sustained contention on one producer.
+/// Attempts one publish or batch gets at the chain transaction, the first
+/// included. A first head lost to a concurrent first insert is answered by
+/// the retry (that writer committed, so the re-read head decides); further
+/// attempts cover database contention - opposite-order batches deadlocking,
+/// `SQLite` busy - under sustained load on the same heads.
 const ATTEMPTS: u32 = 5;
+
+/// How the chain transaction ended without a database failure.
+pub(super) enum Enqueued {
+    /// Committed: one outcome per request, in request order, each `Accept` or
+    /// `DuplicateIgnore`, with the wake of every row enqueued, to fire now
+    /// that they are durable.
+    Committed {
+        outcomes: Vec<ProducerIdempotencyOutcome>,
+        wake: Wake,
+    },
+    /// A run broke its chain (feature 0001 §5.2 R4); the transaction rolled
+    /// back, so nothing is enqueued and no head moved. `index` is the request
+    /// position of the run's first event, `last_sequence` the committed head.
+    Violation {
+        index: usize,
+        producer_id: Uuid,
+        topic: GtsInstanceId,
+        last_sequence: i64,
+    },
+}
 
 /// Why one attempt at the chain transaction failed.
 #[derive(Debug, thiserror::Error)]
 enum AttemptError {
-    #[error("another writer moved the producer head between this attempt's read and its write")]
+    #[error("another writer wrote the producer head after this attempt read it")]
     HeadMoved,
+    /// Not a failure of the attempt: the error that makes the transaction
+    /// roll back what earlier requests of the batch wrote.
+    #[error("the run at event {index} does not link to the producer head at {last_sequence}")]
+    Violation {
+        index: usize,
+        producer_id: Uuid,
+        topic: GtsInstanceId,
+        last_sequence: i64,
+    },
     #[error(transparent)]
     Db(DbErr),
     #[error(transparent)]
@@ -88,38 +160,57 @@ impl From<OutboxError> for AttemptError {
 #[derive(Clone)]
 struct Attempt {
     backend: DbBackend,
-    request: PublishEnqueue,
+    requests: Vec<PublishEnqueue>,
     outbox: Arc<Outbox>,
     #[cfg(any(test, feature = "test-utils"))]
-    head_read_pause: crate::test_support::PausePoint,
+    pauses: ChainPauses,
 }
 
-/// Runs the chain transaction until it commits, retrying a lost
-/// compare-and-set and database contention up to [`ATTEMPTS`] times. Any
-/// failure that still ends the publish is logged with its cause and answered
-/// as an unavailable storage path.
+/// The two points where a test holds a chained publish inside its
+/// transaction: before its head reads (and before the write lock on
+/// `SQLite`), and after them, before anything is written.
+#[cfg(any(test, feature = "test-utils"))]
+#[derive(Clone)]
+pub(super) struct ChainPauses {
+    pub(super) before_head_read: crate::test_support::PausePoint,
+    pub(super) after_head_read: crate::test_support::PausePoint,
+}
+
+/// Runs the chain transaction over `requests` until it commits or a request
+/// breaks its chain, retrying a lost compare-and-set and database contention
+/// up to [`ATTEMPTS`] times. Any failure that still ends the publish is logged
+/// with its cause and answered as an unavailable storage path.
 pub(super) async fn check_and_enqueue(
     db: &Db,
     outbox: Arc<Outbox>,
-    request: PublishEnqueue,
-    #[cfg(any(test, feature = "test-utils"))] head_read_pause: crate::test_support::PausePoint,
-) -> Result<(ProducerIdempotencyOutcome, Wake), DomainError> {
+    requests: Vec<PublishEnqueue>,
+    #[cfg(any(test, feature = "test-utils"))] pauses: ChainPauses,
+) -> Result<Enqueued, DomainError> {
     let backend = db.backend();
     let attempt = Attempt {
         backend,
-        request,
+        requests,
         outbox,
         #[cfg(any(test, feature = "test-utils"))]
-        head_read_pause,
+        pauses,
     };
     let mut tries = 1;
     loop {
-        let this = attempt.clone();
-        let err = match db
-            .transaction_ref_mapped(move |tx| Box::pin(this.run(tx)))
-            .await
-        {
-            Ok(done) => return Ok(done),
+        let err = match attempt.clone().transact(db).await {
+            Ok((outcomes, wake)) => return Ok(Enqueued::Committed { outcomes, wake }),
+            Err(AttemptError::Violation {
+                index,
+                producer_id,
+                topic,
+                last_sequence,
+            }) => {
+                return Ok(Enqueued::Violation {
+                    index,
+                    producer_id,
+                    topic,
+                    last_sequence,
+                });
+            }
             Err(err) => err,
         };
         let retryable = match &err {
@@ -127,7 +218,9 @@ pub(super) async fn check_and_enqueue(
             AttemptError::Db(db_err) => {
                 toolkit_db::contention::is_retryable_contention(backend, db_err)
             }
-            AttemptError::Scope(_) | AttemptError::Other(_) => false,
+            AttemptError::Violation { .. } | AttemptError::Scope(_) | AttemptError::Other(_) => {
+                false
+            }
         };
         if retryable && tries < ATTEMPTS {
             tokio::time::sleep(retry_delay(tries)).await;
@@ -158,65 +251,152 @@ fn retry_delay(failed_tries: u32) -> Duration {
 }
 
 impl Attempt {
-    async fn run(self, tx: &DbTx<'_>) -> Result<(ProducerIdempotencyOutcome, Wake), AttemptError> {
-        let PublishEnqueue {
-            chain,
-            ingest_partition,
-            payload,
-            payload_type,
-        } = self.request;
-
-        let (outcome, head) = match &chain {
-            None => (ProducerIdempotencyOutcome::Accept, None),
-            Some(c) => {
-                let sqlite = self.backend == DbBackend::Sqlite;
-                // The test pause sits at the last point where another writer
-                // can still commit before this attempt writes: before the
-                // write lock on `SQLite`, after the head read elsewhere.
-                #[cfg(any(test, feature = "test-utils"))]
-                if sqlite {
-                    self.head_read_pause.pass().await;
-                }
-                if sqlite {
-                    take_write_lock(tx, c).await?;
-                }
-                let head = producer_sequence::Entity::find()
-                    .filter(producer_sequence::Column::ProducerId.eq(c.producer_id))
-                    .filter(producer_sequence::Column::Topic.eq(c.topic.as_ref()))
-                    .secure()
-                    .scope_with(&AccessScope::allow_all())
-                    .one(tx)
-                    .await?
-                    .map(|row| row.last_sequence);
-                #[cfg(any(test, feature = "test-utils"))]
-                if !sqlite {
-                    self.head_read_pause.pass().await;
-                }
-                // The domain owns the sequencing decision; infra only reads
-                // the head and performs the write it dictates.
-                (c.decide(head), head)
-            }
-        };
-        if !matches!(outcome, ProducerIdempotencyOutcome::Accept) {
-            return Ok((outcome, Wake::empty()));
+    /// One attempt as its own transaction, at read committed on `MySQL` (see
+    /// the module doc) and at the engine's default elsewhere.
+    async fn transact(
+        self,
+        db: &Db,
+    ) -> Result<(Vec<ProducerIdempotencyOutcome>, Wake), AttemptError> {
+        if self.backend == DbBackend::MySql {
+            let read_committed = TxConfig {
+                isolation: Some(TxIsolationLevel::ReadCommitted),
+                ..TxConfig::default()
+            };
+            db.transaction_ref_mapped_with_config(read_committed, move |tx| Box::pin(self.run(tx)))
+                .await
+        } else {
+            db.transaction_ref_mapped(move |tx| Box::pin(self.run(tx)))
+                .await
         }
-
-        let record = toolkit_db::outbox::Record::to(
-            crate::domain::outbox::INGEST_QUEUE_NAME,
-            ingest_partition,
-        )
-        .payload(payload, &payload_type)
-        .build()?;
-        let wake = self.outbox.enqueue(tx, record).await?;
-
-        if let Some(c) = &chain {
-            match head {
-                Some(read) => advance_head(tx, c, read).await?,
-                None => seed_head(tx, c).await?,
-            }
-        }
-        Ok((outcome, wake))
     }
+
+    async fn run(
+        self,
+        tx: &DbTx<'_>,
+    ) -> Result<(Vec<ProducerIdempotencyOutcome>, Wake), AttemptError> {
+        let Attempt {
+            backend,
+            requests,
+            outbox,
+            #[cfg(any(test, feature = "test-utils"))]
+            pauses,
+        } = self;
+        let runs = ChainRun::split(&requests);
+        if let Some(first) = runs.first() {
+            // The last point where another writer can still move a head this
+            // attempt reads: before the locking reads, and before the write
+            // lock on `SQLite`.
+            #[cfg(any(test, feature = "test-utils"))]
+            pauses.before_head_read.pass().await;
+            // `SQLite` takes its write lock once, before the first head read,
+            // with the first run's key; every later read then runs under it.
+            if backend == DbBackend::Sqlite {
+                take_write_lock(tx, first).await?;
+            }
+        }
+
+        // Feature 0001 §5.2 R4 / R5: each run against its committed head, the
+        // heads read in request order. The domain decides; infra reads the
+        // heads and performs the writes the decisions dictate.
+        let mut duplicate = vec![false; requests.len()];
+        let mut head_writes = Vec::with_capacity(runs.len());
+        for run in &runs {
+            let head = read_head(tx, run).await?;
+            let duplicates = match run.decide(head) {
+                RunDecision::Advance {
+                    duplicates,
+                    head: to,
+                } => {
+                    head_writes.push((run, head, to));
+                    duplicates
+                }
+                RunDecision::Duplicate => run.events.len(),
+                RunDecision::SequenceViolation { last_sequence } => {
+                    return Err(AttemptError::Violation {
+                        index: run.events.first().map_or(0, |event| event.index),
+                        producer_id: run.producer_id,
+                        topic: run.topic.clone(),
+                        last_sequence,
+                    });
+                }
+            };
+            for event in run.events.iter().take(duplicates) {
+                if let Some(slot) = duplicate.get_mut(event.index) {
+                    *slot = true;
+                }
+            }
+        }
+        // Every head is read and nothing is written yet: an absent head is
+        // still open to a concurrent first insert on `PostgreSQL` and `MySQL`,
+        // while on `SQLite` this attempt already holds the write lock.
+        #[cfg(any(test, feature = "test-utils"))]
+        if !runs.is_empty() {
+            pauses.after_head_read.pass().await;
+        }
+
+        // Every event that is not a duplicate is enqueued in request order, so
+        // events of one key drain in the order they were sent; a stateless
+        // event is never a duplicate.
+        let mut outcomes = Vec::with_capacity(requests.len());
+        let mut wake = Wake::empty();
+        for (request, duplicate) in requests.into_iter().zip(duplicate) {
+            if duplicate {
+                outcomes.push(ProducerIdempotencyOutcome::DuplicateIgnore);
+                continue;
+            }
+            match enqueue(tx, &outbox, request).await {
+                Ok(enqueued) => wake += enqueued,
+                Err(err) => {
+                    // The transaction rolls back, so its rows never commit.
+                    wake.discard();
+                    return Err(err);
+                }
+            }
+            outcomes.push(ProducerIdempotencyOutcome::Accept);
+        }
+
+        for (run, read, to) in head_writes {
+            let written = match read {
+                ChainHead::At(read) => advance_head(tx, run, read, to).await,
+                ChainHead::Absent => seed_head(tx, run, to).await,
+            };
+            if let Err(err) = written {
+                wake.discard();
+                return Err(err);
+            }
+        }
+        Ok((outcomes, wake))
+    }
+}
+
+/// The committed head of `run`'s chain. A locking read on `PostgreSQL` and
+/// `MySQL`, so no other writer moves the head before this transaction ends;
+/// `SQLite` renders no lock clause and is already under its write lock.
+async fn read_head(tx: &DbTx<'_>, run: &ChainRun) -> Result<ChainHead, AttemptError> {
+    let row = producer_sequence::Entity::find()
+        .filter(producer_sequence::Column::ProducerId.eq(run.producer_id))
+        .filter(producer_sequence::Column::Topic.eq(run.topic.as_ref()))
+        .secure()
+        .scope_with(&AccessScope::allow_all())
+        .lock_exclusive()
+        .one(tx)
+        .await?;
+    Ok(row.map_or(ChainHead::Absent, |row| ChainHead::At(row.last_sequence)))
+}
+
+/// One request's payload as one ingest outbox row.
+async fn enqueue(
+    tx: &DbTx<'_>,
+    outbox: &Outbox,
+    request: PublishEnqueue,
+) -> Result<Wake, AttemptError> {
+    let record = toolkit_db::outbox::Record::to(
+        crate::domain::outbox::INGEST_QUEUE_NAME,
+        request.ingest_partition,
+    )
+    .payload(request.payload, &request.payload_type)
+    .build()?;
+    Ok(outbox.enqueue(tx, record).await?)
 }
 
 /// Makes `SQLite` take its database write lock before the head read. `SQLite`
@@ -226,14 +406,14 @@ impl Attempt {
 /// exhausts any retry budget. Writing first makes the transaction wait its
 /// turn (`busy_timeout`) instead, and read a head nobody else can move. The
 /// statement changes nothing: it rewrites the head, if any, to itself.
-async fn take_write_lock(tx: &DbTx<'_>, chain: &ProducerChainCheck) -> Result<(), AttemptError> {
+async fn take_write_lock(tx: &DbTx<'_>, run: &ChainRun) -> Result<(), AttemptError> {
     producer_sequence::Entity::update_many()
         .secure()
         .scope_with(&AccessScope::allow_all())
         .filter(
             Condition::all()
-                .add(producer_sequence::Column::ProducerId.eq(chain.producer_id))
-                .add(producer_sequence::Column::Topic.eq(chain.topic.as_ref())),
+                .add(producer_sequence::Column::ProducerId.eq(run.producer_id))
+                .add(producer_sequence::Column::Topic.eq(run.topic.as_ref())),
         )
         .col_expr(
             producer_sequence::Column::LastSequence,
@@ -244,26 +424,23 @@ async fn take_write_lock(tx: &DbTx<'_>, chain: &ProducerChainCheck) -> Result<()
     Ok(())
 }
 
-/// Moves the head from `read` to the accepted sequence, only if it is still
-/// `read`.
+/// Moves `run`'s head from `read` to `to`, only if it is still `read`.
 async fn advance_head(
     tx: &DbTx<'_>,
-    chain: &ProducerChainCheck,
+    run: &ChainRun,
     read: i64,
+    to: i64,
 ) -> Result<(), AttemptError> {
     let moved = producer_sequence::Entity::update_many()
         .secure()
         .scope_with(&AccessScope::allow_all())
         .filter(
             Condition::all()
-                .add(producer_sequence::Column::ProducerId.eq(chain.producer_id))
-                .add(producer_sequence::Column::Topic.eq(chain.topic.as_ref()))
+                .add(producer_sequence::Column::ProducerId.eq(run.producer_id))
+                .add(producer_sequence::Column::Topic.eq(run.topic.as_ref()))
                 .add(producer_sequence::Column::LastSequence.eq(read)),
         )
-        .col_expr(
-            producer_sequence::Column::LastSequence,
-            Expr::value(chain.sequence),
-        )
+        .col_expr(producer_sequence::Column::LastSequence, Expr::value(to))
         .col_expr(
             producer_sequence::Column::UpdatedAt,
             Expr::value(Utc::now()),
@@ -277,13 +454,13 @@ async fn advance_head(
     }
 }
 
-/// Writes the first head for the producer on this topic, unless a concurrent
-/// first publish wrote it first.
-async fn seed_head(tx: &DbTx<'_>, chain: &ProducerChainCheck) -> Result<(), AttemptError> {
-    // The tenant is denormalized from the producer row, which also guards the
-    // foreign key: a producer deleted after the ingest path resolved it is
-    // reported by name rather than as a constraint failure.
-    let producer_row = producer::Entity::find_by_id(chain.producer_id)
+/// Writes `run`'s first head at `to`, unless a concurrent first publish wrote
+/// it first.
+async fn seed_head(tx: &DbTx<'_>, run: &ChainRun, to: i64) -> Result<(), AttemptError> {
+    // The tenant is denormalized from the producer row. A producer deleted
+    // after the ingest path resolved it fails the write without a retry: the
+    // publish answers `503`, and the logged cause names the producer.
+    let producer_row = producer::Entity::find_by_id(run.producer_id)
         .secure()
         .scope_with(&AccessScope::allow_all())
         .one(tx)
@@ -291,14 +468,14 @@ async fn seed_head(tx: &DbTx<'_>, chain: &ProducerChainCheck) -> Result<(), Atte
         .ok_or_else(|| {
             AttemptError::Other(DbError::Other(anyhow::anyhow!(
                 "producer '{}' is not registered",
-                chain.producer_id
+                run.producer_id
             )))
         })?;
     let am = producer_sequence::ActiveModel {
-        producer_id: Set(chain.producer_id),
-        topic: Set(chain.topic.as_ref().to_owned()),
+        producer_id: Set(run.producer_id),
+        topic: Set(run.topic.as_ref().to_owned()),
         tenant_id: Set(producer_row.tenant_id),
-        last_sequence: Set(chain.sequence),
+        last_sequence: Set(to),
         updated_at: Set(Utc::now()),
     };
     match secure_insert::<producer_sequence::Entity>(

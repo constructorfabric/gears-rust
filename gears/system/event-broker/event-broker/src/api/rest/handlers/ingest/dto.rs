@@ -11,7 +11,8 @@ use serde_json::Value as JsonValue;
 use uuid::Uuid;
 
 use crate::domain::error::DomainError;
-use crate::domain::ingest::{ProducerCursors, ProducerMode, ProducerResetSelector, PublishRequest};
+use crate::domain::ingest::{ProducerCursors, ProducerMode, PublishRequest};
+use crate::domain::producer_reset::ProducerResetSelector;
 use event_broker_sdk::models::EventType;
 
 use crate::domain::model::{Meta, Sequence, Topic, TopicSegmentManifest};

@@ -98,6 +98,31 @@ No compile-time field checking — validation happens at `types-registry::switch
 
 Some base types (e.g. `PluginV1<P>`) are generic over a derived-spec `P: GtsSchema`. Spell such instances with turbofish — `PluginV1::<DerivedSpec> { …, properties: DerivedSpec }`. The derived spec is declared with `#[gts_macros::struct_to_gts_schema(base = PluginV1, ...)]` in the owning gear and, when its `properties` depend on config, registered with `types-registry` at gear `init()` (in-process: it already has a reference to itself; OoP: via an SDK-level publish helper).
 
+## Crate-local collectors (publishing your own declarations)
+
+A gear that publishes its declarations to a remote `types-registry` needs to know which are
+its own. Such a crate opts in, without changing any other crate:
+
+```rust
+// lib.rs
+toolkit_gts::declare_gts_inventory!();
+
+// anywhere in the crate: the same input as the crate-root macros
+#[toolkit_gts::local::gts_type_schema(/* ... */)]
+pub struct MySpecV1;
+toolkit_gts::local::gts_instance_raw!({ "id": "...", /* ... */ });
+```
+
+The `local` macros submit each declaration to the crate's own collector and to the
+process-wide inventory, so an embedded registry still seeds it. The crate then exports
+`gts_declarations() -> Vec<(String, String)>` — `(GTS id, JSON text)`, std types only. A gear
+merges its crates' declarations with `toolkit_gts::local::merge_declarations`, which sorts them,
+keeps one of canonically equal duplicates (`same_canonical_content`: key order aside, number
+spelling kept, so `-0.0` ≠ `0.0`) and reports every conflicting id with both origins. The
+crate-root macros keep their process-wide-only behaviour; crates that do not opt in need no
+change. A `local` macro without the declaration fails to compile ("could not find
+`__toolkit_gts_inventory` in the crate root").
+
 ## Boundary with `types-registry`
 
 - `types-registry` is a **content-agnostic** aggregator. It calls `all_inventory_type_schemas()` / `all_inventory_instances()` and registers whatever it finds. It never names specific types, so adding a new GTS Type requires zero edits in `types-registry`.

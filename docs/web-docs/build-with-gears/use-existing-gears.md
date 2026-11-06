@@ -10,7 +10,7 @@ Before writing your own gear, compose the ones that already ship. A Gears applic
 
 ## Pick the gears you need
 
-- **System gears** provide the control plane — API gateway, authn/authz, tenancy, type registry. Most applications include these. See [System gears](../../capabilities/system-gears/).
+- **Core gears** provide the control plane — API gateway, authn/authz, tenancy, type registry. Most applications include these. See [Core gears](../../capabilities/core-gears/).
 - **Reusable service gears** provide business capabilities you can drop in — file parsing, credentials, chat, settings. See [Reusable service gears](../../capabilities/service-gears/).
 
 ## Add a gear to your application

@@ -1,18 +1,10 @@
-//! The policy-engine gear: wiring and readiness.
+//! Policy-engine wiring and readiness.
 //!
-//! `init` validates the configuration, resolves the types-registry,
-//! tenant-resolver and authz-resolver clients, validates and compiles the
-//! built-in policies (any finding fails startup), builds the decision and
-//! management services, registers `dyn PolicyManagementClientV1` in
-//! `ClientHub`, registers the admission engine plugin in the types registry
-//! and scopes `dyn AdmissionEnginePluginClientV1` to its instance id.
-//!
-//! The types registry answers type lookups only once it is ready, after
-//! every `init`: `init` validates the built-ins in everything but whether
-//! their concrete resource types are known, and `post_init` (system
-//! capability, after the registry's own) completes that check, failing
-//! startup on a finding. Nothing is served before `post_init`. The gear runs
-//! no background tasks; it is ready once initialised.
+//! `init` validates configuration, compiles built-ins, builds services and
+//! registers the management client and scoped admission plugin. Resource-type
+//! validation waits for `post_init`, after legacy registry finalization.
+//! Any validation finding fails startup. No background tasks run; the gear
+//! is ready after `post_init`.
 
 use std::sync::{Arc, OnceLock};
 
@@ -25,7 +17,7 @@ use sea_orm_migration::MigratorTrait;
 use tenant_resolver_sdk::TenantResolverClient;
 use toolkit::api::OpenApiRegistry;
 use toolkit::client_hub::ClientScope;
-use toolkit::contracts::{DatabaseCapability, SystemCapability};
+use toolkit::contracts::DatabaseCapability;
 use toolkit::{ClientHub, Gear, GearCtx, Healthcheck, HealthcheckResult, RestApiCapability};
 use toolkit_db::Db;
 use toolkit_db::odata::LimitCfg;
@@ -67,7 +59,7 @@ struct Wired {
 #[toolkit::gear(
     name = "policy-engine",
     deps = [types_registry, tenant_resolver, authz_resolver],
-    capabilities = [system, db, rest]
+    capabilities = [db, rest]
 )]
 #[derive(Default)]
 pub struct PolicyEngine {
@@ -129,6 +121,28 @@ impl Gear for PolicyEngine {
         );
         Ok(())
     }
+
+    /// Completes the built-ins' validation with the types registry, after
+    /// the runtime finalized every application gear's legacy registration.
+    async fn post_init(&self, _ctx: &GearCtx) -> anyhow::Result<()> {
+        let wired = self
+            .wired
+            .get()
+            .ok_or_else(|| anyhow::anyhow!("{}: not initialised", Self::MODULE_NAME))?;
+        if wired.builtins.is_empty() {
+            return Ok(());
+        }
+        let findings = wired
+            .validator
+            .validate(&wired.builtins)
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "policy-engine: built-in policies rejected: types registry could not be consulted: {e}"
+                )
+            })?;
+        reject_findings(&findings).context("policy-engine: built-in policies rejected")
+    }
 }
 
 struct Clients {
@@ -156,32 +170,6 @@ impl Clients {
             tenant_resolver,
             authz,
         })
-    }
-}
-
-#[async_trait]
-impl SystemCapability for PolicyEngine {
-    /// Completes the built-ins' validation with the types registry, which
-    /// answers type lookups once its own `post_init` has run (it is a
-    /// dependency, so it runs first).
-    async fn post_init(&self, _sys: &toolkit::runtime::SystemContext) -> anyhow::Result<()> {
-        let wired = self
-            .wired
-            .get()
-            .ok_or_else(|| anyhow::anyhow!("{}: not initialised", Self::MODULE_NAME))?;
-        if wired.builtins.is_empty() {
-            return Ok(());
-        }
-        let findings = wired
-            .validator
-            .validate(&wired.builtins)
-            .await
-            .map_err(|e| {
-                anyhow::anyhow!(
-                    "policy-engine: built-in policies rejected: types registry could not be consulted: {e}"
-                )
-            })?;
-        reject_findings(&findings).context("policy-engine: built-in policies rejected")
     }
 }
 

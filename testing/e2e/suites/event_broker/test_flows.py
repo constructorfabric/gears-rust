@@ -29,7 +29,7 @@ async def test_publish_subscribe_consume_full_flow(api, test_env):
     tenant_id = str(uuid.uuid4())
     occurred_at = datetime.now(timezone.utc).isoformat()
 
-    # Step 1 — Publish 3 events BEFORE the consumer JOINs.
+    # Step 1 - Publish 3 events BEFORE the consumer JOINs.
     event_ids = [str(uuid.uuid4()) for _ in range(3)]
     async with api() as pub_client:
         for eid in event_ids:
@@ -47,7 +47,7 @@ async def test_publish_subscribe_consume_full_flow(api, test_env):
             )
             assert pub_resp.status_code == 202
 
-    # Step 2 — Consumer creates a group, JOINs, SEEKs to earliest.
+    # Step 2 - Consumer creates a group, JOINs, SEEKs to earliest.
     async with api() as client:
         group_resp = await client.post("/consumer-groups")
         assert group_resp.status_code == 201
@@ -78,7 +78,7 @@ async def test_publish_subscribe_consume_full_flow(api, test_env):
         )
         assert seek_resp.status_code == 200
 
-    # Step 3 — Stream and receive all 3 events.
+    # Step 3 - Stream and receive all 3 events.
     received_ids = []
     async with httpx.AsyncClient(
         base_url=f"{test_env.base_url}/event-broker/v1", timeout=None

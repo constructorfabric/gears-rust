@@ -670,6 +670,192 @@ async fn a_deleted_edge_is_revived_by_the_next_upsert() {
     .await;
 }
 
+/// One edge between `edge-a` and `edge-b` on a fresh tenant, and its key.
+async fn one_edge(stand: &Stand) -> (Uuid, String) {
+    let tenant = tenant_on(stand).await;
+    let scope = AccessScope::for_tenant(tenant);
+    let ctx = conformance::ctx(tenant, &scope, None);
+    stand
+        .store
+        .register_types(&ctx, conformance::ontology_batch())
+        .await
+        .expect("the ontology registers");
+    conformance::ingest_batch(
+        stand.store.as_ref(),
+        &ctx,
+        conformance::batch(
+            vec![
+                conformance::node("edge-a", "a"),
+                conformance::node("edge-b", "b"),
+            ],
+            vec![conformance::edge("edge-a", "edge-b")],
+        ),
+    )
+    .await
+    .expect("the edge is created");
+    let key = stand
+        .store
+        .get_node(&ctx, &"edge-a".to_owned(), 10)
+        .await
+        .expect("the endpoint reads")
+        .adjacency
+        .first()
+        .expect("the edge is adjacent")
+        .edge_key
+        .clone();
+    (tenant, key)
+}
+
+/// A key no edge ever held is absent, not a no-op: only a tombstone under
+/// the key proves the delete already happened.
+#[tokio::test]
+async fn deleting_an_edge_key_nobody_holds_is_not_found() {
+    let Some(stand) = stand().await else {
+        return;
+    };
+    let tenant = tenant_on(&stand).await;
+    let scope = AccessScope::for_tenant(tenant);
+    let ctx = conformance::ctx(tenant, &scope, None);
+    let refused = stand
+        .store
+        .soft_delete(
+            &ctx,
+            graph_storage_sdk::models::DeleteRequest::Edge("no-such-edge".to_owned()),
+        )
+        .await;
+    assert!(
+        matches!(
+            refused,
+            Err(graph_storage_sdk::plugin_api::GraphStoreError::NotFound)
+        ),
+        "an edge that never existed reads as absent, got {refused:?}"
+    );
+}
+
+/// The edge half of the lost compare-and-set, made deterministic.
+///
+/// The race test above opens the window only now and then, so the arm that
+/// settles a delete whose `deleted_at IS NULL` write found the row already
+/// tombstoned went unrun. Here a plain transaction tombstones the row and
+/// holds its lock: the delete reads the edge live, blocks on the write, and
+/// sees zero rows affected once the holder commits. That delete happened
+/// already, so the answer is the no-op, not a conflict and not absence.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_edge_delete_that_loses_its_write_to_another_delete_is_a_no_op() {
+    use sea_orm::{ConnectionTrait as _, TransactionTrait as _};
+    let Some(stand) = stand().await else {
+        return;
+    };
+    let (tenant, key) = one_edge(&stand).await;
+
+    let raw = sea_orm::Database::connect(&stand.dsn)
+        .await
+        .expect("a plain connection to hold the row");
+    let holder = raw.begin().await.expect("the holder begins");
+    holder
+        .execute_unprepared(&format!(
+            "UPDATE edge SET deleted_at = now() WHERE edge_key = '{key}'"
+        ))
+        .await
+        .expect("the holder tombstones the row and keeps its lock");
+
+    let deleter = {
+        let store = Arc::clone(&stand.store);
+        let key = key.clone();
+        tokio::spawn(async move {
+            let scope = AccessScope::for_tenant(tenant);
+            let ctx = conformance::ctx(tenant, &scope, None);
+            store
+                .soft_delete(&ctx, graph_storage_sdk::models::DeleteRequest::Edge(key))
+                .await
+        })
+    };
+
+    // Commit only once the delete waits on the row, or it would read the
+    // tombstone and take the arm that is already covered.
+    let waiting = sea_orm::Statement::from_string(
+        sea_orm::DatabaseBackend::Postgres,
+        "SELECT count(*)::bigint AS n FROM pg_stat_activity \
+         WHERE wait_event_type = 'Lock' AND datname = current_database()"
+            .to_owned(),
+    );
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let row = raw
+            .query_one_raw(waiting.clone())
+            .await
+            .expect("the activity view reads")
+            .expect("a count is one row");
+        if row.try_get::<i64>("", "n").expect("the count is a number") > 0 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the delete never blocked on the held row"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    holder.commit().await.expect("the holder commits");
+
+    let outcome = deleter
+        .await
+        .expect("the deleter task does not panic")
+        .expect("a delete that lost to another delete is a no-op, not a refusal");
+    assert_eq!(
+        (outcome.tombstoned_nodes, outcome.tombstoned_edges),
+        (0, 0),
+        "the delete reports no write it did not make"
+    );
+}
+
+/// An endpoint hidden while its edge stays live leaves the edge to the
+/// edge read's answer: absent. Tombstoning the node by hand, without its
+/// edges, is the shape a scope the caller does not hold also takes, and
+/// the delete must neither tombstone the edge nor call it already gone.
+#[tokio::test]
+async fn an_edge_whose_endpoint_is_hidden_is_not_found_and_stays_live() {
+    use sea_orm::ConnectionTrait as _;
+    let Some(stand) = stand().await else {
+        return;
+    };
+    let (tenant, key) = one_edge(&stand).await;
+    let raw = sea_orm::Database::connect(&stand.dsn)
+        .await
+        .expect("a plain connection to hide the endpoint");
+    raw.execute_unprepared("UPDATE node SET deleted_at = now() WHERE node_key = 'edge-b'")
+        .await
+        .expect("the endpoint is tombstoned alone");
+
+    let scope = AccessScope::for_tenant(tenant);
+    let ctx = conformance::ctx(tenant, &scope, None);
+    let refused = stand
+        .store
+        .soft_delete(
+            &ctx,
+            graph_storage_sdk::models::DeleteRequest::Edge(key.clone()),
+        )
+        .await;
+    assert!(
+        matches!(
+            refused,
+            Err(graph_storage_sdk::plugin_api::GraphStoreError::NotFound)
+        ),
+        "a live edge behind a hidden endpoint reads as absent, got {refused:?}"
+    );
+    let live = raw
+        .query_one_raw(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            format!("SELECT (deleted_at IS NULL) AS live FROM edge WHERE edge_key = '{key}'"),
+        ))
+        .await
+        .expect("the edge reads")
+        .expect("the edge row is there");
+    assert!(
+        live.try_get::<bool>("", "live").expect("a flag"),
+        "the refused delete left the edge as it was"
+    );
+}
+
 /// Written out rather than `pg_case!`d, for the same reason as the scope
 /// race: the two ingests are spawned as separate tasks and need a runtime
 /// with threads to put them on.

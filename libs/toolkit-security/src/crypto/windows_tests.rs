@@ -1,6 +1,6 @@
 //! Execute CNG primitives even on CI hosts without Windows FIPS policy.
 //! Internal injection does not change the production provider/witness gate.
-use super::{CryptoError, backend, ecdsa, hash, initialize, mac, rng, rsa};
+use super::{CryptoError, aead, backend, ecdsa, hash, initialize, mac, rng, rsa};
 use aws_lc_rs::signature::{self, KeyPair};
 use pkcs1::der::Decode;
 
@@ -18,6 +18,11 @@ fn native_cng_operations() {
             Some(CryptoError::FipsUnavailable)
         );
     }
+    // No CNG AEAD route exists; the facade says so before any witness check.
+    assert_eq!(
+        aead::Aes256Gcm::new(&[0; aead::KEY_LEN]).err(),
+        Some(CryptoError::UnsupportedAlgorithm)
+    );
     let provider = rustls_cng_crypto::custom_provider(
         rustls_cng_crypto::ALL_CIPHER_SUITES.to_vec(),
         rustls_cng_crypto::ALL_KX_GROUPS.to_vec(),

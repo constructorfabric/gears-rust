@@ -3,7 +3,7 @@ use gts::GtsTypeId;
 use uuid::Uuid;
 
 use crate::error::EventBrokerError;
-use crate::models::{Event, ProducerMeta};
+use crate::models::Event;
 use crate::typed_event::TypedEvent;
 
 use super::schema_cache::ProducerSchemaCache;
@@ -25,7 +25,6 @@ pub(crate) async fn prepare_event<E: TypedEvent>(
     identity: &ProducerIdentity,
     ctx: &toolkit_security::SecurityContext,
     event: E,
-    meta_for_topic: impl FnOnce(&str) -> Option<ProducerMeta>,
 ) -> Result<PreparedEvent, EventBrokerError> {
     let type_id = E::TYPE_ID;
     let subject = event.subject();
@@ -39,7 +38,7 @@ pub(crate) async fn prepare_event<E: TypedEvent>(
     let topic = cache.prepared_topic(type_id).await?;
     let pointer = cache.prepared_partition_key(type_id).await?;
 
-    let mut prepared = Event {
+    let prepared = Event {
         id: Uuid::now_v7(),
         type_id: GtsTypeId::new(type_id),
         tenant_id,
@@ -57,7 +56,6 @@ pub(crate) async fn prepare_event<E: TypedEvent>(
 
     cache.ensure_topic(&topic).await?;
     let key = prepared.partition_input(&pointer)?;
-    prepared.meta = meta_for_topic(&topic);
 
     Ok(PreparedEvent {
         topic,

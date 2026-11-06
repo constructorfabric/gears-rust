@@ -44,11 +44,15 @@ mod shared;
 mod startup;
 
 #[cfg(test)]
+mod append_tests;
+#[cfg(test)]
 mod body_tests;
 #[cfg(test)]
 mod error_tests;
 #[cfg(test)]
 mod names_tests;
+#[cfg(test)]
+mod notify_tests;
 #[cfg(test)]
 mod segment_tests;
 #[cfg(test)]

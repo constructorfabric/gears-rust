@@ -3,12 +3,12 @@
 These tests exercise multi-step journeys that don't fit neatly in a single
 scenario domain:
 
-- 1.01: Two-consumer rebalance — both consumers stream concurrently and each
+- 1.01: Two-consumer rebalance - both consumers stream concurrently and each
   receives events from its assigned partitions.
-- 1.02: PositionsNotSet recovery — SDK-style re-SEEK loop after a 409.
-- 1.03: Path-A consumer with persistent offset store — reconnect from exact
+- 1.02: PositionsNotSet recovery - SDK-style re-SEEK loop after a 409.
+- 1.03: Path-A consumer with persistent offset store - reconnect from exact
   last-processed offset.
-- 1.04: Leave triggers gain+terminate — leaving member's partition is gained
+- 1.04: Leave triggers gain+terminate - leaving member's partition is gained
   by surviving member; the leaving member's stream terminates.
 """
 
@@ -54,7 +54,7 @@ async def test_two_consumer_rebalance(api, test_env):
         assert group_resp.status_code == 201
         group_id = group_resp.json()["id"]
 
-        # Consumer A JOINs first — gets all 4 partitions.
+        # Consumer A JOINs first - gets all 4 partitions.
         sub_a_resp = await client.post(
             "/subscriptions",
             json={
@@ -84,7 +84,7 @@ async def test_two_consumer_rebalance(api, test_env):
             kind, _ = await reader_a.next_frame(timeout=5)
             assert kind == "topology"
 
-            # Consumer B JOINs — triggers rebalance.
+            # Consumer B JOINs - triggers rebalance.
             async with api() as client_b:
                 sub_b_resp = await client_b.post(
                     "/subscriptions",
@@ -173,7 +173,7 @@ async def test_positions_not_set_recovery(api):
         )
         assert seek_resp.status_code == 200
 
-        # Step 3: stream now succeeds — open it, check the status, close it.
+        # Step 3: stream now succeeds - open it, check the status, close it.
         async with client.stream(
             "GET",
             f"/events:stream?subscription_id={sub_id}",
@@ -302,8 +302,8 @@ async def test_gain_and_terminate(api, test_env, disconnect):
     """scenario: consumer/flows/1.04-flow-leave-triggers-gain-terminate.md
 
     With two members in a TOPIC_4P group, A holds 2 partitions and B holds 2.
-    When B departs — either via DELETE (delete variant) or by dropping its SSE
-    connection (disconnect variant) — A gains the freed partitions and receives a
+    When B departs - either via DELETE (delete variant) or by dropping its SSE
+    connection (disconnect variant) - A gains the freed partitions and receives a
     control/terminal frame.  The disconnect variant uses session_timeout=PT2S so
     the server's grace-period timer fires quickly.
     """
@@ -368,7 +368,7 @@ async def test_gain_and_terminate(api, test_env, disconnect):
                         reader_b = SseFrameReader(resp_b)
                         kind, _ = await reader_b.next_frame(timeout=5)
                         assert kind == "topology"
-                    # B's connection closes here — server starts the session_timeout timer.
+                    # B's connection closes here - server starts the session_timeout timer.
             else:
                 async with api() as del_client:
                     del_resp = await del_client.delete(f"/subscriptions/{sub_b_id}")

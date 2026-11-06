@@ -1,10 +1,10 @@
 //! Keeps the specification cache following what `types-registry` holds.
 //!
-//! `types-registry` commits configuration-seeded entities once, during the
-//! platform's `post_init`, and offers no change feed, so the broker re-reads on
-//! a cadence instead: a topic or an event type registered after startup becomes
-//! resolvable at the next pass, without a restart. Watching for change events,
-//! and later a registration-time hook, are the two stages after this one.
+//! `types-registry` offers no change feed, so the broker re-reads on a cadence
+//! instead: a topic or an event type admitted into the registry's database
+//! after startup becomes resolvable at the next pass, without a restart.
+//! Watching for change events, and later a registration-time hook, are the two
+//! stages after this one.
 //!
 //! Driven rather than self-scheduling: the caller decides the cadence and one
 //! pass does one load, so a test forces passes instead of sleeping and hoping a
@@ -19,7 +19,7 @@ use std::time::Duration;
 
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use types_registry_sdk::TypesRegistryClient;
+use types_registry_sdk::PlatformTypesRegistryApi;
 
 use crate::config::EventBrokerConfig;
 use crate::domain::backend::BackendResolver;
@@ -29,8 +29,26 @@ use crate::domain::specification::{ProvisioningLimits, SpecificationManager};
 /// `run` (doubled up to the tick); the cap on `settle_provisioning`'s backoff.
 const PROVISIONING_RETRY_FIRST: Duration = Duration::from_secs(1);
 
+/// First retry delay of [`SpecificationRefreshWorker::settle_provisioning`]:
+/// short, so a backend that is still starting is picked up soon after it is up.
+const STARTUP_RETRY_FIRST: Duration = Duration::from_millis(250);
+
+/// How [`SpecificationRefreshWorker::settle_provisioning`] ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProvisioningWait {
+    /// The retries ended with no pass in flight: every registered topic is
+    /// provisioned (`unprovisioned` is 0), or the bound left no room for
+    /// another retry with `unprovisioned` topics still not provisioned.
+    Settled { unprovisioned: usize },
+    /// The bound passed while a pass was in flight; that pass was abandoned,
+    /// so how many topics are left unprovisioned is not known.
+    Cut,
+    /// The stop fired first; the wait was abandoned.
+    Stopped,
+}
+
 pub struct SpecificationRefreshWorker {
-    client: Arc<dyn TypesRegistryClient>,
+    client: Arc<dyn PlatformTypesRegistryApi>,
     db: Arc<toolkit_db::DBProvider<toolkit_db::DbError>>,
     config: EventBrokerConfig,
     tick: Duration,
@@ -48,7 +66,7 @@ impl SpecificationRefreshWorker {
     /// database handle, the configuration resolution folds in, and a cadence.
     #[must_use]
     pub fn new(
-        client: Arc<dyn TypesRegistryClient>,
+        client: Arc<dyn PlatformTypesRegistryApi>,
         db: Arc<toolkit_db::DBProvider<toolkit_db::DbError>>,
         config: EventBrokerConfig,
         tick: Duration,
@@ -79,40 +97,51 @@ impl SpecificationRefreshWorker {
         self
     }
 
-    /// One pass: re-read, re-project, re-resolve, upsert, then provision.
-    ///
-    /// A failure is logged and left for the next pass. The cache still holds
-    /// what the previous pass found, which is a better answer than none.
+    /// One pass: [`Self::load_once`], then a provisioning pass.
     ///
     /// Returns how many registered topics are left unprovisioned (always 0
     /// without provisioning).
     pub async fn run_once(&self) -> usize {
+        self.load_once().await;
+        self.provision_once().await
+    }
+
+    /// Re-reads the registry, re-projects, re-resolves and upserts, without
+    /// provisioning.
+    ///
+    /// A failure is logged and left for the next pass. The cache still holds
+    /// what the previous pass found, which is a better answer than none.
+    pub async fn load_once(&self) {
         if let Err(err) =
             crate::infra::specification::bulk_load(&self.client, &self.db, &self.config).await
         {
             tracing::warn!(%err, "specification refresh failed; the cache still holds the last load");
         }
-        self.provision_once().await
     }
 
     /// Retries provisioning on the short backoff until every registered topic
-    /// is provisioned or `within` has passed; the number left unprovisioned,
-    /// or `None` when `stop` fired first.
+    /// is provisioned, `within` has passed or `stop` fires, whichever comes
+    /// first.
     ///
     /// For the start phase: a backend that is still starting gets its topics
     /// provisioned before the instance takes traffic, while one that is down
-    /// delays the start by `within` at most and never fails it. A stop ends the
-    /// wait at once, so a process stopped right after launch exits promptly;
-    /// abandoning a pass midway is safe, since a provisioning attempt left
-    /// unfinished is taken over once its attempt timeout passes.
+    /// delays the start by `within` at most and never fails it. `within` is a
+    /// hard bound: a pass still in flight when it passes, the first one
+    /// included, is abandoned rather than awaited, so a backend that never
+    /// answers costs `within` and not a call timeout per topic. A stop ends the
+    /// wait at once, so a process stopped right after launch exits promptly.
+    /// Abandoning a pass midway is safe: a provisioning attempt left
+    /// unfinished is taken over once its attempt timeout passes, and a
+    /// re-provision abandoned midway leaves its record unconfirmed, so the next
+    /// pass calls again (feature 0006 §4.1).
     pub async fn settle_provisioning(
         &self,
         within: Duration,
         stop: &CancellationToken,
-    ) -> Option<usize> {
+    ) -> ProvisioningWait {
         let settle = async {
             let deadline = tokio::time::Instant::now() + within;
-            let mut backoff = PROVISIONING_RETRY_FIRST.min(Duration::from_millis(250));
+            let mut backoff = STARTUP_RETRY_FIRST;
             let mut pending = self.provision_once().await;
             while pending > 0 && tokio::time::Instant::now() + backoff < deadline {
                 tokio::time::sleep(backoff).await;
@@ -122,8 +151,10 @@ impl SpecificationRefreshWorker {
             pending
         };
         tokio::select! {
-            pending = settle => Some(pending),
-            () = stop.cancelled() => None,
+            biased;
+            () = stop.cancelled() => ProvisioningWait::Stopped,
+            unprovisioned = settle => ProvisioningWait::Settled { unprovisioned },
+            () = tokio::time::sleep(within) => ProvisioningWait::Cut,
         }
     }
 
@@ -144,15 +175,23 @@ impl SpecificationRefreshWorker {
     /// tick first.
     ///
     /// The initial load is the caller's: nothing may serve a request against an
-    /// empty cache, so `serve()` awaits one pass before anything is wired and
+    /// empty cache, so `serve()` awaits one load before anything is wired and
     /// this loop picks up from the next tick. Passing straight away here would
     /// re-read what was just read.
+    ///
+    /// Every pass is raced against `shutdown`, so a stop never waits out a
+    /// pass against an unreachable registry or backend. A provisioning attempt
+    /// abandoned midway is taken over once its attempt timeout passes, and a
+    /// re-provision abandoned midway leaves its record unconfirmed, so the next
+    /// pass calls again (feature 0006 §4.1).
     pub async fn run(self, shutdown: CancellationToken) {
         // A topic not provisioned by a pass - its backend not started yet, or
         // answering `Pending` - is retried on a short backoff rather than at
         // the next refresh (feature 0006 §4.1); the registry is still re-read
         // once per tick.
-        let mut pending = self.provision_once().await;
+        let Some(mut pending) = race_shutdown(&shutdown, self.provision_once()).await else {
+            return;
+        };
         let mut backoff = PROVISIONING_RETRY_FIRST;
         let mut next_refresh = tokio::time::Instant::now() + self.tick;
         loop {
@@ -161,19 +200,24 @@ impl SpecificationRefreshWorker {
             } else {
                 next_refresh
             };
-            tokio::select! {
-                () = tokio::time::sleep_until(wake) => {}
-                () = shutdown.cancelled() => return,
-            }
-            if shutdown.is_cancelled() {
+            if race_shutdown(&shutdown, tokio::time::sleep_until(wake))
+                .await
+                .is_none()
+            {
                 return;
             }
             if tokio::time::Instant::now() >= next_refresh {
-                pending = self.run_once().await;
+                let Some(left) = race_shutdown(&shutdown, self.run_once()).await else {
+                    return;
+                };
+                pending = left;
                 next_refresh = tokio::time::Instant::now() + self.tick;
                 backoff = PROVISIONING_RETRY_FIRST;
             } else {
-                pending = self.provision_once().await;
+                let Some(left) = race_shutdown(&shutdown, self.provision_once()).await else {
+                    return;
+                };
+                pending = left;
                 backoff = (backoff * 2).min(self.tick);
             }
         }
@@ -184,6 +228,20 @@ impl SpecificationRefreshWorker {
     #[must_use]
     pub fn spawn(self, shutdown: CancellationToken) -> JoinHandle<()> {
         tokio::spawn(self.run(shutdown))
+    }
+}
+
+/// Runs `pass` to its end, or abandons it when `shutdown` fires first; `None`
+/// when abandoned. A shutdown that has already fired wins over a pass that is
+/// ready too, so nothing new completes after a stop.
+async fn race_shutdown<T>(
+    shutdown: &CancellationToken,
+    pass: impl Future<Output = T>,
+) -> Option<T> {
+    tokio::select! {
+        biased;
+        () = shutdown.cancelled() => None,
+        done = pass => Some(done),
     }
 }
 

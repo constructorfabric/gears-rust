@@ -216,3 +216,56 @@ fn crypto_backend_failures_remain_operational_errors() {
         ));
     }
 }
+
+#[test]
+fn encode_signs_es256_tokens_that_both_decoders_accept() {
+    use crate::crypto::signature::EcdsaP256KeyPair;
+    let key = EcdsaP256KeyPair::generate().unwrap();
+    let mut header = Header::new(Algorithm::ES256);
+    header.kid = Some("key-1".to_owned());
+    let expected = claims();
+    let token = super::encode(&header, &expected, &key).unwrap();
+    let decoding = DecodingKey::from_ec_der(key.public_key());
+    let facade = decode::<Value>(&token, &decoding, &policy(Algorithm::ES256)).unwrap();
+    assert_eq!(facade.claims, expected);
+    assert_eq!(facade.header.kid.as_deref(), Some("key-1"));
+    assert_eq!(facade.header.typ.as_deref(), Some("JWT"));
+    // Independent oracle: AWS-LC verifies the raw r||s over the signing input.
+    let parts: Vec<_> = token.split('.').collect();
+    let raw = URL_SAFE_NO_PAD.decode(parts[2]).unwrap();
+    assert_eq!(raw.len(), 64);
+    signature::UnparsedPublicKey::new(&signature::ECDSA_P256_SHA256_FIXED, key.public_key())
+        .verify(format!("{}.{}", parts[0], parts[1]).as_bytes(), &raw)
+        .unwrap();
+    let other = EcdsaP256KeyPair::generate().unwrap();
+    assert!(matches!(
+        decode::<Value>(
+            &token,
+            &DecodingKey::from_ec_der(other.public_key()),
+            &policy(Algorithm::ES256)
+        )
+        .unwrap_err()
+        .kind(),
+        ErrorKind::InvalidSignature
+    ));
+}
+
+#[test]
+fn encode_refuses_every_other_algorithm() {
+    use crate::crypto::signature::EcdsaP256KeyPair;
+    let key = EcdsaP256KeyPair::generate().unwrap();
+    for algorithm in [
+        Algorithm::ES384,
+        Algorithm::RS256,
+        Algorithm::PS256,
+        Algorithm::HS256,
+        Algorithm::EdDSA,
+    ] {
+        assert!(matches!(
+            super::encode(&Header::new(algorithm), &claims(), &key)
+                .unwrap_err()
+                .kind(),
+            ErrorKind::InvalidAlgorithm
+        ));
+    }
+}

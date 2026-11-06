@@ -4,16 +4,10 @@ use file_parser::domain::parser::FileParserBackend;
 use file_parser::infra::parsers::docx_parser::DocxParser;
 use std::path::PathBuf;
 
-/// Helper to get the path to test data files
+mod common;
+
 fn get_test_file_path(filename: &str) -> PathBuf {
-    // Path relative to workspace root
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .join("testing/e2e/testdata/docx")
-        .join(filename)
+    common::fixture_path("docx", filename)
 }
 
 #[tokio::test]
@@ -30,10 +24,7 @@ async fn test_docx_parser_with_working_file() {
     let test_file = get_test_file_path("test_file_1table_multilingual.docx");
 
     // Skip test if file doesn't exist (not all test files may be available)
-    if !test_file.exists() {
-        eprintln!("Skipping test: test file not found at {test_file:?}");
-        return;
-    }
+    assert!(test_file.exists(), "test fixture missing: {test_file:?}");
 
     let result = parser.parse_local_path(&test_file, None).await;
 
@@ -59,10 +50,7 @@ async fn test_docx_parser_with_two_page_file() {
     let parser = DocxParser::new();
     let test_file = get_test_file_path("test_file_2pages_multilingual.docx");
 
-    if !test_file.exists() {
-        eprintln!("Skipping test: test file not found at {test_file:?}");
-        return;
-    }
+    assert!(test_file.exists(), "test fixture missing: {test_file:?}");
 
     let result = parser.parse_local_path(&test_file, None).await;
 
@@ -87,10 +75,7 @@ async fn test_docx_parser_with_big_english_file() {
     let parser = DocxParser::new();
     let test_file = get_test_file_path("test_file_big_english.docx");
 
-    if !test_file.exists() {
-        eprintln!("Skipping test: test file not found at {test_file:?}");
-        return;
-    }
+    assert!(test_file.exists(), "test fixture missing: {test_file:?}");
 
     let result = parser.parse_local_path(&test_file, None).await;
 
@@ -115,10 +100,7 @@ async fn test_docx_parser_with_edge_cases_file_returns_error() {
     let parser = DocxParser::new();
     let test_file = get_test_file_path("test_file_1table_edge_cases.docx");
 
-    if !test_file.exists() {
-        eprintln!("Skipping test: test file not found at {test_file:?}");
-        return;
-    }
+    assert!(test_file.exists(), "test fixture missing: {test_file:?}");
 
     // This should return an error due to parser limitations
     let result = parser.parse_local_path(&test_file, None).await;
@@ -140,10 +122,7 @@ async fn test_docx_parser_with_image_multilingual_file() {
     let parser = DocxParser::new();
     let test_file = get_test_file_path("test_file_1table_image_multilingual.docx");
 
-    if !test_file.exists() {
-        eprintln!("Skipping test: test file not found at {test_file:?}");
-        return;
-    }
+    assert!(test_file.exists(), "test fixture missing: {test_file:?}");
 
     let result = parser.parse_local_path(&test_file, None).await;
 
@@ -168,10 +147,7 @@ async fn test_docx_parser_parse_bytes() {
     let parser = DocxParser::new();
     let test_file = get_test_file_path("test_file_1table_multilingual.docx");
 
-    if !test_file.exists() {
-        eprintln!("Skipping test: test file not found at {test_file:?}");
-        return;
-    }
+    assert!(test_file.exists(), "test fixture missing: {test_file:?}");
 
     // Read file as bytes
     let file_bytes = std::fs::read(&test_file).expect("Failed to read test file");
@@ -202,10 +178,7 @@ async fn test_docx_parser_parse_bytes_without_filename() {
     let parser = DocxParser::new();
     let test_file = get_test_file_path("test_file_1table_multilingual.docx");
 
-    if !test_file.exists() {
-        eprintln!("Skipping test: test file not found at {test_file:?}");
-        return;
-    }
+    assert!(test_file.exists(), "test fixture missing: {test_file:?}");
 
     let file_bytes = std::fs::read(&test_file).expect("Failed to read test file");
     let bytes = bytes::Bytes::from(file_bytes);
@@ -274,10 +247,7 @@ async fn test_docx_parser_extracts_tables() {
     let parser = DocxParser::new();
     let test_file = get_test_file_path("test_file_1table_multilingual.docx");
 
-    if !test_file.exists() {
-        eprintln!("Skipping test: test file not found at {test_file:?}");
-        return;
-    }
+    assert!(test_file.exists(), "test fixture missing: {test_file:?}");
 
     let result = parser.parse_local_path(&test_file, None).await;
     assert!(
@@ -338,10 +308,7 @@ async fn test_docx_parser_table_edge_cases() {
     let parser = DocxParser::new();
     let test_file = get_test_file_path("test_file_1table_edge_cases.docx");
 
-    if !test_file.exists() {
-        eprintln!("Skipping test: test file not found at {test_file:?}");
-        return;
-    }
+    assert!(test_file.exists(), "test fixture missing: {test_file:?}");
 
     let result = parser.parse_local_path(&test_file, None).await;
     assert!(

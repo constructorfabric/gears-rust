@@ -75,7 +75,7 @@ def _patch_restart_config(config_text: str, home_dir: str, sidecars, namespace: 
 def _resolve_binary() -> Path:
     binary_str = os.environ.get("E2E_BINARY")
     if not binary_str:
-        pytest.fail("E2E_BINARY not set — run these tests via: make e2e-event-broker")
+        pytest.fail("E2E_BINARY not set - run these tests via: make e2e-event-broker")
     p = Path(binary_str)
     if not p.exists():
         pytest.fail(f"E2E_BINARY={binary_str!r} does not exist")

@@ -136,6 +136,7 @@ pub use http::sse::SseBroadcaster;
 pub mod telemetry;
 
 pub mod backends;
+pub mod gts_publication;
 pub mod lifecycle;
 pub mod plugins;
 pub mod runtime;
@@ -176,11 +177,13 @@ pub use backends::{
     BackendKind, GearRuntimeBackend, InstanceHandle, LocalProcessBackend, OopBackend,
     OopGearConfig, OopSpawnConfig,
 };
-pub use lifecycle::{Lifecycle, Runnable, Status, StopReason, WithLifecycle};
+pub use lifecycle::{
+    DEFAULT_READY_WARN_AFTER, Lifecycle, Runnable, Status, StopReason, WithLifecycle,
+};
 pub use plugins::GtsPluginSelector;
 pub use runtime::{
-    DEFAULT_SHUTDOWN_DEADLINE, DbOptions, Endpoint, GearInstance, GearManager, OopGearSpawnConfig,
-    OopSpawnOptions, RunOptions, ShutdownOptions, run,
+    DEFAULT_INIT_DEADLINE, DEFAULT_SHUTDOWN_DEADLINE, DbOptions, Endpoint, GearInstance,
+    GearManager, OopGearSpawnConfig, OopSpawnOptions, RunOptions, ShutdownOptions, run,
 };
 
 #[cfg(feature = "bootstrap")]

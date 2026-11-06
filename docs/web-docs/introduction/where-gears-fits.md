@@ -24,7 +24,7 @@ Gears supports two distinct entry points. Most teams start with one and grow int
 
 ### Path A — Greenfield
 
-Start a new platform or product on Gears. You build your first gear, compose it with the system gears (gateway, authn/authz, tenancy), and grow the platform capability by capability. Follow [Build your first gear](../../build-with-gears/your-first-gear/).
+Start a new platform or product on Gears. You build your first gear, compose it with the core gears (gateway, authn/authz, tenancy), and grow the platform capability by capability. Follow [Build your first gear](../../build-with-gears/your-first-gear/).
 
 Choose greenfield when you are starting a new XaaS product, an on-prem or edge appliance, or a GenAI platform backbone.
 

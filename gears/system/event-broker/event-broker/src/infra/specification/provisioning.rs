@@ -14,6 +14,15 @@
 //! Every comparison of `attempt_at` and every refresh of it uses the
 //! database's clock, so clock skew between ingest hosts never decides whether
 //! an attempt is abandoned.
+//!
+//! A `provisioned` topic is provisioned again only when its resolved
+//! retention differs from the retention its record holds, or when its record
+//! is unconfirmed, and then with a `Held` claim that never creates the log
+//! (feature 0006 §4.1). The record is marked unconfirmed before the call and
+//! confirmed only by the answer's compare-and-set, so a call dropped
+//! mid-flight, one whose answer is not seen and one whose record write loses
+//! all leave it unconfirmed, and instances that resolved different retentions
+//! during a rollout converge once they resolve the same one.
 
 use std::collections::HashMap;
 
@@ -28,11 +37,12 @@ use toolkit_gts::GtsInstanceId;
 use toolkit_security::AccessScope;
 use uuid::Uuid;
 
-use super::TypesRegistrySpecificationManager;
+use super::{TypesRegistrySpecificationManager, deserialize_row};
 use crate::domain::backend::BackendResolver;
 use crate::domain::error::DomainError;
 use crate::domain::model::Topic;
-use crate::domain::specification::{ProvisioningLimits, SpecificationManager, TopicState};
+use crate::domain::specification::{ProvisioningLimits, TopicState};
+use crate::infra::storage::entity::spec_cache::SpecKind;
 use crate::infra::storage::entity::topic_binding::{self, Column};
 
 const PROVISIONING: &str = "provisioning";
@@ -67,7 +77,7 @@ impl TypesRegistrySpecificationManager {
         &self,
         id: &GtsInstanceId,
     ) -> Result<Option<TopicState>, DomainError> {
-        self.binding(&binding_key(id))
+        self.binding(binding_key(id))
             .await?
             .as_ref()
             .map(state_of)
@@ -94,8 +104,12 @@ impl TypesRegistrySpecificationManager {
         backends: &dyn BackendResolver,
         limits: ProvisioningLimits,
     ) -> usize {
+        let topics = self.resolved_topics().await.unwrap_or_else(|err| {
+            tracing::warn!(%err, "spec cache list failed while provisioning topics");
+            Vec::new()
+        });
         let mut pending = 0;
-        for topic in self.list_topics().await {
+        for topic in topics {
             if let Err(err) = self.provision_one(&topic, backends, limits).await {
                 tracing::warn!(topic = %topic.id, %err, "topic provisioning pass failed; retried on the next pass");
             }
@@ -109,27 +123,39 @@ impl TypesRegistrySpecificationManager {
         pending
     }
 
+    /// Every registered topic with the settings configuration resolved for
+    /// it, not the partition count its backend holds: provisioning compares
+    /// the two (feature 0006 §4.1), and listing lays the backend's count over
+    /// it.
+    pub(super) async fn resolved_topics(&self) -> Result<Vec<Topic>, DomainError> {
+        Ok(self
+            .list_rows(SpecKind::Topic)
+            .await?
+            .iter()
+            .filter_map(deserialize_row)
+            .collect())
+    }
+
     async fn provision_one(
         &self,
         topic: &Topic,
         backends: &dyn BackendResolver,
         limits: ProvisioningLimits,
     ) -> Result<(), DomainError> {
+        let spec = topic_spec(topic);
         let attempt = Attempt {
             topic,
             backend: backends.resolve(topic),
-            spec: topic_spec(topic),
+            retention: StoredRetention::of(&spec.retention),
+            spec,
             key: binding_key(&topic.id),
             limits,
         };
-        match self.binding(&attempt.key).await? {
+        match self.binding(attempt.key).await? {
             None => self.start(&attempt).await,
-            Some(row) if row.state == PROVISIONED => {
-                self.refresh(&attempt, &row).await;
-                Ok(())
-            }
+            Some(row) if row.state == PROVISIONED => self.refresh(&attempt, &row).await,
             Some(row) => {
-                self.continue_or_replace(&attempt, parse_log(&row.log_id)?)
+                self.continue_or_replace(&attempt, LogId::from_uuid(row.log_id))
                     .await
             }
         }
@@ -139,10 +165,7 @@ impl TypesRegistrySpecificationManager {
     /// instance's insert won.
     async fn start(&self, attempt: &Attempt<'_>) -> Result<(), DomainError> {
         let log = LogId::new_v4();
-        if !self
-            .insert_attempt(attempt.topic, &attempt.key, log)
-            .await?
-        {
+        if !self.insert_attempt(attempt.topic, attempt.key, log).await? {
             return Ok(());
         }
         self.drive(
@@ -155,23 +178,108 @@ impl TypesRegistrySpecificationManager {
         .await
     }
 
-    /// A provisioned topic: hand the backend its current settings under the
-    /// same log id, so it adopts changed retention; nothing else changes.
-    async fn refresh(&self, attempt: &Attempt<'_>, row: &topic_binding::Model) {
+    /// A provisioned topic. A partition count that differs from the recorded
+    /// one is logged on every pass, and the recorded count stays in force.
+    /// Only a resolved retention that differs from the recorded one, or any
+    /// retention on an unconfirmed record, reaches the backend, through
+    /// [`Self::re_provision`]; until a call records and confirms it, every
+    /// pass calls again. The record is marked unconfirmed before the call, so
+    /// a call dropped mid-flight leaves it unconfirmed; a pass whose mark finds
+    /// the record written since its read leaves the topic to the next pass.
+    async fn refresh(
+        &self,
+        attempt: &Attempt<'_>,
+        row: &topic_binding::Model,
+    ) -> Result<(), DomainError> {
         if row.partitions != Some(i64::from(attempt.spec.partitions)) {
             log_partition_mismatch(attempt.topic, attempt.spec.partitions, row.partitions);
         }
-        let Ok(log) = parse_log(&row.log_id) else {
-            tracing::warn!(topic = %attempt.topic.id, "topic binding holds a malformed log id");
-            return;
+        if row.retention_confirmed && StoredRetention::recorded(row) == attempt.retention {
+            return Ok(());
+        }
+        let partitions = row
+            .partitions
+            .and_then(|partitions| u32::try_from(partitions).ok())
+            .ok_or_else(|| {
+                DomainError::Internal(format!(
+                    "topic binding holds partition count {:?}",
+                    row.partitions
+                ))
+            })?;
+        let log = LogId::from_uuid(row.log_id);
+        if !self
+            .claim_re_provision(attempt.key, log, row.retention_version)
+            .await?
+        {
+            tracing::debug!(topic = %attempt.topic.id, log_id = %log, "topic record written since it was read; re-provisioned on a later pass");
+            return Ok(());
+        }
+        self.re_provision(attempt, log, partitions, row.retention_version + 1)
+            .await
+    }
+
+    /// Hands a provisioned topic its resolved retention under its log id and
+    /// its recorded partition count, as a `Held` claim: the backend applies
+    /// the settings to the log it holds and never creates one. Records the
+    /// retention on `Ready` if the record is still at `version`, the
+    /// `retention_version` [`Self::claim_re_provision`] wrote. `Pending`, a
+    /// timeout and any other failure mark the record unconfirmed again, so a
+    /// write that read before the mark cannot confirm the record over a call
+    /// whose answer was not seen. A backend holding no log for the topic (it
+    /// was routed elsewhere since) answers `NotProvisioned`, and one holding
+    /// another log id for it answers `LogConflict`; both refusals leave the
+    /// record unconfirmed, break the single-holder invariant and are logged at
+    /// error level on every pass.
+    async fn re_provision(
+        &self,
+        attempt: &Attempt<'_>,
+        log: LogId,
+        partitions: u32,
+        version: i64,
+    ) -> Result<(), DomainError> {
+        let spec = TopicSpec {
+            partitions,
+            ..attempt.spec.clone()
         };
         let claim = LogClaim {
-            replacing: Replacing::Log(log),
+            replacing: Replacing::Held,
             new: log,
         };
-        if let Err(problem) = attempt.call(&claim).await {
-            tracing::warn!(topic = %attempt.topic.id, %problem, "re-provisioning a provisioned topic failed");
+        let problem = match attempt.call(&spec, &claim).await {
+            Ok(Provisioning::Ready { .. }) => {
+                return self.retention_re_provisioned(attempt, log, version).await;
+            }
+            Ok(Provisioning::Pending) => "the backend has not finished".to_owned(),
+            Err(CallProblem::Backend(BackendError::NotProvisioned { .. })) => {
+                log_single_holder_refusal(attempt.topic, log, SingleHolderRefusal::NoLog);
+                return Ok(());
+            }
+            Err(CallProblem::Backend(BackendError::LogConflict { .. })) => {
+                log_single_holder_refusal(attempt.topic, log, SingleHolderRefusal::AnotherLog);
+                return Ok(());
+            }
+            Err(problem) => problem.to_string(),
+        };
+        self.mark_retention_unconfirmed(attempt.key, log).await?;
+        tracing::warn!(topic = %attempt.topic.id, %problem, "re-provisioning a provisioned topic failed; retried on the next pass");
+        Ok(())
+    }
+
+    async fn retention_re_provisioned(
+        &self,
+        attempt: &Attempt<'_>,
+        log: LogId,
+        version: i64,
+    ) -> Result<(), DomainError> {
+        if self
+            .record_retention(attempt.key, log, version, attempt.retention)
+            .await?
+        {
+            tracing::info!(topic = %attempt.topic.id, log_id = %log, "topic retention re-provisioned");
+        } else if self.mark_retention_unconfirmed(attempt.key, log).await? {
+            tracing::info!(topic = %attempt.topic.id, log_id = %log, "topic retention re-provisioned concurrently; confirmed on a later pass");
         }
+        Ok(())
     }
 
     /// A live attempt is continued under its log id; one nobody acted on for
@@ -183,7 +291,7 @@ impl TypesRegistrySpecificationManager {
         log: LogId,
     ) -> Result<(), DomainError> {
         if !self
-            .attempt_older_than(&attempt.key, attempt.limits.attempt_timeout)
+            .attempt_older_than(attempt.key, attempt.limits.attempt_timeout)
             .await?
         {
             return self
@@ -197,7 +305,7 @@ impl TypesRegistrySpecificationManager {
                 .await;
         }
         let new = LogId::new_v4();
-        if !self.replace_attempt(&attempt.key, log, new).await? {
+        if !self.replace_attempt(attempt.key, log, new).await? {
             return Ok(());
         }
         self.drive(
@@ -210,14 +318,25 @@ impl TypesRegistrySpecificationManager {
         .await
     }
 
+    /// Hands the topic's resolved spec to the backend under `claim`. `Pending`,
+    /// a timeout and any failure but a `LogConflict` refusal, which applies
+    /// nothing, leave the backend free to apply this call later, so when
+    /// another instance driving the same attempt has recorded the topic
+    /// meanwhile, they mark that record unconfirmed.
     async fn drive(&self, attempt: &Attempt<'_>, claim: LogClaim) -> Result<(), DomainError> {
-        match attempt.call(&claim).await {
+        match attempt.call(&attempt.spec, &claim).await {
             Ok(Provisioning::Ready { partitions }) => self.ready(attempt, claim, partitions).await,
-            Ok(Provisioning::Pending) => self.touch(&attempt.key, claim.new).await,
+            Ok(Provisioning::Pending) => {
+                self.mark_retention_unconfirmed(attempt.key, claim.new)
+                    .await?;
+                self.touch(attempt.key, claim.new).await
+            }
             Err(CallProblem::Backend(BackendError::LogConflict { .. })) => {
                 self.conflict(attempt, claim).await
             }
             Err(problem) => {
+                self.mark_retention_unconfirmed(attempt.key, claim.new)
+                    .await?;
                 tracing::warn!(topic = %attempt.topic.id, %problem, "topic provisioning failed; retried on the next pass");
                 Ok(())
             }
@@ -225,7 +344,9 @@ impl TypesRegistrySpecificationManager {
     }
 
     /// The backend holds the log: record it as provisioned with the
-    /// partition count the backend reported.
+    /// partition count the backend reported. When another instance driving
+    /// the same attempt recorded it first, the backend may hold this call's
+    /// retention over the recorded one, so the record is marked unconfirmed.
     async fn ready(
         &self,
         attempt: &Attempt<'_>,
@@ -239,16 +360,24 @@ impl TypesRegistrySpecificationManager {
                 Some(i64::from(partitions)),
             );
         }
-        self.mark_provisioned(&attempt.key, claim.new, partitions)
-            .await?;
-        tracing::info!(topic = %attempt.topic.id, log_id = %claim.new, partitions, "topic provisioned");
+        if self
+            .mark_provisioned(attempt.key, claim.new, partitions, attempt.retention)
+            .await?
+        {
+            tracing::info!(topic = %attempt.topic.id, log_id = %claim.new, partitions, "topic provisioned");
+        } else if self
+            .mark_retention_unconfirmed(attempt.key, claim.new)
+            .await?
+        {
+            tracing::info!(topic = %attempt.topic.id, log_id = %claim.new, "topic provisioned concurrently; its retention is confirmed on a later pass");
+        }
         Ok(())
     }
 
     /// The backend holds another log id: the attempt keeps its id and stays
     /// live, so it is retried rather than replaced (ADR-0008 owns the reaction).
     async fn conflict(&self, attempt: &Attempt<'_>, claim: LogClaim) -> Result<(), DomainError> {
-        self.touch(&attempt.key, claim.new).await?;
+        self.touch(attempt.key, claim.new).await?;
         tracing::error!(
             topic = %attempt.topic.id,
             log_id = %claim.new,
@@ -257,9 +386,9 @@ impl TypesRegistrySpecificationManager {
         Ok(())
     }
 
-    async fn binding(&self, key: &str) -> Result<Option<topic_binding::Model>, DomainError> {
+    async fn binding(&self, key: Uuid) -> Result<Option<topic_binding::Model>, DomainError> {
         let conn = self.db.conn()?;
-        Ok(topic_binding::Entity::find_by_id(key.to_owned())
+        Ok(topic_binding::Entity::find_by_id(key)
             .secure()
             .scope_with(&AccessScope::allow_all())
             .one(&conn)
@@ -271,21 +400,25 @@ impl TypesRegistrySpecificationManager {
     async fn insert_attempt(
         &self,
         topic: &Topic,
-        key: &str,
+        key: Uuid,
         log: LogId,
     ) -> Result<bool, DomainError> {
         let conn = self.db.conn()?;
         let inserted = secure_insert::<topic_binding::Entity>(
             topic_binding::ActiveModel {
-                topic_uuid: Set(key.to_owned()),
+                topic_uuid: Set(key),
                 topic_id: Set(topic.id.to_string()),
-                log_id: Set(log.to_string()),
+                log_id: Set(log.uuid()),
                 state: Set(PROVISIONING.to_owned()),
                 // Replaced by the database's clock right below.
                 attempt_at: Set(chrono::Utc::now()
                     .format("%Y-%m-%dT%H:%M:%S%.3fZ")
                     .to_string()),
                 partitions: Set(None),
+                retention_max_age_ms: Set(None),
+                retention_max_bytes: Set(None),
+                retention_version: Set(0),
+                retention_confirmed: Set(false),
             },
             &AccessScope::allow_all(),
             &conn,
@@ -303,7 +436,7 @@ impl TypesRegistrySpecificationManager {
 
     async fn attempt_older_than(
         &self,
-        key: &str,
+        key: Uuid,
         timeout: std::time::Duration,
     ) -> Result<bool, DomainError> {
         let cutoff = db_clock(self.db.db().backend(), timeout.as_secs())?;
@@ -325,36 +458,110 @@ impl TypesRegistrySpecificationManager {
     /// when someone replaced the attempt first.
     async fn replace_attempt(
         &self,
-        key: &str,
+        key: Uuid,
         old: LogId,
         new: LogId,
     ) -> Result<bool, DomainError> {
         self.update_attempt(key, old, |update, now| {
             update
-                .col_expr(Column::LogId, Expr::value(new.to_string()))
+                .col_expr(Column::LogId, Expr::value(new.uuid()))
                 .col_expr(Column::AttemptAt, now)
         })
         .await
     }
 
+    /// Compare-and-set `(log, provisioning)` -> `(log, provisioned)` with
+    /// `partitions` and a confirmed `retention`. `false` when the attempt was
+    /// recorded or replaced first.
     async fn mark_provisioned(
         &self,
-        key: &str,
+        key: Uuid,
         log: LogId,
         partitions: u32,
-    ) -> Result<(), DomainError> {
+        retention: StoredRetention,
+    ) -> Result<bool, DomainError> {
         self.update_attempt(key, log, |update, now| {
             update
                 .col_expr(Column::State, Expr::value(PROVISIONED))
                 .col_expr(Column::Partitions, Expr::value(i64::from(partitions)))
+                .col_expr(Column::RetentionMaxAgeMs, Expr::value(retention.max_age_ms))
+                .col_expr(Column::RetentionMaxBytes, Expr::value(retention.max_bytes))
+                .col_expr(
+                    Column::RetentionVersion,
+                    Expr::col(Column::RetentionVersion).add(1),
+                )
+                .col_expr(Column::RetentionConfirmed, Expr::value(true))
                 .col_expr(Column::AttemptAt, now)
         })
         .await
-        .map(|_| ())
+    }
+
+    /// Compare-and-set the `provisioned` record of `key` under `log` on
+    /// `version`, the `retention_version` the caller read: marks it
+    /// unconfirmed and bumps the version before a re-provision call. `false`
+    /// when another write changed the record since that read.
+    async fn claim_re_provision(
+        &self,
+        key: Uuid,
+        log: LogId,
+        version: i64,
+    ) -> Result<bool, DomainError> {
+        self.update_record(key, log, PROVISIONED, |update, _| {
+            update
+                .col_expr(
+                    Column::RetentionVersion,
+                    Expr::col(Column::RetentionVersion).add(1),
+                )
+                .col_expr(Column::RetentionConfirmed, Expr::value(false))
+                .filter(Column::RetentionVersion.eq(version))
+        })
+        .await
+    }
+
+    /// Compare-and-set the retention of the `provisioned` record of `key`
+    /// under `log` on `version`, the `retention_version` the caller's
+    /// [`Self::claim_re_provision`] wrote: records `retention`, bumps the
+    /// version and confirms the record. `false` when another write changed the
+    /// record since.
+    async fn record_retention(
+        &self,
+        key: Uuid,
+        log: LogId,
+        version: i64,
+        retention: StoredRetention,
+    ) -> Result<bool, DomainError> {
+        self.update_record(key, log, PROVISIONED, |update, _| {
+            update
+                .col_expr(Column::RetentionMaxAgeMs, Expr::value(retention.max_age_ms))
+                .col_expr(Column::RetentionMaxBytes, Expr::value(retention.max_bytes))
+                .col_expr(
+                    Column::RetentionVersion,
+                    Expr::col(Column::RetentionVersion).add(1),
+                )
+                .col_expr(Column::RetentionConfirmed, Expr::value(true))
+                .filter(Column::RetentionVersion.eq(version))
+        })
+        .await
+    }
+
+    /// Marks the `provisioned` record of `key` under `log` unconfirmed. The
+    /// version bump makes every compare-and-set on a version read before the
+    /// mark lose, so none of them confirms the record over the mark. `false`
+    /// when no record matches `key`, `log` and `provisioned`.
+    async fn mark_retention_unconfirmed(&self, key: Uuid, log: LogId) -> Result<bool, DomainError> {
+        self.update_record(key, log, PROVISIONED, |update, _| {
+            update
+                .col_expr(
+                    Column::RetentionVersion,
+                    Expr::col(Column::RetentionVersion).add(1),
+                )
+                .col_expr(Column::RetentionConfirmed, Expr::value(false))
+        })
+        .await
     }
 
     /// Records that the attempt under `log` acted now.
-    async fn touch(&self, key: &str, log: LogId) -> Result<(), DomainError> {
+    async fn touch(&self, key: Uuid, log: LogId) -> Result<(), DomainError> {
         self.update_attempt(key, log, |update, now| {
             update.col_expr(Column::AttemptAt, now)
         })
@@ -367,8 +574,23 @@ impl TypesRegistrySpecificationManager {
     /// with.
     async fn update_attempt(
         &self,
-        key: &str,
+        key: Uuid,
         log: LogId,
+        set: impl FnOnce(
+            sea_orm::UpdateMany<topic_binding::Entity>,
+            Expr,
+        ) -> sea_orm::UpdateMany<topic_binding::Entity>,
+    ) -> Result<bool, DomainError> {
+        self.update_record(key, log, PROVISIONING, set).await
+    }
+
+    /// Applies `set` to the record of `key` under `log` in `state`; `true`
+    /// when it matched. `set` gets the database's clock.
+    async fn update_record(
+        &self,
+        key: Uuid,
+        log: LogId,
+        state: &str,
         set: impl FnOnce(
             sea_orm::UpdateMany<topic_binding::Entity>,
             Expr,
@@ -380,8 +602,8 @@ impl TypesRegistrySpecificationManager {
             .filter(
                 Condition::all()
                     .add(Column::TopicUuid.eq(key))
-                    .add(Column::LogId.eq(log.to_string()))
-                    .add(Column::State.eq(PROVISIONING)),
+                    .add(Column::LogId.eq(log.uuid()))
+                    .add(Column::State.eq(state)),
             )
             .secure()
             .scope_with(&AccessScope::allow_all())
@@ -394,16 +616,49 @@ impl TypesRegistrySpecificationManager {
 struct Attempt<'a> {
     topic: &'a Topic,
     backend: std::sync::Arc<dyn Backend>,
+    /// `spec.retention` in the units the record stores.
+    retention: StoredRetention,
     spec: TopicSpec,
-    key: String,
+    key: Uuid,
     limits: ProvisioningLimits,
 }
 
+/// A retention in the units the binding record stores it in; `None` is
+/// unbounded. Retentions are compared in these units.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StoredRetention {
+    max_age_ms: Option<i64>,
+    max_bytes: Option<i64>,
+}
+
+impl StoredRetention {
+    /// A bound past what the record's columns hold is stored as `i64::MAX`:
+    /// no event lives that long or grows that big, so the saturated bound
+    /// limits nothing the original would.
+    fn of(retention: &Retention) -> Self {
+        Self {
+            max_age_ms: retention
+                .max_age
+                .map(|age| i64::try_from(age.as_millis()).unwrap_or(i64::MAX)),
+            max_bytes: retention
+                .max_bytes
+                .map(|bytes| i64::try_from(bytes).unwrap_or(i64::MAX)),
+        }
+    }
+
+    fn recorded(row: &topic_binding::Model) -> Self {
+        Self {
+            max_age_ms: row.retention_max_age_ms,
+            max_bytes: row.retention_max_bytes,
+        }
+    }
+}
+
 impl Attempt<'_> {
-    async fn call(&self, claim: &LogClaim) -> Result<Provisioning, CallProblem> {
+    async fn call(&self, spec: &TopicSpec, claim: &LogClaim) -> Result<Provisioning, CallProblem> {
         tokio::time::timeout(
             self.limits.call_timeout,
-            self.backend.provision(&self.spec, claim),
+            self.backend.provision(spec, claim),
         )
         .await
         .map_err(|_| CallProblem::TimedOut)?
@@ -427,6 +682,34 @@ impl std::fmt::Display for CallProblem {
     }
 }
 
+/// Why the backend does not hold a provisioned topic's log under its
+/// recorded log id.
+#[derive(Debug, Clone, Copy)]
+enum SingleHolderRefusal {
+    /// `NotProvisioned`: the backend holds no log for the topic.
+    NoLog,
+    /// `LogConflict`: the backend holds another log id for the topic.
+    AnotherLog,
+}
+
+/// Logs at error level a re-provision the backend refused because it does
+/// not hold the topic's log under `log`: at most one backend holds the
+/// recorded log id (0006 §4.1), so this needs an operator.
+fn log_single_holder_refusal(topic: &Topic, log: LogId, refusal: SingleHolderRefusal) {
+    match refusal {
+        SingleHolderRefusal::NoLog => tracing::error!(
+            topic = %topic.id,
+            log_id = %log,
+            "re-provisioning a provisioned topic refused: the backend this topic is routed to holds no log for it; retried on the next pass"
+        ),
+        SingleHolderRefusal::AnotherLog => tracing::error!(
+            topic = %topic.id,
+            log_id = %log,
+            "re-provisioning a provisioned topic refused: the backend holds another log id for it; retried on the next pass"
+        ),
+    }
+}
+
 fn log_partition_mismatch(topic: &Topic, configured: u32, provisioned: Option<i64>) {
     tracing::error!(
         topic = %topic.id,
@@ -436,18 +719,12 @@ fn log_partition_mismatch(topic: &Topic, configured: u32, provisioned: Option<i6
     );
 }
 
-fn binding_key(id: &GtsInstanceId) -> String {
-    topic_uuid(id).hyphenated().to_string()
-}
-
-fn parse_log(raw: &str) -> Result<LogId, DomainError> {
-    Uuid::parse_str(raw)
-        .map(LogId::from_uuid)
-        .map_err(|e| DomainError::Internal(format!("topic binding holds a malformed log id: {e}")))
+fn binding_key(id: &GtsInstanceId) -> Uuid {
+    topic_uuid(id)
 }
 
 fn state_of(row: &topic_binding::Model) -> Result<TopicState, DomainError> {
-    let log = parse_log(&row.log_id)?;
+    let log = LogId::from_uuid(row.log_id);
     match (row.state.as_str(), row.partitions) {
         (PROVISIONED, Some(partitions)) => Ok(TopicState::Provisioned {
             log,

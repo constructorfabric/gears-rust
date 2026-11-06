@@ -2,13 +2,14 @@
 //! `read_committed` consumers, assigned one partition per call.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use event_broker_sdk::backend::{BackendError, TopicPartition, Wait};
 use event_broker_sdk::models::{Event, PartitionRange, TopicSegment};
 use event_broker_sdk::{Position, Sequence};
 use rdkafka::consumer::{Consumer, StreamConsumer};
-use rdkafka::error::{KafkaError, RDKafkaErrorCode};
+use rdkafka::error::{KafkaError, KafkaResult, RDKafkaErrorCode};
 use rdkafka::topic_partition_list::{Offset, TopicPartitionList};
 
 use crate::clients::{self, Consumed, Lease, Record, Span};
@@ -114,6 +115,19 @@ where
     }
 }
 
+/// Where the probes read records: the pooled consumer, or a scripted
+/// partition in unit tests.
+pub trait RecordSource {
+    /// The committed records of `span`, as [`clients::consume`] reads them.
+    fn consume(&self, span: Span<'_>) -> impl Future<Output = KafkaResult<Consumed>> + Send;
+}
+
+impl RecordSource for StreamConsumer {
+    fn consume(&self, span: Span<'_>) -> impl Future<Output = KafkaResult<Consumed>> + Send {
+        clients::consume(self, span)
+    }
+}
+
 /// The partition's bounds: the floor (the cursor before its oldest stored
 /// event) and the ceiling (its last event's sequence).
 struct Bounds {
@@ -147,9 +161,10 @@ async fn bounds(
         let ceiling = match cached {
             Some(latest) if latest.high == high => latest.sequence,
             _ => {
-                let found = last_event(&consumer, topic, partition, low, high, timeout).await?;
+                let found =
+                    last_event(consumer.as_ref(), topic, partition, low, high, timeout).await?;
                 let sequence = match found {
-                    Some(offset) => names::sequence_of(offset),
+                    Some(record) => names::sequence_of(record.offset),
                     // Nothing ever stored, or every event removed. With every
                     // write transactional, the record below the watermark is
                     // a marker, so its offset is the last event's sequence
@@ -175,21 +190,21 @@ async fn bounds(
     .await
 }
 
-/// The offset of the last committed record in `[low, high)`.
-async fn last_event(
-    consumer: &StreamConsumer,
+/// The last committed record in `[low, high)`, read back from `high` in
+/// growing windows.
+async fn last_event<S: RecordSource>(
+    source: &S,
     topic: &str,
     partition: i32,
     low: i64,
     high: i64,
-    timeout: std::time::Duration,
-) -> Result<Option<i64>, KafkaError> {
+    timeout: Duration,
+) -> KafkaResult<Option<Record>> {
     let mut window = FIRST_WINDOW;
     loop {
         let start = high.saturating_sub(window).max(low);
-        let Consumed { records, complete } = clients::consume(
-            consumer,
-            Span {
+        let consumed = source
+            .consume(Span {
                 topic,
                 partition,
                 start,
@@ -197,17 +212,10 @@ async fn last_event(
                 max: usize::try_from(high - start).unwrap_or(usize::MAX),
                 timeout,
                 eof_ends: true,
-            },
-        )
-        .await?;
-        if let Some(last) = records.last() {
-            return Ok(Some(last.offset));
-        }
-        // A window not read to its end is no evidence that it is empty.
-        if !complete {
-            return Err(KafkaError::MessageConsumption(
-                RDKafkaErrorCode::OperationTimedOut,
-            ));
+            })
+            .await?;
+        if let Some(last) = complete(consumed)?.pop() {
+            return Ok(Some(last));
         }
         if start <= low {
             return Ok(None);
@@ -288,33 +296,58 @@ pub async fn query(
     const OP: Operation = Operation::Query;
     let (known, partition) = shared.partition(at, OP).await?;
     let bounds = bounds(shared, at, &known.name, partition, OP).await?;
-    let first = range.start_offset.map_or(bounds.low, |start| {
-        start.as_i64().saturating_sub(1).max(bounds.low)
+    let scope = Scope {
+        topic: &known.name,
+        partition,
+        low: bounds.low,
+        high: bounds.high,
+        timeout: shared.settings.request_timeout,
+    };
+    let lease = shared.lease(OP).await?;
+    let found = query_on(lease.consumer().as_ref(), at, &scope, range).await;
+    if found.is_err() {
+        lease.discard();
+    }
+    found
+}
+
+/// The Kafka partition a query reads, and its watermarks.
+pub struct Scope<'a> {
+    /// The Kafka topic.
+    pub topic: &'a str,
+    /// The Kafka partition.
+    pub partition: i32,
+    /// The log start offset.
+    pub low: i64,
+    /// The last stable offset.
+    pub high: i64,
+    /// How long one read may take.
+    pub timeout: Duration,
+}
+
+/// [`query`] over `source`: the first event by a single-record read
+/// forward, the last by the backward windows of [`last_event`] when the
+/// limit covers the range, else by reading forward at most `limit` records.
+/// A read the timeout cuts short is an error, never a partial envelope.
+pub async fn query_on<S: RecordSource>(
+    source: &S,
+    at: &TopicPartition,
+    scope: &Scope<'_>,
+    range: &PartitionRange,
+) -> Result<Vec<TopicSegment>, BackendError> {
+    const OP: Operation = Operation::Query;
+    let first = range.start_offset.map_or(scope.low, |start| {
+        start.as_i64().saturating_sub(1).max(scope.low)
     });
     let last = range
         .end_offset
         .map_or(i64::MAX, |end| end.as_i64().saturating_sub(1));
-    let end = bounds.high.min(last.saturating_add(1));
+    let end = scope.high.min(last.saturating_add(1));
     let limit = usize::try_from(range.limit).unwrap_or(usize::MAX);
-    let timeout = shared.settings.request_timeout;
-    let topic = Arc::clone(&known.name);
-    let consumed = with_lease(shared, OP, |consumer| async move {
-        clients::consume(
-            &consumer,
-            Span {
-                topic: &topic,
-                partition,
-                start: first,
-                end,
-                max: limit,
-                timeout,
-                eof_ends: true,
-            },
-        )
+    let found = ends(source, scope, first, end, limit)
         .await
-    })
-    .await?;
-    let (Some(oldest), Some(newest)) = (consumed.records.first(), consumed.records.last()) else {
+        .map_err(|err| error::map(OP, &err))?;
+    let Some((oldest, newest)) = found else {
         return Ok(Vec::new());
     };
     Ok(vec![TopicSegment {
@@ -322,13 +355,72 @@ pub async fn query(
         partition: at.partition.value(),
         start_sequence: names::sequence_of(oldest.offset),
         end_sequence: names::sequence_of(newest.offset),
-        start_time: Some(stored_at(oldest)?),
-        end_time: Some(stored_at(newest)?),
+        start_time: Some(stored_at(&oldest)?),
+        end_time: Some(stored_at(&newest)?),
         segments: vec![serde_json::json!({
-            "kafka_topic": known.name.as_ref(),
-            "kafka_partition": partition,
-            "log_start_offset": bounds.low,
-            "last_stable_offset": bounds.high,
+            "kafka_topic": scope.topic,
+            "kafka_partition": scope.partition,
+            "log_start_offset": scope.low,
+            "last_stable_offset": scope.high,
         })],
     }])
+}
+
+/// The first and the last of the first `limit` events in `[first, end)`;
+/// `None` when there is none or `limit` is 0, which reads nothing.
+async fn ends<S: RecordSource>(
+    source: &S,
+    scope: &Scope<'_>,
+    first: i64,
+    end: i64,
+    limit: usize,
+) -> KafkaResult<Option<(Record, Record)>> {
+    if limit == 0 {
+        return Ok(None);
+    }
+    let span = |start: i64, max: usize| Span {
+        topic: scope.topic,
+        partition: scope.partition,
+        start,
+        end,
+        max,
+        timeout: scope.timeout,
+        eof_ends: true,
+    };
+    let Some(oldest) = complete(source.consume(span(first, 1)).await?)?
+        .into_iter()
+        .next()
+    else {
+        return Ok(None);
+    };
+    let covered = i64::try_from(limit).map_or(true, |limit| limit >= end - oldest.offset);
+    let newest = if covered {
+        last_event(
+            source,
+            scope.topic,
+            scope.partition,
+            oldest.offset,
+            end,
+            scope.timeout,
+        )
+        .await?
+    } else {
+        complete(source.consume(span(oldest.offset, limit)).await?)?.pop()
+    };
+    // Both reads start at `oldest`: finding nothing means retention removed it
+    // meanwhile, and the envelope falls back to the one event already read.
+    let newest = newest.unwrap_or_else(|| oldest.clone());
+    Ok(Some((oldest, newest)))
+}
+
+/// The records of a read that reached its end or its `max`; a read the
+/// timeout cut short is no evidence of what lies past it.
+fn complete(consumed: Consumed) -> KafkaResult<Vec<Record>> {
+    if consumed.complete {
+        Ok(consumed.records)
+    } else {
+        Err(KafkaError::MessageConsumption(
+            RDKafkaErrorCode::OperationTimedOut,
+        ))
+    }
 }

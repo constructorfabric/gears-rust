@@ -1,7 +1,7 @@
 {
   "$id": "gts://gts.cf.core.events.consumer_group.v1~",
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "description": "Consumer group resource. Persistent broker resource (evbk_consumer_group). Two creation paths: anonymous (broker-minted UUID via POST /v1/consumer-groups) and named (vendor-namespaced via types_registry upsert).",
+  "description": "Consumer group resource. Persistent broker resource (event_broker_consumer_group). Two creation paths: anonymous (broker-minted UUID via POST /v1/consumer-groups) and named (vendor-namespaced via types_registry upsert).",
   "type": "object",
   "additionalProperties": false,
   "required": ["id", "tenant_id", "owner_principal_id", "kind"],

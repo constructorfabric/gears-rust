@@ -47,7 +47,7 @@ async def test_seek_earliest_returns_resolved_cursor(api, prefilled_topic):
     retention eviction on TOPIC_PREFILLED), so the cursor is always 0 even
     though the topic carries PREFILLED_COUNT events.  Using a pre-seeded
     topic proves that "earliest" is 0 while "latest" (tested separately) is
-    non-zero — the two sentinels resolve to distinct values.
+    non-zero - the two sentinels resolve to distinct values.
     """
     async with api() as client:
         group_resp = await client.post("/consumer-groups")

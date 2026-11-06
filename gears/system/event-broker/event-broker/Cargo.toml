@@ -52,7 +52,9 @@ workspace = true
 # `gts_id!(...)` literals.
 event-broker-sdk = { workspace = true }
 gts = { workspace = true }
-types-registry-sdk = { workspace = true }
+# `rest-client`: the resolving client `#[toolkit::consumes]` registers when no
+# in-process registry publishes the platform API.
+types-registry-sdk = { workspace = true, features = ["rest-client"] }
 
 cluster = { workspace = true }
 cluster-sdk = { workspace = true }
@@ -167,6 +169,13 @@ harness = false
 # The crate itself with `test-utils`, as oagw does: every `tests/` binary gets
 # `test_support` (the in-process harness) with no `required-features`.
 cf-gears-event-broker = { path = ".", features = ["test-utils"] }
+# `tests/migrations_backends_test.rs`: the SDK's producer registration
+# migration (`producer_registration_migrations`, behind its `db` feature) on
+# every engine the gear database may be.
+event-broker-sdk = { workspace = true, features = ["db"] }
+# `MockDatabase`: `migrations_tests.rs` records the DDL the migrations emit
+# on PostgreSQL to compare it with `docs/migration.sql`.
+sea-orm = { workspace = true, features = ["mock"] }
 # `tests/support/containers.rs`: the PostgreSQL and MySQL servers of the
 # engine-matrix tests, on `libs/test-containers`' pinned tags.
 test-containers = { workspace = true }
@@ -187,9 +196,9 @@ tracing-test = { workspace = true }
 # rather than in-process mocks.
 reqwest = { workspace = true, features = ["json", "stream"] }
 tempfile = { workspace = true }
-# `types_registry_sdk::testing::MockTypesRegistryClient` - the SDK's own
-# ready-made in-memory test double, reused rather than hand-rolled
-# (`eb-gts-type-registration`).
+# `types_registry_sdk::testing_platform::MockTypesRegistry` - the SDK's own
+# in-memory `PlatformTypesRegistryApi` test double, reused rather than
+# hand-rolled.
 types-registry-sdk = { workspace = true, features = ["test-util"] }
 # `cf-gears-standalone-cluster-plugin` moved to [dependencies] above (also
 # needed by src/bin/server.rs); regular dependencies are available to tests

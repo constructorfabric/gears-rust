@@ -1,0 +1,5 @@
+error: `local` is per contract; with several contracts set it on the list entry: `contract = [path::Api(local = ...), ...]`
+  --> tests/ui/fail/provides_list_top_level_local.rs:11:12
+   |
+11 | #[provides(local = make, contract = [FooApi, BarApi])]
+   |            ^^^^^

@@ -92,7 +92,7 @@ path = "src/bin/evctl.rs"
 required-features = ["rest-client"]
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt", "sync", "net"] }
+tokio = { workspace = true, features = ["macros", "rt", "sync", "net", "test-util"] }
 # Serve the gear's axum router in-process for the REST transport round-trip test.
 axum = { workspace = true }
 # The gear, with its in-process test harness, so the SDK's integration tests
@@ -101,3 +101,6 @@ axum = { workspace = true }
 # dev-only, so Cargo permits the cycle.
 cf-gears-event-broker = { path = "../event-broker", features = ["test-utils"] }
 trybuild = { workspace = true }
+# `MockDatabase`, so the unit tests read the exact DDL each backend's migration
+# emits without a live database.
+sea-orm = { workspace = true, features = ["mock"] }

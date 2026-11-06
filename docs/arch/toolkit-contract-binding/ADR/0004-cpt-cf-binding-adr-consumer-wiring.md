@@ -88,7 +88,24 @@ pub struct OrdersGear { … }
 ```
 
 Multiple `#[toolkit::consumes]` attributes are allowed on the same struct, one per dependency trait.
-Each is independent; they may name the same or different provider gears.
+Each is independent; they may name the same or different provider gears. One attribute can also
+list several contracts. A top-level `from` applies to every entry, and an entry can set its own
+`from` or `resolving_client`:
+
+```rust
+#[toolkit::consumes(
+    from = "types-registry",
+    contract = [
+        types_registry_sdk::PlatformTypesRegistryApi,
+        types_registry_sdk::TypesRegistryApi,
+        billing_sdk::BillingApi(from = "billing"),
+    ],
+)]
+pub struct OrdersGear { … }
+```
+
+The list form expands to the same registrations as one attribute per contract. A contract consumed
+twice on one struct, in one list or across stacked attributes, is a compile error.
 
 ### What the macro generates
 
@@ -108,8 +125,14 @@ inventory::submit! {
             if hub.try_get_local::<dyn billing_sdk::BillingApi>().is_some() {
                 return Ok(WireOutcome::Local);
             }
-            // Another consumer of the same contract already wired a proxy.
+            // This view already holds a proxy for the contract: in a gear's
+            // view, a second `#[consumes]` of it (boot error); in the
+            // process-wide hub, reuse it.
             if hub.has_remote_proxy::<dyn billing_sdk::BillingApi>() {
+                if let Some(owner) = hub.owner() {
+                    anyhow::bail!("gear `{owner}` declares #[toolkit::consumes] for \
+                                   `billing_sdk::BillingApi` more than once");
+                }
                 return Ok(WireOutcome::Remote);
             }
             // `tuning` is prepared by the proxy-wiring phase from the consumer's
@@ -125,15 +148,23 @@ inventory::submit! {
 }
 ```
 
-**The short-circuit must use `try_get_local`, not `try_get`.** `ClientHub` is
-keyed by type alone, so a resolving proxy and a genuine local implementation are
-indistinguishable once stored. With plain `try_get`, two consumers of the same
-contract in one process break the readiness model: whichever wires second finds
-the first one's *proxy*, reports `Local`, and — since both registrations carry
-the same `dep_gear` — marks the very `DependencyChecker` entry the unresolved
-remote dep was gating on. The checker is sticky, so `/readyz` goes 200 with no
-provider up. `register_remote_proxy` records the provenance that makes
-`try_get_local` able to tell the two apart.
+**Each consumer gets its own proxy.** The runtime calls `wire` with the owner gear's view of the
+hub, `ClientHub::for_gear(owner_gear)`. Local and scoped registrations are shared by all views;
+a proxy registered through `register_remote_proxy` belongs to the view's owner. So two gears that
+consume the same contract each get a proxy built from their own `consumer_wiring.<dep>` settings
+(endpoint, timeout, retry, `require_tls`, pool), whatever the wiring order. `GearCtx::client_hub()`
+returns the gear's view, and `get`/`try_get` there return, in order: a local impl, the gear's own
+proxy, a process-wide proxy. A local impl registered after wiring still wins. A registration whose
+`owner_gear` is not a gear in the process (an SDK-level one such as cluster-sdk's) is wired into
+the plain hub, and its proxy is process-wide. One gear declaring the same contract twice would get
+one proxy for both declarations. The macro rejects that at compile time for declarations on one
+struct. The wire fn also refuses it at boot, but only on the remote path: with a co-located
+provider both declarations resolve to the local impl.
+
+**The short-circuit must use `try_get_local`, not `try_get`.** Proxies are stored apart from
+local registrations, and `try_get_local` sees only the latter. `try_get` also returns a
+process-wide proxy; reporting that as `Local` would mark the `DependencyChecker` entry resolved.
+The checker is sticky, so `/readyz` would go 200 with no provider up.
 
 Two details differ from the sketch this ADR originally carried, both load-bearing:
 
@@ -156,25 +187,30 @@ tolerated lazily by the resolving client.
 
 ### Runtime integration — proxy-wiring phase (`runtime/host_runtime.rs`)
 
-After establishing the `DirectoryClient` connection and before calling `gear.run()`, the bootstrap
-wires every `ConsumerRegistration` whose `owner_gear` matches the current gear, then spawns a
-resolve loop for those that bound remotely:
+After init and before post-init, the bootstrap wires every `ConsumerRegistration` into its owner's
+view of the hub, then spawns a resolve loop for the deps that bound through discovery:
 
 ```text
-for each ConsumerRegistration where owner_gear == this_gear:
-    (endpoint, tuning) = read_consumer_wiring(dep_gear)  // parsed ConsumerWiring
-    outcome = ConsumerRegistration.wire(client_hub, resolver_for(dep_gear, endpoint), tuning)?
-    if outcome == Local:
-        mark dep_gear readiness-resolved       // no directory probe at all
+for each ConsumerRegistration:
+    (endpoint, tuning) = read_consumer_wiring(owner_gear, dep_gear)  // parsed ConsumerWiring
+    hub = client_hub.for_gear(owner_gear) if owner_gear is a gear here, else client_hub
+    outcome = ConsumerRegistration.wire(hub, resolver_for(dep_gear, endpoint), tuning)?
+    if outcome == Local or endpoint is static:
+        resolve_now += dep_gear
     else:
-        spawn probe: loop with exponential backoff (100 ms → 200 ms → … → 30 s cap):
-            if DirectoryService.resolve_rest_service(dep_gear) is Ok:
-                mark dep_gear readiness-resolved
-                break
+        needs_probe += dep_gear
+
+mark readiness-resolved: resolve_now - needs_probe   // no directory probe at all
+spawn probe for needs_probe: loop with exponential backoff (100 ms → 200 ms → … → 30 s cap):
+    if DirectoryService.resolve_rest_service(dep_gear) is Ok:
+        mark dep_gear readiness-resolved
 
 when no dep_gear remains unresolved:
     state = ready   →   /readyz responds HTTP 200
 ```
+
+A dep is resolved at wiring time only when no consumer of it needs discovery: with one consumer on
+a static endpoint and another on discovery, the dep waits for the probe.
 
 Wiring happens once and up front; the probe only drives *readiness*, not the binding. The client
 registered for a `Remote` dep resolves its endpoint per call through the same
@@ -259,12 +295,11 @@ provider side's `client_wiring` (`toolkit::wiring::read_wiring`); it is never do
 bypassing the directory and readiness-resolved immediately (no probe loop). This is the dev/test
 escape hatch, logged at `warn!`. **`endpoint` omitted** → discovery is untouched; only tuning applies.
 
-The `<owner>` segment is `ConsumerRegistration::owner_gear`, which `#[toolkit::consumes]` derives as
-the **kebab-case of the annotated struct's ident** — a separate attribute cannot read the
-`name = "..."` given to `#[toolkit::gear]`. So `orders` above assumes `struct Orders`, and
-`api-contracts-consumer` assumes `struct ApiContractsConsumer`. If a gear's declared name is not the
-kebab form of its struct ident the key will not resolve; the proxy-wiring phase emits a `warn!`
-naming both rather than ignoring the override silently.
+The `<owner>` segment is `ConsumerRegistration::owner_gear`. `#[toolkit::consumes]` takes it from
+`name = "..."` of a `#[toolkit::gear]` written below it on the same struct; otherwise it uses the
+**kebab-case of the struct's ident** (`struct ApiContractsConsumer` → `api-contracts-consumer`).
+If `owner_gear` is not a registered gear, the key will not resolve; the proxy-wiring phase emits a
+`warn!` naming both rather than ignoring the override silently.
 
 Known limits of the escape hatch: exactly one address (no list, weights or failover), no fallback to
 the directory if that address is dead, no metadata or version predicate, and it is read once at

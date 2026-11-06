@@ -5,7 +5,6 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-#[cfg(feature = "cluster")]
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -402,6 +401,80 @@ async fn deleting_an_upstream_makes_its_alias_not_found_and_its_routes_unmatched
     )
     .await;
     not_found(&[lookup]).await;
+}
+
+/// With the database down, cached lookups keep resolving past the TTL from
+/// their stale entries: each reload is tried once, then not again for the
+/// retry window, while a lookup with nothing cached still fails. Once the
+/// database is back, the next reload after the window refreshes the
+/// entries. The clock is paused only while the outage keeps every
+/// statement from running.
+///
+/// ADR-0020: CACHE-FAIL-001, CACHE-STALE-010.
+#[tokio::test]
+async fn with_the_database_down_cached_lookups_outlive_the_ttl() {
+    use super::section::RETRY_WINDOW;
+    const TTL: Duration = Duration::from_secs(60);
+    let tenant = Uuid::new_v4();
+    let (db, recorder) = recorded_sqlite().await;
+    let stores = Stores::new(Backend::Db(db));
+    let outage = Outage::over(&stores);
+    let f = CachedPlanes::with_lifetimes(
+        Stores {
+            upstreams: outage.clone(),
+            routes: outage.clone(),
+            ..stores
+        },
+        recorder,
+        Arc::new(MockTenantResolverClient::single_tenant()),
+        TTL,
+        Duration::from_hours(1),
+    );
+    let ctx = provisioning_ctx(tenant).unwrap();
+    for host in ["api.example.com", "other.example.com"] {
+        let upstream = upstream_at(tenant, host);
+        f.cp.create_upstream(&ctx, upstream.request.clone())
+            .await
+            .unwrap();
+        f.cp.create_route(&ctx, route_on(&upstream, "/v1").request)
+            .await
+            .unwrap();
+    }
+    let v1 = Some(("POST", "/v1"));
+    let cached = (tenant, "api.example.com", v1);
+    let uncached = (tenant, "other.example.com", v1);
+    let served = f.cached(cached).await;
+    assert!(served.is_ok(), "{served:?}");
+
+    outage.set_down(true);
+    tokio::time::pause();
+    tokio::time::advance(TTL).await;
+    assert_eq!(resolve(&f.cp, cached).await, served, "served stale");
+    assert_eq!(
+        outage.failed(),
+        2,
+        "the alias and the route entry reloaded once"
+    );
+    assert_eq!(resolve(&f.cp, cached).await, served);
+    assert_eq!(outage.failed(), 2, "no reload in the retry window");
+    let miss = resolve(&f.cp, uncached).await;
+    assert!(
+        matches!(miss, Err(Failed(DomainError::Internal { .. }))),
+        "nothing cached: {miss:?}"
+    );
+
+    tokio::time::advance(RETRY_WINDOW).await;
+    let failed = outage.failed();
+    assert_eq!(resolve(&f.cp, cached).await, served, "still served stale");
+    assert_eq!(outage.failed(), failed + 2, "reloaded after the window");
+
+    tokio::time::advance(RETRY_WINDOW).await;
+    tokio::time::resume();
+    outage.set_down(false);
+    let failed = outage.failed();
+    assert_eq!(resolve(&f.cp, cached).await, served);
+    assert_eq!(outage.failed(), failed, "the database answered the reload");
+    assert_eq!(f.cached(cached).await, served, "fresh again: a hit");
 }
 
 /// Repositories that pass every call on to `upstreams` and `routes` while

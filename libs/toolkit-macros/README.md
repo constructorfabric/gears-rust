@@ -34,7 +34,9 @@ Parameters:
 - **`lifecycle(...)`** (optional, used for `stateful` gears)
   - `entry = "serve"` (default: `"serve"`)
   - `stop_timeout = "30s"` (default: `"30s"`; supports `ms`, `s`, `m`, `h`)
+  - `stop_timeout_fn = "method_name"` (mutually exclusive with `stop_timeout`; computes the timeout from the gear at stop)
   - `await_ready` / `await_ready = true|false` (default: `false`)
+  - `ready_warn_after = "90s"` (optional; requires `await_ready`, else a compile error) — non-fatal readiness warning period; expiry logs an error but keeps waiting. Default 60s.
 
 Example (stateful, no ready gating):
 
@@ -90,7 +92,9 @@ Parameters:
 
 - **`method = "serve"`** (required)
 - **`stop_timeout = "30s"`** (optional)
+- **`stop_timeout_fn = "method_name"`** (optional; mutually exclusive with `stop_timeout`)
 - **`await_ready` / `await_ready = true|false`** (optional)
+- **`ready_warn_after = "90s"`** (optional; requires `await_ready`, else a compile error) — non-fatal readiness warning period
 
 Notes:
 

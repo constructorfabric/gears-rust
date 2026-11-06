@@ -496,6 +496,30 @@ fn panic_message(panic: &(dyn std::any::Any + Send)) -> String {
 // Router assembly
 // ---------------------------------------------------------------------------
 
+/// Before the application group started, serve only platform-plane and
+/// anonymous routes: a tenant-plane route (and an unknown path) replies `503`
+/// rather than run without a tenant authenticator.
+async fn bootstrap_plane_gate(
+    State(policy): State<Arc<RouteAuthPolicy>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let auth = request
+        .extensions()
+        .get::<axum::extract::MatchedPath>()
+        .and_then(|path| policy.resolve(request.method(), path.as_str()));
+    match auth {
+        Some(toolkit_security::RouteAuth::Platform | toolkit_security::RouteAuth::Anonymous) => {
+            next.run(request).await
+        }
+        _ => CanonicalError::service_unavailable()
+            .with_retry_after_seconds(STARTING_RETRY_AFTER_SECONDS)
+            .with_detail("tenant-plane routes are served once the application group has started")
+            .create()
+            .into_response(),
+    }
+}
+
 /// Derive the listener policy from [`OperationSpec::auth`].
 pub(super) fn route_auth_policy<S>(specs: impl IntoIterator<Item = S>) -> RouteAuthPolicy
 where
@@ -512,6 +536,7 @@ where
 fn layer_gear_router(
     gear_router: Router,
     route_auth: RouteAuthPolicy,
+    tenant_plane: TenantPlane,
     drain_guard: DrainGuard,
     options: &OopServeOptions,
 ) -> Router {
@@ -520,13 +545,18 @@ fn layer_gear_router(
     // without an internal authenticator, tenant and unlisted routes without a bearer
     // authenticator (unless `auth_disabled`). `check_route_auth` refuses to start
     // before that can happen for a declared tenant operation.
-    let mut gear = layer_route_auth_with(
+    let gear = layer_route_auth_with(
         gear_router,
         route_auth,
-        options.tenant_plane(),
+        tenant_plane,
         options.internal_authenticator.clone(),
     );
+    layer_serving(gear, drain_guard)
+}
 
+/// The layers every served gear router gets outside its auth stack: drain guard,
+/// canonical errors and the trace context.
+fn layer_serving(mut gear: Router, drain_guard: DrainGuard) -> Router {
     // Drain guard sits just inside the canonical-error layer: it rejects new
     // requests while draining and tracks the in-flight count (catching handler
     // panics so the counter can never leak and stall the drain).
@@ -685,7 +715,33 @@ pub(super) struct OopHttpServer {
     options: OopServeOptions,
     cancel: CancellationToken,
     registration_task: Option<tokio::task::JoinHandle<()>>,
-    serve: tokio::task::JoinHandle<anyhow::Result<()>>,
+    /// The `OpenAPI` document `registration_task` registers, and the channel
+    /// replacing its registration info.
+    presence_openapi: Option<Arc<str>>,
+    presence_updates: Option<tokio::sync::watch::Sender<RegisterInstanceInfo>>,
+    /// Presence of co-hosted provider gears other than `options.gear_name`
+    /// (the system group's, published before the application group), each
+    /// deregistered on [`join`](Self::join) like the root's.
+    provider_presence: Vec<(String, tokio::task::JoinHandle<()>)>,
+    /// Taken by [`join`](Self::join); aborted by `Drop` otherwise.
+    serve: Option<tokio::task::JoinHandle<anyhow::Result<()>>>,
+}
+
+/// Dropped without [`join`](OopHttpServer::join) — the lifecycle future was
+/// dropped — the server closes its listeners and presence instead of
+/// outliving the runtime.
+impl Drop for OopHttpServer {
+    fn drop(&mut self) {
+        if let Some(task) = self.registration_task.take() {
+            task.abort();
+        }
+        for (_, task) in self.provider_presence.drain(..) {
+            task.abort();
+        }
+        if let Some(serve) = self.serve.take() {
+            serve.abort();
+        }
+    }
 }
 
 impl OopHttpServer {
@@ -762,7 +818,10 @@ impl OopHttpServer {
             options,
             cancel,
             registration_task: None,
-            serve,
+            presence_openapi: None,
+            presence_updates: None,
+            provider_presence: Vec::new(),
+            serve: Some(serve),
         })
     }
 
@@ -831,13 +890,42 @@ impl OopHttpServer {
         Ok(())
     }
 
-    /// Check the route policy ([`Self::check_route_auth`]), then atomically publish the
-    /// composed gear routes (with auth policy) and their `OpenAPI` document, then start
-    /// background directory presence.
+    /// Serve system platform-plane and anonymous routes before application startup;
+    /// tenant routes and unknown paths return `503` until tenant auth is installed.
+    /// Does not mark startup complete or advertise; see [`start_presence`](Self::start_presence).
+    pub(super) fn publish_bootstrap_routes(
+        &mut self,
+        gear_router: Router,
+        openapi_json: String,
+        route_auth: RouteAuthPolicy,
+    ) {
+        // The outer gate blocks tenant calls. Keep anonymous contexts anonymous,
+        // even with `auth_disabled`; install tenant auth with the final routes.
+        let authenticated = layer_route_auth_with(
+            gear_router,
+            route_auth.clone(),
+            TenantPlane::Absent,
+            self.options.internal_authenticator.clone(),
+        );
+        let gated = authenticated.layer(from_fn_with_state(
+            Arc::new(route_auth),
+            bootstrap_plane_gate,
+        ));
+        let layered = layer_serving(gated, self.drain_guard.clone());
+        self.late.publish(layered, Arc::from(openapi_json));
+        tracing::info!(
+            gear = %self.options.gear_name,
+            "OoP system routes attached (platform plane only)"
+        );
+    }
+
+    /// Atomically publish the composed gear routes (with auth policy) and their
+    /// `OpenAPI` document on the bound listener, replacing the bootstrap
+    /// routes, and mark startup complete.
     ///
-    /// Presence (registration + heartbeat + self-heal) starts only once the gear
-    /// can serve requests, so discovery never advertises a not-yet-serving instance.
-    /// Dependency resolution runs in the proxy-wiring phase before serving.
+    /// Dependency resolution runs in the proxy-wiring phase before serving;
+    /// directory presence is started separately by
+    /// [`start_presence`](Self::start_presence).
     ///
     /// # Errors
     /// When the route policy fails [`Self::check_route_auth`]; nothing is published.
@@ -850,37 +938,89 @@ impl OopHttpServer {
         // A declared operation whose plane has no validator would refuse every request;
         // stop here, before serving, and say why.
         self.check_route_auth(&route_auth)?;
-        let openapi_arc: Arc<str> = Arc::from(openapi_json);
         let layered = layer_gear_router(
             gear_router,
             route_auth,
+            self.options.tenant_plane(),
             self.drain_guard.clone(),
             &self.options,
         );
-        self.late.publish(layered, Arc::clone(&openapi_arc));
+        self.late.publish(layered, Arc::from(openapi_json));
         self.readiness.mark_startup_complete();
         tracing::info!(gear = %self.options.gear_name, "OoP gear routes attached (now serving)");
+        Ok(())
+    }
 
-        // Single directory-presence task: registration + heartbeat + self-heal.
-        // Dependency resolution is handled by the proxy-wiring phase (typed
-        // `#[toolkit::consumes]` clients), which runs before serving.
+    /// Start directory registration, heartbeats and self-heal with the current
+    /// `OpenAPI` document. Later calls register a changed document without
+    /// interrupting heartbeats, so gateway discovery sees the newly served routes.
+    /// An unchanged document is a no-op.
+    pub(super) fn start_presence(&mut self) {
+        let openapi = self.late.openapi();
+        if let Some(updates) = &self.presence_updates {
+            if self.presence_openapi != openapi {
+                updates.send_replace(self.registration_info(openapi.as_ref()));
+                self.presence_openapi = openapi;
+            }
+            return;
+        }
+        let registration_info = self.registration_info(openapi.as_ref());
+        self.presence_openapi = openapi;
+        let (updates, presence) = tokio::sync::watch::channel(registration_info);
+        self.presence_updates = Some(updates);
+        let directory = Arc::clone(&self.options.directory);
+        let heartbeat_interval = self.options.heartbeat_interval;
+        let cancel = self.cancel.clone();
+        self.registration_task = Some(tokio::spawn(async move {
+            super::oop_registration::presence_loop_with_updates(
+                directory,
+                presence,
+                heartbeat_interval,
+                cancel,
+            )
+            .await;
+        }));
+    }
+
+    /// The advertised gear's registration, with `openapi`.
+    fn registration_info(&self, openapi: Option<&Arc<str>>) -> RegisterInstanceInfo {
         let mut registration_info = RegisterInstanceInfo::new(
             self.options.gear_name.clone(),
             self.options.instance_id.clone(),
         )
         .with_rest_endpoint(ServiceEndpoint::new(self.options.advertise_uri.clone()))
-        .with_openapi_spec(openapi_arc.to_string())
         .with_labels(self.options.labels.clone());
+        if let Some(openapi) = openapi {
+            registration_info = registration_info.with_openapi_spec(openapi.to_string());
+        }
         if let Some(version) = self.options.version.clone() {
             registration_info = registration_info.with_version(version);
         }
-        self.registration_task = Some(tokio::spawn(super::oop_registration::presence_loop(
-            Arc::clone(&self.options.directory),
-            registration_info,
-            self.options.heartbeat_interval,
-            self.cancel.clone(),
-        )));
-        Ok(())
+        registration_info
+    }
+
+    /// Advertise a co-hosted provider at this listener's URL and instance id,
+    /// even while the root starts. Uses normal directory retries and heartbeats.
+    pub(super) fn start_provider_presence(&mut self, gear: String) {
+        if gear == self.options.gear_name
+            || self.provider_presence.iter().any(|(name, _)| *name == gear)
+        {
+            return;
+        }
+        let mut info = RegisterInstanceInfo::new(gear.clone(), self.options.instance_id.clone())
+            .with_rest_endpoint(ServiceEndpoint::new(self.options.advertise_uri.clone()))
+            .with_labels(self.options.labels.clone());
+        if let Some(version) = self.options.version.clone() {
+            info = info.with_version(version);
+        }
+        let directory = Arc::clone(&self.options.directory);
+        let heartbeat_interval = self.options.heartbeat_interval;
+        let cancel = self.cancel.clone();
+        let task = tokio::spawn(async move {
+            super::oop_registration::presence_loop(directory, info, heartbeat_interval, cancel)
+                .await;
+        });
+        self.provider_presence.push((gear, task));
     }
 
     /// Wait for the server to drain on shutdown, then deregister from
@@ -890,13 +1030,29 @@ impl OopHttpServer {
     /// # Errors
     /// Propagates a serve error; deregistration failures are logged only.
     pub(super) async fn join(mut self) -> anyhow::Result<()> {
-        let serve_result = match self.serve.await {
+        // Awaited in place: if this future is dropped, `Drop` still aborts it.
+        let Some(serve) = self.serve.as_mut() else {
+            anyhow::bail!("OoP serve task already joined");
+        };
+        let serve_result = match serve.await {
             Ok(r) => r,
             Err(e) => Err(anyhow::anyhow!("OoP serve task join error: {e}")),
         };
+        self.serve = None;
 
         if let Some(task) = self.registration_task.take() {
             task.abort();
+        }
+        for (gear, task) in std::mem::take(&mut self.provider_presence) {
+            task.abort();
+            if let Err(e) = self
+                .options
+                .directory
+                .deregister_instance(&gear, &self.options.instance_id)
+                .await
+            {
+                tracing::warn!(gear, error = %e, "deregistration from DirectoryService failed on shutdown");
+            }
         }
         if let Err(e) = self
             .options

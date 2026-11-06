@@ -4,7 +4,7 @@ gdl_version = "1.0"
 #
 # Gearbox product metadata for the License Resolver.
 #
-# Projected from #[toolkit::gear]: id, runtime_caps (system), colocated_deps
+# Projected from #[toolkit::gear]: id, runtime_caps (rest), colocated_deps
 # (types-registry). The same host shape as tenant-resolver: one `vendor`
 # selector choosing which registered plugin answers.
 

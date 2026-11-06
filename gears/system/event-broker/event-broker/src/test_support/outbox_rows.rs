@@ -20,3 +20,19 @@ pub async fn outbox_queue_partitions(dsn: &str) -> i64 {
     .try_get::<i64>("", "n")
     .expect("a count")
 }
+
+/// How many message bodies the outbox in the database at `dsn` holds, read
+/// over a connection of its own.
+pub async fn outbox_bodies(dsn: &str) -> i64 {
+    let conn = sea_orm::Database::connect(dsn).await.expect("connect");
+    conn.query_one(
+        Query::select()
+            .expr_as(Expr::col(Alias::new("id")).count(), "n")
+            .from(Alias::new(format!("{OUTBOX_TABLE_PREFIX}_body"))),
+    )
+    .await
+    .expect("read the outbox bodies")
+    .expect("a count row")
+    .try_get::<i64>("", "n")
+    .expect("a count")
+}

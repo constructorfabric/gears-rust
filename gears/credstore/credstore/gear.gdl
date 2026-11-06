@@ -4,8 +4,8 @@ gdl_version = "1.0"
 #
 # Gearbox product metadata for the credstore gear.
 #
-# Projected from #[toolkit::gear]: id, runtime_caps (system, db, rest,
-# stateful), colocated_deps (authz-resolver, tenant-resolver, types-registry)
+# Projected from #[toolkit::gear]: id, runtime_caps (db, rest, stateful),
+# colocated_deps (authz-resolver, tenant-resolver, types-registry)
 # and the lifecycle clause.
 
 

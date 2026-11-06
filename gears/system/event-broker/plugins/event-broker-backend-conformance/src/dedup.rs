@@ -53,8 +53,8 @@ pub async fn dedup_turns_a_retry_into_a_duplicate(harness: &dyn Harness) {
     .await;
 
     assert!(
-        !matches!(first, Appended::Duplicate),
-        "the first append is no duplicate"
+        matches!(first, Appended::Heads(_)),
+        "a fresh Sync append answers Heads: {first:?}"
     );
     assert_eq!(retry, Appended::Duplicate);
     assert_eq!(
@@ -127,7 +127,7 @@ pub async fn dedup_accepts_gaps(harness: &dyn Harness) {
     )
     .await;
 
-    assert!(!matches!(after_gap, Appended::Duplicate));
+    assert!(matches!(after_gap, Appended::Heads(_)), "{after_gap:?}");
     assert_eq!(
         keys_and_ns(&wait_for_count(backend.as_ref(), &at, 2).await),
         [("k".to_owned(), 3), ("k".to_owned(), 7)]
@@ -172,7 +172,7 @@ pub async fn dedup_keeps_keys_apart(harness: &dyn Harness) {
     ];
 
     assert!(
-        answers.iter().all(|a| !matches!(a, Appended::Duplicate)),
+        answers.iter().all(|a| matches!(a, Appended::Heads(_))),
         "{answers:?}"
     );
     assert_eq!(

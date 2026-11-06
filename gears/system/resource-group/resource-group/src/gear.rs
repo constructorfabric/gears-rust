@@ -16,7 +16,8 @@ use toolkit_db::DbError;
 use tracing::info;
 
 use crate::api::rest::routes;
-use crate::domain::group_service::{GroupService, QueryProfile};
+use crate::config::ResourceGroupConfig;
+use crate::domain::group_service::{GroupService, QueryProfile, TenantTypes};
 use crate::domain::membership_service::MembershipService;
 use crate::domain::read_service::RgReadService;
 use crate::domain::rg_service::RgService;
@@ -67,6 +68,13 @@ impl Default for ResourceGroup {
 #[async_trait]
 impl Gear for ResourceGroup {
     async fn init(&self, ctx: &GearCtx) -> anyhow::Result<()> {
+        let cfg: ResourceGroupConfig = ctx.config_or_default()?;
+        cfg.validate()?;
+        info!(
+            tenant_type_paths = ?cfg.tenant_type_paths,
+            "Loaded resource-group configuration"
+        );
+
         // Acquire DB capability (secure wrapper)
         let db: Arc<DBProvider<DbError>> = Arc::new(ctx.db_required()?);
 
@@ -119,7 +127,8 @@ impl Gear for ResourceGroup {
             )
             .with_metrics(Arc::new(
                 crate::infra::metrics::RgMetricsMeter::from_global(),
-            )),
+            ))
+            .with_tenant_types(TenantTypes::new(cfg.tenant_type_paths)),
         );
 
         self.group_service

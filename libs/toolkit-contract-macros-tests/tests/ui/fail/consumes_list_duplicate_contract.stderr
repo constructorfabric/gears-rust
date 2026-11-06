@@ -1,0 +1,5 @@
+error: contract is listed more than once
+ --> tests/ui/fail/consumes_list_duplicate_contract.rs:9:46
+  |
+9 | #[consumes(from = "bar", contract = [FooApi, FooApi(from = "baz")])]
+  |                                              ^^^^^^

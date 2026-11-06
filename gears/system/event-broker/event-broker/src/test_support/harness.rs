@@ -7,7 +7,7 @@ use event_broker_sdk::EventBrokerApi;
 use toolkit::client_hub::ClientHub;
 use toolkit_db::outbox::{Outbox, Partitions};
 use toolkit_security::SecurityContext;
-use types_registry_sdk::testing::{MockTypesRegistryClient, make_test_instance};
+use types_registry_sdk::PlatformTypesRegistryApi;
 use uuid::Uuid;
 
 use crate::api::rest::routes::test_router;
@@ -17,7 +17,7 @@ use crate::domain::delivery::DeliveryService;
 use crate::domain::ingest::IngestService;
 use crate::domain::local_broker::LocalBroker;
 use crate::domain::outbox::{INGEST_QUEUE_NAME, OUTBOX_TABLE_PREFIX, OutboxPartitions};
-use crate::domain::specification::SpecificationManager;
+use crate::domain::specification::{ProvisioningLimits, SpecificationManager, TopicState};
 use crate::infra::metrics::IngestMetrics;
 use crate::infra::specification::TypesRegistrySpecificationManager;
 use crate::infra::storage::Storage;
@@ -28,7 +28,7 @@ use event_broker_sdk::backend::Backend;
 use memory_event_broker_plugin::MemoryBackend;
 
 /// Seeds a `TypesRegistrySpecificationManager` from `registry`'s
-/// `Topic`/`EventType` fixtures via a `MockTypesRegistryClient`, run through
+/// `Topic`/`EventType` fixtures via a `MockTypesRegistry`, run through
 /// the same startup bulk-load path production uses (`module.rs::serve()`) -
 /// not a direct in-memory insert, so harness-backed tests exercise the real
 /// `types-registry`-to-cache pipeline (eb-single-process-implementation D2
@@ -37,35 +37,30 @@ async fn seeded_spec_manager(
     db: Arc<toolkit_db::DBProvider<toolkit_db::DbError>>,
     registry: Option<super::type_registry::StaticTypesRegistry>,
     live: Option<(
-        Arc<dyn types_registry_sdk::TypesRegistryClient>,
+        Arc<dyn PlatformTypesRegistryApi>,
         crate::config::EventBrokerConfig,
     )>,
 ) -> Arc<dyn SpecificationManager> {
-    // A caller-supplied registry client (for example the real `types-registry` service another
-    // gear registered its contract into) is loaded unchanged, under that deployment's config.
+    // A caller-supplied registry client (for example one holding another gear's own contract) is
+    // loaded unchanged, under that deployment's config.
     if let Some((client, config)) = live {
         crate::infra::specification::bulk_load(&client, &db, &config)
             .await
             .expect("SpecificationManager bulk-load must not fail");
         return Arc::new(TypesRegistrySpecificationManager::new(db));
     }
-    let mut instances = Vec::new();
-    let (schemas, config) = if let Some(registry) = registry {
-        for document in registry.topics {
-            let id = document["id"]
-                .as_str()
-                .expect("a topic document names its id");
-            instances.push(make_test_instance(id, document.clone()));
-        }
-        (registry.event_types, registry.config)
+    let (client, config): (Arc<dyn PlatformTypesRegistryApi>, _) = if let Some(registry) = registry
+    {
+        (
+            registry_holding(&registry.topics, &registry.event_types),
+            registry.config,
+        )
     } else {
-        (Vec::new(), StaticTypesRegistry::empty_config())
+        (
+            registry_holding(&[], &[]),
+            StaticTypesRegistry::empty_config(),
+        )
     };
-    let client: Arc<dyn types_registry_sdk::TypesRegistryClient> = Arc::new(
-        MockTypesRegistryClient::new()
-            .with_instances(instances)
-            .with_type_schemas(schemas),
-    );
     crate::infra::specification::bulk_load(&client, &db, &config)
         .await
         .expect("SpecificationManager bulk-load must not fail");
@@ -89,12 +84,13 @@ async fn start_outbox(
     spec_manager: Arc<dyn SpecificationManager>,
     storage: &Storage,
     provisioning: Provisioning,
+    limits: ProvisioningLimits,
     outbox_partitions: OutboxPartitions,
 ) -> (Arc<dyn BackendResolver>, toolkit_db::outbox::OutboxHandle) {
     let backend_resolver: Arc<dyn BackendResolver> = Arc::new(SingleBackendResolver::new(backend));
     if provisioning == Provisioning::AtStart {
         spec_manager
-            .provision_topics(backend_resolver.as_ref(), PROVISIONING_LIMITS)
+            .provision_topics(backend_resolver.as_ref(), limits)
             .await;
     }
 
@@ -130,15 +126,14 @@ enum Provisioning {
     Deferred,
 }
 
-const PROVISIONING_LIMITS: crate::domain::specification::ProvisioningLimits =
-    crate::domain::specification::ProvisioningLimits {
-        call_timeout: std::time::Duration::from_secs(5),
-        attempt_timeout: std::time::Duration::from_mins(5),
-    };
+const PROVISIONING_LIMITS: ProvisioningLimits = ProvisioningLimits {
+    call_timeout: std::time::Duration::from_secs(5),
+    attempt_timeout: std::time::Duration::from_mins(5),
+};
 
 use super::api_v1::ApiV1;
 use super::authz_doubles::AllowAllAuthZ;
-use super::type_registry::StaticTypesRegistry;
+use super::type_registry::{StaticTypesRegistry, registry_holding};
 
 /// Arms/disarms the publish faults on a [`FaultInjectingIngest`]. Cloneable and
 /// cheap - the harness keeps one and hands it out via
@@ -206,7 +201,7 @@ impl IngestService for FaultInjectingIngest {
         &self,
         ctx: &SecurityContext,
         requests: Vec<crate::domain::ingest::PublishRequest>,
-    ) -> Result<crate::domain::ingest::BatchResult, crate::domain::error::DomainError> {
+    ) -> Result<crate::domain::ingest::BatchAck, crate::domain::error::DomainError> {
         if self.faults.rate_limited() {
             return Err(Self::rate_limit_error());
         }
@@ -234,7 +229,7 @@ impl IngestService for FaultInjectingIngest {
         &self,
         ctx: &SecurityContext,
         producer_id: Uuid,
-        scope: crate::domain::ingest::ProducerResetScope,
+        scope: crate::domain::producer_reset::ProducerResetScope,
     ) -> Result<(), crate::domain::error::DomainError> {
         self.inner.reset_producer(ctx, producer_id, scope).await
     }
@@ -300,6 +295,7 @@ pub struct EventBrokerHarness {
     /// What [`EventBrokerHarness::provision_topics`] drives.
     spec_manager: Arc<dyn SpecificationManager>,
     backend_resolver: Arc<dyn BackendResolver>,
+    provisioning_limits: ProvisioningLimits,
 }
 
 impl Drop for EventBrokerHarness {
@@ -334,6 +330,19 @@ impl EventBrokerHarness {
     /// with, read from the outbox's own table.
     pub async fn outbox_queue_partitions(&self) -> i64 {
         crate::test_support::outbox_queue_partitions(&self.dsn).await
+    }
+
+    /// How many message bodies the outbox holds. A body stays until its event
+    /// is on the backend, so an accepted event shows up here or in
+    /// [`backend`](Self::backend).
+    pub async fn outbox_bodies(&self) -> i64 {
+        crate::test_support::outbox_rows::outbox_bodies(&self.dsn).await
+    }
+
+    /// Test fault injection: drops `table` from the metadata database, so every
+    /// later read of it fails while the rest of the database keeps working.
+    pub async fn drop_metadata_table(&self, table: &str) {
+        crate::test_support::tables::drop_table(&self.dsn, table).await;
     }
 
     #[must_use]
@@ -378,13 +387,12 @@ impl EventBrokerHarness {
         &self.ctx
     }
 
-    /// Test fault injection: forget a producer's server-side registration, the
-    /// state the registration Reaper (a future ticket) or a `P30D` age-out
-    /// leaves behind. Afterwards the `producer_id` resolves to nothing, so the
-    /// next publish naming it is a `404 ProducerNotFound`; a managed producer
-    /// with `on_unknown = RegisterNew` recovers by rotating to a fresh
-    /// registration. There is no client-facing deregister to drive this through,
-    /// which is why it is a harness hook rather than an API call.
+    /// Test fault injection: forget a producer's registration row, as the registration Reaper (not
+    /// yet implemented, tracked in #5651) does on a `P30D` age-out; unlike the Reaper, it leaves
+    /// the producer's chain rows in place. Afterwards the `producer_id` resolves to nothing, so the
+    /// next publish naming it is a `404 ProducerNotFound`; a managed producer recovers by
+    /// registering a replacement for that partition and retrying. There is no client-facing
+    /// deregister to drive this through, which is why it is a harness hook rather than an API call.
     pub async fn forget_producer(&self, producer_id: uuid::Uuid) {
         self.storage
             .delete_producer_registration(producer_id)
@@ -406,8 +414,21 @@ impl EventBrokerHarness {
     /// [`without_provisioning`](EventBrokerHarnessBuilder::without_provisioning).
     pub async fn provision_topics(&self) {
         self.spec_manager
-            .provision_topics(self.backend_resolver.as_ref(), PROVISIONING_LIMITS)
+            .provision_topics(self.backend_resolver.as_ref(), self.provisioning_limits)
             .await;
+    }
+
+    /// Where `topic` stands on its storage backend, read from its binding
+    /// record.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `topic` is not a valid topic id or the record does not read.
+    pub async fn topic_state(&self, topic: &str) -> Option<TopicState> {
+        self.spec_manager
+            .topic_state(&toolkit_gts::GtsInstanceId::try_new(topic).expect("a valid topic id"))
+            .await
+            .expect("the topic binding reads")
     }
 
     pub fn router(&self) -> &axum::Router {
@@ -438,12 +459,13 @@ impl EventBrokerHarness {
 pub struct EventBrokerHarnessBuilder {
     type_registry: Option<StaticTypesRegistry>,
     types_registry_client: Option<(
-        Arc<dyn types_registry_sdk::TypesRegistryClient>,
+        Arc<dyn PlatformTypesRegistryApi>,
         crate::config::EventBrokerConfig,
     )>,
     policy_enforcer: Option<PolicyEnforcer>,
     heartbeat: Option<std::time::Duration>,
     provisioning: Provisioning,
+    provisioning_limits: Option<ProvisioningLimits>,
     outbox_partitions: Option<OutboxPartitions>,
     gear_db: GearDb,
     backend: Option<Arc<dyn Backend>>,
@@ -482,17 +504,17 @@ impl EventBrokerHarnessBuilder {
         self
     }
 
-    /// Loads topics and event types from `client` - typically the real `types-registry`
-    /// service a producing gear registered its own contract into - through the same startup
-    /// bulk-load production runs, instead of from static fixtures. `topic_partitions` is the
-    /// deployment's per-topic partition configuration, since a topic carries no count.
+    /// Loads topics and event types from `client` - typically a registry holding a producing gear's
+    /// own contract - through the same startup bulk-load production runs, instead of from static
+    /// fixtures. `topic_partitions` is the deployment's per-topic partition configuration, since a
+    /// topic carries no count.
     ///
     /// # Panics
     /// Panics if the partition configuration does not deserialize.
     #[must_use]
     pub fn with_types_registry_client(
         mut self,
-        client: Arc<dyn types_registry_sdk::TypesRegistryClient>,
+        client: Arc<dyn PlatformTypesRegistryApi>,
         topic_partitions: &[(&str, u32)],
     ) -> Self {
         let topics: serde_json::Map<String, serde_json::Value> = topic_partitions
@@ -534,6 +556,14 @@ impl EventBrokerHarnessBuilder {
         self
     }
 
+    /// The bounds every provisioning pass works within, in place of
+    /// `PROVISIONING_LIMITS`, for a test that waits out an abandoned attempt.
+    #[must_use]
+    pub fn with_provisioning_limits(mut self, limits: ProvisioningLimits) -> Self {
+        self.provisioning_limits = Some(limits);
+        self
+    }
+
     /// Overrides the default always-allow `PolicyEnforcer` (default:
     /// `AllowAllAuthZ`) - for tests asserting a specific authz denial.
     #[must_use]
@@ -566,6 +596,7 @@ impl EventBrokerHarnessBuilder {
         storage.set_cache(cluster.cache);
 
         let outbox_partitions = self.outbox_partitions.unwrap_or_default();
+        let provisioning_limits = self.provisioning_limits.unwrap_or(PROVISIONING_LIMITS);
         // The backend's own event log, not the harness's `db`: that database
         // keeps the metadata behind `Storage` and the ingest outbox, and events
         // are not metadata. In memory unless the test names one, because a
@@ -579,6 +610,7 @@ impl EventBrokerHarnessBuilder {
             Arc::clone(&spec_manager),
             &storage,
             self.provisioning,
+            provisioning_limits,
             outbox_partitions,
         )
         .await;
@@ -688,6 +720,7 @@ impl EventBrokerHarnessBuilder {
             publish_faults,
             spec_manager,
             backend_resolver,
+            provisioning_limits,
         }
     }
 }

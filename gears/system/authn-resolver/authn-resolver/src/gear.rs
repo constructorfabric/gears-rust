@@ -6,7 +6,6 @@ use async_trait::async_trait;
 use authn_resolver_sdk::{AuthNResolverBearerAuthenticator, AuthNResolverClient};
 use toolkit::Gear;
 use toolkit::context::GearCtx;
-use toolkit::contracts::SystemCapability;
 use toolkit_security::DynBearerAuthenticator;
 use tracing::info;
 
@@ -26,7 +25,6 @@ use crate::domain::{AuthNResolverLocalClient, Service};
 #[toolkit::gear(
     name = "authn-resolver",
     deps = [types_registry],
-    capabilities = [system]
 )]
 pub(crate) struct AuthNResolver {
     service: OnceLock<Arc<Service>>,
@@ -39,11 +37,6 @@ impl Default for AuthNResolver {
         }
     }
 }
-
-// Marked as `system` so that init() runs in the system-gear phase.
-// This ensures the AuthNResolver client is available in ClientHub before
-// other system gears that depend on it.
-impl SystemCapability for AuthNResolver {}
 
 #[async_trait]
 impl Gear for AuthNResolver {

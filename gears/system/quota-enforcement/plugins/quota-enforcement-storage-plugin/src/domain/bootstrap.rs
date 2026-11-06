@@ -236,6 +236,9 @@ impl FromStore for StorageError {
             StoreError::ThresholdsRequireBoundedCap => Self::ThresholdsRequireBoundedCap,
             StoreError::SubjectOutOfScope => Self::SubjectOutOfScope,
             StoreError::InvalidCursor => Self::InvalidCursor,
+            StoreError::IdempotencyPayloadMismatch => Self::IdempotencyPayloadMismatch,
+            StoreError::ContentionTimeout => Self::LeaseContentionTimeout,
+            StoreError::BulkItem { index, cause } => Self::from_store(*cause).at_item(index),
             StoreError::DefaultOutOfRange { .. }
             | StoreError::InvalidPatch { .. }
             | StoreError::InvalidFilter { .. }

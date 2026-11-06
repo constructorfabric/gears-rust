@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use uuid::Uuid;
 
-use super::{AliasKey, CachedProxyConfigReader, Change, ProxyConfigCache};
+use super::{AliasKey, CachedProxyConfigReader, Change, ProxyConfigCache, StaleHealth};
 use crate::domain::gts_helpers::HTTP_PROTOCOL_ID;
 use crate::domain::model::{
     Endpoint, HttpMatch, HttpMethod, ManagedBy, MatchRules, PathSuffixMode, Route, Scheme, Server,
@@ -28,6 +28,7 @@ fn fixture() -> Fixture {
 fn fixture_holding(max_entries: usize) -> Fixture {
     let cache = Arc::new(ProxyConfigCache::new(
         Duration::from_secs(60),
+        Duration::ZERO,
         max_entries,
         Arc::new(NoopMetrics),
     ));
@@ -232,4 +233,49 @@ async fn a_full_alias_section_keeps_an_alias_read_in_between() {
     }
     assert_eq!(f.cache.aliases.len(), 2);
     f.cache.aliases.assert_consistent();
+}
+
+/// `Degraded` with `proxy_cache_serving_stale` for 30 s after a stale
+/// answer, then healthy again.
+///
+/// ADR-0020: CACHE-STALE-011.
+#[tokio::test(start_paused = true)]
+async fn the_health_check_reports_stale_answers_for_thirty_seconds() {
+    use futures_util::FutureExt;
+    use toolkit::{Healthcheck, HealthcheckStatus};
+
+    use crate::domain::repo::RepositoryError;
+
+    let ttl = Duration::from_secs(60);
+    let cache = Arc::new(ProxyConfigCache::new(
+        ttl,
+        Duration::from_hours(1),
+        10,
+        Arc::new(NoopMetrics),
+    ));
+    let health = StaleHealth(Arc::clone(&cache));
+    let key = AliasKey {
+        alias: "api.example.com".into(),
+        chain: vec![Uuid::new_v4()],
+    };
+    let ok = |_| async { Ok(vec![upstream(Uuid::new_v4(), "api.example.com")]) }.boxed();
+    let down = |_| async { Err(RepositoryError::Internal("database down".into())) }.boxed();
+
+    cache.aliases.get_or_load(key.clone(), ok).await.unwrap();
+    assert_eq!(health.check().await.status, HealthcheckStatus::Healthy);
+
+    tokio::time::advance(ttl).await;
+    cache
+        .aliases
+        .get_or_load(key, down)
+        .await
+        .expect("served stale");
+    let degraded = health.check().await;
+    assert_eq!(degraded.status, HealthcheckStatus::Degraded);
+    assert_eq!(degraded.code.as_deref(), Some("proxy_cache_serving_stale"));
+
+    tokio::time::advance(Duration::from_secs(29)).await;
+    assert_eq!(health.check().await.status, HealthcheckStatus::Degraded);
+    tokio::time::advance(Duration::from_secs(1)).await;
+    assert_eq!(health.check().await.status, HealthcheckStatus::Healthy);
 }

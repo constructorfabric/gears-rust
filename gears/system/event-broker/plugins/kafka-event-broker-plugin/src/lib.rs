@@ -40,6 +40,8 @@ mod names_tests;
 #[cfg(test)]
 mod provision_tests;
 #[cfg(test)]
+mod read_tests;
+#[cfg(test)]
 mod records_tests;
 #[cfg(test)]
 mod settings_tests;
