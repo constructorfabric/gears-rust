@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use toolkit_canonical_errors::CanonicalError;
-use types_registry_sdk::testing_platform::{Call, Fault, MockTypesRegistry, ProtocolFault};
+use types_registry_sdk::testing_platform::{Call, Fault, MockTypesRegistry, ProtocolFault, Seed};
 use types_registry_sdk::{PlatformTypesRegistryApi, TypesRegistryApi};
 
 use super::RegistryTypeCatalog;
@@ -54,6 +54,39 @@ async fn known_types_reports_only_registered_type_identifiers() {
         .unwrap();
     assert_eq!(known, std::collections::HashSet::from([WIDGET.to_owned()]));
     assert_eq!(registry.platform_calls(Call::BatchGet), 1);
+}
+
+async fn assert_deleted_types_are_not_known(scope: TypeCatalogScope<'_>) {
+    let registry = registry();
+    registry.seed_entity(
+        Seed::new(
+            UNKNOWN,
+            serde_json::json!({
+                "$id": format!("gts://{UNKNOWN}"),
+                "$schema": "http://json-schema.org/draft-07/schema#",
+                "type": "object",
+            }),
+        )
+        .deleted(),
+    );
+
+    let known = catalog(&registry)
+        .known_types(scope, &[WIDGET.to_owned(), UNKNOWN.to_owned()])
+        .await
+        .unwrap();
+
+    assert_eq!(known, std::collections::HashSet::from([WIDGET.to_owned()]));
+}
+
+#[tokio::test]
+async fn platform_validation_excludes_deleted_resource_types() {
+    assert_deleted_types_are_not_known(TypeCatalogScope::Platform).await;
+}
+
+#[tokio::test]
+async fn caller_validation_excludes_deleted_resource_types() {
+    let caller = ctx(uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+    assert_deleted_types_are_not_known(TypeCatalogScope::Caller(&caller)).await;
 }
 
 #[tokio::test]

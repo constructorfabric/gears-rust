@@ -28,8 +28,8 @@ use crate::infra::runtime::build_oidc_authn_plugin;
 
 /// `ToolKit` gear responsible for wiring oidc-authn plugin into runtime.
 ///
-/// The plugin schema reaches types-registry through the `toolkit-gts` inventory the
-/// registry seeds from; this gear publishes only its instance.
+/// AuthN Resolver publishes the shared plugin schema from its SDK declarations;
+/// this gear publishes only its configured instance.
 #[toolkit::gear(
     name = "oidc-authn-plugin",
     gts_publication(entities = Self::plugin_instance),

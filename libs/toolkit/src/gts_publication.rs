@@ -78,8 +78,10 @@
 //! `gears.<gear>.config.gts_publication` sets the policy of one publishing gear
 //! ([`GtsPublicationOptions`]); the typed gear configuration does not see it. The
 //! registry client itself — its URL, HTTP timeout and HTTP retries — stays in
-//! `gears.<gear>.config.consumer_wiring.<provider>`. Publication reuses the gear's
-//! own client view and transport settings. Publication policy applies locally and remotely.
+//! `gears.<gear>.config.consumer_wiring.<provider>`. Each consuming gear has its own
+//! client view, remote registry proxy and tuning. A publisher that also explicitly
+//! consumes the registry contract reuses that gear's client. Publication policy
+//! remains per gear for both local and remote registries.
 
 use std::fmt;
 use std::future::Future;

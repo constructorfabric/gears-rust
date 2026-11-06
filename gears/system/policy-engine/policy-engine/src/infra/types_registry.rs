@@ -12,7 +12,7 @@ use async_trait::async_trait;
 use toolkit_canonical_errors::CanonicalError;
 use toolkit_security::PlatformSecurityContext;
 use types_registry_sdk::{
-    GtsTypeId, PlatformTypesRegistryApi, PlatformTypesRegistryApiExt, ReadOptions,
+    GtsTypeId, LifecycleStatus, PlatformTypesRegistryApi, PlatformTypesRegistryApiExt, ReadOptions,
     TypesRegistryApi, TypesRegistryApiExt,
 };
 
@@ -89,10 +89,10 @@ impl TypeCatalogPort for RegistryTypeCatalog {
         let mut known = HashSet::new();
         for id in keys {
             match answers.get(&id) {
-                Some(Some(_)) => {
+                Some(Some(schema)) if schema.lifecycle_status == LifecycleStatus::Active => {
                     known.insert(id.to_string());
                 }
-                Some(None) => {}
+                Some(_) => {}
                 None => {
                     return Err(PortError::Unavailable(
                         "types registry omitted a requested type".to_owned(),

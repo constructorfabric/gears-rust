@@ -4385,6 +4385,65 @@ async fn hard_delete_batch_redacts_vendor_detail_on_terminal_failure() {
 // until the registry is restored or the schema backfilled.
 
 #[tokio::test]
+async fn mandatory_tenant_type_read_preserves_caller_refusals_before_tenant_provisioning() {
+    use crate::infra::types_registry::test_helpers::{at_the_boundary, refusals};
+    use types_registry_sdk::testing_platform::{Call, Fault, MockTypesRegistry};
+
+    for (refusal, status) in refusals() {
+        let root = Uuid::from_u128(0x100);
+        let child = Uuid::from_u128(0x200);
+        let repo = Arc::new(FakeTenantRepo::with_root(root));
+        let registry = Arc::new(MockTypesRegistry::new());
+        // The first read is the optional tenant-name schema. Refuse only
+        // the mandatory parent-context read that follows it.
+        registry.inject(Fault::on(Call::BatchGet).nth(2).fail(refusal));
+        let idp = Arc::new(FakeIdpProvisioner::new(FakeOutcome::Ok));
+        let service = TenantService::new(
+            repo,
+            idp.clone(),
+            Arc::new(InertResourceOwnershipChecker),
+            crate::domain::tenant_type::inert_tenant_type_checker(),
+            mock_enforcer(),
+            AccountManagementConfig::default(),
+        )
+        .with_registry(registry.clone());
+
+        let error = service
+            .create_tenant(&ctx_for(root), child_input(child, root))
+            .await
+            .expect_err("the caller cannot resolve the parent type");
+
+        assert_eq!(at_the_boundary(error).1, Some(status));
+        assert_eq!(idp.provision_call_count(), 0);
+        assert_eq!(registry.calls(Call::BatchGet), 2);
+        assert_eq!(registry.platform_calls(Call::BatchGet), 0);
+    }
+}
+
+#[tokio::test]
+async fn mandatory_tenant_type_read_classifies_platform_credential_refusals_as_internal() {
+    use crate::infra::types_registry::test_helpers::{at_the_boundary, refusals};
+    use types_registry_sdk::testing_platform::{Call, Fault, MockTypesRegistry};
+
+    for (refusal, _) in refusals() {
+        let root = Uuid::from_u128(0x100);
+        let registry = Arc::new(MockTypesRegistry::new());
+        registry.inject(Fault::on(Call::BatchGet).fail(refusal));
+        let service = make_service(Arc::new(FakeTenantRepo::with_root(root)), FakeOutcome::Ok)
+            .with_registry(registry.clone());
+
+        let error = service
+            .load_tenant_context(CallerOrigin::Background, root)
+            .await
+            .expect_err("AM's own credential was refused");
+
+        assert_eq!(at_the_boundary(error).1, Some(500));
+        assert_eq!(registry.platform_calls(Call::BatchGet), 1);
+        assert!(registry.caller_contexts(Call::BatchGet).is_empty());
+    }
+}
+
+#[tokio::test]
 async fn load_tenant_context_defers_on_gts_type_schema_not_found() {
     let root = Uuid::from_u128(0x100);
     let repo = Arc::new(FakeTenantRepo::with_root(root));

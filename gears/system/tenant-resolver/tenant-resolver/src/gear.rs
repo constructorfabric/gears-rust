@@ -19,9 +19,9 @@ use crate::domain::{Service, TenantResolverLocalClient};
 ///
 /// The registry is consumed, not linked: `PlatformTypesRegistryApi` is the registry's own
 /// local client where the registry runs in this process, and its resolving REST client
-/// otherwise. The `TenantResolverPluginSpecV1` schema reaches the registry through the
-/// `toolkit-gts` inventory it seeds from. Plugin discovery is lazy: it happens on the
-/// first API call, never in `init`.
+/// otherwise. This gear publishes the SDK's `TenantResolverPluginSpecV1` schema before
+/// application `init`. Plugin discovery is lazy: it happens on the first API call,
+/// after every local plugin has bound its admitted instance in `init`.
 #[toolkit::gear(
     name = "tenant-resolver",
     gts_publication(crates = [tenant_resolver_sdk]),

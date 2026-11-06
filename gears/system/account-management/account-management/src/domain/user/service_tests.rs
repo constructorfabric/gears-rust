@@ -44,6 +44,32 @@ use crate::domain::user::test_support::{FakeIdpUserProvisioner, FakeUserOutcome}
 
 const USER_SCHEMA: &str = gts_id!("cf.core.am.user.v1~");
 
+#[tokio::test]
+async fn mandatory_tenant_type_read_preserves_caller_refusals_before_user_creation() {
+    use crate::infra::types_registry::test_helpers::{at_the_boundary, refusals};
+    use types_registry_sdk::testing_platform::{Call, Fault};
+
+    for (refusal, status) in refusals() {
+        let tenants = Arc::new(FakeTenantRepo::new());
+        let tenant_id = Uuid::from_u128(0x1);
+        seed_tenant(&tenants, tenant_id, None, TenantStatus::Active, "acme");
+        let registry = Arc::new(registry_with_test_tenant_type());
+        seed_user_schema(&registry);
+        registry.inject(Fault::on(Call::BatchGet).fail(refusal));
+        let idp = Arc::new(FakeIdpUserProvisioner::new());
+        let service = UserService::new(tenants, idp.clone(), registry.clone(), mock_enforcer());
+
+        let error = service
+            .create_user(&ctx(), tenant_id, payload("alice"))
+            .await
+            .expect_err("the caller cannot resolve the tenant type");
+
+        assert_eq!(at_the_boundary(error).1, Some(status));
+        assert_eq!(idp.create_call_count(), 0);
+        assert_eq!(registry.platform_calls(Call::BatchGet), 0);
+    }
+}
+
 /// Canonical chained `tenant_type` every seeded tenant carries. The
 /// matching Type Schema is pre-registered in [`make_service`]'s
 /// `MockTypesRegistry` so `UserService::resolve_active_tenant`

@@ -147,8 +147,8 @@ gears:
       server: "sqlite_users"
       file: "types_registry.db"
     config:
-      # AM reconciles the platform-root tenant type into the database during
-      # its init. This customer type remains
+      # AM publishes the platform-root tenant type before application init.
+      # This customer type remains
       # deployment-owned E2E data used by the AM suite for children under the
       # platform root. It allows nesting under either the platform root or
       # another customer so the suite can build multi-level hierarchies for

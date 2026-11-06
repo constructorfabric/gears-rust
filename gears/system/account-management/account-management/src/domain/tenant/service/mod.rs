@@ -347,9 +347,10 @@ impl<R: TenantRepo> TenantService<R> {
                 )));
             }
             Err(err) => {
-                return Err(DomainError::service_unavailable(format!(
-                    "tenant_type resolution failed for tenant {tenant_id}: {err}"
-                )));
+                return Err(reader.failure(
+                    err,
+                    format_args!("tenant_type resolution failed for tenant {tenant_id}"),
+                ));
             }
         };
         let metadata = self

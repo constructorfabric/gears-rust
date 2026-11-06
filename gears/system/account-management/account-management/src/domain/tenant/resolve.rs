@@ -24,6 +24,7 @@
 //! check it once: a second copy is a second thing to keep in step.
 
 use account_management_sdk::gts::TENANT_RESOURCE_TYPE;
+use toolkit_canonical_errors::CanonicalError;
 use toolkit_security::{AccessScope, SecurityContext};
 use types_registry_sdk::{TypesRegistryApi, TypesRegistryApiExt};
 use uuid::Uuid;
@@ -60,7 +61,9 @@ const TENANT_TYPE_RESOLUTION_UNAVAILABLE: &str =
 /// * [`DomainError::Validation`] — the tenant exists but is not
 ///   [`TenantStatus::Active`] (provisioning, suspended, deleted).
 /// * [`DomainError::ServiceUnavailable`] — Types Registry or DB
-///   transport failure.
+///   transport failure, or an unregistered tenant type.
+/// * [`DomainError::RegistryRefusedCaller`] — Types Registry refused
+///   the request's credential; its 401 / 403 is preserved.
 pub(crate) async fn resolve_active_tenant(
     tenant_repo: &dyn TenantRepo,
     types_registry: &dyn TypesRegistryApi,
@@ -100,11 +103,23 @@ pub(crate) async fn resolve_active_tenant(
                 resource_type = TENANT_RESOURCE_TYPE,
                 tenant_type_uuid = %tenant.tenant_type_uuid,
                 error = %err,
-                "tenant_type uuid -> chained-id resolution failed; surfacing ServiceUnavailable"
+                "tenant_type uuid -> chained-id resolution failed"
             );
-            return Err(DomainError::service_unavailable(
-                TENANT_TYPE_RESOLUTION_UNAVAILABLE,
-            ));
+            // A missing mandatory identifier is catalog drift, not a missing
+            // tenant. Preserve the fixed public outage message while classifying
+            // caller refusals and other faults through the shared boundary.
+            let classified = match err {
+                CanonicalError::NotFound { .. } => {
+                    DomainError::service_unavailable(TENANT_TYPE_RESOLUTION_UNAVAILABLE)
+                }
+                other => DomainError::caller_registry_failure(other, "tenant type resolution"),
+            };
+            return Err(match classified {
+                DomainError::ServiceUnavailable { .. } => {
+                    DomainError::service_unavailable(TENANT_TYPE_RESOLUTION_UNAVAILABLE)
+                }
+                other => other,
+            });
         }
     };
 

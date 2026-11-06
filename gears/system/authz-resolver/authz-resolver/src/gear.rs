@@ -21,9 +21,9 @@ use crate::domain::{AuthZResolverLocalClient, Service};
 ///
 /// The registry is consumed, not linked: `PlatformTypesRegistryApi` is the registry's own
 /// local client where the registry runs in this process, and its resolving REST client
-/// otherwise. The `AuthZResolverPluginSpecV1` schema reaches the registry through the
-/// `toolkit-gts` inventory it seeds from. Plugin discovery is lazy: it happens on the
-/// first evaluation, never in `init`, so no registry call waits on this gear's phase.
+/// otherwise. This gear publishes the SDK's `AuthZResolverPluginSpecV1` schema before
+/// application `init`. Plugin discovery is lazy: it happens on the first evaluation,
+/// after every local plugin has bound its admitted instance in `init`.
 ///
 /// `AuthZResolverApi` is exposed as a `#[toolkit::contract]`: `provides`
 /// auto-wires the local impl into `ClientHub`, and the `rest` capability hosts

@@ -160,6 +160,32 @@ fn summary(client_id: &str, name: &str) -> IdpServiceAccountSummary {
 // ---- create ---------------------------------------------------------
 
 #[tokio::test]
+async fn mandatory_tenant_type_read_preserves_caller_refusals_before_service_account_creation() {
+    use crate::infra::types_registry::test_helpers::{at_the_boundary, refusals};
+    use types_registry_sdk::testing_platform::{Call, Fault};
+
+    for (refusal, status) in refusals() {
+        let tenants = Arc::new(FakeTenantRepo::new());
+        let tenant_id = Uuid::from_u128(0x1);
+        seed_tenant(&tenants, tenant_id, TenantStatus::Active, "acme");
+        let registry = Arc::new(registry_with_test_tenant_type());
+        registry.inject(Fault::on(Call::BatchGet).fail(refusal));
+        let idp = Arc::new(FakeServiceAccountProvider::new());
+        let service =
+            ServiceAccountService::new(tenants, idp.clone(), registry.clone(), mock_enforcer());
+
+        let error = service
+            .create(&ctx(), tenant_id, "ci".to_owned(), vec![])
+            .await
+            .expect_err("the caller cannot resolve the tenant type");
+
+        assert_eq!(at_the_boundary(error).1, Some(status));
+        assert_eq!(idp.create_call_count(), 0);
+        assert_eq!(registry.platform_calls(Call::BatchGet), 0);
+    }
+}
+
+#[tokio::test]
 async fn create_happy_path_returns_credentials_and_forwards_inputs() {
     let (svc, idp, tenant_id) = active_tenant_fixture();
 
