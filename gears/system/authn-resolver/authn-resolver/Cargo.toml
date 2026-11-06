@@ -45,3 +45,9 @@ inventory = { workspace = true }
 
 # Logging
 tracing = { workspace = true }
+
+[dev-dependencies]
+parking_lot = { workspace = true }
+secrecy = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt"] }
+types-registry-sdk = { workspace = true, features = ["test-util"] }

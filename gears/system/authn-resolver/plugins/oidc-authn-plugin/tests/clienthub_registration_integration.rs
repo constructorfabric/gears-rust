@@ -84,7 +84,11 @@ async fn scoped_plugin_authenticates_valid_jwt() -> anyhow::Result<()> {
         }),
         Some(common::TEST_KID),
     );
-    let result = discovered.authenticate(&token).await?;
+    let result = discovered
+        .authenticate(&authn_resolver_sdk::AuthenticationRequest::new(
+            token.as_str(),
+        ))
+        .await?;
 
     assert_eq!(
         result.security_context.subject_id(),

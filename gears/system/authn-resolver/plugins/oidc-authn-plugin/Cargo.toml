@@ -59,6 +59,7 @@ parking_lot.workspace = true
 # Serialization
 serde.workspace = true
 serde_json.workspace = true
+time.workspace = true
 
 # Error handling
 thiserror.workspace = true
@@ -85,6 +86,7 @@ secrecy.workspace = true
 
 [dev-dependencies]
 tokio.workspace = true
+tracing-test.workspace = true
 secrecy.workspace = true
 criterion.workspace = true
 httpmock.workspace = true

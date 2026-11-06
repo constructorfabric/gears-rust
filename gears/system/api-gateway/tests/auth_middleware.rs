@@ -690,8 +690,17 @@ struct MockAuthNResolverClient {
 impl AuthNResolverClient for MockAuthNResolverClient {
     async fn authenticate(
         &self,
-        bearer_token: &str,
+        request: &authn_resolver_sdk::AuthenticationRequest,
     ) -> Result<AuthenticationResult, AuthNResolverError> {
+        // The middleware validates every request: a request that would let the
+        // plugin serve a cached result fails every authenticated test.
+        if request.cache_control != authn_resolver_sdk::RequestCacheControl::refresh() {
+            return Err(AuthNResolverError::Internal(format!(
+                "expected a fresh validation, got {:?}",
+                request.cache_control
+            )));
+        }
+        let bearer_token = secrecy::ExposeSecret::expose_secret(&request.bearer_token);
         (self.handler)(bearer_token)
     }
 
@@ -825,13 +834,13 @@ fn mock_accepting_token(
     MockAuthNResolverClient {
         handler: Arc::new(move |token| {
             if token == valid_token {
-                Ok(AuthenticationResult {
-                    security_context: SecurityContext::builder()
+                Ok(AuthenticationResult::new(
+                    SecurityContext::builder()
                         .subject_id(subject_id)
                         .subject_tenant_id(tenant_id)
                         .build()
                         .unwrap(),
-                })
+                ))
             } else {
                 Err(AuthNResolverError::Unauthorized("invalid token".to_owned()))
             }
@@ -855,14 +864,14 @@ fn mock_accepting_token_with_scopes(
     MockAuthNResolverClient {
         handler: Arc::new(move |token| {
             if token == valid_token {
-                Ok(AuthenticationResult {
-                    security_context: SecurityContext::builder()
+                Ok(AuthenticationResult::new(
+                    SecurityContext::builder()
                         .subject_id(Uuid::new_v4())
                         .subject_tenant_id(Uuid::new_v4())
                         .token_scopes(scopes.clone())
                         .build()
                         .unwrap(),
-                })
+                ))
             } else {
                 Err(AuthNResolverError::Unauthorized("invalid token".to_owned()))
             }

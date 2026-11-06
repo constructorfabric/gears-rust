@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
-use authn_resolver_sdk::AuthNResolverClient;
+use authn_resolver_sdk::{AuthNResolverClient, AuthenticationRequest};
 use clap::{Parser, Subcommand};
 use credstore_sdk::{
     CredStoreClientV1, CredStoreError, SecretRef, SecretValue, SharingMode, WritePrecondition,
@@ -477,8 +477,10 @@ impl Runtime {
         let authn = self
             .wait_for(ClientHub::try_get::<dyn AuthNResolverClient>)
             .await?;
+        // Validate the token now: `new` forbids a result the plugin cached.
+        let request = AuthenticationRequest::new(platform_token);
         let result = authn
-            .authenticate(platform_token)
+            .authenticate(&request)
             .await
             .map_err(|e| anyhow!("the platform token was refused: {e}"))?;
         Ok(result.security_context)

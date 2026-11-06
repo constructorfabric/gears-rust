@@ -986,11 +986,8 @@ async fn exchange_client_credentials(
     creds: &crate::config::ClientCredentialsConfig,
 ) -> anyhow::Result<toolkit_security::SecurityContext> {
     info!("Exchanging client credentials for OAGW provisioning context");
-    let request = ClientCredentialsRequest {
-        client_id: creds.client_id.clone(),
-        client_secret: creds.client_secret.clone(),
-        scopes: Vec::new(),
-    };
+    let request =
+        ClientCredentialsRequest::new(creds.client_id.clone(), creds.client_secret.clone());
     let result = authn
         .exchange_client_credentials(&request)
         .await

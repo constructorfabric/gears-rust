@@ -67,6 +67,40 @@ pub fn single_flight_gate_with_leadership(
     }
 }
 
+/// A lease on the gate for one key, released on drop.
+///
+/// Cancellation while waiting for or holding [`SingleFlightGate::mutex`]
+/// releases the lease; the last holder removes the gate. Manual release via
+/// [`release_single_flight_gate`] would leak on cancellation.
+pub struct SingleFlightLease<'a> {
+    in_flight: &'a DashMap<String, Arc<SingleFlightGate>>,
+    key: &'a str,
+    gate: Arc<SingleFlightGate>,
+}
+
+impl<'a> SingleFlightLease<'a> {
+    /// Acquire the gate for `key`, creating it if absent.
+    pub fn acquire(in_flight: &'a DashMap<String, Arc<SingleFlightGate>>, key: &'a str) -> Self {
+        let gate = single_flight_gate(in_flight, key);
+        Self {
+            in_flight,
+            key,
+            gate,
+        }
+    }
+
+    /// The leased gate.
+    pub fn gate(&self) -> &SingleFlightGate {
+        &self.gate
+    }
+}
+
+impl Drop for SingleFlightLease<'_> {
+    fn drop(&mut self) {
+        release_single_flight_gate(self.in_flight, self.key, &self.gate);
+    }
+}
+
 /// Releases a lease on `gate` and removes it from `in_flight` once no holders remain.
 pub fn release_single_flight_gate(
     in_flight: &DashMap<String, Arc<SingleFlightGate>>,

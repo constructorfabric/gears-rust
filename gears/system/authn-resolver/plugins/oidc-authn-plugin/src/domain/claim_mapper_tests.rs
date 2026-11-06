@@ -320,3 +320,65 @@ fn map_supports_custom_tenant_claim_name() {
     );
     assert_eq!(context.token_scopes(), &["*"]);
 }
+
+fn tenant_claims(extra: &serde_json::Value) -> Claims {
+    let mut value = json!({
+        "sub": "550e8400-e29b-41d4-a716-446655440000",
+        "tenant_id": "550e8400-e29b-41d4-a716-446655440001",
+    });
+    value
+        .as_object_mut()
+        .unwrap()
+        .extend(extra.as_object().unwrap().clone());
+    claims(value)
+}
+
+fn map_s2s(
+    claims: &Claims,
+    oauth_expires_at: Option<time::OffsetDateTime>,
+) -> Result<SecurityContext> {
+    map_with_bearer_opts(
+        claims,
+        &default_config(),
+        &ClaimMapperOptions::default(),
+        None,
+        &MetricsHarness::new().metrics(),
+        Some(S2sMapping {
+            default_subject_type: "service",
+            oauth_expires_at,
+        }),
+    )
+}
+
+#[test]
+fn map_without_exp_leaves_expiry_unknown() {
+    let context = map_with_options(
+        &tenant_claims(&json!({})),
+        &default_config(),
+        &ClaimMapperOptions::default(),
+        &MetricsHarness::new().metrics(),
+    )
+    .unwrap();
+
+    assert_eq!(context.expires_at(), None);
+}
+
+#[test]
+fn s2s_mapping_without_exp_uses_the_oauth_deadline() {
+    let oauth = time::OffsetDateTime::from_unix_timestamp(1_900_000_000).unwrap();
+
+    let context = map_s2s(&tenant_claims(&json!({})), Some(oauth)).unwrap();
+
+    assert_eq!(context.expires_at(), Some(oauth));
+}
+
+#[test]
+fn map_rejects_an_exp_outside_the_timestamp_range() {
+    for exp in [json!(253_402_300_800_u64), json!(u64::MAX), json!("soon")] {
+        let err = map_s2s(&tenant_claims(&json!({ "exp": exp })), None).unwrap_err();
+        assert!(
+            matches!(&err, AuthNResolverError::Unauthorized(msg) if msg == "invalid credential expiry"),
+            "exp {exp}: {err:?}"
+        );
+    }
+}

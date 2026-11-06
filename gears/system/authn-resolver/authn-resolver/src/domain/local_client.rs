@@ -4,7 +4,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use authn_resolver_sdk::{
-    AuthNResolverClient, AuthNResolverError, AuthenticationResult, ClientCredentialsRequest,
+    AuthNResolverClient, AuthNResolverError, AuthenticationRequest, AuthenticationResult,
+    ClientCredentialsRequest,
 };
 use toolkit_macros::domain_model;
 
@@ -34,10 +35,10 @@ fn log_and_convert(op: &str, e: DomainError) -> AuthNResolverError {
 impl AuthNResolverClient for AuthNResolverLocalClient {
     async fn authenticate(
         &self,
-        bearer_token: &str,
+        request: &AuthenticationRequest,
     ) -> Result<AuthenticationResult, AuthNResolverError> {
         self.svc
-            .authenticate(bearer_token)
+            .authenticate(request)
             .await
             .map_err(|e| log_and_convert("authenticate", e))
     }
@@ -52,3 +53,8 @@ impl AuthNResolverClient for AuthNResolverLocalClient {
             .map_err(|e| log_and_convert("exchange_client_credentials", e))
     }
 }
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+#[path = "local_client_tests.rs"]
+mod local_client_tests;

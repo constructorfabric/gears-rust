@@ -21,22 +21,20 @@ use toolkit_gts::gts_type_schema;
 ///
 /// # Example
 ///
-/// ```ignore
-/// // Plugin generates its instance ID
-/// let instance_id = AuthNResolverPluginSpecV1::gts_make_instance_id(
-///     "cf.builtin.static_authn_resolver.plugin.v1"
-/// );
+/// ```
+/// use authn_resolver_sdk::AuthNResolverPluginSpecV1;
+/// use toolkit::gts::PluginV1;
 ///
-/// // Plugin creates instance data
-/// let instance = PluginV1::<AuthNResolverPluginSpecV1> {
-///     id: instance_id.clone(),
-///     vendor: "constructorfabric".to_owned(),
-///     priority: 100,
-///     properties: AuthNResolverPluginSpecV1,
-/// };
-///
-/// // Register with types-registry
-/// registry.register(vec![serde_json::to_value(&instance)?]).await?;
+/// // The plugin builds its instance ID and registration payload...
+/// let (instance_id, payload) = PluginV1::<AuthNResolverPluginSpecV1>::build_registration(
+///     "cf.builtin.static_authn_resolver.plugin.v1",
+///     "constructorfabric",
+///     100,
+/// )?;
+/// // ...and registers `payload` through the types-registry client
+/// // (`registry.register(vec![payload]).await?`).
+/// # let _ = (instance_id, payload);
+/// # Ok::<(), serde_json::Error>(())
 /// ```
 #[derive(Default)]
 #[gts_type_schema(

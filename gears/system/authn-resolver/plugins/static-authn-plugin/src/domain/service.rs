@@ -156,9 +156,9 @@ fn build_result(
         .map_err(|e| tracing::error!("Failed to build SecurityContext from config: {e}"))
         .ok()?;
 
-    Some(AuthenticationResult {
-        security_context: ctx,
-    })
+    // Conservative: no-store and no expiry. Static identities have no
+    // credential lifetime to report, and the exchange is a local lookup.
+    Some(AuthenticationResult::new(ctx))
 }
 
 #[cfg(test)]

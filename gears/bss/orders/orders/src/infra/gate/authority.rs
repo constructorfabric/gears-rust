@@ -8,8 +8,12 @@
 //! The token inside the context is never logged or persisted: logs name the seller and the error
 //! kind only.
 use crate::config::CommercialIdentityConfig;
+use anyhow::Context as _;
 use async_trait::async_trait;
-use authn_resolver_sdk::{AuthNResolverClient, AuthNResolverError, ClientCredentialsRequest};
+use authn_resolver_sdk::{
+    AuthNResolverClient, AuthNResolverError, ClientCredentialsRequest, ScopeSet,
+};
+use secrecy::SecretString;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -134,14 +138,20 @@ impl CommercialAuthority for NotProvisioned {
 }
 
 /// The `AuthN` client-credentials authority over `gate.commercial_identities`, keyed by seller.
-/// Every call exchanges: `AuthenticationResult` carries no token expiry today
-/// (`authn-resolver-sdk/src/models.rs`), so no context is cached; re-add a cache when the SDK
-/// exposes one (D-244). Each submit phase resolves its own context (D-194).
+/// This authority still exchanges on every call; it does not cache the context (D-244). Each
+/// submit phase resolves its own context (D-194).
 pub struct AuthnAuthority {
     resolver: Arc<dyn AuthNResolverClient>,
-    identities: BTreeMap<Uuid, CommercialIdentityConfig>,
+    identities: BTreeMap<Uuid, Identity>,
     /// Sellers already warned about a failed exchange (one warning per seller per process).
     warned: WarnOnce,
+}
+
+/// One seller's credentials with its scopes parsed once, at construction.
+struct Identity {
+    client_id: String,
+    client_secret: SecretString,
+    scopes: Option<ScopeSet>,
 }
 
 impl std::fmt::Debug for AuthnAuthority {
@@ -155,20 +165,36 @@ impl std::fmt::Debug for AuthnAuthority {
 
 impl AuthnAuthority {
     /// An authority presenting `identities` (one per seller; `GateConfig::validate` rejects a
-    /// duplicate) through `resolver`.
-    #[must_use]
+    /// duplicate) through `resolver`. Scopes are parsed here, once, never per exchange.
+    ///
+    /// # Errors
+    /// An identity's scopes are invalid (`GateConfig::validate` rejects them first).
     pub fn new(
         resolver: Arc<dyn AuthNResolverClient>,
         identities: &[CommercialIdentityConfig],
-    ) -> Self {
-        Self {
+    ) -> anyhow::Result<Self> {
+        let identities = identities
+            .iter()
+            .map(|i| {
+                let scopes = i.scope_set().with_context(|| {
+                    format!(
+                        "bss-orders: gate.commercial_identities[{}]: invalid scopes",
+                        i.seller_tenant_id
+                    )
+                })?;
+                let identity = Identity {
+                    client_id: i.client_id.clone(),
+                    client_secret: i.client_secret.clone(),
+                    scopes,
+                };
+                Ok((i.seller_tenant_id, identity))
+            })
+            .collect::<anyhow::Result<_>>()?;
+        Ok(Self {
             resolver,
-            identities: identities
-                .iter()
-                .map(|i| (i.seller_tenant_id, i.clone()))
-                .collect(),
+            identities,
             warned: WarnOnce::default(),
-        }
+        })
     }
 }
 
@@ -182,11 +208,11 @@ impl CommercialAuthority for AuthnAuthority {
             .identities
             .get(&seller_tenant_id)
             .ok_or(AuthorityError::NotProvisioned)?;
-        let request = ClientCredentialsRequest {
-            client_id: identity.client_id.clone(),
-            client_secret: identity.client_secret.clone(),
-            scopes: identity.scopes.clone(),
-        };
+        let mut request = ClientCredentialsRequest::new(
+            identity.client_id.clone(),
+            identity.client_secret.clone(),
+        );
+        request.scopes.clone_from(&identity.scopes);
         let result = self
             .resolver
             .exchange_client_credentials(&request)
@@ -263,5 +289,5 @@ pub fn commercial_authority(
              published"
         )
     })?;
-    Ok(Arc::new(AuthnAuthority::new(resolver, identities)))
+    Ok(Arc::new(AuthnAuthority::new(resolver, identities)?))
 }

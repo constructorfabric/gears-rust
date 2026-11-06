@@ -393,8 +393,9 @@ Authentication is handled by the **AuthN Resolver** — a gear with plugins and 
 ```rust
 #[async_trait]
 pub trait AuthNResolverClient: Send + Sync {
-    /// Authenticate a bearer token and return the authentication result.
-    async fn authenticate(&self, bearer_token: &str) -> Result<AuthenticationResult, AuthNResolverError>;
+    /// Authenticate `request.bearer_token`; `request.cache_control` is forwarded
+    /// to the plugin unchanged.
+    async fn authenticate(&self, request: &AuthenticationRequest) -> Result<AuthenticationResult, AuthNResolverError>;
 
     /// Exchange OAuth2 client credentials for a SecurityContext (S2S authentication).
     /// See [S2S Authentication](#s2s-authentication-service-to-service) for details.
@@ -408,8 +409,9 @@ pub trait AuthNResolverClient: Send + Sync {
 ```rust
 #[async_trait]
 pub trait AuthNResolverPluginClient: Send + Sync {
-    /// Authenticate a bearer token using vendor-specific validation logic.
-    async fn authenticate(&self, bearer_token: &str) -> Result<AuthenticationResult, AuthNResolverError>;
+    /// Authenticate `request.bearer_token` using vendor-specific validation logic,
+    /// honouring `request.cache_control` if the plugin keeps an authenticate cache.
+    async fn authenticate(&self, request: &AuthenticationRequest) -> Result<AuthenticationResult, AuthNResolverError>;
 
     /// Exchange client credentials for a SecurityContext (S2S authentication).
     /// See [S2S Authentication](#s2s-authentication-service-to-service) for details.
@@ -417,6 +419,8 @@ pub trait AuthNResolverPluginClient: Send + Sync {
         -> Result<AuthenticationResult, AuthNResolverError>;
 }
 ```
+
+`AuthenticationRequest { bearer_token: SecretString, cache_control: RequestCacheControl }` carries the same plugin-cache semantics as `ClientCredentialsRequest`: `AllowCached` (an explicit opt-in) may reuse a plugin-cached result; `Refresh` without a tag (the `new` default) must not; `Refresh` with a `CacheTag` may reuse only a provably newer result. Plugins without an authenticate cache (OIDC, static, Firebase) validate every call, which satisfies every value. Request middleware, the direct `AuthNResolverBearerAuthenticator` and step-up checks use that default, so every request is a full validation.
 
 **Architecture:**
 - **AuthN Middleware** — Extracts bearer token from request headers
@@ -458,21 +462,14 @@ sequenceDiagram
 The `AuthenticationResult` is returned by the AuthN Resolver upon successful authentication:
 
 ```rust
-pub struct AuthenticationResult {
-    /// The validated security context.
-    pub security_context: SecurityContext,
-
-    /// Optional verified profile/time claims for the same token (ADR 0005).
-    /// Populated only by plugins that expose them; most leave it `None`.
-    /// Kept off `SecurityContext` so the PDP identity stays minimal.
-    pub principal: Option<VerifiedPrincipal>,
-}
+let result = AuthenticationResult::new(security_context); // NoStore
+let result = result.with_cache_control(CacheControl::until(cache_deadline));
 ```
 
-Construct via `AuthenticationResult::authenticated(ctx)` (no principal) or
-`AuthenticationResult::with_principal(ctx, principal)`. When `principal` is `Some`, its `subject_id`
-equals `security_context.subject_id()`. Handlers that require a principal treat a missing extension on
-an authenticated request as an internal error (5xx), not a 401 — see [ADR 0005](./ADR/0005-verified-principal-request-extension.md).
+The result exposes `security_context`, `cache_control: CacheControl { tag, cache_until }`, and a local
+a private local origin on `ClientCredentialsProvider` results. Credential expiry belongs to `SecurityContext`.
+The verified profile extension in [ADR 0005](./ADR/0005-verified-principal-request-extension.md)
+is not part of the current SDK.
 
 ### SecurityContext
 
@@ -487,6 +484,7 @@ SecurityContext {
     subject_tenant_id: TenantId,           // required - Subject Tenant
     token_scopes: Vec<String>,             // required - capability restrictions (["*"] for first-party)
     bearer_token: Option<Secret<String>>,  // optional - original token for forwarding to PDP
+    expires_at: Option<time::OffsetDateTime>, // optional - verified/exchanged credential expiry
 }
 ```
 
@@ -499,9 +497,10 @@ SecurityContext {
 | `subject_tenant_id` | Yes | Subject Tenant — tenant the subject belongs to. Used as default `owner_tenant_id` for CREATE when the API has no explicit tenant field (see S06 in [AUTHZ_USAGE_SCENARIOS.md](./AUTHZ_USAGE_SCENARIOS.md)) | PDP for tenant context, PEP for resource ownership |
 | `token_scopes` | Yes | Capability restrictions from token (see [Token Scopes](#token-scopes)) | PDP for scope narrowing |
 | `bearer_token` | No | Original bearer token (wrapped in `Secret` from [secrecy](https://crates.io/crates/secrecy) crate) | PDP validation, external API calls |
+| `expires_at` | No | Verified/exchanged credential expiry; revocation may happen earlier | SDK provider reuse boundary |
 
 **Security Notes:**
-- Token expiration (`exp`) is validated during authentication but not included in SecurityContext (expiration is token metadata, not identity)
+- `expires_at` records verified/exchanged credential expiry (JWT `exp`, bounded by the original OAuth deadline when available). Revocation may happen earlier; unknown expiry is not indefinite validity. AuthZ interpretation of this field is outside the S2S cache scope.
 - `bearer_token` uses `Secret<String>` from the `secrecy` crate which provides: redacted `Debug` output, no `Display` impl, and zeroization on drop
 - `bearer_token` MUST NOT be logged, serialized to persistent storage, or included in error messages
 - The token is included for:
@@ -1440,7 +1439,7 @@ For concrete examples demonstrating the authorization model in practice, see [AU
 
 Platform gears communicate with each other outside the context of an HTTP request — inter-gear calls, background processing, scheduled tasks. These interactions require a `SecurityContext` to pass through AuthZ. AuthN Resolver provides S2S authentication via the [OAuth 2.0 Client Credentials Grant (RFC 6749 §4.4)](https://datatracker.ietf.org/doc/html/rfc6749#section-4.4) pattern.
 
-A gear presents its OAuth2 credentials (`client_id`, `client_secret`, optional `scopes`) to AuthN Resolver. The AuthN plugin exchanges them with the vendor's IdP and returns a validated `SecurityContext` — the same `AuthenticationResult` that `authenticate()` returns for bearer tokens.
+A gear presents its OAuth2 credentials (`client_id`, `client_secret`, optional `scopes` as a validated `ScopeSet`; none means the IdP defaults) to AuthN Resolver. The AuthN plugin exchanges them with the vendor's IdP and returns a validated `SecurityContext` — the same `AuthenticationResult` that `authenticate()` returns for bearer tokens.
 
 ### How It Works
 
@@ -1475,10 +1474,25 @@ S2S `SecurityContext` flows through the standard AuthZ pipeline unchanged. The t
 - **The platform does not issue tokens.** The plugin delegates to an external IdP and maps the response.
 - **Credentials and endpoints are separated.** Gear configuration contains credentials; plugin configuration contains token endpoint / issuer URL.
 
-### Future Extensions
+### S2S caching provider
 
-- **Token lifetime propagation** — Plugin communicates token expiry to enable caller-side caching with proper TTL
-- **Cached SecurityContext provider** — A wrapper that caches the `SecurityContext` and automatically refreshes it on expiry, so gears don't need to manage token lifecycle themselves
+`authn_resolver_sdk::ClientCredentialsProvider::builder(client, client_id, client_secret)` creates a provider; optional default scopes (`with_default_scopes`) and `ClientCredentialsProviderConfig` (`with_config`) are fixed at `build()`, which validates the config without contacting the resolver. It caches `AuthenticationResult`s for these credentials, one slot per exact scope set; clones share them. `get()` uses the default scopes (IdP defaults when unset); `get_with_scopes(&ScopeSet)` uses exactly the given RFC 6749 scope set, sharing the configured slot only when equal and never reusing a subset or superset. Each slot has its own entry, single flight, backoff and generation; the rules below apply per slot. Plugins opt into reuse with a finite `CacheControl::cache_until` (`None` means NoStore). Reuse ends at the earlier of that deadline and known credential expiry, minus a safety margin. Valid results too short for the margin reach current waiters without caching; an elapsed reuse deadline becomes NoStore. The reuse window and the margin bound only reuse: the waiters of an acquisition receive its result until the credential's known expiry (unbounded when unknown), and a later call needs a usable entry or a new acquisition.
+
+The first `get()` in a jittered early-refresh window starts a shared, time-bounded acquisition while serving the usable entry. Every error triggers jittered backoff; failures and recovery are logged. Only `ServiceUnavailable` permits fallback before the reuse deadline; other errors discard the entry. Caller cancellation leaves acquisition running; final handle drop or `shutdown()` cancels it. After shutdown, `get()` and `get_with_scopes()` return `ClientCredentialsProviderError::ShutDown`.
+
+`ClientCredentialsProviderConfig::max_entries` (default 17, `1..=1024`) bounds slots in total, including the always-present default-scopes slot and counting slots in backoff or acquiring; `1` allows only the default scopes. Admission evicts only an idle slot (no call in progress, no acquisition task including cancelled ones still ending, backoff elapsed), preferring one without a usable entry, then the least recently used; otherwise it fails at once with `ClientCredentialsProviderError::CapacityExhausted { max_entries }` reporting the configured total (temporary, or permanent for non-default sets when `max_entries` is 1). Provider calls return `ClientCredentialsProviderError` (`ShutDown`, `CapacityExhausted`, or `Resolver` with the `AuthNResolverError` as source); resolver calls keep returning `AuthNResolverError`. The shared acquisition runs in the initiating caller's tracing span and active subscriber (the ambient one if none was active). A new dynamic slot first requests plugin refresh, so eviction cannot bring back a cleared result from the plugin cache. The bound is a slot count, not a byte budget, and does not bound concurrent IdP requests left by cancelled acquisitions.
+
+`clear()` invalidates every slot's entry and pending deliveries, cancels acquisition, and requests plugin refresh next, preserving backoff. Newer successes leave uncollected deliveries valid. `invalidate(&result)` uses the result's private local origin (process-unique cache id, slot, generation; slot ids are never reused) to clear only the issuing slot and to protect newer entries, other scope sets, recreated slots and other caches from late rejections; results not returned by this provider are no-ops. `shutdown()` closes admission before cancelling and waiting. The separate plugin `CacheTag` accompanies `RequestCacheControl::Refresh`: unconditional refresh requires re-acquisition; tagged refresh permits reuse only of a provably newer, suitable result.
+
+See the [SDK usage example](../../../gears/system/authn-resolver/authn-resolver-sdk/README.md) and [API reference](../../../gears/system/authn-resolver/authn-resolver-sdk/src/client_credentials/mod.rs). This provider covers client-credentials acquisition only; inbound authentication caching is described below; AuthZ decision caching (#5502) and token exchange/delegation (#5643) are separate work.
+
+### Inbound authentication caching (opt-in)
+
+`authn_resolver_sdk::CachingAuthenticator::builder(client).with_config(CachingAuthenticatorConfig).build()` wraps `AuthNResolverClient::authenticate` and also implements `BearerAuthenticator`. It implements the bounded positive-result caching anticipated by [ADR-0008](../toolkit-oop/ADR/0008-cpt-cf-adr-two-plane-auth.md) as an explicit opt-in: the default `AuthNResolverBearerAuthenticator` and the API gateway keep validating every call. There is no trusted-peer shortcut: only an earlier validation of the same token is reused, and only while its producer allows it.
+
+The producer decides. The OIDC plugin sets `CacheControl::cache_until` for bearer results only when `jwt.authenticate_result_cache_ttl` is positive (default `0s`, at most 300s): until that TTL after validation *started*, never past the verified JWT `exp`; missing or already-passed `exp` stays NoStore. The consumer caches a result only with a future `cache_until`, until the earliest of it, known credential expiry and its own `max_ttl` (default 30s); a finite `cache_until` with unknown expiry is honoured, as the `CacheControl` contract allows. A success whose known expiry has passed at completion is refused as `Unauthorized` (even within the backend's leeway). The callers of a validation receive its result until the credential's known expiry, even if the reuse window (`cache_until`, `max_ttl`) closed meanwhile: they waited for that validation rather than reusing it. A call whose collected result is discarded (fenced by invalidation or `clear()`, or its credential expired) re-evaluates, at most three validations in total, and then fails with `ServiceUnavailable`; the provider applies the same bound per call without recording a failure or backoff. The bound counts sequential acquisitions, not wall time. Failures are never cached and there is no background refresh or token renewal, stale fallback or backoff.
+
+Every validation it starts sends `Refresh`: with the plugin's tag of the token's latest result when one is retained (after expiry, the `max_ttl` cap, invalidation, or a tagged no-store result), otherwise unconditionally. Retained tags are tag-only hints in the same bounded map (they count toward `max_entries` and are evicted first); `clear()` and eviction forget them, which only makes the next request unconditional, so a rejected plugin-cached result is never resurrected. Tokens are keyed by SHA-256 through the platform crypto facade. Concurrent calls share one validation per token; at most `max_in_flight` validations run (cancelled ones counted until their task ends), and a token needing another fails at once with `CachingAuthenticatorError::Overloaded` (transport `Unavailable`) while cached tokens and joiners proceed. At most `max_entries` results are kept, evicting the earliest deadline. `invalidate(&result)` drops only the publication behind that result and fences its uncollected deliveries (other caches' and raw results are no-ops); `clear()` and `shutdown()` fence everything. Revocation becomes visible to new calls when the entry's deadline passes or the caller invalidates; a caller already waiting on a validation can still receive that result up to credential expiry unless it is fenced. The cache TTL is therefore not a maximum age for every returned decision; a caller needing that guarantee must bound the call itself.
 
 ---
 
@@ -1522,13 +1536,7 @@ These questions require further design work.
       - How do industry multi-tenant platforms (Azure AD Conditional Access, AWS IAM, Google Cloud IAP) handle MFA in the context of delegated authorization?
       - What is the interaction between MFA and token scopes? Should third-party apps be able to request MFA-elevated scopes?
 
-11. **S2S SecurityContext caching** — Gears may call `exchange_client_credentials()` frequently (on every background task iteration, on every inter-gear call). Open questions:
-    - **TTL strategy** — What default TTL for cached `SecurityContext`? Static plugin has no token expiry (effectively infinite), production plugins depend on OAuth2 token TTL. Proposal: default 5 min, configurable.
-    - **Cache identity** — If credentials and scopes remain request-level inputs, any S2S cache key must include at least `client_id`, normalized scopes, and a non-reversible credential fingerprint. `client_id` alone is insufficient because it can reuse the wrong token across scope or credential changes.
-    - **`AuthenticationResult.expires_at`** — Should `AuthenticationResult` include an `expires_at: Option<DateTime>` field so the plugin can communicate token lifetime to the caller? This enables smart caller-side caching without hardcoded TTLs.
-    - **`S2sSecurityContextProvider`** — Should there be a standard cached wrapper in the SDK (`authn-resolver-sdk`) that gears use instead of calling `exchange_client_credentials()` directly? Design: ArcSwap-based cache with TTL from `expires_at`, automatic refresh on expiry.
-    - **Plugin-level caching** — Production plugins can reuse `toolkit-auth::oauth2::Token` handles with auto-refresh internally. Should this be a requirement or recommendation for plugin implementors?
-    - **Cache invalidation** — When credentials are rotated, how does the cached `SecurityContext` get invalidated? Is TTL-based expiry sufficient, or do we need explicit invalidation?
+11. **S2S SecurityContext caching** — Resolved for client credentials in #5566; see [S2S caching provider](#s2s-caching-provider).
 
 ---
 

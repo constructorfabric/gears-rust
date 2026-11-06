@@ -3,10 +3,10 @@ use crate::config::FirebaseAuthnPluginConfig;
 use crate::firebase::{AllowedIdentity, FirebaseVerifier, Refusal};
 use async_trait::async_trait;
 use authn_resolver_sdk::{
-    AuthNResolverError, AuthNResolverPluginClient, AuthNResolverPluginSpecV1, AuthenticationResult,
-    ClientCredentialsRequest,
+    AuthNResolverError, AuthNResolverPluginClient, AuthNResolverPluginSpecV1,
+    AuthenticationRequest, AuthenticationResult, ClientCredentialsRequest,
 };
-use secrecy::SecretString;
+use secrecy::{ExposeSecret as _, SecretString};
 use std::sync::{Arc, OnceLock};
 use toolkit::client_hub::ClientScope;
 use toolkit::{Gear, GearCtx};
@@ -108,7 +108,13 @@ fn log_token_refusal(refusal: &Refusal) {
 
 #[async_trait]
 impl AuthNResolverPluginClient for FirebaseService {
-    async fn authenticate(&self, token: &str) -> Result<AuthenticationResult, AuthNResolverError> {
+    /// No authenticate cache: every call verifies the token, so any
+    /// `cache_control` is honoured.
+    async fn authenticate(
+        &self,
+        request: &AuthenticationRequest,
+    ) -> Result<AuthenticationResult, AuthNResolverError> {
+        let token = request.bearer_token.expose_secret();
         let uid = self
             .verifier
             .verify_identity(token)
@@ -131,7 +137,7 @@ impl AuthNResolverPluginClient for FirebaseService {
             .bearer_token(SecretString::from(token.to_owned()))
             .build()
             .map_err(|error| AuthNResolverError::Internal(error.to_string()))?;
-        Ok(AuthenticationResult { security_context })
+        Ok(AuthenticationResult::new(security_context))
     }
 
     async fn exchange_client_credentials(
@@ -190,7 +196,12 @@ mod tests {
             let token = crate::firebase::tests::signed_claims(
                 serde_json::json!({"sub": format!("account-{id}"), "email": format!("account-{id}@example.test"), "tenant_id": Uuid::nil(), "scopes": ["*"]}),
             );
-            let result = service.authenticate(&token).await.unwrap();
+            let result = service
+                .authenticate(&authn_resolver_sdk::AuthenticationRequest::new(
+                    token.as_ref() as &str,
+                ))
+                .await
+                .unwrap();
             assert_eq!(
                 result.security_context.subject_tenant_id(),
                 Uuid::from_u128(id)
@@ -239,7 +250,11 @@ mod tests {
             Vec::new(),
         ));
         assert!(matches!(
-            outage.authenticate(&token).await,
+            outage
+                .authenticate(&authn_resolver_sdk::AuthenticationRequest::new(
+                    token.as_ref() as &str
+                ))
+                .await,
             Err(AuthNResolverError::ServiceUnavailable(_))
         ));
 
@@ -249,11 +264,19 @@ mod tests {
             crate::firebase::tests::signing_keys(),
         ));
         assert!(matches!(
-            stranger.authenticate(&token).await,
+            stranger
+                .authenticate(&authn_resolver_sdk::AuthenticationRequest::new(
+                    token.as_ref() as &str
+                ))
+                .await,
             Err(AuthNResolverError::Unauthorized(_))
         ));
         assert!(matches!(
-            stranger.authenticate("not-a-token").await,
+            stranger
+                .authenticate(&authn_resolver_sdk::AuthenticationRequest::new(
+                    "not-a-token"
+                ))
+                .await,
             Err(AuthNResolverError::Unauthorized(_))
         ));
     }

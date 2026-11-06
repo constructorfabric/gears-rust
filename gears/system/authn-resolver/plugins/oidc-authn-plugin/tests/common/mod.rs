@@ -183,6 +183,7 @@ pub fn plugin_config() -> OidcPluginConfig {
         s2s_claim_mapper: claim_mapper::default_config(),
         claim_mapper_options: claim_mapper::ClaimMapperOptions::default(),
         s2s_default_subject_type: TEST_S2S_DEFAULT_SUBJECT_TYPE.to_owned(),
+        authenticate_result_cache_ttl: std::time::Duration::ZERO,
         circuit_breaker: Some(default_circuit_breaker_config()),
         retry_policy: default_retry_policy_config(),
         s2s: default_s2s_config(),
@@ -211,6 +212,7 @@ pub struct MockOidcServer {
     server: MockServer,
     discovery_requests: RequestCounters,
     jwks_requests: RequestCounters,
+    token_requests: RequestCounters,
 }
 
 impl MockOidcServer {
@@ -220,6 +222,17 @@ impl MockOidcServer {
     ///
     /// Returns an error if the generated base URL is unexpectedly invalid.
     pub fn spawn() -> anyhow::Result<Self> {
+        Self::spawn_with_token_lifetime(Some(300), future_exp())
+    }
+
+    /// Spawn a server with explicit OAuth and JWT lifetimes.
+    ///
+    /// # Errors
+    /// Returns an error if the generated server URL is invalid.
+    pub fn spawn_with_token_lifetime(
+        expires_in: Option<u64>,
+        jwt_exp: u64,
+    ) -> anyhow::Result<Self> {
         let server = MockServer::start();
         reqwest::Url::parse(&server.base_url())?;
         let discovery_requests = Arc::new(Mutex::new(HashMap::new()));
@@ -227,12 +240,14 @@ impl MockOidcServer {
 
         install_discovery_mock(&server, Arc::clone(&discovery_requests));
         install_jwks_mock(&server, Arc::clone(&jwks_requests));
-        install_token_mock(&server);
+        let token_requests = Arc::new(Mutex::new(HashMap::new()));
+        install_token_mock(&server, Arc::clone(&token_requests), expires_in, jwt_exp);
 
         Ok(Self {
             server,
             discovery_requests,
             jwks_requests,
+            token_requests,
         })
     }
 
@@ -241,6 +256,11 @@ impl MockOidcServer {
     pub fn issuer(&self, realm: &str) -> String {
         let realm = realm.trim_start_matches('/');
         format!("{}/{realm}", self.server.base_url())
+    }
+
+    #[must_use]
+    pub fn token_request_count(&self, realm: &str) -> usize {
+        request_count(&self.token_requests, &issuer_path_key(realm))
     }
 
     /// Return how many discovery requests were made for the given realm path.
@@ -303,7 +323,12 @@ fn install_jwks_mock(server: &MockServer, jwks_requests: RequestCounters) {
     });
 }
 
-fn install_token_mock(server: &MockServer) {
+fn install_token_mock(
+    server: &MockServer,
+    token_requests: RequestCounters,
+    expires_in: Option<u64>,
+    jwt_exp: u64,
+) {
     let base_url = server.base_url();
     server.mock(move |when, then| {
         when.method(POST)
@@ -328,11 +353,12 @@ fn install_token_mock(server: &MockServer) {
                 .path()
                 .strip_suffix("/protocol/openid-connect/token")
                 .unwrap_or("");
+            increment_request_count(&token_requests, issuer_path);
             let issuer = format!("{base_url}{issuer_path}");
             let claims = json!({
                 "sub": "550e8400-e29b-41d4-a716-446655440333",
                 "iss": issuer,
-                "exp": future_exp(),
+                "exp": jwt_exp,
                 "client_id": TEST_S2S_CLIENT_ID,
                 "tenant_id": "550e8400-e29b-41d4-a716-446655440222",
                 "scope": params.get("scope").map_or("", String::as_str),
@@ -344,7 +370,7 @@ fn install_token_mock(server: &MockServer) {
                 &json!({
                     "access_token": access_token,
                     "token_type": "Bearer",
-                    "expires_in": 300,
+                    "expires_in": expires_in,
                 }),
             )
         });

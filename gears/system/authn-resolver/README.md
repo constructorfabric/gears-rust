@@ -9,13 +9,14 @@ The decision to split authentication and authorization into separate resolvers i
 [ADR-0002](../../../docs/arch/authorization/ADR/0002-split-authn-authz-resolvers.md) and
 the minimalist interface choice in [ADR-0003](../../../docs/arch/authorization/ADR/0003-authn-resolver-minimalist-interface.md).
 
-The **authn_resolver** gear provides a single responsibility: convert a bearer token into a validated identity (`SecurityContext`). The resolver is a integration point — it discovers and delegates to a vendor-specific plugin via the types-registry. The actual token validation logic lives in the plugin.
+The **authn_resolver** gear provides a single responsibility: convert a bearer token or service credentials into a validated identity (`SecurityContext`). The resolver is an integration point — it discovers and delegates to a vendor-specific plugin via the types-registry. The actual token validation logic lives in the plugin.
 
 ## Public API
 
 The gear registers [`AuthNResolverClient`](authn-resolver-sdk/src/api.rs) in ClientHub:
 
-- `authenticate(bearer_token)` — Validate bearer token and return `AuthenticationResult`
+- `authenticate(bearer_token)` — Validate a bearer token and return `AuthenticationResult`
+- `exchange_client_credentials(request)` — Obtain a token and validated identity for S2S work
 
 ### `AuthenticationResult`
 
@@ -25,10 +26,13 @@ Contains a `SecurityContext` with:
 - `subject_tenant_id` — Home tenant of the subject (required)
 - `token_scopes` — Permission scopes (`["*"]` for first-party apps)
 - `bearer_token` — Optionally preserved for downstream PDP forwarding
+- `expires_at` — Optional verified/exchanged credential expiry
+
+The result also carries the plugin's reuse policy in `cache_control`; NoStore is the default.
 
 ### Errors
 
-See [`error.rs`](authn-resolver-sdk/src/error.rs): `Unauthorized`, `NoPluginAvailable`, `ServiceUnavailable`, `Internal`
+See [`error.rs`](authn-resolver-sdk/src/error.rs): `Unauthorized`, `NoPluginAvailable`, `ServiceUnavailable` (including unavailable IdP dependencies), `TokenAcquisitionFailed`, `Internal`
 
 ## Plugin API
 
@@ -76,7 +80,9 @@ gears:
 // API Gateway middleware
 let authn = hub.get::<dyn AuthNResolverClient>()?;
 
-let result = authn.authenticate("Bearer abc123").await?;
+// Raw token without the `Bearer ` prefix; `new` always revalidates.
+let request = AuthenticationRequest::new("abc123");
+let result = authn.authenticate(&request).await?;
 // result.security_context contains validated identity
 ```
 
@@ -97,3 +103,7 @@ The API Gateway consumes `AuthNResolverClient` in its authentication middleware.
 
 - JWKS-based token validation
 - Standard OIDC claims mapping to `SecurityContext`
+
+## Cached client credentials
+
+Use `authn_resolver_sdk::ClientCredentialsProvider::builder(...)` for client-side S2S caching. See the [SDK example](authn-resolver-sdk/README.md#cached-s2s-credentials) and [design](../../../docs/arch/authorization/DESIGN.md#s2s-caching-provider).

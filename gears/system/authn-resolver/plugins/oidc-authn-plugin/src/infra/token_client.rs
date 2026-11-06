@@ -7,29 +7,27 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use authn_resolver_sdk::ClientCredentialsRequest;
+use authn_resolver_sdk::{ClientCredentialsRequest, RequestCacheControl, ScopeSet};
 use dashmap::DashMap;
-use secrecy::ExposeSecret;
+use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
+use time::OffsetDateTime;
 use tracing::{debug, info, warn};
 
 use crate::config::{IssuerTrustConfig, RetryPolicyConfig, S2sConfig};
 use crate::domain::error::AuthNError;
-use crate::domain::ports::ClientCredentialsExchanger;
+use crate::domain::ports::{ClientCredentialsExchanger, ExchangedToken};
 use crate::infra::circuit_breaker::{HostCircuitBreakers, host_key};
 use crate::infra::http_response::read_json_response_limited;
 use crate::infra::oidc::{OidcConfig, OidcDiscovery};
 use crate::infra::retry::{RetriedRequestError, is_retryable_status, send_with_retry};
-use crate::infra::single_flight::{
-    SingleFlightGate, release_single_flight_gate as release_gate,
-    single_flight_gate as acquire_gate,
-};
+use crate::infra::single_flight::{SingleFlightGate, SingleFlightLease};
 use crate::infra::ttl_cache::{Timestamped, TtlCache};
 
 /// Cached S2S access token entry.
 #[derive(Debug, Clone)]
 struct CachedToken {
-    access_token: String,
+    token: ExchangedToken,
     fetched_at: Instant,
     /// Per-token TTL derived from `min(expires_in, config.token_cache_ttl_secs)`.
     effective_ttl: Duration,
@@ -50,6 +48,54 @@ impl Timestamped for CachedToken {
 struct TokenResponse {
     access_token: String,
     expires_in: Option<u64>,
+}
+
+/// Why [`TokenClient::exchange`] goes to the token endpoint.
+#[derive(Debug, Clone, Copy)]
+enum FetchReason {
+    CacheMiss,
+    /// The caller asked to bypass the cache; `tagged` says whether it named
+    /// the tag to replace (the tag itself is not logged).
+    Refresh {
+        tagged: bool,
+    },
+}
+
+impl FetchReason {
+    fn log(self, client_id: &str) {
+        match self {
+            Self::CacheMiss => {
+                info!(%client_id, "S2S token cache miss, fetching from IdP");
+            }
+            Self::Refresh { tagged } => info!(
+                %client_id,
+                tagged,
+                "S2S token refresh requested, bypassing cache and fetching from IdP"
+            ),
+        }
+    }
+}
+
+/// `obtained_at + secs`, or a logged parse failure when that instant is not
+/// representable (an absurd `expires_in` or configured TTL).
+fn lifetime_end(
+    client_id: &str,
+    obtained_at: OffsetDateTime,
+    field: &'static str,
+    secs: u64,
+) -> Result<OffsetDateTime, AuthNError> {
+    i64::try_from(secs)
+        .ok()
+        .and_then(|secs| obtained_at.checked_add(time::Duration::seconds(secs)))
+        .ok_or_else(|| {
+            warn!(
+                %client_id,
+                field,
+                secs,
+                "S2S token lifetime is out of the representable range"
+            );
+            AuthNError::TokenResponseParseFailed
+        })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -120,33 +166,40 @@ impl TokenClient {
     ///
     /// Returns a cached token on cache hit. On cache miss, performs the full
     /// `OAuth2` `client_credentials` grant against the `IdP` token endpoint.
+    ///
+    /// Cancellation releases the single-flight lease. An already-sent `IdP`
+    /// request may complete, but its token is neither cached nor returned.
     #[allow(clippy::cognitive_complexity)]
     pub(crate) async fn exchange(
         &self,
         request: &ClientCredentialsRequest,
         issuer_trust: &IssuerTrustConfig,
-    ) -> Result<String, AuthNError> {
+    ) -> Result<ExchangedToken, AuthNError> {
         let identity = Self::cache_identity(request);
+        // We cannot prove a different opaque tag is newer than the caller's.
+        // Conservatively bypass both cache reads for every Refresh request.
+        let reason = match &request.cache_control {
+            RequestCacheControl::AllowCached => FetchReason::CacheMiss,
+            RequestCacheControl::Refresh { replacing } => FetchReason::Refresh {
+                tagged: replacing.is_some(),
+            },
+        };
+        let allow_cached = matches!(reason, FetchReason::CacheMiss);
 
-        if let Some(cached) = self.cache.get_fresh(&identity.key) {
+        if allow_cached && let Some(cached) = self.cached_token(&identity.key) {
             debug!(client_id = %request.client_id, "S2S token cache hit");
-            return Ok(cached.access_token);
+            return Ok(cached);
         }
 
-        let gate = self.single_flight_gate(&identity.key);
-        let result = {
-            let _single_flight_guard = gate.mutex.lock().await;
+        let lease = SingleFlightLease::acquire(&self.in_flight, &identity.key);
+        let _single_flight_guard = lease.gate().mutex.lock().await;
 
-            if let Some(cached) = self.cache.get_fresh(&identity.key) {
-                debug!(client_id = %request.client_id, "S2S token cache hit after wait");
-                Ok(cached.access_token)
-            } else {
-                self.exchange_uncached(request, &identity, issuer_trust)
-                    .await
-            }
-        };
-        self.release_single_flight_gate(&identity.key, &gate);
-        result
+        if allow_cached && let Some(cached) = self.cached_token(&identity.key) {
+            debug!(client_id = %request.client_id, "S2S token cache hit after wait");
+            return Ok(cached);
+        }
+        self.exchange_uncached(request, &identity, issuer_trust, reason)
+            .await
     }
 
     async fn exchange_uncached(
@@ -154,9 +207,13 @@ impl TokenClient {
         request: &ClientCredentialsRequest,
         identity: &CacheIdentity,
         issuer_trust: &IssuerTrustConfig,
-    ) -> Result<String, AuthNError> {
-        info!(client_id = %request.client_id, "S2S token cache miss, fetching from IdP");
+        reason: FetchReason,
+    ) -> Result<ExchangedToken, AuthNError> {
+        reason.log(&request.client_id);
         let endpoint = self.resolve_token_endpoint(issuer_trust).await?;
+        // Start before the request: network/retry time must not extend expiry.
+        let fetched_at = Instant::now();
+        let obtained_at = OffsetDateTime::now_utc();
         let token_response = self
             .post_client_credentials(&endpoint, request, &identity.normalized_scopes)
             .await?;
@@ -172,19 +229,41 @@ impl TokenClient {
             "Caching S2S access token"
         );
 
+        let expires_at = token_response
+            .expires_in
+            .map(|secs| lifetime_end(&request.client_id, obtained_at, "expires_in", secs))
+            .transpose()?;
+        let cache_until = lifetime_end(
+            &request.client_id,
+            obtained_at,
+            "token_cache_ttl_secs",
+            ttl_secs,
+        )?;
+        let token = ExchangedToken {
+            access_token: SecretString::from(token_response.access_token),
+            expires_at,
+            cache_until,
+        };
         let cached = CachedToken {
-            access_token: token_response.access_token.clone(),
-            fetched_at: Instant::now(),
+            token: token.clone(),
+            fetched_at,
             effective_ttl: Duration::from_secs(ttl_secs),
         };
         self.cache
             .insert_with_eviction(&identity.key, cached, "S2S token");
 
-        Ok(token_response.access_token)
+        Ok(token)
+    }
+
+    fn cached_token(&self, key: &str) -> Option<ExchangedToken> {
+        let token = self.cache.get_fresh(key)?.token;
+        let now = OffsetDateTime::now_utc();
+        (now < token.cache_until && token.expires_at.is_none_or(|until| now < until))
+            .then_some(token)
     }
 
     fn cache_identity(request: &ClientCredentialsRequest) -> CacheIdentity {
-        let normalized_scopes = Self::normalize_scopes(&request.scopes);
+        let normalized_scopes = Self::normalize_scopes(request.scopes.as_ref());
         let credential_fingerprint =
             Self::credential_fingerprint(request.client_secret.expose_secret());
         let key = Self::build_cache_key(
@@ -198,15 +277,12 @@ impl TokenClient {
         }
     }
 
-    fn normalize_scopes(scopes: &[String]) -> String {
-        let mut scope_parts = scopes
-            .iter()
-            .map(|scope| scope.trim())
-            .filter(|scope| !scope.is_empty())
-            .collect::<Vec<_>>();
-        scope_parts.sort_unstable();
-        scope_parts.dedup();
-        scope_parts.join(" ")
+    /// The `scope` parameter: the SDK's canonical [`ScopeSet`] form, so a
+    /// `ClientCredentialsProvider` slot and this cache agree on scope identity. `None`
+    /// (the `IdP` defaults) yields an empty string, and the form then omits
+    /// the `scope` field.
+    fn normalize_scopes(scopes: Option<&ScopeSet>) -> String {
+        scopes.map(ToString::to_string).unwrap_or_default()
     }
 
     fn credential_fingerprint(secret: &str) -> String {
@@ -230,14 +306,6 @@ impl TokenClient {
             client_id.len(),
             normalized_scopes.len()
         )
-    }
-
-    fn single_flight_gate(&self, key: &str) -> Arc<SingleFlightGate> {
-        acquire_gate(&self.in_flight, key)
-    }
-
-    fn release_single_flight_gate(&self, key: &str, gate: &Arc<SingleFlightGate>) {
-        release_gate(&self.in_flight, key, gate);
     }
 
     /// Resolve the token endpoint URL from OIDC discovery metadata.
@@ -378,7 +446,7 @@ impl ClientCredentialsExchanger for TokenClient {
         &self,
         request: &ClientCredentialsRequest,
         issuer_trust: &IssuerTrustConfig,
-    ) -> Result<String, AuthNError> {
+    ) -> Result<ExchangedToken, AuthNError> {
         TokenClient::exchange(self, request, issuer_trust).await
     }
 }

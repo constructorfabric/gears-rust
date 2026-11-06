@@ -730,9 +730,9 @@ Details body. The caller process MUST NOT crash.
   changes to OpenAPI generation are needed.
 - Gear SDK crates already define client traits (e.g., `UsersClient`). Generated REST clients implement these existing
   traits.
-- `postcard` serialization of SecurityContext is deterministic and backward-compatible across gear versions. The
-  existing `toolkit_security::bin_codec` with `SECCTX_BIN_VERSION = 1` provides versioned encoding. This encoding is
-  used only for in-process gRPC metadata (Profile 1); HTTP propagation uses JWT re-validation per ADR-0008.
+- `toolkit_security::bin_codec` uses deterministic, positional `postcard` encoding. Serialized field changes require
+  a `SECCTX_BIN_VERSION` bump (v2 adds `expires_at`); peers must use matching layouts and versions or decoding fails.
+  Encoding is used only for in-process gRPC metadata (Profile 1); HTTP propagation re-validates JWTs per ADR-0008.
 - `SecurityContext` will gain a `set_bearer_token(&mut self, token: SecretString)` method for post-deserialization token
   injection (currently only settable via builder).
 - External gateways (Kong, Tyk) expose a programmatic admin API sufficient for dynamic route registration.

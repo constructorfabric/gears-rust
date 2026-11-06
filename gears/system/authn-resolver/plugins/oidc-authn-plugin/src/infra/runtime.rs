@@ -119,5 +119,6 @@ fn build_oidc_authn_plugin_with_url_policy(
     .claim_mapper_config(plugin_config.claim_mapper)
     .s2s_claim_mapper_config(plugin_config.s2s_claim_mapper)
     .claim_mapper_options(plugin_config.claim_mapper_options)
+    .authenticate_result_cache_ttl(plugin_config.authenticate_result_cache_ttl)
     .build(jwks_provider, token_exchanger, metrics)
 }

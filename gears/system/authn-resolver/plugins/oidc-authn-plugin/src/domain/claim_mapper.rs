@@ -229,7 +229,16 @@ pub fn map_with_bearer_with_options(
     bearer_token: Option<&str>,
     metrics: &AuthNMetrics,
 ) -> Result<SecurityContext> {
-    map_with_bearer_opts(claims, config, options, bearer_token, metrics, true, None)
+    map_with_bearer_opts(claims, config, options, bearer_token, metrics, None)
+}
+
+/// Extra lifetime and identity information for service-account mapping.
+#[domain_model]
+pub(crate) struct S2sMapping<'a> {
+    /// Service-account classification when the token omits a subject type.
+    pub default_subject_type: &'a str,
+    /// Original deadline from the token endpoint, retained across cache hits.
+    pub oauth_expires_at: Option<time::OffsetDateTime>,
 }
 
 /// Internal mapping implementation with optional first-party tracking.
@@ -239,9 +248,8 @@ pub(crate) fn map_with_bearer_opts(
     options: &ClaimMapperOptions,
     bearer_token: Option<&str>,
     metrics: &AuthNMetrics,
-    // False for S2S tokens: skip first-party ratio tracking and allow subject-type fallback.
-    track_first_party: bool,
-    default_subject_type: Option<&str>,
+    // S2S tokens skip first-party ratio tracking and allow subject-type fallback.
+    s2s: Option<S2sMapping<'_>>,
 ) -> Result<SecurityContext> {
     let subject_id = extract_subject_id_with_claim(claims, &config.subject_id)?;
     let subject_tenant_id = extract_tenant_id(claims, &config.subject_tenant_id, metrics)?;
@@ -255,18 +263,39 @@ pub(crate) fn map_with_bearer_opts(
         }
     }
     let app_type = detect_app_type(claims, &options.first_party_clients);
-    if track_first_party {
+    if s2s.is_none() {
         metrics.observe_first_party_auth(matches!(app_type, AppType::FirstParty));
     }
     let token_scopes = extract_scopes_with_claim(claims, app_type, &config.token_scopes);
-    if !track_first_party && subject_type.is_none() {
-        subject_type = default_subject_type.map(str::to_owned);
+    if subject_type.is_none()
+        && let Some(s2s) = &s2s
+    {
+        subject_type = Some(s2s.default_subject_type.to_owned());
     }
 
     let mut builder = SecurityContext::builder()
         .subject_id(subject_id)
         .subject_tenant_id(subject_tenant_id)
         .token_scopes(token_scopes);
+
+    // These claims have already passed JWT validation. Keep the actual exp,
+    // without validation leeway, and the original OAuth deadline if earlier.
+    let jwt_expiry = claims
+        .get("exp")
+        .map(|exp| {
+            exp.as_i64()
+                .and_then(|seconds| time::OffsetDateTime::from_unix_timestamp(seconds).ok())
+                .ok_or_else(|| unauthorized("invalid credential expiry"))
+        })
+        .transpose()?;
+    let oauth_expiry = s2s.and_then(|mapping| mapping.oauth_expires_at);
+    let expiry = match (jwt_expiry, oauth_expiry) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    };
+    if let Some(expiry) = expiry {
+        builder = builder.expires_at(expiry);
+    }
 
     if let Some(subject_type_value) = subject_type.as_deref() {
         builder = builder.subject_type(subject_type_value);
