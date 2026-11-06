@@ -19,9 +19,9 @@ use uuid::Uuid;
 use crate::models::{
     AcceptRequest, AcceptResponse, BulkCancelRequest, BulkMoveRequest, BulkReprioritizeRequest,
     BulkResult, BulkTaskIdsRequest, CancelRequest, CheckpointRequest, CheckpointResponse,
-    ClaimRequest, ClaimResponse, CompleteRequest, CountTasksQuery, CreateEntryRequest, Entry,
-    EntryPage, HeartbeatRequest, HeartbeatResponse, HistoryEventPage, HoldRequest,
-    LeaseTokenRequest, NewTask, PageQuery, ParkRequest, ParkResponse, ProgressRequest, Queue,
+    ClaimRequest, ClaimResponse, CompleteRequest, CountTasksQuery, CreateEntryRequest,
+    CreateTaskRequest, Entry, EntryPage, HeartbeatRequest, HeartbeatResponse, HistoryEventPage,
+    HoldRequest, LeaseTokenRequest, PageQuery, ParkRequest, ParkResponse, ProgressRequest, Queue,
     QueueList, ReassignRequest, ReleaseRequest, ResolveRequest, ResolveResponse,
     RuntimeConfigAccepted, RuntimeConfigRequest, RuntimeConfigStatus, SearchTasksQuery,
     SetWaitRequest, SetWaitResponse, TagsPatchRequest, Task, TaskCount, TaskSearchPage,
@@ -54,7 +54,7 @@ pub trait TaskEngineApi: Send + Sync {
     async fn create_task(
         &self,
         ctx: SecurityContext,
-        task: NewTask,
+        task: CreateTaskRequest,
     ) -> Result<Task, CanonicalError>;
 
     /// Keyset-paged search over the caller's visible tasks (`searchTasks`).

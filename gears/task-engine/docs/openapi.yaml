@@ -2134,9 +2134,9 @@ components:
       required: [type, input]
       additionalProperties: false
       description: >-
-        Create body. The SDK equivalent is `NewTask`, which carries `idempotency_key`
-        (the `Idempotency-Key` header here) and never `created_by` (taken from the
-        caller's security context).
+        Create body. The SDK type of the same name also carries `idempotency_key`
+        (the `Idempotency-Key` header here) until header binding is supported; it
+        never carries `created_by` (taken from the caller's security context).
       properties:
         type:
           $ref: "#/components/schemas/TaskTypeRef"

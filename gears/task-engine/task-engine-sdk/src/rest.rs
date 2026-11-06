@@ -25,8 +25,8 @@
 //!
 //! **Known wire gap.** `Idempotency-Key` is a request header in the document,
 //! but the macro cannot bind headers yet, so the generated client sends
-//! [`NewTask::idempotency_key`](crate::models::NewTask::idempotency_key) in the
-//! body. See [`NewTask`].
+//! [`CreateTaskRequest::idempotency_key`](crate::models::CreateTaskRequest::idempotency_key) in the
+//! body. See [`CreateTaskRequest`].
 
 use gts::GtsInstanceId;
 use toolkit_canonical_errors::CanonicalError;
@@ -37,9 +37,9 @@ use crate::api::TaskEngineApi;
 use crate::models::{
     AcceptRequest, AcceptResponse, BulkCancelRequest, BulkMoveRequest, BulkReprioritizeRequest,
     BulkResult, BulkTaskIdsRequest, CancelRequest, CheckpointRequest, CheckpointResponse,
-    ClaimRequest, ClaimResponse, CompleteRequest, CountTasksQuery, CreateEntryRequest, Entry,
-    EntryPage, HeartbeatRequest, HeartbeatResponse, HistoryEventPage, HoldRequest,
-    LeaseTokenRequest, NewTask, PageQuery, ParkRequest, ParkResponse, ProgressRequest, Queue,
+    ClaimRequest, ClaimResponse, CompleteRequest, CountTasksQuery, CreateEntryRequest,
+    CreateTaskRequest, Entry, EntryPage, HeartbeatRequest, HeartbeatResponse, HistoryEventPage,
+    HoldRequest, LeaseTokenRequest, PageQuery, ParkRequest, ParkResponse, ProgressRequest, Queue,
     QueueList, ReassignRequest, ReleaseRequest, ResolveRequest, ResolveResponse,
     RuntimeConfigAccepted, RuntimeConfigRequest, RuntimeConfigStatus, SearchTasksQuery,
     SetWaitRequest, SetWaitResponse, TagsPatchRequest, Task, TaskCount, TaskSearchPage,
@@ -60,7 +60,7 @@ pub trait TaskEngineApiRest: TaskEngineApi {
     async fn create_task(
         &self,
         ctx: SecurityContext,
-        task: NewTask,
+        task: CreateTaskRequest,
     ) -> Result<Task, CanonicalError>;
 
     #[get("/tasks")]

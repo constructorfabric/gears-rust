@@ -473,9 +473,9 @@ impl Task {
 // Requests
 // ---------------------------------------------------------------------------
 
-/// Create a task — the SDK form of the `CreateTaskRequest` body.
+/// Create a task — the `CreateTaskRequest` body.
 ///
-/// Carries [`idempotency_key`](Self::idempotency_key), which `openapi.yaml`
+/// Also carries [`idempotency_key`](Self::idempotency_key), which `openapi.yaml`
 /// sends as the `Idempotency-Key` header, and never `created_by` (taken from
 /// the caller's security context).
 ///
@@ -484,11 +484,11 @@ impl Task {
 /// DESIGN), so the generated REST client sends `idempotency_key` as a body
 /// field instead of the header. `create_task` is `#[server_manual]`, so the
 /// gear's handler accepts both until header binding lands; then this field moves
-/// to the header and the body matches `CreateTaskRequest` exactly.
+/// to the header and the body matches the document's schema exactly.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 #[non_exhaustive]
-pub struct NewTask {
+pub struct CreateTaskRequest {
     /// Platform idempotency key, unique per tenant and creating subject.
     /// Required for every task type without a derived dedup identity (missing →
     /// `428`); ignored for types that declare the `dedup` trait (p2).
@@ -560,7 +560,7 @@ pub struct NewTask {
     pub wait: Option<InitialWaitGroup>,
 }
 
-impl NewTask {
+impl CreateTaskRequest {
     /// Build a create request with a type, an input and an idempotency key.
     #[must_use]
     pub fn new(
