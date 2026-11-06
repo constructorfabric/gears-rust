@@ -825,14 +825,14 @@ accumulate, so a leaf restating `index` restates all of it.
 ##### Files and verification
 
 The schemas above are kept as registrable files under
-[`schemas/`](../graph-storage/schemas/), with the worked producer types in
-[`graph-storage/schemas/examples/`](../graph-storage/schemas/examples/) under the fictional `acme` vendor.
+[`graph-storage-sdk/schemas/`](../graph-storage-sdk/schemas/), with the worked producer types in
+[`graph-storage-sdk/schemas/examples/`](../graph-storage-sdk/schemas/examples/) under the fictional `acme` vendor.
 This section is the normative narrative; those files are the same content in the
 form the types-registry accepts, so the chain can be validated mechanically
 rather than read for correctness:
 
 ```bash
-gts --path gears/graph-storage/graph-storage/schemas \
+gts --path gears/graph-storage/graph-storage-sdk/schemas \
     validate-type-schema --type-id 'gts.cf.core.graph.node.v1~cf.core.graph.owned_node.v1~'
 ```
 
@@ -3022,11 +3022,17 @@ scan.
 
 ### Base Ontology Publication
 
-The gear submits the base ontology defined in § 3.1 (Base Ontology GTS
-Schemas) — the three abstract bases and the six family types — and its
-permission instances (one `AuthzPermissionV1` per resource and action the PEP
-checks: node read, write and delete; type read and admin) to the `toolkit-gts`
-inventory (`src/gts.rs`). types-registry seeds the inventory at its own startup,
+The SDK submits the base ontology defined in § 3.1 (Base Ontology GTS
+Schemas) — the three abstract bases and the six family types — and the schema
+of the type catalogue's authorization resource (`gts.cf.core.graph.type.v1~`,
+which is not part of the ontology) to the `toolkit-gts` inventory
+(`graph_storage_sdk::gts`), as the other gears publish their type schemas: the
+ontology is the public contract producers derive from, and a process that links
+only the SDK publishes it too. The gear submits its permission instances (one
+`AuthzPermissionV1` per resource and action the PEP checks: node read, write
+and delete; type read and admin; `src/gts.rs`). Every permission's resource
+type is therefore in the registry, which the policy-engine requires of a policy
+naming it without a wildcard. types-registry seeds the inventory at its own startup,
 so producers can derive types and administrators can grant permissions before
 any runtime registration happens, and the gear makes no call to the registry.
 The submitted schemas are the same embedded documents the gear validates

@@ -10,7 +10,7 @@ in-process consumers, the REST surface under `/graph-storage/v1`, and the
 plugin contracts (`GraphStoreV1`, `GraphEngineV1`, `EmbeddingProviderV1`).
 
 - [PRD](../docs/PRD.md), [DESIGN](../docs/DESIGN.md), [ADRs](../docs/ADR/)
-- Base ontology schemas the gear registers at boot: [`schemas/`](./schemas/)
+- Base ontology schemas the gear registers at boot and the SDK publishes to types-registry: [`graph-storage-sdk/schemas/`](../graph-storage-sdk/schemas/)
 - Known gaps between these documents and the code: [below](#known-limitations)
 
 ## Requirements

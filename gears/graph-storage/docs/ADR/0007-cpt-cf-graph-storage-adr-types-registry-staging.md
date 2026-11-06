@@ -98,7 +98,7 @@ platform namespace for good, which is the thing to fix.
 | Stage | When | What | Runtime dependency on the registry |
 |---|---|---|---|
 | 0 | now | This ADR; DESIGN, PRD and the `gts_type` doc say the gear's catalogue is authoritative for producer types in the interim | none |
-| 1 | now | The nine base schemas and the gear's permissions (one `AuthzPermissionV1` per resource and action the PEP checks) are submitted to the `toolkit-gts` inventory (`src/gts.rs`), which types-registry seeds at its own startup | **none**: the registry seeds, the gear does not call it |
+| 1 | now | The nine base schemas and the schema of the type-catalogue resource (`gts.cf.core.graph.type.v1~`) are submitted by the SDK (`graph_storage_sdk::gts`), and the gear's permissions (one `AuthzPermissionV1` per resource and action the PEP checks) by the gear (`src/gts.rs`), to the `toolkit-gts` inventory, which types-registry seeds at its own startup | **none**: the registry seeds, the gear does not call it |
 | 2 | after types-registry P1 (#4628) | Producer types are tenant-owned registry entities; `gts_type` becomes their projection; existing tenants' types are imported with their identity; readiness reports the registry | yes, with the gear serving from its projection while the registry is unreachable |
 | 3 | after types-registry P2 | The graph rules become the gear's validation hook at admission, and the gear's copy of the compatibility check (`domain/evolution.rs`) goes | yes |
 
@@ -106,11 +106,14 @@ platform namespace for good, which is the thing to fix.
 
 - Good: the base ontology and the permissions resolve platform-wide from
   stage 1, so a grant can name `gts.cf.toolkit.authz.permission.v1~cf.core.graph.*`
-  and a producer can derive from `gts.cf.core.graph.*` in the registry.
+  and a producer can derive from `gts.cf.core.graph.*` in the registry. Both
+  resource types the permissions name, `gts.cf.core.graph.node.v1~` and
+  `gts.cf.core.graph.type.v1~`, are registered schemas, so a policy can name
+  either without a wildcard (the policy-engine refuses an unknown one).
 - Good: stage 1 adds no deploy order and no readiness dependency.
 - Bad, accepted for stage 1: a bad inventory entry stops the registry's
   startup, and the platform with it. `tests/types_registry.rs` seeds the real
-  registry with everything the gear submits and fails on a refusal or on a
+  registry with everything the gear and its SDK submit and fails on a refusal or on a
   stored schema that differs from the one the gear validates against.
 - Bad, until stage 2: producer types are still registered with the gear only,
   and the gear still carries its own copy of the registry's rules.
@@ -122,12 +125,13 @@ platform namespace for good, which is the thing to fix.
 
 - `tests/types_registry.rs` initialises the real types-registry gear on an
   in-memory database, runs its startup seeding over the whole inventory, and
-  reads back the nine base schemas (equal to `BASE_SCHEMAS`) and the five
-  permissions. Removing one schema from the inventory, or altering one, fails
-  it.
+  reads back the nine base schemas (equal to `BASE_SCHEMAS`), the
+  type-catalogue resource schema, the five permissions and the resource type
+  each permission names. Removing one schema from the inventory, or altering
+  one, fails it.
 - A seeding probe on `main` (2026-10-30, not committed) admitted the nine base
   schemas byte-identical and the three example producer types in
-  `schemas/examples/` — graph traits, payload schemas and edge endpoint
+  `graph-storage-sdk/schemas/examples/` — graph traits, payload schemas and edge endpoint
   constraints — under vendor `cf`; under vendor `acme` the registry's vendor
   policy refused them.
 

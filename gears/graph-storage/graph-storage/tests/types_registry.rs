@@ -2,17 +2,24 @@
 
 //! What the gear publishes to types-registry, seeded by the real registry.
 //!
-//! The gear submits its base ontology and its permissions to the `toolkit-gts`
-//! inventory (`src/gts.rs`), and types-registry admits the whole inventory at
+//! The SDK submits the base ontology and the type-catalogue resource schema
+//! (`graph_storage_sdk::gts`), the gear its permissions (`src/gts.rs`), to the
+//! `toolkit-gts` inventory, and types-registry admits the whole inventory at
 //! its own startup. One entry it refuses stops that startup -- and the
 //! platform with it -- so the entries are proved here against the registry
 //! itself rather than against what its rules are believed to be: every one
-//! is admitted, and every base schema is stored exactly as the gear validates
-//! against it.
+//! is admitted, every published schema is stored exactly as the gear
+//! validates against it, and every permission names a resource type the
+//! registry knows -- the policy-engine refuses a policy naming one it does not.
 
 use std::sync::Arc;
 
-use graph_storage::domain::ontology::BASE_SCHEMAS;
+// The permissions are submitted by the gear crate and the schemas by its SDK.
+// The inventory only holds what the binary links, and nothing below names an
+// item of the gear crate, so it is linked explicitly: a test that linked the
+// SDK alone would find the schemas and none of the permissions.
+use graph_storage as _;
+use graph_storage_sdk::gts::published_schemas;
 use toolkit::config::ConfigProvider;
 use toolkit::contracts::{DatabaseCapability, SystemCapability};
 use toolkit::runtime::{GearManager, GrpcInstallerStore, SystemContext};
@@ -79,7 +86,7 @@ async fn seeded_registry(hub: &Arc<ClientHub>) -> TypesRegistryGear {
     )
     .with_db(DBProvider::new(db));
     gear.init(&ctx).await.expect("types-registry init");
-    gear.post_init(&system())
+    gear.legacy_finalize_after_application_init(&system())
         .await
         .expect("the registry admits the whole inventory, this gear's entries included");
     gear
@@ -93,7 +100,7 @@ async fn the_registry_admits_the_base_ontology_and_the_permissions_as_published(
         .get::<dyn TypesRegistryClient>()
         .expect("the registry client is wired");
 
-    for (type_id, raw) in BASE_SCHEMAS {
+    for (type_id, raw) in published_schemas() {
         let stored = client
             .get_type_schema(type_id)
             .await
@@ -114,5 +121,11 @@ async fn the_registry_admits_the_base_ontology_and_the_permissions_as_published(
             .unwrap_or_else(|error| panic!("{id} is in the registry: {error}"));
         assert_eq!(instance.object["resource_type"], resource, "{id}");
         assert_eq!(instance.object["action"], action, "{id}");
+        client
+            .get_type_schema(resource)
+            .await
+            .unwrap_or_else(|error| {
+                panic!("{id}: its resource type {resource} is in the registry: {error}")
+            });
     }
 }

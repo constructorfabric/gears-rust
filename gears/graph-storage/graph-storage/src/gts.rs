@@ -1,5 +1,8 @@
-//! What the gear publishes to the platform types-registry: the base ontology
-//! and the permissions its PEP checks (DESIGN § Base Ontology Publication).
+//! The permissions the gear's PEP checks, published to the platform
+//! types-registry (DESIGN § Base Ontology Publication). The base ontology and
+//! the schema of the type-catalogue resource are published by the SDK
+//! (`graph_storage_sdk::gts`), as the other gears publish their type schemas;
+//! the permission instances stay with the gear that enforces them.
 //!
 //! Both go through the process-wide `toolkit-gts` inventory, which
 //! types-registry seeds at its own startup, so the gear gains no runtime
@@ -15,44 +18,12 @@
 //!
 //! One bad inventory entry stops the registry's startup, and the platform
 //! with it, so `tests/types_registry.rs` seeds the real registry with
-//! everything this module submits and reads every entry back.
+//! everything this gear and its SDK submit and reads every entry back.
 
 use graph_storage_sdk::gts::{NODE_RESOURCE, TYPE_RESOURCE};
-use toolkit_gts::{AuthzPermissionV1, InventoryTypeSchema, gts_instance, inventory};
+use toolkit_gts::{AuthzPermissionV1, gts_instance};
 
 use crate::domain::authz::actions;
-use crate::domain::ontology::BASE_SCHEMAS;
-
-// ---- base ontology ---------------------------------------------------------
-//
-// The same embedded documents the gear validates against, byte for byte: a
-// copy published here and another kept there would be two schemas under one
-// identifier the first time one of them is edited.
-
-macro_rules! publish_base_schema {
-    ($index:literal) => {
-        inventory::submit! {
-            InventoryTypeSchema {
-                type_id: BASE_SCHEMAS[$index].0,
-                schema_fn: || BASE_SCHEMAS[$index].1.to_owned(),
-            }
-        }
-    };
-}
-
-publish_base_schema!(0);
-publish_base_schema!(1);
-publish_base_schema!(2);
-publish_base_schema!(3);
-publish_base_schema!(4);
-publish_base_schema!(5);
-publish_base_schema!(6);
-publish_base_schema!(7);
-publish_base_schema!(8);
-
-// Nine entries above for nine schemas; a tenth schema without a tenth entry
-// fails to compile here rather than going unpublished.
-const _: () = assert!(BASE_SCHEMAS.len() == 9);
 
 // ---- permissions -----------------------------------------------------------
 //
