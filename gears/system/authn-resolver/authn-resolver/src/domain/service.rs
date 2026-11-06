@@ -11,7 +11,7 @@ use authn_resolver_sdk::{
     ClientCredentialsRequest,
 };
 use toolkit::client_hub::{ClientHub, ClientScope};
-use toolkit::plugins::{GtsPluginSelector, choose_registered_plugin_instance};
+use toolkit::plugins::{GtsPluginSelector, choose_registered_plugin_instance, is_discovery_outage};
 use toolkit::telemetry::ThrottledLog;
 use toolkit_canonical_errors::CanonicalError;
 use toolkit_macros::domain_model;
@@ -58,7 +58,14 @@ impl Service {
 
     /// Lazily resolves and returns the plugin client.
     async fn get_plugin(&self) -> Result<Arc<dyn AuthNResolverPluginClient>, DomainError> {
-        let instance_id = bounded(self.selector.get_or_init(|| self.resolve_plugin())).await?;
+        let instance_id = self
+            .selector
+            .get_or_init_with_timeout(
+                DISCOVERY_BUDGET,
+                || self.resolve_plugin(),
+                DomainError::TypesRegistryUnavailable,
+            )
+            .await?;
         let scope = ClientScope::gts_id(instance_id.as_ref());
 
         if let Some(client) = self
@@ -157,31 +164,13 @@ impl Service {
     }
 }
 
-/// `selection` within [`DISCOVERY_BUDGET`]; on expiry it is dropped, which caches nothing.
-async fn bounded<F>(selection: F) -> Result<Arc<str>, DomainError>
-where
-    F: Future<Output = Result<Arc<str>, DomainError>>,
-{
-    tokio::time::timeout(DISCOVERY_BUDGET, selection)
-        .await
-        .unwrap_or_else(|_| {
-            Err(DomainError::TypesRegistryUnavailable(format!(
-                "plugin discovery did not finish within {DISCOVERY_BUDGET:?}"
-            )))
-        })
-}
-
 /// Registry availability failures map to retryable `TypesRegistryUnavailable` (503);
 /// malformed pages, credential refusals and contract faults remain internal.
 fn registry_failure(error: CanonicalError) -> DomainError {
-    match error {
-        CanonicalError::ServiceUnavailable { .. }
-        | CanonicalError::DeadlineExceeded { .. }
-        | CanonicalError::ResourceExhausted { .. }
-        | CanonicalError::Aborted { .. } => {
-            DomainError::TypesRegistryUnavailable(error.to_string())
-        }
-        other => DomainError::from(other),
+    if is_discovery_outage(&error) {
+        DomainError::TypesRegistryUnavailable(error.to_string())
+    } else {
+        DomainError::from(error)
     }
 }
 
