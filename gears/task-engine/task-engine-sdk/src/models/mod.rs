@@ -1,7 +1,7 @@
 //! Models of the [`TaskEngineApi`](crate::TaskEngineApi) contract.
 //!
-//! One Rust type per schema of `gears/task-engine/docs/openapi.yaml` (named
-//! after it, except [`NewTask`], the SDK form of `CreateTaskRequest`). Field
+//! One Rust type per schema of `gears/task-engine/docs/openapi.yaml`, named
+//! after it. Field
 //! names and JSON shapes follow the document; `type` fields are spelled
 //! `task_type` / `entry_type` / `event_type` in Rust.
 //!
@@ -46,7 +46,7 @@ pub use search::{
     TaskOrderBy, TaskSearchItem, TaskSearchPage, TaskView,
 };
 pub use task::{
-    Assignment, CancelRequest, CancelRequestInfo, NewTask, Predecessor, PredecessorInput,
+    Assignment, CancelRequest, CancelRequestInfo, CreateTaskRequest, Predecessor, PredecessorInput,
     ProgressInfo, ResourceRef, ResourceRefInput, TagsPatchRequest, Task, TaskError, TaskResult,
 };
 pub use wait::{
@@ -72,10 +72,10 @@ mod api_dto_markers {
     use super::{
         AcceptRequest, AcceptResponse, BulkCancelRequest, BulkMoveRequest, BulkReprioritizeRequest,
         BulkResult, BulkTaskIdsRequest, CancelRequest, CheckpointRequest, CheckpointResponse,
-        ClaimRequest, ClaimResponse, CompleteRequest, CreateEntryRequest, Entry, EntryPage,
-        HeartbeatRequest, HeartbeatResponse, HistoryEventPage, HoldRequest, LeaseTokenRequest,
-        NewTask, ParkRequest, ParkResponse, ProgressRequest, Queue, QueueList, ReassignRequest,
-        ReleaseRequest, ResolveRequest, ResolveResponse, RuntimeConfigAccepted,
+        ClaimRequest, ClaimResponse, CompleteRequest, CreateEntryRequest, CreateTaskRequest, Entry,
+        EntryPage, HeartbeatRequest, HeartbeatResponse, HistoryEventPage, HoldRequest,
+        LeaseTokenRequest, ParkRequest, ParkResponse, ProgressRequest, Queue, QueueList,
+        ReassignRequest, ReleaseRequest, ResolveRequest, ResolveResponse, RuntimeConfigAccepted,
         RuntimeConfigRequest, RuntimeConfigStatus, SetWaitRequest, SetWaitResponse,
         TagsPatchRequest, Task, TaskCount, TaskSearchPage, WaitConditionPage,
     };
@@ -85,7 +85,7 @@ mod api_dto_markers {
     }
 
     markers!(RequestApiDto:
-        NewTask, CancelRequest, TagsPatchRequest, ClaimRequest, HeartbeatRequest,
+        CreateTaskRequest, CancelRequest, TagsPatchRequest, ClaimRequest, HeartbeatRequest,
         LeaseTokenRequest, ProgressRequest, CheckpointRequest, CompleteRequest, ReleaseRequest,
         AcceptRequest, CreateEntryRequest, SetWaitRequest, ParkRequest, ResolveRequest,
         BulkCancelRequest, BulkReprioritizeRequest, BulkTaskIdsRequest, BulkMoveRequest,

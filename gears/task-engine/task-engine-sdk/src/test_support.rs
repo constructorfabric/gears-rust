@@ -15,9 +15,9 @@ use crate::error::TaskResourceError;
 use crate::models::{
     AcceptRequest, AcceptResponse, BulkCancelRequest, BulkMoveRequest, BulkReprioritizeRequest,
     BulkResult, BulkTaskIdsRequest, CancelRequest, CheckpointRequest, CheckpointResponse,
-    ClaimRequest, ClaimResponse, CompleteRequest, CountTasksQuery, CreateEntryRequest, Entry,
-    EntryPage, HeartbeatRequest, HeartbeatResponse, HistoryEventPage, HoldRequest,
-    LeaseTokenRequest, NewTask, PageQuery, ParkRequest, ParkResponse, ProgressRequest, Queue,
+    ClaimRequest, ClaimResponse, CompleteRequest, CountTasksQuery, CreateEntryRequest,
+    CreateTaskRequest, Entry, EntryPage, HeartbeatRequest, HeartbeatResponse, HistoryEventPage,
+    HoldRequest, LeaseTokenRequest, PageQuery, ParkRequest, ParkResponse, ProgressRequest, Queue,
     QueueList, ReassignRequest, ReleaseRequest, ResolveRequest, ResolveResponse,
     RuntimeConfigAccepted, RuntimeConfigRequest, RuntimeConfigStatus, SearchTasksQuery,
     SetWaitRequest, SetWaitResponse, TagsPatchRequest, Task, TaskCount, TaskSearchPage,
@@ -42,7 +42,7 @@ impl TaskEngineApi for UnimplementedTaskEngine {
     async fn create_task(
         &self,
         _ctx: SecurityContext,
-        _task: NewTask,
+        _task: CreateTaskRequest,
     ) -> Result<Task, CanonicalError> {
         Err(not_implemented("create_task"))
     }

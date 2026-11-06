@@ -1,7 +1,7 @@
 //! Smoke tests: the contract covers the document, and its examples decode.
 
 use serde_json::json;
-use task_engine_sdk::models::{ClaimResponse, NewTask, TaskState, WaitCondition};
+use task_engine_sdk::models::{ClaimResponse, CreateTaskRequest, TaskState, WaitCondition};
 use task_engine_sdk::{
     TaskEngineApi, UnimplementedTaskEngine, task_engine_api_ir, task_engine_api_rest_http_binding,
 };
@@ -55,7 +55,7 @@ fn claim_response_example_decodes() {
 
 #[test]
 fn create_example_round_trips_and_unknown_enum_values_are_absorbed() {
-    let task = NewTask::new(
+    let task = CreateTaskRequest::new(
         gts::GtsTypeId::new("gts.cf.core.tasks.task.v1~acme.reports._.render.v1~"),
         json!({ "report_id": "r-42", "format": "pdf" }),
         "key-1",
@@ -66,7 +66,7 @@ fn create_example_round_trips_and_unknown_enum_values_are_absorbed() {
         "gts.cf.core.tasks.task.v1~acme.reports._.render.v1~"
     );
     assert_eq!(
-        serde_json::from_value::<NewTask>(wire).expect("decodes"),
+        serde_json::from_value::<CreateTaskRequest>(wire).expect("decodes"),
         task
     );
 

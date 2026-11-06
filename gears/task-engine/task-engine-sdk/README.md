@@ -16,7 +16,7 @@ The public API contract of the `task-engine` gear, derived from
 
 Known gaps against the document (see `src/rest.rs`):
 
-- `Idempotency-Key` travels in the `NewTask` body until the contract macro can
+- `Idempotency-Key` travels in the `CreateTaskRequest` body until the contract macro can
   bind request headers.
 - Operations needing a non-`200` status or response headers are
   `#[server_manual]`: `create_task`, `cancel_task`, `claim_tasks`,
