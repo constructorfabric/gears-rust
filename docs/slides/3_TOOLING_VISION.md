@@ -51,7 +51,7 @@ Both halves hurt, and the second one outlives the first.
 | **P8** | Version alignment | know which gear versions work together — *application developer* |
 | **P9** | Portability | leave `gears-rust` and keep any of it — *both* |
 
-P1–P6 cost a team **once per repository**.
+P1–P3 cost a team **once per repository**. P4–P6 then cost it **for the life of the repository**.
 P7–P9 cost somebody **every working day**.
 
 ---
@@ -190,7 +190,8 @@ Success is visible in **what stops happening**.
 - Drift is found by a check on a pull request, not by an incident.
 - A developer learns what a gear is missing **before** pushing, not in review.
 - An upgrade lands in a week when nobody touched the repository.
-- A convention improves in **one place** and reaches everyone that pinned it.
+- A convention improves in **one place** and reaches everyone that pinned it without an exception —
+  and those who did are told, not changed.
 
 Two ways to fail even if every feature ships:
 teams keep copying by hand — or a green check comes to mean *"nothing ran"*.

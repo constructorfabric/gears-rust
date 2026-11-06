@@ -81,12 +81,12 @@ selection would look like this:
 
 | Convention | What it brings here | How it arrives |
 |---|---|---|
-| **Build rules** | the `Makefile` driver and `gears.mk` with its 32 targets | referenced by pin; the 74 targets in `gears-rust.mk` stay the project's |
+| **Build rules** | `gears.mk` with its 32 targets, behind a three-line `Makefile` driver | `gears.mk` referenced by pin; the driver copied, because `include` needs a file present before make parses anything; the 74 targets in `gears-rust.mk` stay the project's |
 | **CI pipeline** | the 30 workflows, the 4 composite actions, the 24 pipeline scripts under `tools/scripts/` | referenced by tag; the triggers and the secrets stay the project's |
 | **Rust lint and toolchain** | `clippy.toml`, `rustfmt.toml`, `deny.toml`, `rust-toolchain.toml`, `.config/nextest.toml`, `.cargo/config.toml` | generated from an upstream base plus the project's own values where the file has them — an ignored advisory, a licence exception, a threshold; copied and replaced whole under a version check where it has none |
 | **Dependency and lint baseline** | the 256 `[workspace.dependencies]` entries and the ~125 `[workspace.lints]` settings | generated from a shared source; Cargo has no cross-repository mechanism, so that source is new work |
 | **Repository layout** | the rule that `gears/`, `libs/`, `apps/` and the document roots are where a Gears repository puts them | setup creates the directories; after that there is no file to manage, and the rule is what the check answers |
-| **Gear layout** | the rule that states the complete set a gear carries: the crate, the `gear.gdl` descriptor, its documents, its workspace entry, its publish settings | nothing is written — the tool creates no gear. The check answers presence and placement; Gearbox still owns what the descriptor says, and `cfs` what the documents say |
+| **Gear layout** | the rule that states the complete set a gear carries — the layered crate, the SDK crate, the `gear.gdl` descriptor, the five documents, both workspace member entries, the `[workspace.dependencies]` alias, registration in `artifacts.toml`, the publish settings; P7 holds the list | nothing is written — the tool creates no gear. The check answers presence and placement; Gearbox still owns what the descriptor says, and `cfs` what the documents say |
 | **Document-first development** | the kit, its artifact templates, and the CI step that makes `cfs` run | referenced by kit version; the systems map in `artifacts.toml` stays the project's |
 | **Agent configuration** | the prompt and agent files for the five agent vendors this repository supports | generated from one source; today `toolkit-pr-review` exists five times and four copies have diverged |
 | **Platform guidelines** | the `guidelines/DNA` submodule and the platform documents beside it | referenced by submodule pin — the one convention here that already works this way |
@@ -250,8 +250,10 @@ puts the update on a schedule, runs the check on every change, and tells the upd
 already uses about the new pins. It is a working default, not an example in a README.
 
 Setup writes that wiring once and hands it over. It is project-owned from the first day — no pin, no
-management, and the project is free to change the schedule, change the bot, or remove it. That is
-the one thing setup writes and does not keep: everything else it installs stays managed and pinned.
+management, and the project is free to change the schedule, change the bot, or remove it. It is not the only thing setup
+writes without keeping — the boilerplate in section 1 is project-owned from the first day too — but
+it is the only one a convention depends on, which is why the hand-over is stated rather than
+assumed.
 The cost is deliberate, and section 9 names it as a risk: wiring a project removed is wiring that
 delivers nothing.
 
@@ -282,10 +284,12 @@ names four. The tool creates no gear and judges no gear's content.
 
 There are two generators, not one. `cargo gears generate module` creates the crate, and Gearbox's
 own `gearbox/gear/scaffold` writes `gear.gdl`, `Cargo.toml` and `src/lib.rs` from Gearbox Studio.
-That is the argument for a check rather than a third generator: **the convention states what a
-complete gear is, and both generators produce that list.** One statement, two producers, and a
-developer who used neither still gets the same answer. The tool reports that a declared part is
-absent; Gearbox says whether the part that exists is right.
+Neither produces the whole set today, and they produce different parts of it. That is the argument
+for a check rather than a third generator: **the convention states what a complete gear is, once,
+and each generator is then measured against that statement rather than against the other.** A
+developer who used neither still gets the same answer. Whether the generators grow to cover the
+whole list is their maintainers' decision; the check does not depend on it, and it is what makes
+the gap visible either way.
 
 **It owns repository-level conformance. Domain judgements stay with their owners.** The line is
 presence and placement against content and correctness. That a declared convention requires a DESIGN
@@ -296,11 +300,18 @@ dependency policy is `cargo-deny`'s. A second implementation of any of those giv
 answers to one question.
 
 Part of the gear check is therefore already written, by somebody else. `gearbox validate` reports a
-gear crate with no descriptor, a descriptor whose library name does not match its crate, and a
-descriptor that repeats what the `#[toolkit::gear]` attribute already says. Those are Gearbox's
-verdicts, and the tool writes none of them a second time. What it does for them is what it does for
-clippy: it checks that `gearbox validate` is configured and reachable for whoever runs it, and
-leaves the running and the verdict where they are. Composition pins follow the same line.
+descriptor whose library name does not match its crate, and one that repeats what the
+`#[toolkit::gear]` attribute already says. Both are judgements about content, both are Gearbox's,
+and the tool writes neither a second time. What it does for them is what it does for clippy: it
+checks that `gearbox validate` is configured and reachable for whoever runs it, and leaves the
+running and the verdict where they are.
+
+One check does overlap, and saying so is better than pretending otherwise. `gearbox validate` also
+reports a gear crate with no descriptor, which is a presence question — the same question the gear
+layout convention asks about every part it declares. The tool answers presence for the list it
+declared, so a missing descriptor is reported twice, by two tools, with the same answer. That is
+tolerable where the answer cannot diverge. It would not be tolerable for a judgement, which is why
+the line is drawn at presence and not at correctness. Composition pins follow the same line.
 `product.gdl` holds pins of its own, and moving one means resolving again and writing a new
 `product.lock`, so Gearbox moves those pins and the update loop here does not.
 
@@ -490,8 +501,9 @@ tool that cannot complete that cycle for one convention will not complete it for
 Setup answers P1 bootstrap, P2 CI reproduction, P3 SDLC reproduction and P9 portability. Validation
 answers P5 conformance signal and P7 gear completeness. The update loop answers P4 staying current.
 The declaration answers P6 all or nothing. Two answers carry a condition. P2 and P9 wait until the
-conventions live where a pin can select them. P8 version alignment stays with Gearbox, because only
-Gearbox can produce a resolved set of gear versions.
+conventions live where a pin can select them. P8 version alignment stays with Gearbox, because
+composition is Gearbox's. Note what that leaves open: Gearbox resolves versions, and the part P8
+names — a published set known to work together — has no owner yet.
 
 **In scope** are the three responsibilities above, and with them the declaration of the conventions
 a repository follows and the presence check for the tools those conventions need.
@@ -542,7 +554,7 @@ Seven observations about tools people use every day. Each one decided something 
 - **A template is a versioned artifact, not a branch you copy.** `dotnet new` installs a template
   from a feed at an exact version. That can be pinned and rolled back. A branch can only be copied.
 - **Regenerate instead of edit, and make the exception explicit.** Expo regenerates the native
-  directories from the app config, and never overwrites one that exists. Where a project must
+  directories from the app config, and regenerating is the upgrade. Where a project must
   diverge, give it a declared exception, or it edits the file and says nothing.
 - **Upgrades are explicit transformations, not merges.** `ng update`, `nx migrate` and
   `rails app:update` ship versioned steps owned by whoever caused the change. A merge with no
@@ -621,7 +633,7 @@ signal is where to look, not a target to hit.
 | A maintainer learns about drift from a report, not an incident | Drift is found by a check on a pull request rather than by a build that broke for an unrelated reason |
 | A developer learns what a gear is missing before pushing | The check runs locally as a habit, not only in CI — if it only ever runs in CI, the value arrived too late |
 | An upgrade lands in a week when nobody touched the repository | Repositories do not sit on pins that upstream moved past long ago, and the update pull request is a small diff rather than an afternoon |
-| A convention improves in one place and reaches everyone | Fixing a shared rule means one release, not one pull request per repository that copied it |
+| A convention improves in one place and reaches everyone that pinned it without an exception | Fixing a shared rule means one release, not one pull request per repository that copied it. A project holding a declared exception is told, not changed |
 | The set of files nobody manages keeps shrinking | The list of copied files gets shorter between releases, and each addition to it has a recorded reason |
 
 None of that is the same as a healthy repository, and the tool should never claim otherwise. It
