@@ -497,8 +497,8 @@ pub fn register_admin_facts_routes(
         .operation_id("construct.admin_add_subject_fact")
         .summary("Add a fact to a subject's profile")
         .description(
-            "Adds one fact, `properties` with exactly one property of the person types and \
-             its value, with the administrator as origin; a subject without a profile gets \
+            "Adds one fact, a `property` of the person types and its `value`, with the \
+             administrator as origin; a subject without a profile gets \
              one. The value passes the sensitive-data checks and Admission; when they refuse \
              it, or personalization is off for the subject, 422 names the reason and nothing \
              is stored. A value the subject holds already, or a second value of a one-valued \
@@ -534,7 +534,9 @@ pub fn register_admin_facts_routes(
         .description(
             "Stores a new value for the fact's own property in place of the fact, with the \
              administrator as origin; the fact gets a new id. An open review request on the \
-             fact closes as corrected; while a reviewer resolves it, 409. The value passes \
+             fact closes as corrected; while a reviewer resolves it, 409. When the edit was \
+             stored but the request did not close, 409 with reason `WRITTEN_NOT_CLOSED`: the \
+             fact has its new id already, so the edit is not sent again. The value passes \
              the sensitive-data checks and Admission; when they refuse it, 422 names the \
              reason, nothing is stored and a review request stays open. A fact the subject \
              does not have answers 404. Needs the permission to administer a subject's \

@@ -99,7 +99,6 @@ impl Tenant {
         let service = AdminFactsService::new(
             AdminFactsPorts {
                 writes,
-                reviews: Arc::clone(&self.reviews) as _,
                 review_queue,
                 one_step: Some(one_step),
                 events: Arc::default() as Arc<crate::test_support::RecordingAdminEvents>,
@@ -190,14 +189,14 @@ async fn an_administrator_lists_adds_edits_and_deletes_a_subjects_facts() {
         tenant.admin(),
         Method::POST,
         &tenant.facts(),
-        Some(json!({ "properties": { "headline": "Engineer" } })),
+        Some(json!({ "property": "headline", "value": "Engineer" })),
     )
     .await;
     let edited = send(
         tenant.admin(),
         Method::PUT,
         &tenant.fact(&skill),
-        Some(json!({ "properties": { "skills": { "name": "Go" } } })),
+        Some(json!({ "property": "skills", "value": { "name": "Go" } })),
     )
     .await;
     let new_skill = edited.body["fact_id"]
@@ -219,14 +218,13 @@ async fn an_administrator_lists_adds_edits_and_deletes_a_subjects_facts() {
     assert_eq!(listed.body["items"][0]["review_request"], Value::Null);
     assert_eq!(added.status, StatusCode::CREATED, "{}", added.body);
     assert_eq!(added.body["entity_kind"], json!("identity"));
-    assert_eq!(added.body["properties"], json!({ "headline": "Engineer" }));
+    assert_eq!(added.body["property"], json!("headline"));
+    assert_eq!(added.body["value"], json!("Engineer"));
     assert_eq!(added.body["origin"]["kind"], json!("administrator"));
     assert_eq!(edited.status, StatusCode::OK, "{}", edited.body);
     assert_ne!(new_skill, skill);
-    assert_eq!(
-        edited.body["properties"],
-        json!({ "skills": { "name": "Go" } })
-    );
+    assert_eq!(edited.body["property"], json!("skills"));
+    assert_eq!(edited.body["value"], json!({ "name": "Go" }));
     assert_eq!(deleted.status, StatusCode::NO_CONTENT);
     assert_eq!(after.body["items"].as_array().map(Vec::len), Some(1));
     assert_eq!(after.body["items"][0]["fact_id"], added.body["fact_id"]);
@@ -242,7 +240,7 @@ async fn a_caller_without_the_permission_gets_403_and_a_fact_the_subject_lacks_4
         denied(),
         Method::POST,
         &tenant.facts(),
-        Some(json!({ "properties": { "headline": "Engineer" } })),
+        Some(json!({ "property": "headline", "value": "Engineer" })),
     )
     .await;
     let unknown = send(
@@ -256,7 +254,7 @@ async fn a_caller_without_the_permission_gets_403_and_a_fact_the_subject_lacks_4
         tenant.admin(),
         Method::PUT,
         &tenant.fact("not%20a%20key"),
-        Some(json!({ "properties": { "skills": { "name": "Go" } } })),
+        Some(json!({ "property": "skills", "value": { "name": "Go" } })),
     )
     .await;
 
@@ -280,14 +278,14 @@ async fn a_refused_value_is_422_naming_the_reason_and_a_held_one_409() {
         tenant.routes(Arc::new(AllowResolver), OFF),
         Method::POST,
         &tenant.facts(),
-        Some(json!({ "properties": { "headline": "Engineer" } })),
+        Some(json!({ "property": "headline", "value": "Engineer" })),
     )
     .await;
     let held = send(
         tenant.admin(),
         Method::POST,
         &tenant.facts(),
-        Some(json!({ "properties": { "skills": { "name": "Rust" } } })),
+        Some(json!({ "property": "skills", "value": { "name": "Rust" } })),
     )
     .await;
 
@@ -304,7 +302,7 @@ async fn a_refused_value_is_422_naming_the_reason_and_a_held_one_409() {
         "{}",
         refused.body
     );
-    assert_eq!(violation["subject"], json!("properties"));
+    assert_eq!(violation["subject"], json!("value"));
     assert_eq!(held.status, StatusCode::CONFLICT, "{}", held.body);
     assert_eq!(held.body["context"]["reason"], json!("ALREADY_HELD"));
     assert!(
@@ -316,16 +314,21 @@ async fn a_refused_value_is_422_naming_the_reason_and_a_held_one_409() {
 }
 
 #[tokio::test]
-async fn a_body_without_exactly_one_known_property_is_400_naming_the_field() {
+async fn an_unknown_property_or_a_value_its_schema_does_not_take_is_400_naming_the_field() {
     let tenant = Tenant::new();
 
-    for body in [
-        json!({ "properties": {} }),
-        json!({ "properties": { "skills": { "name": "Go" }, "headline": "Engineer" } }),
-        json!({ "properties": { "shoe_size": 42 } }),
-        json!({ "properties": { "Skills": { "name": "Go" } } }),
-        json!({ "properties": { "x".repeat(65): 42 } }),
-        json!({ "properties": { "skills": 42 } }),
+    for (body, field) in [
+        (json!({ "property": "shoe_size", "value": 42 }), "property"),
+        (
+            json!({ "property": "Skills", "value": { "name": "Go" } }),
+            "property",
+        ),
+        (
+            json!({ "property": "x".repeat(65), "value": 42 }),
+            "property",
+        ),
+        (json!({ "property": "", "value": 42 }), "property"),
+        (json!({ "property": "skills", "value": 42 }), "value"),
     ] {
         let answer = send(
             tenant.admin(),
@@ -342,8 +345,35 @@ async fn a_body_without_exactly_one_known_property_is_400_naming_the_field() {
         );
         assert_eq!(
             answer.body["context"]["field_violations"][0]["field"],
-            json!("properties"),
+            json!(field),
             "{body}: {}",
+            answer.body
+        );
+    }
+    assert_eq!(tenant.profile.live().len(), 1);
+}
+
+#[tokio::test]
+async fn a_body_without_a_property_or_a_value_or_with_another_field_stores_nothing() {
+    let tenant = Tenant::new();
+
+    for body in [
+        json!({ "value": 42 }),
+        json!({ "property": "headline" }),
+        json!({ "properties": { "headline": "Engineer" } }),
+        json!({ "property": "headline", "value": "Engineer", "category": "identity" }),
+    ] {
+        let answer = send(
+            tenant.admin(),
+            Method::POST,
+            &tenant.facts(),
+            Some(body.clone()),
+        )
+        .await;
+        assert!(
+            answer.status.is_client_error(),
+            "{body}: {} {}",
+            answer.status,
             answer.body
         );
     }
@@ -367,7 +397,7 @@ async fn an_edit_closes_the_facts_review_request_and_while_a_reviewer_holds_it_i
                 router,
                 Method::PUT,
                 &uri,
-                Some(json!({ "properties": { "skills": { "name": "Go" } } })),
+                Some(json!({ "property": "skills", "value": { "name": "Go" } })),
             )
             .await
         }

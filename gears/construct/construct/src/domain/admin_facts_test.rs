@@ -157,7 +157,6 @@ impl Fixture {
         AdminFactsService::new(
             AdminFactsPorts {
                 writes,
-                reviews: Arc::clone(&self.reviews) as _,
                 review_queue,
                 one_step,
                 events: Arc::clone(&self.events) as _,
@@ -767,6 +766,14 @@ async fn a_refused_edit_of_a_fact_under_review_leaves_the_request_open() {
         event,
         AdminFactsEvent::Refused { fact_id: Some(fact), .. } if fact == &request.fact_id
     )));
+    assert!(
+        fixture
+            .review_events
+            .taken()
+            .iter()
+            .all(|event| !matches!(event, ReviewQueueEvent::CorrectionRefused { .. })),
+        "recorded once, as the administrator's"
+    );
 }
 
 #[tokio::test]
@@ -1057,6 +1064,47 @@ async fn an_edit_whose_fact_goes_away_before_the_write_stores_nothing() {
     assert!(fixture.events.taken().is_empty());
 }
 
+#[tokio::test]
+async fn an_edit_of_a_fact_under_review_that_goes_away_meanwhile_closes_the_request_and_is_404() {
+    let fixture = Fixture::new();
+    let request = fixture.flagged().await;
+    let writer = MemoryWriter::racing(Arc::clone(&fixture.profile));
+    let service = fixture.service_writing(
+        Arc::new(AllowResolver),
+        Some(ON),
+        Vec::new(),
+        Arc::clone(&writer) as _,
+    );
+
+    let edit = service
+        .edit(
+            &fixture.admin(),
+            fixture.subject,
+            &request.fact_id,
+            "skills",
+            &json!({ "name": "Go" }),
+        )
+        .await;
+
+    assert!(matches!(edit, Err(DomainError::NoSuchFact(_))), "{edit:?}");
+    let ReviewStatus::Closed(closed) = fixture.status() else {
+        panic!("still open");
+    };
+    assert_eq!(closed.outcome, ReviewOutcome::Deleted);
+    assert_eq!(closed.by, fixture.admin);
+    assert!(
+        closed
+            .reason
+            .as_ref()
+            .is_some_and(|reason| reason.as_str().contains("gone before the correction")),
+        "says the administrator deleted nothing: {closed:?}"
+    );
+    assert!(
+        fixture.events.taken().is_empty(),
+        "the administrator wrote nothing"
+    );
+}
+
 /// The fixture's skill with a reviewer's correction to "Go" in the profile
 /// whose request did not close, its claim lapsed: what the next resolution
 /// settles.
@@ -1279,6 +1327,77 @@ async fn an_edit_closes_a_request_flagged_after_its_check_unless_a_reviewer_hold
     assert!(
         matches!(held.status(), ReviewStatus::Open { .. }),
         "left to the reviewer who holds it"
+    );
+}
+
+#[tokio::test]
+async fn an_edit_whose_close_of_a_request_flagged_after_its_check_fails_gives_the_claim_back() {
+    let fixture = Fixture::new();
+    let request = fixture.flagged().await;
+    fixture.reviews.hide_next.store(1, Ordering::SeqCst);
+    fixture.reviews.close_fails.store(true, Ordering::SeqCst);
+
+    let edited = fixture
+        .service()
+        .edit(
+            &fixture.admin(),
+            fixture.subject,
+            &request.fact_id,
+            "skills",
+            &json!({ "name": "Go" }),
+        )
+        .await
+        .unwrap();
+
+    assert!(matches!(fixture.status(), ReviewStatus::Open { .. }));
+    assert_eq!(
+        fixture.reviews.held(),
+        vec![false],
+        "a reviewer can resolve it now"
+    );
+    assert!(fixture.events.taken().iter().any(|event| matches!(
+        event,
+        AdminFactsEvent::Edited { new_fact_id, .. } if new_fact_id == &edited.node_key
+    )));
+}
+
+#[tokio::test]
+async fn an_edit_leaves_a_request_flagged_after_its_check_with_a_recorded_write_to_its_resolution()
+{
+    let fixture = Fixture::new();
+    let request = fixture.flagged().await;
+    let recorded = crate::domain::review_queue::Closed {
+        outcome: ReviewOutcome::Deleted,
+        by: Uuid::new_v4(),
+        at: time::OffsetDateTime::now_utc(),
+        reason: None,
+    };
+    fixture
+        .reviews
+        .pending
+        .lock()
+        .unwrap()
+        .insert(request.id, recorded.clone());
+    fixture.reviews.hide_next.store(1, Ordering::SeqCst);
+
+    fixture
+        .service()
+        .edit(
+            &fixture.admin(),
+            fixture.subject,
+            &request.fact_id,
+            "skills",
+            &json!({ "name": "Go" }),
+        )
+        .await
+        .unwrap();
+
+    assert!(matches!(fixture.status(), ReviewStatus::Open { .. }));
+    assert_eq!(fixture.reviews.held(), vec![false], "no claim was taken");
+    assert_eq!(
+        fixture.reviews.pending_of(request.id),
+        Some(recorded),
+        "the record stays for the next resolution"
     );
 }
 

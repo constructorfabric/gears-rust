@@ -581,15 +581,18 @@ impl TryFrom<ResolutionRequest> for Resolution {
     }
 }
 
-/// What a tenant administrator sends to add a fact, or to edit one:
-/// `properties` holds exactly one property with its value. An edit keeps the
-/// fact's own property.
+/// What a tenant administrator sends to add a fact, or to edit one: one
+/// property of the person types, as a fact names it, and its value. An edit
+/// keeps the fact's own property.
 #[derive(Debug)]
 #[toolkit_macros::api_dto(request)]
 #[serde(deny_unknown_fields)]
 pub struct AdminFactRequest {
-    #[schema(value_type = Object)]
-    pub properties: serde_json::Map<String, serde_json::Value>,
+    /// The fact's property, such as `skills`.
+    pub property: String,
+    /// The value: a string, or an object for a property with fields, such
+    /// as `{"name": "Rust"}` for a skill.
+    pub value: serde_json::Value,
 }
 
 /// The longest property name an administrator's body takes; every name of
@@ -597,32 +600,25 @@ pub struct AdminFactRequest {
 const MAX_PROPERTY_CHARS: usize = 64;
 
 impl AdminFactRequest {
-    /// The one property and its value.
+    /// The property and its value.
     ///
     /// # Errors
     ///
-    /// A body with no property or more than one, or a property name longer
-    /// than 64 characters or of other characters than lower-case letters,
-    /// digits and `_`, which no person type has.
+    /// A property name longer than 64 characters or of other characters
+    /// than lower-case letters, digits and `_`, which no person type has.
     pub fn into_property(self) -> Result<(String, serde_json::Value), BodyMistake> {
-        let mut properties = self.properties.into_iter();
-        let (Some((property, value)), None) = (properties.next(), properties.next()) else {
-            return Err(BodyMistake {
-                field: "properties",
-                rule: "a fact holds exactly one property",
-            });
-        };
-        let plausible = (1..=MAX_PROPERTY_CHARS).contains(&property.len())
-            && property
+        let plausible = (1..=MAX_PROPERTY_CHARS).contains(&self.property.len())
+            && self
+                .property
                 .bytes()
                 .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_');
         if !plausible {
             return Err(BodyMistake {
-                field: "properties",
+                field: "property",
                 rule: "no person type has this property",
             });
         }
-        Ok((property, value))
+        Ok((self.property, self.value))
     }
 }
 
@@ -636,8 +632,10 @@ pub struct StoredFactDto {
     /// The fact's id, the graph node key.
     pub fact_id: String,
     pub entity_kind: EntityKindDto,
-    #[schema(value_type = Object)]
-    pub properties: serde_json::Map<String, serde_json::Value>,
+    /// The fact's property, such as `skills`.
+    pub property: String,
+    /// The value as Admission let it through.
+    pub value: serde_json::Value,
     pub origin: OriginDto,
 }
 
@@ -645,12 +643,11 @@ impl StoredFactDto {
     /// A fact the administrator stored, with the administrator as origin.
     #[must_use]
     pub fn administrator(fact: NewFact) -> Self {
-        let mut properties = serde_json::Map::new();
-        properties.insert(fact.property.name, fact.property.value);
         Self {
             fact_id: fact.node_key.0,
             entity_kind: fact.category.into(),
-            properties,
+            property: fact.property.name,
+            value: fact.property.value,
             origin: OriginDto {
                 kind: OriginKindDto::Administrator,
             },

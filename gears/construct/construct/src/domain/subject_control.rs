@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use authz_resolver_sdk::PolicyEnforcer;
 use time::OffsetDateTime;
+use tokio::time::Instant;
 use toolkit_macros::domain_model;
 use toolkit_odata::{ODataQuery, Page, SortDir};
 use toolkit_security::{AccessScope, SecurityContext};
@@ -19,7 +20,7 @@ use super::profile::Category;
 use super::profile_read::{StoredFact, settings_scope};
 use super::profile_writes::{ProfileWrites, Removed, WriteError};
 use super::review_queue::{
-    ReviewOutcome, ReviewQueueEvents, ReviewRequest, ReviewRequests, close_on_change,
+    OutsideChange, ReviewOutcome, ReviewQueueEvents, ReviewRequest, ReviewRequests, close_on_change,
 };
 use super::subject_access::{authorize, own};
 use super::subject_settings::{SubjectKey, SubjectSettings, SubjectSettingsReader};
@@ -281,34 +282,28 @@ impl SubjectControlService {
     ) -> Result<(), DomainError> {
         // @cpt-begin:cpt-cf-construct-algo-subject-control-delete:p1:inst-del-own
         let deadline = self.ports.writes.deadline();
-        // The permission check and the context write nothing, so the budget
-        // may cut them off, like a read.
-        let (key, scope, construct) = ProfileWrites::before_write(deadline, "delete", async {
-            let (key, scope) = own(&self.policy_enforcer, ctx, subject_id, actions::DELETE).await?;
-            let (construct, _) = self.ports.writes.construct(key.tenant_id).await?;
-            Ok((key, scope, construct))
-        })
+        // The permission check writes nothing, so the budget may cut it off,
+        // like a read.
+        let (key, scope) = ProfileWrites::before_write(
+            deadline,
+            "delete",
+            own(&self.policy_enforcer, ctx, subject_id, actions::DELETE),
+        )
         .await?;
         // @cpt-end:cpt-cf-construct-algo-subject-control-delete:p1:inst-del-own
-        let origin = Origin::Subject {
-            subject: subject_id,
-        };
-        let removed = self
-            .ports
-            .writes
-            .remove(&construct, key, fact_id, &origin, deadline)
-            .await
-            .map_err(|err| match err {
-                WriteError::NotWritten(err) => err,
-                // The read after the failure did not find the fact gone, so
-                // its request stays open: a repeat deletes the fact or finds
-                // it gone, and closes the request.
-                WriteError::MaybeWritten(err) => DomainError::Unavailable(format!(
-                    "the delete of fact {} may have landed; send it again: {err}",
-                    fact_id.0
-                )),
-            })?;
-        if let Removed::Removed(fact) = &removed {
+        FactDelete {
+            writes: &self.ports.writes,
+            requests: self.ports.reviews.as_ref(),
+            events: self.ports.review_events.as_ref(),
+            scope: &scope,
+            key,
+            by: subject_id,
+            origin: Origin::Subject {
+                subject: subject_id,
+            },
+            deadline,
+        }
+        .run(fact_id, |fact| {
             self.ports.events.record(SubjectControlEvent::Deleted {
                 tenant_id: key.tenant_id,
                 subject_id,
@@ -316,40 +311,8 @@ impl SubjectControlService {
                 fact_id: fact.node_key.clone(),
                 category: fact.category,
             });
-        }
-        // @cpt-begin:cpt-cf-construct-algo-subject-control-delete:p1:inst-del-close
-        // A fact already gone may still have an open request left by an
-        // earlier delete whose close failed; this closes it.
-        let closed = close_on_change(
-            self.ports.reviews.as_ref(),
-            self.ports.review_events.as_ref(),
-            &self.ports.writes,
-            &scope,
-            key,
-            fact_id,
-            subject_id,
-            ReviewOutcome::Deleted,
-            matches!(removed, Removed::Removed(_)),
-        )
+        })
         .await
-        .map_err(|err| match err {
-            // A store that did not answer: a repeat finds the fact gone and
-            // closes the request.
-            DomainError::Unavailable(_) | DomainError::Database(_) => {
-                DomainError::Unavailable(format!(
-                    "fact {} is deleted, but its review request was not closed; send the \
-                     delete again: {err}",
-                    fact_id.0
-                ))
-            }
-            other => other,
-        })?;
-        match removed {
-            Removed::Removed(_) => Ok(()),
-            Removed::Gone if closed => Ok(()),
-            Removed::Gone => Err(no_such_fact(fact_id)),
-        }
-        // @cpt-end:cpt-cf-construct-algo-subject-control-delete:p1:inst-del-close
     }
 
     /// A subject's data, for the data protection officer of the caller's
@@ -429,6 +392,108 @@ pub(crate) async fn with_requests(
             }
         })
         .collect())
+}
+
+/// A delete of one live fact of a subject, by the subject or by a tenant
+/// administrator: the stores it touches, who deletes and as what origin,
+/// and the budget the delete started.
+#[domain_model]
+pub(crate) struct FactDelete<'a> {
+    pub writes: &'a ProfileWrites,
+    pub requests: &'a dyn ReviewRequests,
+    pub events: &'a dyn ReviewQueueEvents,
+    pub scope: &'a AccessScope,
+    pub key: SubjectKey,
+    pub by: Uuid,
+    pub origin: Origin,
+    pub deadline: Instant,
+}
+
+impl FactDelete<'_> {
+    /// Soft-delete the fact `fact_id`: a plan with one removal, written
+    /// against the profile's version, and read and written again after a
+    /// short pause on a conflict, within the rerun limit and the budget.
+    /// `deleted` records the fact a delete removed; then the fact's open
+    /// review request closes as deleted.
+    ///
+    /// NOT cancel-safe: a drop after the writer stored the plan leaves the
+    /// fact deleted without its event, and its review request open until the
+    /// delete is sent again.
+    ///
+    /// # Errors
+    ///
+    /// [`DomainError::NoSuchFact`] when the subject has no such live fact
+    /// and no open request on it, also when a concurrent write removed it
+    /// before a rerun; unavailable when the profile kept changing past the
+    /// reruns or the budget, when the writer failed and the fact is not seen
+    /// gone after it, or when the fact's review request could not be closed,
+    /// the last two of which a repeat of the delete finishes; not configured
+    /// without a processing identity.
+    pub(crate) async fn run(
+        &self,
+        fact_id: &NodeKey,
+        deleted: impl FnOnce(&StoredFact),
+    ) -> Result<(), DomainError> {
+        // The context writes nothing, so the budget may cut it off.
+        let (construct, _) = ProfileWrites::before_write(
+            self.deadline,
+            "delete",
+            self.writes.construct(self.key.tenant_id),
+        )
+        .await?;
+        let removed = self
+            .writes
+            .remove(&construct, self.key, fact_id, &self.origin, self.deadline)
+            .await
+            .map_err(|err| match err {
+                WriteError::NotWritten(err) => err,
+                // The read after the failure did not find the fact gone, so
+                // its request stays open: a repeat deletes the fact or finds
+                // it gone, and closes the request.
+                WriteError::MaybeWritten(err) => DomainError::Unavailable(format!(
+                    "the delete of fact {} may have landed; send it again: {err}",
+                    fact_id.0
+                )),
+            })?;
+        if let Removed::Removed(fact) = &removed {
+            deleted(fact);
+        }
+        // @cpt-begin:cpt-cf-construct-algo-subject-control-delete:p1:inst-del-close
+        // A fact already gone may still have an open request left by an
+        // earlier delete whose close failed; this closes it.
+        let closed = close_on_change(
+            self.requests,
+            self.events,
+            self.writes,
+            self.scope,
+            self.key,
+            fact_id,
+            OutsideChange {
+                by: self.by,
+                outcome: ReviewOutcome::Deleted,
+                changed: matches!(removed, Removed::Removed(_)),
+            },
+        )
+        .await
+        .map_err(|err| match err {
+            // A store that did not answer: a repeat finds the fact gone and
+            // closes the request.
+            DomainError::Unavailable(_) | DomainError::Database(_) => {
+                DomainError::Unavailable(format!(
+                    "fact {} is deleted, but its review request was not closed; send the \
+                     delete again: {err}",
+                    fact_id.0
+                ))
+            }
+            other => other,
+        })?;
+        match removed {
+            Removed::Removed(_) => Ok(()),
+            Removed::Gone if closed => Ok(()),
+            Removed::Gone => Err(no_such_fact(fact_id)),
+        }
+        // @cpt-end:cpt-cf-construct-algo-subject-control-delete:p1:inst-del-close
+    }
 }
 
 fn categories_of(facts: &[StoredFact]) -> BTreeSet<Category> {

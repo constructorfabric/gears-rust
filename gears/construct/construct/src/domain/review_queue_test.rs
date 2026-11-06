@@ -23,8 +23,8 @@ use crate::domain::profile_writes::ProfileWrites;
 use crate::domain::profile_writes::{SubjectFacts, SubjectProfiles};
 use crate::domain::record_intake::DropReason;
 use crate::domain::review_queue::{
-    CLAIM_HOLD, NotStored, Resolution, ReviewConflict, ReviewOutcome, ReviewQueueEvent,
-    ReviewQueueService, ReviewRequest, ReviewStatus, ReviewText, close_on_change,
+    CLAIM_HOLD, NotStored, OutsideChange, Resolution, ReviewConflict, ReviewOutcome,
+    ReviewQueueEvent, ReviewQueueService, ReviewRequest, ReviewStatus, ReviewText, close_on_change,
 };
 use crate::domain::sensitive_data::{SensitiveDataCheck, SensitiveDataChecks, SensitiveDataKind};
 use crate::domain::subject_settings::{SubjectKey, SubjectSettings};
@@ -1100,9 +1100,11 @@ async fn the_subjects_delete_after_a_landed_correction_closes_the_request_as_the
         &AccessScope::allow_all(),
         request.subject(),
         &request.fact_id,
-        fixture.subject,
-        ReviewOutcome::Deleted,
-        false,
+        OutsideChange {
+            by: fixture.subject,
+            outcome: ReviewOutcome::Deleted,
+            changed: false,
+        },
     )
     .await
     .unwrap();

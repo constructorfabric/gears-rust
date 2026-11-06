@@ -24,12 +24,12 @@ use super::pagination::page;
 use super::plan::{NodeKey, Origin};
 use super::planner::manage::SUBJECT_FACTS_RESOURCE;
 use super::profile::Category;
-use super::profile_writes::{ProfileWrites, Removed, WriteError};
+use super::profile_writes::{ProfileWrites, WriteError};
 use super::review_queue::{
     Resolution, Resolver, ReviewConflict, ReviewOutcome, ReviewQueueService, ReviewRequest,
-    ReviewRequests, ReviewStatus, Wrote, reaches_tenant,
+    ReviewStatus, Wrote, reaches_tenant,
 };
-use super::subject_control::{SUBJECT_FACTS_LISTING, SubjectFactsPage, with_requests};
+use super::subject_control::{FactDelete, SUBJECT_FACTS_LISTING, SubjectFactsPage, with_requests};
 use super::subject_settings::SubjectKey;
 
 pub(crate) mod actions {
@@ -95,7 +95,7 @@ pub trait AdminFactsEvents: Send + Sync {
 #[domain_model]
 pub struct AdminFactsPorts {
     pub writes: Arc<ProfileWrites>,
-    pub reviews: Arc<dyn ReviewRequests>,
+    /// The Review Queue, and through it the review requests.
     pub review_queue: Arc<ReviewQueueService>,
     /// The one-step plan path; none where the deployment did not opt in to
     /// storing values without sensitive-data checks.
@@ -147,7 +147,7 @@ impl AdminFactsService {
         // @cpt-begin:cpt-cf-construct-flow-admin-facts-read:p2:inst-read-facts
         let facts = self.ports.writes.facts(key).await?;
         let Page { items, page_info } = page(facts.facts, query, &SUBJECT_FACTS_LISTING)?;
-        let items = with_requests(self.ports.reviews.as_ref(), &scope, key, items).await?;
+        let items = with_requests(self.ports.review_queue.requests(), &scope, key, items).await?;
         // @cpt-end:cpt-cf-construct-flow-admin-facts-read:p2:inst-read-facts
         // @cpt-begin:cpt-cf-construct-flow-admin-facts-read:p2:inst-read-event
         self.ports.events.record(AdminFactsEvent::Read {
@@ -452,55 +452,22 @@ impl AdminFactsService {
         }
         // @cpt-end:cpt-cf-construct-flow-admin-facts-delete:p2:inst-delete-review
         // @cpt-begin:cpt-cf-construct-flow-admin-facts-delete:p2:inst-delete-write
-        let (construct, _) = ProfileWrites::before_write(
-            deadline,
-            "delete",
-            self.ports.writes.construct(key.tenant_id),
-        )
-        .await?;
-        let removed = self
-            .ports
-            .writes
-            .remove(
-                &construct,
-                key,
-                fact_id,
-                &Origin::Administrator { administrator: by },
-                deadline,
-            )
-            .await
-            .map_err(|err| maybe_written(err, "delete"))?;
-        if let Removed::Removed(fact) = &removed {
-            self.deleted(key, by, &fact.node_key, fact.category);
-        }
         // A request opened after the check above, or left open by an
         // earlier delete whose close failed, closes here.
-        let closed = self
-            .ports
-            .review_queue
-            .close_on_delete(
-                &scope,
-                key,
-                fact_id,
-                by,
-                matches!(removed, Removed::Removed(_)),
-            )
-            .await
-            .map_err(|err| match err {
-                DomainError::Unavailable(_) | DomainError::Database(_) => {
-                    DomainError::Unavailable(format!(
-                        "fact {} is deleted, but its review request was not closed; send the \
-                         delete again: {err}",
-                        fact_id.0
-                    ))
-                }
-                other => other,
-            })?;
-        match removed {
-            Removed::Removed(_) => Ok(()),
-            Removed::Gone if closed => Ok(()),
-            Removed::Gone => Err(no_such_fact(fact_id)),
+        FactDelete {
+            writes: &self.ports.writes,
+            requests: self.ports.review_queue.requests(),
+            events: self.ports.review_queue.events(),
+            scope: &scope,
+            key,
+            by,
+            origin: Origin::Administrator { administrator: by },
+            deadline,
         }
+        .run(fact_id, |fact| {
+            self.deleted(key, by, &fact.node_key, fact.category);
+        })
+        .await
         // @cpt-end:cpt-cf-construct-flow-admin-facts-delete:p2:inst-delete-write
     }
 
@@ -562,10 +529,11 @@ impl AdminFactsService {
         what: &str,
         deadline: Instant,
     ) -> Result<Option<ReviewRequest>, DomainError> {
-        let latest = self
-            .ports
-            .reviews
-            .latest_on(scope, key, std::slice::from_ref(fact_id));
+        let latest =
+            self.ports
+                .review_queue
+                .requests()
+                .latest_on(scope, key, std::slice::from_ref(fact_id));
         Ok(ProfileWrites::before_write(deadline, what, latest)
             .await?
             .into_iter()

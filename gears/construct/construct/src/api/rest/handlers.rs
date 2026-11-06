@@ -170,11 +170,17 @@ fn fact_key(subject_id: Uuid, raw: String) -> Result<NodeKey, CanonicalError> {
     }
 }
 
-/// A span that names who asked for which subject, for the error mapped and
-/// logged in it.
-fn subject_span(name: &'static str, ctx: &SecurityContext, subject_id: Uuid) -> tracing::Span {
+/// A span of `feature`'s `name` operation that names who asked for which
+/// subject, for the error mapped and logged in it.
+fn operation_span(
+    feature: &'static str,
+    name: &'static str,
+    ctx: &SecurityContext,
+    subject_id: Uuid,
+) -> tracing::Span {
     tracing::info_span!(
-        "subject_control",
+        "subject_operation",
+        feature,
         operation = name,
         %subject_id,
         caller = %ctx.subject_id(),
@@ -196,7 +202,7 @@ pub async fn list_subject_facts(
             .await
             .map_err(|e| for_facts(e, subject_id))
     }
-    .instrument(subject_span("view", &ctx, subject_id))
+    .instrument(operation_span("subject_control", "view", &ctx, subject_id))
     .await?;
     // @cpt-begin:cpt-cf-construct-flow-subject-control-view:p1:inst-view-return
     Ok(Json(SubjectFactsPageDto::from(page)))
@@ -216,7 +222,12 @@ pub async fn get_subject_fact(
             .await
             .map_err(|e| for_facts(e, subject_id))
     }
-    .instrument(subject_span("read_fact", &ctx, subject_id))
+    .instrument(operation_span(
+        "subject_control",
+        "read_fact",
+        &ctx,
+        subject_id,
+    ))
     .await?;
     // @cpt-begin:cpt-cf-construct-flow-subject-control-fact:p1:inst-fact-return
     Ok(Json(SubjectFactDto::from(fact)))
@@ -237,7 +248,12 @@ pub async fn delete_subject_fact(
             .await
             .map_err(|e| for_facts(e, subject_id))
     }
-    .instrument(subject_span("delete_fact", &ctx, subject_id))
+    .instrument(operation_span(
+        "subject_control",
+        "delete_fact",
+        &ctx,
+        subject_id,
+    ))
     .await?;
     // @cpt-begin:cpt-cf-construct-flow-subject-control-delete:p1:inst-delete-return
     Ok(StatusCode::NO_CONTENT)
@@ -253,7 +269,12 @@ pub async fn export_subject(
     // @cpt-end:cpt-cf-construct-flow-subject-control-export:p1:inst-export-parse
 ) -> ApiResult<impl IntoResponse> {
     let export = async { svc.export(&ctx, subject_id).await.map_err(for_export) }
-        .instrument(subject_span("export", &ctx, subject_id))
+        .instrument(operation_span(
+            "subject_control",
+            "export",
+            &ctx,
+            subject_id,
+        ))
         .await?;
     // @cpt-begin:cpt-cf-construct-flow-subject-control-export:p1:inst-export-return
     let disposition = format!("attachment; filename=\"subject-{subject_id}.json\"");
@@ -284,7 +305,12 @@ pub async fn flag_fact(
             .await
             .map_err(|e| for_facts(e, subject_id))
     }
-    .instrument(subject_span("flag_fact", &ctx, subject_id))
+    .instrument(operation_span(
+        "subject_control",
+        "flag_fact",
+        &ctx,
+        subject_id,
+    ))
     .await?;
     Ok((StatusCode::CREATED, Json(ReviewRequestDto::from(request))))
 }
@@ -302,7 +328,12 @@ pub async fn list_own_review_requests(
             .await
             .map_err(|e| for_facts(e, subject_id))
     }
-    .instrument(subject_span("list_review_requests", &ctx, subject_id))
+    .instrument(operation_span(
+        "subject_control",
+        "list_review_requests",
+        &ctx,
+        subject_id,
+    ))
     .await?;
     // @cpt-begin:cpt-cf-construct-flow-review-queue-list-own:p1:inst-own-return
     Ok(Json(ReviewRequestsPageDto::from(page)))
@@ -360,18 +391,6 @@ pub async fn resolve_review_request(
     Ok(Json(ReviewRequestDto::from(request)))
 }
 
-/// A span that names the administrator and the subject, for the error
-/// mapped and logged in it.
-fn admin_span(name: &'static str, ctx: &SecurityContext, subject_id: Uuid) -> tracing::Span {
-    tracing::info_span!(
-        "admin_facts",
-        operation = name,
-        %subject_id,
-        caller = %ctx.subject_id(),
-        tenant_id = %ctx.subject_tenant_id()
-    )
-}
-
 /// @cpt-dod:cpt-cf-construct-dod-admin-facts-read:p2
 pub async fn admin_list_facts(
     // @cpt-begin:cpt-cf-construct-flow-admin-facts-read:p2:inst-read-parse
@@ -386,7 +405,7 @@ pub async fn admin_list_facts(
             .await
             .map_err(|e| for_admin_facts(e, subject_id))
     }
-    .instrument(admin_span("read", &ctx, subject_id))
+    .instrument(operation_span("admin_facts", "read", &ctx, subject_id))
     .await?;
     // @cpt-begin:cpt-cf-construct-flow-admin-facts-read:p2:inst-read-return
     Ok(Json(SubjectFactsPageDto::from(page)))
@@ -410,7 +429,7 @@ pub async fn admin_add_fact(
             .await
             .map_err(|e| for_admin_facts(e, subject_id))
     }
-    .instrument(admin_span("add", &ctx, subject_id))
+    .instrument(operation_span("admin_facts", "add", &ctx, subject_id))
     .await?;
     Ok((
         StatusCode::CREATED,
@@ -435,7 +454,7 @@ pub async fn admin_edit_fact(
             .await
             .map_err(|e| for_admin_facts(e, subject_id))
     }
-    .instrument(admin_span("edit", &ctx, subject_id))
+    .instrument(operation_span("admin_facts", "edit", &ctx, subject_id))
     .await?;
     Ok(Json(StoredFactDto::administrator(fact)))
 }
@@ -454,7 +473,7 @@ pub async fn admin_delete_fact(
             .await
             .map_err(|e| for_admin_facts(e, subject_id))
     }
-    .instrument(admin_span("delete", &ctx, subject_id))
+    .instrument(operation_span("admin_facts", "delete", &ctx, subject_id))
     .await?;
     Ok(StatusCode::NO_CONTENT)
 }

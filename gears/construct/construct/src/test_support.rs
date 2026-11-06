@@ -1225,15 +1225,16 @@ impl MemoryWriter {
     }
 
     /// Apply the plan's removals, its entity replaces as a correction or an
-    /// edit makes them, and its added entities, with the plan's origin.
+    /// edit makes them, and its added entities, with the plan's origin. A
+    /// subject's plan stores no fact, as the writer refuses one.
     fn remove(&self, plan: &Plan) {
         use crate::domain::profile_read::OriginKind;
         let origin = match plan.origin {
-            crate::domain::plan::Origin::Administrator { .. } => OriginKind::Administrator,
-            crate::domain::plan::Origin::Agent { .. } => OriginKind::Agent,
-            crate::domain::plan::Origin::Connector { .. } => OriginKind::Connector,
-            crate::domain::plan::Origin::Reviewer { .. }
-            | crate::domain::plan::Origin::Subject { .. } => OriginKind::Reviewer,
+            crate::domain::plan::Origin::Administrator { .. } => Some(OriginKind::Administrator),
+            crate::domain::plan::Origin::Agent { .. } => Some(OriginKind::Agent),
+            crate::domain::plan::Origin::Connector { .. } => Some(OriginKind::Connector),
+            crate::domain::plan::Origin::Reviewer { .. } => Some(OriginKind::Reviewer),
+            crate::domain::plan::Origin::Subject { .. } => None,
         };
         let removed: Vec<&NodeKey> = plan
             .steps
@@ -1262,7 +1263,7 @@ impl MemoryWriter {
                         category,
                         property: property.name.clone(),
                         value: property.value.clone(),
-                        origin,
+                        origin: origin?,
                         stored_at: time::OffsetDateTime::now_utc(),
                         produced_at: None,
                     })
@@ -1274,7 +1275,7 @@ impl MemoryWriter {
                         category: crate::domain::profile::Category::from_name(&step.entity_kind)?,
                         property: property.name.clone(),
                         value: property.value.clone(),
-                        origin,
+                        origin: origin?,
                         stored_at: time::OffsetDateTime::now_utc(),
                         produced_at: None,
                     })

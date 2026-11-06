@@ -362,11 +362,7 @@ pub fn for_admin_facts(e: DomainError, subject_id: Uuid) -> CanonicalError {
                 "construct administrator value not stored"
             );
             SubjectFactsError::failed_precondition()
-                .with_precondition_violation(
-                    "properties",
-                    "the value was not stored",
-                    reason.name(),
-                )
+                .with_precondition_violation("value", "the value was not stored", reason.name())
                 .with_override(Http::status_code(422))
                 .create()
         }

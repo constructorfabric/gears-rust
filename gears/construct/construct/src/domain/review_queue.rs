@@ -614,17 +614,27 @@ pub trait ReviewQueueEvents: Send + Sync {
     fn record(&self, event: ReviewQueueEvent);
 }
 
-/// Close the open request on a fact `by` changed or deleted outside a
-/// resolution, as `outcome`, and record it. Whether there was one, and it
-/// was closed.
+/// A change of a fact outside a resolution: who made it, the outcome the
+/// fact's open request closes as, and whether the change's own write
+/// removed or replaced the fact.
+#[domain_model]
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct OutsideChange {
+    pub by: Uuid,
+    pub outcome: ReviewOutcome,
+    pub changed: bool,
+}
+
+/// Close the open request on a fact changed or deleted outside a
+/// resolution as `change` says, and record it. Whether there was one, and
+/// it was closed.
 ///
 /// A reviewer's resolution whose write is in the profile closes the request
 /// as that resolution instead, so a change outside a resolution never
-/// overwrites it. When `changed`, the caller's own write removed or replaced
-/// the fact, so no reviewer's write had: each is written against the
-/// profile's version. A close is taken only while the claim's record is what
-/// was read, so a resolution recording its write meanwhile keeps the
-/// request.
+/// overwrites it. When the change's own write removed or replaced the fact,
+/// no reviewer's write had: each is written against the profile's version.
+/// A close is taken only while the claim's record is what was read, so a
+/// resolution recording its write meanwhile keeps the request.
 ///
 /// # Errors
 ///
@@ -638,21 +648,21 @@ pub(crate) async fn close_on_change(
     scope: &AccessScope,
     key: SubjectKey,
     fact_id: &NodeKey,
-    by: Uuid,
-    outcome: ReviewOutcome,
-    changed: bool,
+    change: OutsideChange,
 ) -> Result<bool, DomainError> {
     let Some((request, recorded)) = requests.open_request_on(scope, key, fact_id).await? else {
         return Ok(false);
     };
     let by_caller = Closed {
-        outcome,
-        by,
+        outcome: change.outcome,
+        by: change.by,
         at: OffsetDateTime::now_utc(),
         reason: None,
     };
     let closed = match &recorded {
-        Some(pending) if !changed && landed(&request, pending, &writes.facts(key).await?) => {
+        Some(pending)
+            if !change.changed && landed(&request, pending, &writes.facts(key).await?) =>
+        {
             tracing::warn!(
                 request_id = %request.id,
                 outcome = pending.outcome.name(),
@@ -862,9 +872,11 @@ impl ReviewQueueService {
                 &scope,
                 key,
                 fact_id,
-                subject_id,
-                ReviewOutcome::Deleted,
-                false,
+                OutsideChange {
+                    by: subject_id,
+                    outcome: ReviewOutcome::Deleted,
+                    changed: false,
+                },
             )
             .await?;
             return Err(no_such_fact(fact_id));
@@ -957,19 +969,24 @@ impl ReviewQueueService {
         resolution: Resolution,
     ) -> Result<ReviewRequest, DomainError> {
         // @cpt-begin:cpt-cf-construct-flow-review-queue-resolve:p1:inst-resolve-read
+        // The budget bounds the permission check and the lookup too, as
+        // every step before a write.
         let deadline = self.writes.deadline();
-        let scope = self.reviewer(ctx).await?;
+        let scope = ProfileWrites::before_write(deadline, "resolution", self.reviewer(ctx)).await?;
         let reviewer = ctx.subject_id();
         let key = RequestKey {
             tenant_id: ctx.subject_tenant_id(),
             id: request_id,
         };
-        let request = self.requests.find(&scope, key).await?.ok_or_else(|| {
-            DomainError::NoSuchReviewRequest(format!(
-                "tenant {} has no review request {request_id}",
-                key.tenant_id
-            ))
-        })?;
+        let request =
+            ProfileWrites::before_write(deadline, "resolution", self.requests.find(&scope, key))
+                .await?
+                .ok_or_else(|| {
+                    DomainError::NoSuchReviewRequest(format!(
+                        "tenant {} has no review request {request_id}",
+                        key.tenant_id
+                    ))
+                })?;
         if !request.is_open() {
             return Err(DomainError::ReviewConflict(ReviewConflict::Closed(
                 request_id,
@@ -1271,9 +1288,17 @@ impl ReviewQueueService {
                     hold.closing(ReviewOutcome::Corrected(fact.node_key.clone()), reason),
                     Wrote::Corrected(fact),
                 ),
+                // Closed as deleted, which nobody wrote here: the reason
+                // says so, when the resolver gave none.
                 Corrected::Gone => {
                     found_gone(request);
-                    (hold.closing(ReviewOutcome::Deleted, reason), Wrote::Nothing)
+                    (
+                        hold.closing(
+                            ReviewOutcome::Deleted,
+                            reason.or_else(|| Some(gone_before())),
+                        ),
+                        Wrote::Nothing,
+                    )
                 }
             },
             // @cpt-end:cpt-cf-construct-flow-review-queue-resolve:p1:inst-resolve-correct
@@ -1391,44 +1416,16 @@ impl ReviewQueueService {
         }
     }
 
-    /// Close the open request on a fact `by` deleted outside a resolution,
-    /// as deleted, whether a reviewer holds it or not, as the subject's
-    /// delete does; `removed` when `by`'s own delete removed it. Whether
-    /// there was one, and it was closed.
-    ///
-    /// # Errors
-    ///
-    /// When the request store or the profile cannot be read.
-    pub(crate) async fn close_on_delete(
-        &self,
-        scope: &AccessScope,
-        key: SubjectKey,
-        fact_id: &NodeKey,
-        by: Uuid,
-        removed: bool,
-    ) -> Result<bool, DomainError> {
-        close_on_change(
-            self.requests.as_ref(),
-            self.events.as_ref(),
-            &self.writes,
-            scope,
-            key,
-            fact_id,
-            by,
-            ReviewOutcome::Deleted,
-            removed,
-        )
-        .await
-    }
-
     /// Close the open request on a fact `by` replaced outside a resolution
     /// as `outcome`, when no resolution holds it or recorded a write on it.
     /// A request a reviewer holds is left to its resolution, which finds the
-    /// fact gone. Whether one closed.
+    /// fact gone; one with a recorded write is left to the next resolution,
+    /// which settles the record. Whether one closed.
     ///
     /// # Errors
     ///
-    /// When the request store cannot be reached.
+    /// When the request store cannot be reached. A close that failed gives
+    /// its claim back first.
     pub(crate) async fn close_unclaimed(
         &self,
         scope: &AccessScope,
@@ -1437,61 +1434,96 @@ impl ReviewQueueService {
         by: Uuid,
         outcome: ReviewOutcome,
     ) -> Result<bool, DomainError> {
-        let Some(request) = self
-            .requests
-            .latest_on(scope, key, std::slice::from_ref(fact_id))
-            .await?
-            .into_iter()
-            .find(ReviewRequest::is_open)
-        else {
+        let Some((request_key, claim)) = self.claim_unclaimed(scope, key, fact_id).await? else {
             return Ok(false);
         };
-        let claim = ClaimId(Uuid::new_v4());
-        let request_key = request.key();
-        let claimed = self
-            .requests
-            .claim(
-                scope,
-                request_key,
-                claim,
-                OffsetDateTime::now_utc(),
-                CLAIM_HOLD,
-            )
-            .await?;
-        match claimed {
-            Claimed::Taken { pending: None, .. } => {}
-            Claimed::Taken {
-                pending: Some(_), ..
-            } => {
-                // An earlier resolution's write may be in the profile; the
-                // next resolution settles it.
-                self.requests.release(scope, request_key, claim).await?;
-                return Ok(false);
-            }
-            Claimed::Closed | Claimed::Held => {
-                tracing::info!(
-                    request_id = %request.id,
-                    "construct: a request on a replaced fact is left to the resolution that holds it"
-                );
-                return Ok(false);
-            }
-        }
         let closed = Closed {
             outcome,
             by,
             at: OffsetDateTime::now_utc(),
             reason: None,
         };
-        let Some(closed_request) = self
+        let closed_request = match self
             .requests
             .close(scope, request_key, claim, &closed)
-            .await?
-        else {
-            return Ok(false);
+            .await
+        {
+            Ok(Some(closed_request)) => closed_request,
+            Ok(None) => return Ok(false),
+            // The claim recorded nothing, so it is given back: a reviewer
+            // can resolve the request now, not only after CLAIM_HOLD.
+            Err(err) => {
+                if let Err(release) = self.requests.release(scope, request_key, claim).await {
+                    tracing::warn!(
+                        error = %release,
+                        request_id = %request_key.id,
+                        "construct: a review request's claim was not given back; it frees itself"
+                    );
+                }
+                return Err(err);
+            }
         };
         self.events
             .record(ReviewQueueEvent::resolved(&closed_request, &closed));
         Ok(true)
+    }
+
+    /// A claim on the open request on the fact, when no resolution holds it
+    /// or recorded a write on it.
+    ///
+    /// A claim taken over a recorded write would take over the record, and
+    /// giving it back forgets the record: so none is taken over one, and one
+    /// that finds a record written after the read is not given back. It
+    /// lapses after [`CLAIM_HOLD`], and the next resolution settles the
+    /// record.
+    async fn claim_unclaimed(
+        &self,
+        scope: &AccessScope,
+        key: SubjectKey,
+        fact_id: &NodeKey,
+    ) -> Result<Option<(RequestKey, ClaimId)>, DomainError> {
+        let Some((request, recorded)) = self.requests.open_request_on(scope, key, fact_id).await?
+        else {
+            return Ok(None);
+        };
+        let claim = ClaimId(Uuid::new_v4());
+        let claimed = match recorded {
+            Some(_) => None,
+            None => Some(
+                self.requests
+                    .claim(
+                        scope,
+                        request.key(),
+                        claim,
+                        OffsetDateTime::now_utc(),
+                        CLAIM_HOLD,
+                    )
+                    .await?,
+            ),
+        };
+        let left_to = match claimed {
+            Some(Claimed::Taken { pending: None, .. }) => {
+                return Ok(Some((request.key(), claim)));
+            }
+            None | Some(Claimed::Taken { .. }) => "the next resolution, which settles its record",
+            Some(Claimed::Closed | Claimed::Held) => "the resolution that holds it",
+        };
+        tracing::info!(
+            request_id = %request.id,
+            left_to,
+            "construct: a request on a replaced fact is left to a resolution"
+        );
+        Ok(None)
+    }
+
+    /// The review requests this service resolves and closes.
+    pub(crate) fn requests(&self) -> &dyn ReviewRequests {
+        self.requests.as_ref()
+    }
+
+    /// Where this service records what it did.
+    pub(crate) fn events(&self) -> &dyn ReviewQueueEvents {
+        self.events.as_ref()
     }
 }
 
@@ -1603,6 +1635,12 @@ fn found_gone(request: &ReviewRequest) {
         fact_id = %request.fact_id.0,
         "construct: a resolution found its fact gone; the request closes as deleted"
     );
+}
+
+/// The reason a correction that found its fact gone closes with: it
+/// deleted nothing.
+fn gone_before() -> ReviewText {
+    ReviewText("the fact was gone before the correction; nothing was written".to_owned())
 }
 
 /// Log a resolution that was written, or may have been, but whose request

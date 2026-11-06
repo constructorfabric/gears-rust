@@ -304,7 +304,6 @@ pub fn assemble(
     let admin_facts = Arc::new(AdminFactsService::new(
         AdminFactsPorts {
             writes: profile_writes,
-            reviews: Arc::clone(&reviews),
             review_queue: Arc::clone(&review_queue),
             one_step,
             events: Arc::new(LogAdminFactsEvents),
