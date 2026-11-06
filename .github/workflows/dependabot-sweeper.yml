@@ -31,6 +31,10 @@
 # as an ENVIRONMENT secret of `deps-bot` (never a repo secret); DEPS_BOT_APP_ID is a repo
 # variable. Only the `sweep-live` job uses the environment; the script also refuses
 # `--live` outside refs/heads/main.
+# App installation permissions (must match the `permission-*` inputs of the token step in
+# `sweep-live`; the installation must grant at least these): Contents: write, Pull requests:
+# write, Issues: write (labels use the Issues API), Actions: read, Checks: read, Commit
+# statuses: read.
 name: Dependabot Sweeper
 
 on:
