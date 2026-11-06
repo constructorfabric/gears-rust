@@ -33,8 +33,8 @@
 //!   times on the one seeded graph, so a run reports its own spread.
 //! - `GEARS_GRAPH_PERF_RTT_MS` (default `0`), a comma list of milliseconds
 //!   added to every round trip to the database with `netem`, applied from a
-//!   `nicolaka/netshoot` container in the database container's network
-//!   namespace. How p50 grows with it says how many sequential round trips a
+//!   `nicolaka/netshoot` container (pinned in `test-containers`) in the
+//!   database container's network namespace. How p50 grows with it says how many sequential round trips a
 //!   request makes, which a localhost run cannot show.
 //!
 //! Every timing is printed as one `RESULT` line, which
@@ -316,13 +316,18 @@ fn rtts() -> Vec<f64> {
 /// network namespace, so the host needs Docker and nothing else: no root, no
 /// `iproute2` in the database image. A delay that does not apply fails the
 /// run -- a column labelled "+2 ms" measured at +0 is worse than no column.
-fn set_rtt(container_id: &str, ms: f64) {
+///
+/// Async, on `tokio::process`: the test runs on a current-thread runtime, and
+/// a blocking `docker run` (seconds, plus the pull on first use) would stall
+/// it whole, the pool's background tasks included.
+async fn set_rtt(container_id: &str, ms: f64) {
     if ms > 0.0 {
         let delay = format!("{ms}ms");
         let out = tc(
             container_id,
             &["replace", "dev", "eth0", "root", "netem", "delay", &delay],
-        );
+        )
+        .await;
         assert!(
             out.status.success(),
             "netem did not apply: {}",
@@ -335,12 +340,13 @@ fn set_rtt(container_id: &str, ms: f64) {
     // whether a delay is still installed: a "+0 ms" column measured over a
     // leftover delay is the baseline every other column is read against.
     if tc(container_id, &["del", "dev", "eth0", "root"])
+        .await
         .status
         .success()
     {
         return;
     }
-    let shown = tc(container_id, &["show", "dev", "eth0"]);
+    let shown = tc(container_id, &["show", "dev", "eth0"]).await;
     let qdiscs = String::from_utf8_lossy(&shown.stdout);
     assert!(
         shown.status.success() && !qdiscs.contains("netem"),
@@ -350,10 +356,13 @@ fn set_rtt(container_id: &str, ms: f64) {
 }
 
 /// `tc qdisc <args>` in a helper container joined to the database
-/// container's network namespace.
-fn tc(container_id: &str, args: &[&str]) -> std::process::Output {
+/// container's network namespace. The image is the one `test-containers`
+/// pins by digest: it runs with `NET_ADMIN`, and two runs compared side by
+/// side must have been shaped by the same `tc`.
+async fn tc(container_id: &str, args: &[&str]) -> std::process::Output {
     let netns = format!("container:{container_id}");
-    std::process::Command::new("docker")
+    let image = test_containers::netshoot_image();
+    tokio::process::Command::new("docker")
         .args([
             "run",
             "--rm",
@@ -361,12 +370,13 @@ fn tc(container_id: &str, args: &[&str]) -> std::process::Output {
             &netns,
             "--cap-add",
             "NET_ADMIN",
-            "nicolaka/netshoot",
+            &image,
             "tc",
             "qdisc",
         ])
         .args(args)
         .output()
+        .await
         .expect("docker runs")
 }
 
@@ -607,6 +617,15 @@ async fn the_retrieval_scenarios_answer_within_their_budgets() {
     let ctx = conformance::ctx(tenant, &scope, None);
     let store = stand.store.as_ref();
 
+    // The same for the delay: a missing image, a refused `NET_ADMIN` or a
+    // kernel without `sch_netem` would otherwise surface only at the first
+    // shaped cell, after the seed. Apply the first delay and remove it now.
+    let shaped = rtts.iter().any(|ms| *ms > 0.0);
+    if let Some(&first) = rtts.iter().find(|ms| **ms > 0.0) {
+        set_rtt(&stand.container_id, first).await;
+        set_rtt(&stand.container_id, 0.0).await;
+    }
+
     let (seeding, rows) = seed(&stand, &ctx, &shape, true).await;
     println!(
         "\nseeded {rows} rows ({} nodes, {} edges) in {:.1} s -- {}",
@@ -662,11 +681,10 @@ async fn the_retrieval_scenarios_answer_within_their_budgets() {
         .expect("the root exists")
         .1;
 
-    let shaped = rtts.iter().any(|ms| *ms > 0.0);
     for repeat in 0..repeats {
         for &rtt in &rtts {
             if shaped {
-                set_rtt(&stand.container_id, rtt);
+                set_rtt(&stand.container_id, rtt).await;
             }
             let ctx = fresh(&ctx);
 
@@ -731,8 +749,11 @@ async fn the_retrieval_scenarios_answer_within_their_budgets() {
             );
 
             // --- scenarios 3 and 4: the hop -----------------------------
-            let (traversal, neighborhood, ranked) =
-                time_hops(&stand.engine, store, &ctx, &seed_ids, &type_set, root).await;
+            let HopTimings {
+                traversal,
+                neighborhood,
+                ranked,
+            } = time_hops(&stand.engine, store, &ctx, &seed_ids, &type_set, root).await;
             report(
                 repeat,
                 rtt,
@@ -781,7 +802,7 @@ async fn the_retrieval_scenarios_answer_within_their_budgets() {
         }
     }
     if shaped {
-        set_rtt(&stand.container_id, 0.0);
+        set_rtt(&stand.container_id, 0.0).await;
     }
     println!();
 }
@@ -799,7 +820,7 @@ async fn time_hops(
     seed_ids: &[graph_storage_sdk::models::NodeId],
     type_set: &graph_storage_sdk::models::TypeIdSet,
     root: graph_storage_sdk::models::NodeId,
-) -> (Measured, Measured, Measured) {
+) -> HopTimings {
     let traversal = measure(30, |_| {
         let frontier = seed_ids.to_vec();
         let edge_types = Some(type_set.clone());
@@ -876,7 +897,23 @@ async fn time_hops(
     };
     let plain = neighborhood(false).await;
     let ranked = neighborhood(true).await;
-    (traversal, plain, ranked)
+    HopTimings {
+        traversal,
+        neighborhood: plain,
+        ranked,
+    }
+}
+
+/// What `time_hops` measured, by name: each one is reported under its own
+/// label and held to its own threshold, and a positional tuple would let two
+/// of them trade places at the destructuring and still compile.
+struct HopTimings {
+    /// The depth-3 typed traversal from the seeds.
+    traversal: Measured,
+    /// The depth-3 neighborhood with hydration.
+    neighborhood: Measured,
+    /// The same neighborhood with each reached node's degree.
+    ranked: Measured,
 }
 
 /// `nfr-ingest-throughput`: 10,000 nodes and 20,000 edges, embedding
