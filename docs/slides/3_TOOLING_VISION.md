@@ -32,24 +32,24 @@ Both halves hurt, and the second one outlives the first.
 
 ## Six problems for whoever owns the repository
 
-| | You cannot… |
-|---|---|
-| **P1** | create a correct repository — only copy one |
-| **P2** | reproduce CI |
-| **P3** | reproduce the SDLC pipeline |
-| **P4** | stay current |
-| **P5** | tell whether a repository is still correct |
-| **P6** | take only part of the conventions |
+| | Name | You cannot… |
+|---|---|---|
+| **P1** | Bootstrap | create a correct repository — only copy one |
+| **P2** | CI reproduction | reproduce CI |
+| **P3** | SDLC reproduction | reproduce the SDLC pipeline |
+| **P4** | Staying current | stay current |
+| **P5** | Conformance signal | tell whether a repository is still correct |
+| **P6** | All or nothing | take only part of the conventions |
 
 ---
 
 ## Three more for the people working in one
 
-| | You cannot… |
-|---|---|
-| **P7** | state the complete set of parts a gear needs — *gear developer* |
-| **P8** | know which gear versions work together — *application developer* |
-| **P9** | leave `gears-rust` and keep any of it — *both* |
+| | Name | You cannot… |
+|---|---|---|
+| **P7** | Gear completeness | state the complete set of parts a gear needs — *gear developer* |
+| **P8** | Version alignment | know which gear versions work together — *application developer* |
+| **P9** | Portability | leave `gears-rust` and keep any of it — *both* |
 
 P1–P6 cost a team **once per repository**.
 P7–P9 cost somebody **every working day**.
