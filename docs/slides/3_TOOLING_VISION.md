@@ -102,10 +102,10 @@ The product is the arc, not any one step: **set up → check → update → chec
 
 **Installed and pinned** — build rules (`gears.mk`, 32 targets) · CI (30 workflows, 4 composite actions, 24 pipeline scripts) · Rust lint and toolchain (6 config files) · dependency baseline (256 deps, ~125 lints) · document-first development (the `cfs` kit) · agent configuration (5 vendors, one source) · platform guidelines (`guidelines/DNA`) · repository boilerplate
 
-**Checked only — nothing is installed** — repository layout · gear layout: the crate, `gear.gdl`, the documents, the workspace entry, the publish settings
+**Pinned, but no file installed** — repository layout · gear layout: the crate, `gear.gdl`, the documents, the workspace entry, the publish settings
 
 > A project takes the subset it wants — that is **P6**.
-> Two conventions write no file at all, which is why **the check is not an afterthought to setup**.
+> Two conventions write no file at all, which is why **the check is not an afterthought to setup**. They still carry a pin: without one, adding a required part upstream would fail every project that never saw the decision.
 
 ---
 

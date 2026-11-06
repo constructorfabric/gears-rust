@@ -85,16 +85,19 @@ selection would look like this:
 | **CI pipeline** | the 30 workflows, the 4 composite actions, the 24 pipeline scripts under `tools/scripts/` | referenced by tag; the triggers and the secrets stay the project's |
 | **Rust lint and toolchain** | `clippy.toml`, `rustfmt.toml`, `deny.toml`, `rust-toolchain.toml`, `.config/nextest.toml`, `.cargo/config.toml` | generated from an upstream base plus the project's own values where the file has them — an ignored advisory, a licence exception, a threshold; copied and replaced whole under a version check where it has none |
 | **Dependency and lint baseline** | the 256 `[workspace.dependencies]` entries and the ~125 `[workspace.lints]` settings | generated from a shared source; Cargo has no cross-repository mechanism, so that source is new work |
-| **Repository layout** | the rule that `gears/`, `libs/`, `apps/` and the document roots are where a Gears repository puts them | setup creates the directories; after that there is no file to manage, and the rule is what the check answers |
-| **Gear layout** | the rule that states the complete set a gear carries — the layered crate, the SDK crate, the `gear.gdl` descriptor, the five documents, both workspace member entries, the `[workspace.dependencies]` alias, registration in `artifacts.toml`, the publish settings; P7 holds the list | nothing is written — the tool creates no gear. The check answers presence and placement; Gearbox still owns what the descriptor says, and `cfs` what the documents say |
+| **Repository layout** | the rule that `gears/`, `libs/`, `apps/` and the document roots are where a Gears repository puts them | the rule is pinned like any other convention; setup creates the directories, and after that there is no file to manage |
+| **Gear layout** | the rule that states the complete set a gear carries — the layered crate, the SDK crate, the `gear.gdl` descriptor, the five documents, both workspace member entries, the `[workspace.dependencies]` alias, registration in `artifacts.toml`, the publish settings; P7 holds the list | the rule is pinned; no file is written, because the tool creates no gear. The check answers presence and placement; Gearbox still owns what the descriptor says, and `cfs` what the documents say |
 | **Document-first development** | the kit, its artifact templates, and the CI step that makes `cfs` run | referenced by kit version; the systems map in `artifacts.toml` stays the project's |
 | **Agent configuration** | the prompt and agent files for the five agent vendors this repository supports | generated from one source; today `toolkit-pr-review` exists five times and four copies have diverged |
 | **Platform guidelines** | the `guidelines/DNA` submodule and the platform documents beside it | referenced by submodule pin — the one convention here that already works this way |
 | **Repository boilerplate** | `CONTRIBUTING.md`, `CODEOWNERS`, the pull-request template, the legal files | written once at setup, then project-owned and never managed |
 
 Whether those are ten conventions or thirty is a design decision. What a convention *is* is not.
-Two of them install nothing. They exist only as something the check can answer, which is why
-conformance is not an afterthought to setup.
+Two of them bring no file at all. They still carry a pin, and that is not a formality: a pinned
+rule is what keeps the check from becoming a moving target. If upstream adds a required document to
+the gear layout rule, a project pinned to the older version stays conformant until it moves — the
+same reason a repository on 1.2 is not drifting while upstream ships 1.3. A convention whose rule
+could change under a project would fail that project for a decision it never saw.
 
 ## 2. Problems
 

@@ -161,10 +161,10 @@ The other two happen for the <strong>life of the project</strong>.</p>
 </foreignObject></svg><svg data-marpit-svg="" viewBox="0 0 1280 720"><foreignObject width="1280" height="720"><section id="8" data-paginate="true" data-theme="rose-pine-moon" lang="en-US" data-marpit-pagination="8" style="--paginate:true;--theme:rose-pine-moon;" data-marpit-pagination-total="16">
 <h2 id="what-a-convention-is-concretely">What a convention is, concretely</h2>
 <p><strong>Installed and pinned</strong> — build rules (<code>gears.mk</code>, 32 targets) · CI (30 workflows, 4 composite actions, 24 pipeline scripts) · Rust lint and toolchain (6 config files) · dependency baseline (256 deps, ~125 lints) · document-first development (the <code>cfs</code> kit) · agent configuration (5 vendors, one source) · platform guidelines (<code>guidelines/DNA</code>) · repository boilerplate</p>
-<p><strong>Checked only — nothing is installed</strong> — repository layout · gear layout: the crate, <code>gear.gdl</code>, the documents, the workspace entry, the publish settings</p>
+<p><strong>Pinned, but no file installed</strong> — repository layout · gear layout: the crate, <code>gear.gdl</code>, the documents, the workspace entry, the publish settings</p>
 <blockquote>
 <p>A project takes the subset it wants — that is <strong>P6</strong>.<br />
-Two conventions write no file at all, which is why <strong>the check is not an afterthought to setup</strong>.</p>
+Two conventions write no file at all, which is why <strong>the check is not an afterthought to setup</strong>. They still carry a pin: without one, adding a required part upstream would fail every project that never saw the decision.</p>
 </blockquote>
 </section>
 </foreignObject></svg><svg data-marpit-svg="" viewBox="0 0 1280 720"><foreignObject width="1280" height="720"><section id="9" data-paginate="true" data-theme="rose-pine-moon" lang="en-US" data-marpit-pagination="9" style="--paginate:true;--theme:rose-pine-moon;" data-marpit-pagination-total="16">
