@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use event_broker::test_support::{EventBrokerHarness, StaticTypesRegistry};
 use event_broker_sdk::{Event, EventBrokerApi, GtsIdPattern, GtsInstanceId, GtsTypeId};
-use serde_json::json;
+use toolkit_gts::GtsSchema;
 use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
@@ -34,7 +34,7 @@ pub struct PublishJson<'a> {
 /// these fixtures need to place events on a chosen partition. `/source` is the
 /// member to point at: no test asserts it, so routing leaves the subject and the
 /// payload - which tests do assert - exactly as the caller wrote them.
-const FIXTURE_PARTITION_POINTER: &str = "/source";
+pub const FIXTURE_PARTITION_POINTER: &str = "/source";
 
 /// The subject type every fixture event carries. A real broker validates
 /// `subject_type` as a GTS id and rejects it unless the event type declares it
@@ -59,18 +59,45 @@ pub async fn fixture_from_catalog(catalog: StaticTypesRegistry) -> TopicFixture 
     }
 }
 
-/// One topic with one event type, the type partitioned by `/source`.
-pub async fn topic_fixture(topic: &str, event_type: &str, partitions: u32) -> TopicFixture {
-    fixture_from_catalog(StaticTypesRegistry::of(json!([
-        { "id": topic, "partitions": partitions },
-        {
-            "id": event_type,
-            "topic": topic,
-            "data_schema": { "type": "object" },
-            "allowed_subject_types": [SHOWCASE_SUBJECT_TYPE],
-            "partition_key": FIXTURE_PARTITION_POINTER,
-        },
-    ])))
+/// Declares a fixture event type: a unit struct deriving from `EventV1` whose
+/// payload is any object (open, body-less), routed to `$topic`, carrying
+/// `SHOWCASE_SUBJECT_TYPE`, and partitioned by `/source` (or by the optional
+/// `$pointer`). Also defines
+/// `$konst`, the type's id, for the publishers and consumers that name it.
+/// `$id` is the id without the leading `gts.`. The invoking module imports
+/// `event_broker_sdk::gts::EventV1`, which the macro names as the base.
+macro_rules! showcase_event_type {
+    ($konst:ident, $name:ident, $id:tt, $topic:expr) => {
+        $crate::consumer::common::showcase_event_type!(
+            $konst,
+            $name,
+            $id,
+            $topic,
+            $crate::consumer::common::FIXTURE_PARTITION_POINTER
+        );
+    };
+    ($konst:ident, $name:ident, $id:tt, $topic:expr, $pointer:expr) => {
+        #[allow(dead_code, reason = "a fixture type no test publishes to")]
+        const $konst: &str = toolkit_gts::gts_id!($id);
+
+        event_broker::fixture_event_type!(
+            $name = $id,
+            topic = $topic,
+            subjects = [crate::consumer::common::SHOWCASE_SUBJECT_TYPE],
+            partition_key = $pointer,
+        );
+    };
+}
+pub(crate) use showcase_event_type;
+
+/// One topic with one event type `T`, the type partitioned by `/source`.
+pub async fn topic_fixture<T: GtsSchema>(topic: &str, partitions: u32) -> TopicFixture {
+    fixture_from_catalog(
+        StaticTypesRegistry::of(serde_json::json!([
+            { "id": topic, "partitions": partitions },
+        ]))
+        .event_type::<T>(),
+    )
     .await
 }
 
@@ -170,30 +197,18 @@ pub async fn wait_until(mut predicate: impl FnMut() -> bool) {
 /// A fixture with two topics, each with its own event type, for the multi-topic
 /// delivery path. A delivered event names no topic, so attributing it correctly
 /// depends entirely on its type resolving - and partition 0 exists on both.
-pub async fn two_topic_fixture(
-    first: (&str, &str),
-    second: (&str, &str),
+pub async fn two_topic_fixture<A: GtsSchema, B: GtsSchema>(
+    first_topic: &str,
+    second_topic: &str,
     partitions: u32,
 ) -> TopicFixture {
-    let (first_topic, first_type) = first;
-    let (second_topic, second_type) = second;
-    fixture_from_catalog(StaticTypesRegistry::of(json!([
-        { "id": first_topic, "partitions": partitions },
-        {
-            "id": first_type,
-            "topic": first_topic,
-            "data_schema": { "type": "object" },
-            "allowed_subject_types": [SHOWCASE_SUBJECT_TYPE],
-            "partition_key": FIXTURE_PARTITION_POINTER,
-        },
-        { "id": second_topic, "partitions": partitions },
-        {
-            "id": second_type,
-            "topic": second_topic,
-            "data_schema": { "type": "object" },
-            "allowed_subject_types": [SHOWCASE_SUBJECT_TYPE],
-            "partition_key": FIXTURE_PARTITION_POINTER,
-        },
-    ])))
+    fixture_from_catalog(
+        StaticTypesRegistry::of(serde_json::json!([
+            { "id": first_topic, "partitions": partitions },
+            { "id": second_topic, "partitions": partitions },
+        ]))
+        .event_type::<A>()
+        .event_type::<B>(),
+    )
     .await
 }

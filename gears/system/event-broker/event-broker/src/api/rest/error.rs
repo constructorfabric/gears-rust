@@ -3,8 +3,8 @@
 //! Catalog (`cpt-cf-evbk-interface-error-codes`). `SequenceViolation`/
 //! `BatchTooLarge` keep their canonical `FailedPrecondition`/`InvalidArgument`
 //! category (dispatch-relevant fields - `type`/`title` - stay put) but carry a
-//! `TransportOverride` so the wire `status` matches `docs/openapi.yaml`'s
-//! literal `412`/`413` instead of the category default of `400`
+//! `TransportOverride` so the wire `status` is the literal
+//! `412`/`413` instead of the category default of `400`
 //! (`gears-rust#4465`/`canonical-error-transport-overrides`, which added the
 //! escape hatch this needed).
 
@@ -138,7 +138,7 @@ impl From<DomainError> for CanonicalError {
     fn from(err: DomainError) -> Self {
         match err {
             // The body parsed, but its `data` fails the event type's `data_schema`:
-            // `docs/openapi.yaml` documents a literal `422`, which a `TransportOverride`
+            // The wire status is a literal `422`, which a `TransportOverride`
             // surfaces over the `InvalidArgument` category's `400`. The `(payload)`
             // violation reproduces nothing the caller sent (no user input in error
             // bodies); the topic rides in `context.resource_name`.
@@ -220,7 +220,7 @@ impl From<DomainError> for CanonicalError {
                 // `topic` and committed `last_sequence` (feature 0001 §5.2)
                 // ride in `description` as text, `last_sequence` last: the
                 // SDK reads the resync point as the description's last number.
-                // `docs/openapi.yaml` documents a literal `412`; the override
+                // The wire status is a literal `412`; the override
                 // only changes the wire `status`, not the category.
                 TopicResourceError::failed_precondition()
                     .with_precondition_violation(
@@ -257,7 +257,7 @@ impl From<DomainError> for CanonicalError {
 
             DomainError::BatchTooLarge { count, max } => {
                 let message = format!("batch too large: {count} events (max {max})");
-                // `docs/openapi.yaml` documents this as a literal `413`.
+                // The wire status is a literal `413`.
                 EventBrokerResourceError::invalid_argument()
                     .with_format(message)
                     .with_override(Http::status_code(413))
@@ -266,7 +266,7 @@ impl From<DomainError> for CanonicalError {
 
             DomainError::BatchPayloadTooLarge { bytes, max } => {
                 let message = format!("batch payload too large: {bytes} bytes (max {max})");
-                // `docs/openapi.yaml` documents this as a literal `413`.
+                // The wire status is a literal `413`.
                 EventBrokerResourceError::invalid_argument()
                     .with_format(message)
                     .with_override(Http::status_code(413))

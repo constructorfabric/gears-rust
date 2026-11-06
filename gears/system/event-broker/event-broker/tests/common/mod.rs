@@ -44,64 +44,42 @@ fn alloc_port() -> u16 {
 
 /// Splits declarative fixtures into what each side of the process receives.
 ///
-/// A test writes what it means - a topic with a partition count, an event type
-/// with a topic and a payload contract - and this puts each half where the
-/// running process expects it: the topic and event type become the documents
-/// `types-registry` holds (an instance, and a derived type schema of the
-/// abstract event base), while the partition count becomes `event-broker`
-/// configuration, because a topic carries no count of its own.
-///
-/// An event-type fixture may name `partition_key` to point the type at a member
-/// other than the tenant the base defaults to.
+/// A topic fixture (`{"id", "partitions"}`) becomes the instance `types-registry`
+/// holds, while its partition count becomes `event-broker` configuration,
+/// because a topic carries no count of its own. An event type arrives as the
+/// document its `#[gts_type_schema(base = EventV1)]` declaration generates
+/// (`T::gts_schema_with_refs()`), and is seeded as it is.
 fn split_fixtures(entities: &[Value]) -> (Vec<Value>, Vec<(String, i64)>) {
     let topic_base = "gts.cf.core.events.topic.v1~";
-    let event_base = "gts.cf.core.events.event.v1~";
     let mut documents = Vec::new();
     let mut partitions = Vec::new();
 
     for entity in entities {
+        if let Some(schema_id) = entity.get("$id").and_then(Value::as_str) {
+            assert!(
+                schema_id.starts_with("gts://gts.cf.core.events.event.v1~"),
+                "fixture schema '{schema_id}' is not an event type"
+            );
+            documents.push(entity.clone());
+            continue;
+        }
         let id = entity["id"]
             .as_str()
             .expect("a fixture entity names its id");
-        if id.starts_with(topic_base) && !id.ends_with('~') {
-            partitions.push((
-                id.to_owned(),
-                entity["partitions"]
-                    .as_i64()
-                    .expect("a topic fixture names its partition count"),
-            ));
-            documents.push(serde_json::json!({
-                "id": id,
-                "description": "a topic this integration test publishes to",
-            }));
-        } else if id.starts_with(event_base) {
-            let allowed: Vec<&str> = entity["allowed_subject_types"]
-                .as_array()
-                .map(|values| {
-                    values
-                        .iter()
-                        .map(|value| value.as_str().expect("a subject-type pattern is a string"))
-                        .collect()
-                })
-                .unwrap_or_default();
-            let mut schema = event_broker_sdk::gts::derived_event_type_schema(
-                id,
-                entity["topic_id"]
-                    .as_str()
-                    .expect("an event-type fixture names its topic"),
-                entity
-                    .get("data_schema")
-                    .cloned()
-                    .unwrap_or_else(|| serde_json::json!({})),
-                &allowed,
-            );
-            if let Some(pointer) = entity.get("partition_key").and_then(Value::as_str) {
-                schema["x-gts-traits"]["partition_key"] = serde_json::json!(pointer);
-            }
-            documents.push(schema);
-        } else {
-            panic!("fixture '{id}' is neither a topic instance nor an event type");
-        }
+        assert!(
+            id.starts_with(topic_base) && !id.ends_with('~'),
+            "fixture '{id}' is neither a topic instance nor a generated event-type document"
+        );
+        partitions.push((
+            id.to_owned(),
+            entity["partitions"]
+                .as_i64()
+                .expect("a topic fixture names its partition count"),
+        ));
+        documents.push(serde_json::json!({
+            "id": id,
+            "description": "a topic this integration test publishes to",
+        }));
     }
 
     (documents, partitions)

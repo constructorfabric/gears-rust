@@ -388,9 +388,10 @@ owner's projection resolve the same shared applicable-Quota set.
 
 ## More Information
 
-The contract model ships as validated JSON Schema files in [`docs/schemas/`](../schemas/), not
-only as prose: the four abstract bases, the concrete scope-discriminator type with its two P1
-well-known instances, and worked `cf.genai.llm_gateway` owner examples for all four contract
+The contract model ships as validated GTS type declarations, not only as prose: the four abstract
+bases and the concrete scope-discriminator type in
+[`quota-enforcement-sdk/src/gts.rs`](../../quota-enforcement-sdk/src/gts.rs) (its two P1 well-known
+instances are produced by `scope_instance()` in the SDK's `gts.rs`), and worked `cf.genai.llm_gateway` owner examples for all four contract
 families under [`docs/schemas/examples/`](../schemas/examples/). The examples exercise the
 decisions above: one owner publishing user- and tenant-scope projections that admit the same
 metrics (scope cascade), one metric request contract per metric and each shared by both

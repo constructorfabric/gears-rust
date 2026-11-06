@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use tokio::time::{Instant, sleep};
+use toolkit_gts::gts_type_schema;
 use uuid::Uuid;
 
 use event_broker::test_support::{
@@ -13,6 +14,7 @@ use event_broker::test_support::{
 use event_broker_sdk::api::EventBrokerApi;
 use event_broker_sdk::backend::{Partition, TopicPartition, Wait};
 use event_broker_sdk::error::EventBrokerError;
+use event_broker_sdk::gts::EventV1;
 use event_broker_sdk::models::{Event, ProducerMeta, ResetScope};
 use event_broker_sdk::producer::IngestOutcome;
 use event_broker_sdk::producer::{PRODUCER_OUTBOX_PAYLOAD_TYPE, TEST_QUEUE};
@@ -38,6 +40,64 @@ const SUBJECT_TYPE: &str = "gts.cf.core.events.subject.v1~example.sdk.outbox.ord
 /// The payload member `EVENT_TYPE_KEYED` points its partition key at. Reaching
 /// inside `data` is the interesting case: a bare field name could not.
 const PAYLOAD_POINTER: &str = "/data/partition_key";
+
+/// The registered event types: declarations deriving from `EventV1`, each
+/// carrying the payload its `TypedEvent` below publishes. The keyed type points
+/// its `partition_key` into the payload; the others take the tenant.
+#[gts_type_schema(
+    dir_path = "schemas",
+    base = EventV1,
+    type_id = toolkit_gts::gts_id!("cf.core.events.event.v1~example.sdk.outbox.created.v1~"),
+    description = "An order was created.",
+    properties = "order_id,total_cents,partition_key",
+    traits = serde_json::json!({
+        "topic": TOPIC,
+        "allowed_subject_types": [SUBJECT_TYPE],
+        "partition_key": "/tenant_id",
+    }),
+)]
+struct OrderCreatedV1 {
+    order_id: Uuid,
+    total_cents: i64,
+    #[serde(default)]
+    partition_key: Option<String>,
+}
+
+#[gts_type_schema(
+    dir_path = "schemas",
+    base = EventV1,
+    type_id = toolkit_gts::gts_id!("cf.core.events.event.v1~example.sdk.outbox.charged.v1~"),
+    description = "A charge was made.",
+    properties = "charge_id,total_cents",
+    traits = serde_json::json!({
+        "topic": TOPIC2,
+        "allowed_subject_types": [SUBJECT_TYPE],
+        "partition_key": "/tenant_id",
+    }),
+)]
+struct ChargeV1 {
+    charge_id: String,
+    total_cents: i64,
+}
+
+#[gts_type_schema(
+    dir_path = "schemas",
+    base = EventV1,
+    type_id = toolkit_gts::gts_id!("cf.core.events.event.v1~example.sdk.outbox.keyed.v1~"),
+    description = "An order whose partition is chosen by a payload member.",
+    properties = "order_id,total_cents,partition_key",
+    traits = serde_json::json!({
+        "topic": TOPIC,
+        "allowed_subject_types": [SUBJECT_TYPE],
+        "partition_key": PAYLOAD_POINTER,
+    }),
+)]
+struct KeyedOrderCreatedV1 {
+    order_id: Uuid,
+    total_cents: i64,
+    #[serde(default)]
+    partition_key: Option<String>,
+}
 
 static DB_SEQ: AtomicU64 = AtomicU64::new(1);
 
@@ -1076,31 +1136,15 @@ async fn outbox_processor_recovers_chained_sequence_violation_by_refreshing_curs
 async fn fixture() -> (toolkit_db::Db, Arc<dyn EventBrokerApi>, EventBrokerHarness) {
     let db = db().await;
     let harness = EventBrokerHarness::builder()
-        .with_type_registry(StaticTypesRegistry::of(serde_json::json!([
-            { "id": TOPIC, "partitions": FIXTURE_BROKER_PARTITIONS },
-            { "id": TOPIC2, "partitions": FIXTURE_BROKER_PARTITIONS },
-            {
-                "id": EVENT_TYPE,
-                "topic": TOPIC,
-                "data_schema": order_schema(),
-                "allowed_subject_types": [SUBJECT_TYPE],
-                "partition_key": "/tenant_id",
-            },
-            {
-                "id": EVENT_TYPE2,
-                "topic": TOPIC2,
-                "data_schema": billing_schema(),
-                "allowed_subject_types": [SUBJECT_TYPE],
-                "partition_key": "/tenant_id",
-            },
-            {
-                "id": EVENT_TYPE_KEYED,
-                "topic": TOPIC,
-                "data_schema": order_schema(),
-                "allowed_subject_types": [SUBJECT_TYPE],
-                "partition_key": PAYLOAD_POINTER,
-            },
-        ])))
+        .with_type_registry(
+            StaticTypesRegistry::of(serde_json::json!([
+                { "id": TOPIC, "partitions": FIXTURE_BROKER_PARTITIONS },
+                { "id": TOPIC2, "partitions": FIXTURE_BROKER_PARTITIONS },
+            ]))
+            .event_type::<OrderCreatedV1>()
+            .event_type::<ChargeV1>()
+            .event_type::<KeyedOrderCreatedV1>(),
+        )
         .build()
         .await;
     let broker = harness.broker();
@@ -1233,29 +1277,6 @@ async fn managed_producer(db: toolkit_db::Db, broker: Arc<dyn EventBrokerApi>) -
         .prepare_all()
         .await
         .unwrap()
-}
-
-fn order_schema() -> serde_json::Value {
-    serde_json::json!({
-        "type": "object",
-        "required": ["order_id", "total_cents"],
-        "properties": {
-            "order_id": { "type": "string" },
-            "total_cents": { "type": "integer" },
-            "partition_key": { "type": "string" }
-        }
-    })
-}
-
-fn billing_schema() -> serde_json::Value {
-    serde_json::json!({
-        "type": "object",
-        "required": ["charge_id", "total_cents"],
-        "properties": {
-            "charge_id": { "type": "string" },
-            "total_cents": { "type": "integer" }
-        }
-    })
 }
 
 fn order(partition_key: Option<&str>) -> OrderCreated {

@@ -93,11 +93,11 @@ Success criteria: LLM plugin registers GTS schemas at startup; capabilities are 
 - GTS schema registry unavailable at startup (plugin fails to initialize)
 
 **Steps**:
-1. [ ] - `p1` - Register `LlmPluginConfig` schema (`gtx.cf.chat_engine.llm_gateway_plugin_config.v1~`) in GTS schema registry — validates `PluginConfig.config` for this plugin - `inst-reg-plugin-config`
-2. [ ] - `p1` - Register `LlmSummarizationSettings` schema (`gtx.cf.chat_engine.llm_gateway.summarization_settings.v1~`) — nested in `LlmPluginConfig.summarization_settings` - `inst-reg-summarization`
-3. [ ] - `p1` - Register `LlmMessageMetadata` schema (`gtx.cf.chat_engine.llm_gateway.message_metadata.v1~`) — validates `Message.metadata` for LLM responses - `inst-reg-message-metadata`
-4. [ ] - `p1` - Register `LlmUsage` schema (`gtx.cf.chat_engine.llm_gateway.usage.v1~`) — nested in `LlmMessageMetadata.usage` - `inst-reg-usage`
-5. [ ] - `p1` - Register entity extension schemas (`LlmMessage`, `LlmMessageGetResponse`, `LlmMessageNewResponse`, `LlmMessageRecreateResponse`, `LlmStreamingCompleteEvent`, `LlmMessageNewEvent`, `LlmSessionSummaryEvent`) — extend base Chat Engine schemas via JSON Schema `allOf` - `inst-reg-entity-schemas`
+1. [ ] - `p1` - Define `LlmPluginConfig` (Rust struct in `domain/llm_config.rs`) — validates `PluginConfig.config` for this plugin - `inst-reg-plugin-config`
+2. [ ] - `p1` - Define `LlmSummarizationSettings` — nested in `LlmPluginConfig.summarization_settings` - `inst-reg-summarization`
+3. [ ] - `p1` - Define `LlmMessageMetadata` — shape of `Message.metadata` for LLM responses - `inst-reg-message-metadata`
+4. [ ] - `p1` - Define `LlmUsage` — nested in `LlmMessageMetadata.usage` - `inst-reg-usage`
+5. [ ] - `p1` - Register the plugin in `ClientHub` under GTS instance id `gts.cf.toolkit.plugins.plugin.v1~cf.chat_engine._.backend_plugin.v1~cf.chat_engine._.llm_gateway.v1` - `inst-reg-entity-schemas`
 6. [ ] - `p1` - **RETURN** plugin initialized and ready to receive trait method calls - `inst-reg-return`
 
 ### On Session Type Configured
@@ -317,13 +317,13 @@ No plugin-specific state machines. The LLM Gateway Plugin is stateless; session 
 
 - [ ] `p1` - **ID**: `cpt-cf-chat-engine-dod-llm-gateway-plugin-schema-registration`
 
-The system **MUST** register all LLM-specific GTS schemas (`LlmPluginConfig`, `LlmSummarizationSettings`, `LlmMessageMetadata`, `LlmUsage`, and entity extension schemas) at plugin startup, isolated under the `gtx.cf.chat_engine.llm_gateway.*` namespace, before any session type referencing this plugin can be created.
+The system **MUST** define all LLM-specific config and metadata types (`LlmPluginConfig`, `LlmSummarizationSettings`, `LlmMessageMetadata`, `LlmUsage`) as Rust structs in `domain/llm_config.rs` and register the plugin under its GTS instance id at startup, before any session type referencing this plugin can be created.
 
 **Implements**:
 - `cpt-cf-chat-engine-flow-llm-gateway-plugin-register-schemas`
 
 **Touches**:
-- GTS Schema Registry: `gtx.cf.chat_engine.llm_gateway.*` namespace
+- Plugin instance id: `gts.cf.toolkit.plugins.plugin.v1~cf.chat_engine._.backend_plugin.v1~cf.chat_engine._.llm_gateway.v1`
 - Entities: `LlmPluginConfig`, `LlmSummarizationSettings`, `LlmMessageMetadata`, `LlmUsage`
 
 ### Model Registry Capability Resolution
@@ -400,7 +400,7 @@ The system **MUST** implement plugin-owned resilience for all outbound HTTP call
 
 ## 6. Acceptance Criteria
 
-- [ ] LLM plugin registers all GTS schemas (`LlmPluginConfig`, `LlmSummarizationSettings`, `LlmMessageMetadata`, `LlmUsage`, entity extensions) under `gtx.cf.chat_engine.llm_gateway.*` namespace at startup; non-LLM session types are unaffected
+- [ ] LLM plugin is registered under its GTS instance id at startup and validates `LlmPluginConfig`; non-LLM session types are unaffected
 - [ ] Creating a session with an LLM-backed session type queries Model Registry and returns capabilities including model selection, temperature, max_tokens, and web_search
 - [ ] Changing the model capability value on a session triggers `on_session_updated`, queries Model Registry for the new model's capabilities, and returns refreshed capabilities
 - [ ] Sending a message to an LLM-backed session forwards the request to LLM Gateway and streams response chunks back to the client via NDJSON

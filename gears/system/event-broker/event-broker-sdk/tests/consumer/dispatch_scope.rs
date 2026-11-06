@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use chrono::Utc;
 use event_broker::test_support::StaticTypesRegistry;
+use event_broker_sdk::gts::EventV1;
 use event_broker_sdk::{
     ConsumerBuilder, ConsumerGroupRef, Event, Fallback, GtsTypeId, InMemoryOffsetManager, gts_id,
 };
@@ -16,13 +17,25 @@ use serde_json::json;
 use toolkit_stable_hash::murmur3_x86_32;
 use uuid::Uuid;
 
-use super::common::{SHOWCASE_SUBJECT_TYPE, fixture_from_catalog, topic};
+use super::common::{SHOWCASE_SUBJECT_TYPE, fixture_from_catalog, showcase_event_type, topic};
 use super::doubles::BatchScopeRecorder;
 
 const ORDERS_TOPIC: &str = gts_id!("cf.core.events.topic.v1~example.mock.showcase.orders.v1");
 const PAYMENTS_TOPIC: &str = gts_id!("cf.core.events.topic.v1~example.mock.showcase.payments.v1");
-const ORDERS_EVENT: &str = gts_id!("cf.core.events.event.v1~example.mock.showcase.order.v1~");
-const PAYMENTS_EVENT: &str = gts_id!("cf.core.events.event.v1~example.mock.showcase.payment.v1~");
+showcase_event_type!(
+    ORDERS_EVENT,
+    OrdersEventV1,
+    "cf.core.events.event.v1~example.mock.showcase.order.v1~",
+    ORDERS_TOPIC,
+    "/subject"
+);
+showcase_event_type!(
+    PAYMENTS_EVENT,
+    PaymentsEventV1,
+    "cf.core.events.event.v1~example.mock.showcase.payment.v1~",
+    PAYMENTS_TOPIC,
+    "/subject"
+);
 
 /// The broker's partition function (`domain::ingest::partition_for`), reproduced
 /// so the test can choose keys that land on a chosen partition.
@@ -43,21 +56,14 @@ fn key_for_partition(target: u32, count: u32) -> String {
 async fn runtime_dispatch_never_mixes_topics_or_partitions_in_handler_batches() {
     // Two topics, each with an event type partitioned by `/subject`, admitting
     // the showcase subject type.
-    let event_type = |id: &str, topic: &str| {
-        json!({
-            "id": id,
-            "topic": topic,
-            "partition_key": "/subject",
-            "allowed_subject_types": [SHOWCASE_SUBJECT_TYPE],
-            "data_schema": { "type": "object" },
-        })
-    };
-    let fx = fixture_from_catalog(StaticTypesRegistry::of(json!([
-        { "id": ORDERS_TOPIC, "partitions": 2 },
-        { "id": PAYMENTS_TOPIC, "partitions": 2 },
-        event_type(ORDERS_EVENT, ORDERS_TOPIC),
-        event_type(PAYMENTS_EVENT, PAYMENTS_TOPIC),
-    ])))
+    let fx = fixture_from_catalog(
+        StaticTypesRegistry::of(json!([
+            { "id": ORDERS_TOPIC, "partitions": 2 },
+            { "id": PAYMENTS_TOPIC, "partitions": 2 },
+        ]))
+        .event_type::<OrdersEventV1>()
+        .event_type::<PaymentsEventV1>(),
+    )
     .await;
 
     let subject_type = GtsTypeId::try_new(SHOWCASE_SUBJECT_TYPE).expect("valid subject type");

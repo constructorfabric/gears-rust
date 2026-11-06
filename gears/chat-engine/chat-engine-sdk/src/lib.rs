@@ -11,8 +11,10 @@
 #![allow(clippy::missing_fields_in_debug)]
 
 pub mod error;
+pub mod gts;
 pub mod models;
 pub mod plugin;
+pub mod webhook;
 
 pub use error::PluginError;
 pub use models::{

@@ -9,8 +9,9 @@
 use crate::domain::model::Sequence;
 use std::time::Duration;
 
+use event_broker_sdk::gts::EventV1;
 use serde_json::json;
-use toolkit_gts::GtsInstanceId;
+use toolkit_gts::{GtsInstanceId, GtsSchema};
 use uuid::Uuid;
 
 use crate::domain::model::Assignment;
@@ -19,17 +20,20 @@ use crate::infra::loader::attach::{AttachRequest, attach_readers};
 use crate::test_support::{EventBrokerHarness, Json, StaticTypesRegistry};
 
 const TOPIC: &str = "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1";
-const EVENT_TYPE: &str = "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~";
+
+crate::fixture_event_type!(
+    FooV1 = "cf.core.events.event.v1~x.eb.t1.foo.v1~",
+    topic = TOPIC,
+    subjects = ["gts.x.eb.t1.subject.v1~"],
+);
+
+const EVENT_TYPE: &str = <FooV1 as GtsSchema>::TYPE_ID;
 
 fn registry() -> StaticTypesRegistry {
     StaticTypesRegistry::of(json!([
         { "id": TOPIC, "partitions": 1 },
-        {
-            "id": EVENT_TYPE,
-            "topic": TOPIC,
-            "allowed_subject_types": ["gts.x.eb.t1.subject.v1~"],
-        },
     ]))
+    .event_type::<FooV1>()
 }
 
 /// Polls until `f` holds or the budget runs out, so the assertion reports the

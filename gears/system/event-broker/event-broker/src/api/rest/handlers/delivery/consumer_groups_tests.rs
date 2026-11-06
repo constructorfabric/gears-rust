@@ -72,8 +72,7 @@ async fn create_consumer_group_with_client_agent_and_description_returns_201() {
     resp.assert_status(201);
     let body = resp.json();
     // `client_agent` has no broker-side semantic beyond logging
-    // (`gts.cf.core.events.consumer_group.v1~.schema.json`'s `CreateRequest.client_agent` doc
-    // comment) - not returned on the resource, unlike `description`.
+    // (`CreateConsumerGroupRequest::client_agent`'s doc comment) - not returned on the resource, unlike `description`.
     assert_eq!(body["description"], json!("for integration tests"));
     assert!(
         !body.as_object().unwrap().contains_key("client_agent"),

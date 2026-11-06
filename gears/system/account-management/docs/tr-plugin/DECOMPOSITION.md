@@ -125,7 +125,7 @@ This DECOMPOSITION covers the Tenant Resolver Plugin (`tr-plugin`) sub-system, a
   - [ ] `p1` - `tenants` (AM-owned table; consumed via the dedicated read-only DB role — existence probes, bulk-by-ids, ancestor hydration JOINs; provisioning rows filtered out in the query-builder as defense-in-depth)
   - [ ] `p1` - `tenant_closure` (AM-owned table with the platform-canonical schema `(ancestor_id, descendant_id, barrier, descendant_status)`; consumed via the dedicated read-only DB role — all barrier and status semantics reduce to single predicates on this table)
   - [ ] `p3` - `cpt-cf-tr-plugin-db-schema` (DESIGN §3.7 — read-only schema & index coverage reference; no schema authored by this feature)
-  - [ ] `p1` - Plugin descriptor schema: `gts://gts.cf.core.toolkit.plugin.v1~cf.core.tenant_resolver.plugin.v1~` ([`tr_plugin.v1.schema.json`](./schemas/tr_plugin.v1.schema.json))
+  - [ ] `p1` - Plugin descriptor schema: `gts://gts.cf.core.toolkit.plugin.v1~cf.core.tenant_resolver.plugin.v1~` ([`gts.rs`](../../../tenant-resolver/tenant-resolver-sdk/src/gts.rs))
   - **No dbtables authored by this feature** — `tenants` and `tenant_closure` are owned and migrated by `cpt-cf-account-management-feature-tenant-hierarchy-management`.
 
 ---

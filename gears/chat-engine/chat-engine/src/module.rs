@@ -75,7 +75,8 @@ use crate::infra::webhook_compat::WebhookCompatPlugin;
 /// instance. Operators that want multiple webhook bindings can register
 /// additional `WebhookCompatPlugin` instances themselves; the default one
 /// is keyed under this stable id.
-pub const DEFAULT_WEBHOOK_COMPAT_INSTANCE_ID: &str = "gtx.cf.chat_engine.webhook_compat_plugin.v1~";
+pub const DEFAULT_WEBHOOK_COMPAT_INSTANCE_ID: &str =
+    chat_engine_sdk::gts::WEBHOOK_COMPAT_PLUGIN_INSTANCE_ID;
 
 /// Aggregated runtime state filled in during [`Gear::init`].
 struct RuntimeState {

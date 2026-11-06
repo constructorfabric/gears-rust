@@ -1579,8 +1579,10 @@ impl Gear for BssLedgerGear {
 /// gears-rust. Until it lands this returns a **broker-free** publisher — it
 /// mirrors the invariant-alarm counter into metrics and logs would-be events,
 /// but publishes nothing. When the broker arrives, restore here: obtain
-/// `hub.get::<dyn event_broker_sdk::EventBroker>()`, register the event-type
-/// schemas (`crate::infra::events::schemas::register_event_schemas`), build one
+/// `hub.get::<dyn event_broker_sdk::EventBroker>()`, declare the event types in
+/// Rust as `#[gts_type_schema]` types (note: the macro's derived form needs a
+/// generic slot on the base, and `EventV1` in event-broker-sdk is not generic
+/// today), build one
 /// `AsyncProducer` per event type via `broker.producer_builder()...build_async()`,
 /// and return `LedgerEventPublisher::new(<producers>, db, metrics)`.
 async fn build_event_publisher(

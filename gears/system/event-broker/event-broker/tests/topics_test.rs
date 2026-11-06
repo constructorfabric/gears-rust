@@ -10,6 +10,7 @@ use std::time::Duration;
 use chrono::DateTime;
 use event_broker::test_support::{EventBrokerHarness, Json, StaticTypesRegistry};
 use event_broker_sdk::backend::{Partition, TopicPartition, Wait};
+use event_broker_sdk::gts::EventV1;
 use event_broker_sdk::{Event, Sequence};
 use gts::GtsInstanceId;
 use serde_json::{Value, json};
@@ -19,19 +20,31 @@ const OTHER_TOPIC: &str = "gts.cf.core.events.topic.v1~x.eb.topics.longpoll.v1";
 const EVENT_TYPE: &str = "gts.cf.core.events.event.v1~x.eb.topics.happy.v1~";
 const SUBJECT_TYPE: &str = "gts.x.eb.topics.subject.v1~";
 
+event_broker::fixture_event_type!(
+    /// Any object payload: an open type with no declared members.
+    HappyEventV1 = "cf.core.events.event.v1~x.eb.topics.happy.v1~",
+    topic = TOPIC,
+    subjects = [SUBJECT_TYPE],
+);
+
 async fn harness() -> EventBrokerHarness {
     EventBrokerHarness::builder()
-        .with_type_registry(StaticTypesRegistry::of(json!([
+        .with_type_registry(
+            StaticTypesRegistry::of(json!([
             { "id": TOPIC, "partitions": 1 },
             { "id": OTHER_TOPIC, "partitions": 1 },
-            {
-                "id": EVENT_TYPE,
-                "topic": TOPIC,
-                "allowed_subject_types": [SUBJECT_TYPE],
-            },
-        ])))
+             ]))
+            .event_type::<HappyEventV1>(),
+        )
         .build()
         .await
+}
+
+/// The base event's `data` member as the SDK generates it: the first branch of
+/// every composed payload contract.
+fn base_data_member() -> serde_json::Value {
+    <event_broker_sdk::gts::EventV1<()> as gts::GtsSchema>::gts_schema_with_refs()["properties"]["data"]
+        .clone()
 }
 
 // scenario: topics/1.01-positive-list-topics.md
@@ -127,6 +140,7 @@ async fn segments_of_an_unknown_topic_answer_404() {
 #[tokio::test]
 async fn list_event_types_of_a_topic_returns_a_paged_list() {
     let harness = harness().await;
+    let declared = <HappyEventV1 as gts::GtsSchema>::gts_schema_with_refs();
 
     let resp = harness
         .api_v1()
@@ -142,18 +156,13 @@ async fn list_event_types_of_a_topic_returns_a_paged_list() {
             "items": [{
                 "id": EVENT_TYPE,
                 "topic": TOPIC,
-                "description": null,
+                "description": declared["description"],
                 "allowed_subject_types": [SUBJECT_TYPE],
                 "partition_key": "/tenant_id",
                 "data_schema": {
                     "allOf": [
-                        {
-                            "additionalProperties": true,
-                            "default": null,
-                            "description": "Event payload, validated at ingest against the resolved schema of the event's type. The only field where UTF-8 (or any non-ASCII bytes) is permitted; all other event fields are ASCII per platform convention. May be absent for body-less events (e.g., notification-only events whose semantics are fully carried by `type` + `subject`).",
-                            "type": ["object", "null"],
-                        },
-                        { "type": ["object", "null"] },
+                        base_data_member(),
+                        declared["allOf"][1]["properties"]["data"],
                     ],
                 },
             }],

@@ -202,19 +202,11 @@ fn subject_bound_is_wider_than_source() {
 
 // -- the schemas are the authority: bounds here must equal bounds there ----
 //
-// A `validate` function and the committed schema declaring the same field are
-// two statements of one contract. These tests read the schema off disk and
-// probe the validator at the boundaries it names, so a bound edited on one
-// side and not the other fails here rather than in production.
-
-fn committed_schema(file: &str) -> serde_json::Value {
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../docs/schemas")
-        .join(file);
-    let text =
-        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
-    serde_json::from_str(&text).expect("committed schema is valid JSON")
-}
+// A `validate` function and the schema declaring the same field are two
+// statements of one contract. These tests read the schema generated from
+// `crate::gts` for the topic and event bases and probe the validator at the boundaries it
+// names, so a bound edited on one side and not the other fails here rather than
+// in production.
 
 /// A field's declared contract, read from the schema rather than restated.
 struct Declared {
@@ -278,38 +270,15 @@ fn agrees_with(
 }
 
 #[test]
-fn client_agent_agrees_with_the_consumer_group_schema() {
-    let schema = committed_schema("gts.cf.core.events.consumer_group.v1~.schema.json");
-    let node = &schema["definitions"]["CreateRequest"]["properties"]["client_agent"];
-    agrees_with(&declared(node), client_agent, false);
-}
-
-#[test]
-fn client_agent_agrees_with_the_subscription_schema() {
-    // The same field on another resource - the bound must not have drifted
-    // between the two schemas that declare it.
-    let schema = committed_schema("gts.cf.core.events.subscription.v1~.schema.json");
-    let node = &schema["properties"]["client_agent"];
-    agrees_with(&declared(node), client_agent, false);
-}
-
-#[test]
-fn description_agrees_with_the_consumer_group_schema() {
-    let schema = committed_schema("gts.cf.core.events.consumer_group.v1~.schema.json");
-    let node = &schema["definitions"]["CreateRequest"]["properties"]["description"];
-    agrees_with(&declared(node), description, true);
-}
-
-#[test]
 fn description_agrees_with_the_topic_schema() {
-    let schema = committed_schema("gts.cf.core.events.topic.v1~.schema.json");
+    let schema = <crate::gts::TopicV1 as gts::GtsSchema>::gts_schema_with_refs();
     let node = &schema["properties"]["description"];
     agrees_with(&declared(node), description, true);
 }
 
 #[test]
 fn source_agrees_with_the_event_schema() {
-    let schema = committed_schema("gts.cf.core.events.event.v1~.schema.json");
+    let schema = <crate::gts::EventV1<()> as gts::GtsSchema>::gts_schema_with_refs();
     let node = &schema["properties"]["source"];
     // `source` declares no `minLength`, but its `+` pattern rejects empty, so
     // the validator's 1-byte floor is what the schema means rather than what
@@ -324,7 +293,7 @@ fn source_agrees_with_the_event_schema() {
 
 #[test]
 fn subject_agrees_with_the_event_schema() {
-    let schema = committed_schema("gts.cf.core.events.event.v1~.schema.json");
+    let schema = <crate::gts::EventV1<()> as gts::GtsSchema>::gts_schema_with_refs();
     let node = &schema["properties"]["subject"];
     agrees_with(&declared(node), subject, false);
 }

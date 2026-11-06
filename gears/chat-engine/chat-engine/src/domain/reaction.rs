@@ -10,7 +10,7 @@
 //!
 //! Types:
 //! - [`ReactionType`] — wire enum (`like` / `dislike` / `none`), serialized
-//!   in snake_case to match `schemas/common/ReactionType.json`.
+//!   in snake_case to match the `reaction_type` wire values in `docs/openapi.json`.
 //! - [`MessageReaction`] — domain view of a stored row.
 //! - [`MessageReactionEvent`] — payload of the fire-and-forget
 //!   `message.reaction` plugin notification (ADR-0020 §Webhook Event).
@@ -85,8 +85,9 @@ pub struct MessageReaction {
 }
 
 /// Fire-and-forget plugin event payload built by the reaction service after
-/// every successful add / change / remove. Mirrors
-/// `schemas/webhook/MessageReactionEvent.json`.
+/// every successful add / change / remove. Not yet dispatched over the
+/// webhook wire (the plugin trait has no reaction hook); see
+/// `docs/WEBHOOK-PROTOCOL.md`.
 #[domain_model]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MessageReactionEvent {

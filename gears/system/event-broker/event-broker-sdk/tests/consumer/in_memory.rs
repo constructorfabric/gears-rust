@@ -6,10 +6,18 @@ use event_broker_sdk::{
     InMemoryOffsetManager, RawEvent, SingleEventHandler, SubscriptionInterest, gts_id,
 };
 
-use super::common::{event_pattern, publish_json, topic, topic_fixture, wait_until};
+use super::common::{
+    event_pattern, publish_json, showcase_event_type, topic, topic_fixture, wait_until,
+};
+use event_broker_sdk::gts::EventV1;
 
 const TOPIC: &str = gts_id!("cf.core.events.topic.v1~example.mock.showcase.inmemory.v1");
-const EVENT_TYPE: &str = gts_id!("cf.core.events.event.v1~example.mock.showcase.inmemory.v1~");
+showcase_event_type!(
+    EVENT_TYPE,
+    EventTypeV1,
+    "cf.core.events.event.v1~example.mock.showcase.inmemory.v1~",
+    TOPIC
+);
 
 struct RecordingHandler {
     subjects: Arc<Mutex<Vec<String>>>,
@@ -29,7 +37,7 @@ impl SingleEventHandler for RecordingHandler {
 
 #[tokio::test]
 async fn if_i_want_at_least_once_consumption_with_in_memory_offsets() {
-    let fixture = topic_fixture(TOPIC, EVENT_TYPE, 1).await;
+    let fixture = topic_fixture::<EventTypeV1>(TOPIC, 1).await;
     let subjects = Arc::new(Mutex::new(Vec::new()));
 
     let handle = ConsumerBuilder::new(fixture.broker.clone())

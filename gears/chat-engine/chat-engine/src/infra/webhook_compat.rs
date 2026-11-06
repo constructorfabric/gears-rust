@@ -72,59 +72,48 @@ use reqwest::{
     Client, RequestBuilder, Response, StatusCode,
     header::{HeaderMap, HeaderName, HeaderValue, RETRY_AFTER},
 };
+use serde::Serialize;
 use serde_json::Value as JsonValue;
 use tokio::select;
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
 use chat_engine_sdk::error::PluginError;
-use chat_engine_sdk::models::{Capability, HealthStatus, StreamingEvent};
+use chat_engine_sdk::models::{HealthStatus, StreamingEvent};
 use chat_engine_sdk::plugin::{
     ChatEngineBackendPlugin, MessagePluginCtx, PluginCallContext, PluginStream, SessionPluginCtx,
     SessionPluginResponse, empty_stream, stream_from_events,
 };
+use chat_engine_sdk::webhook::{
+    WebhookEvent, WebhookMessageRequest, WebhookSessionRequest, WebhookSessionResponse,
+};
 
-/// Outgoing body for the two message hooks.
+/// Build the request body for the two message hooks.
 ///
 /// `enabled_capabilities` is on the wire whenever the call carries values: an
 /// in-process plugin reads them straight off `ctx.call_ctx`, so the webhook
 /// transport has to forward them or a webhook backend can never observe a
 /// capability it declared itself. The key is omitted (rather than sent as
-/// `null`) when the call carries none, matching the optional
-/// `enabled_capabilities` in `schemas/webhook/*Event.json`.
-fn message_body(event: &str, ctx: &MessagePluginCtx) -> JsonValue {
-    let mut body = serde_json::json!({
-        "event": event,
-        "session_id": ctx.session_id,
-        "message_id": ctx.message_id,
-        "messages": ctx.messages,
-    });
-    attach_capabilities(&mut body, &ctx.call_ctx);
-    body
+/// `null`) when the call carries none. Wire types live in
+/// [`chat_engine_sdk::webhook`].
+fn message_body(event: WebhookEvent, ctx: &MessagePluginCtx) -> WebhookMessageRequest<'_> {
+    WebhookMessageRequest {
+        event,
+        session_id: ctx.session_id,
+        message_id: ctx.message_id,
+        messages: &ctx.messages,
+        enabled_capabilities: ctx.call_ctx.enabled_capabilities.as_deref(),
+    }
 }
 
-/// Outgoing body for the session-scoped hooks. Carries capability values on
-/// the same terms as [`message_body`].
-fn session_body(event: &str, ctx: &SessionPluginCtx) -> JsonValue {
-    let mut body = serde_json::json!({
-        "event": event,
-        "session_type_id": ctx.session_type_id,
-        "session_id": ctx.session_id,
-    });
-    attach_capabilities(&mut body, &ctx.call_ctx);
-    body
-}
-
-/// Insert `enabled_capabilities` into `body` when `call_ctx` carries values.
-fn attach_capabilities(body: &mut JsonValue, call_ctx: &PluginCallContext) {
-    let Some(caps) = call_ctx.enabled_capabilities.as_ref() else {
-        return;
-    };
-    if let Some(map) = body.as_object_mut() {
-        map.insert(
-            "enabled_capabilities".into(),
-            serde_json::to_value(caps).unwrap_or(JsonValue::Array(Vec::new())),
-        );
+/// Build the request body for the session-scoped hooks. Carries capability
+/// values on the same terms as [`message_body`].
+fn session_body(event: WebhookEvent, ctx: &SessionPluginCtx) -> WebhookSessionRequest<'_> {
+    WebhookSessionRequest {
+        event,
+        session_type_id: ctx.session_type_id,
+        session_id: ctx.session_id,
+        enabled_capabilities: ctx.call_ctx.enabled_capabilities.as_deref(),
     }
 }
 
@@ -238,7 +227,7 @@ impl ChatEngineBackendPlugin for WebhookCompatPlugin {
         &self,
         ctx: SessionPluginCtx,
     ) -> Result<SessionPluginResponse, PluginError> {
-        let body = session_body("session_type_configured", &ctx);
+        let body = session_body(WebhookEvent::SessionTypeConfigured, &ctx);
         let cfg = Self::extract_config(&ctx.call_ctx)?;
         let resp = post_json(
             &self.http,
@@ -255,7 +244,7 @@ impl ChatEngineBackendPlugin for WebhookCompatPlugin {
         &self,
         ctx: SessionPluginCtx,
     ) -> Result<SessionPluginResponse, PluginError> {
-        let body = session_body("session_created", &ctx);
+        let body = session_body(WebhookEvent::SessionCreated, &ctx);
         let cfg = Self::extract_config(&ctx.call_ctx)?;
         let resp = post_json(&self.http, &cfg, &ctx.call_ctx, &body, "session_created").await?;
         parse_session_response(resp).await
@@ -265,7 +254,7 @@ impl ChatEngineBackendPlugin for WebhookCompatPlugin {
         &self,
         ctx: SessionPluginCtx,
     ) -> Result<SessionPluginResponse, PluginError> {
-        let body = session_body("session_updated", &ctx);
+        let body = session_body(WebhookEvent::SessionUpdated, &ctx);
         let cfg = Self::extract_config(&ctx.call_ctx)?;
         let resp = post_json(&self.http, &cfg, &ctx.call_ctx, &body, "session_updated").await?;
         parse_session_response(resp).await
@@ -276,7 +265,7 @@ impl ChatEngineBackendPlugin for WebhookCompatPlugin {
         // the returned `PluginStream` is `'static` and Chat Engine drives it
         // long after this `async fn` frame unwinds.
         let cfg = Self::extract_config(&ctx.call_ctx)?;
-        let body = message_body("message", &ctx);
+        let body = message_body(WebhookEvent::Message, &ctx);
         run_streaming_request(
             self.http.clone(),
             cfg,
@@ -292,7 +281,7 @@ impl ChatEngineBackendPlugin for WebhookCompatPlugin {
         ctx: MessagePluginCtx,
     ) -> Result<PluginStream, PluginError> {
         let cfg = Self::extract_config(&ctx.call_ctx)?;
-        let body = message_body("message_recreate", &ctx);
+        let body = message_body(WebhookEvent::MessageRecreate, &ctx);
         run_streaming_request(
             self.http.clone(),
             cfg,
@@ -305,7 +294,7 @@ impl ChatEngineBackendPlugin for WebhookCompatPlugin {
 
     async fn on_session_summary(&self, ctx: SessionPluginCtx) -> Result<PluginStream, PluginError> {
         let cfg = Self::extract_config(&ctx.call_ctx)?;
-        let body = session_body("session_summary", &ctx);
+        let body = session_body(WebhookEvent::SessionSummary, &ctx);
         run_streaming_request(
             self.http.clone(),
             cfg,
@@ -406,7 +395,7 @@ fn build_request(
     http: &Client,
     cfg: &WebhookConfig,
     call_ctx: &PluginCallContext,
-    body: &JsonValue,
+    body: &(impl Serialize + ?Sized),
 ) -> Result<RequestBuilder, PluginError> {
     let timeout = cfg.resolved_timeout(call_ctx)?;
     let req = http
@@ -424,7 +413,7 @@ async fn post_json(
     http: &Client,
     cfg: &WebhookConfig,
     call_ctx: &PluginCallContext,
-    body: &JsonValue,
+    body: &(impl Serialize + ?Sized),
     method_label: &'static str,
 ) -> Result<Response, PluginError> {
     // Pre-flight: already cancelled?
@@ -474,7 +463,7 @@ async fn run_streaming_request(
     http: Client,
     cfg: WebhookConfig,
     call_ctx: PluginCallContext,
-    body: JsonValue,
+    body: impl Serialize,
     method_label: &'static str,
 ) -> Result<PluginStream, PluginError> {
     let cancel = call_ctx.cancel.clone();
@@ -634,30 +623,9 @@ async fn parse_session_response(resp: Response) -> Result<SessionPluginResponse,
     if bytes.is_empty() {
         return Ok(SessionPluginResponse::default());
     }
-    let value: serde_json::Value = serde_json::from_slice(&bytes)
+    let parsed: WebhookSessionResponse = serde_json::from_slice(&bytes)
         .map_err(|e| PluginError::internal_with("malformed session response", e))?;
-    match value {
-        serde_json::Value::Array(_) => {
-            let capabilities = serde_json::from_value::<Vec<Capability>>(value)
-                .map_err(|e| PluginError::internal_with("malformed capability payload", e))?;
-            Ok(SessionPluginResponse::from(capabilities))
-        }
-        serde_json::Value::Object(mut map) => {
-            let capabilities = match map.remove("capabilities") {
-                Some(c) => serde_json::from_value::<Vec<Capability>>(c)
-                    .map_err(|e| PluginError::internal_with("malformed capability payload", e))?,
-                None => Vec::new(),
-            };
-            let metadata = map.remove("metadata").filter(|v| !v.is_null());
-            Ok(SessionPluginResponse {
-                capabilities,
-                metadata,
-            })
-        }
-        _ => Err(PluginError::internal(
-            "session response must be a capability array or an object",
-        )),
-    }
+    Ok(parsed.into())
 }
 
 /// Map an HTTP status (4xx/5xx) to a [`PluginError`] using the canonical

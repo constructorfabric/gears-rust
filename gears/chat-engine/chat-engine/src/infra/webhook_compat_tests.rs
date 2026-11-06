@@ -252,7 +252,11 @@ fn session_ctx(caps: Option<Vec<CapabilityValue>>) -> SessionPluginCtx {
 
 #[test]
 fn message_body_puts_capabilities_on_the_wire() {
-    let body = message_body("message", &message_ctx(Some(sample_caps())));
+    let body = serde_json::to_value(message_body(
+        WebhookEvent::Message,
+        &message_ctx(Some(sample_caps())),
+    ))
+    .unwrap();
     assert_eq!(body["event"], "message");
     assert_eq!(
         body["enabled_capabilities"],
@@ -263,7 +267,11 @@ fn message_body_puts_capabilities_on_the_wire() {
 
 #[test]
 fn message_recreate_body_puts_capabilities_on_the_wire() {
-    let body = message_body("message_recreate", &message_ctx(Some(sample_caps())));
+    let body = serde_json::to_value(message_body(
+        WebhookEvent::MessageRecreate,
+        &message_ctx(Some(sample_caps())),
+    ))
+    .unwrap();
     assert_eq!(body["event"], "message_recreate");
     assert_eq!(
         body["enabled_capabilities"],
@@ -274,7 +282,11 @@ fn message_recreate_body_puts_capabilities_on_the_wire() {
 
 #[test]
 fn session_updated_body_puts_capabilities_on_the_wire() {
-    let body = session_body("session_updated", &session_ctx(Some(sample_caps())));
+    let body = serde_json::to_value(session_body(
+        WebhookEvent::SessionUpdated,
+        &session_ctx(Some(sample_caps())),
+    ))
+    .unwrap();
     assert_eq!(body["event"], "session_updated");
     assert_eq!(
         body["enabled_capabilities"],
@@ -285,7 +297,11 @@ fn session_updated_body_puts_capabilities_on_the_wire() {
 
 #[test]
 fn session_summary_body_puts_capabilities_on_the_wire() {
-    let body = session_body("session_summary", &session_ctx(Some(sample_caps())));
+    let body = serde_json::to_value(session_body(
+        WebhookEvent::SessionSummary,
+        &session_ctx(Some(sample_caps())),
+    ))
+    .unwrap();
     assert_eq!(body["event"], "session_summary");
     assert_eq!(
         body["enabled_capabilities"],
@@ -296,11 +312,15 @@ fn session_summary_body_puts_capabilities_on_the_wire() {
 
 #[test]
 fn bodies_omit_capabilities_when_the_call_carries_none() {
-    // Omitted rather than serialised as `null`: the webhook event schemas
-    // type the field as an array, so a null would not validate.
+    // Omitted rather than serialised as `null`: the documented wire
+    // types the field as an array, so a null would not be accepted.
     for body in [
-        message_body("message", &message_ctx(None)),
-        session_body("session_updated", &session_ctx(None)),
+        serde_json::to_value(message_body(WebhookEvent::Message, &message_ctx(None))).unwrap(),
+        serde_json::to_value(session_body(
+            WebhookEvent::SessionUpdated,
+            &session_ctx(None),
+        ))
+        .unwrap(),
     ] {
         assert!(
             body.get("enabled_capabilities").is_none(),

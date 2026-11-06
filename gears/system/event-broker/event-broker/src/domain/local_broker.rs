@@ -66,7 +66,7 @@ use crate::domain::streaming::frames::{
 };
 
 /// The documented JOIN default when the caller names no `session_timeout`
-/// (`docs/schemas/gts.cf.core.events.subscription.v1~.schema.json`); the REST
+/// (`JoinSubscriptionRequest::session_timeout`); the REST
 /// layer resolves the same `PT30S` before building its domain request.
 const DEFAULT_SESSION_TIMEOUT: Duration = Duration::from_secs(30);
 

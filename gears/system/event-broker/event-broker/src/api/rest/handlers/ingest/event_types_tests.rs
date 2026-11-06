@@ -18,22 +18,55 @@ use serde_json::json;
 use std::collections::BTreeSet;
 
 use crate::test_support::{EventBrokerHarness, StaticTypesRegistry};
+use event_broker_sdk::gts::EventV1;
+
+crate::fixture_event_type!(
+    AV1 = "cf.core.events.event.v1~x.eb.t1.a.v1~",
+    topic = "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
+);
+
+crate::fixture_event_type!(
+    BV1 = "cf.core.events.event.v1~x.eb.t2.b.v1~",
+    topic = "gts.cf.core.events.topic.v1~x.eb.t2.topic.v1",
+);
+
+crate::fixture_event_type!(
+    Type0V1 = "cf.core.events.event.v1~x.eb.t1.type0.v1~",
+    topic = "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
+);
+
+crate::fixture_event_type!(
+    Type1V1 = "cf.core.events.event.v1~x.eb.t1.type1.v1~",
+    topic = "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
+);
+
+crate::fixture_event_type!(
+    Type2V1 = "cf.core.events.event.v1~x.eb.t1.type2.v1~",
+    topic = "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
+);
+
+/// The payload contract an event type serves: the base event's `data` member -
+/// as the SDK generates it - composed with the member the type declares.
+fn data_contract_of<T: gts::GtsSchema>() -> serde_json::Value {
+    json!({
+        "allOf": [
+            <EventV1<()> as gts::GtsSchema>::gts_schema_with_refs()["properties"]["data"].clone(),
+            T::gts_schema_with_refs()["allOf"][1]["properties"]["data"].clone(),
+        ],
+    })
+}
 
 #[tokio::test]
 async fn list_event_types_happy_path_returns_all_seeded_types() {
     let harness = EventBrokerHarness::builder()
-        .with_type_registry(StaticTypesRegistry::of(json!([
-            { "id": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1", "partitions": 1 },
-            { "id": "gts.cf.core.events.topic.v1~x.eb.t2.topic.v1", "partitions": 1 },
-            {
-                "id": "gts.cf.core.events.event.v1~x.eb.t1.a.v1~",
-                "topic": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
-            },
-            {
-                "id": "gts.cf.core.events.event.v1~x.eb.t2.b.v1~",
-                "topic": "gts.cf.core.events.topic.v1~x.eb.t2.topic.v1",
-            },
-        ])))
+        .with_type_registry(
+            StaticTypesRegistry::of(json!([
+                { "id": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1", "partitions": 1 },
+                { "id": "gts.cf.core.events.topic.v1~x.eb.t2.topic.v1", "partitions": 1 },
+            ]))
+            .event_type::<AV1>()
+            .event_type::<BV1>(),
+        )
         .build()
         .await;
 
@@ -52,38 +85,18 @@ async fn list_event_types_happy_path_returns_all_seeded_types() {
                 {
                     "id": "gts.cf.core.events.event.v1~x.eb.t1.a.v1~",
                     "topic": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
-                    "description": null,
+                    "description": <AV1 as gts::GtsSchema>::gts_schema_with_refs()["description"],
                     "allowed_subject_types": [],
                     "partition_key": "/tenant_id",
-                    "data_schema": {
-                        "allOf": [
-                            {
-                                "additionalProperties": true,
-                                "default": null,
-                                "description": "Event payload, validated at ingest against the resolved schema of the event's type. The only field where UTF-8 (or any non-ASCII bytes) is permitted; all other event fields are ASCII per platform convention. May be absent for body-less events (e.g., notification-only events whose semantics are fully carried by `type` + `subject`).",
-                                "type": ["object", "null"],
-                            },
-                            { "type": ["object", "null"] },
-                        ],
-                    },
+                    "data_schema": data_contract_of::<AV1>(),
                 },
                 {
                     "id": "gts.cf.core.events.event.v1~x.eb.t2.b.v1~",
                     "topic": "gts.cf.core.events.topic.v1~x.eb.t2.topic.v1",
-                    "description": null,
+                    "description": <BV1 as gts::GtsSchema>::gts_schema_with_refs()["description"],
                     "allowed_subject_types": [],
                     "partition_key": "/tenant_id",
-                    "data_schema": {
-                        "allOf": [
-                            {
-                                "additionalProperties": true,
-                                "default": null,
-                                "description": "Event payload, validated at ingest against the resolved schema of the event's type. The only field where UTF-8 (or any non-ASCII bytes) is permitted; all other event fields are ASCII per platform convention. May be absent for body-less events (e.g., notification-only events whose semantics are fully carried by `type` + `subject`).",
-                                "type": ["object", "null"],
-                            },
-                            { "type": ["object", "null"] },
-                        ],
-                    },
+                    "data_schema": data_contract_of::<BV1>(),
                 },
             ],
             "page_info": { "next_cursor": null, "prev_cursor": null, "limit": 25 },
@@ -94,18 +107,14 @@ async fn list_event_types_happy_path_returns_all_seeded_types() {
 #[tokio::test]
 async fn list_event_types_filters_by_id() {
     let harness = EventBrokerHarness::builder()
-        .with_type_registry(StaticTypesRegistry::of(json!([
-            { "id": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1", "partitions": 1 },
-            { "id": "gts.cf.core.events.topic.v1~x.eb.t2.topic.v1", "partitions": 1 },
-            {
-                "id": "gts.cf.core.events.event.v1~x.eb.t1.a.v1~",
-                "topic": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
-            },
-            {
-                "id": "gts.cf.core.events.event.v1~x.eb.t2.b.v1~",
-                "topic": "gts.cf.core.events.topic.v1~x.eb.t2.topic.v1",
-            },
-        ])))
+        .with_type_registry(
+            StaticTypesRegistry::of(json!([
+                { "id": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1", "partitions": 1 },
+                { "id": "gts.cf.core.events.topic.v1~x.eb.t2.topic.v1", "partitions": 1 },
+            ]))
+            .event_type::<AV1>()
+            .event_type::<BV1>(),
+        )
         .build()
         .await;
 
@@ -126,20 +135,10 @@ async fn list_event_types_filters_by_id() {
             "items": [{
                 "id": "gts.cf.core.events.event.v1~x.eb.t1.a.v1~",
                 "topic": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
-                "description": null,
+                "description": <AV1 as gts::GtsSchema>::gts_schema_with_refs()["description"],
                 "allowed_subject_types": [],
                 "partition_key": "/tenant_id",
-                "data_schema": {
-                        "allOf": [
-                            {
-                                "additionalProperties": true,
-                                "default": null,
-                                "description": "Event payload, validated at ingest against the resolved schema of the event's type. The only field where UTF-8 (or any non-ASCII bytes) is permitted; all other event fields are ASCII per platform convention. May be absent for body-less events (e.g., notification-only events whose semantics are fully carried by `type` + `subject`).",
-                                "type": ["object", "null"],
-                            },
-                            { "type": ["object", "null"] },
-                        ],
-                    },
+                "data_schema": data_contract_of::<AV1>(),
             }],
             "page_info": { "next_cursor": null, "prev_cursor": null, "limit": 25 },
         })
@@ -149,18 +148,14 @@ async fn list_event_types_filters_by_id() {
 #[tokio::test]
 async fn list_event_types_filters_by_topic() {
     let harness = EventBrokerHarness::builder()
-        .with_type_registry(StaticTypesRegistry::of(json!([
-            { "id": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1", "partitions": 1 },
-            { "id": "gts.cf.core.events.topic.v1~x.eb.t2.topic.v1", "partitions": 1 },
-            {
-                "id": "gts.cf.core.events.event.v1~x.eb.t1.a.v1~",
-                "topic": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
-            },
-            {
-                "id": "gts.cf.core.events.event.v1~x.eb.t2.b.v1~",
-                "topic": "gts.cf.core.events.topic.v1~x.eb.t2.topic.v1",
-            },
-        ])))
+        .with_type_registry(
+            StaticTypesRegistry::of(json!([
+                { "id": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1", "partitions": 1 },
+                { "id": "gts.cf.core.events.topic.v1~x.eb.t2.topic.v1", "partitions": 1 },
+            ]))
+            .event_type::<AV1>()
+            .event_type::<BV1>(),
+        )
         .build()
         .await;
 
@@ -181,20 +176,10 @@ async fn list_event_types_filters_by_topic() {
             "items": [{
                 "id": "gts.cf.core.events.event.v1~x.eb.t2.b.v1~",
                 "topic": "gts.cf.core.events.topic.v1~x.eb.t2.topic.v1",
-                "description": null,
+                "description": <BV1 as gts::GtsSchema>::gts_schema_with_refs()["description"],
                 "allowed_subject_types": [],
                 "partition_key": "/tenant_id",
-                "data_schema": {
-                        "allOf": [
-                            {
-                                "additionalProperties": true,
-                                "default": null,
-                                "description": "Event payload, validated at ingest against the resolved schema of the event's type. The only field where UTF-8 (or any non-ASCII bytes) is permitted; all other event fields are ASCII per platform convention. May be absent for body-less events (e.g., notification-only events whose semantics are fully carried by `type` + `subject`).",
-                                "type": ["object", "null"],
-                            },
-                            { "type": ["object", "null"] },
-                        ],
-                    },
+                "data_schema": data_contract_of::<BV1>(),
             }],
             "page_info": { "next_cursor": null, "prev_cursor": null, "limit": 25 },
         })
@@ -204,21 +189,14 @@ async fn list_event_types_filters_by_topic() {
 #[tokio::test]
 async fn list_event_types_paginates_with_limit() {
     let harness = EventBrokerHarness::builder()
-        .with_type_registry(StaticTypesRegistry::of(json!([
-            { "id": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1", "partitions": 1 },
-            {
-                "id": "gts.cf.core.events.event.v1~x.eb.t1.type0.v1~",
-                "topic": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
-            },
-            {
-                "id": "gts.cf.core.events.event.v1~x.eb.t1.type1.v1~",
-                "topic": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
-            },
-            {
-                "id": "gts.cf.core.events.event.v1~x.eb.t1.type2.v1~",
-                "topic": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
-            },
-        ])))
+        .with_type_registry(
+            StaticTypesRegistry::of(json!([
+                { "id": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1", "partitions": 1 },
+            ]))
+            .event_type::<Type0V1>()
+            .event_type::<Type1V1>()
+            .event_type::<Type2V1>(),
+        )
         .build()
         .await;
 
@@ -312,13 +290,12 @@ async fn list_event_types_paginates_with_limit() {
 #[tokio::test]
 async fn listing_event_types_during_a_spec_cache_fault_answers_503() {
     let harness = EventBrokerHarness::builder()
-        .with_type_registry(StaticTypesRegistry::of(json!([
-            { "id": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1", "partitions": 1 },
-            {
-                "id": "gts.cf.core.events.event.v1~x.eb.t1.a.v1~",
-                "topic": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
-            },
-        ])))
+        .with_type_registry(
+            StaticTypesRegistry::of(json!([
+                { "id": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1", "partitions": 1 },
+            ]))
+            .event_type::<AV1>(),
+        )
         .build()
         .await;
     harness.drop_metadata_table("event_broker_spec_cache").await;

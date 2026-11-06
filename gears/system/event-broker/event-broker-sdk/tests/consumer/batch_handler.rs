@@ -8,10 +8,16 @@ use event_broker_sdk::{
     ConsumerHandler, EventBatch, Fallback, InMemoryOffsetManager,
 };
 
-use super::common::{publish_json, topic, topic_fixture, wait_until};
+use super::common::{publish_json, showcase_event_type, topic, topic_fixture, wait_until};
+use event_broker_sdk::gts::EventV1;
 
 const TOPIC: &str = gts_id!("cf.core.events.topic.v1~example.mock.showcase.batch.v1");
-const EVENT_TYPE: &str = gts_id!("cf.core.events.event.v1~example.mock.showcase.batch.v1~");
+showcase_event_type!(
+    EVENT_TYPE,
+    EventTypeV1,
+    "cf.core.events.event.v1~example.mock.showcase.batch.v1~",
+    TOPIC
+);
 
 type RecordedBatch = (u32, Vec<i64>);
 type RecordedBatches = Arc<Mutex<Vec<RecordedBatch>>>;
@@ -40,7 +46,7 @@ impl ConsumerHandler for BatchProjector {
 
 #[tokio::test]
 async fn if_i_want_native_batches_they_stay_inside_one_partition() {
-    let fixture = topic_fixture(TOPIC, EVENT_TYPE, 2).await;
+    let fixture = topic_fixture::<EventTypeV1>(TOPIC, 2).await;
     let batches = Arc::new(Mutex::new(Vec::new()));
 
     let handle = ConsumerBuilder::new(fixture.broker.clone())

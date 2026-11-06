@@ -169,6 +169,8 @@ harness = false
 # The crate itself with `test-utils`, as oagw does: every `tests/` binary gets
 # `test_support` (the in-process harness) with no `required-features`.
 cf-gears-event-broker = { path = ".", features = ["test-utils"] }
+# `#[gts_type_schema]` event-type fixtures in `tests/` expand to `schemars` derives.
+schemars = { workspace = true }
 # `tests/migrations_backends_test.rs`: the SDK's producer registration
 # migration (`producer_registration_migrations`, behind its `db` feature) on
 # every engine the gear database may be.

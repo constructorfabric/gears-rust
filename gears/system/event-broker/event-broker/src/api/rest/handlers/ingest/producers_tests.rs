@@ -12,6 +12,25 @@ use uuid::Uuid;
 
 use crate::domain::ingest::{ProducerMode, ProducerRegistrationInput};
 use crate::test_support::{EventBrokerHarness, Json, StaticTypesRegistry, TestResponse};
+use event_broker_sdk::gts::EventV1;
+
+crate::fixture_event_type!(
+    FooV1 = "cf.core.events.event.v1~x.eb.t1.foo.v1~",
+    topic = "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
+    subjects = ["gts.x.eb.t1.subject.v1~"],
+);
+
+crate::fixture_event_type!(
+    FooAV1 = "cf.core.events.event.v1~x.eb.t1.foo_a.v1~",
+    topic = "gts.cf.core.events.topic.v1~x.eb.t1.topic_a.v1",
+    subjects = ["gts.x.eb.t1.subject.v1~"],
+);
+
+crate::fixture_event_type!(
+    FooBV1 = "cf.core.events.event.v1~x.eb.t1.foo_b.v1~",
+    topic = "gts.cf.core.events.topic.v1~x.eb.t1.topic_b.v1",
+    subjects = ["gts.x.eb.t1.subject.v1~"],
+);
 
 #[tokio::test]
 async fn register_producer_chained_mode_returns_201_with_minted_id() {
@@ -229,14 +248,12 @@ async fn publish_chained_event(
 #[tokio::test]
 async fn reset_producer_full_scope_returns_200_with_no_body() {
     let harness = EventBrokerHarness::builder()
-        .with_type_registry(StaticTypesRegistry::of(json!([
-            { "id": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1", "partitions": 1 },
-            {
-                "id": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
-                "topic": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
-                "allowed_subject_types": ["gts.x.eb.t1.subject.v1~"],
-            },
-        ])))
+        .with_type_registry(
+            StaticTypesRegistry::of(json!([
+                { "id": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1", "partitions": 1 },
+            ]))
+            .event_type::<FooV1>(),
+        )
         .build()
         .await;
     let register = harness
@@ -304,20 +321,14 @@ async fn reset_producer_full_scope_returns_200_with_no_body() {
 #[tokio::test]
 async fn reset_producer_scoped_to_topic_returns_200_with_no_body() {
     let harness = EventBrokerHarness::builder()
-        .with_type_registry(StaticTypesRegistry::of(json!([
-            { "id": "gts.cf.core.events.topic.v1~x.eb.t1.topic_a.v1", "partitions": 1 },
-            { "id": "gts.cf.core.events.topic.v1~x.eb.t1.topic_b.v1", "partitions": 1 },
-            {
-                "id": "gts.cf.core.events.event.v1~x.eb.t1.foo_a.v1~",
-                "topic": "gts.cf.core.events.topic.v1~x.eb.t1.topic_a.v1",
-                "allowed_subject_types": ["gts.x.eb.t1.subject.v1~"],
-            },
-            {
-                "id": "gts.cf.core.events.event.v1~x.eb.t1.foo_b.v1~",
-                "topic": "gts.cf.core.events.topic.v1~x.eb.t1.topic_b.v1",
-                "allowed_subject_types": ["gts.x.eb.t1.subject.v1~"],
-            },
-        ])))
+        .with_type_registry(
+            StaticTypesRegistry::of(json!([
+                { "id": "gts.cf.core.events.topic.v1~x.eb.t1.topic_a.v1", "partitions": 1 },
+                { "id": "gts.cf.core.events.topic.v1~x.eb.t1.topic_b.v1", "partitions": 1 },
+            ]))
+            .event_type::<FooAV1>()
+            .event_type::<FooBV1>(),
+        )
         .build()
         .await;
     let register = harness
@@ -500,7 +511,7 @@ async fn reset_producer_not_owner_returns_403() {
 
 // -- reset audit record -----------------------------------------------------
 //
-// `docs/openapi.yaml` promises an audit record per reset: one
+// The producer-reset contract promises an audit record per reset: one
 // `event_broker.events` record of `kind = "producer.chain_reset"` per
 // successful reset, whichever way in (REST or the in-process broker), and none
 // for a reset that fails. Each test reads only the records of its own span, and

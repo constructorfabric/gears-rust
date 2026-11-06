@@ -596,7 +596,7 @@ Reference schemas for every entity below live under [`schemas/`](./schemas/) (`t
 
 **GTS entities reused / derived from other subsystems** (not owned here):
 
-- **Event types, topic, consumer group** derive from the **Event Broker** base types `gts.cf.core.events.{event,topic,consumer_group}.v1~` (see `gears/system/event-broker/docs/schemas/`). The Task Engine ships the derived event types and the topic and consumer-group instances above; it does **not** define its own event/topic/consumer-group base types.
+- **Event types, topic, consumer group** derive from the **Event Broker** base types `gts.cf.core.events.{event,topic,consumer_group}.v1~` (declared in `gears/system/event-broker/event-broker-sdk/src/gts.rs`). The Task Engine ships the derived event types and the topic and consumer-group instances above; it does **not** define its own event/topic/consumer-group base types.
 - **Errors** reuse the platform's fixed **canonical error categories** `gts.cf.core.errors.err.v1~cf.core.err.{category}.v1~` (see `docs/arch/errors/`). The Task Engine defines **no** error GTS types; it maps its failure conditions onto canonical categories (§3.3 Error Response Format).
 - **Permission base type** `gts.cf.toolkit.authz.permission.v1~` is owned by the ToolKit authz stack; the Task Engine only registers instances.
 - **Tags** are **not** GTS entities — task tags are free-form, tenant-scoped key/value strings (PRD §5.1).

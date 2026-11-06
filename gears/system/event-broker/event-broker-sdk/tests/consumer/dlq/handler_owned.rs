@@ -11,10 +11,18 @@ use event_broker_sdk::{
 };
 use uuid::Uuid;
 
-use crate::consumer::common::{event_type, publish_json, topic, topic_fixture, wait_until};
+use crate::consumer::common::{
+    event_type, publish_json, showcase_event_type, topic, topic_fixture, wait_until,
+};
+use event_broker_sdk::gts::EventV1;
 
 const TOPIC: &str = gts_id!("cf.core.events.topic.v1~example.mock.showcase.dlq.v1");
-const EVENT_TYPE: &str = gts_id!("cf.core.events.event.v1~example.mock.showcase.dlq.v1~");
+showcase_event_type!(
+    EVENT_TYPE,
+    EventTypeV1,
+    "cf.core.events.event.v1~example.mock.showcase.dlq.v1~",
+    TOPIC
+);
 
 #[derive(Clone, Default)]
 struct RecordingDeadLetterSink {
@@ -88,7 +96,7 @@ impl SingleEventHandler for HandlerOwnedDlqPolicy {
 
 #[tokio::test]
 async fn if_i_want_permanent_failures_parked_i_do_it_in_the_handler() {
-    let fixture = topic_fixture(TOPIC, EVENT_TYPE, 1).await;
+    let fixture = topic_fixture::<EventTypeV1>(TOPIC, 1).await;
     let sink = RecordingDeadLetterSink::default();
     let records = sink.records.clone();
 

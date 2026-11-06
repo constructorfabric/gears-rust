@@ -284,13 +284,13 @@ Production code MUST NOT call `AccessScope::allow_all()` directly (bare) anywher
 
 ### 3.1 Domain Model
 
-**Technology**: GTS (JSON Schema)
+**Technology**: Rust types (no generated or published JSON schemas)
 
-**Location**: `schemas/`
+**Location**: the webhook wire types live in `chat-engine-sdk/src/webhook.rs`; REST contracts are defined by the Rust DTOs in `chat-engine/src/api/rest/dto.rs` and `chat-engine-sdk/src/models.rs`, and by [`openapi.json`](openapi.json))
 
 **Core Schemas**:
 
-#### Session Operations (session/)
+#### Session Operations
 
 - **SessionCreateRequest** - Create session (session_type_id, client_id)
 - **SessionCreateResponse** - Session created (session_id, enabled_capabilities)
@@ -312,7 +312,7 @@ Production code MUST NOT call `AccessScope::allow_all()` directly (bare) anywher
 - **SessionsSearchResponse** - Sessions found (results)
 - **SessionSummarizeRequest** - Generate summary (session_id, enabled_capabilities)
 
-#### Message Operations (message/)
+#### Message Operations
 
 - **MessageSendRequest** - Send message (session_id, parts, file_ids, parent_message_id, enabled_capabilities) — `parts` is an ordered list of `MessagePartInput` (`{type, content}`); the legacy scalar `content` field is removed (see `cpt-cf-chat-engine-design-entity-message-part`)
 - **MessageListRequest** - List messages (session_id, parent_message_id)
@@ -323,7 +323,7 @@ Production code MUST NOT call `AccessScope::allow_all()` directly (bare) anywher
 - **MessageGetVariantsRequest** - Get variants (message_id)
 - **MessageGetVariantsResponse** - Variants list (variants, current_index)
 
-#### Streaming Events (streaming/)
+#### Streaming Events
 
 - [ ] `p1` - **ID**: `cpt-cf-chat-engine-design-streaming-protocol`
 
@@ -390,22 +390,11 @@ A dropped connection (network blip, client reload) MUST be resumable without re-
 
 > The buffer is **not** durable conversation history — it only bridges reconnects within the live window. The durable record is the persisted message (parts + citations), read via `GET /messages/{id}`.
 
-#### Webhook Protocol (webhook/)
+#### Webhook Protocol
 
-- **SessionCreatedEvent** - Session created notification (event, session_id, session_type_id, client_id, user_id, tenant_id, timestamp)
-- **SessionCreatedResponse** - Capabilities list (enabled_capabilities)
-- **MessageNewEvent** - New message for processing (event, session_id, message_id, session_metadata, enabled_capabilities, message, history, timestamp)
-- **MessageNewResponse** - Assistant response (message_id, role, parts, metadata) — `parts` is the ordered list of `MessagePartInput` the plugin emits
-- **MessageRecreateEvent** - Recreate request (event, session_id, message_id, enabled_capabilities, history, timestamp)
-- **MessageRecreateResponse** - Recreated response (same as MessageNewResponse)
-- **MessageAbortedEvent** - Streaming cancelled (event, session_id, message_id, partial_content, timestamp)
-- **SessionDeletedEvent** - Session deleted (event, session_id, timestamp)
-- **SessionSummaryEvent** - Summary request (event, session_id, enabled_capabilities, history, summarization_settings, timestamp)
-- **SessionSummaryResponse** - Summary text (summary, metadata)
-- **SessionTypeHealthCheckEvent** - Health check (event, session_type_id, timestamp)
-- **SessionTypeHealthCheckResponse** - Health status (status, version, available_capabilities)
+Defined by the Rust types in `chat-engine-sdk/src/webhook.rs` and `chat-engine-sdk/src/models.rs`; see [WEBHOOK-PROTOCOL.md](WEBHOOK-PROTOCOL.md).
 
-#### Common Types (common/)
+#### Common Types
 
 ##### Session
 
@@ -552,16 +541,6 @@ HTTP Protocol:
 - MessageSendRequest → CapabilityValue: per-message capability settings via enabled_capabilities
 - MessageGetResponse → VariantInfo: includes variant metadata
 - SessionSearchResponse, SessionsSearchResponse → SearchResult/SessionSearchResult: contains results
-
-Webhook Protocol:
-- SessionCreatedEvent → Session: creates
-- SessionCreatedResponse → Capability: returns enabled_capabilities list (typed Capability definitions)
-- MessageNewEvent, MessageRecreateEvent → Message: references
-- MessageNewEvent, MessageRecreateEvent → Session: context
-- MessageNewEvent, MessageRecreateEvent, SessionSummaryEvent → CapabilityValue: per-message capability settings via enabled_capabilities
-- MessageNewResponse, MessageRecreateResponse → MessagePartInput: contains ordered array
-- MessageNewResponse, MessageRecreateResponse → Usage: includes metadata
-- SessionSummaryEvent → SummarizationSettings: includes config
 
 Common Types:
 - Session → SessionType: references via session_type_id
@@ -1604,7 +1583,7 @@ Lightweight URL badges attached to a `text` `message_part` (see `cpt-cf-chat-eng
 |--------|------|-------------|
 | plugin_instance_id | VARCHAR | Plugin instance identifier (composite PK) |
 | session_type_id | UUID FK | References session_types (composite PK) |
-| config | JSONB | Plugin-specific configuration — opaque to Chat Engine, validated by the plugin against its registered GTS schema |
+| config | JSONB | Plugin-specific configuration — opaque to Chat Engine, validated by the plugin itself (GTS schema registration is not implemented) |
 | created_at | TIMESTAMPTZ | Creation timestamp |
 | updated_at | TIMESTAMPTZ | Last modification timestamp |
 
@@ -1976,7 +1955,7 @@ Chat Engine never stores file content. Clients upload directly to File Storage S
 **ID**: `cpt-cf-chat-engine-design-context-security`
 
 <!-- fdd-id-content -->
-Plugin configuration (`plugin_configs.config` JSONB) may contain sensitive data (API keys, service URLs). Chat Engine treats plugin config as opaque and does not interpret its contents. Each plugin validates its own config against its registered GTS schema. Malicious backend plugins can return arbitrary content. Session type creation and plugin configuration should be restricted to admin users only.
+Plugin configuration (`plugin_configs.config` JSONB) may contain sensitive data (API keys, service URLs). Chat Engine treats plugin config as opaque and does not interpret its contents. Each plugin validates its own config. Malicious backend plugins can return arbitrary content. Session type creation and plugin configuration should be restricted to admin users only.
 <!-- fdd-id-content -->
 
 #### Context: Error Response Security Pattern

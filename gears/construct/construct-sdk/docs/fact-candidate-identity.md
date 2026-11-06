@@ -1,6 +1,6 @@
 # Fact candidate identity derivation
 
-This spec gives the exact form of `provenance` and `version` for a record of type `gts.cf.connectors.core.record.v1~cf.construct.enrichment.fact_candidate.v1~`, and the conformance vectors that check it. The type is `FactCandidateV1` in `construct_sdk::gts`, whose generated schema is in `../schemas/`. Where this spec and the candidate schema disagree, the schema wins.
+This spec gives the exact form of `provenance` and `version` for a record of type `gts.cf.connectors.core.record.v1~cf.construct.enrichment.fact_candidate.v1~`, and the conformance vectors that check it. The type is `construct_sdk::gts::FactCandidateV1`, and its declaration there is the source of the schema. Where this spec and the candidate schema disagree, the schema wins.
 
 ## Derivation
 

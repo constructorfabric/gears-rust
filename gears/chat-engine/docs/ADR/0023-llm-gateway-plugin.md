@@ -27,7 +27,7 @@ date: 2026-03-06
 - [Plugin Input: Messages List](#plugin-input-messages-list)
 - [Schema Extensions](#schema-extensions)
   - [Plugin Config & Metadata Schemas](#plugin-config--metadata-schemas)
-  - [Entity Schemas](#entity-schemas)
+  - [Entity Types](#entity-types)
 - [Context Overflow and Summarization](#context-overflow-and-summarization)
   - [Trigger: context_overflow Error](#trigger-context_overflow-error)
   - [Summarization Flow](#summarization-flow)
@@ -72,7 +72,7 @@ Chosen option: "Model Registry + GTS derived schemas", because it keeps capabili
 
 ### Plugin Lifecycle
 
-1. **Startup** — plugin registers GTS derived schemas (`LlmPluginConfig`, `LlmMessageMetadata`, `LlmUsage`) and entity schemas in the GTS schema registry
+1. **Startup** — plugin instance is registered in `ClientHub` under its GTS instance id; its config and metadata types (`LlmPluginConfig`, `LlmMessageMetadata`, `LlmUsage`) are defined in `domain/llm_config.rs`
 2. **Session type configuration** (`on_session_type_configured`) — plugin validates `PluginConfig.config` and returns an empty `Vec<Capability>` — capability resolution is deferred to session creation
 3. **Session creation** (`on_session_created`) — plugin performs two-step capability resolution via **Model Registry**:
    1. Queries Model Registry for the **list of available models** — the registry returns the models list along with the designated default model; builds a `model` capability (`type: "enum"`, `enum_values` from registry, `default_value` from registry's default)
@@ -101,7 +101,7 @@ Chosen option: "Model Registry + GTS derived schemas", because it keeps capabili
 * Good, because capabilities are resolved at session creation time — each session gets a fresh model list and model-specific capabilities from Model Registry
 * Good, because `LlmUsage` provides typed token counts (prompt/completion/cached) without breaking the abstract base `Usage` schema
 * Good, because Chat Engine validates LLM metadata blobs against registered GTS schemas (FR-021)
-* Good, because plugin schema namespace is isolated (`gtx.cf.chat_engine.llm_gateway.*`) — no conflicts with other plugins
+* Good, because the plugin's config and metadata types are isolated in `domain/llm_config.rs` — no conflicts with other plugins
 * Good, because base schemas remain unchanged — non-LLM plugins are unaffected
 * Bad, because plugin depends on Model Registry availability during `on_session_created` — session creation fails if Model Registry is down
 * Bad, because plugin must register GTS schemas at startup before any session type can be created
@@ -232,14 +232,16 @@ The plugin is responsible for deciding which messages to summarize and which to 
 
 ### Plugin Config & Metadata Schemas
 
-**GTS Schema IDs registered by LLM gateway plugin**:
+**Types** (Rust structs in `chat-engine/src/domain/llm_config.rs` are the source of truth; there are no separate JSON schema files, and the plugin config is validated by `validate_plugin_config`):
 
-| Schema | GTS ID | Extension Point |
-|--------|--------|-----------------|
-| `LlmPluginConfig` | `gtx.cf.chat_engine.llm_gateway_plugin_config.v1~` | `PluginConfig.config` |
-| `LlmSummarizationSettings` | `gtx.cf.chat_engine.llm_gateway.summarization_settings.v1~` | nested in `LlmPluginConfig.summarization_settings` |
-| `LlmMessageMetadata` | `gtx.cf.chat_engine.llm_gateway.message_metadata.v1~` | `Message.metadata` |
-| `LlmUsage` | `gtx.cf.chat_engine.llm_gateway.usage.v1~` | nested in `LlmMessageMetadata.usage` |
+| Type | Extension Point |
+|------|-----------------|
+| `LlmPluginConfig` | `PluginConfig.config` |
+| `LlmSummarizationSettings` | nested in `LlmPluginConfig.summarization_settings` |
+| `LlmMessageMetadata` | `Message.metadata` |
+| `LlmUsage` | nested in `LlmMessageMetadata.usage` |
+
+**Plugin instance ID**: the plugin is a GTS instance of `gts.cf.toolkit.plugins.plugin.v1~cf.chat_engine._.backend_plugin.v1~` (`ChatEngineBackendPluginSpecV1` in `chat-engine-sdk`): `gts.cf.toolkit.plugins.plugin.v1~cf.chat_engine._.backend_plugin.v1~cf.chat_engine._.llm_gateway.v1`. This is the value persisted in `session_types.plugin_instance_id` and `plugin_configs.plugin_instance_id`. The earlier `gtx.cf.chat_engine.llm_gateway_plugin.v1~` was not a valid GTS identifier; a data migration rewrites stored values and session-type registration still accepts the old value as an alias.
 
 **`LlmPluginConfig` fields**: `summarization_settings?: LlmSummarizationSettings | null` — context overflow summarization config; null disables summarization
 
@@ -249,19 +251,9 @@ The plugin is responsible for deciding which messages to summarize and which to 
 
 **`LlmUsage` fields**: `prompt_tokens: int`, `completion_tokens: int`, `total_tokens: int`, `cached_tokens?: int`
 
-### Entity Schemas
+### Entity Types
 
-GTS entity schemas registered by LLM gateway plugin (extend base Chat Engine schemas via JSON Schema `allOf`, overriding the `metadata` property where applicable):
-
-| Schema | GTS ID | Extends |
-|--------|--------|---------|
-| `LlmMessage` | `gtx.cf.chat_engine.llm_gateway.message.v1~` | `common/Message` |
-| `LlmMessageGetResponse` | `gtx.cf.chat_engine.llm_gateway.message_get_response.v1~` | `message/MessageGetResponse` |
-| `LlmMessageNewResponse` | `gtx.cf.chat_engine.llm_gateway.message_new_response.v1~` | `webhook/MessageNewResponse` |
-| `LlmMessageRecreateResponse` | `gtx.cf.chat_engine.llm_gateway.message_recreate_response.v1~` | `webhook/MessageRecreateResponse` |
-| `LlmStreamingCompleteEvent` | `gtx.cf.chat_engine.llm_gateway.streaming_complete_event.v1~` | `streaming/StreamingCompleteEvent` |
-| `LlmMessageNewEvent` | `gtx.cf.chat_engine.llm_gateway.message_new_event.v1~` | Plugin input for `on_message` / `on_message_recreate` |
-| `LlmSessionSummaryEvent` | `gtx.cf.chat_engine.llm_gateway.session_summary_event.v1~` | Plugin input for `on_session_summary` |
+The plugin reuses the base Chat Engine message, response and event types unchanged; LLM-specific data travels only in `Message.metadata` (`LlmMessageMetadata`) and `PluginConfig.config` (`LlmPluginConfig`). Per-entity JSON schema extensions (`LlmMessage`, `LlmMessageNewResponse`, ...) are not defined.
 
 ## Context Overflow and Summarization
 

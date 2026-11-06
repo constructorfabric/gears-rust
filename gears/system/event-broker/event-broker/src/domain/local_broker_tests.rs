@@ -3,32 +3,36 @@
 
 use chrono::{DateTime, Utc};
 use serde_json::json;
-use toolkit_gts::gts_id;
+use toolkit_gts::{GtsSchema, gts_id};
 use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
 use event_broker_sdk::api::{IngestOutcome, ProducerMode};
+use event_broker_sdk::gts::EventV1;
 use event_broker_sdk::models::{Event, ProducerMeta};
 use event_broker_sdk::{GtsTypeId, ProducerId};
 
 use crate::test_support::{EventBrokerHarness, StaticTypesRegistry};
 
 const TOPIC: &str = gts_id!("cf.core.events.topic.v1~example.eb.local_broker.orders.v1");
-const EVENT_TYPE: &str = gts_id!("cf.core.events.event.v1~example.eb.local_broker.created.v1~");
+const EVENT_TYPE: &str = <CreatedV1 as GtsSchema>::TYPE_ID;
 const SUBJECT_TYPE: &str = gts_id!("cf.core.events.subject.v1~example.eb.local_broker.order.v1~");
 const TENANT: Uuid = Uuid::from_u128(1);
 
+crate::fixture_event_type!(
+    CreatedV1 = "cf.core.events.event.v1~example.eb.local_broker.created.v1~",
+    topic = TOPIC,
+    subjects = [SUBJECT_TYPE],
+);
+
 async fn harness() -> EventBrokerHarness {
     EventBrokerHarness::builder()
-        .with_type_registry(StaticTypesRegistry::of(json!([
-            { "id": TOPIC, "partitions": 1 },
-            {
-                "id": EVENT_TYPE,
-                "topic": TOPIC,
-                "data_schema": { "type": "object" },
-                "allowed_subject_types": [SUBJECT_TYPE],
-            },
-        ])))
+        .with_type_registry(
+            StaticTypesRegistry::of(json!([
+                { "id": TOPIC, "partitions": 1 },
+            ]))
+            .event_type::<CreatedV1>(),
+        )
         .build()
         .await
 }

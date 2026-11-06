@@ -56,7 +56,7 @@ const TENANT_TYPE_BASE_GTS_ID: &str = gts_id!("cf.core.am.tenant_type.v1~");
 /// Top-level key on the effective trait map carrying the list of
 /// admitted parent GTS identifiers. Defined on
 /// `gts.cf.core.am.tenant_type.v1~`'s `x-gts-traits-schema` — see
-/// `docs/schemas/tenant_type.v1.schema.json`.
+/// `TenantTypeTraits` (`account-management-sdk/src/gts.rs`).
 const ALLOWED_PARENT_TYPES_TRAIT: &str = "allowed_parent_types";
 
 /// Default GTS probe timeout (ms). Keeps a hung registry from stalling

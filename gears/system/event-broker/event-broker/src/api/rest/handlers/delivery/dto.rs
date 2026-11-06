@@ -65,18 +65,25 @@ impl From<ConsumerGroup> for ConsumerGroupDto {
     }
 }
 
-/// Request body for `POST /v1/consumer-groups`
-/// (`docs/schemas/gts.cf.core.events.consumer_group.v1~.schema.json#/definitions/CreateRequest`)
-/// - the whole body is optional (`docs/openapi.yaml`'s `requestBody.required:
-/// false`); `client_agent` is required only once a body is sent at all
+/// Request body for `POST /v1/consumer-groups`. The broker mints the group's id,
+/// so the body carries none. The bounds on `client_agent` and `description` are
+/// the ones `event_broker_sdk::validate` enforces; `dto_tests` checks the two
+/// statements agree. The whole body is optional (the route's request body is not
+/// required); `client_agent` is required only once a body is sent at all
 /// (`create_consumer_group`'s manual body-bytes handling, matching
 /// `ingest::producers::reset_producer`'s established optional-body pattern).
 #[derive(Debug)]
 #[toolkit_macros::api_dto(request)]
 #[serde(deny_unknown_fields)]
 pub struct CreateConsumerGroupRequest {
+    /// RFC 9110 User-Agent grammar; ASCII; 1-256 bytes. Diagnostic hint surfaced
+    /// in operational logs. No broker-side semantic beyond logging.
+    #[schema(min_length = 1, max_length = 256, pattern = r"^[\x20-\x7E]+$")]
     pub client_agent: String,
+    /// Free-text note about the group. Printable ASCII; up to 1024 bytes. An
+    /// empty string is permitted and equivalent to omitting the field.
     #[serde(default)]
+    #[schema(max_length = 1024, pattern = r"^[\x20-\x7E]*$")]
     pub description: Option<String>,
 }
 
@@ -309,15 +316,40 @@ impl From<BarrierModeDto> for BarrierMode {
 #[toolkit_macros::api_dto(request)]
 #[serde(deny_unknown_fields)]
 pub struct InterestDto {
+    /// Full GTS topic identifier. Partition / rebalance / authz unit.
     pub topic: String,
     pub tenant_id: Uuid,
     #[serde(default)]
     pub max_depth: MaxDepthDto,
     #[serde(default)]
     pub barrier_mode: BarrierModeDto,
+    /// GTS event-type patterns, scoped to `topic`. Each must be a valid GTS
+    /// pattern under `gts.cf.core.events.event.v1~`: the base itself, a wildcard
+    /// under it, a derived type, or an instance pattern.
     pub types: Vec<String>,
     #[serde(default)]
     pub filter: Option<FilterSpecDto>,
+}
+
+/// Parses one event-type selector of an interest. It must be a valid GTS
+/// pattern (GTS spec section 10) covered by the event base type, so `gts.*`
+/// and other bases' patterns are rejected.
+fn parse_event_type_selector(selector: &str) -> Result<GtsIdPattern, DomainError> {
+    let bad = |message: String| DomainError::Validation {
+        code: ErrorCode::BadTypePattern,
+        message,
+    };
+    let event_base = <event_broker_sdk::gts::EventV1<()> as gts::GtsSchema>::TYPE_ID;
+    let pattern = GtsIdPattern::try_new(selector)
+        .map_err(|_| bad("event type selector must be a valid GTS pattern".to_owned()))?;
+    let scope = GtsIdPattern::try_new(event_base)
+        .map_err(|_| bad("event type selector scope is not a valid GTS pattern".to_owned()))?;
+    if !scope.covers(&pattern) {
+        return Err(bad(format!(
+            "event type selector must select event types under '{event_base}'"
+        )));
+    }
+    Ok(pattern)
 }
 
 impl TryFrom<InterestDto> for Interest {
@@ -338,12 +370,7 @@ impl TryFrom<InterestDto> for Interest {
         let types = i
             .types
             .iter()
-            .map(|selector| {
-                GtsIdPattern::try_new(selector).map_err(|_| DomainError::Validation {
-                    code: ErrorCode::BadTypePattern,
-                    message: "event type selector must be a valid GTS pattern".to_owned(),
-                })
-            })
+            .map(|selector| parse_event_type_selector(selector))
             .collect::<Result<Vec<_>, DomainError>>()?;
         Ok(Self {
             topic,
@@ -360,7 +387,11 @@ impl TryFrom<InterestDto> for Interest {
 #[toolkit_macros::api_dto(request)]
 #[serde(deny_unknown_fields)]
 pub struct JoinSubscriptionRequest {
+    /// Full GTS consumer-group identifier (anonymous: `~{uuid}`).
     pub consumer_group: String,
+    /// RFC 9110 User-Agent grammar; ASCII; 1-256 bytes. Informational diagnostic
+    /// hint surfaced in operational logs.
+    #[schema(min_length = 1, max_length = 256, pattern = r"^[\x20-\x7E]+$")]
     pub client_agent: String,
     pub interests: Vec<InterestDto>,
     #[serde(default)]

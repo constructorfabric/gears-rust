@@ -37,7 +37,7 @@ decision-makers: Event Broker Team
 
 ## Context and Problem Statement
 
-The current consumer subscription API (`POST /v1/subscriptions`, per `schemas/gts.cf.core.events.subscription.v1~.schema.json`) carries `topics: [string]` and `filters: [string]` as **two parallel arrays**. Three problems with that surface:
+The current consumer subscription API (`POST /v1/subscriptions`, per the former `gts.cf.core.events.subscription.v1~` JSON schema, now the Rust `JoinSubscriptionRequest`) carries `topics: [string]` and `filters: [string]` as **two parallel arrays**. Three problems with that surface:
 
 1. **Parallel arrays with no declared mapping.** The JSON Schema does not specify whether `filters[i]` applies to `topics[i]`, to all of `topics`, or to none. Prose in `features/0002-consumer-subscription-lifecycle.md` is ambiguous; the rolling-deploy scenario (v1 with `(topics=T1, filters=F1)`, v2 with `(T2, F2)`) becomes guess-work as soon as a member subscribes to more than one topic.
 2. **Untyped filter expressions.** `filters[i]` is a bare string, implicitly CEL, with no declared expression language, no engine-extensibility story, no validation contract. Adding a second engine (starlark, rego, jsonpath) would break the wire.
@@ -196,7 +196,7 @@ pub enum FilterError {
 
 ### CEL Engine Filter Context (v1)
 
-The CEL engine binds one variable `event` whose fields are the read-side event (the same `gts.cf.core.events.event.v1~.schema.json` resource consumers receive — `meta` is stripped on read via its `writeOnly` marker; `partition`/`sequence`/`sequence_time` are server-stamped via `readOnly`):
+The CEL engine binds one variable `event` whose fields are the read-side event (the same `gts.cf.core.events.event.v1~` resource consumers receive — `meta` is stripped on read via its `writeOnly` marker; `partition`/`sequence`/`sequence_time` are server-stamped via `readOnly`):
 
 | CEL identifier | Type | Source |
 |---|---|---|
@@ -388,8 +388,8 @@ External references:
 - **Scenario and test coverage**: JOIN shape, interest body, pattern syntax, version resolution, topic / tenant / type authz, filter-engine resolution, expression compilation, per-event delivery, limits, and rolling deploy are covered by repository scenarios and tests.
 - **Related ADRs**:
   - [`0002-partition-selection`](0002-partition-selection.md) — partition derivation; the subscription rebalance still operates on `(topic, partition)`.
-  - [`0003-event-schema`](0003-event-schema.md) — read-side event fields exposed to the CEL filter context (the `gts.cf.core.events.event.v1~.schema.json` resource with `readOnly` fields populated and `writeOnly` `meta` stripped).
+  - [`0003-event-schema`](0003-event-schema.md) — read-side event fields exposed to the CEL filter context (the `gts.cf.core.events.event.v1~` resource with `readOnly` fields populated and `writeOnly` `meta` stripped).
   - [`0004-idempotent-producer-protocol`](0004-idempotent-producer-protocol.md) — `client_agent` field convention on resource-creating endpoints; JOIN reuses the consumer-group's `client_agent` rather than re-declaring per subscription.
 - **Feature doc**: [`docs/features/0002-consumer-subscription-lifecycle.md`](../features/0002-consumer-subscription-lifecycle.md) — CDSL flows, ACs, test plans.
 - **Schemas**:
-  - [`schemas/gts.cf.core.events.subscription.v1~.schema.json`](../schemas/gts.cf.core.events.subscription.v1~.schema.json) — subscription resource (updated for interests[]).
+  - [`dto.rs`](../../event-broker/src/api/rest/handlers/delivery/dto.rs) — `JoinSubscriptionRequest` / `InterestDto`, the subscription request types (interests[]).

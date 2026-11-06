@@ -3,17 +3,16 @@
 //! Compile-time entries reach `types-registry` through the `toolkit-gts`
 //! link-time inventory: the engine plugin specification, the admission
 //! resource type, the shared audit topic instance and the refusal event type,
-//! a derived schema under the broker's event base built by
-//! [`refusal_event_type_schema`].
+//! declared in Rust as [`RefusalEventV1`] under the broker's event base.
 
-use gts::GtsInstanceId;
-use schemars::generate::{Contract, SchemaSettings};
+use gts::{GtsInstanceId, GtsSchema};
 use serde_json::Value;
 use toolkit_gts::{PluginV1, gts_id, gts_instance, gts_type_schema};
+use uuid::Uuid;
 
-use event_broker_sdk::gts::TopicV1;
+use event_broker_sdk::gts::{EventV1, TopicV1};
 
-use crate::models::RefusalEvent;
+use crate::models::{FailureCondition, PolicyReference, RefusalEventCause};
 
 /// Error-family / resource-type identifier of an admission decision: the
 /// resource type of the gear's canonical errors and the subject type of
@@ -25,8 +24,7 @@ pub const AUDIT_TOPIC_ID: &str =
     gts_id!("cf.core.events.topic.v1~cf.core.admission_control.audit.v1");
 
 /// Event type of a [`RefusalEvent`](crate::models::RefusalEvent).
-pub const REFUSAL_EVENT_TYPE: &str =
-    gts_id!("cf.core.events.event.v1~cf.core.admission_control.refusal.v1~");
+pub const REFUSAL_EVENT_TYPE: &str = <RefusalEventV1 as GtsSchema>::TYPE_ID;
 
 /// GTS plugin specification for admission engines selectable by the gate.
 ///
@@ -68,40 +66,63 @@ gts_instance! {
     }
 }
 
-toolkit_gts::inventory::submit! {
-    toolkit_gts::InventoryTypeSchema {
-        type_id: REFUSAL_EVENT_TYPE,
-        schema_fn: || refusal_event_type_schema().to_string(),
-    }
+/// Declaration of the refusal event type under the broker's event base, on
+/// [`AUDIT_TOPIC_ID`] with subject type [`ADMISSION_CONTROL_RESOURCE`]; its
+/// fields are the event's `data` contract.
+///
+/// This struct only declares the schema: a derived GTS struct has no `serde`
+/// impls of its own, and its generated serializer would write an absent optional
+/// as `null`, which the contract (absent, never `null`) refuses. The payload that
+/// is sent is [`RefusalEvent`], whose serialization the declaration is tested
+/// against, so the two cannot drift. Unknown properties are not allowed at any
+/// level, so a field added to the payload must be declared here first.
+#[gts_type_schema(
+    dir_path = "schemas",
+    base = EventV1,
+    type_id = gts_id!("cf.core.events.event.v1~cf.core.admission_control.refusal.v1~"),
+    description = "Admission-control refusal or shadow finding: one event per (operation, policy) pair. Property values are never carried, only names.",
+    properties = "enforcing_gear,action,resource_type,resource_id,subject_id,subject_tenant_id,enforced,cause,condition,policy,property_names",
+    traits = serde_json::json!({
+        "topic": AUDIT_TOPIC_ID,
+        "allowed_subject_types": [ADMISSION_CONTROL_RESOURCE],
+    }),
+)]
+pub struct RefusalEventV1 {
+    /// Calling enforcing gear.
+    pub enforcing_gear: String,
+    /// Action requested.
+    pub action: String,
+    /// GTS type identifier of the target resource.
+    pub resource_type: String,
+    /// Target resource identifier, where the request named one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "Uuid")]
+    pub resource_id: Option<Uuid>,
+    /// Subject, from the security context.
+    pub subject_id: Uuid,
+    /// Subject's tenant, from the security context.
+    pub subject_tenant_id: Uuid,
+    /// `false` for a shadow finding (the operation was not refused by it).
+    pub enforced: bool,
+    /// Refusal cause.
+    pub cause: RefusalEventCause,
+    /// For a could-not-run refusal: the failure condition.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "FailureCondition")]
+    pub condition: Option<FailureCondition>,
+    /// For a policy refusal or shadow finding: the responsible document.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "PolicyReference")]
+    pub policy: Option<PolicyReference>,
+    /// Names of every supplied property (never values).
+    #[serde(default)]
+    pub property_names: Vec<String>,
 }
 
-/// `data` schema of a refusal event, generated from [`RefusalEvent`] as it
-/// serializes, so the schema cannot drift from the payload. Subschemas are
-/// inlined, since the schema is embedded in the event-type document where a
-/// `$ref` to generated definitions would not resolve. Unknown properties are
-/// allowed so fields can be added within a major version.
-#[must_use]
-pub fn refusal_event_data_schema() -> Value {
-    let mut settings = SchemaSettings::draft07();
-    settings.inline_subschemas = true;
-    settings.meta_schema = None;
-    settings.contract = Contract::Serialize;
-    settings
-        .into_generator()
-        .into_root_schema_for::<RefusalEvent>()
-        .to_value()
-}
-
-/// Derived event-type schema of [`REFUSAL_EVENT_TYPE`] on [`AUDIT_TOPIC_ID`],
-/// subject type [`ADMISSION_CONTROL_RESOURCE`].
+/// Derived event-type schema of [`REFUSAL_EVENT_TYPE`], as registered at runtime.
 #[must_use]
 pub fn refusal_event_type_schema() -> Value {
-    event_broker_sdk::gts::derived_event_type_schema(
-        REFUSAL_EVENT_TYPE,
-        AUDIT_TOPIC_ID,
-        refusal_event_data_schema(),
-        &[ADMISSION_CONTROL_RESOURCE],
-    )
+    RefusalEventV1::gts_schema_with_refs()
 }
 
 #[cfg(test)]

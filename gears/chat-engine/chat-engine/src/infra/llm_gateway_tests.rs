@@ -159,10 +159,7 @@ fn valid_config() -> serde_json::Value {
 #[tokio::test]
 async fn plugin_instance_id_matches_adr_constant() {
     let plugin = make_plugin(FakeLlmGatewayClient::default());
-    assert_eq!(
-        plugin.plugin_instance_id(),
-        "gtx.cf.chat_engine.llm_gateway_plugin.v1~",
-    );
+    assert_eq!(plugin.plugin_instance_id(), LLM_GATEWAY_PLUGIN_INSTANCE_ID,);
 }
 
 #[tokio::test]

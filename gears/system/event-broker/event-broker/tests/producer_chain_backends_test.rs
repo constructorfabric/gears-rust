@@ -24,6 +24,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use event_broker::test_support::{EventBrokerHarness, Json, PausePoint, StaticTypesRegistry};
+use event_broker_sdk::gts::EventV1;
 use serde_json::json;
 
 use support::matrix::{Engine, Matrix};
@@ -33,6 +34,13 @@ const TOPIC: &str = "gts.cf.core.events.topic.v1~x.eb.chain.orders.v1";
 const EVENT_TYPE: &str = "gts.cf.core.events.event.v1~x.eb.chain.placed.v1~";
 const SUBJECT_TYPE: &str = "gts.x.eb.chain.order.v1~";
 
+event_broker::fixture_event_type!(
+    /// Any object payload: an open type with no declared members.
+    PlacedV1 = "cf.core.events.event.v1~x.eb.chain.placed.v1~",
+    topic = TOPIC,
+    subjects = [SUBJECT_TYPE],
+);
+
 /// Concurrent copies of one chain step.
 const COPIES: usize = 8;
 /// Chain steps in the head-monotonicity run.
@@ -41,14 +49,12 @@ const STEPS: u32 = 200;
 async fn harness(matrix: &Matrix) -> Arc<EventBrokerHarness> {
     Arc::new(
         EventBrokerHarness::builder()
-            .with_type_registry(StaticTypesRegistry::of(json!([
+            .with_type_registry(
+                StaticTypesRegistry::of(json!([
                 { "id": TOPIC, "partitions": 1 },
-                {
-                    "id": EVENT_TYPE,
-                    "topic": TOPIC,
-                    "allowed_subject_types": [SUBJECT_TYPE],
-                },
-            ])))
+                 ]))
+                .event_type::<PlacedV1>(),
+            )
             .with_gear_db(matrix.gear_db())
             .with_backend(matrix.backend().await)
             .build()

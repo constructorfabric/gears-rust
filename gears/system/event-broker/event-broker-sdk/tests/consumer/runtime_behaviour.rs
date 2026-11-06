@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use chrono::Utc;
 use event_broker::test_support::{EventBrokerHarness, StaticTypesRegistry};
+use event_broker_sdk::gts::EventV1;
 use event_broker_sdk::{
     BatchHandlerOutcome, ConnectionDropReason, ConsumerBuffering, ConsumerBuilder,
     ConsumerCommitMode, ConsumerGroupRef, ConsumerListenerSettings, ConsumerRuntimeEvent,
@@ -16,10 +17,11 @@ use event_broker_sdk::{
     Sequence, SlowConsumerTrigger, gts_id,
 };
 use serde_json::{Value, json};
+use toolkit_gts::GtsSchema;
 use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
-use super::common::{SHOWCASE_SUBJECT_TYPE, topic};
+use super::common::{SHOWCASE_SUBJECT_TYPE, showcase_event_type, topic};
 use super::doubles::{
     AckAllBatchHandler, FailingRuntimeListener, FailingThenCommitBatchHandler,
     RecordingCommitOffsetManager, RecordingRuntimeListener, RuntimeEventKind,
@@ -29,17 +31,12 @@ use super::doubles::{
 
 /// A harness with a 10ms heartbeat, so slow-detection and idle cadence run fast
 /// instead of waiting out the production 1s tick.
-async fn fast_harness(topic_id: &str, event_type: &str, partitions: u32) -> EventBrokerHarness {
+async fn fast_harness<T: GtsSchema>(topic_id: &str, partitions: u32) -> EventBrokerHarness {
     EventBrokerHarness::builder()
-        .with_type_registry(StaticTypesRegistry::of(json!([
-            { "id": topic_id, "partitions": partitions },
-            {
-                "id": event_type,
-                "topic": topic_id,
-                "allowed_subject_types": [SHOWCASE_SUBJECT_TYPE],
-                "data_schema": { "type": "object" },
-            },
-        ])))
+        .with_type_registry(
+            StaticTypesRegistry::of(json!([{ "id": topic_id, "partitions": partitions }]))
+                .event_type::<T>(),
+        )
         .with_heartbeat(Duration::from_millis(10))
         .build()
         .await
@@ -102,9 +99,15 @@ async fn wait_for_runtime_event_kinds(
 #[tokio::test]
 async fn slow_detection_emits_listener_events_and_drops_subscription_stream() {
     const TOPIC: &str = gts_id!("cf.core.events.topic.v1~example.mock.showcase.slow.v1");
-    const EVENT_TYPE: &str = gts_id!("cf.core.events.event.v1~example.mock.showcase.slow.v1~");
+    showcase_event_type!(
+        EVENT_TYPE,
+        SlowEventV1,
+        "cf.core.events.event.v1~example.mock.showcase.slow.v1~",
+        TOPIC,
+        "/tenant_id"
+    );
 
-    let fx = fast_harness(TOPIC, EVENT_TYPE, 1).await;
+    let fx = fast_harness::<SlowEventV1>(TOPIC, 1).await;
     let broker = fx.broker();
     let ctx = SecurityContext::anonymous();
     let listener = RecordingRuntimeListener::default();
@@ -210,10 +213,15 @@ async fn slow_detection_emits_listener_events_and_drops_subscription_stream() {
 #[tokio::test]
 async fn runtime_listener_observes_representative_non_dlq_event_variants() {
     const TOPIC: &str = gts_id!("cf.core.events.topic.v1~example.mock.showcase.listenerall.v1");
-    const EVENT_TYPE: &str =
-        gts_id!("cf.core.events.event.v1~example.mock.showcase.listenerall.v1~");
+    showcase_event_type!(
+        EVENT_TYPE,
+        ListenerallEventV1,
+        "cf.core.events.event.v1~example.mock.showcase.listenerall.v1~",
+        TOPIC,
+        "/tenant_id"
+    );
 
-    let fx = fast_harness(TOPIC, EVENT_TYPE, 1).await;
+    let fx = fast_harness::<ListenerallEventV1>(TOPIC, 1).await;
     let broker = fx.broker();
     let ctx = SecurityContext::anonymous();
     let listener = RecordingRuntimeListener::default();
@@ -287,10 +295,15 @@ async fn runtime_listener_observes_representative_non_dlq_event_variants() {
 #[tokio::test]
 async fn listener_failure_does_not_commit_drop_or_stop_consumer_events() {
     const TOPIC: &str = gts_id!("cf.core.events.topic.v1~example.mock.showcase.listenerfail.v1");
-    const EVENT_TYPE: &str =
-        gts_id!("cf.core.events.event.v1~example.mock.showcase.listenerfail.v1~");
+    showcase_event_type!(
+        EVENT_TYPE,
+        ListenerfailEventV1,
+        "cf.core.events.event.v1~example.mock.showcase.listenerfail.v1~",
+        TOPIC,
+        "/tenant_id"
+    );
 
-    let fx = fast_harness(TOPIC, EVENT_TYPE, 1).await;
+    let fx = fast_harness::<ListenerfailEventV1>(TOPIC, 1).await;
     let broker = fx.broker();
     let ctx = SecurityContext::anonymous();
     let recorder = RecordingRuntimeListener::default();
@@ -387,10 +400,15 @@ async fn listener_failure_does_not_commit_drop_or_stop_consumer_events() {
 #[tokio::test]
 async fn slow_listener_timeout_does_not_block_runtime_delivery_or_handler_processing() {
     const TOPIC: &str = gts_id!("cf.core.events.topic.v1~example.mock.showcase.listenerto.v1");
-    const EVENT_TYPE: &str =
-        gts_id!("cf.core.events.event.v1~example.mock.showcase.listenerto.v1~");
+    showcase_event_type!(
+        EVENT_TYPE,
+        ListenertoEventV1,
+        "cf.core.events.event.v1~example.mock.showcase.listenerto.v1~",
+        TOPIC,
+        "/tenant_id"
+    );
 
-    let fx = fast_harness(TOPIC, EVENT_TYPE, 1).await;
+    let fx = fast_harness::<ListenertoEventV1>(TOPIC, 1).await;
     let broker = fx.broker();
     let ctx = SecurityContext::anonymous();
     let recorder = RecordingRuntimeListener::default();
@@ -471,9 +489,15 @@ async fn slow_listener_timeout_does_not_block_runtime_delivery_or_handler_proces
 #[tokio::test]
 async fn handler_latency_strikes_emit_listener_events_and_drop_subscription_stream() {
     const TOPIC: &str = gts_id!("cf.core.events.topic.v1~example.mock.showcase.latency.v1");
-    const EVENT_TYPE: &str = gts_id!("cf.core.events.event.v1~example.mock.showcase.latency.v1~");
+    showcase_event_type!(
+        EVENT_TYPE,
+        LatencyEventV1,
+        "cf.core.events.event.v1~example.mock.showcase.latency.v1~",
+        TOPIC,
+        "/tenant_id"
+    );
 
-    let fx = fast_harness(TOPIC, EVENT_TYPE, 1).await;
+    let fx = fast_harness::<LatencyEventV1>(TOPIC, 1).await;
     let broker = fx.broker();
     let ctx = SecurityContext::anonymous();
     let listener = RecordingRuntimeListener::default();
@@ -585,9 +609,15 @@ async fn handler_latency_strikes_emit_listener_events_and_drop_subscription_stre
 #[tokio::test]
 async fn slow_drop_reports_other_assignments_owned_by_same_subscription_slot() {
     const TOPIC: &str = gts_id!("cf.core.events.topic.v1~example.mock.showcase.affected.v1");
-    const EVENT_TYPE: &str = gts_id!("cf.core.events.event.v1~example.mock.showcase.affected.v1~");
+    showcase_event_type!(
+        EVENT_TYPE,
+        AffectedEventV1,
+        "cf.core.events.event.v1~example.mock.showcase.affected.v1~",
+        TOPIC,
+        "/tenant_id"
+    );
 
-    let fx = fast_harness(TOPIC, EVENT_TYPE, 2).await;
+    let fx = fast_harness::<AffectedEventV1>(TOPIC, 2).await;
     let broker = fx.broker();
     let ctx = SecurityContext::anonymous();
     let listener = RecordingRuntimeListener::default();
@@ -679,10 +709,15 @@ async fn wait_for_slow_drop_affected_assignments(
 #[tokio::test]
 async fn slow_drop_drains_buffer_before_rejoin_load_position() {
     const TOPIC: &str = gts_id!("cf.core.events.topic.v1~example.mock.showcase.drainrejoin.v1");
-    const EVENT_TYPE: &str =
-        gts_id!("cf.core.events.event.v1~example.mock.showcase.drainrejoin.v1~");
+    showcase_event_type!(
+        EVENT_TYPE,
+        DrainrejoinEventV1,
+        "cf.core.events.event.v1~example.mock.showcase.drainrejoin.v1~",
+        TOPIC,
+        "/tenant_id"
+    );
 
-    let fx = fast_harness(TOPIC, EVENT_TYPE, 1).await;
+    let fx = fast_harness::<DrainrejoinEventV1>(TOPIC, 1).await;
     let broker = fx.broker();
     let ctx = SecurityContext::anonymous();
     let timeline: SharedTimeline = Arc::new(Mutex::new(Vec::new()));
@@ -781,9 +816,15 @@ async fn parallelism_creates_independent_slots_with_shared_group_and_interests()
     use std::collections::BTreeMap;
 
     const TOPIC: &str = gts_id!("cf.core.events.topic.v1~example.mock.showcase.parallel.v1");
-    const EVENT_TYPE: &str = gts_id!("cf.core.events.event.v1~example.mock.showcase.parallel.v1~");
+    showcase_event_type!(
+        EVENT_TYPE,
+        ParallelEventV1,
+        "cf.core.events.event.v1~example.mock.showcase.parallel.v1~",
+        TOPIC,
+        "/tenant_id"
+    );
 
-    let fx = fast_harness(TOPIC, EVENT_TYPE, 4).await;
+    let fx = fast_harness::<ParallelEventV1>(TOPIC, 4).await;
     let broker = fx.broker();
     let listener = RecordingRuntimeListener::default();
     let recorded = listener.events.clone();

@@ -12,6 +12,7 @@ use crate::test_support::{authed_ctx, flat_in_enforcer, resolved_usage_types, te
 use axum::{Router, body::Body, http::Request};
 use event_broker::test_support::{EventBrokerHarness, StaticTypesRegistry};
 use event_broker_sdk::backend::{Partition, TopicPartition, Wait};
+use event_broker_sdk::gts::EventV1;
 use event_broker_sdk::{GtsInstanceId, Sequence, api::EventBrokerApi};
 use serde_json::{Value, json};
 use std::{collections::BTreeSet, time::Duration};
@@ -30,6 +31,47 @@ const AT_ONCE: Duration = Duration::from_secs(5);
 /// How long nothing may move after a rolled-back transaction.
 const QUIET: Duration = Duration::from_secs(2);
 
+// Fixture event types over any object payload: the broker is what these tests exercise, not the
+// payloads. The ids repeat the `TypedEvent` constants, and a publish under a mismatched id fails at
+// the broker.
+
+event_broker::fixture_event_type!(
+    SkuPublishedTypeV1 = "cf.core.events.event.v1~cf.bss.products.sku_published.v1~",
+    topic = TOPIC,
+    subjects = [toolkit_gts::gts_id!(
+        "cf.core.events.subject.v1~cf.bss.products.sku.v1~"
+    )],
+);
+event_broker::fixture_event_type!(
+    SkuChangedTypeV1 = "cf.core.events.event.v1~cf.bss.products.sku_changed.v1~",
+    topic = TOPIC,
+    subjects = [toolkit_gts::gts_id!(
+        "cf.core.events.subject.v1~cf.bss.products.sku.v1~"
+    )],
+);
+event_broker::fixture_event_type!(
+    SkuRetiredTypeV1 = "cf.core.events.event.v1~cf.bss.products.sku_retired.v1~",
+    topic = TOPIC,
+    subjects = [toolkit_gts::gts_id!(
+        "cf.core.events.subject.v1~cf.bss.products.sku.v1~"
+    )],
+);
+event_broker::fixture_event_type!(
+    ApprovalUnitDecidedTypeV1 = "cf.core.events.event.v1~cf.bss.products.approval_unit_decided.v1~",
+    topic = TOPIC,
+    subjects = [toolkit_gts::gts_id!(
+        "cf.core.events.subject.v1~cf.bss.products.approval_unit.v1~"
+    )],
+);
+event_broker::fixture_event_type!(
+    ReferenceForceReleasedTypeV1 =
+        "cf.core.events.event.v1~cf.bss.products.reference_force_released.v1~",
+    topic = TOPIC,
+    subjects = [toolkit_gts::gts_id!(
+        "cf.core.events.subject.v1~cf.bss.products.sku.v1~"
+    )],
+);
+
 /// A products state over a database with four connections (the door fixtures pin one), bound to
 /// a real broker that knows every products event type: the outbox's sequencer then reads on a
 /// connection of its own while a transaction is still open, as it does in a deployment. The
@@ -41,23 +83,15 @@ async fn bound() -> (
     event_broker_sdk::ProducerOutboxHandle,
     EventBrokerHarness,
 ) {
-    let mut spec = vec![json!({"id": TOPIC, "partitions": PARTITIONS})];
-    for (type_id, subject) in [
-        (SkuPublished::TYPE_ID, SKU_SUBJECT_TYPE),
-        (SkuChanged::TYPE_ID, SKU_SUBJECT_TYPE),
-        (SkuRetired::TYPE_ID, SKU_SUBJECT_TYPE),
-        (ApprovalUnitDecided::TYPE_ID, APPROVAL_UNIT_SUBJECT_TYPE),
-        (ReferenceForceReleased::TYPE_ID, SKU_SUBJECT_TYPE),
-    ] {
-        spec.push(json!({
-            "id": type_id,
-            "topic": TOPIC,
-            "data_schema": {"type": "object"},
-            "allowed_subject_types": [subject],
-        }));
-    }
     let broker = EventBrokerHarness::builder()
-        .with_type_registry(StaticTypesRegistry::of(Value::Array(spec)))
+        .with_type_registry(
+            StaticTypesRegistry::of(json!([{"id": TOPIC, "partitions": PARTITIONS}]))
+                .event_type::<SkuPublishedTypeV1>()
+                .event_type::<SkuChangedTypeV1>()
+                .event_type::<SkuRetiredTypeV1>()
+                .event_type::<ApprovalUnitDecidedTypeV1>()
+                .event_type::<ReferenceForceReleasedTypeV1>(),
+        )
         .build()
         .await;
     let (db, _, tenant, dsn) = test_db_with(4).await;

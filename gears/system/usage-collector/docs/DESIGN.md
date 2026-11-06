@@ -495,8 +495,6 @@ a vendor-specific dependency requires a Plugin SPI major-version revision.
 - wire shapes — [`usage-collector-v2.yaml`](usage-collector-v2.yaml)
 - GTS base type every meter derives from —
   [`schemas/usage_record.v2.schema.json`](schemas/usage_record.v2.schema.json)
-- worked derivation —
-  [`schemas/example.stored_volume.v1.schema.json`](schemas/example.stored_volume.v1.schema.json)
 
 #### Modeling conventions
 

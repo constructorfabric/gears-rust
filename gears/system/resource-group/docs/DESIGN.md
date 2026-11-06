@@ -491,7 +491,8 @@ Base path: `/api/resource-group/v1` (groups, memberships), `/api/types-registry/
 | GET | resource-group | `/groups/{group_id}` | `getGroup` | Get group by ID |
 | PUT | resource-group | `/groups/{group_id}` | `updateGroup` | Full replace of group (including parent move) |
 | DELETE | resource-group | `/groups/{group_id}` | `deleteGroup` | Delete group (optional `?force=true`) |
-| GET | resource-group | `/groups/{group_id}/hierarchy` | `listGroupHierarchy` | Traverse hierarchy from reference group with relative depth |
+| GET | resource-group | `/groups/{group_id}/descendants` | `listGroupDescendants` | Descendants of the reference group (relative depth >= 0) |
+| GET | resource-group | `/groups/{group_id}/ancestors` | `listGroupAncestors` | Ancestors of the reference group (relative depth <= 0) |
 | GET | resource-group | `/memberships` | `listMemberships` | List memberships with OData query |
 | POST | resource-group | `/memberships/{group_id}/{resource_type}/{resource_id}` | `addMembership` | Add membership |
 | DELETE | resource-group | `/memberships/{group_id}/{resource_type}/{resource_id}` | `deleteMembership` | Remove membership |
@@ -502,10 +503,13 @@ Query support on all list endpoints:
 - `limit` — page size (1..200, default 25)
 - `cursor` — opaque token from previous response for next/previous page
 - Ordering is undefined but consistent — no `$orderby`
+- Changing `$filter` while reusing an existing `cursor` is rejected with `400`
+
+**REST contract source of truth**: there is no hand-written OpenAPI file. The contract is what the code declares: the `OperationBuilder` routes in `resource-group/src/api/rest/routes/{types,groups,memberships}.rs`, the DTOs in `resource-group/src/api/rest/dto.rs`, and the generated spec (`/openapi.json`, aggregated in `docs/api/api.json`). `DELETE /groups/{group_id}` without `?force=true` returns `409` when the group has children or memberships; with `force=true` it cascades over the subtree and its memberships. Type `PUT` is a full replacement; type delete returns `409` while groups still use the type.
 
 Group list (`listGroups`) `$filter` fields: `type` (eq, ne, in), `hierarchy/parent_id` (eq, ne, in — direct parent only, depth=1; for ancestor traversal use `listGroupHierarchy`), `tenant_id` (eq, ne, in — narrows the AuthZ-scoped result to a specific tenant; cannot widen access), `id` (eq, ne, in), `name` (eq, ne, in).
 
-Group depth (`listGroupHierarchy`) `$filter` fields: `hierarchy/depth` (eq, ne, gt, ge, lt, le), `type` (eq, ne, in).
+Group depth (`listGroupDescendants` / `listGroupAncestors`) `$filter` fields: `hierarchy/depth` (eq, ne, gt, ge, lt, le), `type` (eq, ne, in).
 
 Membership list `$filter` fields: `resource_id` (eq, ne, in), `resource_type` (eq, ne, in), `group_id` (eq, ne, in).
 
@@ -638,7 +642,7 @@ tenant T9 (99999999-9999-9999-9999-999999999999)
 
 Client initialization: AuthZ plugin resolves `dyn ResourceGroupReadHierarchy` from ClientHub (hierarchy only); general consumers resolve `dyn ResourceGroupClient` (full CRUD). Both build `SecurityContext` with `subject_id` + `subject_tenant_id` for tenant-scoped operations.
 
-**Integration read examples** — see [openapi.yaml](./openapi.yaml) for full request/response examples with realistic data.
+**Integration read examples** — request/response shapes are defined by the DTOs in `resource-group/src/api/rest/dto.rs` (see `docs/api/api.json`); the data shape above is the worked example.
 
 - `list_group_depth(ctx, D2, filter="hierarchy/depth ge 0")` — returns descendants: D2 at depth 0, B3 at depth 1.
 - `list_group_depth(ctx, B3, filter="hierarchy/depth ge -10 and hierarchy/depth le 0")` — returns ancestor chain: T1 at depth -2, D2 at depth -1, B3 at depth 0.

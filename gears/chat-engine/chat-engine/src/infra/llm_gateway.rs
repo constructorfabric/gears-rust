@@ -72,7 +72,8 @@ use crate::domain::llm_config::{
 
 /// Stable GTS plugin instance ID per ADR-0023. Renaming is a breaking
 /// change — clients persist the ID in `plugin_configs.plugin_instance_id`.
-pub const LLM_GATEWAY_PLUGIN_INSTANCE_ID: &str = "gtx.cf.chat_engine.llm_gateway_plugin.v1~";
+pub const LLM_GATEWAY_PLUGIN_INSTANCE_ID: &str =
+    chat_engine_sdk::gts::LLM_GATEWAY_PLUGIN_INSTANCE_ID;
 
 /// Capability ID for the model selector capability (enum).
 pub const CAPABILITY_MODEL: &str = "model";

@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use event_broker::test_support::StaticTypesRegistry;
+use event_broker_sdk::gts::EventV1;
 use event_broker_sdk::gts_id;
 use event_broker_sdk::{
     BatchHandlerOutcome, CommitOffset, ConnectionDropReason, ConsumerBuffering, ConsumerBuilder,
@@ -13,12 +14,22 @@ use event_broker_sdk::{
 };
 use serde_json::json;
 
-use super::common::{SHOWCASE_SUBJECT_TYPE, TopicFixture, publish_json, topic, wait_until};
+use super::common::{TopicFixture, publish_json, showcase_event_type, topic, wait_until};
 
 const SLOW_TOPIC: &str = gts_id!("cf.core.events.topic.v1~example.mock.showcase.slow.v1");
-const SLOW_EVENT_TYPE: &str = gts_id!("cf.core.events.event.v1~example.mock.showcase.slow.v1~");
+showcase_event_type!(
+    SLOW_EVENT_TYPE,
+    SlowEventV1,
+    "cf.core.events.event.v1~example.mock.showcase.slow.v1~",
+    SLOW_TOPIC
+);
 const FAST_TOPIC: &str = gts_id!("cf.core.events.topic.v1~example.mock.showcase.fast.v1");
-const FAST_EVENT_TYPE: &str = gts_id!("cf.core.events.event.v1~example.mock.showcase.fast.v1~");
+showcase_event_type!(
+    FAST_EVENT_TYPE,
+    FastEventV1,
+    "cf.core.events.event.v1~example.mock.showcase.fast.v1~",
+    FAST_TOPIC
+);
 
 #[derive(Clone, Default)]
 struct RecordingRuntimeListener {
@@ -106,12 +117,14 @@ impl ConsumerHandler for RecordingBatchHandler {
 }
 
 async fn broker_with_slow_and_fast_topics() -> TopicFixture {
-    super::common::fixture_from_catalog(StaticTypesRegistry::of(json!([
-        { "id": SLOW_TOPIC, "partitions": 2 },
-        { "id": SLOW_EVENT_TYPE, "topic": SLOW_TOPIC, "data_schema": { "type": "object" }, "allowed_subject_types": [SHOWCASE_SUBJECT_TYPE], "partition_key": "/source" },
-        { "id": FAST_TOPIC, "partitions": 1 },
-        { "id": FAST_EVENT_TYPE, "topic": FAST_TOPIC, "data_schema": { "type": "object" }, "allowed_subject_types": [SHOWCASE_SUBJECT_TYPE], "partition_key": "/source" },
-    ])))
+    super::common::fixture_from_catalog(
+        StaticTypesRegistry::of(json!([
+            { "id": SLOW_TOPIC, "partitions": 2 },
+            { "id": FAST_TOPIC, "partitions": 1 },
+        ]))
+        .event_type::<SlowEventV1>()
+        .event_type::<FastEventV1>(),
+    )
     .await
 }
 

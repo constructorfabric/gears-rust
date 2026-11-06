@@ -43,9 +43,8 @@ pub const TENANT_METADATA_RESOURCE_TYPE: &str = gts_id!("cf.core.am.tenant_metad
 pub const CONVERSION_REQUEST_RESOURCE_TYPE: &str = gts_id!("cf.core.am.conversion_request.v1~");
 
 /// AM `IdpUser` resource projection. Mirror of the
-/// `gts.cf.core.am.user.v1~` JSON Schema declared in
-/// `gears/system/account-management/docs/schemas/user.v1.schema.json`
-/// and produced by [`crate::IdpUser`]. Surfaces as the `resource_type`
+/// `gts.cf.core.am.user.v1~` schema declared by [`UserV1`]
+/// (the source of truth) and produced by [`crate::IdpUser`]. Surfaces as the `resource_type`
 /// on user-scoped canonical errors raised by the user-operations
 /// feature (`feature-idp-user-operations-contract`).
 pub const USER_RESOURCE_TYPE: &str = gts_id!("cf.core.am.user.v1~");
@@ -139,8 +138,8 @@ pub const USER_RG_TYPE_CODE: &str = gts_id!("cf.core.rg.type.v1~cf.core.am.user.
 //   * `conversion_request.v1~` -- registered via [`ConversionRequestV1`] below.
 //
 // Not on the registration list (no vendor-derived extensions planned):
-//   * `user_group.v1~` -- no consumer (the SDK constant was removed in
-//     this PR); the JSON file may be deletable separately.
+//   * `user_group.v1~` -- no consumer (the SDK constant was removed);
+//     the RG type is built in Rust by `register_user_group_types`.
 
 // ---------------------------------------------------------------------------
 // AM resource type schema mirrors
@@ -165,7 +164,7 @@ use toolkit_gts::{GtsTraitsSchema, gts_id, gts_type_schema};
 /// `ServiceUnavailable` and `create_user` is unavailable until the
 /// catalog is seeded.
 ///
-/// Field shape mirrors `docs/schemas/user.v1.schema.json` for
+/// Field shape mirrors the `UserV1` schema for
 /// `username` / `email` / `display_name` — the fields AM actually
 /// validates on the create-user payload. The `id` field is typed
 /// [`gts::GtsInstanceId`] only because `gts-macros` requires base
@@ -282,7 +281,7 @@ pub struct IdpPluginSpecV1;
 /// [`account-management::domain::gts_validation::validate_tenant_name_via_gts`]
 /// validates the tenant `name` against this schema's `properties.name` on
 /// every `create_tenant` — it is fail-closed, so a missing `name` property
-/// surfaces as Internal/500. Bounds mirror `docs/schemas/tenant.v1.schema.json`
+/// surfaces as Internal/500. Bounds mirror the `TenantV1` schema
 /// (and the DB `CHECK (length(name) BETWEEN 1 AND 255)`); guarded by
 /// `tenant_schema_constraints_tests`.
 #[gts_type_schema(
@@ -346,13 +345,12 @@ pub struct ConversionRequestV1 {
 // Behavioural traits for `gts.cf.core.am.tenant_type.v1~` — emitted as
 // the envelope's `x-gts-traits-schema`. NOTE: a `///` doc comment here
 // would surface as a `description` on the emitted `x-gts-traits-schema`
-// object (which the documented contract omits), so this stays a plain
+// object (which the contract omits), so this stays a plain
 // `//` comment. Field `///` docs ARE wanted — they become the per-trait
 // `description`; `#[serde(default)]` yields the `default` keyword and
 // drops the trait from `required`.
-// Field docs are verbatim copies of the documented `docs/schemas/` trait
-// contract (the drift guard asserts byte-equality), so they are prose,
-// not rustdoc — suppress the markdown-backtick lint.
+// Field docs are prose, not rustdoc — the markdown-backtick lint is
+// suppressed below.
 // A single `allowed_parent_types` entry: the GTS type identifier of a
 // tenant type permitted as parent. The `x-gts-type-ref` extension makes the
 // gts store validate each value is a `tenant_type.v1~`-derived type id
@@ -394,13 +392,6 @@ pub struct TenantTypeTraits {
     description = "Base tenant type schema for Account Management. Derived tenant type schemas resolve behavioral traits via x-gts-traits. Traits configure system behavior for processing tenants of each type - they are not part of the tenant instance data model.",
     properties = "id,payload",
     traits_schema = inline(TenantTypeTraits),
-    // Inline-only `x-gts-traits` defaults (not in docs/schemas). gts's
-    // OP#13 `validate_entity_traits` rejects an `x-gts-traits-schema` with
-    // no values in the chain — even for abstract types — so the abstract
-    // base MUST carry defaults or types-registry ready-commit fails and the
-    // server cannot boot. Mirrors the trait-schema `default`s; guarded by
-    // `sync_tests::tenant_type_envelope_trait_contract_matches_docs`.
-    traits = serde_json::json!({ "allowed_parent_types": [], "idp_provisioning": false }),
     gts_abstract = true
 )]
 #[schemars(extend("required" = ["payload"]))]
@@ -423,7 +414,7 @@ pub struct TenantTypeEnvelopeV1<P> {
 // tenant hierarchy. Serialises snake_case to match the wire tokens read
 // by `metadata_schema_registry`. NOTE: variant `///` docs would make
 // schemars emit a `oneOf` of `const` subschemas instead of the flat
-// `enum: ["override_only", "inherit"]` the documented contract uses, so
+// `enum: ["override_only", "inherit"]` the contract uses, so
 // the variants are left undocumented here.
 // Variants exist for schema generation (`enum` values); only `OverrideOnly`
 // is constructed in Rust (via `Default`).
@@ -460,10 +451,6 @@ pub struct TenantMetadataTraits {
     description = "Base tenant metadata schema for Account Management. Derived metadata schemas resolve behavioral traits via x-gts-traits. Traits configure how MetadataService treats entries of each schema - they are not part of the metadata payload.",
     properties = "id,payload",
     traits_schema = inline(TenantMetadataTraits),
-    // Inline-only `x-gts-traits` default — see `TenantTypeEnvelopeV1` for
-    // the OP#13 rationale. Guarded by
-    // `sync_tests::tenant_metadata_envelope_trait_contract_matches_docs`.
-    traits = serde_json::json!({ "inheritance_policy": "override_only" }),
     gts_abstract = true
 )]
 #[schemars(extend("required" = ["payload"]))]
@@ -524,7 +511,7 @@ mod user_schema_constraints_tests {
     //! reaches the Types Registry at boot and that
     //! `account-management::domain::gts_validation::validate_new_user_payload_via_gts`
     //! enforces fail-closed — MUST carry the `minLength` / `maxLength` /
-    //! `format` constraints documented in `docs/schemas/user.v1.schema.json`.
+    //! `format` constraints declared by `UserV1`.
     //! Until <https://github.com/GlobalTypeSystem/gts-rust/issues/86> was
     //! understood these were silently dropped; schemars field helpers on
     //! `UserV1` now forward them verbatim through `schemars::schema_for!`.
@@ -629,7 +616,7 @@ mod tenant_schema_constraints_tests {
     //! `gts.cf.core.am.tenant.v1~`) is the type
     //! `account-management::domain::gts_validation::validate_tenant_name_via_gts`
     //! validates the tenant `name` against. It MUST declare `name` with the
-    //! `minLength`/`maxLength` bounds from `docs/schemas/tenant.v1.schema.json`.
+    //! `minLength`/`maxLength` bounds from `TenantV1`.
     //! If `name` is absent, the fail-closed validator returns Internal/500 on
     //! every `create_tenant` ("schema does not declare property `name`").
 
@@ -666,129 +653,5 @@ mod tenant_schema_constraints_tests {
 }
 
 #[cfg(test)]
-mod sync_tests {
-    //! Drift guard: the macro-generated envelope's root data shape and trait
-    //! contract MUST agree with `docs/schemas/<name>.v1.schema.json`. Runtime-only
-    //! trait defaults are asserted separately because the published schemas do
-    //! not carry `x-gts-traits`.
-
-    use std::fs;
-    use std::path::PathBuf;
-
-    use gts::schema_traits::X_GTS_TRAITS_SCHEMA;
-    use gts::{GtsSchema, X_GTS_TYPE_REF};
-    use serde_json::Value;
-
-    use super::{TenantMetadataEnvelopeV1, TenantTypeEnvelopeV1};
-
-    fn read_disk_schema(file_name: &str) -> Value {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("..")
-            .join("docs")
-            .join("schemas")
-            .join(file_name);
-        let body = fs::read_to_string(&path)
-            .unwrap_or_else(|err| panic!("read {}: {err}", path.display()));
-        serde_json::from_str(&body)
-            .unwrap_or_else(|err| panic!("parse {} as JSON: {err}", path.display()))
-    }
-
-    /// Assert the macro-generated `x-gts-traits-schema` equals the
-    /// documented one, that the envelope is marked abstract, and that it
-    /// declares the `x-gts-traits` **default values** required for gts's
-    /// OP#13 entity-trait completeness check.
-    ///
-    /// `gts::store::validate_entity_traits` (run for every schema at
-    /// types-registry ready-commit) rejects any chain that declares an
-    /// `x-gts-traits-schema` without supplying matching `x-gts-traits`
-    /// values — and, unlike `validate_schema_traits`, it does NOT exempt
-    /// abstract types. So the abstract base MUST still carry default trait
-    /// values or the whole types-registry post-init fails (server cannot
-    /// boot). These defaults are inline-only — they are intentionally not
-    /// part of `docs/schemas/*.json`, matching the pre-macro envelope
-    /// registration — so they are asserted separately from the disk diff.
-    fn assert_trait_contract(
-        generated: &Value,
-        disk: &Value,
-        type_id: &str,
-        expected_traits: &Value,
-    ) {
-        assert_eq!(
-            generated.get("x-gts-traits-schema"),
-            disk.get("x-gts-traits-schema"),
-            "macro x-gts-traits-schema for {type_id} drifted from docs/schemas/ -- \
-             re-sync the trait struct with the documented trait contract",
-        );
-        assert_eq!(
-            generated.get("x-gts-abstract"),
-            Some(&Value::Bool(true)),
-            "envelope {type_id} must be x-gts-abstract: true (pure trait carrier)",
-        );
-        assert_eq!(
-            generated.get("x-gts-abstract"),
-            disk.get("x-gts-abstract"),
-            "envelope {type_id} x-gts-abstract drifted from docs/schemas/",
-        );
-        assert_eq!(
-            generated.get("x-gts-traits"),
-            Some(expected_traits),
-            "envelope {type_id} must declare x-gts-traits default values to satisfy gts \
-             OP#13 (validate_entity_traits rejects an x-gts-traits-schema with no values \
-             in the chain, even for abstract types). These defaults were dropped in the \
-             gts-0.10.0 macro migration; restore them via the macro `traits = ...` param.",
-        );
-    }
-
-    /// Assert the closed envelope and designated open payload container stay in
-    /// sync with the published schema, without coupling descriptive metadata or
-    /// JSON object key ordering to this test.
-    fn assert_data_shape(generated: &Value, disk: &Value, type_id: &str) {
-        for field in ["additionalProperties", "properties", "required"] {
-            assert_eq!(
-                generated.get(field),
-                disk.get(field),
-                "macro root field `{field}` for {type_id} drifted from docs/schemas/",
-            );
-        }
-    }
-
-    #[test]
-    fn tenant_type_envelope_trait_contract_matches_docs() {
-        // `()` is the empty container: this asserts the *envelope's* contract, which
-        // is the same whatever a derived type puts in the slot.
-        let generated = TenantTypeEnvelopeV1::<()>::gts_schema_with_refs();
-        let disk = read_disk_schema("tenant_type.v1.schema.json");
-        assert_trait_contract(
-            &generated,
-            &disk,
-            TenantTypeEnvelopeV1::<()>::TYPE_ID,
-            &serde_json::json!({ "allowed_parent_types": [], "idp_provisioning": false }),
-        );
-        assert_data_shape(&generated, &disk, TenantTypeEnvelopeV1::<()>::TYPE_ID);
-        // `type_id` and the `allowed_parent_types` `x-gts-type-ref` are separate
-        // attribute literals (Rust attributes can't reference a const), so
-        // guard that they agree: the ref must equal this envelope's TYPE_ID
-        // so derived chains validate against the correct base prefix.
-        let xref = generated.pointer(&format!(
-            "/{X_GTS_TRAITS_SCHEMA}/properties/allowed_parent_types/items/{X_GTS_TYPE_REF}"
-        ));
-        assert_eq!(
-            xref.and_then(Value::as_str),
-            Some(TenantTypeEnvelopeV1::<()>::TYPE_ID),
-            "allowed_parent_types x-gts-type-ref literal must match the envelope's type_id literal",
-        );
-    }
-
-    #[test]
-    fn tenant_metadata_envelope_trait_contract_matches_docs() {
-        let generated = TenantMetadataEnvelopeV1::<()>::gts_schema_with_refs();
-        let disk = read_disk_schema("tenant_metadata.v1.schema.json");
-        assert_trait_contract(
-            &generated,
-            &disk,
-            TenantMetadataEnvelopeV1::<()>::TYPE_ID,
-            &serde_json::json!({ "inheritance_policy": "override_only" }),
-        );
-        assert_data_shape(&generated, &disk, TenantMetadataEnvelopeV1::<()>::TYPE_ID);
-    }
-}
+#[path = "gts_envelope_tests.rs"]
+mod envelope_behaviour_tests;

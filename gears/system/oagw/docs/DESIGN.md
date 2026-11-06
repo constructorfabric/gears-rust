@@ -252,19 +252,17 @@ classDiagram
 
 **Base type**: `gts.cf.core.oagw.upstream.v1~`
 
-Full schema: [schemas/upstream.v1.schema.json](./schemas/upstream.v1.schema.json)
-
-Sharing fields fragment: [schemas/oagw_upstream_sharing_fields.fragment.json](./schemas/oagw_upstream_sharing_fields.fragment.json)
+Shape: the upstream DTOs in [`src/api/rest/dto.rs`](../oagw/src/api/rest/dto.rs)
 
 #### Route Schema
 
 **Base type**: `gts.cf.core.oagw.route.v1~`
 
-Full schema: [schemas/route.v1.schema.json](./schemas/route.v1.schema.json)
+Shape: the route DTOs in [`src/api/rest/dto.rs`](../oagw/src/api/rest/dto.rs)
 
 #### Plugin Schemas
 
-**Auth Plugin** — Base type: `gts.cf.core.oagw.auth_plugin.v1~` — [schemas/auth_plugin.v1.schema.json](./schemas/auth_plugin.v1.schema.json)
+**Auth Plugin** — Base type: `gts.cf.core.oagw.auth_plugin.v1~`
 
 One per upstream. Named auth plugins resolved via in-process registries, not stored in `oagw_plugin`. UUID-backed auth plugins stored in `oagw_plugin`.
 
@@ -276,7 +274,7 @@ Built-in auth plugins:
 
 `basic.v1` and `bearer.v1` are reserved GTS identifiers cataloged in the types-registry with no backing `AuthPlugin` implementation in `AuthPluginRegistry` — using either as `auth.plugin_type` fails with `unknown auth plugin`.
 
-**Guard Plugin** — Base type: `gts.cf.core.oagw.guard_plugin.v1~` — [schemas/guard_plugin.v1.schema.json](./schemas/guard_plugin.v1.schema.json)
+**Guard Plugin** — Base type: `gts.cf.core.oagw.guard_plugin.v1~`
 
 Multiple per upstream/route. Can reject requests before they reach upstream.
 
@@ -286,7 +284,7 @@ Multiple per upstream/route. Can reject requests before they reach upstream.
 
 `required_headers.v1` is the only guard identifier resolvable via `GuardPluginRegistry` and bindable through `plugins.items[].plugin_ref`. Timeout and CORS are core Data Plane functionality, not `GuardPlugin` trait implementations: request timeout is gear-level configuration, and CORS is configured via the dedicated `cors` field on `Upstream`/`Route` (see [ADR: CORS](./ADR/0006-cors.md)). Their `gts.cf.core.oagw.guard_plugin.v1~cf.core.oagw.timeout.v1` / `...cors.v1` identifiers exist only for types-registry cataloging and cannot be bound via `plugins.items[].plugin_ref`. Circuit breaker is likewise **core functionality** (not a plugin). See [ADR: Circuit Breaker](./ADR/0005-circuit-breaker.md).
 
-**Transform Plugin** — Base type: `gts.cf.core.oagw.transform_plugin.v1~` — [schemas/transform_plugin.v1.schema.json](./schemas/transform_plugin.v1.schema.json)
+**Transform Plugin** — Base type: `gts.cf.core.oagw.transform_plugin.v1~`
 
 Multiple per upstream/route, executed in order. Each plugin declares supported phases: `on_request`, `on_response`, `on_error`.
 

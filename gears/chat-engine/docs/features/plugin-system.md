@@ -294,8 +294,8 @@ Plugin authors **MUST NOT** add their own `Debug`/`Display` impls (or `tracing` 
 **Steps**:
 1. [ ] - `p1` - Receive trait method call with call context (includes `plugin_config` containing endpoint address, authentication config, timeout, retry config) - `inst-wc-input`
 2. [ ] - `p1` - Extract transport configuration from `plugin_config.config` JSONB: endpoint address, auth_type, auth_credentials, timeout_ms, retry_count, retry_backoff_ms - `inst-wc-extract-config`
-3. [ ] - `p1` - Map trait method to webhook event type (on_session_created -> session.created, on_message -> message.new, etc.) - `inst-wc-map-event`
-4. [ ] - `p1` - Build outbound request with event payload conforming to Chat Engine webhook schemas - `inst-wc-build-request`
+3. [ ] - `p1` - Map trait method to webhook event type (on_session_created -> `session_created`, on_message -> `message`, etc.; see [WEBHOOK-PROTOCOL.md](../WEBHOOK-PROTOCOL.md)) - `inst-wc-map-event`
+4. [ ] - `p1` - Build outbound request with the typed request bodies of `chat_engine_sdk::webhook` - `inst-wc-build-request`
 5. [ ] - `p1` - **IF** auth_type is configured: apply authentication credentials to the outbound request - `inst-wc-apply-auth`
 6. [ ] - `p1` - **TRY** - `inst-wc-try`
    1. [ ] - `p1` - Send request to the configured endpoint with configured timeout; for streaming methods (on_message, on_message_recreate, on_session_summary), read chunked response and pipe chunks to ResponseStream - `inst-wc-send`

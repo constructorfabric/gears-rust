@@ -180,7 +180,7 @@ Resource groups operate **within** tenant boundaries — groups are tenant-scope
 
 - [RG Technical Design](../../../gears/system/resource-group/docs/DESIGN.md) — Full RG gear design (domain model, API, database schemas, security, auth modes)
 - [RG PRD](../../../gears/system/resource-group/docs/PRD.md) — Product requirements
-- [RG OpenAPI](../../../gears/system/resource-group/docs/openapi.yaml) — REST API specification
+- [RG REST routes](../../../gears/system/resource-group/resource-group/src/api/rest/routes/) — REST API contract (generated spec in [api.json](../../api/api.json))
 - [DESIGN.md](./DESIGN.md) — Core authorization design
 - [TENANT_MODEL.md](./TENANT_MODEL.md) — Tenant topology, barriers, closure tables
 - [AUTHZ_USAGE_SCENARIOS.md](./AUTHZ_USAGE_SCENARIOS.md) — Authorization scenarios with resource group examples

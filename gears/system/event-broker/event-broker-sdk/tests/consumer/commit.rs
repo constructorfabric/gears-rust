@@ -12,11 +12,17 @@ use event_broker_sdk::{
 use serde_json::json;
 use uuid::Uuid;
 
-use super::common::{publish_json, topic, topic_fixture};
+use super::common::{publish_json, showcase_event_type, topic, topic_fixture};
 use super::doubles::{RecordingBatchHandler, SharedCommits};
+use event_broker_sdk::gts::EventV1;
 
 const TOPIC: &str = gts_id!("cf.core.events.topic.v1~example.mock.showcase.autocommit.v1");
-const EVENT_TYPE: &str = gts_id!("cf.core.events.event.v1~example.mock.showcase.autocommit.v1~");
+showcase_event_type!(
+    EVENT_TYPE,
+    EventTypeV1,
+    "cf.core.events.event.v1~example.mock.showcase.autocommit.v1~",
+    TOPIC
+);
 
 /// A custom offset store that records every commit's full coordinates - the
 /// `.topics([..]) + custom OffsetStore` shape the delivery fix confirmed works.
@@ -76,7 +82,7 @@ async fn wait_for_first_non_negative_commit(
 
 #[tokio::test]
 async fn async_auto_commit_uses_resolved_group_topic_partition_and_frontier_offset() {
-    let fx = topic_fixture(TOPIC, EVENT_TYPE, 1).await;
+    let fx = topic_fixture::<EventTypeV1>(TOPIC, 1).await;
     let offset_manager = RecordingOffsetManager::default();
     let commits = offset_manager.commits.clone();
     let calls = Arc::new(Mutex::new(Vec::new()));

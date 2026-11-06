@@ -20,7 +20,7 @@ use crate::domain::error::DomainError;
 /// The base type the broker owns; abstract, and the only declarer of the
 /// event trait schema.
 const BASE_ID: &str = "gts.cf.core.events.event.v1~";
-/// The committed worked example under `docs/schemas/examples/`.
+/// The worked example event type (`event-broker-sdk/tests/worked_examples.rs`).
 const DERIVED_ID: &str = "gts.cf.core.events.event.v1~fabrikam.shop.orders.order_placed.v1~";
 /// A topic is an instance, so the example topic's identifier does not end in `~`.
 const EXAMPLE_TOPIC: &str = "gts.cf.core.events.topic.v1~fabrikam.shop._.orders.v1";

@@ -7,11 +7,18 @@ use event_broker_sdk::{
 };
 
 use super::common::{
-    PublishJson, publish_json, topic, topic_fixture, two_topic_fixture, wait_until,
+    PublishJson, publish_json, showcase_event_type, topic, topic_fixture, two_topic_fixture,
+    wait_until,
 };
+use event_broker_sdk::gts::EventV1;
 
 const TOPIC: &str = gts_id!("cf.core.events.topic.v1~example.mock.showcase.single.v1");
-const EVENT_TYPE: &str = gts_id!("cf.core.events.event.v1~example.mock.showcase.single.v1~");
+showcase_event_type!(
+    EVENT_TYPE,
+    EventTypeV1,
+    "cf.core.events.event.v1~example.mock.showcase.single.v1~",
+    TOPIC
+);
 
 struct SingleEventProjector {
     offsets: Arc<Mutex<Vec<i64>>>,
@@ -33,7 +40,7 @@ impl SingleEventHandler for SingleEventProjector {
 
 #[tokio::test]
 async fn if_i_want_a_simple_single_event_handler() {
-    let fixture = topic_fixture(TOPIC, EVENT_TYPE, 1).await;
+    let fixture = topic_fixture::<EventTypeV1>(TOPIC, 1).await;
     let offsets = Arc::new(Mutex::new(Vec::new()));
     let partitions = Arc::new(Mutex::new(Vec::new()));
 
@@ -71,7 +78,7 @@ async fn if_i_want_a_simple_single_event_handler() {
 /// sees it.
 #[tokio::test]
 async fn if_i_publish_events_partitioned_by_a_payload_member_each_lands_on_its_partition() {
-    let fixture = topic_fixture(TOPIC, EVENT_TYPE, 2).await;
+    let fixture = topic_fixture::<EventTypeV1>(TOPIC, 2).await;
     let offsets = Arc::new(Mutex::new(Vec::new()));
     let partitions = Arc::new(Mutex::new(Vec::new()));
 
@@ -111,9 +118,19 @@ async fn if_i_publish_events_partitioned_by_a_payload_member_each_lands_on_its_p
 }
 
 const ORDERS_TOPIC: &str = gts_id!("cf.core.events.topic.v1~example.mock.showcase.orders.v1");
-const ORDERS_EVENT: &str = gts_id!("cf.core.events.event.v1~example.mock.showcase.orders.v1~");
+showcase_event_type!(
+    ORDERS_EVENT,
+    OrdersEventV1,
+    "cf.core.events.event.v1~example.mock.showcase.orders.v1~",
+    ORDERS_TOPIC
+);
 const AUDIT_TOPIC: &str = gts_id!("cf.core.events.topic.v1~example.mock.showcase.audit.v1");
-const AUDIT_EVENT: &str = gts_id!("cf.core.events.event.v1~example.mock.showcase.audit.v1~");
+showcase_event_type!(
+    AUDIT_EVENT,
+    AuditEventV1,
+    "cf.core.events.event.v1~example.mock.showcase.audit.v1~",
+    AUDIT_TOPIC
+);
 
 /// The `(topic, partition)` each delivered event was attributed to.
 type Attributions = Arc<Mutex<Vec<(String, u32)>>>;
@@ -145,7 +162,7 @@ impl SingleEventHandler for AttributionProjector {
 #[tokio::test]
 async fn events_from_two_topics_are_each_attributed_to_their_own_topic() {
     let fixture =
-        two_topic_fixture((ORDERS_TOPIC, ORDERS_EVENT), (AUDIT_TOPIC, AUDIT_EVENT), 1).await;
+        two_topic_fixture::<OrdersEventV1, AuditEventV1>(ORDERS_TOPIC, AUDIT_TOPIC, 1).await;
     let seen = Arc::new(Mutex::new(Vec::new()));
 
     let handle = ConsumerBuilder::new(fixture.broker.clone())

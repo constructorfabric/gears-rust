@@ -30,20 +30,12 @@ toolkit_gts::inventory::submit! {
     }
 }
 
-toolkit_gts::inventory::submit! {
-    toolkit_gts::InventoryTypeSchema {
-        type_id: PROBE_EVENT_TYPE,
-        schema_fn: || {
-            event_broker_sdk::gts::derived_event_type_schema(
-                PROBE_EVENT_TYPE,
-                PROBE_TOPIC,
-                json!({}),
-                &[],
-            )
-            .to_string()
-        },
-    }
-}
+event_broker::fixture_event_type!(
+    /// The probe event type: a declaration in this binary's inventory, as a gear's own
+    /// event types are.
+    ProbeEventV1 = "cf.core.events.event.v1~x.eb.inventory.probe.v1~",
+    topic = PROBE_TOPIC,
+);
 
 fn pattern(pattern: &str) -> ListEntitiesRequest {
     ListEntitiesRequest::matching(GtsIdPattern::try_new(pattern).expect("a valid GTS pattern"))
@@ -94,7 +86,7 @@ async fn registry_holding_seeds_only_the_broker_base_types() {
         .map(|schema| schema.type_id.as_ref().to_owned())
         .collect();
     event_schemas.sort();
-    assert_eq!(event_schemas, vec![EventV1::TYPE_ID.to_owned()]);
+    assert_eq!(event_schemas, vec![EventV1::<()>::TYPE_ID.to_owned()]);
 
     let mut topic_instances: Vec<String> = registry
         .list_instances(&ctx, pattern("gts.cf.core.events.topic.v1~*"))

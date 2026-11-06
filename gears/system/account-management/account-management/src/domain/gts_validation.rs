@@ -1,8 +1,7 @@
 //! GTS-runtime payload validation.
 //!
-//! AM resource shapes (`tenant`, `user`) are pinned by JSON Schemas
-//! published under `gears/system/account-management/docs/schemas/`
-//! and registered in the GTS Types Registry at deployment time. This
+//! AM resource shapes (`tenant`, `user`) are pinned by the `TenantV1` / `UserV1` GTS type schemas
+//! (`account-management-sdk/src/gts.rs`) registered in the GTS Types Registry at deployment time. This
 //! gear is the single AM-side seam that fetches a resolved schema
 //! from `TypesRegistryClient` and runs `jsonschema::validator_for`
 //! against the supplied field values — adapting the

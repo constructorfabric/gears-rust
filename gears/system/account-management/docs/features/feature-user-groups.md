@@ -53,7 +53,7 @@ Delivers the delegation half of PRD §5.6 (User Groups Management) by ensuring A
 ### 1.4 References
 
 - **PRD**: [PRD.md](../PRD.md) §5.6 User Groups Management (`fr-user-group-rg-type`, `fr-user-group-lifecycle`, `fr-user-group-membership`, `fr-nested-user-groups`).
-- **Design**: [DESIGN.md](../DESIGN.md) §2.1 Delegation-to-RG Principle (`principle-delegation-to-rg`); §3.1 Domain Model — Tenant → Resource Group (user groups) delegation wiring; §3.4 External Dependencies — `ResourceGroupClient` consumer contract; user-group schema body at [user_group.v1.schema.json](../schemas/user_group.v1.schema.json); rejected-alternative context in [ADR-0004](../ADR/0004-cpt-cf-account-management-adr-resource-group-tenant-hierarchy-source.md) (`adr-resource-group-tenant-hierarchy-source`).
+- **Design**: [DESIGN.md](../DESIGN.md) §2.1 Delegation-to-RG Principle (`principle-delegation-to-rg`); §3.1 Domain Model — Tenant → Resource Group (user groups) delegation wiring; §3.4 External Dependencies — `ResourceGroupClient` consumer contract; user-group type spec built in Rust at [registration.rs](../../account-management/src/domain/user_groups/registration.rs); rejected-alternative context in [ADR-0004](../ADR/0004-cpt-cf-account-management-adr-resource-group-tenant-hierarchy-source.md) (`adr-resource-group-tenant-hierarchy-source`).
 - **DECOMPOSITION**: [DECOMPOSITION.md](../DECOMPOSITION.md) §2.6 User Groups (via Resource Group delegation).
 - **Dependencies**:
   - `cpt-cf-account-management-feature-tenant-hierarchy-management` — invokes this feature's cascade-cleanup trigger inside its hard-delete flow before the `tenants` row is removed.
@@ -120,7 +120,7 @@ Delivers the delegation half of PRD §5.6 (User Groups Management) by ensuring A
 
 - [ ] `p1` - **ID**: `cpt-cf-account-management-algo-user-groups-rg-type-schema-registration`
 
-**Input**: Chained type identifier `gts.cf.core.rg.type.v1~cf.core.am.user_group.v1~`, required traits (`allowed_memberships = [gts.cf.core.am.user.v1~]`, `allowed_parents = [gts.cf.core.rg.type.v1~cf.core.am.user_group.v1~]`), schema body reference (`user_group.v1.schema.json`).
+**Input**: Chained type identifier `gts.cf.core.rg.type.v1~cf.core.am.user_group.v1~`, required traits (`allowed_memberships = [gts.cf.core.am.user.v1~]`, `allowed_parents = [gts.cf.core.rg.type.v1~cf.core.am.user_group.v1~]`), type spec built in Rust (`registration.rs`).
 
 **Output**: Idempotent outcome — `already-present-and-equivalent` (no-op), `registered-new` (newly persisted in RG), OR one of the mapped failure categories (`service_unavailable` when RG is unreachable, `validation` when an existing RG-side schema diverges from the required traits).
 
@@ -136,7 +136,7 @@ Delivers the delegation half of PRD §5.6 (User Groups Management) by ensuring A
 4. [ ] - `p1` - **IF** the type is registered but traits diverge - `inst-algo-rgreg-diverged-branch`
    1. [ ] - `p1` - **RETURN** `(reject, code=validation, reason=diverged_schema)` so the calling flow can surface the envelope-mapped error; AM does NOT auto-repair - `inst-algo-rgreg-diverged-return`
 5. [ ] - `p1` - **ELSE** the type is absent - `inst-algo-rgreg-absent-branch`
-   1. [ ] - `p1` - Register the chained type schema via `ResourceGroupClient` with the required traits and the schema body at `user_group.v1.schema.json` - `inst-algo-rgreg-register`
+   1. [ ] - `p1` - Register the chained type schema via `ResourceGroupClient` with the required traits and the type spec built in Rust (`registration.rs`) - `inst-algo-rgreg-register`
    2. [ ] - `p1` - **RETURN** `registered-new` - `inst-algo-rgreg-register-return`
 
 ## 4. States (CDSL)

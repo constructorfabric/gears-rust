@@ -304,7 +304,7 @@ currency and scale.
 `InvoicePostService::post_reversal`, which re-reads the stored journal facts and the
 stored currency and scale, never the current registry.
 
-Events are not migrated. The parked `v1` event schemas (`ledger/schemas/*.v1.schema.json`)
+Events are not migrated. The parked `v1` event payloads (the structs in `src/infra/events/payloads.rs`)
 and the parked publisher keep their integer `*_minor` fields, filled through one policy
 (`infra/v1_payload.rs`): `amount × 10^scale`, exact because a posted amount is a multiple
 of the increment, whenever the value fits `i64`. A larger value (reachable at high

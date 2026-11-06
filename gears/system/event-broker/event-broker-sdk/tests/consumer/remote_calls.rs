@@ -7,10 +7,16 @@ use event_broker_sdk::{
     InMemoryOffsetManager, RawEvent, SingleEventHandler,
 };
 
-use super::common::{publish_json, topic, topic_fixture, wait_until};
+use super::common::{publish_json, showcase_event_type, topic, topic_fixture, wait_until};
+use event_broker_sdk::gts::EventV1;
 
 const TOPIC: &str = gts_id!("cf.core.events.topic.v1~example.mock.showcase.remote.v1");
-const EVENT_TYPE: &str = gts_id!("cf.core.events.event.v1~example.mock.showcase.remote.v1~");
+showcase_event_type!(
+    EVENT_TYPE,
+    EventTypeV1,
+    "cf.core.events.event.v1~example.mock.showcase.remote.v1~",
+    TOPIC
+);
 
 type RemoteCall = (String, &'static str);
 type RecordedRemoteCalls = Arc<Mutex<Vec<RemoteCall>>>;
@@ -43,7 +49,7 @@ impl SingleEventHandler for ForwardingHandler {
 
 #[tokio::test]
 async fn if_i_need_remote_calls_the_handler_owns_its_client_and_auth() {
-    let fixture = topic_fixture(TOPIC, EVENT_TYPE, 1).await;
+    let fixture = topic_fixture::<EventTypeV1>(TOPIC, 1).await;
     let calls = Arc::new(Mutex::new(Vec::new()));
     let remote = FakeRemoteClient {
         token: "service-token",

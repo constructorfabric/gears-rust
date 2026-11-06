@@ -78,6 +78,10 @@ event-broker-sdk = { workspace = true, features = ["db", "outbox"] }
 # The bound-producer suite (`tests/broker_producer.rs`) drives a real in-process broker: the
 # gear's own harness (`test_support::EventBrokerHarness`), which replaced the SDK's mock.
 cf-gears-event-broker = { path = "../../../system/event-broker/event-broker", features = ["test-utils"] }
+# `#[gts_type_schema]` expands to code naming `gts` and `schemars`: the bound-producer suite
+# declares its fixture event types with it.
+gts = { workspace = true }
+schemars = { workspace = true }
 toml = { workspace = true }
 # The shipped binary keeps a parsed body's key order (file-parser pulls in `preserve_order`);
 # the tests run in that order too, so the key-order digest test can fail (behaviour LOW-4).

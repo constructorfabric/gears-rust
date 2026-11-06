@@ -634,6 +634,70 @@ async fn register_session_type_owner_no_plugin_persists() {
     assert_eq!(got.session_type_id, st.session_type_id);
 }
 
+/// A plugin that answers health checks, registered under one instance id.
+struct AliasProbePlugin;
+
+#[async_trait::async_trait]
+impl chat_engine_sdk::ChatEngineBackendPlugin for AliasProbePlugin {
+    async fn health_check(
+        &self,
+    ) -> std::result::Result<
+        chat_engine_sdk::models::HealthStatus,
+        chat_engine_sdk::error::PluginError,
+    > {
+        Ok(chat_engine_sdk::models::HealthStatus::Healthy)
+    }
+
+    fn plugin_instance_id(&self) -> &str {
+        chat_engine_sdk::gts::WEBHOOK_COMPAT_PLUGIN_INSTANCE_ID
+    }
+}
+
+/// An older client may still send the pre-fix `gtx.…~` plugin id. Registration
+/// resolves it to the plugin registered under the current id and stores the
+/// current id, so later lookups never see the legacy form.
+#[tokio::test]
+async fn register_session_type_with_a_legacy_plugin_id_stores_the_current_id() {
+    use crate::domain::service::test_support::{session_repo, session_type_repo};
+    use crate::infra::db::repo::plugin_config_repo::SeaPluginConfigRepo;
+    use toolkit::ClientHub;
+    use toolkit::client_hub::ClientScope;
+
+    let db = inmem_db().await;
+    let ctx = ctx_for_subject(Uuid::new_v4(), Uuid::new_v4());
+    let current = chat_engine_sdk::gts::WEBHOOK_COMPAT_PLUGIN_INSTANCE_ID;
+    let hub = Arc::new(ClientHub::new());
+    hub.register_scoped::<dyn chat_engine_sdk::ChatEngineBackendPlugin>(
+        ClientScope::gts_id(current),
+        Arc::new(AliasProbePlugin),
+    );
+    let svc = SessionService::new(
+        session_repo(&db),
+        session_type_repo(&db),
+        PluginService::new(hub, Arc::new(SeaPluginConfigRepo::new(Arc::clone(&db)))),
+        Arc::new(crate::domain::service::webhook::NoopWebhookEmitter),
+        enforcer_allow_unconstrained(),
+    );
+
+    let st = svc
+        .register_session_type(
+            &ctx,
+            RegisterSessionTypeRequest {
+                name: "legacy".into(),
+                plugin_instance_id: Some("gtx.cf.chat_engine.webhook_compat_plugin.v1~".into()),
+                plugin_config: None,
+            },
+        )
+        .await
+        .expect("a legacy id resolves to the registered plugin");
+
+    let stored = svc
+        .get_session_type(&ctx, st.session_type_id)
+        .await
+        .expect("get ok");
+    assert_eq!(stored.plugin_instance_id.as_deref(), Some(current));
+}
+
 #[tokio::test]
 async fn register_session_type_empty_name_is_bad_request() {
     let db = inmem_db().await;

@@ -7,9 +7,13 @@
 //! structs would let a unit suite pass against a process that cannot load a
 //! topic at all.
 //!
-//! `StaticTypesRegistry::of(...)` takes a flat list; each entry's `id` alone
-//! says which kind it is, since there is exactly one base type per kind, and
-//! every id is validated as the GTS kind it claims to be.
+//! Topics are data: `StaticTypesRegistry::of(...)` takes a flat list of topic
+//! entries. Event types are Rust declarations - `#[gts_type_schema(base =
+//! EventV1, ..)]` structs, added with [`StaticTypesRegistry::event_type`] - so a
+//! fixture holds exactly the document the macro generates for a real gear's
+//! event type. A fixture whose point is a document the macro cannot produce (one
+//! the broker or the registry must refuse) adds it with
+//! [`StaticTypesRegistry::refused_event_type_document`].
 //!
 //! The documents are held by a `MockTypesRegistry` that also holds the
 //! broker's two base types, taken from the declarations `event-broker-sdk`
@@ -23,7 +27,6 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use event_broker_sdk::gts::{EventV1, TopicV1};
-use gts::GtsTypeId;
 use serde_json::{Value as JsonValue, json};
 use toolkit_gts::{GTS_ID_URI_PREFIX, GtsInstanceId, GtsSchema};
 use types_registry_sdk::testing_platform::MockTypesRegistry;
@@ -31,36 +34,13 @@ use types_registry_sdk::testing_platform::MockTypesRegistry;
 use crate::config::EventBrokerConfig;
 
 const TOPIC_BASE: &str = TopicV1::TYPE_ID;
-const EVENT_BASE: &str = EventV1::TYPE_ID;
+const EVENT_BASE: &str = EventV1::<()>::TYPE_ID;
 
 /// The backend every fixture deployment names. A fixture never builds it
 /// through configuration - the harness builds the memory backend directly - but
 /// configuration has to name a backend type for the same reason production does.
 const MEMORY_BACKEND: &str =
     toolkit_gts::gts_id!("cf.core.events.backend.v1~cf.core.backend.memory.v1~");
-
-/// A derived event-type schema document, built by the same helper the
-/// production fixtures use, so what a test registers is the shape
-/// `types-registry` provisions.
-///
-/// # Panics
-/// Panics if `type_id` is not a well-formed GTS type identifier.
-#[must_use]
-pub fn derived_event_type(
-    type_id: &str,
-    topic: &str,
-    data_schema: JsonValue,
-    allowed_subject_types: &[&str],
-) -> JsonValue {
-    GtsTypeId::try_new(type_id)
-        .unwrap_or_else(|err| panic!("'{type_id}' is not a valid GTS type id: {err}"));
-    event_broker_sdk::gts::derived_event_type_schema(
-        type_id,
-        topic,
-        data_schema,
-        allowed_subject_types,
-    )
-}
 
 /// A registry holding the broker's two base types (`TOPIC_BASE` and
 /// `EVENT_BASE`, as `event-broker-sdk` declares them), the `topics` instance
@@ -107,6 +87,9 @@ pub struct StaticTypesRegistry {
     pub(super) topics: Vec<JsonValue>,
     /// Derived event-type schema documents.
     pub(super) event_types: Vec<JsonValue>,
+    /// Ids of the topics `of(...)` declared, which an event type's `topic`
+    /// trait must name.
+    topic_ids: HashSet<String>,
     /// The configuration the partition counts came from: a topic carries no
     /// count of its own, so a fixture that asks for four partitions is asking
     /// for a deployment configured that way.
@@ -114,30 +97,16 @@ pub struct StaticTypesRegistry {
 }
 
 impl StaticTypesRegistry {
-    /// `spec` is a flat JSON array; each entry's `id` prefix decides what
-    /// fields it needs:
-    /// - a topic (`{TOPIC_BASE}...`, no trailing `~`): `partitions` (integer,
-    ///   required) - written into configuration rather than onto the topic,
-    ///   because that is where a partition count lives.
-    /// - an event type (`{EVENT_BASE}...~`, trailing `~` required, since a
-    ///   concrete event type is a derived type schema): `topic` (the `id` of a
-    ///   topic declared earlier in the same list, required), `data_schema`
-    ///   (object, defaults to `{}`), `allowed_subject_types` (array of GTS
-    ///   Type-id pattern strings, defaults to `[]` - the true minimal value,
-    ///   which rejects every `subject_type` at publish time), and
-    ///   `partition_key` (a JSON Pointer, defaulting to the tenant the base
-    ///   declares).
-    ///
-    /// An event type may name a topic deliberately left unregistered - the only
-    /// way to reach the broker's "the type resolves a topic nobody registered"
-    /// branch - with `"topic_registered": false`.
+    /// `spec` is a flat JSON array of topic entries: `id` (a topic instance id,
+    /// `{TOPIC_BASE}...`, no trailing `~`) and `partitions` (integer, required) -
+    /// written into configuration rather than onto the topic, because that is
+    /// where a partition count lives. Event types are added afterwards with
+    /// [`Self::event_type`].
     ///
     /// # Panics
     /// Panics (fixture-construction failure, not a runtime `Result`) if `spec`
-    /// is not a JSON array; an entry is missing `id` or a kind-required field;
-    /// an `id` is not well-formed for its kind; an `id`'s base type is neither
-    /// the topic nor the event base; or an event type's `topic` was not declared
-    /// earlier in the same list.
+    /// is not a JSON array, an entry is missing `id` or `partitions`, an `id` is
+    /// not a well-formed topic instance id, or an entry is an event type.
     #[must_use]
     #[allow(
         clippy::needless_pass_by_value,
@@ -148,92 +117,39 @@ impl StaticTypesRegistry {
             .as_array()
             .expect("StaticTypesRegistry::of expects a JSON array");
         let mut topics = Vec::new();
-        let mut event_types = Vec::new();
         let mut topic_ids: HashSet<String> = HashSet::new();
         let mut settings = serde_json::Map::new();
-
         for entry in entries {
             let id = entry["id"].as_str().unwrap_or_else(|| {
                 panic!("StaticTypesRegistry entry missing a string 'id': {entry}")
             });
-
-            if id.starts_with(TOPIC_BASE) && !id.ends_with('~') {
-                GtsInstanceId::try_new(id)
-                    .unwrap_or_else(|err| panic!("'{id}' is not a valid GTS instance id: {err}"));
-                let partitions = entry["partitions"].as_i64().unwrap_or_else(|| {
-                    panic!("topic '{id}' is missing an integer 'partitions' field")
-                });
-                topic_ids.insert(id.to_owned());
-                topics.push(json!({
-                    "id": id,
-                    "description": "a topic this test publishes to",
-                }));
-                settings.insert(id.to_owned(), json!({ "partitions": partitions }));
-            } else if id.starts_with(EVENT_BASE) {
-                GtsTypeId::try_new(id).unwrap_or_else(|err| {
-                    panic!(
-                        "'{id}' is not a valid GTS type id: {err} - a concrete event type is a \
-                         derived type schema, so its identifier ends in '~'"
-                    )
-                });
-                let topic = entry["topic"]
-                    .as_str()
-                    .unwrap_or_else(|| panic!("event type '{id}' is missing a string 'topic'"));
-                let topic_registered = entry
-                    .get("topic_registered")
-                    .and_then(JsonValue::as_bool)
-                    .unwrap_or(true);
-                assert!(
-                    !topic_registered || topic_ids.contains(topic),
-                    "event type '{id}' references topic '{topic}', which isn't declared earlier \
-                     in this StaticTypesRegistry::of(...) list - add \"topic_registered\": false \
-                     if that is the point of the fixture"
-                );
-                let allowed: Vec<&str> = entry
-                    .get("allowed_subject_types")
-                    .map(|value| {
-                        value
-                            .as_array()
-                            .unwrap_or_else(|| {
-                                panic!("event type '{id}' 'allowed_subject_types' must be an array")
-                            })
-                            .iter()
-                            .map(|entry| {
-                                entry.as_str().unwrap_or_else(|| {
-                                    panic!(
-                                        "event type '{id}' 'allowed_subject_types' entries must \
-                                         be strings"
-                                    )
-                                })
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                let data_schema = entry.get("data_schema").cloned().unwrap_or(json!({}));
-                let mut body = event_broker_sdk::gts::derived_event_type_schema(
-                    id,
-                    topic,
-                    data_schema,
-                    &allowed,
-                );
-                // The standard builder fixes the pointer at the tenant. An
-                // entry may override it, which is how a fixture exercises a
-                // type that groups by a payload member.
-                if let Some(pointer) = entry.get("partition_key").and_then(JsonValue::as_str) {
-                    body["x-gts-traits"]["partition_key"] = json!(pointer);
-                }
-                event_types.push(body);
-            } else {
-                panic!(
-                    "'{id}' is neither a topic instance ('{TOPIC_BASE}...') nor an event type \
-                     ('{EVENT_BASE}...~') - StaticTypesRegistry seeds these two kinds only"
-                );
-            }
+            assert!(
+                !id.starts_with(EVENT_BASE),
+                "'{id}' is an event type: declare it as a `#[gts_type_schema(base = EventV1)]` \
+                 struct and add it with `.event_type::<T>()`"
+            );
+            assert!(
+                id.starts_with(TOPIC_BASE) && !id.ends_with('~'),
+                "'{id}' is not a topic instance ('{TOPIC_BASE}...') - StaticTypesRegistry::of \
+                 seeds topics only"
+            );
+            GtsInstanceId::try_new(id)
+                .unwrap_or_else(|err| panic!("'{id}' is not a valid GTS instance id: {err}"));
+            let partitions = entry["partitions"]
+                .as_i64()
+                .unwrap_or_else(|| panic!("topic '{id}' is missing an integer 'partitions' field"));
+            topic_ids.insert(id.to_owned());
+            topics.push(json!({
+                "id": id,
+                "description": "a topic this test publishes to",
+            }));
+            settings.insert(id.to_owned(), json!({ "partitions": partitions }));
         }
 
         Self {
             topics,
-            event_types,
+            event_types: Vec::new(),
+            topic_ids,
             config: serde_json::from_value(json!({
                 "mode": "standalone",
                 "backends": { "main": { "type": MEMORY_BACKEND } },
@@ -242,6 +158,61 @@ impl StaticTypesRegistry {
             }))
             .expect("fixture configuration deserializes"),
         }
+    }
+
+    /// Adds the event type `T` declares - a `#[gts_type_schema(base = EventV1)]`
+    /// struct - as the document `types-registry` holds for it. Its `topic` trait
+    /// must name a topic declared in [`Self::of`].
+    ///
+    /// # Panics
+    /// Panics if `T` is not an event type or its topic was not declared.
+    #[must_use]
+    pub fn event_type<T: GtsSchema>(self) -> Self {
+        self.add_event_type(T::gts_schema_with_refs(), true)
+    }
+
+    /// As [`Self::event_type`], for a type whose topic is deliberately left
+    /// unregistered - the only way to reach the broker's "the type resolves a
+    /// topic nobody registered" branch.
+    ///
+    /// # Panics
+    /// Panics if `T` is not an event type.
+    #[must_use]
+    pub fn event_type_on_unregistered_topic<T: GtsSchema>(self) -> Self {
+        self.add_event_type(T::gts_schema_with_refs(), false)
+    }
+
+    /// Adds a hand-written event-type document, for a fixture whose point is a
+    /// document the macro cannot produce: one the broker or the registry must
+    /// refuse. Every other event type is a Rust declaration.
+    ///
+    /// # Panics
+    /// Panics if `document` names no event-type `$id`.
+    #[must_use]
+    pub fn refused_event_type_document(self, document: JsonValue) -> Self {
+        self.add_event_type(document, false)
+    }
+
+    fn add_event_type(mut self, document: JsonValue, topic_must_be_declared: bool) -> Self {
+        let id = document["$id"]
+            .as_str()
+            .and_then(|uri| uri.strip_prefix(GTS_ID_URI_PREFIX))
+            .unwrap_or_else(|| panic!("an event-type document names no `gts://` $id: {document}"));
+        assert!(
+            id.starts_with(EVENT_BASE) && id != EVENT_BASE,
+            "'{id}' is not a type derived from '{EVENT_BASE}'"
+        );
+        if topic_must_be_declared {
+            let topic = document["x-gts-traits"]["topic"].as_str().unwrap_or("");
+            assert!(
+                self.topic_ids.contains(topic),
+                "event type '{id}' names topic '{topic}', which this fixture's \
+                 StaticTypesRegistry::of(...) list does not declare - use \
+                 `.event_type_on_unregistered_topic::<T>()` if that is the point of the fixture"
+            );
+        }
+        self.event_types.push(document);
+        self
     }
 
     /// The configuration a fixture-free harness runs with: no topics named, so
@@ -256,4 +227,52 @@ impl StaticTypesRegistry {
         }))
         .expect("fixture configuration deserializes")
     }
+}
+
+/// Declares a fixture event type admitting any object payload (an open,
+/// body-less `#[gts_type_schema(base = EventV1)]` type), for
+/// [`StaticTypesRegistry::event_type`]. Tests exercise the broker, not
+/// payloads, so only the identity and the traits vary:
+///
+/// ```ignore
+/// use event_broker_sdk::gts::EventV1; // the macro names `EventV1` as the base
+///
+/// event_broker::fixture_event_type!(
+///     OrderPlacedV1 = "cf.core.events.event.v1~x.eb.t1.placed.v1~",
+///     topic = "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
+///     subjects = ["gts.x.eb.t1.subject.v1~"],
+///     partition_key = "/subject",
+/// );
+/// ```
+///
+/// `subjects` and `partition_key` are optional; omitted, the type declares no
+/// subject types and inherits the base's `/tenant_id` partition key. The
+/// calling crate needs `toolkit-gts`, `gts`, `schemars`, `serde` and
+/// `serde_json`, which the generated declaration names.
+#[macro_export]
+macro_rules! fixture_event_type {
+    (
+        $(#[$attr:meta])*
+        $vis:vis $name:ident = $id:literal,
+        topic = $topic:expr
+        $(, subjects = [$($subject:expr),* $(,)?])?
+        $(, partition_key = $pointer:expr)?
+        $(,)?
+    ) => {
+        #[toolkit_gts::gts_type_schema(
+            dir_path = "schemas",
+            base = EventV1,
+            type_id = toolkit_gts::gts_id!($id),
+            description = "A fixture event type admitting any object payload.",
+            properties = "",
+            traits = serde_json::json!({
+                "topic": $topic,
+                $("allowed_subject_types": [$($subject),*],)?
+                $("partition_key": $pointer,)?
+            }),
+        )]
+        #[schemars(extend("additionalProperties" = true))]
+        $(#[$attr])*
+        $vis struct $name;
+    };
 }

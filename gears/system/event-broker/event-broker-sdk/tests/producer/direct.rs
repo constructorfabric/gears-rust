@@ -8,16 +8,37 @@ use event_broker::test_support::{
     DeliveredOutcome, EventBrokerHarness, FaultInjectingBroker, StaticTypesRegistry,
 };
 use event_broker_sdk::backend::{Partition, TopicPartition, Wait};
+use event_broker_sdk::gts::EventV1;
 use event_broker_sdk::{
     DirectDeduplication, EventBrokerApi, EventBrokerError, GtsInstanceId, IngestOutcome, Producer,
     ProducerIdentity, ProducerMode, Sequence, TypedEvent, gts_id,
 };
+use toolkit_gts::gts_type_schema;
 use toolkit_security::SecurityContext;
 
 const TOPIC: &str = gts_id!("cf.core.events.topic.v1~example.sdk.producer.orders.v1");
 const EVENT_TYPE: &str = gts_id!("cf.core.events.event.v1~example.sdk.producer.created.v1~");
 const SUBJECT_TYPE: &str = gts_id!("cf.core.events.subject.v1~example.sdk.producer.order.v1~");
 const TENANT_PARTITION: u32 = 2;
+
+/// The registered event type: a declaration deriving from `EventV1`, whose
+/// fields are the payload `OrderCreated` publishes. The type declares no
+/// `partition_key`, so the base default (`/tenant_id`) applies.
+#[gts_type_schema(
+    dir_path = "schemas",
+    base = EventV1,
+    type_id = gts_id!("cf.core.events.event.v1~example.sdk.producer.created.v1~"),
+    description = "An order was created.",
+    properties = "order_id,total_cents",
+    traits = serde_json::json!({
+        "topic": TOPIC,
+        "allowed_subject_types": [SUBJECT_TYPE],
+    }),
+)]
+struct OrderCreatedV1 {
+    order_id: Uuid,
+    total_cents: i64,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct OrderCreated {
@@ -362,22 +383,10 @@ async fn a_local_broker_duplicate_ack_advances_the_local_chain() {
 /// applies and events partition by tenant.
 async fn harness() -> EventBrokerHarness {
     EventBrokerHarness::builder()
-        .with_type_registry(StaticTypesRegistry::of(serde_json::json!([
-            { "id": TOPIC, "partitions": 4 },
-            {
-                "id": EVENT_TYPE,
-                "topic": TOPIC,
-                "data_schema": {
-                    "type": "object",
-                    "required": ["order_id", "total_cents"],
-                    "properties": {
-                        "order_id": { "type": "string" },
-                        "total_cents": { "type": "integer" }
-                    }
-                },
-                "allowed_subject_types": [SUBJECT_TYPE],
-            },
-        ])))
+        .with_type_registry(
+            StaticTypesRegistry::of(serde_json::json!([{ "id": TOPIC, "partitions": 4 }]))
+                .event_type::<OrderCreatedV1>(),
+        )
         .build()
         .await
 }

@@ -74,7 +74,7 @@ use crate::domain::session::Session;
 pub const CAPABILITY_FEEDBACK: &str = "feedback";
 
 /// Response shape returned by [`ReactionService::set_reaction`]. Mirrors
-/// `schemas/message/MessageReactionResponse.json` (`{message_id,
+/// the `docs/openapi.json` reaction response (`{message_id,
 /// reaction_type, applied}`).
 #[domain_model]
 #[derive(Debug, Clone, PartialEq, Eq)]

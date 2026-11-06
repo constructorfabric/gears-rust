@@ -180,7 +180,7 @@ pub enum ResetScope<'a> {
     Topic(&'a str),
 }
 
-/// The event envelope. Matches `gts.cf.core.events.event.v1~.schema.json` in the design and is the
+/// The event envelope. Matches the [`EventV1`](crate::gts::EventV1) schema and is the
 /// parameter/return type on the public [`EventBrokerApi`](crate::api::EventBrokerApi)
 /// (publish/storage side). Broker-stamped fields (`partition`, `sequence`,
 /// `sequence_time`) are `None` on publish payloads; the broker populates them on

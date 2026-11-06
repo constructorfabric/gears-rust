@@ -189,8 +189,18 @@ impl SessionService {
     pub async fn register_session_type(
         &self,
         ctx: &SecurityContext,
-        req: RegisterSessionTypeRequest,
+        mut req: RegisterSessionTypeRequest,
     ) -> Result<SessionType> {
+        // Transition alias: pre-fix plugin ids (`gtx.…~`) sent by older
+        // clients are mapped to the current valid GTS instance ids so they
+        // are persisted and resolved in canonical form.
+        if let Some(id) = req.plugin_instance_id.as_mut() {
+            let canonical = chat_engine_sdk::gts::canonical_plugin_instance_id(id);
+            if canonical != id.as_str() {
+                *id = canonical.to_owned();
+            }
+        }
+
         // @cpt-cf-chat-engine-design-auth-model
         // session_type mutation is a PDP permission decision, not a SQL scope:
         // `session_types` is a global unrestricted table (DESIGN §3.5.6). The

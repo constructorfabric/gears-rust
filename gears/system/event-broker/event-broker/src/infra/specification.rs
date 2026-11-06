@@ -254,7 +254,7 @@ pub async fn bulk_load(
         }
     }
 
-    let event_base = event_broker_sdk::gts::EventV1::TYPE_ID;
+    let event_base = event_broker_sdk::gts::EventV1::<()>::TYPE_ID;
     let schemas = match client
         .list_type_schemas(
             &ctx,
@@ -539,17 +539,32 @@ mod tests {
     use crate::config::EventBrokerConfig;
     use crate::domain::resolution::Source;
     use crate::infra::storage::migrations::Migrator;
-    use crate::test_support::type_registry::{derived_event_type, registry_holding};
+    use crate::test_support::type_registry::registry_holding;
+    use event_broker_sdk::gts::EventV1;
     use sea_orm_migration::MigratorTrait;
 
     const TOPIC_ID: &str = toolkit_gts::gts_id!("cf.core.events.topic.v1~example.eb.t1.topic.v1");
-    const EVENT_TYPE_ID: &str =
-        toolkit_gts::gts_id!("cf.core.events.event.v1~example.eb.t1.foo.v1~");
+    const EVENT_TYPE_ID: &str = <FooV1 as GtsSchema>::TYPE_ID;
     const SUBJECT_TYPE: &str = toolkit_gts::gts_id!("example.eb.t1.subject.v1~");
     const SQLITE_BACKEND: &str =
         toolkit_gts::gts_id!("cf.core.events.backend.v1~cf.core.backend.sqlite.v1~");
     /// The instance-less routing key every `backend_routing` requires.
     const BASE_ROUTE: &str = toolkit_gts::gts_id!("cf.core.events.topic.v1~");
+
+    crate::fixture_event_type!(
+        /// An event type that states its own partition pointer.
+        FooV1 = "cf.core.events.event.v1~example.eb.t1.foo.v1~",
+        topic = TOPIC_ID,
+        subjects = [SUBJECT_TYPE],
+        partition_key = "/tenant_id",
+    );
+
+    crate::fixture_event_type!(
+        /// The same type declaring no partition pointer of its own.
+        SilentFooV1 = "cf.core.events.event.v1~example.eb.t1.foo.v1~",
+        topic = TOPIC_ID,
+        subjects = [SUBJECT_TYPE],
+    );
 
     /// A topic instance carrying exactly what its base type declares - the
     /// partition count is not among them, and a document that named one would
@@ -661,12 +676,7 @@ mod tests {
         let cfg = config(&json!({}));
         let manager = manager_with(
             vec![topic_document(TOPIC_ID)],
-            vec![derived_event_type(
-                EVENT_TYPE_ID,
-                TOPIC_ID,
-                json!({}),
-                &[SUBJECT_TYPE],
-            )],
+            vec![FooV1::gts_schema_with_refs()],
             &cfg,
         )
         .await;
@@ -701,17 +711,7 @@ mod tests {
     #[tokio::test]
     async fn a_type_declaring_no_pointer_resolves_the_bases_default() {
         let cfg = config(&json!({}));
-        let silent = json!({
-            "$id": format!("gts://{EVENT_TYPE_ID}"),
-            "$schema": "http://json-schema.org/draft-07/schema#",
-            "x-gts-traits": { "topic": TOPIC_ID, "allowed_subject_types": [SUBJECT_TYPE] },
-            "type": "object",
-            "allOf": [
-                { "$ref": format!("gts://{}", event_broker_sdk::gts::EventV1::TYPE_ID) },
-                { "type": "object", "properties": { "data": { "type": ["object", "null"] } } },
-            ],
-        });
-
+        let silent = SilentFooV1::gts_schema_with_refs();
         let manager = manager_with(vec![topic_document(TOPIC_ID)], vec![silent], &cfg).await;
 
         let event_type = manager
@@ -733,12 +733,7 @@ mod tests {
         let cfg = config(&json!({}));
         let manager = manager_with(
             vec![topic_document(TOPIC_ID)],
-            vec![derived_event_type(
-                EVENT_TYPE_ID,
-                TOPIC_ID,
-                json!({}),
-                &[SUBJECT_TYPE],
-            )],
+            vec![FooV1::gts_schema_with_refs()],
             &cfg,
         )
         .await;
@@ -826,12 +821,7 @@ mod tests {
         let (db, dsn) = test_db_with_dsn().await;
         let client: Arc<dyn PlatformTypesRegistryApi> = registry_holding(
             &[topic_document(TOPIC_ID)],
-            &[derived_event_type(
-                EVENT_TYPE_ID,
-                TOPIC_ID,
-                json!({}),
-                &[SUBJECT_TYPE],
-            )],
+            &[FooV1::gts_schema_with_refs()],
         );
         super::bulk_load(&client, &db, &config(&json!({})))
             .await

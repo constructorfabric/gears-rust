@@ -12,7 +12,7 @@ mod entry_support;
 use bss_pricing::{
     api::rest::authoring::AuthoringState,
     infra::{
-        events::{self, APPROVAL_UNIT_SUBJECT_TYPE, EventSink, PRICE_BOOK_SUBJECT_TYPE, TOPIC},
+        events::{self, EventSink, TOPIC},
         reference_events::{PlanReferenceLost, PriceBookEntryReferenceLost},
     },
 };
@@ -20,6 +20,7 @@ use entry_support::policy_support;
 use entry_support::{Script, app_for, request, test_db, user_of};
 use event_broker::test_support::{EventBrokerHarness, StaticTypesRegistry};
 use event_broker_sdk::backend::{Partition, TopicPartition, Wait};
+use event_broker_sdk::gts::EventV1;
 use event_broker_sdk::{GtsInstanceId, Sequence, TypedEvent, api::EventBrokerApi};
 use serde_json::json;
 use std::{collections::BTreeSet, sync::Arc, time::Duration};
@@ -27,26 +28,64 @@ use uuid::Uuid;
 
 const PUBLISHED: &str = "gts.cf.core.events.event.v1~cf.bss.pricing.prices_published.v1~";
 const DECIDED: &str = "gts.cf.core.events.event.v1~cf.bss.pricing.approval_unit_decided.v1~";
-const ENTRY_SUBJECT_TYPE: &str =
-    "gts.cf.core.events.subject.v1~cf.bss.pricing.price_book_entry.v1~";
 /// The partitions pricing's topic is configured with: the broker's default, which the producer
 /// assumes when it declares none.
 const PARTITIONS: u32 = 8;
 
-/// A real in-process broker that knows pricing's topic and each `(type, subject type)` of
-/// `types`, every one over an object payload. The harness must outlive every publish.
-async fn broker_knowing(types: &[(&str, &str)]) -> EventBrokerHarness {
-    let mut spec = vec![json!({"id": TOPIC, "partitions": PARTITIONS})];
-    for (type_id, subject) in types {
-        spec.push(json!({
-            "id": type_id,
-            "topic": TOPIC,
-            "data_schema": {"type": "object"},
-            "allowed_subject_types": [subject],
-        }));
-    }
+// Fixture event types over any object payload: the broker is what these tests exercise, not the
+// payloads. The ids repeat the `TypedEvent` constants, and a publish under a mismatched id fails at
+// the broker.
+
+event_broker::fixture_event_type!(
+    PriceBookEntryReferenceLostTypeV1 =
+        "cf.core.events.event.v1~cf.bss.pricing.price_book_entry_reference_lost.v1~",
+    topic = TOPIC,
+    subjects = [toolkit_gts::gts_id!(
+        "cf.core.events.subject.v1~cf.bss.pricing.price_book_entry.v1~"
+    )],
+);
+event_broker::fixture_event_type!(
+    PlanReferenceLostTypeV1 = "cf.core.events.event.v1~cf.bss.pricing.plan_reference_lost.v1~",
+    topic = TOPIC,
+    subjects = [toolkit_gts::gts_id!(
+        "cf.core.events.subject.v1~cf.bss.pricing.plan_item.v1~"
+    )],
+);
+event_broker::fixture_event_type!(
+    PricesPublishedTypeV1 = "cf.core.events.event.v1~cf.bss.pricing.prices_published.v1~",
+    topic = TOPIC,
+    subjects = [toolkit_gts::gts_id!(
+        "cf.core.events.subject.v1~cf.bss.pricing.price_book.v1~"
+    )],
+);
+event_broker::fixture_event_type!(
+    PlanRevisionPublishedTypeV1 =
+        "cf.core.events.event.v1~cf.bss.pricing.plan_revision_published.v1~",
+    topic = TOPIC,
+    subjects = [toolkit_gts::gts_id!(
+        "cf.core.events.subject.v1~cf.bss.pricing.plan.v1~"
+    )],
+);
+event_broker::fixture_event_type!(
+    ApprovalUnitDecidedTypeV1 = "cf.core.events.event.v1~cf.bss.pricing.approval_unit_decided.v1~",
+    topic = TOPIC,
+    subjects = [toolkit_gts::gts_id!(
+        "cf.core.events.subject.v1~cf.bss.pricing.approval_unit.v1~"
+    )],
+);
+
+/// Adds one declared event type to a registry fixture.
+type Declare = fn(StaticTypesRegistry) -> StaticTypesRegistry;
+
+/// A real in-process broker that knows pricing's topic and each event type of `types`. The
+/// harness must outlive every publish.
+async fn broker_knowing(types: &[Declare]) -> EventBrokerHarness {
+    let topics = StaticTypesRegistry::of(json!([{"id": TOPIC, "partitions": PARTITIONS}]));
+    let registry = types
+        .iter()
+        .fold(topics, |registry, declare| declare(registry));
     EventBrokerHarness::builder()
-        .with_type_registry(StaticTypesRegistry::of(serde_json::Value::Array(spec)))
+        .with_type_registry(registry)
         .build()
         .await
 }
@@ -128,17 +167,7 @@ async fn enqueue(
 
 #[tokio::test]
 async fn a_bound_producer_delivers_committed_events_retries_dispatch_and_drops_rollbacks() {
-    let broker = broker_knowing(&[
-        (PriceBookEntryReferenceLost::TYPE_ID, ENTRY_SUBJECT_TYPE),
-        (PlanReferenceLost::TYPE_ID, PlanReferenceLost::SUBJECT_TYPE),
-        (PUBLISHED, PRICE_BOOK_SUBJECT_TYPE),
-        (
-            events::PlanRevisionPublished::TYPE_ID,
-            events::PlanRevisionPublished::SUBJECT_TYPE,
-        ),
-        (DECIDED, APPROVAL_UNIT_SUBJECT_TYPE),
-    ])
-    .await;
+    let broker = broker_knowing(&EVENT_TYPES.map(|(.., declare)| declare)).await;
     let (db, _, tenant, dsn) = test_db().await;
     let hub = Arc::new(toolkit::ClientHub::default());
     hub.register::<bss_products_sdk::PricingReferenceRegistry>(Arc::new(
@@ -299,11 +328,7 @@ async fn pooled_state() -> (
     EventBrokerHarness,
 ) {
     use toolkit::contracts::DatabaseCapability as _;
-    let known: Vec<(&str, &str)> = EVENT_TYPES
-        .iter()
-        .map(|(_, type_id, subject)| (*type_id, *subject))
-        .collect();
-    let broker = broker_knowing(&known).await;
+    let broker = broker_knowing(&EVENT_TYPES.map(|(.., declare)| declare)).await;
     let dsn = entry_support::TestDsn::new("pricing-wake-");
     let db = toolkit_db::connect_db(
         &dsn,
@@ -493,31 +518,36 @@ async fn a_door_wakes_the_sequencer_once_its_transaction_commits() {
 
 /// Every pricing event type, by the struct that implements `TypedEvent`: the census the bound
 /// producer is held to.
-const EVENT_TYPES: [(&str, &str, &str); 5] = [
+const EVENT_TYPES: [(&str, &str, &str, Declare); 5] = [
     (
         "PriceBookEntryReferenceLost",
         PriceBookEntryReferenceLost::TYPE_ID,
         PriceBookEntryReferenceLost::SUBJECT_TYPE,
+        |registry| registry.event_type::<PriceBookEntryReferenceLostTypeV1>(),
     ),
     (
         "PlanReferenceLost",
         PlanReferenceLost::TYPE_ID,
         PlanReferenceLost::SUBJECT_TYPE,
+        |registry| registry.event_type::<PlanReferenceLostTypeV1>(),
     ),
     (
         "PricesPublished",
         events::PricesPublished::TYPE_ID,
         events::PricesPublished::SUBJECT_TYPE,
+        |registry| registry.event_type::<PricesPublishedTypeV1>(),
     ),
     (
         "PlanRevisionPublished",
         events::PlanRevisionPublished::TYPE_ID,
         events::PlanRevisionPublished::SUBJECT_TYPE,
+        |registry| registry.event_type::<PlanRevisionPublishedTypeV1>(),
     ),
     (
         "ApprovalUnitDecided",
         events::ApprovalUnitDecided::TYPE_ID,
         events::ApprovalUnitDecided::SUBJECT_TYPE,
+        |registry| registry.event_type::<ApprovalUnitDecidedTypeV1>(),
     ),
 ];
 
@@ -554,17 +584,14 @@ fn typed_events_in_src() -> std::collections::BTreeSet<String> {
 /// The state comes with its database's DSN, which holds the database's temporary directory,
 /// and with the broker, which must outlive the state.
 async fn bind_with(
-    types: &[(&str, &str, &str)],
+    types: &[(&str, &str, &str, Declare)],
 ) -> anyhow::Result<(
     Arc<AuthoringState>,
     entry_support::TestDsn,
     EventBrokerHarness,
 )> {
-    let known: Vec<(&str, &str)> = types
-        .iter()
-        .map(|(_, type_id, subject)| (*type_id, *subject))
-        .collect();
-    let broker = broker_knowing(&known).await;
+    let declares: Vec<Declare> = types.iter().map(|(.., declare)| *declare).collect();
+    let broker = broker_knowing(&declares).await;
     let (db, _, _, dsn) = test_db().await;
     let hub = Arc::new(toolkit::ClientHub::default());
     hub.register::<bss_products_sdk::PricingReferenceRegistry>(Arc::new(
@@ -582,16 +609,14 @@ async fn bind_with(
 /// rather than failing the first business transaction that announces it.
 #[tokio::test]
 async fn the_bound_producer_prepares_every_pricing_event_type_at_bind() {
-    let listed: std::collections::BTreeSet<String> = EVENT_TYPES
-        .iter()
-        .map(|(n, _, _)| (*n).to_owned())
-        .collect();
+    let listed: std::collections::BTreeSet<String> =
+        EVENT_TYPES.iter().map(|(n, ..)| (*n).to_owned()).collect();
     assert_eq!(
         typed_events_in_src(),
         listed,
         "the census lists every TypedEvent"
     );
-    for (name, type_id, subject) in EVENT_TYPES {
+    for (name, type_id, subject, _) in EVENT_TYPES {
         let short = type_id
             .strip_prefix("gts.cf.core.events.event.v1~cf.bss.pricing.")
             .and_then(|rest| rest.strip_suffix(".v1~"))
@@ -611,7 +636,7 @@ async fn the_bound_producer_prepares_every_pricing_event_type_at_bind() {
     bind_with(&EVENT_TYPES)
         .await
         .expect("a broker that knows every pricing event type binds");
-    for (index, (name, type_id, _)) in EVENT_TYPES.iter().enumerate() {
+    for (index, (name, type_id, ..)) in EVENT_TYPES.iter().enumerate() {
         let mut known = EVENT_TYPES.to_vec();
         known.remove(index);
         let error = bind_with(&known)

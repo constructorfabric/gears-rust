@@ -25,14 +25,14 @@ pub const CONSUMER_GROUP_FAMILY_RESOURCE: ResourceType =
 /// Matches the event base type and its descendants. Invalid SDK metadata is
 /// handled by [`event_family`] without panicking.
 static EVENT_FAMILY: LazyLock<Option<GtsIdPattern>> =
-    LazyLock::new(|| GtsIdPattern::try_new(EventV1::TYPE_ID).ok());
+    LazyLock::new(|| GtsIdPattern::try_new(EventV1::<()>::TYPE_ID).ok());
 
 /// The event family pattern; fails closed when it cannot be built.
 fn event_family() -> Result<&'static GtsIdPattern, DomainError> {
     EVENT_FAMILY.as_ref().ok_or_else(|| {
         DomainError::Internal(format!(
             "event base type '{}' is not a valid GTS pattern",
-            EventV1::TYPE_ID
+            EventV1::<()>::TYPE_ID
         ))
     })
 }
@@ -78,7 +78,7 @@ pub fn event_type_interest_resource(pattern: &GtsIdPattern) -> Result<ResourceTy
             message: format!(
                 "event type selector '{}' cannot match any event type ({}…)",
                 pattern.pattern(),
-                EventV1::TYPE_ID
+                EventV1::<()>::TYPE_ID
             ),
         });
     }
@@ -87,7 +87,7 @@ pub fn event_type_interest_resource(pattern: &GtsIdPattern) -> Result<ResourceTy
         .iter()
         .any(GtsIdPatternSegment::is_wildcard);
     Ok(if wildcard {
-        ResourceType::from_static(EventV1::TYPE_ID, &[pep_properties::OWNER_TENANT_ID])
+        ResourceType::from_static(EventV1::<()>::TYPE_ID, &[pep_properties::OWNER_TENANT_ID])
     } else {
         ResourceType::new(
             pattern.pattern().to_owned(),
@@ -112,7 +112,7 @@ pub fn consumer_group_resource(group: &GtsInstanceId) -> ResourceType {
     ResourceType::new(group.as_ref().to_owned(), &[])
 }
 /// Generic resource for the platform-tenant-scope check
-/// (`docs/openapi.yaml`'s `TenantIdNotAuthorized`) - deliberately distinct
+/// (the `TenantIdNotAuthorized` code) - deliberately distinct
 /// from the topic/event-type resources: this call is about the
 /// calling principal's authority over the *target tenant*, not the
 /// topic/event type being acted on, so it stays its own `PolicyEnforcer`
@@ -122,7 +122,7 @@ pub const TENANT_SCOPE_RESOURCE: ResourceType =
     ResourceType::from_static(REQUEST_RESOURCE_TYPE, &[pep_properties::OWNER_TENANT_ID]);
 
 /// Overwrites a `DomainError::Forbidden`'s `code` with a specific
-/// `docs/openapi.yaml` code (`TopicNotAuthorized`/`EventTypeNotAuthorized`/
+/// REST machine code (`TopicNotAuthorized`/`EventTypeNotAuthorized`/
 /// `NotAuthorizedToProduce`/`TenantIdNotAuthorized`) - `From<EnforcerError>`
 /// only knows a generic `"AuthzDenied"`, since which specific check failed
 /// is known only at the call site (design.md "code-per-call-site"). A no-op

@@ -11,6 +11,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use authz_resolver_sdk::{AuthZResolverApi, EvaluationRequest, EvaluationResponse, PolicyEnforcer};
 use event_broker::test_support::{DenyingAuthZ, EventBrokerHarness, Json, StaticTypesRegistry};
+use event_broker_sdk::gts::EventV1;
 use http::HeaderValue;
 use serde_json::json;
 use toolkit_canonical_errors::CanonicalError;
@@ -20,15 +21,18 @@ const TOPIC: &str = "gts.cf.core.events.topic.v1~x.eb.errors.stream.v1";
 const EVENT_TYPE: &str = "gts.cf.core.events.event.v1~x.eb.errors.happy.v1~";
 const SUBJECT_TYPE: &str = "gts.x.eb.errors.subject.v1~";
 
+event_broker::fixture_event_type!(
+    /// Any object payload: an open type with no declared members.
+    HappyEventV1 = "cf.core.events.event.v1~x.eb.errors.happy.v1~",
+    topic = TOPIC,
+    subjects = [SUBJECT_TYPE],
+);
+
 fn registry() -> StaticTypesRegistry {
     StaticTypesRegistry::of(json!([
-        { "id": TOPIC, "partitions": 1 },
-        {
-            "id": EVENT_TYPE,
-            "topic": TOPIC,
-            "allowed_subject_types": [SUBJECT_TYPE],
-        },
-    ]))
+    { "id": TOPIC, "partitions": 1 },
+     ]))
+    .event_type::<HappyEventV1>()
 }
 
 /// A policy decision point that cannot be reached: every evaluation fails as

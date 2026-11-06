@@ -91,25 +91,3 @@ fn llm_message_metadata_round_trips() {
     let back: LlmMessageMetadata = serde_json::from_value(json).unwrap();
     assert_eq!(back, meta);
 }
-
-#[test]
-fn schema_ids_are_stable() {
-    // Acts as a tripwire: renaming any of these is a breaking change
-    // (clients persist the IDs in the GTS registry).
-    assert_eq!(
-        schema_ids::LLM_PLUGIN_CONFIG_SCHEMA_ID,
-        "gtx.cf.chat_engine.llm_gateway_plugin_config.v1~"
-    );
-    assert_eq!(
-        schema_ids::LLM_SUMMARIZATION_SETTINGS_SCHEMA_ID,
-        "gtx.cf.chat_engine.llm_gateway.summarization_settings.v1~"
-    );
-    assert_eq!(
-        schema_ids::LLM_MESSAGE_METADATA_SCHEMA_ID,
-        "gtx.cf.chat_engine.llm_gateway.message_metadata.v1~"
-    );
-    assert_eq!(
-        schema_ids::LLM_USAGE_SCHEMA_ID,
-        "gtx.cf.chat_engine.llm_gateway.usage.v1~"
-    );
-}

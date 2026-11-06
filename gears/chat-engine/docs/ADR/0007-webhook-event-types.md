@@ -2,6 +2,8 @@ Created:  2026-02-04 by Constructor Tech
 Updated:  2026-03-06 by Constructor Tech
 # ADR-0007: Webhook Event Schema with Typed Events
 
+> **Note**: the dotted-event design below (`message.new`, `history`, `timestamp`) is superseded by the implemented wire (`session_created`, `message`, `messages`, ...). See [WEBHOOK-PROTOCOL.md](../WEBHOOK-PROTOCOL.md). The typed `event` field decision itself still holds.
+
 
 <!-- toc -->
 

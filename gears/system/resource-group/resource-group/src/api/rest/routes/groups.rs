@@ -107,7 +107,7 @@ pub(super) fn register_group_routes(mut router: Router, openapi: &dyn OpenApiReg
         .operation_id("resource_group.delete_group")
         .summary("Delete resource group")
         .description(
-            "Delete a resource group. Use ?force=true to cascade delete subtree and memberships.",
+            "Delete a resource group. Without ?force=true, returns 409 if the group has children or memberships. Use ?force=true to cascade delete subtree and memberships.",
         )
         .tag(API_TAG)
         .authenticated()

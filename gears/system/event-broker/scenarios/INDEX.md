@@ -1,6 +1,6 @@
 # Event Broker — Scenario Guide
 
-Practical companion to [DESIGN.md](../docs/DESIGN.md) and [openapi.yaml](../docs/openapi.yaml). Each scenario is a concrete HTTP exchange: a literal request, the expected response, and the side effects the broker must produce.
+Practical companion to [DESIGN.md](../docs/DESIGN.md) and the REST route declarations in [routes/mod.rs](../event-broker/src/api/rest/routes/mod.rs) (generated OpenAPI at `/openapi.json`). Each scenario is a concrete HTTP exchange: a literal request, the expected response, and the side effects the broker must produce.
 
 Organized in two parts:
 
