@@ -664,7 +664,7 @@ An in-process map from tenant id to that tenant's ordered ancestor chain (parent
 3. Failures are not cached. A failed call fails the request with dependency unavailable; no entry is stored.
 4. The map is a bounded concurrent LRU cache of `chain_cache_max_entries` (default 100,000) entries. Inserting into a full map evicts the least recently used entry in constant time.
 5. There is no invalidation API. A stale entry is used for at most one TTL plus the duration of the request that read it. A stale chain can narrow or widen visibility. A tenant moved under a new parent keeps its former ancestors' shared catalog and does not yet see the new ancestors' shared providers, including ones that would shadow an inherited slug. A detached tenant keeps its former ancestors' shared catalog. A tenant whose `self_managed` flag changes keeps its previous chain, and so does each tenant below it. Deployments that need hierarchy changes to apply on the next request set the TTL to 0.
-6. Concurrent misses for the same tenant share one Tenant Resolver call (single flight per tenant).
+6. Concurrent misses for the same tenant share one Tenant Resolver call (single flight per tenant). At TTL 0 every request makes its own call, so a request never receives a chain fetched by a call that started before it.
 7. Expiry is checked against an injectable clock, the same clock that sets audit and approval timestamps.
 
 ##### Responsibility boundaries

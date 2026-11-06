@@ -299,7 +299,7 @@ The system **MUST** give models the same sharing modes as providers. A model **M
 
 - [ ] `p2` - **ID**: `cpt-cf-model-registry-fr-inherited-model-restriction`
 
-The system **MUST** let a Tenant Administrator restrict an individual inherited model for their tenant without shadowing its provider. A restricted model **MUST NOT** resolve or appear in the available list for the restricting tenant. The restriction **MUST NOT** change the model's approval state or the ancestor's catalog, and the other models of the provider and later changes to the ancestor's catalog **MUST** stay inherited. Lifting the restriction **MUST** restore the model.
+The system **MUST** let a Tenant Administrator restrict an individual inherited model for their tenant without shadowing its provider. A restricted model **MUST NOT** resolve or appear in the available list for the restricting tenant. The restriction **MUST NOT** change the model's approval state or the ancestor's catalog, and the other models of the provider and later changes to the ancestor's catalog **MUST** stay inherited. Lifting the restriction **MUST** return the model to the availability it would have without the restriction.
 
 - **Rationale**: Shadowing replaces a whole provider. A tenant that wants to block one inherited model, for example an expensive one, while keeping the others and future catalog updates would otherwise have to copy and maintain the rest of the provider's models.
 - **Actors**: `cpt-cf-model-registry-actor-tenant-admin`
@@ -328,7 +328,7 @@ The system **MUST**, given a canonical id and the calling tenant, return the ful
 
 - [ ] `p1` - **ID**: `cpt-cf-model-registry-fr-list-available-models`
 
-The system **MUST** list, for the calling tenant, exactly the models that would resolve successfully under `cpt-cf-model-registry-fr-resolve-model`. Listed models **MUST** carry the full model record, the same record resolution returns. The list **MUST** support OData filtering, ordering, selection, and paging on the model's general fields: identity, approval, capabilities, and user-facing fields.
+The system **MUST** list, for the calling tenant, exactly the models that would resolve successfully under `cpt-cf-model-registry-fr-resolve-model`. Listed models **MUST** carry the full model record, the same record resolution returns, unless the caller selects fields. The list **MUST** support OData filtering, ordering, selection, and paging on the model's general fields: identity, approval, capabilities, and user-facing fields.
 
 - **Rationale**: Users and consumer gears need to pick from models they can actually use.
 - **Actors**: `cpt-cf-model-registry-actor-consumer-gear`, `cpt-cf-model-registry-actor-llm-gateway`
