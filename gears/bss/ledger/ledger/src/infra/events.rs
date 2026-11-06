@@ -7,4 +7,3 @@
 pub mod alarm_catalog;
 pub mod payloads;
 pub mod publisher;
-pub mod schemas;

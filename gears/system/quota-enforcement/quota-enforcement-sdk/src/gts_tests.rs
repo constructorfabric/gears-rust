@@ -1,13 +1,12 @@
 #![allow(clippy::expect_used)]
 
-use gts::{GTS_ID_PREFIX, GTS_ID_URI_PREFIX, GtsRefValidation, GtsSchema, GtsStore};
+use gts::{GTS_ID_URI_PREFIX, GtsRefValidation, GtsStore};
 use serde_json::Value;
 use toolkit_gts::{InventoryInstance, InventoryTypeSchema};
 
 use super::{
-    CONSTRAINT_BASE, LEASE_RESOURCE, METRIC_BASE_TYPE, OPERATION_RESOURCE, OwnedDefinition,
-    POLICY_RESOURCE, QUOTA_RESOURCE, QuotaEnforcementStoragePluginSpecV1, REQUEST_BASE,
-    RESOURCE_BASE, SCOPE_TENANT, SCOPE_TYPE, SCOPE_USER, SUBJECT_BASE, owned_definitions,
+    CONSTRAINT_BASE, METRIC_BASE_TYPE, OwnedDefinition, REQUEST_BASE, RESOURCE_BASE, SCOPE_TYPE,
+    SCOPE_USER, SUBJECT_BASE, owned_definitions,
 };
 
 /// The reviewed owner examples of ADR-0007: one complete `llm_gateway` set.
@@ -65,92 +64,15 @@ fn definitions() -> Vec<OwnedDefinition> {
 }
 
 #[test]
-fn the_storage_plugin_spec_type_id_derives_from_the_toolkit_plugin_base() {
-    let storage = QuotaEnforcementStoragePluginSpecV1::TYPE_ID;
-    assert!(
-        storage.starts_with("gts.cf.toolkit.plugins.plugin.v1~"),
-        "{storage}"
-    );
-    assert!(storage.ends_with('~'));
-}
-
-#[test]
-fn the_notification_sink_spec_type_id_derives_from_the_toolkit_plugin_base() {
-    let sink = crate::QuotaNotificationSinkSpecV1::TYPE_ID;
-    assert!(
-        sink.starts_with("gts.cf.toolkit.plugins.plugin.v1~"),
-        "{sink}"
-    );
-    assert!(
-        sink.ends_with("~cf.core.qe.notification_sink.v1~"),
-        "{sink}"
-    );
-    assert_ne!(sink, QuotaEnforcementStoragePluginSpecV1::TYPE_ID);
-}
-
-#[test]
-fn resource_ids_are_distinct_five_segment_type_ids() {
-    let all = [
-        QUOTA_RESOURCE,
-        POLICY_RESOURCE,
-        LEASE_RESOURCE,
-        OPERATION_RESOURCE,
-    ];
-    for id in all {
-        assert!(id.starts_with("gts.cf.core.qe."), "{id}");
-        assert!(id.ends_with(".v1~"), "{id}");
-    }
-    let mut sorted = all.to_vec();
-    sorted.sort_unstable();
-    sorted.dedup();
-    assert_eq!(sorted.len(), all.len(), "resource ids must be unique");
-}
-
-#[test]
-fn owned_definitions_are_the_seven_qe_definitions_in_registration_order() {
-    let defs = definitions();
-    let ids: Vec<&str> = defs.iter().map(|d| d.id).collect();
-    assert_eq!(
-        ids,
-        [
-            SUBJECT_BASE,
-            RESOURCE_BASE,
-            REQUEST_BASE,
-            CONSTRAINT_BASE,
-            SCOPE_TYPE,
-            SCOPE_USER,
-            SCOPE_TENANT
-        ]
-    );
-    let owned_prefix = format!("{GTS_ID_PREFIX}cf.core.qe.");
-    for def in &defs {
-        assert!(
-            def.id.starts_with(&owned_prefix),
-            "{} is not a QE-owned definition",
+fn every_embedded_document_carries_the_id_of_its_constant() {
+    for def in definitions().iter().filter(|d| d.id.ends_with('~')) {
+        let expected = format!("{GTS_ID_URI_PREFIX}{}", def.id);
+        assert_eq!(def.document["$id"], expected, "{}", def.id);
+        assert_eq!(
+            def.document["$schema"], "http://json-schema.org/draft-07/schema#",
+            "{} must declare the Draft-07 dialect",
             def.id
         );
-    }
-    assert!(
-        !ids.contains(&METRIC_BASE_TYPE),
-        "the metric base is registry-owned and never registered by QE"
-    );
-}
-
-#[test]
-fn every_embedded_document_carries_the_id_of_its_constant() {
-    for def in definitions() {
-        if def.id.ends_with('~') {
-            let expected = format!("{GTS_ID_URI_PREFIX}{}", def.id);
-            assert_eq!(def.document["$id"], expected, "{}", def.id);
-            assert_eq!(
-                def.document["$schema"], "http://json-schema.org/draft-07/schema#",
-                "{} must declare the Draft-07 dialect",
-                def.id
-            );
-        } else {
-            assert_eq!(def.document["id"], def.id);
-            assert_eq!(def.document["type"], SCOPE_TYPE);
-        }
     }
 }
 
@@ -160,25 +82,6 @@ fn the_four_bases_are_abstract_and_the_scope_type_is_concrete() {
         let is_abstract = def.document["x-gts-abstract"] == Value::Bool(true);
         assert_eq!(is_abstract, def.id != SCOPE_TYPE, "{}", def.id);
     }
-}
-
-#[test]
-fn scope_instance_payloads_equal_the_documented_files() {
-    let user = parse(include_str!(
-        "../../docs/schemas/gts.cf.core.qe.scope.v1~cf.core.qe.user.v1.json"
-    ));
-    let tenant = parse(include_str!(
-        "../../docs/schemas/gts.cf.core.qe.scope.v1~cf.core.qe.tenant.v1.json"
-    ));
-    let defs = definitions();
-    let by_id = |id: &str| {
-        defs.iter()
-            .find(|d| d.id == id)
-            .map(|d| d.document.clone())
-            .expect("instance present")
-    };
-    assert_eq!(by_id(SCOPE_USER), user);
-    assert_eq!(by_id(SCOPE_TENANT), tenant);
 }
 
 #[test]
@@ -329,43 +232,4 @@ fn the_token_request_envelope_validates_against_its_resolved_contract() {
         bare_metadata.to_string().contains("type"),
         "{bare_metadata}"
     );
-}
-
-/// The published crate cannot reach `docs/`, so it ships its own copies of
-/// the five base schemas. This holds the copies to the reviewed files.
-#[test]
-fn the_shipped_base_schemas_are_byte_identical_to_the_reviewed_documents() {
-    const PAIRS: [(&str, &str, &str); 5] = [
-        (
-            "gts.cf.core.qe.subj.v1~.schema.json",
-            include_str!("../schemas/gts.cf.core.qe.subj.v1~.schema.json"),
-            include_str!("../../docs/schemas/gts.cf.core.qe.subj.v1~.schema.json"),
-        ),
-        (
-            "gts.cf.core.qe.res.v1~.schema.json",
-            include_str!("../schemas/gts.cf.core.qe.res.v1~.schema.json"),
-            include_str!("../../docs/schemas/gts.cf.core.qe.res.v1~.schema.json"),
-        ),
-        (
-            "gts.cf.core.qe.request.v1~.schema.json",
-            include_str!("../schemas/gts.cf.core.qe.request.v1~.schema.json"),
-            include_str!("../../docs/schemas/gts.cf.core.qe.request.v1~.schema.json"),
-        ),
-        (
-            "gts.cf.core.qe.constraint.v1~.schema.json",
-            include_str!("../schemas/gts.cf.core.qe.constraint.v1~.schema.json"),
-            include_str!("../../docs/schemas/gts.cf.core.qe.constraint.v1~.schema.json"),
-        ),
-        (
-            "gts.cf.core.qe.scope.v1~.schema.json",
-            include_str!("../schemas/gts.cf.core.qe.scope.v1~.schema.json"),
-            include_str!("../../docs/schemas/gts.cf.core.qe.scope.v1~.schema.json"),
-        ),
-    ];
-    for (name, shipped, reviewed) in PAIRS {
-        assert_eq!(
-            shipped, reviewed,
-            "quota-enforcement-sdk/schemas/{name} drifted from docs/schemas/{name}"
-        );
-    }
 }

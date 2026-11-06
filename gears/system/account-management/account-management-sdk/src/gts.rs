@@ -43,9 +43,8 @@ pub const TENANT_METADATA_RESOURCE_TYPE: &str = gts_id!("cf.core.am.tenant_metad
 pub const CONVERSION_REQUEST_RESOURCE_TYPE: &str = gts_id!("cf.core.am.conversion_request.v1~");
 
 /// AM `IdpUser` resource projection. Mirror of the
-/// `gts.cf.core.am.user.v1~` JSON Schema declared in
-/// `gears/system/account-management/docs/schemas/user.v1.schema.json`
-/// and produced by [`crate::IdpUser`]. Surfaces as the `resource_type`
+/// `gts.cf.core.am.user.v1~` schema declared by [`UserV1`]
+/// (the source of truth) and produced by [`crate::IdpUser`]. Surfaces as the `resource_type`
 /// on user-scoped canonical errors raised by the user-operations
 /// feature (`feature-idp-user-operations-contract`).
 pub const USER_RESOURCE_TYPE: &str = gts_id!("cf.core.am.user.v1~");
@@ -139,8 +138,8 @@ pub const USER_RG_TYPE_CODE: &str = gts_id!("cf.core.rg.type.v1~cf.core.am.user.
 //   * `conversion_request.v1~` -- registered via [`ConversionRequestV1`] below.
 //
 // Not on the registration list (no vendor-derived extensions planned):
-//   * `user_group.v1~` -- no consumer (the SDK constant was removed in
-//     this PR); the JSON file may be deletable separately.
+//   * `user_group.v1~` -- no consumer (the SDK constant was removed);
+//     the RG type is built in Rust by `register_user_group_types`.
 
 // ---------------------------------------------------------------------------
 // AM resource type schema mirrors
@@ -165,7 +164,7 @@ use toolkit_gts::{GtsTraitsSchema, gts_id, gts_type_schema};
 /// `ServiceUnavailable` and `create_user` is unavailable until the
 /// catalog is seeded.
 ///
-/// Field shape mirrors `docs/schemas/user.v1.schema.json` for
+/// Field shape mirrors the `UserV1` schema for
 /// `username` / `email` / `display_name` — the fields AM actually
 /// validates on the create-user payload. The `id` field is typed
 /// [`gts::GtsInstanceId`] only because `gts-macros` requires base
@@ -282,7 +281,7 @@ pub struct IdpPluginSpecV1;
 /// [`account-management::domain::gts_validation::validate_tenant_name_via_gts`]
 /// validates the tenant `name` against this schema's `properties.name` on
 /// every `create_tenant` — it is fail-closed, so a missing `name` property
-/// surfaces as Internal/500. Bounds mirror `docs/schemas/tenant.v1.schema.json`
+/// surfaces as Internal/500. Bounds mirror the `TenantV1` schema
 /// (and the DB `CHECK (length(name) BETWEEN 1 AND 255)`); guarded by
 /// `tenant_schema_constraints_tests`.
 #[gts_type_schema(
@@ -524,7 +523,7 @@ mod user_schema_constraints_tests {
     //! reaches the Types Registry at boot and that
     //! `account-management::domain::gts_validation::validate_new_user_payload_via_gts`
     //! enforces fail-closed — MUST carry the `minLength` / `maxLength` /
-    //! `format` constraints documented in `docs/schemas/user.v1.schema.json`.
+    //! `format` constraints declared by `UserV1`.
     //! Until <https://github.com/GlobalTypeSystem/gts-rust/issues/86> was
     //! understood these were silently dropped; schemars field helpers on
     //! `UserV1` now forward them verbatim through `schemars::schema_for!`.
@@ -629,7 +628,7 @@ mod tenant_schema_constraints_tests {
     //! `gts.cf.core.am.tenant.v1~`) is the type
     //! `account-management::domain::gts_validation::validate_tenant_name_via_gts`
     //! validates the tenant `name` against. It MUST declare `name` with the
-    //! `minLength`/`maxLength` bounds from `docs/schemas/tenant.v1.schema.json`.
+    //! `minLength`/`maxLength` bounds from `TenantV1`.
     //! If `name` is absent, the fail-closed validator returns Internal/500 on
     //! every `create_tenant` ("schema does not declare property `name`").
 

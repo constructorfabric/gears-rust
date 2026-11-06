@@ -388,9 +388,9 @@ When strict-mode enforcement is active, AM validates the chained schema identifi
 3. Validate the requested parent-child type relationship against the GTS `allowed_parent_types` rules — reject with `CanonicalError::FailedPrecondition` (HTTP 400, `reason=TYPE_NOT_ALLOWED`) if not permitted
 4. Call `IdpPluginClient::provision_tenant`; provider implementations create tenant-scoped resources or reuse shared ones based on deployment-specific behavior and tenant traits such as `idp_provisioning`. Providers **MUST NOT** silently no-op — unsupported operations **MUST** fail with `CanonicalError::Unimplemented` (HTTP 501)
 
-**User-group Resource Group type schema:** AM registers the chained RG type `gts.cf.core.rg.type.v1~cf.core.am.user_group.v1~` — [user_group.v1.schema.json](./schemas/user_group.v1.schema.json). It lives in the flat AM docs schema list, reuses the RG base contract, and defines no AM-specific `metadata` fields in v1. The `user_group` schema uses a chained GTS `$id` (`gts://gts.cf.core.rg.type.v1~cf.core.am.user_group.v1~`) because user groups are delegated to Resource Group per the Delegation-to-RG principle; the chain expresses that AM's user-group type extends the RG base resource-group type.
+**User-group Resource Group type schema:** AM registers the chained RG type `gts.cf.core.rg.type.v1~cf.core.am.user_group.v1~` — built in Rust by `register_user_group_types` ([registration.rs](../account-management/src/domain/user_groups/registration.rs)). It reuses the RG base contract, and defines no AM-specific `metadata` fields in v1. The `user_group` schema uses a chained GTS `$id` (`gts://gts.cf.core.rg.type.v1~cf.core.am.user_group.v1~`) because user groups are delegated to Resource Group per the Delegation-to-RG principle; the chain expresses that AM's user-group type extends the RG base resource-group type.
 
-**Referenced user resource schema:** The user-group type's `allowed_memberships` points at the platform user resource type `gts.cf.core.am.user.v1~` — [user.v1.schema.json](./schemas/user.v1.schema.json).
+**Referenced user resource schema:** The user-group type's `allowed_memberships` points at the platform user resource type `gts.cf.core.am.user.v1~` — [`UserV1`](../account-management-sdk/src/gts.rs).
 
 | Trait | Value | Meaning |
 |-------|-------|---------|

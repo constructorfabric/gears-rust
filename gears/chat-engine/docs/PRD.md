@@ -933,7 +933,7 @@ No explicit NFR exclusions at this time. All listed NFRs are in scope.
 
 See [openapi.json](openapi.json) for the public HTTP REST API and [WEBHOOK-PROTOCOL.md](WEBHOOK-PROTOCOL.md) for the Webhook protocol.
 
-See [schemas/README.md](../schemas/README.md) for JSON schema definitions.
+See [schemas/README.md](../schemas/README.md) for the retained webhook JSON schemas; REST contracts are defined by [openapi.json](openapi.json).
 
 ### 7.2 External Integration Contracts
 

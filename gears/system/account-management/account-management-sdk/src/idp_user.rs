@@ -14,8 +14,8 @@
 //! # `IdpUser` projection schema
 //!
 //! [`IdpUser`] mirrors the published GTS schema
-//! `gts.cf.core.am.user.v1~` declared in
-//! `gears/system/account-management/docs/schemas/user.v1.schema.json`.
+//! `gts.cf.core.am.user.v1~` declared by
+//! `UserV1` in `gts.rs`.
 //! The shape is intentionally tenant-minimal: no credentials, no
 //! `IdP`-internal identifiers, no membership cache. Provider plugins
 //! project only profile-like fields the `IdP` exposes.

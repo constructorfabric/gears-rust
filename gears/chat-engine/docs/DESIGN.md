@@ -286,11 +286,11 @@ Production code MUST NOT call `AccessScope::allow_all()` directly (bare) anywher
 
 **Technology**: GTS (JSON Schema)
 
-**Location**: `schemas/`
+**Location**: `schemas/` (webhook and LLM Gateway plugin schemas only; REST contracts are defined by the Rust DTOs in `chat-engine/src/api/rest/dto.rs` and `chat-engine-sdk/src/models.rs`, and by [`openapi.json`](openapi.json))
 
 **Core Schemas**:
 
-#### Session Operations (session/)
+#### Session Operations
 
 - **SessionCreateRequest** - Create session (session_type_id, client_id)
 - **SessionCreateResponse** - Session created (session_id, enabled_capabilities)
@@ -312,7 +312,7 @@ Production code MUST NOT call `AccessScope::allow_all()` directly (bare) anywher
 - **SessionsSearchResponse** - Sessions found (results)
 - **SessionSummarizeRequest** - Generate summary (session_id, enabled_capabilities)
 
-#### Message Operations (message/)
+#### Message Operations
 
 - **MessageSendRequest** - Send message (session_id, parts, file_ids, parent_message_id, enabled_capabilities) — `parts` is an ordered list of `MessagePartInput` (`{type, content}`); the legacy scalar `content` field is removed (see `cpt-cf-chat-engine-design-entity-message-part`)
 - **MessageListRequest** - List messages (session_id, parent_message_id)
@@ -323,7 +323,7 @@ Production code MUST NOT call `AccessScope::allow_all()` directly (bare) anywher
 - **MessageGetVariantsRequest** - Get variants (message_id)
 - **MessageGetVariantsResponse** - Variants list (variants, current_index)
 
-#### Streaming Events (streaming/)
+#### Streaming Events
 
 - [ ] `p1` - **ID**: `cpt-cf-chat-engine-design-streaming-protocol`
 
@@ -405,7 +405,7 @@ A dropped connection (network blip, client reload) MUST be resumable without re-
 - **SessionTypeHealthCheckEvent** - Health check (event, session_type_id, timestamp)
 - **SessionTypeHealthCheckResponse** - Health status (status, version, available_capabilities)
 
-#### Common Types (common/)
+#### Common Types
 
 ##### Session
 

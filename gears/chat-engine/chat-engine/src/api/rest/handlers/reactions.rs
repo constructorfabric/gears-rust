@@ -61,7 +61,7 @@ use crate::domain::service::reaction_service::{
 };
 
 /// Wire body for `POST /sessions/{s}/messages/{m}/reaction`. Mirrors
-/// `schemas/message/MessageReactionRequest.json`.
+/// `ReactionRequestDto` in `api/rest/dto.rs`.
 #[derive(Debug, Deserialize)]
 pub struct SetReactionBody {
     /// `"like"` | `"dislike"` | `"none"`. Unknown values cause serde to
@@ -76,7 +76,7 @@ pub struct SetReactionBody {
 }
 
 /// Wire response for `POST /sessions/{s}/messages/{m}/reaction`. Mirrors
-/// `schemas/message/MessageReactionResponse.json`.
+/// the `docs/openapi.json` reaction response.
 #[toolkit_macros::api_dto(response)]
 #[derive(Debug)]
 pub struct SetReactionResponseDto {

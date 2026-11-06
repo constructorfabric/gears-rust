@@ -136,10 +136,10 @@ Protocol specifications **reference** domain schemas from `../schemas/` using JS
 ```json
 {
   "request": {
-    "schema": "../schemas/session/SessionCreateRequest.json"
+    "schema": "../schemas/webhook/SessionCreatedEvent.json"
   },
   "response": {
-    "schema": "../schemas/session/SessionCreateResponse.json"
+    "schema": "../schemas/webhook/SessionCreatedResponse.json"
   }
 }
 ```

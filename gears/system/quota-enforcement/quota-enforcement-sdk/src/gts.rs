@@ -10,10 +10,9 @@
 //!    `Problem.context.resource_type` (DESIGN section 3.3, "Error Model").
 //! 3. The **projection contract bases** of ADR-0007: four abstract bases, the
 //!    concrete scope-discriminator type, and its two P1 well-known instances.
-//!    The documents are the crate's `schemas/` copies of the reviewed JSON
-//!    Schema files under `docs/schemas`: the copies ship inside the published
-//!    crate, and a test holds them byte-identical to the reviewed files, so
-//!    the registry receives exactly what was reviewed.
+//!    The documents are the JSON Schema files under the crate's `schemas/`
+//!    directory, embedded at compile time so they ship inside the published
+//!    crate and the registry receives exactly the reviewed files.
 //!    They reach `types-registry` two ways: through the link-time inventory
 //!    the registry seeds itself from in the embedded profile, and through the
 //!    gear's bootstrap, which re-asserts them idempotently for the deployed

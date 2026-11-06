@@ -2,70 +2,17 @@ Created:  2026-03-06 by Constructor Tech
 Updated:  2026-03-06 by Constructor Tech
 # Chat Engine JSON Schemas
 
-This directory contains JSON Schema definitions (Draft 7) for the Chat Engine API.
+This directory holds the JSON Schema definitions (Draft 7) for the Chat Engine **webhook protocol** and the LLM Gateway plugin.
+
+REST request/response contracts are **not** defined here. They are defined by the Rust DTOs (`chat-engine/src/api/rest/dto.rs`, `chat-engine-sdk/src/models.rs`) and the generated [`docs/openapi.json`](../docs/openapi.json).
 
 ## Structure
 
-- **core/** - Base protocol types (WebSocket message envelope, base payloads)
-- **session/** - Session management operations (create, get, delete, switch, export, share, search)
-- **message/** - Message operations (send, list, get, recreate, stop, variants)
-- **streaming/** - Real-time streaming events (start, chunk, complete, error)
-- **connection/** - Connection lifecycle events (ready, error)
-- **response/** - Generic response wrappers (success, error)
-- **push/** - Server-initiated push events (session updated, message created)
-- **webhook/** - Webhook protocol events (session lifecycle, message processing)
-- **common/** - Shared types (Session, Message, enums, content types)
+- **webhook/** - Webhook protocol events and responses (session lifecycle, message processing), see [`WEBHOOK-PROTOCOL.md`](../docs/WEBHOOK-PROTOCOL.md)
+- **llm_gateway/** - LLM Gateway plugin schemas (plugin config, metadata, usage, events)
+- **common/**, **message/**, **streaming/** - Only the shared types that the schemas above reference via `$ref` (e.g. `common/Message.json`, `common/Role.json`, `message/MessageGetResponse.json`, `streaming/StreamingCompleteEvent.json`)
 
-## GTS Identifiers
-
-All schemas use GTS (Generic Type System) identifiers with the prefix:
-
-```
-gtx.cf.chat_engine.<category>.<type_name>.v1~
-```
-
-Examples:
-- `gtx.cf.chat_engine.common.session.v1~`
-- `gtx.cf.chat_engine.session.create_request.v1~`
-- `gtx.cf.chat_engine.webhook.message_new_event.v1~`
-
-## Usage
-
-### Validation Libraries
-
-**TypeScript**:
-```typescript
-import Ajv from 'ajv';
-import sessionSchema from './schemas/common/Session.json';
-
-const ajv = new Ajv();
-const validate = ajv.compile(sessionSchema);
-const valid = validate(data);
-```
-
-**Python**:
-```python
-import jsonschema
-import json
-
-with open('schemas/common/Session.json') as f:
-    schema = json.load(f)
-
-jsonschema.validate(instance=data, schema=schema)
-```
-
-**Rust**:
-```rust
-use jsonschema;
-
-let schema = serde_json::from_str(include_str!("./schemas/common/Session.json"))?;
-let validator = jsonschema::validator_for(&schema)?;
-validator.validate(&instance)?;
-```
-
-## References
-
-Schemas use JSON Schema `$ref` for reusable types. References are relative paths:
+References between schemas use relative `$ref` paths:
 
 ```json
 {
