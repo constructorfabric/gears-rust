@@ -67,8 +67,8 @@ impl From<ConsumerGroup> for ConsumerGroupDto {
 
 /// Request body for `POST /v1/consumer-groups`
 /// (`docs/schemas/gts.cf.core.events.consumer_group.v1~.schema.json#/definitions/CreateRequest`)
-/// - the whole body is optional (`docs/openapi.yaml`'s `requestBody.required:
-/// false`); `client_agent` is required only once a body is sent at all
+/// - the whole body is optional (the route's request body is not
+/// required); `client_agent` is required only once a body is sent at all
 /// (`create_consumer_group`'s manual body-bytes handling, matching
 /// `ingest::producers::reset_producer`'s established optional-body pattern).
 #[derive(Debug)]

@@ -311,7 +311,7 @@ pub struct Cursor {
 
 /// Whether a `ConsumerGroup` was minted anonymously by `POST
 /// /v1/consumer-groups` or pre-registered by name via the types registry
-/// (`docs/openapi.yaml`'s `POST /v1/consumer-groups` description).
+/// (`POST /v1/consumer-groups`).
 #[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConsumerGroupKind {
@@ -336,7 +336,7 @@ pub struct ConsumerGroup {
 }
 
 /// Caller-suppliable fields for `DeliveryService::create_consumer_group`
-/// (`docs/openapi.yaml`'s `POST /v1/consumer-groups`'s `requestBody` is
+/// (`POST /v1/consumer-groups`'s request body is
 /// itself optional; `client_agent` is required only once a body is sent at
 /// all - both fields are `None` when no body is sent).
 #[domain_model]
@@ -352,8 +352,7 @@ pub struct ConsumerGroupCreateInput {
 
 /// Backend segment manifest for one `(topic, partition)`
 /// (`GET /v1/topics/segments`): the stored range and the segments the topic's
-/// backend reports for the whole partition. `segments` entries are opaque
-/// (`docs/openapi.yaml`). A partition that holds nothing, or is not yet
+/// backend reports for the whole partition. `segments` entries are opaque. A partition that holds nothing, or is not yet
 /// provisioned, has both sequences 0, no times and no segments.
 #[domain_model]
 #[derive(Debug, Clone)]

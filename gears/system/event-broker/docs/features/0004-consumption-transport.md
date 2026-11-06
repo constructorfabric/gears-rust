@@ -70,7 +70,7 @@ Provide a single, long-lived streaming consumption transport that:
 - [HTML Living Standard — Server-Sent Events](https://html.spec.whatwg.org/multipage/server-sent-events.html)
 - [features/0002-consumer-subscription-lifecycle.md](0002-consumer-subscription-lifecycle.md) — JOIN / re-JOIN / LEAVE
 - [DESIGN.md §3.3](../DESIGN.md) — API Contracts
-- [openapi.yaml](../openapi.yaml) — authoritative REST surface
+- [routes/mod.rs](../../event-broker/src/api/rest/routes/mod.rs) — authoritative REST surface (generated OpenAPI at `/openapi.json`)
 
 ## 2. Actor Flows (CDSL)
 

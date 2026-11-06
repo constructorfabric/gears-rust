@@ -112,7 +112,7 @@ pub fn consumer_group_resource(group: &GtsInstanceId) -> ResourceType {
     ResourceType::new(group.as_ref().to_owned(), &[])
 }
 /// Generic resource for the platform-tenant-scope check
-/// (`docs/openapi.yaml`'s `TenantIdNotAuthorized`) - deliberately distinct
+/// (the `TenantIdNotAuthorized` code) - deliberately distinct
 /// from the topic/event-type resources: this call is about the
 /// calling principal's authority over the *target tenant*, not the
 /// topic/event type being acted on, so it stays its own `PolicyEnforcer`
@@ -122,7 +122,7 @@ pub const TENANT_SCOPE_RESOURCE: ResourceType =
     ResourceType::from_static(REQUEST_RESOURCE_TYPE, &[pep_properties::OWNER_TENANT_ID]);
 
 /// Overwrites a `DomainError::Forbidden`'s `code` with a specific
-/// `docs/openapi.yaml` code (`TopicNotAuthorized`/`EventTypeNotAuthorized`/
+/// REST machine code (`TopicNotAuthorized`/`EventTypeNotAuthorized`/
 /// `NotAuthorizedToProduce`/`TenantIdNotAuthorized`) - `From<EnforcerError>`
 /// only knows a generic `"AuthzDenied"`, since which specific check failed
 /// is known only at the call site (design.md "code-per-call-site"). A no-op

@@ -1282,17 +1282,23 @@ The dispatcher's job for delivery routes is **cache-lookup-and-forward** - no ro
 **ID**: `cpt-cf-evbk-interface-api`
 
 > **Authoritative wire contract**: the full request/response shapes for every endpoint
-> below live in [`openapi.yaml`](openapi.yaml) and the per-resource JSON Schemas under
-> [`schemas/`](schemas/). This section keeps endpoint **summaries** and behavioral
-> contracts; concrete payloads are not duplicated here. Where prose below contains
-> illustrative JSON examples (kept for readability), the authoritative shape is the
-> referenced openapi path.
+> below are defined by the code: routes, operation ids and status codes by the
+> `OperationBuilder` registrations in [`routes/mod.rs`](../event-broker/src/api/rest/routes/mod.rs),
+> wire DTOs by the dto modules under
+> [`handlers/ingest/`](../event-broker/src/api/rest/handlers/ingest/dto.rs) and
+> [`handlers/delivery/`](../event-broker/src/api/rest/handlers/delivery/dto.rs), and error
+> codes by [`error.rs`](../event-broker/src/api/rest/error.rs). The running server
+> serves the generated OpenAPI document at `/openapi.json` (`make openapi` writes it out).
+> The per-resource JSON Schemas under [`schemas/`](schemas/) are separate reference
+> schemas. This section keeps endpoint **summaries** and behavioral contracts; concrete
+> payloads are not duplicated here. Where prose below contains illustrative JSON
+> examples (kept for readability), the authoritative shape is the DTO named next to it.
 
 #### Event Response Shape (Common)
 
 Every event in any response (single publish, batch result, list, poll, etc.) carries the same fields:
 
-> _Illustrative example removed; authoritative shape: [openapi.yaml](openapi.yaml)._
+> _Illustrative example removed; authoritative shape: `FrameDto` in [handlers/delivery/dto.rs](../event-broker/src/api/rest/handlers/delivery/dto.rs)._
 
 `partition` is backend-assigned (not producer-set); `meta.producer_id` / `meta.previous` / `meta.sequence` are producer chain fields inside the publish-input `meta` block (chained / monotonic modes; `meta` absent in stateless); `sequence` and `sequence_time` are backend-assigned consumer-visible fields (populated by the time consumers see the event via `read`). Publish is asynchronous: the `202 Accepted` producer response carries no `sequence` (assignment is async), and an idempotent duplicate is `200 OK` with no body. See §3.6 "Two Sequences".
 
@@ -1428,14 +1434,14 @@ POST   /v1/producers/{id}:reset                  # RESET (operator) — clear ch
 Request body: `{ "mode": ..., "client_agent": ... }`, both required and immutable (ADR-0004); no topic - a producer id may publish to any topic.
 
 Response (`201 Created`):
-> _Illustrative example removed; authoritative shape: [openapi.yaml](openapi.yaml)._
+> _Illustrative example removed; authoritative shape: `RegisterProducerResponse` in [handlers/ingest/dto.rs](../event-broker/src/api/rest/handlers/ingest/dto.rs)._
 
 Subsequent `POST /v1/events` requests carrying this id in `meta.producer_id` are accepted only when the call's principal matches the registered owner (`403 Forbidden` otherwise). Stateless producers don't call this endpoint and omit the `meta` block.
 
 **GET /v1/producers/{producer_id}/cursors** - Read the broker's known `last_sequence` per topic for a registered producer. Used for desync recovery (DB restore, restart without persistent state, suspected divergence).
 
 Response (`200 OK`):
-> _Illustrative example removed; authoritative shape: [openapi.yaml](openapi.yaml)._
+> _Illustrative example removed; authoritative shape: `ProducerCursorsResponse` in [handlers/ingest/dto.rs](../event-broker/src/api/rest/handlers/ingest/dto.rs)._
 
 Object grouped by topic (carries the echoed `producer_id` / `client_agent`), with one `last_sequence` per topic; future fields (e.g., `last_seen_at`, `mode`) are additive - extending without breaking.
 
@@ -1468,7 +1474,7 @@ Behavior:
 
 Response: `200 OK`
 
-> _Illustrative example removed; authoritative shape: [openapi.yaml](openapi.yaml)._
+> _Illustrative example removed; authoritative shape: `FrameDto` in [handlers/delivery/dto.rs](../event-broker/src/api/rest/handlers/delivery/dto.rs)._
 
 Each entry in `batches` carries its own `topic` + `partition` and the events from that pair. `assignments` lists every `(topic, partition)` currently owned by this subscription with its `offset` (= `cursor.offset` — the session cursor set by SEEK; where the next consumer joining the group would resume) and `last_examined` (the broker's highest scanned sequence for this group/partition regardless of filter match — see R57). When this member's filter rejects all events scanned, `last_examined` advances while `offset` stays put. When events do match, both advance together. (Filter is per-member: this advancement reflects the current owner's filter.)
 
@@ -1515,7 +1521,7 @@ Each built-in `OffsetManager` (`LocalDbOffsetManager`, `InMemoryOffsetManager`) 
 
 Response: `200 OK`
 
-> _Illustrative example removed; authoritative shape: [openapi.yaml](openapi.yaml)._
+> _Illustrative example removed; authoritative shape: `TopicDto` in [handlers/ingest/dto.rs](../event-broker/src/api/rest/handlers/ingest/dto.rs)._
 
 Each item is a DTO projected from the topic's registered instance, carrying `id`, `description`, and `retention`. See §"Topic Schema" for the projection table.
 
@@ -1532,7 +1538,7 @@ The partition count is broker configuration rather than topic data, so it is not
 
 Response: `200 OK`
 
-> _Illustrative example removed; authoritative shape: [openapi.yaml](openapi.yaml)._
+> _Illustrative example removed; authoritative shape: `TopicSegmentsResponse` in [handlers/ingest/dto.rs](../event-broker/src/api/rest/handlers/ingest/dto.rs)._
 
 Errors:
 - `400 InvalidPartition` — Partition out of range
@@ -1547,10 +1553,10 @@ Consumer groups are persistent broker resources (`event_broker_consumer_group` t
 **POST /v1/consumer-groups** — Register an **anonymous** consumer group. The broker mints the group identifier server-side; the request body MUST NOT carry an `id`.
 
 Request body:
-> _Illustrative example removed; authoritative shape: [openapi.yaml](openapi.yaml)._
+> _Illustrative example removed; authoritative shape: `CreateConsumerGroupRequest` in [handlers/delivery/dto.rs](../event-broker/src/api/rest/handlers/delivery/dto.rs)._
 
 Response (`201 Created`, `Location: /v1/consumer-groups/<encoded-gts-id>`):
-> _Illustrative example removed; authoritative shape: [openapi.yaml](openapi.yaml)._
+> _Illustrative example removed; authoritative shape: `ConsumerGroupDto` in [handlers/delivery/dto.rs](../event-broker/src/api/rest/handlers/delivery/dto.rs)._
 
 The broker generates a fresh UUID per request, composes the `gts.cf.core.events.consumer_group.v1~<uuid>` identifier, and returns it in both the response body and the `Location` header. `tenant_id` and `owner_principal_id` are pulled from `SecurityContext` at create time and are non-overridable. `kind` is always `anonymous` for this endpoint. The caller distributes the returned `id` to its consumer fleet via its own coordination mechanism (DB, ConfigMap, env var) — the coordination point is post-create, not pre-create.
 
@@ -1819,7 +1825,7 @@ Both must pass on publish; both must pass at subscribe. They cover different con
 **Stream / seek / leave** — follow-up operations check the caller's authority over the subscription tenant. During streaming, each matching event additionally passes the independent tenant, topic, and concrete event-type consume checks described above. JOIN decisions are not cached as enduring delivery authority. There is no separate `manage` permission for subscriptions.
 
 **Current implementation status** (`gears-rust#4516`, `eb-authz-enforcement`): the publish and JOIN
-paths above are implemented exactly to the subset `docs/openapi.yaml` documents — `event_type:produce`
+paths above are implemented exactly to the subset described here — `event_type:produce`
 plus tenant scope on publish, and `topic:consume` / `event_type:consume` plus tenant scope on JOIN,
 each `403` before the corresponding lookup/subscription-creation step. `topic:produce`,
 `subject_type:produce`, `subject_type:consume`, and the named/anonymous consumer-group

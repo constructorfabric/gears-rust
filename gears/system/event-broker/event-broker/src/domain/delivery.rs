@@ -143,8 +143,8 @@ pub trait DeliveryService: Send + Sync {
 
     /// Mints a fresh anonymous consumer group
     /// (`gts.cf.core.events.consumer_group.v1~<uuid>`,
-    /// `docs/openapi.yaml`'s `POST /v1/consumer-groups` - "`kind` is always
-    /// `anonymous` for this endpoint"; named groups come from
+    /// `POST /v1/consumer-groups` - `kind` is always
+    /// `anonymous` for this endpoint; named groups come from
     /// `types_registry`, not this call).
     async fn create_consumer_group(
         &self,
@@ -170,8 +170,8 @@ pub trait DeliveryService: Send + Sync {
 
     /// Fails with `Conflict { code: "ConsumerGroupHasActiveMembers", .. }`
     /// if any subscription currently belongs to the group
-    /// (`docs/openapi.yaml`: "Allowed only when there are no active
-    /// members").
+    /// (allowed only when there are no active
+    /// members).
     async fn delete_consumer_group(
         &self,
         ctx: &SecurityContext,

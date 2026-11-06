@@ -411,8 +411,8 @@ pub struct SeekResult {
 /// Implemented by: the in-process direct backend (the gear's `LocalBroker`) and
 /// the remote HTTP backend. This boundary is **transport-agnostic** - no
 /// HTTP types leak through it, and method docs describe operations, not wire paths.
-/// HTTP verbs/paths (and their renames) live solely in `openapi.yaml` and the HTTP
-/// backend, the single source of truth.
+/// HTTP verbs/paths (and their renames) live solely in the REST route declarations
+/// (`routes/mod.rs`) and the HTTP backend, the single source of truth.
 #[async_trait]
 pub trait EventBrokerApi: Send + Sync {
     // -- Producer --------------------------------------------------------------
@@ -543,7 +543,7 @@ pub trait EventBrokerApi: Send + Sync {
     async fn list_topics(&self, ctx: &SecurityContext) -> Result<Vec<Topic>, EventBrokerError>;
 
     /// The backend's segment manifest for one `(topic, partition)`. The wire
-    /// response is a single manifest object (`docs/openapi.yaml`), not a page.
+    /// response is a single manifest object, not a page.
     async fn list_topic_segments(
         &self,
         ctx: &SecurityContext,

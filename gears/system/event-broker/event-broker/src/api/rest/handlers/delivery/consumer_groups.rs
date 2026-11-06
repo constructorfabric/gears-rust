@@ -56,7 +56,7 @@ pub async fn list_consumer_groups(
     // Fetch-all-then-paginate-in-memory: see
     // `ConsumerGroupRepo::list_consumer_groups`'s `#[temporary]` doc
     // (`gears-rust#4347`).
-    // Open question: is a `kind` filter specified in openapi.yaml / DESIGN.md?
+    // Open question: is a `kind` filter specified in the route declarations / DESIGN.md?
     let mut groups = state.delivery.list_consumer_groups(&ctx).await?;
     if let Some(filter) = query.filter() {
         groups.retain(|g| {

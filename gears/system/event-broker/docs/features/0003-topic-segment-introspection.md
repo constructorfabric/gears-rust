@@ -54,7 +54,7 @@ Without it, operators have no way to answer routine retention / replay / lag que
 - Feature 0007 §2.1 storage backend trait - `query(at, range) -> Vec<TopicSegment>`, no `SecurityContext`
 - DESIGN.md §3.7 reference to `received` / `max_offset` derivability
 - DESIGN.md §4.6 Out of Scope (the future subscription-based backfill that supersedes external replay tooling)
-- `openapi.yaml#/paths/~1v1~1topics~1segments`
+- [routes/mod.rs](../../event-broker/src/api/rest/routes/mod.rs) — `GET /v1/topics/segments` registration (generated OpenAPI at `/openapi.json`)
 
 ## 2. Actor Flows (CDSL)
 
@@ -172,7 +172,7 @@ The endpoint is stateless from the broker's perspective. It reflects the backend
 
 - [ ] `p2` - **ID**: `cpt-cf-evbk-dod-topic-segment-introspection-endpoint`
 
-- `GET /v1/topics/segments` is implemented per `openapi.yaml`.
+- `GET /v1/topics/segments` is implemented per its route/DTO declarations in [routes/mod.rs](../../event-broker/src/api/rest/routes/mod.rs).
 - The backend's `query(at, range)` (feature 0007 §2.1) is wired through the storage-backend plugin trait.
 - Authorization checks `topic:read` permission via the PEP.
 - Pagination over the `segments[]` array works per the documented semantics.

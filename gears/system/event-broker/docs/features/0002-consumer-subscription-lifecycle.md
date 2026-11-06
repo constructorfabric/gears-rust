@@ -53,7 +53,7 @@ Consumer subscription lifecycle defines the end-to-end contract a consumer SDK m
 - DESIGN.md §3.2 Subscription Lifecycle + Long-Poll Mechanism
 - DESIGN.md §3.5 Long-Poll Consumption Flow
 - DESIGN.md §3.6 (delivery shard ownership and SD double-check)
-- `openapi.yaml` — wire shapes for all endpoints referenced below
+- [routes/mod.rs](../../event-broker/src/api/rest/routes/mod.rs) — route and DTO declarations (generated OpenAPI at `/openapi.json`): wire shapes for all endpoints referenced below
 - `ADR/0002-consumption-transport.md` — the transport (long-poll vs SSE vs multipart) is open; flows below assume the current long-poll transport.
 
 ## 2. Actor Flows (CDSL)

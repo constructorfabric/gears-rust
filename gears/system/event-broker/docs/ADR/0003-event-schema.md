@@ -230,7 +230,7 @@ The decision is verified by:
 
 * Good, because per-direction semantics are type-system-enforceable via separate files
 * Bad, because two files must be kept in sync — duplicate field declarations (mitigated via `$ref`, but still maintenance)
-* Bad, because the read schema was never `$ref`'d from `openapi.yaml`; it served as documentation-as-a-file, not as a wire contract. The intended codegen-separation benefit was never realized.
+* Bad, because the read schema was never `$ref`'d from the REST contract (the former hand-written OpenAPI file, since removed); it served as documentation-as-a-file, not as a wire contract. The intended codegen-separation benefit was never realized.
 * Bad, because the publish/read split is essentially a per-direction `required` puzzle that JSON Schema `readOnly` / `writeOnly` markers already solve in one file
 
 ### Full CloudEvents Conformance

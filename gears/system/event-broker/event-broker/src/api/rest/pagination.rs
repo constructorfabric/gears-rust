@@ -3,7 +3,7 @@
 //! `/v1/subscriptions`) via `toolkit::api::odata::OData` - the platform's
 //! real keyset (`CursorV1`) pagination, not an offset scheme. Each of these
 //! endpoints has exactly one supported sort key (its `id`, ascending); none
-//! declares an orderby-sortable field (`docs/openapi.yaml`), so a bare
+//! declares an orderby-sortable field, so a bare
 //! `$orderby` with no cursor is accepted but has nothing else to change
 //! (`OData` itself already rejects sending both `$orderby` and `cursor`
 //! together).
@@ -125,7 +125,7 @@ fn build_cursor(
 /// Evaluates a parsed `$filter` AST against one row, given a way to look up
 /// a named field's current value. Supports `eq`/`ne`, `and`/`or`/`not`, and
 /// `in` - the subset every list endpoint in this gear actually declares as
-/// filterable (bare equality checks per `docs/openapi.yaml`, e.g. `id eq
+/// filterable (bare equality checks, e.g. `id eq
 /// '...'`, `kind eq 'anonymous'`). `Function` nodes and comparison operators
 /// other than `eq`/`ne` are not evaluated (the row is excluded) since
 /// nothing here declares them as filterable.

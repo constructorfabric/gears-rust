@@ -500,7 +500,7 @@ async fn reset_producer_not_owner_returns_403() {
 
 // -- reset audit record -----------------------------------------------------
 //
-// `docs/openapi.yaml` promises an audit record per reset: one
+// The producer-reset contract promises an audit record per reset: one
 // `event_broker.events` record of `kind = "producer.chain_reset"` per
 // successful reset, whichever way in (REST or the in-process broker), and none
 // for a reset that fails. Each test reads only the records of its own span, and

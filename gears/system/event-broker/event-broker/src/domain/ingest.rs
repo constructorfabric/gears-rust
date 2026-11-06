@@ -87,7 +87,7 @@ pub struct ProducerRegistrationInput {
 }
 
 /// Result of `IngestService::register_producer` - echoes the identity fields
-/// `docs/openapi.yaml`'s `POST /v1/producers` response requires.
+/// the `POST /v1/producers` response requires.
 #[domain_model]
 #[derive(Debug, Clone)]
 pub struct ProducerRegistration {
@@ -116,7 +116,7 @@ pub struct ProducerTopicCursors {
     pub last_sequence: i64,
 }
 
-/// Result of `IngestService::get_producer_cursors` (`docs/openapi.yaml`'s
+/// Result of `IngestService::get_producer_cursors` (the
 /// `GET /v1/producers/{id}/cursors` response) - an object (not a bare
 /// array) so the echoed identity fields ride along and the shape stays
 /// extensible.
@@ -149,7 +149,7 @@ pub trait IngestService: Send + Sync {
     ) -> Result<BatchAck, DomainError>;
 
     /// Mint a fresh `producer_id` bound to `ctx`'s calling principal
-    /// (`docs/openapi.yaml`'s `POST /v1/producers`).
+    /// (`POST /v1/producers`).
     async fn register_producer(
         &self,
         ctx: &SecurityContext,
@@ -158,7 +158,7 @@ pub trait IngestService: Send + Sync {
 
     /// Read a producer's per-topic `last_sequence` cursors.
     /// Principal-bound - only the registering principal may call this
-    /// (`docs/openapi.yaml`'s `GET /v1/producers/{id}/cursors`).
+    /// (`GET /v1/producers/{id}/cursors`).
     async fn get_producer_cursors(
         &self,
         ctx: &SecurityContext,
@@ -166,8 +166,7 @@ pub trait IngestService: Send + Sync {
     ) -> Result<ProducerCursors, DomainError>;
 
     /// Operator-driven chain reset. Principal-bound - only the registering
-    /// principal may call this (`docs/openapi.yaml`'s
-    /// `POST /v1/producers/{id}:reset`).
+    /// principal may call this (`POST /v1/producers/{id}:reset`).
     async fn reset_producer(
         &self,
         ctx: &SecurityContext,

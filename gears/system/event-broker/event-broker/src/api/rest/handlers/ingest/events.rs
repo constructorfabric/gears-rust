@@ -89,7 +89,7 @@ pub async fn publish_event(
     )
 }
 
-/// Every answer is status only (`docs/openapi.yaml`). A batch is
+/// Every answer is status only. A batch is
 /// all-or-nothing: any one event's rejection rejects the whole request
 /// (`IngestService::publish_batch`, feature 0001 §5.2).
 ///

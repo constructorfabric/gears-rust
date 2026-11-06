@@ -737,7 +737,7 @@ impl EventBrokerApi for RestBroker {
         let qs = serde_html_form::to_string(&params).unwrap_or_default();
         let url = self.url(&format!("{V1}/topics/segments?{qs}"));
         // The wire response is a single manifest object (one per
-        // `(topic, partition)`), not a page - see `docs/openapi.yaml`.
+        // `(topic, partition)`), not a page.
         let m: wire::TopicSegmentsResponseWire =
             self.call_json(ctx, Method::Get, &url, None).await?;
         Ok(TopicSegment {

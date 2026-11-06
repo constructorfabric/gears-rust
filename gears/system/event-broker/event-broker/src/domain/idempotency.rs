@@ -20,7 +20,7 @@ use crate::domain::ingest::ProducerMode;
 /// (`meta.producer_id`, `meta.previous`, `meta.sequence`) against
 /// `ADR-0004`'s idempotent producer protocol. `SequenceViolation` carries
 /// the run's producer and the broker's current `last_sequence` so the caller
-/// can build the `docs/openapi.yaml` `412` response body without a second
+/// can build the `412` response body without a second
 /// lookup.
 #[domain_model]
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -47,7 +47,7 @@ const CONSUMER_GROUPS_TAG: &str = "consumer-groups";
 const SUBSCRIPTIONS_TAG: &str = "subscriptions";
 
 /// Adds `$filter`/`$orderby`/`limit`/`cursor` - the four list endpoints'
-/// shared query-param shape (`docs/openapi.yaml`). Not `OperationBuilderODataExt`
+/// shared query-param shape. Not `OperationBuilderODataExt`
 /// (`with_odata_filter::<T>()`): these handlers use `OData` + a manual
 /// `pagination::eval_filter` closure rather than a typed `FilterField` enum
 /// - no typed filter registry exists here, and adding one is out of scope
@@ -76,7 +76,7 @@ where
         )
 }
 
-/// The ingest role's endpoints of `docs/openapi.yaml`, registered when
+/// The ingest role's endpoints, registered when
 /// `DeploymentMode::ingest_active()` (`module.rs::register_rest`).
 ///
 /// `events:batch` is a deliberate static-segment action suffix (unlike

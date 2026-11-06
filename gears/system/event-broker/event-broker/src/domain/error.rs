@@ -2,7 +2,7 @@
 //!
 //! Coarse-grained by HTTP-status family (`api/rest/error.rs` maps each
 //! variant to one status code) rather than one variant per
-//! `docs/openapi.yaml` machine code - the specific code (e.g.
+//! REST machine code - the specific code (e.g.
 //! `BadTypePattern`, `ConsumerGroupHasActiveMembers`) rides along as an
 //! [`ErrorCode`] field instead, since there are dozens of them across the
 //! Hard-Error Catalogs and they don't otherwise affect handling here.
@@ -17,7 +17,7 @@ use event_broker_sdk::error::{reasons, resources};
 #[derive(Debug, Error)]
 pub enum DomainError {
     /// Client-supplied input failed validation - `api/rest/error.rs` lifts
-    /// this to `400`. `code` is the `docs/openapi.yaml` machine code (e.g.
+    /// this to `400`. `code` is the REST machine code (e.g.
     /// `BadTypePattern`, `InvalidMode`, `InvalidPartition`).
     #[error("{code}: {message}")]
     Validation { code: ErrorCode, message: String },
@@ -64,7 +64,7 @@ pub enum DomainError {
 
     /// Caller is not allowed to perform this operation on this resource -
     /// lifted to `403`. Distinct from `NotFound` even where
-    /// `docs/openapi.yaml` deliberately conflates them for information
+    /// the REST contract deliberately conflates them for information
     /// hiding (callers decide whether to conflate at the REST layer).
     /// `resource` is the raw identifier (not a full sentence) - `DESIGN.md`'s
     /// Hard-Error Catalog carries this separately as `context.resource_name`.
@@ -125,8 +125,8 @@ pub enum DomainError {
     #[error("malformed_run: event {index} does not follow the run before it")]
     MalformedRun { index: usize },
 
-    /// A batch exceeded the documented item-count ceiling. `docs/openapi.yaml`
-    /// documents this as `413` - `api/rest/error.rs` overrides the wire
+    /// A batch exceeded the documented item-count ceiling. The wire status
+    /// is `413` - `api/rest/error.rs` overrides the wire
     /// status accordingly while keeping the canonical `InvalidArgument`
     /// category.
     #[error("batch too large: {count} events (max {max})")]
@@ -319,8 +319,8 @@ impl ErrorCode {
         }
     }
 
-    /// The wire status a `Conflict` overrides to. `docs/openapi.yaml`
-    /// documents these conflicts as `409`, except the topology-version
+    /// The wire status a `Conflict` overrides to. These conflicts
+    /// are `409`, except the topology-version
     /// mismatch, which uses the `412` if-match idiom. `None` keeps the
     /// category default.
     #[must_use]
@@ -393,7 +393,7 @@ impl From<event_broker_sdk::backend::BackendError> for DomainError {
 }
 
 /// `EnforcerError::Denied` -> `Forbidden` with a generic `"AuthzDenied"` code;
-/// call sites that need a specific `docs/openapi.yaml` code
+/// call sites that need a specific REST machine code
 /// (`TopicNotAuthorized`, `EventTypeNotAuthorized`, `NotAuthorizedToProduce`,
 /// `TenantIdNotAuthorized`) overwrite `code` after this conversion
 /// (`eb-authz-enforcement`'s design.md "code-per-call-site" - tenant scope is
