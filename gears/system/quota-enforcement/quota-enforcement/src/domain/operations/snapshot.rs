@@ -18,12 +18,14 @@
 //! No instrument is added: a refused shape counts as an invalid-argument
 //! denial, as on every other surface, and the PDP's outcome is admission's.
 
+use crate::domain::admission::admission_span;
 use quota_enforcement_sdk::{
     ApplicableQuotas, MetricId, PageRequest, PageResult, QuotaSnapshot, SnapshotRequest,
     SubjectRef, SubjectScope, TenantId,
 };
 use serde_json::{Map, Value, json};
 use toolkit_macros::domain_model;
+use tracing::Instrument as _;
 use uuid::Uuid;
 
 use super::service::Operations;
@@ -76,6 +78,7 @@ impl Operations<'_> {
     /// tenant (all before the PDP), a metric or kind the catalogue does not
     /// map, or a foreign cursor; `PdpDenied` / `PdpUnavailable` from the PDP;
     /// the storage error of the read.
+    #[tracing::instrument(name = "quota_enforcement.operations.snapshot", skip_all, fields(tenant_id = %request.tenant_id, subject_count = request.subjects.len()))]
     pub async fn snapshot(
         &self,
         ctx: &toolkit_security::SecurityContext,
@@ -112,6 +115,7 @@ impl Operations<'_> {
                 AdmissionTarget::tenant(tenant_id),
                 filters_of(&targets),
             )
+            .instrument(admission_span(targets.len()))
             .await?;
         // @cpt-end:cpt-cf-quota-enforcement-flow-end-user-snapshot:p1:inst-eus-broaden
         // @cpt-end:cpt-cf-quota-enforcement-flow-end-user-snapshot:p1:inst-eus-broaden-if

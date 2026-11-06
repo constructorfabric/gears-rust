@@ -290,7 +290,7 @@ single-item counterparts (`cpt-cf-quota-enforcement-fr-authorization`,
 - API: `POST /v1/quota-enforcement/quotas/bulk-create`, `POST /v1/quota-enforcement/quotas/bulk-update`,
   `POST /v1/quota-enforcement/quotas/bulk-deactivate`
 - DB: `cpt-cf-quota-enforcement-db-schema`
-- Entities: `Quota`, `QuotaDraft`, `QuotaPatch`, `QuotaId` (quota-lifecycle entities, reused per item)
+- Entities: `Quota`, `QuotaDraft`, `QuotaUpdate`, `QuotaPatch`, `QuotaId` (quota-lifecycle entities, reused per item)
 
 ### All-or-Nothing Envelope Atomicity and Replay
 
@@ -398,7 +398,7 @@ no lease semantics are re-specified here.
 - **Contract shapes** (settled with the design owner): the storage plugin gains three typed primitives, one per
   bulk operation, each applying its envelope in one plugin-owned transaction that reuses the single-item
   transaction bodies; an item-specific failure inside it is reported wrapped with the item's index, and a failure of
-  the envelope as a whole (the backend, a payload mismatch, contention) is reported as is. `QuotaManagerClientV1`
+  the envelope as a whole (the backend, a payload mismatch, contention) is reported as is. `QuotaManagerApi`
   gains the three bulk calls, and REST and the in-process client enter the same domain methods. DESIGN records the
   names.
 - **Envelope idempotency scope**: a management envelope names its target Quotas explicitly and resolves no
@@ -430,7 +430,7 @@ no lease semantics are re-specified here.
 - **Rust contract notes**: the envelope handler is stateless above the storage plugin; per-item validation runs
   outside the storage transaction and holds no in-process lock across an await point, and row serialization inside
   the envelope transaction is delegated to the storage plugin under the ADR-0002 ordering. The envelope payloads are
-  plain data reusing the quota-lifecycle entity shapes (`QuotaDraft`, `QuotaPatch`, `QuotaId`), which are Send + Sync
+  plain data reusing the quota-lifecycle entity shapes (`QuotaDraft`, `QuotaUpdate`, `QuotaPatch`, `QuotaId`), which are Send + Sync
   compatible. Error attribution maps onto the closed `DomainError` enum and the canonical `Problem` envelope: an item's
   error keeps its own canonical category and names the item as `items[index]`.
 - **Rollout / rollback**: the endpoints are additive REST surface over the existing schema major version; no

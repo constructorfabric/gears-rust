@@ -9,7 +9,7 @@ use axum::body::Body;
 use axum::http::{Method, Request, StatusCode, header};
 use axum::{Extension, Router};
 use quota_enforcement_sdk::{
-    BulkDeactivateItem, BulkDeactivateQuotasRequest, QuotaManagerClientV1, QuotaStatus,
+    BulkDeactivateItem, BulkDeactivateQuotasRequest, QuotaManagerApi, QuotaStatus,
 };
 use serde_json::{Value, json};
 use toolkit::api::openapi_registry::OpenApiRegistryImpl;

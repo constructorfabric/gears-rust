@@ -319,6 +319,25 @@ fn quota_patch_default_is_empty_and_any_field_makes_it_non_empty() {
 }
 
 #[test]
+fn a_client_update_cannot_carry_a_constraint_contract() {
+    let contract = json!({ "type_id": "gts.cf.core.qe.constraint.v1~", "version": 1 });
+    let single = json!({
+        "quota_id": QuotaId::generate(),
+        "patch": { "metadata": {}, "constraint_contract": contract },
+    });
+    let err = serde_json::from_value::<crate::UpdateQuotaRequest>(single)
+        .expect_err("the gear alone names the contract");
+    assert!(err.to_string().contains("constraint_contract"), "{err}");
+    let item = json!({
+        "quota_id": QuotaId::generate(),
+        "patch": { "metadata": {}, "constraint_contract": contract },
+    });
+    let err = serde_json::from_value::<crate::BulkUpdateItem>(item)
+        .expect_err("the gear alone names the contract");
+    assert!(err.to_string().contains("constraint_contract"), "{err}");
+}
+
+#[test]
 fn decision_result_is_tagged_and_denied_carries_its_reason() {
     let quota = QuotaId::new(Uuid::from_u128(1));
     let denied = Decision {

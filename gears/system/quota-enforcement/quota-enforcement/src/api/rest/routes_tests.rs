@@ -244,47 +244,36 @@ async fn update_gates_rate_before_the_immutable_fields_and_applies_a_patch() {
     assert_eq!(body["record_version"], json!(2));
 }
 
+/// Percent-encode a query value: spaces and quotes, the characters `$filter`
+/// carries that a URI cannot.
+fn enc(raw: &str) -> String {
+    raw.replace(' ', "%20").replace('\'', "%27")
+}
+
+/// A crafted continuation, for the cursor contract's refusals.
+fn crafted_cursor(sort: &str, direction: &str, hash: Option<&str>) -> String {
+    toolkit_odata::CursorV1 {
+        k: vec!["AZM".to_owned()],
+        o: toolkit_odata::SortDir::Asc,
+        s: sort.to_owned(),
+        f: hash.map(str::to_owned),
+        d: direction.to_owned(),
+    }
+    .encode()
+    .expect("cursor")
+}
+
+async fn list(app: &Router, query: &str) -> (StatusCode, Value) {
+    send(app, Method::GET, &format!("/quotas?{query}"), None).await
+}
+
 #[tokio::test]
-async fn reads_list_with_repeated_ids_and_reject_bad_parameters() {
+async fn reads_one_quota_and_answers_404_for_an_unknown_id() {
     let app = app(bound_service(permitting()).await);
     let first = created(&app).await;
-    let second = created(&app).await;
     let (status, body) = send(&app, Method::GET, &format!("/quotas/{first}"), None).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["id"], json!(first.to_string()));
-
-    let (status, body) = send(
-        &app,
-        Method::GET,
-        &format!("/quotas?id={first}&id={second}&limit=1"),
-        None,
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["items"].as_array().expect("items").len(), 1);
-    assert!(body["next_cursor"].is_string(), "more rows follow: {body}");
-
-    let (status, body) = send(&app, Method::GET, "/quotas", None).await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["items"].as_array().expect("items").len(), 2);
-    assert!(body["next_cursor"].is_null());
-
-    for (query, token) in [
-        (
-            format!("?projection_type={LLM_USER_PROJECTION}"),
-            "LIST_SUBJECT_INCOMPLETE",
-        ),
-        ("?limit=0".to_owned(), "LIST_LIMIT_OUT_OF_RANGE"),
-        ("?status=paused".to_owned(), "STATUS_INVALID"),
-        ("?id=nope".to_owned(), "QUOTA_ID_INVALID"),
-        // Cursors are opaque to the gear; storage refuses one it did not issue
-        // and the refusal is caller input, never a 500.
-        ("?cursor=not-a-cursor".to_owned(), "CURSOR_INVALID"),
-    ] {
-        let (status, body) = send(&app, Method::GET, &format!("/quotas{query}"), None).await;
-        assert_eq!(status, StatusCode::BAD_REQUEST, "{query}: {body}");
-        assert!(body.to_string().contains(token), "{query}: {body}");
-    }
 
     let (status, body) = send(
         &app,
@@ -295,6 +284,203 @@ async fn reads_list_with_repeated_ids_and_reject_bad_parameters() {
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
     assert!(body.to_string().contains("cf.core.qe.quota.v1"), "{body}");
+}
+
+#[tokio::test]
+async fn the_list_filters_through_odata_and_pages_forward_with_a_bound_cursor() {
+    let app = app(bound_service(permitting()).await);
+    let first = created(&app).await;
+    let second = created(&app).await;
+    let third = created(&app).await;
+
+    let (status, body) = list(&app, "").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["items"].as_array().map(Vec::len), Some(3), "{body}");
+    assert!(body["page_info"]["next_cursor"].is_null(), "{body}");
+    assert!(body["page_info"]["prev_cursor"].is_null(), "{body}");
+
+    let every_field = format!(
+        "tenant_id eq {} and projection_type eq '{LLM_USER_PROJECTION}' and subject_id eq 'u1' \
+         and metric eq '{METRIC_TOKENS}' and status eq 'active' and id eq {third}",
+        tenant().as_uuid()
+    );
+    let (status, body) = list(&app, &format!("$filter={}", enc(&every_field))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["items"].as_array().map(Vec::len), Some(1), "{body}");
+    assert_eq!(body["items"][0]["id"], json!(third.to_string()));
+
+    for order in ["id", "id asc"] {
+        let (status, body) = list(&app, &format!("$orderby={}", enc(order))).await;
+        assert_eq!(status, StatusCode::OK, "{order}: {body}");
+    }
+
+    let filter = enc(&format!("id in ({first}, {second})"));
+    let (status, body) = list(&app, &format!("$filter={filter}&$top=1")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["items"][0]["id"], json!(first.to_string()));
+    assert_eq!(body["page_info"]["limit"], json!(1));
+    assert!(
+        body["page_info"]["prev_cursor"].is_null(),
+        "forward only: {body}"
+    );
+    let cursor = body["page_info"]["next_cursor"]
+        .as_str()
+        .expect("more rows follow")
+        .to_owned();
+
+    let (status, body) = list(&app, &format!("$filter={filter}&limit=1&cursor={cursor}")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["items"][0]["id"], json!(second.to_string()));
+    assert!(body["page_info"]["next_cursor"].is_null(), "{body}");
+
+    // The cursor is bound to the effective filter: changing or dropping it is refused.
+    let narrower = enc(&format!("id in ({first})"));
+    for (query, reason) in [
+        (
+            format!("$filter={narrower}&cursor={cursor}"),
+            "FILTER_MISMATCH",
+        ),
+        (format!("cursor={cursor}"), "FILTER_MISMATCH"),
+        (
+            format!("$filter={filter}&cursor={cursor}&$orderby=id"),
+            "ORDER_WITH_CURSOR",
+        ),
+    ] {
+        let (status, body) = list(&app, &query).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{query}: {body}");
+        assert!(body.to_string().contains(reason), "{query}: {body}");
+    }
+}
+
+#[tokio::test]
+async fn the_list_refuses_what_its_grammar_does_not_hold_with_a_400_naming_why() {
+    let app = app(bound_service(permitting()).await);
+    let _ = created(&app).await;
+    let tenant_id = tenant().as_uuid();
+    let backward = crafted_cursor("+id", "bwd", Some("0000000000000000"));
+    let unbound = crafted_cursor("+id", "fwd", None);
+    let other_order = crafted_cursor("+version", "fwd", Some("0000000000000000"));
+    for (query, reason) in [
+        // The former plain parameters are gone, not ignored.
+        (format!("tenant_id={tenant_id}"), "UNSUPPORTED_QUERY_PARAM"),
+        (format!("id={tenant_id}"), "UNSUPPORTED_QUERY_PARAM"),
+        ("$select=id".to_owned(), "UNSUPPORTED_QUERY_PARAM"),
+        // Operators, connectives and fields outside the allow-list.
+        (
+            format!("$filter={}", enc("metric ne 'x'")),
+            "INVALID_FILTER",
+        ),
+        (
+            format!("$filter={}", enc("metric eq 'a' or metric eq 'b'")),
+            "INVALID_FILTER",
+        ),
+        (
+            format!("$filter={}", enc("not (status eq 'active')")),
+            "INVALID_FILTER",
+        ),
+        (
+            format!("$filter={}", enc("contains(subject_id, 'u')")),
+            "INVALID_FILTER",
+        ),
+        (
+            format!("$filter={}", enc("metric in ('a', 'b')")),
+            "INVALID_FILTER",
+        ),
+        (
+            format!("$filter={}", enc("metric eq 'a' and metric eq 'b'")),
+            "INVALID_FILTER",
+        ),
+        (format!("$filter={}", enc("cap eq 5")), "INVALID_FILTER"),
+        (
+            format!("$filter={}", enc("tenant_id eq 'not-a-uuid'")),
+            "INVALID_FILTER",
+        ),
+        // Well-formed, but not a value the list understands.
+        (
+            format!(
+                "$filter={}",
+                enc(&format!("projection_type eq '{LLM_USER_PROJECTION}'"))
+            ),
+            "LIST_SUBJECT_INCOMPLETE",
+        ),
+        (
+            format!("$filter={}", enc("status eq 'paused'")),
+            "STATUS_INVALID",
+        ),
+        (
+            format!("$filter={}", enc("metric eq 'not-a-metric'")),
+            "METRIC_INVALID",
+        ),
+        // Ordering: the cursor's keyset order only.
+        (
+            format!("$orderby={}", enc("id desc")),
+            "INVALID_ORDERBY_FIELD",
+        ),
+        ("$orderby=metric".to_owned(), "INVALID_ORDERBY_FIELD"),
+        // Page size and continuation.
+        ("$top=0".to_owned(), "INVALID_LIMIT"),
+        ("$top=501".to_owned(), "INVALID_LIMIT"),
+        ("cursor=not-a-cursor".to_owned(), "INVALID_CURSOR"),
+        (format!("cursor={backward}"), "INVALID_CURSOR"),
+        (format!("cursor={unbound}"), "FILTER_MISMATCH"),
+        (format!("cursor={other_order}"), "ORDER_MISMATCH"),
+    ] {
+        let (status, body) = list(&app, &query).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{query}: {body}");
+        assert!(body.to_string().contains(reason), "{query}: {body}");
+    }
+    let (status, body) = list(&app, "$top=1&limit=1").await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "one page size, not two: {body}"
+    );
+}
+
+#[tokio::test]
+async fn the_openapi_document_publishes_the_list_allow_list_and_its_one_order() {
+    let registry = OpenApiRegistryImpl::new();
+    let _router = register_routes(Router::new(), &registry, unbound_service(permitting()));
+    let spec = registry
+        .build_openapi(&toolkit::api::OpenApiInfo::default())
+        .expect("spec");
+    let spec = serde_json::to_value(&spec).expect("spec json");
+    let list = &spec["paths"]["/v1/quota-enforcement/quotas"]["get"];
+    assert_eq!(
+        list["x-odata-filter"]["allowedFields"],
+        json!({
+            "id": ["eq", "in"],
+            "tenant_id": ["eq"],
+            "projection_type": ["eq"],
+            "subject_id": ["eq"],
+            "metric": ["eq"],
+            "status": ["eq"]
+        }),
+        "{list}"
+    );
+    assert!(
+        list.get("x-odata-orderby").is_none(),
+        "no order beyond `id asc`: {list}"
+    );
+    let names: Vec<&str> = list["parameters"]
+        .as_array()
+        .expect("parameters")
+        .iter()
+        .filter_map(|p| p["name"].as_str())
+        .collect();
+    for name in ["$filter", "$orderby", "$top", "limit", "cursor"] {
+        assert!(names.contains(&name), "{name} undeclared: {names:?}");
+    }
+    for gone in [
+        "tenant_id",
+        "projection_type",
+        "subject_id",
+        "metric",
+        "status",
+        "id",
+    ] {
+        assert!(!names.contains(&gone), "{gone} still declared: {names:?}");
+    }
 }
 
 #[tokio::test]

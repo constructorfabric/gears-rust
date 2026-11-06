@@ -146,7 +146,7 @@ Realises `cpt-cf-quota-enforcement-seq-lease-acquire`.
    1. [x] - `p1` - **RETURN** `LEASE_CONTENTION_TIMEOUT` (`StorageError::LeaseContentionTimeout` lifted to canonical `Aborted`, 409) with no hold on any Quota; increment `lease_contention_rejected_total` with the canonical registered `metric` label - `inst-lac-contention`
 8. [x] - `p1` - DB: `acquire_lease(applicable, plan, ttl, idem_scope)` in the single backend transaction: insert the `leases` row and one `lease_holds` row per Quota named in the Debit Plan, acquiring row locks in ascending lexicographic `quota_id` order (ADR-0002) so that either every named Quota's capacity is held or none is; capture `acquisition_period_id` for every consumption Quota in the plan (I5) and the acquisition's `IdempotencySubjectKey`; increment the active-lease counter same-tx (I7); persist `AcquireLeaseOutcome::Acquired { token }` as the idempotency outcome (I1, I2); commit - `inst-lac-insert`
 9. [x] - `p1` - Observe `lease_acquisition_wait_seconds` with the canonical registered `metric` label for the wait before successful acquisition or rejection on every path through steps 6 to 8 - `inst-lac-wait`
-10. [x] - `p1` - **RETURN** `{ lease_token, expiry_at }`; the token is opaque and server-issued, each applicable Quota's remaining capacity is decreased by the reserved amount for the TTL duration, and the SDK path is `QuotaEnforcementClientV1::acquire_lease(req)` returning `AcquireLeaseOutcome::Acquired { token }` (a `Denied` verdict from step 5 returns `AcquireLeaseOutcome::Denied { decision }`) - `inst-lac-return`
+10. [x] - `p1` - **RETURN** `{ lease_token, expiry_at }`; the token is opaque and server-issued, each applicable Quota's remaining capacity is decreased by the reserved amount for the TTL duration, and the SDK path is `QuotaEnforcementApi::acquire_lease(req)` returning `AcquireLeaseOutcome::Acquired { token }` (a `Denied` verdict from step 5 returns `AcquireLeaseOutcome::Denied { decision }`) - `inst-lac-return`
 
 ### Commit Lease
 
@@ -177,7 +177,7 @@ Realises `cpt-cf-quota-enforcement-seq-lease-commit`.
    1. [x] - `p1` - **RETURN** `OVER_COMMIT_NOT_AUTHORIZED` (`StorageError::OverCommitNotAuthorized`); callers that need more than their lease must reserve a higher worst-case estimate up front (`cpt-cf-quota-enforcement-fr-lease-commit`) - `inst-lcm-overcommit`
 6. [x] - `p1` - DB: `commit_lease(token, actual_amount, idem_scope, events)` in the same transaction: lock the `lease_holds` and counter rows for the `acquisition_period_id`, apply `actual_amount` against the acquisition period's counter and return `reserved - actual` to it (I5), transition the lease to `Committed`, decrement the active-lease counter, invoke the shared threshold-emission routine (`cpt-cf-quota-enforcement-algo-threshold-emission`; it stays silent for settlement-window mutations per ADR-0004), and persist the commit's idempotency record (I1, I11); commit - `inst-lcm-apply`
 7. [x] - `p1` - Cross-boundary attribution holds by construction: a commit after a period rollover mutates the acquisition period's counter and never the new period's, and a commit after the Quota's `validity_end` succeeds because the lease guarantee was earned at acquisition time; operators that want strict cutoffs constrain the TTL bounds instead - `inst-lcm-boundary`
-8. [x] - `p1` - **RETURN** the `Decision` (Allowed); the commit produces a debit record addressable by the commit call's idempotency key, so it is reversible through the consumption-operations rollback flow (`cpt-cf-quota-enforcement-flow-rollback`); the SDK path is `QuotaEnforcementClientV1::commit_lease(req)` returning `Decision` - `inst-lcm-return`
+8. [x] - `p1` - **RETURN** the `Decision` (Allowed); the commit produces a debit record addressable by the commit call's idempotency key, so it is reversible through the consumption-operations rollback flow (`cpt-cf-quota-enforcement-flow-rollback`); the SDK path is `QuotaEnforcementApi::commit_lease(req)` returning `Decision` - `inst-lcm-return`
 
 ### Release Lease
 
@@ -202,7 +202,7 @@ Realises `cpt-cf-quota-enforcement-seq-lease-release` (the symmetric inverse of
 3. [x] - `p1` - DB: lock the lease row under the same `state = 'active' AND expiry_at > now()` predicate (I4); **IF** the lease is expired or terminal - `inst-lrl-notactive-if`
    1. [x] - `p1` - **RETURN** `LEASE_NOT_ACTIVE`; an expired lease has already been semantically released, so a caller-issued release has nothing left to return - `inst-lrl-notactive`
 4. [x] - `p1` - DB: `release_lease(token, idem_scope, events)` in one transaction: return the full `held_amount` of every hold to the acquisition period's counter (I5), transition the lease to `Released`, decrement the active-lease counter, and persist the release's idempotency record (I1, I11); commit; the eight-kind event catalog defines no dedicated event for a caller-initiated release - `inst-lrl-apply`
-5. [x] - `p1` - **RETURN** the `Decision`; the SDK path is `QuotaEnforcementClientV1::release_lease(req)` returning `Decision` - `inst-lrl-return`
+5. [x] - `p1` - **RETURN** the `Decision`; the SDK path is `QuotaEnforcementApi::release_lease(req)` returning `Decision` - `inst-lrl-return`
 
 ## 3. Processes / Business Logic (CDSL)
 
@@ -271,8 +271,8 @@ the state change.
 - [x] `p1` - **ID**: `cpt-cf-quota-enforcement-dod-lease-endpoints`
 
 The system **MUST** deliver `LeaseManager` (`cpt-cf-quota-enforcement-component-lease-manager`) behind the three REST
-endpoints and the SDK methods `QuotaEnforcementClientV1::acquire_lease`,
-`QuotaEnforcementClientV1::commit_lease`, and `QuotaEnforcementClientV1::release_lease`. Acquire requests with
+endpoints and the SDK methods `QuotaEnforcementApi::acquire_lease`,
+`QuotaEnforcementApi::commit_lease`, and `QuotaEnforcementApi::release_lease`. Acquire requests with
 `amount <= 0` **MUST** be rejected with `INVALID_AMOUNT`, and requests with a missing `ttl` or a `ttl` outside
 `[min_lease_ttl, max_lease_ttl]` **MUST** be rejected with `TTL_OUT_OF_BOUNDS` without clamping; both fail-fasts fire
 before idempotency lookup, multi-quota evaluation, or any hold acquisition and persist nothing. All three operations

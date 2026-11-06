@@ -3950,6 +3950,7 @@ dependencies = [
  "cf-gears-toolkit-contract",
  "cf-gears-toolkit-db",
  "cf-gears-toolkit-macros",
+ "cf-gears-toolkit-odata",
  "cf-gears-toolkit-security",
  "cf-gears-types-registry",
  "cf-gears-types-registry-sdk",
@@ -3969,6 +3970,7 @@ dependencies = [
  "tokio-util",
  "tower",
  "tracing",
+ "tracing-subscriber",
  "utoipa",
  "uuid",
 ]
@@ -3998,18 +4000,26 @@ name = "cf-gears-quota-enforcement-sdk"
 version = "0.4.0"
 dependencies = [
  "async-trait",
+ "axum",
+ "cf-gears-toolkit",
  "cf-gears-toolkit-canonical-errors",
+ "cf-gears-toolkit-contract",
  "cf-gears-toolkit-gts",
+ "cf-gears-toolkit-http",
+ "cf-gears-toolkit-http-middleware",
+ "cf-gears-toolkit-odata",
  "cf-gears-toolkit-security",
  "gts",
  "inventory",
  "parking_lot",
  "schemars 1.2.3",
+ "secrecy",
  "serde",
  "serde_json",
  "thiserror 2.0.21",
  "time",
  "tokio",
+ "utoipa",
  "uuid",
 ]
 

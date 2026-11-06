@@ -9,18 +9,21 @@ use axum::http::Uri;
 use axum::response::IntoResponse;
 use toolkit::api::response::created_json;
 use toolkit::api::rest::extract::{Json as JsonBody, Path};
-use toolkit_contract::query::QueryParamsExtractor;
 use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
-use super::dto::{
-    CreateQuotaDto, DeactivateOutcomeDto, ListQuotasQuery, QuotaPageDto, QuotaViewDto,
-    UpdateQuotaDto,
-};
+use super::dto::{CreateQuotaDto, DeactivateOutcomeDto, QuotaViewDto, UpdateQuotaDto};
 use super::error::ApiResult;
+use super::odata_list::{
+    continuation, lower_quota_filter, next_cursor, page_size, reject_select, reject_unknown_params,
+    require_order,
+};
 use crate::domain::Service;
-use crate::domain::quotas::{CreateQuotaRequest, ListQuotasRequest, UpdateQuotaRequest};
-use quota_enforcement_sdk::QuotaId;
+use crate::domain::quotas::{CreateQuotaRequest, UpdateQuotaRequest};
+use axum::extract::Query;
+use quota_enforcement_sdk::{PageRequest, QuotaId, TenantId};
+use toolkit::api::odata::OData;
+use toolkit_odata::{Page, PageInfo};
 
 /// `POST /v1/quota-enforcement/quotas`: 201 with the view and a `Location`.
 ///
@@ -65,21 +68,46 @@ pub async fn get_quota(
     // @cpt-end:cpt-cf-quota-enforcement-flow-quota-read:p1:inst-qrd-return
 }
 
-/// `GET /v1/quota-enforcement/quotas`.
+/// `GET /v1/quota-enforcement/quotas`: `$filter`, `$orderby=id asc`, `$top` and a forward cursor.
 ///
 /// # Errors
 ///
-/// The domain error of the failed step, as a `Problem`.
+/// A query outside the list's grammar, or the domain error of the failed step, as a `Problem`.
 pub async fn list_quotas(
     Extension(ctx): Extension<SecurityContext>,
     Extension(service): Extension<Arc<Service>>,
-    QueryParamsExtractor(query): QueryParamsExtractor<ListQuotasQuery>,
-) -> ApiResult<axum::Json<QuotaPageDto>> {
+    Query(params): Query<Vec<(String, String)>>,
+    OData(query): OData,
+) -> ApiResult<axum::Json<Page<QuotaViewDto>>> {
+    reject_unknown_params(&params)?;
+    reject_select(query.select.as_ref())?;
+    require_order(&query.order, "id")?;
     let quotas = service.quotas()?;
-    let request = ListQuotasRequest::try_from(query)?;
-    let page = quotas.list(&ctx, request).await?;
-    Ok(axum::Json(QuotaPageDto::from(page)))
+    let limit = page_size(
+        query.limit,
+        PageRequest::DEFAULT_LIMIT,
+        quotas.limits().list_max_limit,
+    )?;
+    let parts = lower_quota_filter(query.filter.as_deref())?;
+    let binding = parts.binding(
+        parts
+            .tenant_id
+            .unwrap_or_else(|| TenantId::new(ctx.subject_tenant_id())),
+    );
+    let cursor = continuation(query.cursor.as_ref(), QUOTA_ORDER, &binding)?;
+    let page = quotas.list(&ctx, parts.into_request(limit, cursor)).await?;
+    Ok(axum::Json(Page {
+        items: page.items.into_iter().map(QuotaViewDto::from).collect(),
+        page_info: PageInfo {
+            next_cursor: next_cursor(page.next_cursor, QUOTA_ORDER, &binding)?,
+            prev_cursor: None,
+            limit: u64::from(limit),
+        },
+    }))
 }
+
+/// The keyset order of the Quota list, as a cursor's signed sort token.
+const QUOTA_ORDER: &str = "+id";
 
 /// `PATCH /v1/quota-enforcement/quotas/{id}`.
 ///

@@ -7,7 +7,9 @@
 //! and the in-process client both enter here, so both transports share one
 //! authorization boundary.
 
+use crate::domain::admission::admission_span;
 use std::collections::HashMap;
+use tracing::Instrument as _;
 
 use quota_enforcement_sdk::{
     DeactivateOutcome, MetricId, MetricKind, NotificationEvent, PageRequest, PageResult, Quota,
@@ -88,6 +90,7 @@ impl<'a> QuotaManagement<'a> {
     /// the catalogue membership error, the subject-scope violation, the
     /// metadata violation, then the storage error.
     // @cpt-flow:cpt-cf-quota-enforcement-flow-quota-create:p1
+    #[tracing::instrument(name = "quota_enforcement.quotas.create", skip_all, fields(tenant_id = %request.tenant_id, metric = %request.metric))]
     pub async fn create(
         &self,
         ctx: &SecurityContext,
@@ -107,6 +110,7 @@ impl<'a> QuotaManagement<'a> {
                 actions::CREATE,
                 AdmissionTarget::tenant(draft.tenant_id),
             )
+            .instrument(admission_span(1))
             .await?;
         // @cpt-end:cpt-cf-quota-enforcement-flow-quota-create:p1:inst-qcr-request
 
@@ -260,6 +264,7 @@ impl<'a> QuotaManagement<'a> {
     /// ([`DomainError::CapBelowConsumed`] and
     /// [`DomainError::ThresholdsRequireBoundedCap`] decided under the row lock).
     // @cpt-flow:cpt-cf-quota-enforcement-flow-quota-update:p1
+    #[tracing::instrument(name = "quota_enforcement.quotas.update", skip_all, fields(quota_id = %quota_id))]
     pub async fn update(
         &self,
         ctx: &SecurityContext,
@@ -268,7 +273,10 @@ impl<'a> QuotaManagement<'a> {
     ) -> Result<QuotaView, DomainError> {
         // @cpt-begin:cpt-cf-quota-enforcement-flow-quota-update:p1:inst-qup-request
         let patch = validate_update_shape(request).map_err(|e| self.shape_rejected(e))?;
-        let admitted = self.admit_resource(ctx, actions::UPDATE, quota_id).await?;
+        let admitted = self
+            .admit_resource(ctx, actions::UPDATE, quota_id)
+            .instrument(admission_span(1))
+            .await?;
         // @cpt-end:cpt-cf-quota-enforcement-flow-quota-update:p1:inst-qup-request
 
         let PreparedUpdate {
@@ -386,6 +394,7 @@ impl<'a> QuotaManagement<'a> {
     /// [`DomainError::QuotaDeactivated`] on a second deactivation, or the
     /// storage error.
     // @cpt-flow:cpt-cf-quota-enforcement-flow-quota-deactivate:p1
+    #[tracing::instrument(name = "quota_enforcement.quotas.deactivate", skip_all, fields(quota_id = %quota_id))]
     pub async fn deactivate(
         &self,
         ctx: &SecurityContext,
@@ -393,6 +402,7 @@ impl<'a> QuotaManagement<'a> {
     ) -> Result<DeactivateOutcome, DomainError> {
         let admitted = self
             .admit_resource(ctx, actions::DEACTIVATE, quota_id)
+            .instrument(admission_span(1))
             .await?;
         let (_, events) = self
             .prepare_deactivate(ctx, &admitted.access_scope, quota_id)
@@ -438,13 +448,17 @@ impl<'a> QuotaManagement<'a> {
     /// The PDP outcome, [`DomainError::NotFound`] for an unknown or
     /// out-of-scope id, or the registry's availability on a cold cache.
     // @cpt-flow:cpt-cf-quota-enforcement-flow-quota-read:p1
+    #[tracing::instrument(name = "quota_enforcement.quotas.get", skip_all, fields(quota_id = %quota_id))]
     pub async fn get(
         &self,
         ctx: &SecurityContext,
         quota_id: QuotaId,
     ) -> Result<QuotaView, DomainError> {
         // @cpt-begin:cpt-cf-quota-enforcement-flow-quota-read:p1:inst-qrd-request
-        let admitted = self.admit_resource(ctx, actions::GET, quota_id).await?;
+        let admitted = self
+            .admit_resource(ctx, actions::GET, quota_id)
+            .instrument(admission_span(1))
+            .await?;
         // @cpt-end:cpt-cf-quota-enforcement-flow-quota-read:p1:inst-qrd-request
         // @cpt-begin:cpt-cf-quota-enforcement-flow-quota-read:p1:inst-qrd-read
         // @cpt-begin:cpt-cf-quota-enforcement-flow-quota-read:p1:inst-qrd-deactivated
@@ -470,6 +484,7 @@ impl<'a> QuotaManagement<'a> {
     ///
     /// The list-shape violation, the PDP outcome, the storage error, or the
     /// registry's availability on a cold cache.
+    #[tracing::instrument(name = "quota_enforcement.quotas.list", skip_all, fields(tenant_id = tracing::field::Empty))]
     pub async fn list(
         &self,
         ctx: &SecurityContext,
@@ -480,6 +495,7 @@ impl<'a> QuotaManagement<'a> {
         let target = filter
             .tenant_id
             .unwrap_or_else(|| TenantId::new(ctx.subject_tenant_id()));
+        tracing::Span::current().record("tenant_id", tracing::field::display(target));
         // A wider grant must not widen an absent tenant to every tenant it covers.
         filter.tenant_id = Some(target);
         let admitted = self
@@ -490,6 +506,7 @@ impl<'a> QuotaManagement<'a> {
                 actions::LIST,
                 AdmissionTarget::tenant(target),
             )
+            .instrument(admission_span(1))
             .await?;
         // Rows outside the scope are absent, not errors; the cursor carries
         // position only and the scope is re-applied on every page.

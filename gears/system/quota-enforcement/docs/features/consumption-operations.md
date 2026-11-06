@@ -152,7 +152,7 @@ Realises `cpt-cf-quota-enforcement-seq-debit`.
 4. [x] - `p1` - Decision-shaped request fields are silently ignored per the PRD §3.4 trust boundary; the Decision is server-derived and response-only - `inst-deb-trust`
 5. [x] - `p1` - **IF** the Decision is `Denied` - `inst-deb-denied-if`
    1. [x] - `p1` - **RETURN** the Decision as an HTTP 200 verdict with an empty `debit_plan` and no counter mutation; increment `denial_total` by the closed `reason` kind - `inst-deb-denied`
-6. [x] - `p1` - **RETURN** the `Decision` body (`result`, `debit_plan`, `diagnostics`); the SDK path is `QuotaEnforcementClientV1::debit(req)` returning `Decision`; a Decision and a `Problem` are mutually exclusive outcomes - `inst-deb-return`
+6. [x] - `p1` - **RETURN** the `Decision` body (`result`, `debit_plan`, `diagnostics`); the SDK path is `QuotaEnforcementApi::debit(req)` returning `Decision`; a Decision and a `Problem` are mutually exclusive outcomes - `inst-deb-return`
 
 ### Credit
 
@@ -185,7 +185,7 @@ Realises `cpt-cf-quota-enforcement-seq-credit`.
 5. [x] - `p1` - **IF** the row is absent or outside the scope, in scope but another tenant's, deactivated, or a consumption Quota whose calendar window has elapsed (`time >= period_end` at the moment the transaction is evaluated) - `inst-cre-guard-if`
    1. [x] - `p1` - **RETURN** the matching rejection before any mutation: `StorageError::QuotaNotFound` lifts to `NotFound { kind: "quota" }` (404), `StorageError::SubjectOutOfScope` lifts to `PdpDenied` (403), `StorageError::QuotaDeactivated` lifts to `QUOTA_DEACTIVATED` (400), and `StorageError::PeriodClosed` lifts to `PERIOD_CLOSED` (400); credit closure is calendar-keyed, so the rejection fires immediately at the boundary even while the settlement window is still draining cross-period lease commits - `inst-cre-guard`
 6. [x] - `p1` - DB: `apply_credit(quota_id, amount, idem_key, events)` in the same transaction: an allocation Quota decrements its in-flight counter and a consumption Quota decreases the current-period consumed amount, both with a floor of zero; the idempotency record uses an `IdempotencySubjectKey` fingerprint of the owning Quota's `(projection_type, subject_id)` read under the same row lock, per `cpt-cf-quota-enforcement-fr-idempotency`, and the operation-log entry are persisted, and the `quota-counter-adjusted` event carrying the credited amount, the target `quota_id`, and the authenticated service principal from `SecurityContext` is enqueued (I11); commit - `inst-cre-apply`
-7. [x] - `p1` - **RETURN** the outcome; the SDK path is `QuotaManagerClientV1::credit(req)` returning `Decision` - `inst-cre-return`
+7. [x] - `p1` - **RETURN** the outcome; the SDK path is `QuotaManagerApi::credit(req)` returning `Decision` - `inst-cre-return`
 
 ### Rollback
 
@@ -216,7 +216,7 @@ Realises `cpt-cf-quota-enforcement-seq-rollback`.
 5. [x] - `p1` - **IF** the debit's attribution period has been fully settled, meaning its `period-rollover` event has been emitted - `inst-rlb-settled-if`
    1. [x] - `p1` - **RETURN** `PERIOD_CLOSED` before any mutation, with no event; rollback closure is settlement-keyed, intentionally asymmetric with credit's calendar-keyed closure, so cross-period lease commits stay reversible during the settlement window - `inst-rlb-settled`
 6. [x] - `p1` - DB: `apply_rollback(target, idem_write, events)` in one transaction: lock the affected counter rows, reverse the original mutation against the debit's `acquisition_period_id` (I5), never the wall-clock current period, persist the rollback's idempotency record under the scope fingerprinted from the re-authorized attribution (step 1), append the operation-log entry, and enqueue the `quota-rollback-applied` event carrying the original idempotency key, the rolled-back amount, the target Quota, and the consumer identity from `SecurityContext` (I11); commit - `inst-rlb-apply`
-7. [x] - `p1` - **RETURN** the Decision; the SDK path is `QuotaEnforcementClientV1::rollback(req)`; replay of the same rollback is a no-op after the first invocation - `inst-rlb-return`
+7. [x] - `p1` - **RETURN** the Decision; the SDK path is `QuotaEnforcementApi::rollback(req)`; replay of the same rollback is a no-op after the first invocation - `inst-rlb-return`
 
 ### Evaluate Preview
 
@@ -242,7 +242,7 @@ Realises `cpt-cf-quota-enforcement-seq-evaluate-preview`.
 2. [x] - `p1` - Consume the PDP-authorized, catalogue-mapped subject set (`cpt-cf-quota-enforcement-algo-subject-resolution`), then DB: `read_quota_snapshot` as a transactional snapshot read of current counter state with no read-modify hold and no contention against concurrent debits (I3) - `inst-prv-read`
 3. [x] - `p1` - DB: `read_policy(scope)`; invoke the Engine boundary (`cpt-cf-quota-enforcement-algo-engine-boundary`) unchanged: an invariant violation on the returned Decision surfaces the same canonical `Internal` error as the corresponding write (fail-closed) and increments `debit_plan_invariant_violations_total` per the engine boundary - `inst-prv-engine`
 4. [x] - `p1` - Persist nothing: no counter mutation, no held capacity, no idempotency record, no operation-log entry, and no outbox event, and no period row even across a boundary; only ephemeral telemetry counters move - `inst-prv-nopersist`
-5. [x] - `p1` - **RETURN** `DecisionPreview` carrying the full Decision shape plus `preview: true`, with `policy_id` and `policy_version` in diagnostics; the SDK path is `QuotaEnforcementClientV1::evaluate_preview(req)`; the verdict can be invalidated by concurrent debits, and callers that need held capacity use the lease flow instead (lease-operations feature) - `inst-prv-return`
+5. [x] - `p1` - **RETURN** `DecisionPreview` carrying the full Decision shape plus `preview: true`, with `policy_id` and `policy_version` in diagnostics; the SDK path is `QuotaEnforcementApi::evaluate_preview(req)`; the verdict can be invalidated by concurrent debits, and callers that need held capacity use the lease flow instead (lease-operations feature) - `inst-prv-return`
 
 ## 3. Processes / Business Logic (CDSL)
 
@@ -267,7 +267,7 @@ counter mutation
    1. [x] - `p1` - **RETURN** the canonical error and roll the transaction back; fail-closed, no counter mutation, no idempotency record - `inst-pipe-fail`
 7. [x] - `p1` - DB: `apply_debit_plan(applicable, plan, idem_scope, events)`: mutate every plan entry's counter, persist the idempotency record, append the operation-log entry, and enqueue the outbox events, all inside the same transaction (I1, I2, I11); a `Denied` Decision changes no counter and persists its idempotency record with an empty plan so an exact replay returns the original verdict (PRD §5.8), while the operation log records only successful mutating operations per the DESIGN `OperationLog` definition; a `NO_APPLICABLE_QUOTA` denial persists no idempotency record and no operation-log entry per the PRD §5.8 exception for that denial; concurrent multi-Quota mutations follow the deterministic lexicographic `quota_id` acquisition ordering of ADR-0002 - `inst-pipe-apply`
 8. [x] - `p1` - Forward the `AccessScope` unmodified into every storage read and write, where `SecureConn` compiles it into query filters (phase-2 defense-in-depth per `cpt-cf-quota-enforcement-algo-pdp-constraint-composition`); the orchestrator never calls the PDP, holds no `TypesRegistryClient`, and performs no schema resolution, so registry latency cannot enter the transaction - `inst-pipe-scope`
-9. [x] - `p1` - Emit the pipeline stage spans (`subject_resolution`, `applicable_quotas_fetch`, `policy_lookup`, `engine_evaluate`, `invariant_check`, `storage.apply_debit_plan`, `notification.enqueue`) per DESIGN §4.1 through the foundation telemetry conventions - `inst-pipe-spans`
+9. [x] - `p1` - Emit the `quota_enforcement.operations.debit` span with the admission phase and the evaluation as sibling spans and the storage call under the evaluation, per DESIGN §4.1 - `inst-pipe-spans`
 10. [x] - `p1` - **RETURN** the committed Decision; orchestrator instances are not singletons, join no cluster election, and delegate all synchronization between concurrent instances to the storage plugin's serialization of row mutations (I9) - `inst-pipe-return`
 
 ### Idempotency Lookup and Replay
@@ -370,7 +370,7 @@ While Active, an exact replay returns the stored outcome verbatim and a divergen
 
 The system **MUST** deliver `QuotaEnforcementService`
 (`cpt-cf-quota-enforcement-component-quota-enforcement-service`) as the S2S entry point for debit, credit, rollback,
-and preview, exposed as the four REST endpoints; debit, rollback and preview are `QuotaEnforcementClientV1` methods, and credit is `QuotaManagerClientV1::credit` only. Debit and credit requests with
+and preview, exposed as the four REST endpoints; debit, rollback and preview are `QuotaEnforcementApi` methods, and credit is `QuotaManagerApi::credit` only. Debit and credit requests with
 `amount <= 0` **MUST** be rejected with `INVALID_AMOUNT` before idempotency lookup (and, for debit, subject resolution)
 or any other pipeline step, persisting nothing. Operations targeting a Quota on a `Direct`-classified metric **MUST** be rejected with
 `METRIC_NOT_QUOTA_GATED` with no counter mutation and no idempotency, operation-log, or lease record. Every evaluation

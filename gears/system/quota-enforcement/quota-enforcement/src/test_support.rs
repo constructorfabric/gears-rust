@@ -1751,3 +1751,212 @@ pub async fn bound_service_over(
         .expect("bind");
     service
 }
+
+/// One opened span: its name, its parent's name, and its `item_count` field.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CapturedSpan {
+    pub name: String,
+    pub parent: Option<String>,
+    pub item_count: Option<u64>,
+}
+
+/// What one capture recorded.
+type Records = Arc<parking_lot::Mutex<Vec<CapturedSpan>>>;
+
+/// The root span a capture runs its calls under.
+const CAPTURE_ROOT: &str = "quota_enforcement_test.capture";
+
+/// The live captures, by the id their root spans carry.
+type LiveCaptures =
+    parking_lot::Mutex<HashMap<u64, std::sync::Weak<parking_lot::Mutex<Vec<CapturedSpan>>>>>;
+
+static CAPTURES: std::sync::LazyLock<LiveCaptures> = std::sync::LazyLock::new(Default::default);
+
+/// Records every `quota_enforcement.*` span opened under its root, through one global
+/// subscriber: a thread-local one let parallel `cargo test` cache spans as disabled.
+#[derive(Clone)]
+pub struct SpanCapture {
+    id: u64,
+    records: Records,
+}
+
+impl Default for SpanCapture {
+    fn default() -> Self {
+        static INSTALL: std::sync::Once = std::sync::Once::new();
+        static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        INSTALL.call_once(|| {
+            use tracing_subscriber::layer::SubscriberExt as _;
+            tracing::subscriber::set_global_default(
+                tracing_subscriber::registry().with(CaptureRouter),
+            )
+            .expect("the span capture is the test binary's global subscriber");
+        });
+        let id = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let records = Records::default();
+        CAPTURES.lock().insert(id, Arc::downgrade(&records));
+        Self { id, records }
+    }
+}
+
+impl SpanCapture {
+    fn root(&self) -> tracing::Span {
+        tracing::info_span!(CAPTURE_ROOT, capture = self.id)
+    }
+
+    /// Run `call` under this capture's root. A task it spawns is captured
+    /// only if it carries the span along, as production tracing needs too.
+    pub async fn within<F: std::future::Future>(&self, call: F) -> F::Output {
+        use tracing::Instrument as _;
+        call.instrument(self.root()).await
+    }
+
+    /// Run `call` under this capture's root, on this thread.
+    pub fn in_scope<T>(&self, call: impl FnOnce() -> T) -> T {
+        self.root().in_scope(call)
+    }
+
+    pub fn spans(&self) -> Vec<CapturedSpan> {
+        self.records.lock().clone()
+    }
+
+    pub fn names(&self) -> Vec<String> {
+        self.spans().into_iter().map(|s| s.name).collect()
+    }
+
+    pub fn parent_of(&self, name: &str) -> Option<String> {
+        self.spans()
+            .into_iter()
+            .find(|s| s.name == name)
+            .and_then(|s| s.parent)
+    }
+
+    pub fn clear(&self) {
+        self.records.lock().clear();
+    }
+}
+
+/// One `u64` field of a span, by name.
+struct U64Field {
+    name: &'static str,
+    value: Option<u64>,
+}
+
+impl tracing::field::Visit for U64Field {
+    fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+        if field.name() == self.name {
+            self.value = Some(value);
+        }
+    }
+
+    fn record_debug(&mut self, _: &tracing::field::Field, _: &dyn std::fmt::Debug) {}
+}
+
+fn u64_field(attrs: &tracing::span::Attributes<'_>, name: &'static str) -> Option<u64> {
+    let mut field = U64Field { name, value: None };
+    attrs.record(&mut field);
+    field.value
+}
+
+/// Hands each `quota_enforcement.*` span to the capture whose root it opens under.
+struct CaptureRouter;
+
+impl<S> tracing_subscriber::Layer<S> for CaptureRouter
+where
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+{
+    fn on_new_span(
+        &self,
+        attrs: &tracing::span::Attributes<'_>,
+        id: &tracing::span::Id,
+        ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        let Some(span) = ctx.span(id) else {
+            return;
+        };
+        let name = attrs.metadata().name();
+        if name == CAPTURE_ROOT {
+            let records = u64_field(attrs, "capture").and_then(|capture| {
+                CAPTURES
+                    .lock()
+                    .get(&capture)
+                    .and_then(std::sync::Weak::upgrade)
+            });
+            if let Some(records) = records {
+                span.extensions_mut().insert(records);
+            }
+            return;
+        }
+        if !name.starts_with("quota_enforcement.") {
+            return;
+        }
+        let Some(records) = span
+            .scope()
+            .skip(1)
+            .find_map(|ancestor| ancestor.extensions().get::<Records>().cloned())
+        else {
+            return;
+        };
+        let parent = span
+            .parent()
+            .filter(|parent| parent.name() != CAPTURE_ROOT)
+            .map(|parent| parent.name().to_owned());
+        records.lock().push(CapturedSpan {
+            name: name.to_owned(),
+            parent,
+            item_count: u64_field(attrs, "item_count"),
+        });
+    }
+}
+
+/// One callsite for both threads: interest is cached per callsite.
+fn capture_probe() -> tracing::Span {
+    tracing::info_span!("quota_enforcement.capture_probe")
+}
+
+#[test]
+fn a_span_first_opened_on_another_thread_is_still_captured() {
+    let capture = SpanCapture::default();
+    std::thread::spawn(|| drop(capture_probe()))
+        .join()
+        .expect("probe thread");
+    capture.in_scope(|| drop(capture_probe()));
+    assert_eq!(
+        capture.names(),
+        vec!["quota_enforcement.capture_probe".to_owned()]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_span_opened_in_a_worker_task_under_the_capture_is_captured() {
+    use tracing::Instrument as _;
+    let capture = SpanCapture::default();
+    capture
+        .within(async {
+            tokio::spawn(
+                async {
+                    drop(tracing::info_span!(
+                        "quota_enforcement.capture_worker_probe"
+                    ));
+                }
+                .in_current_span(),
+            )
+            .await
+            .expect("worker task");
+        })
+        .await;
+    assert_eq!(
+        capture.names(),
+        vec!["quota_enforcement.capture_worker_probe".to_owned()]
+    );
+}
+
+#[test]
+fn each_capture_records_only_the_spans_under_its_own_root() {
+    let (mine, other) = (SpanCapture::default(), SpanCapture::default());
+    mine.in_scope(|| drop(capture_probe()));
+    assert_eq!(
+        mine.names(),
+        vec!["quota_enforcement.capture_probe".to_owned()]
+    );
+    assert_eq!(other.names(), Vec::<String>::new());
+}
