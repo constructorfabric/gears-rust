@@ -3,8 +3,8 @@ upstreams and routes provisioned from the types registry, and the proxy
 configuration cache a database turns on (ADR-0020).
 
 They need this suite's ``sqlite`` profile (``make e2e-oagw-sqlite``). It binds
-OAGW to SQLite and adds the upstream and routes below to the types-registry
-``entities`` (see ``e2e.yaml``). The launcher cannot restart the server, so
+OAGW to SQLite and publishes ``registry-fixtures.json`` through the legacy
+registry API after host startup. The launcher cannot restart the server, so
 restart survival is tested in the gear's ``gear_tests.rs`` and the
 reconcile in ``domain/services/registry_reconcile_tests.rs``. On a database
 OAGW reconciles in a background task after the server reports healthy; the
@@ -39,7 +39,7 @@ from .helpers import (
     update_upstream,
 )
 
-# Mirrors the types-registry entities of the sqlite profile in e2e.yaml.
+# Mirrors the sqlite profile's registry-fixtures.json.
 REGISTRY_ALIAS = "e2e-registry-upstream"
 REGISTRY_TAGS = ["e2e-registry"]
 # The tenant of `oagw_headers`, the root tenant a registry instance without

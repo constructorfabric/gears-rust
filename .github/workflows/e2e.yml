@@ -242,6 +242,14 @@ jobs:
         id: setup
         run: pip install -r testing/e2e/requirements.txt
 
+      - name: Test E2E harness
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        env:
+          PYTEST_ADDOPTS: "--junitxml=${{ github.workspace }}/test-results/e2e/harness.xml -o junit_suite_name=e2e-harness"
+        run: |
+          make py-env
+          .venv/bin/python -m pytest testing/e2e/lib -q
+
       # `make e2e-local` (no SUITE) runs only the shared-server suites
       # (launcher: e2e-launcher) against a single server. Self-managed suites
       # (launcher: pytest — mini-chat, usage-collector) and profile lanes
