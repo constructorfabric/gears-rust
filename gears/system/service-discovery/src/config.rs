@@ -30,18 +30,11 @@ pub struct ServiceDiscoveryConfig {
     /// `billing`. Same guidance as `platform_namespaces`.
     #[serde(default)]
     pub trust_domains: Vec<String>,
-    /// Additional gRPC-service-name -> owning-gear map, for gears the binary does
-    /// **not** compile in (e.g. remote / out-of-process gears). Pins which gear
-    /// may advertise a name so ownership is decided here rather than by whichever
-    /// gear self-registers first (which would let a gear squat a name it was
-    /// never assigned).
-    ///
-    /// Compiled-in gears do not need entries here: the runtime derives their
-    /// ownership from the compiled registry and installs it as authoritative,
-    /// overriding any config entry that disagrees (see
-    /// `GearManager::merge_authoritative_grpc_service_owners`). Use this only for
-    /// names the local binary cannot know about. Names absent everywhere keep
-    /// first-registration ownership. Empty by default.
+    /// Service-name -> gear ownership, loaded before directory serving.
+    /// Configure application/`OoP` names to protect them before registration.
+    /// Compiled-in owners are merged later, overriding conflicting entries.
+    /// Unconfigured names use first-registration ownership. Empty by default;
+    /// caller authorization is checked separately.
     #[serde(default)]
     pub grpc_service_owners: HashMap<String, String>,
 }

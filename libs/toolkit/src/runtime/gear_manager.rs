@@ -325,7 +325,8 @@ impl GearManager {
     /// names keep first-registration ownership. Seeded from operator config, then
     /// layered with the compiled-in owners via
     /// [`merge_authoritative_grpc_service_owners`](Self::merge_authoritative_grpc_service_owners) —
-    /// both at startup, before any gear self-registers.
+    /// as each group's installers become available. Configure application/`OoP` names
+    /// explicitly to protect them before initialization and registration.
     ///
     /// Taken under `reg_lock` so it can't interleave with an in-flight
     /// [`register_instance`](Self::register_instance) check + commit.
@@ -343,8 +344,7 @@ impl GearManager {
     /// absent here (e.g. remote / out-of-process gears) keep their configured
     /// owner.
     ///
-    /// Runs once in the runtime's gRPC phase before self-registration, under
-    /// `reg_lock` like [`set_grpc_service_owners`](Self::set_grpc_service_owners).
+    /// Runs before each group's registration, under `reg_lock`.
     pub fn merge_authoritative_grpc_service_owners(&self, authoritative: HashMap<String, String>) {
         let _gate = self.reg_lock.lock();
         let mut owners = self.service_owners.write();

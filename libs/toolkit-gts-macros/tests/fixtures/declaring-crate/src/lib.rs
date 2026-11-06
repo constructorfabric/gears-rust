@@ -1,7 +1,5 @@
-//! A declaring crate for the crate-local GTS collector tests: it declares its
-//! own collector, depends on `toolkit-gts` under another name (`gts_kit`), and
-//! mixes `local` declarations with a crate-root (global-only) one, some behind an
-//! always-true and an always-false `cfg`.
+//! Local collector fixture with a renamed GTS dependency and cfg-gated declarations.
+//! Global-only declarations have separate rejection tests.
 #![allow(
     clippy::non_minimal_cfg,
     reason = "the constant cfgs are the point: declarations gated in and out"
@@ -92,10 +90,4 @@ gts_kit::local::gts_instance_raw!({
 gts_kit::local::gts_instance_raw!({
     "id": gts_id!("test.cf.local_fixture.widget.v1~test.cf.local_fixture.cfg_off.v1"),
     "name": "off",
-});
-
-// A crate-root macro: process-wide inventory only, never this crate's.
-gts_kit::gts_instance_raw!({
-    "id": gts_id!("test.cf.local_fixture.widget.v1~test.cf.local_fixture.global_only.v1"),
-    "name": "global",
 });

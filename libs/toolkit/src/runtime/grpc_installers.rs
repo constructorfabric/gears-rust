@@ -3,7 +3,7 @@ use std::collections::VecDeque;
 use parking_lot::Mutex;
 use tokio::sync::{Notify, oneshot};
 
-use crate::contracts::RegisterGrpcServiceFn;
+use crate::grpc_registration::RegisterGrpcServiceFn;
 
 /// Installers for a specific gear (gear name + service installers).
 #[derive(Default)]

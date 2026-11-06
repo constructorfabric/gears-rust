@@ -25,6 +25,9 @@ anyhow = { workspace = true }
 async-trait = { workspace = true }
 toolkit = { workspace = true }
 # `gts_publication(...)` runtime integration tests.
+toolkit-gts = { workspace = true }
+# Renamed to exercise a listed SDK crate's real collector across the crate boundary.
+renamed_sdk = { package = "cf-gears-toolkit-gts-declarations-fixture", path = "../toolkit-gts-macros/tests/fixtures/declaring-crate" }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
 serde = { workspace = true }
 serde_json = { workspace = true }

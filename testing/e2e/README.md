@@ -99,8 +99,14 @@ Local E2E has three cooperating pieces, each with a single responsibility:
   server with the right Cargo features, builds any sidecars, and then dispatches
   to one of two backends depending on the suite's `launcher`.
 - **`tools/scripts/ci.py e2e-local`** — the *orchestration engine*. It starts
-  one server from a config file, waits for `/healthz`, runs pytest against the
+  one server from a config file, waits for `/readyz`, runs pytest against the
   live HTTP API, and tears the server down. Docker mode uses the same engine.
+  The E2E startup timeout is 15 seconds, independent of the production GTS
+  publication budget. `/healthz` only confirms liveness and can return 200
+  while application preparation is still in progress.
+  Local mode defaults the gateway's `advertise_uri` to `E2E_BASE_URL`, avoiding
+  waits for an advertised address when the listener binds to `0.0.0.0`.
+  An explicit `APP__GEARS__API_GATEWAY__CONFIG__ADVERTISE_URI` takes precedence.
 
 Flow:
 
@@ -139,7 +145,7 @@ sequenceDiagram
         Focus->>Focus: write target/e2e-local-x.yaml (pruned)
         Focus->>CI: e2e-local --config <generated>
         CI->>Server: start (E2E_SERVER_BINARY)
-        CI->>Server: poll /healthz
+        CI->>Server: poll /readyz (503 until ready)
         Server-->>CI: 200 OK
         CI->>Pytest: run against base_url
         Pytest->>Server: HTTP requests

@@ -24,13 +24,21 @@ use toolkit::gts_publication::{
 use toolkit::runtime::HostRuntime;
 use toolkit::{ClientHub, DbOptions, DependencyChecker, Gear, GearCtx, GearRegistry};
 
-/// What `toolkit_gts::declare_gts_inventory!()` provides in a declaring crate.
-#[must_use]
-pub fn gts_declarations() -> Vec<(String, String)> {
-    vec![(
-        "gts.cf.test.publication.widget.v1~".to_owned(),
-        "{\"type\":\"object\"}".to_owned(),
-    )]
+toolkit_gts::declare_gts_inventory!();
+
+toolkit_gts::local::gts_instance_raw!({
+    "id": "gts.cf.test.publication.widget.v1~cf.test.publication.static.v1",
+    "vendor": "static",
+});
+
+fn expected_ids() -> Vec<&'static str> {
+    let mut ids = renamed_sdk::DECLARED_IDS.to_vec();
+    ids.extend([
+        "gts.cf.test.publication.widget.v1~cf.test.publication.acme.v1",
+        "gts.cf.test.publication.widget.v1~cf.test.publication.static.v1",
+    ]);
+    ids.sort_unstable();
+    ids
 }
 
 /// Provides the registry in this process: a system gear, initialized before
@@ -53,7 +61,7 @@ impl Gear for FakeRegistryGear {
 #[toolkit::gear(
     name = "widget-publisher",
     gts_publication(
-        crates = [crate],
+        crates = [crate, renamed_sdk],
         publisher = fake_publisher,
         entities = Self::configured,
     ),
@@ -88,7 +96,7 @@ impl Gear for WidgetPublisher {
         // Admitted before `init`: the registry holds the manifest, and the
         // gear reads it from its context.
         let manifest = ctx.gts_publication_manifest()?;
-        assert_eq!(manifest.documents().len(), 2);
+        assert_eq!(manifest.documents().len(), expected_ids().len());
         let registry = ctx.client_hub().get::<LocalRegistry>()?;
         let admitted_seen = { registry.admitted.lock().len() };
         assert_eq!(admitted_seen, 1, "admitted before the publisher's init");
@@ -153,13 +161,7 @@ fn the_generated_descriptor_is_linked_with_the_crate_version() {
     let config = Config(json!({ "widget-publisher": { "config": { "vendor": "acme" } } }));
     let manifest = descriptor.build_gts_manifest(&config).unwrap();
     let ids: Vec<_> = manifest.documents().iter().map(|(id, _)| id.id()).collect();
-    assert_eq!(
-        ids,
-        [
-            "gts.cf.test.publication.widget.v1~",
-            "gts.cf.test.publication.widget.v1~cf.test.publication.acme.v1"
-        ]
-    );
+    assert_eq!(ids, expected_ids());
 }
 
 #[tokio::test]
@@ -227,7 +229,8 @@ async fn the_runtime_publishes_through_the_local_registry_before_init() {
         (name.as_str(), version.as_str()),
         ("widget-publisher", env!("CARGO_PKG_VERSION"))
     );
-    assert_eq!(documents.len(), 2);
+    let ids: Vec<_> = documents.iter().map(|(id, _)| id.id()).collect();
+    assert_eq!(ids, expected_ids());
 
     cancel.cancel();
     running.await.unwrap().unwrap();

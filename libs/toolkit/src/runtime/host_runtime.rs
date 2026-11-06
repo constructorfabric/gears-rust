@@ -7,7 +7,7 @@
 //!    wiring, `post_init`, initial gRPC services, `start`.
 //! 3. Application preparation: `pre_init`, migrations, registry-client wiring,
 //!    then concurrent GTS publication. All manifests must be admitted before
-//!    any application `init`; the system group keeps serving if admission fails.
+//!    any application `init`; failed admission stops the process for restart.
 //! 4. Application `init`, remaining client wiring, legacy registry finalization,
 //!    `post_init`, REST composition, late gRPC installation, `start`.
 //! 5. In-process host: advertise REST providers, then spawn configured children
@@ -28,6 +28,13 @@
 //!   `post_init` and `start` in both profiles.
 //!
 //! Prefer `consumes` for inter-gear calls; use `deps` for local init ordering.
+
+#[path = "host_runtime_rest.rs"]
+mod rest_bootstrap;
+
+#[path = "rest_advertiser.rs"]
+mod rest_advertiser;
+use rest_advertiser::RestAdvertiser;
 
 use axum::Router;
 use std::collections::HashSet;
@@ -103,22 +110,19 @@ const LATE_GRPC_INSTALL_TIMEOUT: std::time::Duration = std::time::Duration::from
 enum AppStartup {
     /// Every application gear initialized and started.
     Started,
-    /// A publication was refused or expired: no application `init` ran. The
-    /// system group keeps serving until shutdown, after which the run returns
-    /// this [`RegistryError::ApplicationGroupNotStarted`].
+    /// Publication failed before application init; cleanup precedes the error return.
     Failed(RegistryError),
     /// Shutdown came first.
     Cancelled,
 }
 
-/// The failure of an application group that did not start, logged once here
-/// with its cause: the system group keeps serving until shutdown.
+/// Log the preparation failure before cleanup and error return.
 fn startup_failure(outcome: AppStartup) -> Option<RegistryError> {
     match outcome {
         AppStartup::Failed(failure) => {
             tracing::error!(
                 error = %failure,
-                "the application group did not start; serving the system group only until shutdown"
+                "the application group did not start; stopping the process"
             );
             Some(failure)
         }
@@ -297,7 +301,7 @@ impl HostRuntime {
             gears_cfg,
             dep_checker,
             gts_admitted,
-            advertiser: Arc::new(RestAdvertiser::new(instance_id)),
+            advertiser: Arc::new(RestAdvertiser::new(instance_id, &owned)),
             start_called: parking_lot::Mutex::new(HashSet::new()),
             wired: parking_lot::Mutex::new(HashSet::new()),
             #[cfg(test)]
@@ -971,37 +975,15 @@ impl HostRuntime {
     fn build_gts_manifests(&self) -> Result<Vec<GtsPublicationPlan>, RegistryError> {
         let mut manifests = Vec::new();
         for entry in self.registry.gears() {
+            entry
+                .validate_gts_publication_config(self.gears_cfg.as_ref())
+                .map_err(|source| RegistryError::Publication {
+                    gear: entry.name,
+                    source,
+                })?;
             let Some(publication) = entry.caps.query::<GtsPublicationCap>() else {
-                // The section would be stripped from the typed configuration and
-                // never read: a misplaced policy, refused rather than ignored.
-                if self
-                    .gears_cfg
-                    .get_gear_config(entry.name)
-                    .and_then(|gear| gear.get("config"))
-                    .and_then(|config| config.get(crate::config::GTS_PUBLICATION_CONFIG_KEY))
-                    .is_some()
-                {
-                    return Err(RegistryError::Publication {
-                        gear: entry.name,
-                        source: anyhow::anyhow!(
-                            "gears.{}.config.{} is set, but this gear publishes no GTS \
-                             documents: it declares no `gts_publication(...)`",
-                            entry.name,
-                            crate::config::GTS_PUBLICATION_CONFIG_KEY
-                        ),
-                    });
-                }
                 continue;
             };
-            if entry.is_system() {
-                return Err(RegistryError::Publication {
-                    gear: entry.name,
-                    source: anyhow::anyhow!(
-                        "a system gear initializes before the GTS barrier, so it cannot \
-                         publish GTS documents with `gts_publication(...)`"
-                    ),
-                });
-            }
             let descriptor = publication.descriptor();
             let manifest = descriptor
                 .build_gts_manifest(self.gears_cfg.as_ref())
@@ -1078,6 +1060,7 @@ impl HostRuntime {
             if outcome != crate::discovery::WireOutcome::Remote {
                 continue;
             }
+            self.check_child_registry_dependency(publisher.owner_gear, publisher.dep_gear)?;
             let advertised_here = self.registry.gears().iter().any(|entry| {
                 entry.name == publisher.dep_gear
                     && entry
@@ -1108,6 +1091,40 @@ impl HostRuntime {
             .iter()
             .find(|e| e.name == gear)
             .map(GearEntry::is_system)
+    }
+
+    /// A remote publisher cannot discover its own unstarted child. An explicit
+    /// endpoint may name an already-running external registry instead.
+    fn check_child_registry_dependency(
+        &self,
+        publisher: &'static str,
+        provider: &str,
+    ) -> Result<(), RegistryError> {
+        let child = self.oop_options.as_ref().is_some_and(|options| {
+            options
+                .gears
+                .iter()
+                .any(|child| child.gear_name == provider)
+        });
+        if !child {
+            return Ok(());
+        }
+        let wiring = read_consumer_wiring(self.gears_cfg.as_ref(), publisher, provider).map_err(
+            |source| RegistryError::Publication {
+                gear: publisher,
+                source,
+            },
+        )?;
+        if wiring.is_some_and(|wiring| wiring.endpoint.is_some()) {
+            return Ok(());
+        }
+        Err(RegistryError::Publication {
+            gear: publisher,
+            source: anyhow::anyhow!(
+                "'{publisher}' publishes to child '{provider}', which starts only after parent \
+                 preparation; use an in-process registry or an already-running external registry"
+            ),
+        })
     }
 
     /// Reject early wiring to a local application provider before any gear runs:
@@ -1143,6 +1160,9 @@ impl HostRuntime {
                         descriptor.provider
                     ),
                 });
+            }
+            if !manifest.is_empty() && self.local_group(descriptor.provider).is_none() {
+                self.check_child_registry_dependency(descriptor.gear, descriptor.provider)?;
             }
         }
         Ok(())
@@ -1327,50 +1347,18 @@ impl HostRuntime {
                 gear: host_entry.name,
                 source: e,
             })?;
-        let hc_registry = Arc::new(
-            crate::healthcheck::RestHealthcheckRegistry::with_cancellation(
-                host_ctx.cancellation_token().clone(),
-            ),
-        );
-        // Include unresolved consumed dependencies, application preparation and
-        // draining in the gateway's aggregated readiness report.
-        hc_registry.register(
-            "readiness",
-            Arc::new(super::readiness::ReadinessHealthcheck::new(Arc::clone(
-                &self.dep_checker,
-            ))),
-        );
-        let mut router = host
+        let hc_registry = self.rest_health_registry();
+        let router = host
             .rest_prepare(&host_ctx, Router::new(), Arc::clone(&hc_registry))
             .map_err(|source| RegistryError::RestPrepare {
                 gear: host_entry.name,
                 source,
             })?;
 
-        // The router stays local to this single composition phase: the host's
-        // prepared routes and layers are the base for every provider's routes.
-        for entry in self.registry.gears() {
-            let Some(rest) = entry.caps.query::<RestApiCap>() else {
-                continue;
-            };
-            let ctx = self
-                .ctx_builder
-                .for_gear(entry.name)
-                .await
-                .map_err(|source| RegistryError::RestRegister {
-                    gear: entry.name,
-                    source,
-                })?;
-            router = rest
-                .register_rest(&ctx, router, host.as_registry())
-                .map_err(|source| RegistryError::RestRegister {
-                    gear: entry.name,
-                    source,
-                })?;
-            if let Some(check) = rest.healthcheck(&ctx) {
-                hc_registry.register(entry.name, check);
-            }
-        }
+        let all: Vec<_> = self.registry.gears().iter().collect();
+        let router = self
+            .add_rest_routes(router, &hc_registry, &all, host.as_registry())
+            .await?;
 
         // Host finalize: attach /openapi.json and /docs, persist Router if needed (no server start)
         host.rest_finalize(&host_ctx, router, hc_registry)
@@ -1687,7 +1675,25 @@ impl HostRuntime {
     /// stop every started gear. Runs after a failed startup as at shutdown;
     /// it never cancels the caller's token.
     async fn shut_down(&self) -> Result<(), RegistryError> {
+        self.dep_checker.set_draining(true);
         self.owned.cancel();
+        // Stop discovery traffic before joining a potentially slow HTTP drain.
+        if tokio::time::timeout(self.shutdown_deadline, self.deregister_rest_providers())
+            .await
+            .is_err()
+        {
+            tracing::warn!("REST provider deregistration timed out");
+        }
+        if let Some((entry, host)) = self.rest_host() {
+            match tokio::time::timeout(self.shutdown_deadline, host.rest_shutdown_bootstrap()).await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    tracing::warn!(gear = entry.name, %error, "REST bootstrap shutdown failed");
+                }
+                Err(_) => tracing::warn!(gear = entry.name, "REST bootstrap shutdown timed out"),
+            }
+        }
         self.grpc_installers.close();
         if let Some(oop) = &self.oop_options {
             // Bound child shutdown so in-process gears still stop if reaping hangs.
@@ -1854,11 +1860,6 @@ impl HostRuntime {
         };
 
         if !self.advertiser.is_enabled() {
-            if !self.advertiser.first_attempt() {
-                // An earlier stage found no endpoint or directory: the host
-                // already started, neither appears later.
-                return Ok(());
-            }
             let Some(endpoint) = self.wait_for_rest_endpoint(&host).await else {
                 tracing::warn!(
                     "directory-register: REST host endpoint unavailable; skipping REST provider registration"
@@ -1966,8 +1967,10 @@ impl HostRuntime {
         };
         let failed = startup_failure(outcome);
 
-        // Wait for cancellation
-        self.cancel.cancelled().await;
+        // Return failed preparation to the supervisor after cleanup.
+        if failed.is_none() {
+            self.cancel.cancelled().await;
+        }
 
         // Stop phase with hard timeout. Blocking stop implementations are
         // guarded by a watchdog thread so a hang cannot block shutdown,
@@ -2013,6 +2016,7 @@ impl HostRuntime {
         let manifests = self.build_gts_manifests()?;
         let regs = self.consumer_registrations();
         self.check_wiring_groups(&manifests, &regs)?;
+        let mut rest = self.bind_rest_bootstrap().await?;
 
         // System group, complete: pre-init, migrations, init, its clients,
         // post-init.
@@ -2023,11 +2027,13 @@ impl HostRuntime {
         self.wire_system_clients(&regs)?;
         self.run_post_init_phase_for(&system).await?;
 
-        // System gRPC services run during application preparation. The REST
-        // host starts later, once every application's routes can be composed.
+        // Serve system routes on the listener already hosting probes.
         let mut grpc_seen = HashSet::new();
         self.run_grpc_initial_phase(&mut grpc_seen).await?;
         self.run_start_phase_for(&system).await?;
+        if let Some(composition) = &mut rest {
+            self.publish_system_rest(composition, &system).await?;
+        }
 
         // Application group: pre-init, migrations, the registry clients, then
         // the GTS barrier.
@@ -2048,9 +2054,12 @@ impl HostRuntime {
         self.run_legacy_finalization().await?;
         self.run_post_init_phase_for(&app).await?;
 
-        // Compose the full REST surface before its host starts. Install the
-        // application gRPC services on the system hub, then start applications.
-        let _router = self.run_rest_phase().await?;
+        // Attach the full REST/gRPC surface before starting applications.
+        if let Some(composition) = rest {
+            self.finish_rest_bootstrap(composition, &app).await?;
+        } else {
+            let _router = self.run_rest_phase().await?;
+        }
         self.run_grpc_late_phase(&mut grpc_seen).await?;
         self.run_start_phase_for(&app).await?;
         let all: Vec<&GearEntry> = self.registry.gears().iter().collect();
@@ -2064,125 +2073,10 @@ impl HostRuntime {
     }
 }
 
-/// Advertises in-process REST providers in the directory, each at most once.
-///
-/// The directory-register phase enables it with the gateway endpoint, for the
-/// system and application groups together, after the REST host starts. Only
-/// the in-process host path enables it: in `OoP` serving, `oop_serve` owns
-/// presence + deregister, so nothing is advertised or deregistered here.
-struct RestAdvertiser {
-    instance_id: String,
-    state: parking_lot::Mutex<AdvertiserState>,
-}
-
-#[derive(Default)]
-struct AdvertiserState {
-    target: Option<(Arc<dyn crate::DirectoryClient>, String)>,
-    advertised: Vec<&'static str>,
-    attempted: bool,
-}
-
-impl RestAdvertiser {
-    fn new(instance_id: Uuid) -> Self {
-        Self {
-            instance_id: instance_id.to_string(),
-            state: parking_lot::Mutex::new(AdvertiserState::default()),
-        }
-    }
-
-    fn enable(&self, dir: Arc<dyn crate::DirectoryClient>, endpoint: String) {
-        self.state.lock().target = Some((dir, endpoint));
-    }
-
-    fn is_enabled(&self) -> bool {
-        self.state.lock().target.is_some()
-    }
-
-    /// `true` the first time only: whether to look for an endpoint to enable.
-    fn first_attempt(&self) -> bool {
-        !std::mem::replace(&mut self.state.lock().attempted, true)
-    }
-
-    /// Advertise `gear`, unless not enabled yet or already advertised.
-    async fn advertise(&self, gear: &'static str) {
-        let (dir, endpoint) = {
-            let mut state = self.state.lock();
-            let Some((dir, endpoint)) = state.target.clone() else {
-                return;
-            };
-            if state.advertised.contains(&gear) {
-                return;
-            }
-            state.advertised.push(gear);
-            (dir, endpoint)
-        };
-        let instance_id = &self.instance_id;
-        // The directory keys instances by (gear, instance_id). grpc-hub
-        // registers this same (gear, instance_id) with its gRPC services, in
-        // the start phase or later on a retry; the store keeps them when this
-        // registration carries none (`GearInstance::with_metadata_of`).
-        // Carrying them forward also carries the version.
-        //
-        // Labels are deliberately NOT read-and-rewritten here. Carrying them
-        // through would make this a cross-process read-modify-write with no
-        // compare-and-set: any label change committed between the read and
-        // the write would be silently reverted. Instead we register with an
-        // empty label set, which `GearInstance::with_metadata_of` treats as
-        // "preserve the stored labels" — an atomic no-op on labels.
-        let (grpc_services, version) = match dir.list_instances(gear).await {
-            Ok(insts) => insts
-                .into_iter()
-                .find(|i| &i.instance_id == instance_id)
-                .map(|i| (i.grpc_services, i.version))
-                .unwrap_or_default(),
-            Err(e) => {
-                // A failed directory read must not silently drop the
-                // carried-forward metadata: log it, then fall back to an
-                // empty augmentation so REST registration still proceeds.
-                tracing::warn!(
-                    gear,
-                    error = %e,
-                    "directory-register: failed to read existing registration; \
-                     re-registering with empty grpc_services/version"
-                );
-                (Vec::new(), None)
-            }
-        };
-        // OpenAPI spec is published separately (grpc-hub start phase); the
-        // REST-augmentation registration does not carry it. Labels are
-        // omitted so the store preserves the stored set (see above).
-        let mut info = crate::RegisterInstanceInfo::new(gear.to_owned(), instance_id.clone())
-            .with_grpc_services(grpc_services)
-            .with_rest_endpoint(crate::ServiceEndpoint::new(endpoint.clone()));
-        if let Some(version) = version {
-            info = info.with_version(version);
-        }
-        match dir.register_instance(info).await {
-            Ok(()) => {
-                tracing::info!(gear, endpoint = %endpoint, "registered REST provider in directory");
-            }
-            Err(e) => {
-                tracing::warn!(gear, error = %e, "directory-register: failed to register REST provider");
-            }
-        }
-    }
-
-    /// Deregister every advertised gear and disable further advertisement.
-    async fn deregister_all(&self) {
-        let (target, gears) = {
-            let mut state = self.state.lock();
-            (state.target.take(), std::mem::take(&mut state.advertised))
-        };
-        let Some((dir, _)) = target else {
-            return;
-        };
-        for gear in gears {
-            if let Err(e) = dir.deregister_instance(gear, &self.instance_id).await {
-                tracing::warn!(gear, error = %e, "directory-deregister: failed to deregister REST provider");
-            }
-        }
-    }
-}
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+#[path = "rest_advertiser_tests.rs"]
+mod rest_advertiser_tests;
 
 /// Composed `OoP` router, serialized `OpenAPI`, and auth policy from the same specs.
 #[cfg(feature = "bootstrap")]
@@ -2335,6 +2229,10 @@ impl HostRuntime {
         let serve_result = match outcome {
             Ok(outcome) => {
                 let failed = startup_failure(outcome);
+                // End failed preparation promptly so the supervisor can restart.
+                if failed.is_some() {
+                    self.cancel.cancel();
+                }
                 // Serve until cancelled, drain, then deregister.
                 let joined = server.join().await;
                 match failed {
@@ -2379,6 +2277,14 @@ impl HostRuntime {
         let app = self.group(false);
         let advertised = server.options().gear_name.clone();
         let advertised_is_system = system.iter().any(|e| e.name == advertised.as_str());
+        let root_is_advertised = || {
+            self.registry
+                .gears()
+                .iter()
+                .find(|entry| entry.name == advertised.as_str())
+                .and_then(|entry| entry.caps.query::<RestApiCap>())
+                .is_none_or(|rest| rest.advertised_in_directory())
+        };
 
         let manifests = self.build_gts_manifests()?;
         let regs = self.consumer_registrations();
@@ -2402,7 +2308,7 @@ impl HostRuntime {
                 .compose_oop_router(server.options(), hc_registry, &system, composition)
                 .await?;
             server.publish_bootstrap_routes(router, openapi, route_auth);
-            if advertised_is_system {
+            if advertised_is_system && root_is_advertised() {
                 server.start_presence();
             }
             // Every co-hosted system provider is discoverable at once,
@@ -2459,7 +2365,9 @@ impl HostRuntime {
         server.attach(router, openapi, route_auth)?;
         // First presence of an application root; a system root's restarts
         // with the full `OpenAPI` document.
-        server.start_presence();
+        if root_is_advertised() {
+            server.start_presence();
+        }
         self.dep_checker.mark_resolved(PREPARATION_GATE);
         Ok(AppStartup::Started)
     }
@@ -4021,3 +3929,8 @@ mod tests {
 #[cfg_attr(coverage_nightly, coverage(off))]
 #[path = "host_runtime_preparation_tests.rs"]
 mod host_runtime_preparation_tests;
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+#[path = "host_runtime_rest_bootstrap_tests.rs"]
+mod host_runtime_rest_bootstrap_tests;

@@ -1777,7 +1777,7 @@ dependencies = [
 
 [[package]]
 name = "cf-gears-api-gateway"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -4594,7 +4594,7 @@ dependencies = [
 
 [[package]]
 name = "cf-gears-toolkit"
-version = "0.12.0"
+version = "0.12.1"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -4919,7 +4919,7 @@ dependencies = [
 
 [[package]]
 name = "cf-gears-toolkit-gts"
-version = "0.1.7"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "cf-gears-toolkit-gts-declarations-fixture",
@@ -4945,7 +4945,7 @@ dependencies = [
 
 [[package]]
 name = "cf-gears-toolkit-gts-macros"
-version = "0.1.6"
+version = "0.2.0"
 dependencies = [
  "cf-gears-toolkit-gts",
  "cf-gears-toolkit-gts-declarations-fixture",
@@ -5079,6 +5079,8 @@ dependencies = [
  "anyhow",
  "async-trait",
  "cf-gears-toolkit",
+ "cf-gears-toolkit-gts",
+ "cf-gears-toolkit-gts-declarations-fixture",
  "cf-gears-toolkit-macros",
  "gts",
  "parking_lot",

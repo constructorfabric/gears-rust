@@ -25,7 +25,7 @@ The runtime starts two groups in dependency order within each group:
 
 1. **Early startup.** The system gear group completes startup before application preparation.
 2. **Availability during admission.** It keeps running while application GTS admission
-   is pending or has failed; application readiness remains blocked until successful startup.
+   is pending. Refusal or expiry stops started gears and returns an error for supervisor restart.
 3. **Dependency restrictions.** Its gears cannot declare `deps` or `consumes` on a gear
    in the application gear group in the same process.
 4. **No managed publication.** Its gears cannot declare `gts_publication(...)`.
@@ -39,13 +39,17 @@ The runtime starts two groups in dependency order within each group:
 
 1. **Validate.** Build GTS manifests and publication policies; reject invalid input,
    duplicate GTS owners and invalid startup dependencies before any gear initializes.
+   Bind framework probes early in both embedded and OoP hosts.
 2. **Start the system gear group.** Run `pre_init`, migrations, `init`, client wiring,
-   `post_init`, initial gRPC installation and `start`.
+   `post_init`, initial gRPC installation and `start`. Attach its bootstrap REST routes
+   and advertise opted-in system providers before application preparation.
 3. **Prepare applications.** Run their `pre_init` and migrations, wire registry clients,
    then publish declared GTS Type Schemas and Instances concurrently. All must be admitted
-   before any application `init`; a non-empty publication cannot target a local application provider.
+   before any application `init`. Publication cannot depend on a local application provider
+   or an unstarted child; an explicit external endpoint remains valid.
 4. **Start the application gear group.** Run `init`, remaining client wiring and
-   `post_init`; compose REST routes, install late gRPC services and call `start`.
+   `post_init`; attach the complete REST router and tenant authenticator, install late
+   gRPC services and call `start`.
    The in-process host advertises REST providers, clears `application/preparation`, then
    spawns children without waiting for their readiness. Parent publication must use a
    local or already available external registry and cannot depend on its children.
@@ -64,22 +68,41 @@ Migration-only mode runs runtime wiring, `pre_init` and migrations, system gear 
 no `init`, `post_init` or publication. See [`HostRuntime`](../../libs/toolkit/src/runtime/host_runtime.rs)
 for the implementation.
 
+### gRPC service ownership during preparation
+
+Configure Directory ownership before embedded application or remote OoP providers register:
+
+```yaml
+gears:
+  service-discovery:
+    config:
+      grpc_service_owners:
+        example.orders.v1.OrdersService: orders
+```
+
+Service Discovery loads this map during system `init`; application installers add their names later.
+Until then, unconfigured names use first-registration ownership. Remote metadata is not propagated
+into Directory. Registration identity authorization is independent.
+
 ### Failures, routes and readiness
 
-- Publication retries share one budget (120 seconds at ordinary startup). Refusal or expiry
-  leaves applications uninitialized and the system gear group running until shutdown,
-  then returns the failure. Shutdown cancels pending publication; other startup errors
-  stop already-started gears before returning.
-- The in-process API Gateway starts with the full REST router and initialized AuthN resolver.
-  **OoP** binds probes before lifecycle hooks, attaches system routes after system startup,
-  then final routes and tenant auth after application startup. Early routes allow platform
-  and anonymous calls; tenant calls return `503`. OoP serving does not spawn children.
+- Publication retries share a 120-second startup budget. Refusal or expiry stops started gears
+  and returns an error for supervisor restart. Shutdown cancels pending publication.
+- Both hosts serve probes before preparation, system routes after system startup, and tenant
+  routes after application initialization. Early routes need no AuthN resolver and reject tenant
+  calls with `503`. OoP serving spawns no children. All providers honor `advertised_in_directory()`.
 - `application/preparation` clears after application startup and REST provider registration,
   without waiting for children. Other dependencies and gear healthchecks still gate `/readyz`.
 - A gear's `await_ready` / `ready.notify()` changes its lifecycle state to `Running`,
   without blocking `start`, other gears, route publication or the application readiness gate.
   For asynchronous business bootstrap, work in `serve` and provide a REST healthcheck
   to keep `/readyz` at `503` until ready.
+
+Publication failure does not undo migrations or partial admission. Use retryable preparation and
+expand/contract migrations compatible with old pods.
+
+The barrier permits synchronous plugin binding in `init`, but one slow publisher delays all
+applications. See [ADR-0005](../arch/toolkit-oop/ADR/0005-cpt-cf-adr-eventual-readiness.md).
 
 ## Publishing GTS documents
 
@@ -94,6 +117,10 @@ pub struct MyPlugin { /* ... */ }
 `crates` collects static declarations; optional `entities` builds config-only documents.
 `init` reads admitted documents through `ctx.gts_publication_manifest()` and binds plugin
 clients. An instance becomes selectable only after its plugin binds its client.
+
+Listed crates call `declare_gts_inventory!()` and use `toolkit_gts::local::*`; remaining root
+macros cause a manifest error. Deployment publication shares startup validation and per-publisher
+`consumer_wiring` settings; `--registry` overrides only the endpoint.
 
 See the [SDK publication guide](../../gears/system/types-registry/types-registry-sdk/README.md#publishing-from-a-gear)
 for collectors, publisher setup, manifest binding, retry/timeout/batch configuration and registry-client wiring.

@@ -78,12 +78,8 @@
 //! `gears.<gear>.config.gts_publication` sets the policy of one publishing gear
 //! ([`GtsPublicationOptions`]); the typed gear configuration does not see it. The
 //! registry client itself — its URL, HTTP timeout and HTTP retries — stays in
-//! `gears.<gear>.config.consumer_wiring.<provider>`. A process shares one remote
-//! registry client: the first consumer that creates it — a publisher, or a gear that
-//! `#[toolkit::consumes]` the registry contract — decides its `consumer_wiring`, and the
-//! others' settings for that provider do not apply. The publication policy is per
-//! publication and does not depend on which gear created the client, nor on whether the
-//! registry is local or remote.
+//! `gears.<gear>.config.consumer_wiring.<provider>`. Publication reuses the gear's
+//! own client view and transport settings. Publication policy applies locally and remotely.
 
 use std::fmt;
 use std::future::Future;
@@ -501,11 +497,18 @@ impl GtsPublicationDescriptor {
     /// The manifest for the effective configuration `config`.
     ///
     /// # Errors
-    /// The `entities` function fails, a declared GTS id or JSON text is invalid, or the
-    /// declarations conflict.
+    /// Entity generation, collection, parsing or declaration merging fails.
     pub fn build_gts_manifest(&self, config: &dyn ConfigProvider) -> anyhow::Result<GtsManifest> {
         let mut merge = DeclarationMerge::default();
-        for source in (self.declarations)() {
+        let declarations = std::panic::catch_unwind(self.declarations).map_err(|payload| {
+            let detail = payload
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| payload.downcast_ref::<&str>().copied())
+                .unwrap_or("collector panicked without a text diagnostic");
+            anyhow::anyhow!("{}: GTS declarations: {detail}", self.gear)
+        })?;
+        for source in declarations {
             merge.add_source(source);
         }
         if let Some(entities) = self.entities {

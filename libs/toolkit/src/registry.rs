@@ -263,6 +263,33 @@ impl GearEntry {
     pub fn is_system(&self) -> bool {
         self.caps.has::<SystemCap>()
     }
+
+    /// Validate publication capabilities/configuration for startup and deployment jobs.
+    pub(crate) fn validate_gts_publication_config(
+        &self,
+        config: &dyn crate::config::ConfigProvider,
+    ) -> anyhow::Result<()> {
+        if self.caps.has::<GtsPublicationCap>() {
+            anyhow::ensure!(
+                !self.is_system(),
+                "a system gear initializes before the GTS barrier, so it cannot \
+                 publish GTS documents with `gts_publication(...)`"
+            );
+        } else {
+            anyhow::ensure!(
+                config
+                    .get_gear_config(self.name)
+                    .and_then(|gear| gear.get("config"))
+                    .and_then(|config| config.get(crate::config::GTS_PUBLICATION_CONFIG_KEY))
+                    .is_none(),
+                "gears.{}.config.{} is set, but this gear publishes no GTS \
+                 documents: it declares no `gts_publication(...)`",
+                self.name,
+                crate::config::GTS_PUBLICATION_CONFIG_KEY
+            );
+        }
+        Ok(())
+    }
 }
 
 impl std::fmt::Debug for GearEntry {

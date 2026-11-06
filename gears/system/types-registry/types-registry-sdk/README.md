@@ -218,9 +218,9 @@ replaces it, even when longer. Unknown fields, wrong types, zero values and
 `retry_backoff_max < retry_backoff` fail startup before any publication writes, naming the
 gear and the config path. The policy applies per publication, alike for a local and a
 remote registry; the registry client's URL, HTTP timeout and retries stay in
-`consumer_wiring.types-registry`. One process shares one remote registry client: the first
-consumer that creates it — a publisher, or a gear consuming the registry for its own
-business — decides those settings for every gear. Custom `publisher = ...` adapters provide
+`consumer_wiring.types-registry`. Publication reuses the gear's own client view and settings.
+Deployment jobs use the same validation and tuning; `--registry` changes only the endpoint
+and must respect `require_tls`. Custom `publisher = ...` adapters provide
 the same `Publication` shape: `from_manifest(registry, name, version, &[(GtsId, JsonDocument)])`,
 `deadline(Option<tokio::time::Instant>)`, `timeout(Option<Duration>)`,
 `retry_backoff(Duration, Duration)`, `batch_size(NonZeroUsize)`,
