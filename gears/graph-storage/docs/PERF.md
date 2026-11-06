@@ -48,7 +48,11 @@ least 5.
 **Added round-trip time.** `GEARS_GRAPH_PERF_RTT_MS=0,0.5,1,2` repeats the matrix
 with that many milliseconds added to every packet the database container sends
 (`netem`, applied from a `nicolaka/netshoot` container in the database
-container's network namespace; Docker is the only host requirement). The p50
+container's network namespace; Docker is the only host requirement). The image
+is pinned by tag and digest in `libs/test-containers` (`NETSHOOT_TAG`,
+overridable with `GEARS_TEST_NETSHOOT_TAG`), so two runs are shaped by the same
+`tc`; a shaped run applies and removes its first delay before the seed, so a
+host that cannot shape fails in seconds. The p50
 grows by about one added delay per sequential round trip, so the slope of p50
 against the delay estimates how many round trips a request makes — the number
 that decides latency once the database is not on the same host. The thresholds
@@ -57,9 +61,14 @@ are asserted only at `0`.
 **Pool ping.** The lane connects with the pool's defaults, under which sqlx pings
 the connection before every acquire, so every statement costs two round trips.
 That is what a deployment gets unless its pool configuration sets
-`test_before_acquire: false`. At +2 ms per round trip the ping costs +45% on
-the neighbourhood and +80% on the criteria table (gears-rust#5517); next to the
-database it costs 0–4%.
+`test_before_acquire: false`. This lane cannot turn the ping off: it connects
+through `ConnectOpts`, which never passes `false` to sqlx (gears-rust#5318). The
+cost of the ping was measured on an experimental run that could (gears-rust#5517,
+the patch is posted there): at +2 ms per round trip it cost +45% on the
+neighbourhood and +80% on the criteria table, next to the database 0–4%. That
+criteria-table run read the table without a page limit, up to the default page
+of 200 rows; for the page of 50 this lane reads, the ping's cost is not
+measured yet.
 
 ## Running it
 
