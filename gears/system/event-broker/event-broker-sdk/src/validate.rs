@@ -9,10 +9,11 @@
 //! rather than `user_agent` - because a rejection has to name the field that
 //! carried the value, and one grammar serves several fields.
 //!
-//! The bounds mirror the committed schemas under
-//! `gears/system/event-broker/docs/schemas/`, which remain the authority: a
-//! bound that changes there changes here, and the two are cross-checked by
-//! test.
+//! The bounds are also declared on the REST request types
+//! (`CreateConsumerGroupRequest`, `JoinSubscriptionRequest` in the gear's
+//! `api/rest/handlers/delivery/dto.rs`), where they reach the published
+//! `OpenAPI`. A bound that changes on one side changes on the other, and the
+//! gear's `dto_tests` cross-check the two.
 
 use crate::error::reasons;
 

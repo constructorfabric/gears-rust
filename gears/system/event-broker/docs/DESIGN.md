@@ -468,7 +468,7 @@ The producer chain (`meta.producer_id`, `meta.previous`, `meta.sequence`) is pub
 
 #### Subscription Schema (Ephemeral, In-Cache)
 
-An ephemeral session a consumer instance opens against a consumer group; carries its `interests[]`, `assigned` partitions, and session liveness state. Lives in cache only, not in the broker's database. See [`schemas/gts.cf.core.events.subscription.v1~.schema.json`](schemas/gts.cf.core.events.subscription.v1~.schema.json) and [`ADR/0005-subscription-filter-typing.md`](ADR/0005-subscription-filter-typing.md).
+An ephemeral session a consumer instance opens against a consumer group; carries its `interests[]`, `assigned` partitions, and session liveness state. Lives in cache only, not in the broker's database. See the `JoinSubscriptionRequest` / `SubscriptionDto` types in [`dto.rs`](../event-broker/src/api/rest/handlers/delivery/dto.rs) and [`ADR/0005-subscription-filter-typing.md`](ADR/0005-subscription-filter-typing.md).
 
 **Base type**: `gts.cf.core.events.subscription.v1~`
 
@@ -563,8 +563,8 @@ The broker owns the following GTS base types. A concrete event type is a **deriv
 |---|---|---|
 | `gts.cf.core.events.topic.v1~` | Topic base type; a concrete topic is an instance of it | `TopicV1` in [`event-broker-sdk/src/gts.rs`](../event-broker-sdk/src/gts.rs) |
 | `gts.cf.core.events.event.v1~` | Event (single schema, `readOnly` / `writeOnly` markers per direction) | `EventV1<D>` in [`event-broker-sdk/src/gts.rs`](../event-broker-sdk/src/gts.rs), [`ADR/0003-event-schema.md`](ADR/0003-event-schema.md) |
-| `gts.cf.core.events.consumer_group.v1~` | Consumer group resource | [`schemas/gts.cf.core.events.consumer_group.v1~.schema.json`](schemas/gts.cf.core.events.consumer_group.v1~.schema.json) |
-| `gts.cf.core.events.subscription.v1~` | Subscription resource (ephemeral, in-cache) | [`schemas/gts.cf.core.events.subscription.v1~.schema.json`](schemas/gts.cf.core.events.subscription.v1~.schema.json), [`ADR/0005-subscription-filter-typing.md`](ADR/0005-subscription-filter-typing.md) |
+| `gts.cf.core.events.consumer_group.v1~` | Consumer group resource | `CreateConsumerGroupRequest` / `ConsumerGroupDto` in [`dto.rs`](../event-broker/src/api/rest/handlers/delivery/dto.rs) |
+| `gts.cf.core.events.subscription.v1~` | Subscription resource (ephemeral, in-cache) | `JoinSubscriptionRequest` / `SubscriptionDto` in [`dto.rs`](../event-broker/src/api/rest/handlers/delivery/dto.rs), [`ADR/0005-subscription-filter-typing.md`](ADR/0005-subscription-filter-typing.md) |
 | `gts.cf.core.events.backend.v1~` | Storage backend plugin contract | [`features/0007-storage-backend-api.md`](features/0007-storage-backend-api.md) |
 | `gts.cf.core.events.filter.v1~` | Filter engine plugin contract | [`ADR/0005-subscription-filter-typing.md`](ADR/0005-subscription-filter-typing.md) |
 
@@ -1289,8 +1289,8 @@ The dispatcher's job for delivery routes is **cache-lookup-and-forward** - no ro
 > [`handlers/delivery/`](../event-broker/src/api/rest/handlers/delivery/dto.rs), and error
 > codes by [`error.rs`](../event-broker/src/api/rest/error.rs). The running server
 > serves the generated OpenAPI document at `/openapi.json` (`make openapi` writes it out).
-> The per-resource JSON Schemas under [`schemas/`](schemas/) are separate reference
-> schemas. This section keeps endpoint **summaries** and behavioral contracts; concrete
+> The topic and event base types are declared in
+> [`event-broker-sdk/src/gts.rs`](../event-broker-sdk/src/gts.rs). This section keeps endpoint **summaries** and behavioral contracts; concrete
 > payloads are not duplicated here. Where prose below contains illustrative JSON
 > examples (kept for readability), the authoritative shape is the DTO named next to it.
 
@@ -2435,7 +2435,7 @@ This is an **MVP design**. The consumption surface is intentionally narrow — o
 
 ### 4.7 Open Questions
 
-- **Tenant depth for topic visibility**: ~~Open question~~ **Resolved** — `SubscriptionInterest` now carries `max_depth: Option<u32>` (0 = current only, 1 = direct children, null = unlimited) and `barrier_mode: "respect" | "ignore"`, aligned with `tenant_resolver_sdk::GetDescendantsOptions`. The broker expands `(tenant_id, max_depth, barrier_mode)` into a concrete tenant set at fan-out via the Tenant Resolver. See `schemas/gts.cf.core.events.subscription.v1~.schema.json`.
+- **Tenant depth for topic visibility**: ~~Open question~~ **Resolved** — `SubscriptionInterest` now carries `max_depth: Option<u32>` (0 = current only, 1 = direct children, null = unlimited) and `barrier_mode: "respect" | "ignore"`, aligned with `tenant_resolver_sdk::GetDescendantsOptions`. The broker expands `(tenant_id, max_depth, barrier_mode)` into a concrete tenant set at fan-out via the Tenant Resolver. See `InterestDto` in [`dto.rs`](../event-broker/src/api/rest/handlers/delivery/dto.rs).
 - **Partition selection algorithm**: **Resolved** - the backend assigns the partition from the partition key, the member an event type's partition-key pointer names, defaulting to the event's tenant, with its own deterministic function: for a topic on a backend, a key always maps to the same partition, on every instance ([ADR-0002](ADR/0002-partition-selection.md)). Producers provide no top-level topic partition, routing key or partition hint; a producer's own partitions are SDK-local and never map to a broker partition.
 - **Outbox extension for partition-level scaling**: should `toolkit-db`'s outbox grow native partitioning for producer or ingest scaling? This is a local outbox/ingest partition-domain question, not a requirement that producer outbox partition count equals broker topic partition count. Two shapes to consider: (a) multiple outbox table instances, (b) a partition-aware sequencer + processor pool inside a single outbox table. Current design works for moderate throughput; hot-topic deployments may need this. Decision deferred to post-MVP, gated by the outbox library's roadmap.
 - **Long-poll protocol revisit** - *resolved*, see §3.2. The cache is per-partition accounted segments with registered readers. Each sub-question in turn: **eviction** is byte-based per partition, enforced against measured footprint at absorb time, in three passes (dead spans below the slowest reader, wide gaps between reader clusters, then byte pressure) - not time-based, because idleness is not what makes memory expensive. **Backfill** is not a fall-through: a reader below residency produces a demand like any other and the loader refetches the span, so there is one read path rather than two. **Iterator-versus-cursor** dissolved with the iterator - a reader owns its position, a read advances it over what it accounted for, and the persisted cursor is a separate, session-scoped fact. **Ordering and fairness** is a per-partition rotation over ready readers plus a starvation credit added to each unserved demand, so throughput leads and fairness is a bound on how long it may. What remains open is only **lossy-versus-lossless pub/sub**: correctness does not depend on a head reaching the loader through its watch, because a read that comes back empty backs off and retries, but latency does.

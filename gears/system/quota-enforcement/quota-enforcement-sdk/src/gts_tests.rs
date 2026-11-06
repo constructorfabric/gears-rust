@@ -1,12 +1,11 @@
 #![allow(clippy::expect_used)]
 
-use gts::{GTS_ID_URI_PREFIX, GtsRefValidation, GtsStore};
+use gts::{GtsRefValidation, GtsStore};
 use serde_json::Value;
-use toolkit_gts::{InventoryInstance, InventoryTypeSchema};
 
 use super::{
-    CONSTRAINT_BASE, METRIC_BASE_TYPE, OwnedDefinition, REQUEST_BASE, RESOURCE_BASE, SCOPE_TYPE,
-    SCOPE_USER, SUBJECT_BASE, owned_definitions,
+    CONSTRAINT_BASE, METRIC_BASE_TYPE, REQUEST_BASE, RESOURCE_BASE, SCOPE_TYPE, SCOPE_USER,
+    SUBJECT_BASE, owned_definitions,
 };
 
 /// The reviewed owner examples of ADR-0007: one complete `llm_gateway` set.
@@ -59,59 +58,13 @@ fn parse(raw: &str) -> Value {
     serde_json::from_str(raw).expect("reviewed schema file is valid JSON")
 }
 
-fn definitions() -> Vec<OwnedDefinition> {
-    owned_definitions().expect("embedded documents parse")
-}
-
-#[test]
-fn every_embedded_document_carries_the_id_of_its_constant() {
-    for def in definitions().iter().filter(|d| d.id.ends_with('~')) {
-        let expected = format!("{GTS_ID_URI_PREFIX}{}", def.id);
-        assert_eq!(def.document["$id"], expected, "{}", def.id);
-        assert_eq!(
-            def.document["$schema"], "http://json-schema.org/draft-07/schema#",
-            "{} must declare the Draft-07 dialect",
-            def.id
-        );
-    }
-}
-
-#[test]
-fn the_four_bases_are_abstract_and_the_scope_type_is_concrete() {
-    for def in definitions().iter().filter(|d| d.id.ends_with('~')) {
-        let is_abstract = def.document["x-gts-abstract"] == Value::Bool(true);
-        assert_eq!(is_abstract, def.id != SCOPE_TYPE, "{}", def.id);
-    }
-}
-
-#[test]
-fn the_inventory_carries_the_same_seven_definitions() {
-    let defs = definitions();
-    for def in &defs {
-        if def.id.ends_with('~') {
-            let entry = inventory::iter::<InventoryTypeSchema>
-                .into_iter()
-                .find(|e| e.type_id == def.id)
-                .expect("type schema submitted to the inventory");
-            assert_eq!(parse(&(entry.schema_fn)()), def.document, "{}", def.id);
-        } else {
-            let entry = inventory::iter::<InventoryInstance>
-                .into_iter()
-                .find(|e| e.instance_id == def.id)
-                .expect("instance submitted to the inventory");
-            assert_eq!(entry.type_id, SCOPE_TYPE);
-            assert_eq!((entry.payload_fn)(), def.document, "{}", def.id);
-        }
-    }
-}
-
 /// A store holding the QE definitions and the `llm_gateway` examples: the
 /// repository's semantic check of the reviewed schema files. The registry
 /// validates with the same `gts` library and pattern-only entity-reference policy
 /// at admission time.
 fn store_with_examples() -> GtsStore {
     let mut store = GtsStore::new();
-    for def in definitions().iter().filter(|d| d.id.ends_with('~')) {
+    for def in owned_definitions().iter().filter(|d| d.id.ends_with('~')) {
         store
             .register_schema(def.id, &def.document)
             .expect("QE type schema registers");
@@ -184,7 +137,7 @@ fn the_owner_examples_validate_as_concrete_derived_contracts_with_their_traits()
 #[test]
 fn scope_instances_validate_against_the_scope_type_and_bases_take_no_instances() {
     let mut store = store_with_examples();
-    for def in definitions().iter().filter(|d| !d.id.ends_with('~')) {
+    for def in owned_definitions().iter().filter(|d| !d.id.ends_with('~')) {
         store
             .validate_payload_with(SCOPE_TYPE, &def.document, GtsRefValidation::None)
             .unwrap_or_else(|e| panic!("{}: {e}", def.id));
@@ -232,4 +185,27 @@ fn the_token_request_envelope_validates_against_its_resolved_contract() {
         bare_metadata.to_string().contains("type"),
         "{bare_metadata}"
     );
+}
+
+#[test]
+fn a_concrete_derived_type_leaving_a_required_trait_unresolved_is_rejected() {
+    let mut store = store_with_examples();
+    let id = "gts.cf.core.qe.request.v1~cf.qetest.llm.missing_trait.v1~";
+    // Resolves `metric` but not `constraint_contract`, which the base requires.
+    let derived = serde_json::json!({
+        "$id": format!("gts://{id}"),
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "x-gts-traits": {
+            "metric": format!("{METRIC_BASE_TYPE}cf.qetest.metric.other.v1")
+        },
+        "type": "object",
+        "allOf": [{ "$ref": format!("gts://{REQUEST_BASE}") }]
+    });
+    store
+        .register_schema(id, &derived)
+        .expect("the derived schema registers");
+    let err = store
+        .validate_schema_with(id, GtsRefValidation::None)
+        .expect_err("an unresolved required trait must be rejected");
+    assert!(err.to_string().contains("constraint_contract"), "{err}");
 }

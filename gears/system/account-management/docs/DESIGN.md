@@ -352,7 +352,7 @@ Legacy system integration is handled through the pluggable IdP provider contract
 
 Tenant types are **not a compile-time enum**. They are registered at runtime through the [GTS (Global Type System)](https://github.com/GlobalTypeSystem/gts-spec) types registry, enabling deployments to define their own business hierarchy topology without code changes. The type topology is deployment-specific (see PRD §5.3 for examples: flat, cloud hosting, education, enterprise).
 
-**Base Type Schema:** `gts.cf.core.am.tenant_type.v1~` — [tenant_type.v1.schema.json](./schemas/tenant_type.v1.schema.json)
+**Base Type Schema:** `gts.cf.core.am.tenant_type.v1~` — Rust source of truth: `TenantTypeEnvelopeV1` / `TenantTypeTraits` in `account-management-sdk/src/gts.rs`
 
 The base type defines behavioral traits via standard [GTS Schema Traits](https://github.com/GlobalTypeSystem/gts-spec?tab=readme-ov-file#97---schema-traits-x-gts-traits-schema--x-gts-traits) (`x-gts-traits-schema`). Derived tenant type schemas resolve trait values via `x-gts-traits`. Traits are not part of the tenant instance data model — they configure system behavior for processing tenants of each type.
 
@@ -406,7 +406,7 @@ Tenant metadata schemas are registered at runtime through the GTS types registry
 
 > **Scope**: the `tenant_metadata` schema family models the **public**, tenant-admin-visible metadata surface. Plugin-private state returned by `IdpPluginClient::provision_tenant` is **not** modeled as a `tenant_metadata` schema — it is persisted as an opaque AM-managed JSON blob in the separate `tenant_idp_metadata` store (DESIGN §3.7), owned by the plugin and never validated, namespaced, or interpreted by AM. The two stores are orthogonal: writes to `tenant_metadata` go through `MetadataService` with GTS validation; writes to `tenant_idp_metadata` are AM's side effect of forwarding the plugin's opaque `IdpProvisionResult::metadata` blob.
 
-**Base Type Schema:** `gts.cf.core.am.tenant_metadata.v1~` — [tenant_metadata.v1.schema.json](./schemas/tenant_metadata.v1.schema.json)
+**Base Type Schema:** `gts.cf.core.am.tenant_metadata.v1~` — Rust source of truth: `TenantMetadataEnvelopeV1` / `TenantMetadataTraits` in `account-management-sdk/src/gts.rs`
 
 The base schema defines behavioral traits via `x-gts-traits-schema`. Derived metadata schemas resolve trait values via `x-gts-traits`; properties not specified fall back to the base defaults.
 
@@ -790,12 +790,12 @@ Root tenant creation is exclusively handled by BootstrapService — no API endpo
 
 ### 3.3 API Contracts
 
-The authoritative machine-readable REST contract is [account-management-v1.yaml](./account-management-v1.yaml). DESIGN owns interface boundaries, consistency guarantees, and dependency expectations; the OpenAPI file owns concrete paths, payloads, status mappings, and examples. JSON schemas under [schemas/](./schemas/) remain the authoritative schema artifacts consumed by metadata validation and provider-returned metadata entries, while [migration.sql](./migration.sql) is the reference DDL and index source for persistence detail.
+The authoritative machine-readable REST contract is [account-management-v1.yaml](./account-management-v1.yaml). DESIGN owns interface boundaries, consistency guarantees, and dependency expectations; the OpenAPI file owns concrete paths, payloads, status mappings, and examples. The GTS envelope schemas (`TenantTypeEnvelopeV1`, `TenantMetadataEnvelopeV1`) are generated from the Rust types in `account-management-sdk/src/gts.rs`, which are the authoritative schema source consumed by metadata validation and provider-returned metadata entries, while [migration.sql](./migration.sql) is the reference DDL and index source for persistence detail.
 
 | Artifact | Authoritative for |
 |----------|-------------------|
 | [account-management-v1.yaml](./account-management-v1.yaml) | HTTP paths, parameters, request and response bodies, RFC 9457 problem shapes, pagination objects |
-| [schemas/tenant_metadata.v1.schema.json](./schemas/tenant_metadata.v1.schema.json) and related JSON schemas | GTS-registered metadata payload schemas and traits referenced by metadata validation |
+| `account-management-sdk/src/gts.rs` (`TenantTypeEnvelopeV1`, `TenantMetadataEnvelopeV1`) | GTS envelope schemas and trait contracts, generated from Rust types; referenced by tenant-type and metadata validation |
 | [migration.sql](./migration.sql) | Reference DDL, indexes, and storage-level constraints |
 | `DESIGN.md` | Interface ownership, lifecycle boundaries, auth expectations, dependency contracts, and storage responsibilities |
 
@@ -1724,7 +1724,7 @@ Risk-to-test ownership:
 | [DESIGN.md](./DESIGN.md) | Architecture owner | Boundaries, invariants, dependency model, or review-level operational guidance change | `cpt validate --artifact` and TOC regeneration |
 | [account-management-v1.yaml](./account-management-v1.yaml) | API contract owner | Public REST paths, request/response schemas, or public error mappings change | OpenAPI linting plus Cypilot artifact validation |
 | [migration.sql](./migration.sql) | Persistence owner | Reference schema, indexes, or physical invariants change | Manual review plus consistency with DESIGN storage responsibilities |
-| [schemas/](./schemas/) JSON schema artifacts | Schema owner | GTS-registered metadata or related schema artifacts change | Schema validation and cross-reference review |
+| GTS envelope types in `account-management-sdk/src/gts.rs` | Schema owner | GTS-registered metadata or related schema artifacts change | Schema validation and cross-reference review |
 | [ADR/](./ADR/) | Architecture owner | A design decision changes, is superseded, or gains a new tradeoff outcome | ADR checklist validation |
 
 Sync rules:
@@ -1766,6 +1766,6 @@ The main design pitfalls are:
 - **PRD**: [PRD.md](./PRD.md)
 - **Authoritative REST contract**: [account-management-v1.yaml](./account-management-v1.yaml)
 - **Reference storage contract**: [migration.sql](./migration.sql)
-- **Schema artifacts**: [schemas/](./schemas/)
+- **Schema artifacts**: GTS envelope types in `account-management-sdk/src/gts.rs`
 - **ADRs**: [ADR/](./ADR/)
 - **Accepted residual gap**: `DECOMPOSITION.md` and FEATURE artifacts are intentionally not part of this review-readiness pass. Full downstream `PRD -> DESIGN -> DECOMPOSITION -> FEATURE -> CODE` traceability remains an acknowledged follow-up item rather than a claim of completion.

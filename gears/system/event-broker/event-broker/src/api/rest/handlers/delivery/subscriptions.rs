@@ -1,5 +1,4 @@
-//! JOIN, list, read, leave, seek (`DESIGN.md:591`,
-//! `docs/schemas/gts.cf.core.events.subscription.v1~.schema.json`).
+//! JOIN, list, read, leave, seek (`DESIGN.md:591`).
 
 use std::collections::BTreeMap;
 
@@ -25,8 +24,7 @@ use crate::domain::model::Interest;
 
 const DEFAULT_SESSION_TIMEOUT_SECS: u64 = 30;
 
-/// Parses `session_timeout` (`docs/schemas/gts.cf.core.events.subscription.v1~.schema.json`'s
-/// `"format": "duration"`, i.e. ISO 8601) via
+/// Parses `session_timeout` (`JoinSubscriptionRequest::session_timeout`, an ISO 8601 duration) via
 /// `toolkit_utils::iso8601_duration::Iso8601Duration`. `None` (field absent)
 /// defaults to `PT30S` - documented, correct behavior. A value that is
 /// present but fails to parse, or parses to a zero duration, is rejected

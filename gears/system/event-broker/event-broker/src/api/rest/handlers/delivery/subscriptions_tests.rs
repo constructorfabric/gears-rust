@@ -3045,3 +3045,78 @@ async fn join_rejects_an_over_length_client_agent_before_parsing_session_timeout
         })
     );
 }
+
+// -- event-type selector scope --
+
+/// Subscribes one interest selecting `selector` on a registered topic.
+async fn join_with_selector(selector: &str) -> crate::test_support::TestResponse {
+    let harness = EventBrokerHarness::builder()
+        .with_type_registry(StaticTypesRegistry::of(json!([
+            { "id": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1", "partitions": 1 },
+        ])))
+        .build()
+        .await;
+    let group = harness.api_v1().post_consumer_groups().send().await.json()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    harness
+        .api_v1()
+        .post_subscriptions()
+        .with_body(Json(&json!({
+            "consumer_group": group,
+            "client_agent": "test-agent",
+            "interests": [{
+                "topic": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
+                "tenant_id": Uuid::new_v4(),
+                "types": [selector],
+            }],
+        })))
+        .send()
+        .await
+}
+
+/// A selector must name event types: a valid GTS pattern under the event base
+/// type. The base itself, a wildcard under it, a derived type and an instance
+/// pattern all qualify.
+#[tokio::test]
+async fn join_accepts_selectors_under_the_event_base_type() {
+    for selector in [
+        "gts.cf.core.events.event.v1~",
+        "gts.cf.core.events.event.v1~*",
+        "gts.cf.core.events.event.v1.2~*",
+        "gts.cf.core.events.event.v1~fabrikam.shop.orders.*",
+        "gts.cf.core.events.event.v1~fabrikam.shop.orders.placed.v*",
+        "gts.cf.core.events.event.v1~fabrikam.shop.orders.placed.v1.*",
+        "gts.cf.core.events.event.v1~fabrikam.shop.orders.placed.v1~",
+        "gts.cf.core.events.event.v1~fabrikam.shop.orders.named.v1",
+    ] {
+        eprintln!("selector under test: {selector}");
+        join_with_selector(selector).await.assert_status(201);
+    }
+}
+
+/// Malformed patterns and patterns outside the event base type (`gts.*`,
+/// another base's wildcard, a longer major version) select things that are not
+/// event types and are rejected with `400`.
+#[tokio::test]
+async fn join_rejects_selectors_that_do_not_name_event_types() {
+    let too_long = format!(
+        "gts.cf.core.events.event.v1~fabrikam.shop.orders.{}.v1~",
+        "a".repeat(1024)
+    );
+    for selector in [
+        "not-gts.*",
+        "gts.*",
+        "gts.cf.core.events.topic.v1~*",
+        "gts.cf.core.events.event.v12~*",
+        "gts.cf.core.events.event.v1~fabrikam.*.orders.placed.v1~",
+        "gts.cf.core.events.event.v1~fabrikam.shop.orders.*~*",
+        "gts.cf.core.events.event.v1~fabrikam.shop.orders.plac*",
+        "gts.cf.core.events.event.v1~fabrikam.shop.orders.placed.v01~",
+        &too_long,
+    ] {
+        eprintln!("selector under test: {selector}");
+        join_with_selector(selector).await.assert_status(400);
+    }
+}

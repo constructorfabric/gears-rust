@@ -6,8 +6,9 @@
 // and `plugin_configs.plugin_instance_id` (part of the composite PK
 // `(plugin_instance_id, session_type_id)`).
 //
-// The literals are frozen on purpose: a migration must not follow later
-// changes to the runtime constants. The SQL is backend-neutral (no quoting,
+// The id suffixes are frozen on purpose: a migration must not follow later
+// changes to the runtime constants. The new ids take the deployment's
+// configured GTS prefix through `gts_id!`, as the runtime ids do. The SQL is backend-neutral (no quoting,
 // no UPDATE ... FROM), so it runs unchanged on Postgres, SQLite and MySQL.
 
 use sea_orm_migration::prelude::*;
@@ -16,11 +17,15 @@ use sea_orm_migration::sea_orm::{ConnectionTrait, Statement};
 const ID_PAIRS: [(&str, &str); 2] = [
     (
         "gtx.cf.chat_engine.webhook_compat_plugin.v1~",
-        "gts.cf.toolkit.plugins.plugin.v1~cf.chat_engine._.backend_plugin.v1~cf.chat_engine._.webhook_compat.v1",
+        toolkit_gts::gts_id!(
+            "cf.toolkit.plugins.plugin.v1~cf.chat_engine._.backend_plugin.v1~cf.chat_engine._.webhook_compat.v1"
+        ),
     ),
     (
         "gtx.cf.chat_engine.llm_gateway_plugin.v1~",
-        "gts.cf.toolkit.plugins.plugin.v1~cf.chat_engine._.backend_plugin.v1~cf.chat_engine._.llm_gateway.v1",
+        toolkit_gts::gts_id!(
+            "cf.toolkit.plugins.plugin.v1~cf.chat_engine._.backend_plugin.v1~cf.chat_engine._.llm_gateway.v1"
+        ),
     ),
 ];
 

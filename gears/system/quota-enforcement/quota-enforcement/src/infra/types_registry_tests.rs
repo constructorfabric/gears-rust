@@ -197,7 +197,7 @@ async fn missing_types_and_instances_are_none_and_transport_failures_lift() {
 async fn ensure_registered_is_idempotent_and_a_divergent_definition_is_a_conflict() {
     let client = in_process_registry(Vec::new());
     let registry = TypesRegistryContracts::new(client.clone());
-    let definitions = owned_definitions().expect("definitions");
+    let definitions = owned_definitions();
 
     // The inventory already seeded these; asserting them again is a no-op.
     registry

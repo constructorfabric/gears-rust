@@ -37,7 +37,7 @@ fn schema(
 
 /// Build the canonical envelope (`gts.cf.core.am.tenant_type.v1~`)
 /// with the `x-gts-traits-schema` defaulting `allowed_parent_types`
-/// to `[]`, mirroring `docs/schemas/tenant_type.v1.schema.json`.
+/// to `[]`, mirroring `TenantTypeTraits`.
 fn envelope() -> Arc<GtsTypeSchema> {
     let raw = json!({
         "$id": gts_uri!(TENANT_TYPE_BASE_GTS_ID),

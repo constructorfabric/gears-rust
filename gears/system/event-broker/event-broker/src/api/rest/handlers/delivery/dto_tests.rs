@@ -10,7 +10,7 @@ use chrono::{DateTime, TimeZone, Utc};
 use serde_json::json;
 use uuid::Uuid;
 
-use super::dto::EventPayloadDto;
+use super::dto::{CreateConsumerGroupRequest, EventPayloadDto, JoinSubscriptionRequest};
 use crate::domain::model::{Event, Sequence};
 
 fn occurred_at() -> DateTime<Utc> {
@@ -92,5 +92,79 @@ fn a_sequence_beyond_32_bits_survives_the_crossing() {
     assert_eq!(
         serde_json::to_value(&dto).expect("the DTO must serialise")["sequence"],
         json!(2_147_483_648_i64)
+    );
+}
+
+// -- the request types' declared bounds agree with the validators -----------
+//
+// `event_broker_sdk::validate` enforces a field's bounds; the request type
+// declares the same bounds in the `OpenAPI` it publishes. Two statements of one
+// contract, so each test reads the bound from the type's generated schema and
+// probes the validator at it: a bound edited on one side fails here.
+
+use event_broker_sdk::validate::{Rule, TextFieldError, client_agent, description};
+use utoipa::PartialSchema;
+
+/// The generated schema of one request field.
+fn declared_field<T: PartialSchema>(field: &str) -> serde_json::Value {
+    let schema = serde_json::to_value(T::schema()).expect("the schema must serialise");
+    schema["properties"][field].clone()
+}
+
+fn rule_of(result: Result<(), TextFieldError>) -> Rule {
+    result.expect_err("the value must be rejected").rule()
+}
+
+/// Probes `validate` at the bounds `node` declares: the maximum is accepted, one
+/// byte past it is a `Length` rejection, and the minimum decides whether empty
+/// is accepted.
+fn agrees_with(node: &serde_json::Value, validate: fn(&str) -> Result<(), TextFieldError>) {
+    let bound = |key: &str| node.get(key).and_then(serde_json::Value::as_u64);
+    let max = usize::try_from(bound("maxLength").expect("the schema declares maxLength"))
+        .expect("fits usize");
+    let min = bound("minLength").unwrap_or(0);
+    assert_eq!(validate(&"x".repeat(max)), Ok(()));
+    assert_eq!(rule_of(validate(&"x".repeat(max + 1))), Rule::Length);
+    if min == 0 {
+        assert_eq!(validate(""), Ok(()), "schema allows empty");
+    } else {
+        assert_eq!(min, 1);
+        assert_eq!(rule_of(validate("")), Rule::Length, "schema forbids empty");
+    }
+    // The pattern's quantifier says the same thing about empty as `minLength`.
+    let pattern = node["pattern"]
+        .as_str()
+        .expect("the schema declares pattern");
+    assert_eq!(
+        pattern,
+        if min == 0 {
+            r"^[\x20-\x7E]*$"
+        } else {
+            r"^[\x20-\x7E]+$"
+        }
+    );
+}
+
+#[test]
+fn consumer_group_client_agent_bounds_agree_with_the_validator() {
+    agrees_with(
+        &declared_field::<CreateConsumerGroupRequest>("client_agent"),
+        client_agent,
+    );
+}
+
+#[test]
+fn subscription_client_agent_bounds_agree_with_the_validator() {
+    agrees_with(
+        &declared_field::<JoinSubscriptionRequest>("client_agent"),
+        client_agent,
+    );
+}
+
+#[test]
+fn consumer_group_description_bounds_agree_with_the_validator() {
+    agrees_with(
+        &declared_field::<CreateConsumerGroupRequest>("description"),
+        description,
     );
 }

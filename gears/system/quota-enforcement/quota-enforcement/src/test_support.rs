@@ -1078,7 +1078,6 @@ pub fn document_id(document: &Value) -> String {
 
 fn owned_type_documents() -> Vec<Value> {
     owned_definitions()
-        .expect("owned definitions parse")
         .into_iter()
         .filter(|d| d.id.ends_with('~'))
         .map(|d| d.document)

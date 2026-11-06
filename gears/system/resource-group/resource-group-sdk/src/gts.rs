@@ -16,18 +16,13 @@ use toolkit_gts::gts_type_schema;
 /// All chained RG types (tenant, department, branch, etc.) inherit from this
 /// base contract via `allOf` + `$ref`.
 ///
-/// # TODO: replace manual DTOs when `gts-macros` supports `x-gts-traits-schema`
+/// # Note: manual DTOs and `x-gts-traits-schema`
 ///
-/// Currently `gts-macros` (`struct_to_gts_schema`) does not generate
-/// `x-gts-traits-schema` in the output JSON Schema. Once it does, this struct
-/// should replace:
-/// - `models::ResourceGroupType` (response DTO)
-/// - `models::CreateTypeRequest` (create request DTO)
-/// - `models::UpdateTypeRequest` (update request DTO)
-///
-/// Blockers: `gts-macros` needs camelCase serde support, `x-gts-traits-schema`
-/// generation, `metadata_schema` field support, and `Clone`/`Debug`/`Default`
-/// derives.
+/// The REST layer uses hand-written DTOs (`TypeDto` etc.) rather than this
+/// struct. `struct_to_gts_schema` can emit `x-gts-traits-schema` via
+/// `traits_schema = inline(T)`, but this declaration does not use it today.
+/// Adding a traits schema to `ResourceGroupTypeV1` is a possible future change
+/// and would be wire-visible (it changes the registered GTS schema).
 ///
 /// # Schema ID
 ///

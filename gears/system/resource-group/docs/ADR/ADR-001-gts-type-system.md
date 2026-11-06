@@ -715,4 +715,4 @@ This decision directly addresses the following requirements and design elements:
 
 Additional references:
 - Migration DDL: [migration.sql](../migration.sql)
-- OpenAPI spec: [openapi.yaml](../openapi.yaml)
+- REST contract: route and DTO definitions in [`api/rest`](../../resource-group/src/api/rest/)

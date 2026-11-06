@@ -124,7 +124,7 @@ pub struct FilterSpec {
 }
 
 /// One topic-anchored interest within a JOIN request/response
-/// (`gts.cf.core.events.subscription.v1~.schema.json`'s `Interest` definition): event-type
+/// (`InterestDto` in the REST DTOs): event-type
 /// patterns (GTS wildcard rules) scoped to `topic`, with an optional
 /// compiled filter. Lives here (not `domain/delivery.rs`) because it's part
 /// of `Subscription`'s own persisted/echoed shape, not just a
@@ -323,7 +323,7 @@ pub enum ConsumerGroupKind {
 /// Membership (`GroupState::active_members`) is tracked separately, in
 /// cache, not here. `tenant_id`/`owner_principal_id` are non-overridable -
 /// captured from `SecurityContext` at create time, never from the request
-/// body (`docs/schemas/gts.cf.core.events.consumer_group.v1~.schema.json`).
+/// body (`CreateConsumerGroupRequest` carries neither).
 #[domain_model]
 #[derive(Debug, Clone)]
 pub struct ConsumerGroup {
@@ -344,8 +344,7 @@ pub struct ConsumerGroup {
 pub struct ConsumerGroupCreateInput {
     /// Diagnostic hint surfaced in operational logs only - no broker-side
     /// semantic, not persisted on `ConsumerGroup`
-    /// (`gts.cf.core.events.consumer_group.v1~.schema.json`'s `CreateRequest.client_agent` doc
-    /// comment).
+    /// (`CreateConsumerGroupRequest::client_agent`'s doc comment).
     pub client_agent: Option<String>,
     pub description: Option<String>,
 }

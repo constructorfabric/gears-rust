@@ -214,12 +214,7 @@ impl Bootstrap {
         // @cpt-begin:cpt-cf-quota-enforcement-flow-owner-projection-publication:p1:inst-pub-boot
         // @cpt-begin:cpt-cf-quota-enforcement-algo-catalog-bootstrap:p1:inst-cat-bases
         // Reasserting identical definitions is idempotent; conflicts fail.
-        let definitions = owned_definitions().map_err(|e| {
-            (
-                Dependency::Catalog,
-                DomainError::Internal(format!("embedded GTS definition does not parse: {e}")),
-            )
-        })?;
+        let definitions = owned_definitions();
         self.catalog
             .registry
             .ensure_registered(&definitions)

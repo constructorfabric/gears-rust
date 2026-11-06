@@ -7,7 +7,7 @@
 
 ## SDK Models
 
-Defined in `resource-group-sdk/src/models.rs`. Aligned with REST API schemas ([openapi.yaml](./openapi.yaml)).
+Defined in `resource-group-sdk/src/models.rs`. Aligned with REST API schemas (DTOs in [`api/rest/dto.rs`](../resource-group/src/api/rest/dto.rs)).
 
 ```rust
 use uuid::Uuid;
