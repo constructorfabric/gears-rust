@@ -169,6 +169,7 @@ The Customer tenant defines its own `Shared` provider with the slug `openai`, wh
 - Tenant-scoped model catalog with the model record contents described in section 5.2.
 - Model approval state managed by the owning tenant.
 - Inheritance down the tenant hierarchy, with provider shadowing.
+- Restriction of individual inherited models by a descendant tenant (`p2`).
 - Management API following platform conventions (OData, authorization, canonical errors).
 - Resolution API for evaluation: get a model by canonical id and list available models.
 - Durable storage of the catalog.
@@ -180,7 +181,7 @@ The Customer tenant defines its own `Shared` provider with the slug `openai`, wh
 - Automatic discovery or synchronization of models from provider APIs.
 - Provider health or latency monitoring.
 - Usage metering and billing. The registry stores a model's cost rates and does not compute usage cost.
-- Per-tenant approval overrides of inherited models. A descendant tenant excludes an inherited model only by shadowing its provider.
+- Per-tenant approval overrides of inherited models. A descendant tenant cannot change the approval state of an inherited model.
 - Multi-step approval workflows with external approvers. The registry records the owning tenant's approval decision.
 - Per-user or per-group model entitlements beyond the policy decisions of the PDP.
 
@@ -280,7 +281,7 @@ The system **MUST** hold for each model a provider-independent cost in AI credit
 
 - [ ] `p1` - **ID**: `cpt-cf-model-registry-fr-model-approval`
 
-The system **MUST** keep an approval state on each model, set by the owning tenant's administrator. Each model carries one of four approval states: Pending, Approved, Rejected, or Revoked, together with who made the last decision and when. Create and update **MAY** set the approval state under the model management permission. A model created without an approval state starts as Approved. Only Approved models **MUST** be available for evaluation. Approval is inherited with the model. A descendant tenant cannot change the approval of an inherited model and can only exclude it by shadowing its provider.
+The system **MUST** keep an approval state on each model, set by the owning tenant's administrator. Each model carries one of four approval states: Pending, Approved, Rejected, or Revoked, together with who made the last decision and when. Create and update **MAY** set the approval state under the model management permission. A model created without an approval state starts as Approved. Only Approved models **MUST** be available for evaluation. Approval is inherited with the model. A descendant tenant cannot change the approval of an inherited model; it excludes the model by shadowing its provider or, at `p2`, by restricting the model (`cpt-cf-model-registry-fr-inherited-model-restriction`).
 
 - **Rationale**: The owning tenant controls which models are cleared for use, and the latest decision and who made it stay visible.
 - **Actors**: `cpt-cf-model-registry-actor-tenant-admin`
@@ -292,6 +293,15 @@ The system **MUST** keep an approval state on each model, set by the owning tena
 The system **MUST** give models the same sharing modes as providers. A model **MUST** be visible to descendant tenants only when both the model and its provider are `Shared`. There is no model-level shadowing.
 
 - **Rationale**: Administrators can share a provider yet keep some of its models private by setting them to `Tenant` mode. Shadowing a model would require shadowing its provider first, which already replaces all its inherited models.
+- **Actors**: `cpt-cf-model-registry-actor-tenant-admin`
+
+#### Inherited Model Restriction
+
+- [ ] `p2` - **ID**: `cpt-cf-model-registry-fr-inherited-model-restriction`
+
+The system **MUST** let a Tenant Administrator restrict an individual inherited model for their tenant without shadowing its provider. A restricted model **MUST NOT** resolve or appear in the available list for the restricting tenant. The restriction **MUST NOT** change the model's approval state or the ancestor's catalog, and the other models of the provider and later changes to the ancestor's catalog **MUST** stay inherited. Lifting the restriction **MUST** restore the model.
+
+- **Rationale**: Shadowing replaces a whole provider. A tenant that wants to block one inherited model, for example an expensive one, while keeping the others and future catalog updates would otherwise have to copy and maintain the rest of the provider's models.
 - **Actors**: `cpt-cf-model-registry-actor-tenant-admin`
 
 #### Effective Catalog
@@ -607,6 +617,7 @@ An acknowledged change to a provider or model **MUST** survive restarts of the g
 - Will multi-step approval through an external approval service be required later? (Owner: Platform Architecture, Resolve by: before P2 planning)
 - How will auto-discovery of provider models work? Discovered models would start as Pending and wait for an administrator's approval. (Owner: Model Registry team, Resolve by: before P2 planning)
 - How will change notifications be published and delivered: event types and payload, which tenants receive a change to a shared entry, and how publication survives a crash after commit (for example, an outbox in the catalog transaction)? (Owner: Model Registry team, Resolve by: before P2 planning)
+- Does a tenant's restriction of an inherited model (`cpt-cf-model-registry-fr-inherited-model-restriction`) reach its descendants, and can a descendant lift it? (Owner: Model Registry team, Resolve by: before P2 planning)
 
 ## 14. Traceability
 

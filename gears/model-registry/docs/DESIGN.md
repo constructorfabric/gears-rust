@@ -93,6 +93,7 @@ Terms used below:
 | `cpt-cf-model-registry-fr-management-api-conventions` | Versioned paths under `/model-registry/v1/`, `OperationBuilder` with `.authenticated()` and `.standard_errors()`, OData on every list, canonical Problem errors. Management reads return own and inherited entries with `inherited`, `shadowed`, and eval-availability flags; writes on inherited entries fail with `INHERITED_READ_ONLY`. Every record carries `version`; single-entry responses carry `ETag`, and `PATCH` requires `If-Match` (§3.3). |
 | `cpt-cf-model-registry-fr-change-audit` | `p2`. The audit columns `created_by`, `created_at`, `updated_by`, `updated_at` on both tables and `approval_decided_by`, `approval_decided_at` on models ship in p1 as part of the record. The append-only change log of this FR is not part of this design (§4 Change Audit Follow-up). |
 | `cpt-cf-model-registry-fr-change-notifications` | `p2`, not covered. The gear publishes no change events; consumers read the catalog on each request (§4 Open Questions). |
+| `cpt-cf-model-registry-fr-inherited-model-restriction` | `p2`, not covered. A tenant excludes an inherited model only by shadowing its provider (`cpt-cf-model-registry-seq-effective-catalog`). |
 
 #### NFR Allocation
 
