@@ -98,8 +98,8 @@ paths:
               minimal:
                 summary: Minimal create
                 value:
-                  type: gts.cf.core.tasks.task.v1~acme.reports.render.v1~
-                  queue: gts.cf.core.tasks.queue.v1~acme.reports.render.v1
+                  type: gts.cf.core.tasks.task.v1~acme.reports._.render.v1~
+                  queue: gts.cf.core.tasks.queue.v1~acme.reports._.render.v1
                   priority: 100
                   input: { report_id: r-42, format: pdf }
                   tags: { project: q4 }
@@ -1491,7 +1491,7 @@ components:
       name: queue_id
       in: path
       required: true
-      description: Full GTS queue instance ID, for example `gts.cf.core.tasks.queue.v1~acme.reports.render.v1`.
+      description: Full GTS queue instance ID, for example `gts.cf.core.tasks.queue.v1~acme.reports._.render.v1`.
       schema:
         $ref: "#/components/schemas/QueueRef"
     ConfigVersion:
