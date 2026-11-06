@@ -250,7 +250,7 @@ async fn the_route_asks_the_policy_service_for_manage_on_the_subject_facts() {
     assert_eq!(
         asked,
         [(
-            "gts.cf.construct.subject.facts.v1~".to_owned(),
+            "gts.cf.construct.subject.fact.v1~".to_owned(),
             "manage".to_owned()
         )]
     );

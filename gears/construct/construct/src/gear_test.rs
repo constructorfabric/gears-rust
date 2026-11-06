@@ -10,7 +10,7 @@ use toolkit::contracts::RunnableCapability;
 use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
-use super::{ConstructGear, Running, lock};
+use super::{ConstructGear, Running};
 use crate::config::{CategoryCheckConfig, ConstructConfig};
 use crate::domain::model_client::{ModelClient, ModelError, ModelRequest, ModelResponse};
 use crate::domain::record_intake::RecordHandOff;
@@ -57,7 +57,7 @@ async fn gear_with_worker() -> (ConstructGear, Arc<dyn RecordHandOff>) {
     )
     .unwrap();
     let gear = ConstructGear::default();
-    *lock(&gear.worker) = pipeline.worker;
+    *gear.worker.lock() = pipeline.worker;
     (gear, pipeline.hand_off)
 }
 
@@ -66,8 +66,10 @@ async fn start_runs_the_worker_and_stop_ends_it() {
     let (gear, hand_off) = gear_with_worker().await;
 
     gear.start(CancellationToken::new()).await.unwrap();
-    assert!(lock(&gear.worker).is_none(), "taken by start");
-    let load = lock(&gear.running)
+    assert!(gear.worker.lock().is_none(), "taken by start");
+    let load = gear
+        .running
+        .lock()
         .as_ref()
         .expect("the worker runs")
         .load
@@ -91,7 +93,7 @@ async fn start_runs_the_worker_and_stop_ends_it() {
     .await
     .expect("stop returns once the worker ends")
     .unwrap();
-    assert!(lock(&gear.running).is_none());
+    assert!(gear.running.lock().is_none());
 }
 
 #[tracing_test::traced_test]
@@ -101,7 +103,7 @@ async fn stop_after_its_deadline_aborts_a_worker_that_does_not_end() {
     // A worker that never notices it was told to stop.
     let handle = tokio::spawn(std::future::pending::<()>());
     let aborted = handle.abort_handle();
-    *lock(&gear.running) = Some(Running {
+    *gear.running.lock() = Some(Running {
         token: CancellationToken::new(),
         handle,
         load: WorkerLoad::new(Weak::new()),
@@ -132,7 +134,7 @@ async fn stop_says_how_many_records_it_loses() {
         .unwrap();
     let load = WorkerLoad::new(Arc::downgrade(&hand_off));
     let running = load.start();
-    *lock(&gear.running) = Some(Running {
+    *gear.running.lock() = Some(Running {
         token: CancellationToken::new(),
         handle: tokio::spawn(async {}),
         load,
@@ -151,7 +153,7 @@ async fn without_processing_start_and_stop_do_nothing() {
     let gear = ConstructGear::default();
 
     gear.start(CancellationToken::new()).await.unwrap();
-    assert!(lock(&gear.running).is_none());
+    assert!(gear.running.lock().is_none());
     gear.stop(CancellationToken::new()).await.unwrap();
 }
 
@@ -162,7 +164,7 @@ async fn a_worker_that_panicked_makes_stop_fail() {
     while !handle.is_finished() {
         tokio::task::yield_now().await;
     }
-    *lock(&gear.running) = Some(Running {
+    *gear.running.lock() = Some(Running {
         token: CancellationToken::new(),
         handle,
         load: WorkerLoad::new(Weak::new()),
@@ -198,7 +200,7 @@ async fn stop_gives_up_on_an_aborted_worker_that_does_not_end_and_says_so() {
     while !started_blocking.load(std::sync::atomic::Ordering::SeqCst) {
         tokio::task::yield_now().await;
     }
-    *lock(&gear.running) = Some(Running {
+    *gear.running.lock() = Some(Running {
         token: CancellationToken::new(),
         handle,
         load: WorkerLoad::new(Weak::new()),

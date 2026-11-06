@@ -70,6 +70,7 @@ toolkit-db = { workspace = true, features = ["sqlite"] }
 toolkit-db-macros = { workspace = true }
 toolkit-canonical-errors = { workspace = true, features = ["axum"] }
 toolkit-security = { workspace = true }
+toolkit-utils = { workspace = true }
 # GTS type ids (gts_id!) and the permission catalog (`src/gts/permissions.rs`)
 toolkit-gts = { workspace = true }
 # `gts_instance!` expands to `::gts::…` paths

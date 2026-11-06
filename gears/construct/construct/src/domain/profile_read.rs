@@ -2,7 +2,7 @@
 //! category, for a caller the platform lets act for the subject.
 
 use std::collections::HashSet;
-use std::sync::Arc;
+use std::sync::{Arc, Once};
 
 use async_trait::async_trait;
 use authz_resolver_sdk::models::TenantMode;
@@ -98,14 +98,22 @@ pub trait StoredProfiles: Send + Sync {
 }
 
 /// A content-free event for one profile read: who read which subject's
-/// categories, in which tenant.
+/// categories, in which tenant, and what the policy let them read.
 #[domain_model]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProfileReadEvent {
     pub tenant_id: Uuid,
     pub subject_id: Uuid,
     pub caller: Uuid,
+    /// The categories served: those granted that hold facts.
     pub categories: Vec<Category>,
+    /// The categories the policy let the caller read, in category order,
+    /// also those that hold no fact. Empty when the profile is not served,
+    /// as they are then not asked.
+    pub granted: Vec<Category>,
+    /// Whether the profile was served: personalization on and no erasure
+    /// under way.
+    pub served: bool,
 }
 
 /// Where profile read events go. The Audit gear takes them once it ships.
@@ -194,7 +202,7 @@ fn named_categories<'a>(values: impl IntoIterator<Item = &'a ScopeValue>) -> Has
 /// the applications and agents that act for the tenant's subjects: a
 /// constraint that reaches the tenant lets the caller read every subject in
 /// it. A policy may narrow that to named subjects with a resource id filter.
-fn granted_by(constraint: &ScopeConstraint, key: SubjectKey) -> Option<HashSet<Category>> {
+fn granted_by(constraint: &ScopeConstraint, key: SubjectKey) -> Option<Grant> {
     let mut named: Option<HashSet<Category>> = None;
     let mut tenant_named = false;
     for filter in constraint.filters() {
@@ -221,7 +229,26 @@ fn granted_by(constraint: &ScopeConstraint, key: SubjectKey) -> Option<HashSet<C
     if !tenant_named {
         return None;
     }
-    Some(named.unwrap_or_else(|| Category::ALL.into_iter().collect()))
+    Some(match named {
+        Some(categories) => Grant {
+            categories,
+            unnamed: false,
+        },
+        None => Grant {
+            categories: Category::ALL.into_iter().collect(),
+            unnamed: true,
+        },
+    })
+}
+
+/// What a policy scope grants on a profile.
+#[derive(Debug, PartialEq, Eq)]
+struct Grant {
+    categories: HashSet<Category>,
+    /// A constraint that reaches the profile named no category, so it grants
+    /// every one. Under `one_call` that is also what a plugin that cannot
+    /// express categories answers.
+    unnamed: bool,
 }
 
 /// What a policy scope grants on the profile at `key`: nothing when no
@@ -230,31 +257,42 @@ fn granted_by(constraint: &ScopeConstraint, key: SubjectKey) -> Option<HashSet<C
 /// and the categories must all come from the same one.
 ///
 /// The read asks with constraints required, so the enforcer never answers
-/// with an unconstrained scope; one that does is the platform allowing
-/// everything, and grants every category.
-fn granted(scope: &AccessScope, key: SubjectKey) -> Option<HashSet<Category>> {
+/// with an unconstrained scope. One that does grants nothing: an allow
+/// without constraints is a refusal, never a grant of every profile.
+fn granted(scope: &AccessScope, key: SubjectKey) -> Option<Grant> {
     if scope.is_unconstrained() {
-        return Some(Category::ALL.into_iter().collect());
+        return None;
     }
     scope
         .constraints()
         .iter()
         .filter_map(|constraint| granted_by(constraint, key))
         .reduce(|mut all, these| {
-            all.extend(these);
+            all.categories.extend(these.categories);
+            all.unnamed |= these.unnamed;
             all
         })
 }
 
 /// The scope the subject settings are read under: the profile scope's tenant
-/// filters, as the settings rows are scoped by tenant only. An unconstrained
-/// scope stays as it is, since `tenant_only` would turn it into deny-all.
+/// filters, as the settings rows are scoped by tenant only. The scope is
+/// never unconstrained here, since [`granted`] refuses that.
 fn settings_scope(scope: &AccessScope) -> AccessScope {
-    if scope.is_unconstrained() {
-        scope.clone()
-    } else {
-        scope.tenant_only()
-    }
+    scope.tenant_only()
+}
+
+/// Say once per process that `one_call` met a policy answer without a
+/// category constraint, which grants every category. A plugin that cannot
+/// express categories answers so for every read, and needs `per_category`.
+fn warn_unnamed_categories() {
+    static WARNED: Once = Once::new();
+    WARNED.call_once(|| {
+        tracing::warn!(
+            "construct: profile_category_check is one_call and a policy answer named no \
+             category, so it grants every category; a policy plugin that cannot express \
+             categories needs per_category"
+        );
+    });
 }
 
 /// What a failed policy call means for the read.
@@ -411,7 +449,12 @@ impl ProfileReadService {
         // @cpt-begin:cpt-cf-construct-algo-profile-reader-read:p1:inst-read-categories
         let readable = match (served, self.check) {
             (false, _) => HashSet::new(),
-            (true, CategoryCheck::OneCall) => granted,
+            (true, CategoryCheck::OneCall) => {
+                if granted.unnamed {
+                    warn_unnamed_categories();
+                }
+                granted.categories
+            }
             (true, CategoryCheck::PerCategory) => self.readable_one_by_one(ctx, key).await?,
         };
         // @cpt-end:cpt-cf-construct-algo-profile-reader-read:p1:inst-read-categories
@@ -428,6 +471,11 @@ impl ProfileReadService {
             subject_id,
             caller: ctx.subject_id(),
             categories: categories.iter().map(|group| group.category).collect(),
+            granted: Category::ALL
+                .into_iter()
+                .filter(|category| readable.contains(category))
+                .collect(),
+            served,
         });
         Ok(ProfileView {
             subject_id,
@@ -464,7 +512,8 @@ impl ProfileReadService {
         for (category, decided) in decisions {
             match decided {
                 Ok(scope) => {
-                    if granted(&scope, key).is_some_and(|categories| categories.contains(&category))
+                    if granted(&scope, key)
+                        .is_some_and(|grant| grant.categories.contains(&category))
                     {
                         readable.insert(category);
                     }
@@ -536,12 +585,36 @@ mod tests {
         }
     }
 
+    /// The categories `scope` grants on the profile at `key`.
+    fn categories(scope: &AccessScope, key: SubjectKey) -> Option<HashSet<Category>> {
+        granted(scope, key).map(|grant| grant.categories)
+    }
+
     #[test]
-    fn an_unconstrained_scope_grants_every_category() {
-        assert_eq!(
-            granted(&AccessScope::allow_all(), key()),
-            Some(Category::ALL.into_iter().collect())
-        );
+    fn an_unconstrained_scope_grants_nothing() {
+        assert_eq!(granted(&AccessScope::allow_all(), key()), None);
+    }
+
+    #[test]
+    fn a_grant_says_when_a_constraint_named_no_category() {
+        let key = key();
+
+        let unnamed = granted(&AccessScope::for_tenant(key.tenant_id), key).unwrap();
+        assert!(unnamed.unnamed);
+        let named = granted(&AccessScope::single(path_to(key, &[Category::Skill])), key).unwrap();
+        assert!(!named.unnamed);
+        let both = granted(
+            &AccessScope::from_constraints(vec![
+                path_to(key, &[Category::Skill]),
+                ScopeConstraint::new(vec![ScopeFilter::eq(
+                    pep_properties::OWNER_TENANT_ID,
+                    key.tenant_id,
+                )]),
+            ]),
+            key,
+        )
+        .unwrap();
+        assert!(both.unnamed, "one path without a category is enough");
     }
 
     #[test]
@@ -550,14 +623,14 @@ mod tests {
         let tenant = AccessScope::for_tenant(key.tenant_id);
 
         assert_eq!(
-            granted(&tenant, key),
+            categories(&tenant, key),
             Some(Category::ALL.into_iter().collect())
         );
         let elsewhere = SubjectKey {
             tenant_id: Uuid::new_v4(),
             ..key
         };
-        assert_eq!(granted(&tenant, elsewhere), None);
+        assert_eq!(categories(&tenant, elsewhere), None);
     }
 
     #[test]
@@ -566,14 +639,14 @@ mod tests {
         let scope = AccessScope::single(path_to(key, &[Category::Skill]));
 
         assert_eq!(
-            granted(&scope, key),
+            categories(&scope, key),
             Some([Category::Skill].into_iter().collect())
         );
         let other = SubjectKey {
             subject_id: Uuid::new_v4(),
             ..key
         };
-        assert_eq!(granted(&scope, other), None);
+        assert_eq!(categories(&scope, other), None);
     }
 
     /// One path to the profile at `key`, granting `categories`.
@@ -603,7 +676,7 @@ mod tests {
                 ScopeFilter::r#in(CATEGORY_PROPERTY, values.clone()),
             ]));
 
-            assert_eq!(granted(&scope, key), Some(HashSet::new()), "{values:?}");
+            assert_eq!(categories(&scope, key), Some(HashSet::new()), "{values:?}");
         }
     }
 
@@ -616,16 +689,15 @@ mod tests {
         ]);
 
         assert_eq!(
-            granted(&scope, key),
+            categories(&scope, key),
             Some([Category::Skill, Category::Role].into_iter().collect())
         );
     }
 
     #[test]
-    fn the_settings_scope_keeps_an_unconstrained_scope_and_only_the_tenant_filters_of_others() {
+    fn the_settings_scope_keeps_only_the_tenant_filters() {
         let key = key();
 
-        assert!(settings_scope(&AccessScope::allow_all()).is_unconstrained());
         let narrowed = settings_scope(&AccessScope::single(path_to(key, &[Category::Skill])));
         let [constraint] = narrowed.constraints() else {
             panic!("one constraint: {narrowed:?}");

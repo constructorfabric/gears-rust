@@ -1,8 +1,9 @@
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
+use std::sync::{Arc, OnceLock};
 
 use anyhow::Context as _;
 use async_trait::async_trait;
 use axum::Router;
+use parking_lot::Mutex;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use toolkit::api::OpenApiRegistry;
@@ -140,7 +141,7 @@ impl Gear for ConstructGear {
         self.profile
             .set(Arc::clone(&profile))
             .map_err(|_| anyhow::anyhow!("{} gear already initialized", Self::MODULE_NAME))?;
-        *lock(&self.worker) = pipeline.worker;
+        *self.worker.lock() = pipeline.worker;
         let ports = IntakePorts {
             types,
             switch: Arc::new(ConfigConnectorSwitch::new(
@@ -210,14 +211,14 @@ impl RunnableCapability for ConstructGear {
     /// Start processing received records, when processing is configured.
     async fn start(&self, cancel: CancellationToken) -> anyhow::Result<()> {
         // @cpt-begin:cpt-cf-construct-algo-profile-reader-wire:p1:inst-wire-start
-        let worker = lock(&self.worker).take();
+        let worker = self.worker.lock().take();
         let Some(worker) = worker else {
             return Ok(());
         };
         let token = cancel.child_token();
         let load = worker.load();
         let handle = tokio::spawn(worker.run(token.clone()));
-        *lock(&self.running) = Some(Running {
+        *self.running.lock() = Some(Running {
             token,
             handle,
             load,
@@ -231,7 +232,7 @@ impl RunnableCapability for ConstructGear {
     /// is lost, as the DESIGN says, and its identity stays, so a resend is a
     /// repeat. How many were lost is logged.
     async fn stop(&self, deadline: CancellationToken) -> anyhow::Result<()> {
-        let running = lock(&self.running).take();
+        let running = self.running.lock().take();
         if let Some(Running {
             token,
             mut handle,
@@ -286,13 +287,6 @@ impl RunnableCapability for ConstructGear {
 
 /// How long `stop` waits for an aborted worker to end.
 const ABORT_GRACE: std::time::Duration = std::time::Duration::from_secs(1);
-
-/// The guard of `mutex`, also after a panic while it was held: the worker
-/// slots hold no invariant a panic can break, and dropping the worker or its
-/// handle would leave records queued with nothing to process them.
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(PoisonError::into_inner)
-}
 
 #[cfg(test)]
 #[path = "gear_test.rs"]

@@ -3,7 +3,6 @@
 
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
-use std::time::Duration;
 
 use anyhow::Context as _;
 use async_trait::async_trait;
@@ -168,7 +167,7 @@ pub fn build(
             ChatCompletionsSettings {
                 upstream_alias: model.upstream_alias.clone(),
                 model: model.model.clone(),
-                timeout: Duration::from_secs(model.timeout_secs.get()),
+                timeout: model.timeout,
             },
         )?)),
         None => None,

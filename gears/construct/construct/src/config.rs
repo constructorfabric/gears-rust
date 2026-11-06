@@ -1,4 +1,5 @@
 use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
+use std::time::Duration;
 
 use serde::Deserialize;
 use uuid::Uuid;
@@ -73,13 +74,16 @@ pub struct ModelConfig {
     pub upstream_alias: String,
     /// The model name the upstream expects.
     pub model: String,
-    /// The limit for one model call, in seconds.
-    #[serde(default = "default_model_timeout_secs")]
-    pub timeout_secs: NonZeroU64,
+    /// The limit for one model call, such as `"60s"`.
+    #[serde(
+        with = "toolkit_utils::humantime_serde",
+        default = "default_model_timeout"
+    )]
+    pub timeout: Duration,
 }
 
-fn default_model_timeout_secs() -> NonZeroU64 {
-    NonZeroU64::new(60).unwrap_or(NonZeroU64::MIN)
+const fn default_model_timeout() -> Duration {
+    Duration::from_secs(60)
 }
 
 /// How received records are processed.
@@ -152,7 +156,7 @@ pub const MAX_ROUNDS: u32 = 64;
 /// The most tokens the planner may be capped at for one record.
 pub const MAX_TOKENS: u64 = 1_000_000;
 /// The longest one model call may be allowed to take, in seconds.
-pub const MAX_MODEL_TIMEOUT_SECS: u64 = 600;
+pub const MAX_MODEL_TIMEOUT: Duration = Duration::from_secs(600);
 /// The most records the processing queue may hold.
 pub const MAX_QUEUE_CAPACITY: usize = 100_000;
 /// The most records that may be processed at once.
@@ -255,11 +259,11 @@ impl ConstructConfig {
             )));
         }
         if let Some(model) = &self.model
-            && model.timeout_secs.get() > MAX_MODEL_TIMEOUT_SECS
+            && (model.timeout < Duration::from_secs(1) || model.timeout > MAX_MODEL_TIMEOUT)
         {
             return Err(InvalidConfig(format!(
-                "model.timeout_secs must be from 1 to {MAX_MODEL_TIMEOUT_SECS}, not {}",
-                model.timeout_secs
+                "model.timeout must be from 1s to {MAX_MODEL_TIMEOUT:?}, not {:?}",
+                model.timeout
             )));
         }
         if self.processing_identity == Some(Uuid::nil()) {
@@ -271,6 +275,13 @@ impl ConstructConfig {
             return Err(InvalidConfig(
                 "profile_category_check must be set with a processing identity: one_call when the \
                  policy plugin answers with category constraints, per_category otherwise"
+                    .to_owned(),
+            ));
+        }
+        if self.processing_identity.is_none() && self.profile_category_check.is_some() {
+            return Err(InvalidConfig(
+                "profile_category_check is set without a processing identity, so profile reads \
+                 would answer 501: set processing_identity too, or remove profile_category_check"
                     .to_owned(),
             ));
         }
@@ -393,7 +404,7 @@ mod tests {
         .expect("known keys");
         assert!(config.processing_identity.is_some());
         let model = config.model.expect("a model");
-        assert_eq!(model.timeout_secs.get(), 60);
+        assert_eq!(model.timeout, Duration::from_secs(60));
         assert_eq!(config.processing.workers.get(), 2);
         assert_eq!(config.processing.queue_capacity.get(), 256);
         assert_eq!(
@@ -640,11 +651,15 @@ mod tests {
                 false,
             ),
             (
-                serde_json::json!({ "model": { "upstream_alias": "llm", "model": "m", "timeout_secs": MAX_MODEL_TIMEOUT_SECS } }),
+                serde_json::json!({ "model": { "upstream_alias": "llm", "model": "m", "timeout": "10m" } }),
                 true,
             ),
             (
-                serde_json::json!({ "model": { "upstream_alias": "llm", "model": "m", "timeout_secs": MAX_MODEL_TIMEOUT_SECS + 1 } }),
+                serde_json::json!({ "model": { "upstream_alias": "llm", "model": "m", "timeout": "10m 1s" } }),
+                false,
+            ),
+            (
+                serde_json::json!({ "model": { "upstream_alias": "llm", "model": "m", "timeout": "500ms" } }),
                 false,
             ),
         ] {
@@ -674,10 +689,10 @@ mod tests {
         .unwrap()
         .validated()
         .unwrap();
+        let neither = parse(serde_json::json!({})).unwrap().validated().unwrap();
         let without = parse(serde_json::json!({ "profile_category_check": "one_call" }))
             .unwrap()
-            .validated()
-            .unwrap();
+            .validated();
 
         assert_eq!(
             with.identity(),
@@ -686,6 +701,10 @@ mod tests {
                 category_check: CategoryCheckConfig::OneCall,
             })
         );
-        assert_eq!(without.identity(), None);
+        assert_eq!(neither.identity(), None);
+        let Err(InvalidConfig(message)) = without else {
+            panic!("a category check without an identity is refused");
+        };
+        assert!(message.contains("processing_identity"), "{message}");
     }
 }

@@ -185,6 +185,12 @@ async fn a_caller_the_platform_lets_act_for_the_subject_reads_its_facts_by_categ
         (tenant, subject, caller.subject_id())
     );
     assert_eq!(event.categories, [Category::Identity, Category::Skill]);
+    assert_eq!(
+        event.granted,
+        Category::ALL,
+        "the grant, also the categories without facts"
+    );
+    assert!(event.served);
 }
 
 #[tokio::test]
@@ -291,7 +297,9 @@ async fn a_category_the_scope_leaves_out_is_not_listed() {
         .unwrap();
 
     assert_eq!(kinds(&view), [(Category::Skill, 2)]);
-    assert_eq!(events.taken()[0].categories, [Category::Skill]);
+    let event = &events.taken()[0];
+    assert_eq!(event.categories, [Category::Skill]);
+    assert_eq!(event.granted, [Category::Skill]);
 }
 
 #[tokio::test]
@@ -353,7 +361,10 @@ async fn nothing_is_served_while_personalization_is_off_or_an_erasure_is_under_w
 
         assert!(view.categories.is_empty(), "{settings:?}");
         assert_eq!(events.taken().len(), 1, "the read is still an event");
-        assert!(events.taken()[0].categories.is_empty());
+        let event = &events.taken()[0];
+        assert!(event.categories.is_empty());
+        assert!(!event.served, "{settings:?}");
+        assert!(event.granted.is_empty(), "not asked when nothing is served");
     }
 }
 

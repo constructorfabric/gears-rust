@@ -36,7 +36,7 @@ fn every_enforced_permission_is_declared_once_on_its_resource_and_action() {
     let expected = [
         (
             "cf.construct._.facts_manage.v1",
-            "gts.cf.construct.subject.facts.v1~",
+            "gts.cf.construct.subject.fact.v1~",
             "manage",
         ),
         (

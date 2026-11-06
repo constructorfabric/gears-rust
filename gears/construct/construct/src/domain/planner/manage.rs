@@ -12,7 +12,7 @@ use super::processing::{Managed, NothingStored, Processing};
 use crate::domain::error::DomainError;
 
 pub(crate) const SUBJECT_FACTS_RESOURCE: ResourceType = ResourceType::from_static(
-    toolkit_gts::gts_id!("cf.construct.subject.facts.v1~"),
+    toolkit_gts::gts_id!("cf.construct.subject.fact.v1~"),
     &[pep_properties::OWNER_TENANT_ID, pep_properties::RESOURCE_ID],
 );
 

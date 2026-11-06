@@ -98,7 +98,7 @@ gears:
       model:                         # the planner's model, an OAGW upstream (default: none, records are dropped)
         upstream_alias: "llm"
         model: "gpt-4.1"
-        timeout_secs: 60
+        timeout: 60s
       processing:                    # all optional
         queue_capacity: 256
         workers: 4
@@ -115,7 +115,7 @@ gears:
       profile_category_check: per_category   # required with processing_identity; one_call only for a policy plugin that answers with category constraints
 ```
 
-An unknown key, a value in `connectors_off`, `processing_identity` or `trusted_connectors` that is not a UUID, a zero queue capacity, worker count, model round count or token count in `processing` (zero reruns is allowed), a queue capacity above 100000, more than 256 workers, more than 10 reruns, more than 64 model rounds, more than 1000000 tokens per record, a model call timeout above 600 seconds, the nil UUID as `processing_identity`, a processing identity without `profile_category_check`, an entity kind that is not one of identity, role, skill or preference, a confidence floor outside 0 to 1, a step cap outside 1 to 10000, a value cap outside 1 to 100000, a model upstream alias that is not 1 to 63 letters, digits, `-` or `_`, starting with a letter or digit, or a model name that is not 1 to 128 printable characters with no space, stops the gear from starting. The processing identity needs graph storage's read, write, delete and type registration permissions, and the settings read, in every tenant.
+An unknown key, a value in `connectors_off`, `processing_identity` or `trusted_connectors` that is not a UUID, a zero queue capacity, worker count, model round count or token count in `processing` (zero reruns is allowed), a queue capacity above 100000, more than 256 workers, more than 10 reruns, more than 64 model rounds, more than 1000000 tokens per record, a model call timeout under 1 second or above 600 seconds, the nil UUID as `processing_identity`, a processing identity without `profile_category_check` or `profile_category_check` without a processing identity, an entity kind that is not one of identity, role, skill or preference, a confidence floor outside 0 to 1, a step cap outside 1 to 10000, a value cap outside 1 to 100000, a model upstream alias that is not 1 to 63 letters, digits, `-` or `_`, starting with a letter or digit, or a model name that is not 1 to 128 printable characters with no space, stops the gear from starting. The processing identity needs graph storage's read, write, delete and type registration permissions, and the settings read, in every tenant.
 
 ## Examples
 
@@ -171,6 +171,8 @@ The same record with `"role":"system"` answers `422`:
 ```
 
 ### Read a profile
+
+The static AuthZ plugin of this example does not check who may name a tenant: any caller reads the profiles of the tenant it names in `tenant`. A real host needs a policy plugin that authorizes the caller for that tenant.
 
 ```bash
 curl -s "http://127.0.0.1:8087/cf/construct/v1/subjects/5d1f2c3a-8b4e-4c6d-9a1b-2c3d4e5f6a7b/profile?tenant=00000000-df51-5b42-9538-d2b56b7ee953"

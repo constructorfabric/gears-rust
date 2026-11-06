@@ -122,7 +122,7 @@ pub fn for_settings(e: DomainError) -> CanonicalError {
 }
 
 /// Errors about a subject's facts.
-#[resource_error(gts_id!("cf.construct.subject.facts.v1~"))]
+#[resource_error(gts_id!("cf.construct.subject.fact.v1~"))]
 pub struct SubjectFactsError;
 
 /// A manage-facts field longer than its limit, as an invalid-argument problem that names the field.
