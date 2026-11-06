@@ -63,14 +63,19 @@ API gateway, flight control, cred store).
     REST API handler, business logic, `Modkit SeaORM`, and DB.
 - **Infra** uses `Modkit SeaORM (incl. DB OData)` to reach the Gear's own DB
   through the secure ORM layer.
-- **ModKit libraries** and **system-Gear SDKs** are available to every Gear as
+- **ModKit libraries** and **core-gear SDKs** are available to every Gear as
   shared, reusable building blocks.
 
 ### Gear categories
 
-Gears fall into a few categories depending on their role in the platform —
-system Gears (resolvers, gateways, registries), domain Gears (business
-capabilities), and plugins:
+**Core gears** are all gears under `gears/system/`, including their plugins, such as
+resolvers, gateways and registries. The directory may be renamed to `gears/core/` in the
+future. Domain gears provide business capabilities; plugins extend their owning gears.
+
+Startup groups are selected separately: the **system gear group** contains gears declaring
+`system` in `capabilities = [...]`. Currently Types Registry, Service Discovery, Cluster and gRPC Hub
+have it. All gears without it, including the other core gears, belong to the application
+group. See [the system capability](08_lifecycle_stateful_tasks.md#the-system-capability).
 
 ![Gear categories](../img/gears_categories.drawio.png)
 

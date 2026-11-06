@@ -124,6 +124,7 @@ fn registry_to_build(
 }
 
 #[toolkit::consumes(contract = authz_resolver_sdk::AuthZResolverApi, from = "authz-resolver")]
+#[toolkit::consumes(contract = types_registry_sdk::PlatformTypesRegistryApi, from = "types-registry")]
 #[toolkit::gear(
     name = "event-broker",
     deps = [cluster, types_registry],
@@ -148,9 +149,9 @@ pub struct EventBrokerModule {
     /// this itself) and read by `register_rest()`. The actual
     /// cache-table population (`infra::specification::bulk_load`, a free
     /// function - not a method on this trait, since it never touches the
-    /// object itself, only the `TypesRegistryClient`/`db` `init()` also has
-    /// in hand) happens later, from `serve()` - see that method's own doc
-    /// comment for why.
+    /// object itself, only the `PlatformTypesRegistryApi` client and `db`)
+    /// happens later, from `serve()` - see the comment at the start of
+    /// `start_workers` for why.
     spec_manager: OnceLock<Arc<dyn crate::domain::specification::SpecificationManager>>,
     /// The partition caches this instance serves from. Built in `init()` because
     /// two callers need the *same* one: `register_rest()` hands it to the
@@ -261,8 +262,8 @@ impl Gear for EventBrokerModule {
 
         // eb-single-process-implementation D1: the actual cache-table
         // populate (`infra::specification::bulk_load`) happens later, in
-        // `serve()` - see that method's own doc comment for why. The
-        // manager is usable immediately either way: `get_topic`/etc. query
+        // `serve()` - see the comment at the start of `start_workers` for
+        // why. The manager is usable immediately either way: `get_topic`/etc. query
         // the gear-database cache table directly on every call, so handing
         // services this not-yet-loaded manager now is safe as long as the
         // table is populated before any real request can reach them
@@ -573,12 +574,9 @@ impl EventBrokerModule {
         mode: DeploymentMode,
     ) -> anyhow::Result<()> {
         // Must happen before anything else, and only where the ingest role runs.
-        // `types-registry` commits `entities:`-seeded instances from its
-        // configuration-mode storage to queryable storage during the platform's
-        // `post_init`, which runs after every gear's `init()` but before
-        // `serve()`, so a load in `init()` would always see zero of them -
-        // discovered by seeding a topic that way and finding `GET /v1/topics`
-        // still empty afterwards.
+        // The platform API may be a remote proxy, which the proxy-wiring phase
+        // registers only after every gear's `init()`, so the load runs here
+        // rather than in `init()`.
         //
         // Exactly one role writes this state and the others re-read it: a
         // delivery instance reads what ingest resolved out of the shared
@@ -586,8 +584,9 @@ impl EventBrokerModule {
         // that shaped it, and a dispatcher holds none of it at all.
         if mode.ingest_active() {
             self.start_specification_refresh(sup).await?;
-            // A stop during the startup provisioning wait: start nothing more,
-            // so `serve()` drains an empty set and returns at once.
+            // A stop during the startup load or provisioning wait: start
+            // nothing more, so `serve()` drains an empty set and returns at
+            // once.
             if sup.cancel().is_cancelled() {
                 return Ok(());
             }
@@ -690,11 +689,14 @@ impl EventBrokerModule {
 
     /// Registers the specification refresh worker.
     ///
-    /// Loads the specification cache once, awaited, then registers a loop that
-    /// refreshes it on the configured cadence until the child token fires. The
-    /// first pass is awaited because nothing may serve a request against an
-    /// empty cache, and REST traffic starts arriving as soon as the platform's
-    /// start phase completes.
+    /// Loads the specification cache once, awaited, waits up to
+    /// [`STARTUP_PROVISIONING_WAIT`] for the loaded topics to be provisioned,
+    /// then registers a loop that refreshes it on the configured cadence until
+    /// the child token fires. The load is awaited to its end unless a stop
+    /// comes first, because nothing may serve a request against an empty
+    /// cache, and REST traffic starts arriving as soon as the platform's start
+    /// phase completes; provisioning is not, so a backend that is down delays
+    /// the start by the bound only.
     async fn start_specification_refresh(&self, sup: &mut Supervisor) -> anyhow::Result<()> {
         let db = self
             .db
@@ -708,7 +710,7 @@ impl EventBrokerModule {
             .client_hub
             .get()
             .ok_or_else(|| anyhow::anyhow!("init must run before serve()"))?
-            .get::<dyn types_registry_sdk::TypesRegistryClient>()?;
+            .get::<dyn types_registry_sdk::PlatformTypesRegistryApi>()?;
 
         let spec_manager = self
             .spec_manager
@@ -736,21 +738,33 @@ impl EventBrokerModule {
                 attempt_timeout: config.provisioning.attempt_timeout,
             },
         );
-        worker.run_once().await;
-        // Stopped during the wait: nothing more is started, and `start_workers`
-        // sees the token fired and starts nothing either.
-        let Some(unprovisioned) = worker
+        // Stopped during the load or the provisioning wait: nothing more is
+        // started, and `start_workers` sees the token fired and starts nothing
+        // either.
+        tokio::select! {
+            biased;
+            () = sup.cancel().cancelled() => return Ok(()),
+            () = worker.load_once() => {}
+        }
+        match worker
             .settle_provisioning(STARTUP_PROVISIONING_WAIT, sup.cancel())
             .await
-        else {
-            return Ok(());
-        };
-        if unprovisioned > 0 {
-            tracing::warn!(
-                module = Self::MODULE_NAME,
-                unprovisioned,
-                "starting with topics not provisioned yet; their publishes answer 503 until they are"
-            );
+        {
+            crate::infra::workers::ProvisioningWait::Stopped => return Ok(()),
+            crate::infra::workers::ProvisioningWait::Settled { unprovisioned: 0 } => {}
+            crate::infra::workers::ProvisioningWait::Settled { unprovisioned } => {
+                tracing::warn!(
+                    module = Self::MODULE_NAME,
+                    unprovisioned,
+                    "starting with topics not provisioned yet; their publishes answer 503 until they are"
+                );
+            }
+            crate::infra::workers::ProvisioningWait::Cut => {
+                tracing::warn!(
+                    module = Self::MODULE_NAME,
+                    "starting with the provisioning pass unfinished at the startup bound; topics not provisioned answer 503 until they are"
+                );
+            }
         }
         let token = sup.cancel().clone();
         sup.spawn("specification-refresh", async move {

@@ -9,15 +9,16 @@ use event_broker_sdk::backend::{
 use event_broker_sdk::{Position, Sequence};
 
 use crate::fixture::{
-    KEEP, Writer, event, heads_after, keys_and_ns, provisioned, read_all, rising_from_one,
-    sequences, started, wait_for_count,
+    KEEP, Writer, event, keys_and_ns, provisioned, read_all, rising_from_one, sequences, started,
+    wait_for_count,
 };
 use crate::harness::Harness;
 
 const KEYS: [&str; 6] = ["alpha", "bravo", "charlie", "delta", "echo", "foxtrot"];
 
 /// `Heads` names every partition the call touched with the highest sequence
-/// it assigned there, and only those; the stored events agree.
+/// it assigned there, and only those; the stored events and every
+/// partition's `Latest` agree.
 pub async fn append_reports_heads(harness: &dyn Harness) {
     let backend = started(harness.build().await).await;
     let spec = provisioned(backend.as_ref(), "heads", 4, KEEP).await;
@@ -46,24 +47,31 @@ pub async fn append_reports_heads(harness: &dyn Harness) {
         }
     }
     assert_eq!(count, 12, "every event stored once: {stored:?}");
-    if let Appended::Heads(heads) = &appended {
-        let reported: BTreeMap<Partition, i64> = heads
-            .iter()
-            .map(|h| (h.at.partition, h.sequence.as_i64()))
-            .collect();
-        assert_eq!(reported, stored);
-        assert!(heads.iter().all(|h| h.at.topic == spec.topic));
+    let Appended::Heads(heads) = &appended else {
+        panic!("a Sync append of fresh events must answer Heads: {appended:?}")
+    };
+    let reported: BTreeMap<Partition, i64> = heads
+        .iter()
+        .map(|h| (h.at.partition, h.sequence.as_i64()))
+        .collect();
+    assert_eq!(reported, stored);
+    assert!(heads.iter().all(|h| h.at.topic == spec.topic));
+    let mut latest: BTreeMap<Partition, i64> = BTreeMap::new();
+    for partition in (0..spec.partitions).map(Partition::new) {
+        let at = TopicPartition::new(spec.topic.clone(), partition);
+        let head = backend
+            .resolve(&at, Position::Latest)
+            .await
+            .expect("resolve");
+        latest.insert(partition, head.as_i64());
     }
-    let latest: Vec<i64> = heads_after(backend.as_ref(), &spec, &appended)
-        .await
-        .into_iter()
-        .map(Sequence::as_i64)
-        .collect();
-    let expected: Vec<i64> = (0..spec.partitions)
-        .map(Partition::new)
-        .map(|p| stored.get(&p).copied().unwrap_or(0))
-        .collect();
-    assert_eq!(latest, expected);
+    assert_eq!(
+        latest,
+        (0..spec.partitions)
+            .map(Partition::new)
+            .map(|p| (p, stored.get(&p).copied().unwrap_or(0)))
+            .collect::<BTreeMap<_, _>>()
+    );
 }
 
 /// A fresh partition numbers from 1 or above, rising across calls, and

@@ -238,7 +238,7 @@ async def test_412_sequence_violation_envelope(api):
                 "meta": {
                     "version": 1,
                     "producer_id": producer_id,
-                    "previous": 999,  # wrong — broker has last_sequence=1
+                    "previous": 999,  # wrong - broker has last_sequence=1
                     "sequence": 1000,
                 },
             },
@@ -319,7 +319,7 @@ async def test_500_internal_error_envelope(api):
         "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.internal.v1~",
         "title": "Internal",
         "status": 500,
-        "detail": body["detail"],
+        "detail": "An internal error occurred. Please retry later.",
         "instance": body["instance"],
         "trace_id": TRACE_ID,
         "context": body["context"],

@@ -22,10 +22,12 @@
 //! storage contract in `testing`.
 #![cfg_attr(coverage_nightly, feature(coverage_attribute))]
 
+pub mod bulk;
 pub mod client;
 pub mod engine;
 pub mod gts;
 pub mod models;
+pub mod notifications;
 pub mod period;
 pub mod storage_plugin;
 pub mod thresholds;
@@ -33,6 +35,12 @@ pub mod thresholds;
 #[cfg(feature = "test-util")]
 pub mod testing;
 
+pub use bulk::{
+    BulkCreateEntry, BulkCreateEnvelope, BulkCreateItem, BulkCreateQuotasRequest, BulkCreated,
+    BulkCreatedItem, BulkDeactivateEntry, BulkDeactivateEnvelope, BulkDeactivateItem,
+    BulkDeactivateQuotasRequest, BulkDeactivated, BulkDeactivatedItem, BulkRecord, BulkUpdateEntry,
+    BulkUpdateEnvelope, BulkUpdateItem, BulkUpdateQuotasRequest, BulkUpdated, BulkUpdatedItem,
+};
 pub use client::{
     QuotaEnforcementClientV1, QuotaEnforcementError, QuotaManagerClientV1, QuotaOperatorClientV1,
 };
@@ -44,8 +52,9 @@ pub use engine::{
 };
 pub use gts::{
     CONSTRAINT_BASE, LEASE_RESOURCE, METRIC_BASE_TYPE, OPERATION_RESOURCE, OwnedDefinition,
-    POLICY_RESOURCE, QUOTA_RESOURCE, QuotaEnforcementStoragePluginSpecV1, REQUEST_BASE,
-    RESOURCE_BASE, SCOPE_TENANT, SCOPE_TYPE, SCOPE_USER, SUBJECT_BASE, owned_definitions,
+    POLICY_RESOURCE, QUOTA_RESOURCE, QuotaEnforcementStoragePluginSpecV1,
+    QuotaNotificationSinkSpecV1, REQUEST_BASE, RESOURCE_BASE, SCOPE_TENANT, SCOPE_TYPE, SCOPE_USER,
+    SUBJECT_BASE, owned_definitions,
 };
 pub use models::{
     AcquireLeaseOutcome, AcquireLeaseRequest, ActiveQuotaCounts, ApplicableQuotas, AppliedMutation,
@@ -63,9 +72,13 @@ pub use models::{
     ProjectionBinding, Quota, QuotaDebitPlan, QuotaDraft, QuotaFilter, QuotaId, QuotaPatch,
     QuotaSnapshot, QuotaSource, QuotaSpec, QuotaStatus, QuotaType, QuotaView, ReleaseLeaseRequest,
     ResourceProjection, Retention, RollbackRequest, RollbackTarget, RollbackableOperation,
-    ScopeError, SubjectClaim, SubjectRef, SubjectScope, TenantId, ThresholdCrossing,
-    TransitionOutcome, UnknownValue, ValidityWindow, ValidityWindowPatch, apportion,
-    positive_amount,
+    ScopeError, SnapshotRequest, SnapshotSubject, SubjectClaim, SubjectRef, SubjectScope, TenantId,
+    ThresholdCrossing, TransitionOutcome, UnknownValue, ValidityWindow, ValidityWindowPatch,
+    apportion, positive_amount,
+};
+pub use notifications::{
+    DeliveryOutcome, DispatchError, NotificationDeliveryHandle, NotificationDeliveryV1, QuotaEvent,
+    QuotaNotificationSinkV1,
 };
 pub use storage_plugin::{
     BatchEntry, BatchTimer, CONTRACT_MAJOR, EvaluatedBatch, EvaluatedMutation,

@@ -270,7 +270,7 @@ The system **MUST** register and enqueue the existing event/error/category contr
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-dod-foundation-retention-purge`
 
-The system **MUST** ship the `retention-purge` worker with Foundation (phase 0/1): bounded daily deletion of expired Preview outcomes, refused audit rows and read-access-log rows through their indexes and restricted grants, its per-store metrics and the [Foundation contract §3.8](../DESIGN.md#contract-01-3-8) audit-growth alerts, and the pre-engine request limiter's per-caller gateway zone binding (D-185). Refusal auditing **MUST NOT** be enabled in an environment where the worker is not running.
+The system **MUST** ship the `retention-purge` worker with Foundation (phase 0/1): bounded daily deletion of expired Preview outcomes, refused audit rows and read-access-log rows through their indexes and restricted grants, its per-store metrics and the [Foundation contract §3.8](../DESIGN.md#contract-01-3-8) audit-growth alerts, and the pre-engine request limiter's per-caller gateway zone binding (D-185). Refusal auditing **MUST NOT** be enabled in an environment where the worker is not running. Orders always audits refusals, so startup refuses a `maintenance` block that does not schedule `retention_purge`; with no `maintenance` block no worker runs, a warning is logged and `orders_workers_scheduled` reports 0, which a deployment alert must catch (D-243).
 
 **Implements**: `cpt-cf-bss-orders-algo-foundation-retention-purge`.
 
@@ -1181,8 +1181,9 @@ their guard *registrations* and their reason *entries*, never their logic.
 ### R14 event platform integration (D-200)
 
 Use the [existing platform producer/broker integration contract](../DESIGN.md#contract-01-event-platform-integration).
-The broker implementation and initial chained-cursor transient retry already exist; Orders wiring,
-eleven schema registrations, root identity/grants, exact deployment evidence and conformance remain
-work. Preserve same-transaction enqueue, post-commit Wake and at-least-once consumer semantics.
+The broker implementation and initial chained-cursor transient retry already exist, and the eleven
+event types are GTS inventory entries the registry seeds; Orders wiring, root identity/grants, exact
+deployment evidence and conformance remain work. Preserve same-transaction enqueue, post-commit Wake
+and at-least-once consumer semantics.
 Supported producer dead-letter republication and shared operator recovery remain release gates;
 toolkit message claiming and consumer DLQ support alone do not satisfy them.

@@ -31,7 +31,7 @@ jobs:
     # A cancelled run is not a test result; report nothing rather than a
     # partial or empty one.
     if: github.event.workflow_run.conclusion != 'cancelled'
-    runs-on: ubuntu-latest
+    runs-on: ${{ (vars.GEARS_FORCE_GITHUB_HOSTED == 'true' || github.repository != 'constructorfabric/gears-rust' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && 'ubuntu-latest' || 'gears-small' }}
     timeout-minutes: 10
     steps:
       # One check per artifact that exists: a test job that was skipped (path
@@ -125,7 +125,7 @@ jobs:
       - name: Publish JUnit results
         id: publish
         if: steps.plan.outputs.paths != ''
-        uses: mikepenz/action-junit-report@6ef3fdcfcd5f0b5d14df3e659ef19b8c6820f93d # v6.6.1
+        uses: mikepenz/action-junit-report@8a133bfa3ecb0ea9024c1e2ae788b4c25f6cdb9d # v6.6.2
         with:
           report_paths: ${{ steps.plan.outputs.paths }}
           check_name: ${{ steps.plan.outputs.names }}

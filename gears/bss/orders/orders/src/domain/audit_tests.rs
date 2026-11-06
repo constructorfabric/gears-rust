@@ -1343,12 +1343,11 @@ fn keyed_admin_text_minimization_is_deterministic_per_key_and_never_exposes_the_
             "{prior:?} -> {new:?}"
         );
     }
-    // RFC 4231 test case 2 shape check with a 32-byte key: the tag is HMAC-SHA256 itself.
+    // Independent HMAC-SHA256 known answer (Python stdlib hmac, 32 bytes of 0x0b).
     let rfc = AdminTextKey::new("rfc", &[0x0b; 32]).unwrap();
-    let expected = hmac::sign(&hmac::Key::new(hmac::HMAC_SHA256, &[0x0b; 32]), b"Hi There");
     assert_eq!(
         minimized_text_digest(&rfc, "Hi There"),
-        format!("hmac-sha256:v1:rfc:{}", hex(expected.as_ref()))
+        "hmac-sha256:v1:rfc:198a607eb44bfbc69903a0f1cf2bbdc5ba0aa3f3d9ae3c1c7a3b1696a0b68cf7"
     );
     // NULL stays NULL on both sides; a NULL <-> text change records only the tag.
     let order = facts(OrderState::Draft, 1, 1);

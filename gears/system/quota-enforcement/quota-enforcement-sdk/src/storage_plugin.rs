@@ -10,8 +10,10 @@
 //! - **I2 Idempotency.** Replay returns the original outcome; a different
 //!   payload under the same scope returns
 //!   [`StorageError::IdempotencyPayloadMismatch`].
-//! - **I3 Read-only.** Reads do not mutate state, except snapshot reads may
-//!   materialize their current period row without settlement or events.
+//! - **I3 Read-only.** Reads do not mutate state, and snapshot reads take no
+//!   row lock. A consumption Quota with no row for its current window reads
+//!   as zero there; the next mutating operation creates the row and closes
+//!   the elapsed period.
 //! - **I4-I5 Lease periods.** Expired leases are treated as released; lease
 //!   settlement and rollback target the acquisition period.
 //! - **I6-I8 Bounds.** Cap updates, active-lease limits, and contention
@@ -263,6 +265,29 @@ pub enum StorageError {
     /// Last-resort opaque failure.
     #[error("storage plugin internal error: {0}")]
     Internal(String),
+
+    // --- bulk envelopes ---
+    /// One item of a bulk envelope failed; the whole envelope rolled back.
+    /// Only item-specific failures are wrapped: a failure of the envelope as a
+    /// whole (the backend, a payload mismatch, contention) is raised as is.
+    #[error("bulk item {index}: {cause}")]
+    BulkItem {
+        /// Position of the failing item in the request.
+        index: usize,
+        /// What failed, as the single-item primitive reports it.
+        cause: Box<Self>,
+    },
+}
+
+impl StorageError {
+    /// `self` as the failure of the bulk envelope's item at `index`.
+    #[must_use]
+    pub fn at_item(self, index: usize) -> Self {
+        Self::BulkItem {
+            index,
+            cause: Box::new(self),
+        }
+    }
 }
 
 /// One mutation the plugin evaluates inside its own transaction.
@@ -511,6 +536,67 @@ pub trait QuotaEnforcementStoragePluginV1: Send + Sync + 'static {
         page: PageRequest,
     ) -> Result<PageResult<Quota>, StorageError>;
 
+    // --- bulk quota CRUD ---
+
+    /// Create every draft of `envelope` in one transaction, or none (PRD
+    /// section 5.2). Each item has the effects of
+    /// [`QuotaEnforcementStoragePluginV1::create_quota`]; the envelope's
+    /// idempotency record, holding the returned outcome, commits with them. A
+    /// replay under the same scope and digest returns the stored outcome as
+    /// `NoOp` and writes nothing, once the envelope tenant is found inside
+    /// every item's current scope. The record expires after the longest
+    /// idempotency retention configured for any item's metric.
+    ///
+    /// # Errors
+    ///
+    /// - [`StorageError::BulkItem`] wrapping the single-item error of the
+    ///   first failing item in submission order.
+    /// - [`StorageError::IdempotencyPayloadMismatch`] for the key under a
+    ///   different payload (I2).
+    /// - [`StorageError::LeaseContentionTimeout`] when a concurrent writer of
+    ///   the envelope's scope holds it past the contention budget.
+    /// - [`StorageError::Unavailable`] when the backend cannot answer.
+    async fn bulk_create_quotas(
+        &self,
+        ctx: &SecurityContext,
+        envelope: &crate::bulk::BulkCreateEnvelope,
+    ) -> Result<TransitionOutcome<crate::bulk::BulkCreated>, StorageError>;
+
+    /// Apply every patch of `envelope` in one transaction, or none. Each item
+    /// has the effects and the under-lock guards of
+    /// [`QuotaEnforcementStoragePluginV1::update_quota`]. Every target row is
+    /// locked in ascending `quota_id` order before any item runs; items then
+    /// run in submission order. A Quota outside its item's scope or of another
+    /// tenant than the envelope's is not found. Replay as for
+    /// [`QuotaEnforcementStoragePluginV1::bulk_create_quotas`], once every
+    /// target is visible under its item's current scope.
+    ///
+    /// # Errors
+    ///
+    /// As [`QuotaEnforcementStoragePluginV1::bulk_create_quotas`]; the wrapped
+    /// item errors are those of `update_quota`.
+    async fn bulk_update_quotas(
+        &self,
+        ctx: &SecurityContext,
+        envelope: &crate::bulk::BulkUpdateEnvelope,
+    ) -> Result<TransitionOutcome<crate::bulk::BulkUpdated>, StorageError>;
+
+    /// Deactivate every Quota of `envelope` in one transaction, or none,
+    /// resolving the active leases of each as
+    /// [`QuotaEnforcementStoragePluginV1::deactivate_quota`] does; every
+    /// lease-resolution event commits with the envelope. Locking, ordering and
+    /// replay as for [`QuotaEnforcementStoragePluginV1::bulk_update_quotas`].
+    ///
+    /// # Errors
+    ///
+    /// As [`QuotaEnforcementStoragePluginV1::bulk_create_quotas`]; the wrapped
+    /// item errors are those of `deactivate_quota`.
+    async fn bulk_deactivate_quotas(
+        &self,
+        ctx: &SecurityContext,
+        envelope: &crate::bulk::BulkDeactivateEnvelope,
+    ) -> Result<TransitionOutcome<crate::bulk::BulkDeactivated>, StorageError>;
+
     // --- counter mutation ---
 
     /// Selects and evaluates the applicable policy under the Quota row locks,
@@ -695,8 +781,11 @@ pub trait QuotaEnforcementStoragePluginV1: Send + Sync + 'static {
 
     // --- snapshot reads ---
 
-    /// Per-Quota state for one applicable set. May materialize the current
-    /// period row (the I3 exception).
+    /// Per-Quota state for one applicable set: every active Quota whose
+    /// subject is in the set, in `quota_id` order.
+    ///
+    /// Writes nothing and takes no row lock (I3): a consumption Quota whose
+    /// current window has no row yet reads as zero over that window.
     async fn read_quota_snapshot(
         &self,
         ctx: &SecurityContext,
@@ -705,6 +794,22 @@ pub trait QuotaEnforcementStoragePluginV1: Send + Sync + 'static {
     ) -> Result<Vec<QuotaSnapshot>, StorageError>;
 
     /// Paginated per-Quota state for many applicable sets.
+    ///
+    /// Selects every active Quota under `scope` whose tenant and metric match
+    /// a pair and whose subject is in that pair's subjects. The union is
+    /// ordered by `quota_id` ascending and returns each Quota once, however
+    /// many pairs select it; Quotas outside their validity window are
+    /// included. At most `page.limit` rows are returned (a zero limit means
+    /// the default). `next_cursor` is opaque and holds only the last
+    /// `quota_id` returned, so the next page resumes after it and a walk to
+    /// exhaustion yields each row once; it is `None` on the last page. The
+    /// page is read in one transaction and, like
+    /// [`Self::read_quota_snapshot`], writes nothing.
+    ///
+    /// # Errors
+    ///
+    /// [`StorageError::InvalidCursor`] for a cursor this plugin did not issue;
+    /// [`StorageError::Unavailable`] when the backend cannot serve the page.
     async fn bulk_read_quota_snapshot(
         &self,
         ctx: &SecurityContext,
@@ -818,6 +923,24 @@ pub trait QuotaEnforcementStoragePluginV1: Send + Sync + 'static {
         &self,
         scope: &IdempotencyScope,
     ) -> Result<Option<IdempotencyRecord>, StorageError>;
+
+    // --- notification delivery ---
+
+    /// Start the one notification outbox pipeline of this plugin instance,
+    /// handing every claimed event to `delivery`, and bind it for enqueueing.
+    ///
+    /// Until this returns, events enqueued by a mutation stay queued; an empty
+    /// enqueue never needs it. The pipeline is fenced by the outbox lease, so
+    /// every replica may run one. Keep the handle and stop it on shutdown.
+    ///
+    /// # Errors
+    ///
+    /// [`StorageError::Internal`] when this instance already started one;
+    /// [`StorageError::Unavailable`] when the backend cannot start it.
+    async fn start_notification_delivery(
+        &self,
+        delivery: std::sync::Arc<dyn crate::notifications::NotificationDeliveryV1>,
+    ) -> Result<Box<dyn crate::notifications::NotificationDeliveryHandle>, StorageError>;
 
     // --- sweeper and reclamation ---
 

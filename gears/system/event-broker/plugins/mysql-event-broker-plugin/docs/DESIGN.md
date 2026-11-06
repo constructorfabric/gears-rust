@@ -159,7 +159,7 @@ A statement or transaction chosen as a deadlock victim (`1213`) - by `InnoDB`, o
 ### 4.1 provision
 
 1. Refuse a partition count outside `1..=9999` (`InvalidConfig`): four digits keep every name within 64 bytes.
-2. In one transaction: `INSERT IGNORE` the `evbk__log` row, read it back `FOR UPDATE`, refuse a stored log id the claim does not accept (`LogConflict`), set the claim's id and the spec's retention (an age above 100 years is stored as 100 years), and insert the `evbk__partition` and `evbk__retention` rows of each partition that has none. A partition keeps the table name it was given first.
+2. In one transaction: `INSERT IGNORE` the `evbk__log` row (skipped for a `Held` claim, which never creates), read it back `FOR UPDATE`, refuse what `LogClaim::check` refuses (`LogConflict` for a foreign log id; `NotProvisioned` for a `Held` claim with no row, and so creates no row and no table), set the claim's id and the spec's retention (an age above 100 years is stored as 100 years), and insert the `evbk__partition` and `evbk__retention` rows of each partition that has none. A partition keeps the table name it was given first.
 3. For each partition whose table the server does not hold: a maintenance run (§4.9) under the partition's named lock, waiting up to 5 s for it, which records the first segments `adding`, creates the table with them, and opens them. A busy lock answers `Pending`.
 4. `Ready` with the partition count the log row holds.
 
@@ -210,7 +210,20 @@ A waiting read (`Wait::For`) reads, then waits for a head above its offset from 
 
 ### 4.8 query
 
-The matched range's first and last sequence and storage time from the event table, above the floor, and one entry per live (`open` or `sealed`) segment from the catalog: `{ name, from_sequence, to_sequence }`.
+`start_sequence`/`start_time` are the `seq` and `seq_time` of the first matched event above the floor, `end_sequence`/`end_time` those of the last of the first `limit` matched events, and there is one entry per live (`open` or `sealed`) segment from the catalog: `{ name, from_sequence, to_sequence }`. An empty match is an empty list. The figures are probes on the primary key in one statement, never a scan of the range, so a `query` costs the same over a million stored events as over ten:
+
+```sql
+SELECT ends.first, ends.last, ends.start_time, l.seq_time AS end_time FROM
+  (SELECT f.seq AS first, f.seq_time AS start_time,
+     (SELECT e.seq FROM {table} AS e WHERE e.seq >= f.seq AND e.seq <= LEAST(?end, f.seq + ?limit - 1)
+        ORDER BY e.seq DESC LIMIT 1) AS last FROM
+     (SELECT seq, seq_time FROM {table} WHERE seq <= ?end
+        AND seq >= GREATEST(?start, (SELECT floor_seq + 1 FROM evbk__retention WHERE topic_uuid = ? AND partition_no = ?))
+        ORDER BY seq ASC LIMIT 1) AS f) AS ends
+  JOIN {table} AS l ON l.seq = ends.last;
+```
+
+`ends` has a subquery in its select list, so both engines materialize it and `l` is one key lookup; `LATERAL` would be plainer, but MariaDB lacks it. `first + limit - 1` is the `limit`-th matched event because stored sequences have no gaps: append assigns them from the head up (§4.2) and retention removes whole segments from the floor up (§4.9). A range partition dropped, or events deleted, by hand breaks this (§8): `query` with a `limit` short of the range then reports fewer than `limit` events.
 
 ### 4.9 Maintenance
 

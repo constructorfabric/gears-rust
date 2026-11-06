@@ -28,6 +28,7 @@
 //! # }
 //! ```
 
+use crate::crypto::constant_time_eq;
 use secrecy::{ExposeSecret, SecretString};
 
 use crate::internal_auth::{InternalAuthNError, InternalAuthenticator, PlatformIdentity};
@@ -110,22 +111,6 @@ impl InternalAuthenticator for SharedSecretInternalAuthenticator {
             Err(InternalAuthNError::InvalidToken)
         }
     }
-}
-
-/// Compare two byte slices without short-circuiting on the first differing
-/// byte, so validation time does not leak the position of a mismatch.
-///
-/// The length comparison is not itself constant-time; a pre-shared secret's
-/// length is not sensitive here.
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
 }
 
 #[cfg(test)]

@@ -1,6 +1,6 @@
 [package]
 name = "cf-gears-file-storage"
-version = "0.4.0"
+version = "0.4.1"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
@@ -35,7 +35,7 @@ default = []
 cf-gears-file-storage-sdk = { version = "0.3.0", path = "../file-storage-sdk" }
 
 # Authorization Service (PEP) — per-type access decisions
-cf-gears-authz-resolver-sdk = { version = "0.6.1", path = "../../system/authz-resolver/authz-resolver-sdk" }
+cf-gears-authz-resolver-sdk = { version = "0.6.2", path = "../../system/authz-resolver/authz-resolver-sdk" }
 authz-resolver = { workspace = true }
 
 # Core dependencies
@@ -65,11 +65,10 @@ uuid = { workspace = true }
 # Content pipeline + signed URLs
 bytes = { workspace = true }
 futures = { workspace = true }
-sha2 = { workspace = true }
 hex = { workspace = true }
 base64 = { workspace = true }
-infer = "0.19"
-ring = "0.17"
+zeroize = { workspace = true }
+infer = "0.22"
 
 # HTTP client — used by the sidecar binary to call the control-plane finalize callback.
 reqwest = { workspace = true }

@@ -9,16 +9,15 @@
 use std::sync::Arc;
 
 use bss_orders_sdk::catalog::OrderState;
-#[cfg(orders_event_broker_test_support)]
 use tenant_resolver_sdk::{TenantInfo, TenantResolverClient, TenantResolverError, TenantStatus};
 use time::OffsetDateTime;
-#[cfg(orders_event_broker_test_support)]
 use toolkit_security::SecurityContext;
 use types_registry::config::TypesRegistryConfig;
 use types_registry::domain::legacy_local_client::TypesRegistryLocalClient;
 use types_registry::domain::service::TypesRegistryService;
 use types_registry::infra::InMemoryGtsRepository;
-use types_registry_sdk::{RegisterResult, TypesRegistryClient};
+use types_registry_sdk::testing_platform::MockTypesRegistry;
+use types_registry_sdk::{PlatformTypesRegistryApi, RegisterResult, TypesRegistryClient};
 use uuid::Uuid;
 
 use super::OrderSummary;
@@ -55,9 +54,17 @@ pub fn committed_registry() -> Arc<TypesRegistryService> {
     service
 }
 
-/// The registry as a `TypesRegistryClient` (what Event Broker loads from).
+/// The committed registry as a legacy `TypesRegistryClient`.
 pub fn registry_client() -> Arc<dyn TypesRegistryClient> {
     Arc::new(TypesRegistryLocalClient::new(committed_registry()))
+}
+
+/// The linked GTS inventory, served as the `PlatformTypesRegistryApi` Event Broker loads topics
+/// and event types from.
+pub fn platform_registry() -> Arc<dyn PlatformTypesRegistryApi> {
+    let registry = MockTypesRegistry::new();
+    registry.seed_inventory();
+    Arc::new(registry)
 }
 
 pub fn u(n: u128) -> Uuid {
@@ -282,11 +289,8 @@ pub fn encoded_max_events(order: Uuid) -> Vec<(&'static str, Vec<u8>)> {
     ]
 }
 
-/// The platform tenant resolver's root answer (input double; `None` is an outage). Compiled only
-/// with its #5381-dependent callers (D-229).
-#[cfg(orders_event_broker_test_support)]
+/// The platform tenant resolver's root answer (input double; `None` is an outage).
 pub struct Root(pub Option<TenantInfo>);
-#[cfg(orders_event_broker_test_support)]
 pub fn root(id: u128, parent: Option<u128>) -> Arc<dyn TenantResolverClient> {
     Arc::new(Root(Some(TenantInfo {
         id: tenant_resolver_sdk::TenantId(u(id)),
@@ -297,7 +301,6 @@ pub fn root(id: u128, parent: Option<u128>) -> Arc<dyn TenantResolverClient> {
         self_managed: false,
     })))
 }
-#[cfg(orders_event_broker_test_support)]
 #[async_trait::async_trait]
 impl TenantResolverClient for Root {
     async fn get_tenant(

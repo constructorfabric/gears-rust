@@ -131,6 +131,28 @@ pub async fn transfer_user(
 }
 ```
 
+### SQLite: `transaction_mode`
+
+`SQLite` begins a plain `BEGIN` as a *deferred* transaction. One that reads and then writes cannot wait for the write lock: while another connection holds it, `SQLite` fails the write at once with `SQLITE_BUSY` and ignores `busy_timeout`. Under write contention (a request beside the gear's outbox worker, two requests on one row) such a transaction fails on every retry while the other writer is busy, and the caller sees a conflict that never happened.
+
+A gear whose writes contend can set `transaction_mode: "immediate"` in its database `params`. (A DSN passed to `connect_db` can carry `transaction_mode=immediate` too, but a gear config's `dsn` cannot: the config path ignores a SQLite DSN's query parameters.) `Db`'s transactions that may write then begin with `BEGIN IMMEDIATE`, which takes the write lock up front and waits for it under `busy_timeout`, so writers queue instead of failing. So do the outbox's queue registration, sequencer, vacuum and processing transactions on that database; its dead-letter replay and discard, and the migration runner, still begin deferred. The default is `deferred`.
+
+An immediate transaction holds the write lock from `BEGIN`, so declare pure reads read-only (`TxConfig` access mode `ReadOnly`): they keep the deferred `BEGIN` and never queue behind writers. A read in a transaction with no access mode queues for the write lock like a writer.
+
+```yaml
+gears:
+  bss-pricing:
+    database:
+      server: "sqlite_users"
+      file: "bss_pricing.db"
+      params:
+        transaction_mode: "immediate"
+```
+
+With `immediate`, only one transaction that may write is open at a time. Don't hold one open while waiting for another connection's transaction (for example, two writers meeting at a barrier inside their transactions): the second one waits in its `BEGIN` until `busy_timeout` expires. The same goes for slow work inside one: a transactional outbox handler holds the write lock for the whole handler, so use a leased handler for slow work. sqlx refuses the option, so a raw `sea_orm::Database::connect` must get the DSN without it.
+
+In tests, close a pool before reopening its file (`Db::close`, behind toolkit-db's `test-support` feature). Dropping a pool closes its connections in the background, and on Windows a closing connection still locks the file.
+
 ## Repository pattern
 
 ### Repository with `DBRunner` (works with both `SecureConn` and `SecureTx`)

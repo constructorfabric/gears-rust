@@ -8,14 +8,14 @@ use tokio::time::{Instant, sleep};
 use uuid::Uuid;
 
 use event_broker::test_support::{
-    EventBrokerHarness, FaultInjectingBroker, StaticTypesRegistry, TransientFault,
+    DeliveredOutcome, EventBrokerHarness, FaultInjectingBroker, StaticTypesRegistry, TransientFault,
 };
 use event_broker_sdk::api::EventBrokerApi;
 use event_broker_sdk::backend::{Partition, TopicPartition, Wait};
 use event_broker_sdk::error::EventBrokerError;
 use event_broker_sdk::models::{Event, ProducerMeta, ResetScope};
 use event_broker_sdk::producer::IngestOutcome;
-use event_broker_sdk::producer::TEST_QUEUE;
+use event_broker_sdk::producer::{PRODUCER_OUTBOX_PAYLOAD_TYPE, TEST_QUEUE};
 use event_broker_sdk::{
     DbDeduplication, DbProducer, GtsInstanceId, GtsTypeId, ProducerId, ProducerIdentity,
     ProducerMode, Sequence, TypedEvent,
@@ -201,7 +201,12 @@ async fn managed_client_agent_drift_fails_loudly() {
                 .source("order-service")
                 .client_agent("order-service/2.0"),
         )
-        .deduplication(DbDeduplication::managed(ProducerMode::Chained).key("orders"))
+        .deduplication(
+            DbDeduplication::managed(ProducerMode::Chained)
+                .key("orders")
+                .build()
+                .expect("managed deduplication with a key"),
+        )
         .topics([TOPIC])
         .event_type_patterns([EVENT_TYPE])
         .prepare_all()
@@ -231,7 +236,12 @@ async fn managed_registration_requires_producer_migrations() {
                 .source("order-service")
                 .client_agent("order-service/1.0"),
         )
-        .deduplication(DbDeduplication::managed(ProducerMode::Chained).key("orders"))
+        .deduplication(
+            DbDeduplication::managed(ProducerMode::Chained)
+                .key("orders")
+                .build()
+                .expect("managed deduplication with a key"),
+        )
         .topics([TOPIC])
         .event_type_patterns([EVENT_TYPE])
         .prepare_all()
@@ -244,6 +254,262 @@ async fn managed_registration_requires_producer_migrations() {
     assert!(
         err.to_string().contains("producer"),
         "unexpected migration error: {err}"
+    );
+}
+
+#[tokio::test]
+async fn an_interim_row_written_like_products_drains_through_the_processor() {
+    let (db, broker, harness) = fixture().await;
+    let faulty = FaultInjectingBroker::new(Arc::clone(&broker));
+    let producer = DbProducer::builder()
+        .broker(faulty.clone() as Arc<dyn EventBrokerApi>)
+        .db(db)
+        .security_context(toolkit_security::SecurityContext::anonymous())
+        .identity(
+            ProducerIdentity::new()
+                .source("order-service")
+                .client_agent("order-service"),
+        )
+        .deduplication(
+            DbDeduplication::managed(ProducerMode::Monotonic)
+                .key("order-service")
+                .build()
+                .expect("managed deduplication with a key"),
+        )
+        .topics([TOPIC])
+        .event_type_patterns([EVENT_TYPE])
+        .prepare_all()
+        .await
+        .unwrap();
+    let event_id = Uuid::parse_str("0190a5b2-7c3d-7e4f-8a1b-2c3d4e5f6a7b").unwrap();
+    let order_id = Uuid::parse_str("0190a5b2-7c3d-7e4f-8a1b-000000000042").unwrap();
+    // The interim envelope bss products hand-writes in `enqueue_typed`
+    // (`gears/bss/products/products/src/infra/events.rs`); an SDK envelope
+    // change must keep this row draining.
+    let payload = serde_json::json!({
+        "version": 1,
+        "event_id": event_id,
+        "type": EVENT_TYPE,
+        "topic": TOPIC,
+        "tenant_id": test_tenant(),
+        "source": "order-service",
+        "subject": order_id.to_string(),
+        "subject_type": SUBJECT_TYPE,
+        "occurred_at": "2026-11-03T10:15:30.123456789Z",
+        "trace_parent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+        "data": {"order_id": order_id, "total_cents": 1250},
+        "producer_mode": "stateless",
+        "diagnostic_metadata": {"sdk_client_agent": "order-service"}
+    });
+
+    let result = producer
+        .process_outbox_payload_for_test(serde_json::to_vec(&payload).unwrap(), 1)
+        .await;
+
+    assert!(
+        matches!(result, toolkit_db::outbox::MessageResult::Ok),
+        "expected Ok, got {result:?}"
+    );
+    assert_eq!(
+        PRODUCER_OUTBOX_PAYLOAD_TYPE,
+        "application/vnd.constructorfabric.event-broker.producer-outbox+json;version=1"
+    );
+    assert_eq!(producer.registrations_for_test().await.unwrap(), vec![]);
+    let delivered = faulty.delivered_publishes();
+    let [publish] = delivered.as_slice() else {
+        panic!("expected one delivered publish, got {delivered:?}");
+    };
+    assert_eq!(
+        (
+            publish.event_id,
+            publish.subject.as_str(),
+            publish.meta.is_none(),
+            publish.outcome.clone(),
+            publish.ack_lost
+        ),
+        (
+            event_id,
+            order_id.to_string().as_str(),
+            true,
+            DeliveredOutcome::Accepted,
+            false
+        )
+    );
+    wait_for_stored(&harness, TOPIC, 1).await;
+    let mut stored = Vec::new();
+    for partition in 0..FIXTURE_BROKER_PARTITIONS {
+        let at = TopicPartition::new(
+            GtsInstanceId::try_new(TOPIC).unwrap(),
+            Partition::new(partition),
+        );
+        stored.extend(
+            harness
+                .backend()
+                .read(&at, Sequence::NONE, 16, Wait::No)
+                .await
+                .unwrap(),
+        );
+    }
+    let [event] = stored.as_slice() else {
+        panic!("expected one stored event, got {stored:?}");
+    };
+    assert_eq!(
+        (
+            event.id,
+            event.type_id.as_ref(),
+            event.tenant_id,
+            event.source.as_str(),
+            event.subject.clone(),
+            event.subject_type.as_ref(),
+            event
+                .occurred_at
+                .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
+            event.trace_parent.as_deref(),
+            event.data.clone(),
+            event.partition,
+            event.sequence,
+            (event.sequence_time.is_some(), event.meta.is_none()),
+        ),
+        (
+            event_id,
+            EVENT_TYPE,
+            test_tenant(),
+            "order-service",
+            order_id.to_string(),
+            SUBJECT_TYPE,
+            "2026-11-03T10:15:30.123456789Z".to_owned(),
+            Some("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"),
+            Some(serde_json::json!({"order_id": order_id, "total_cents": 1250})),
+            Some(2),
+            Some(Sequence::assigned(1)),
+            (true, true),
+        )
+    );
+}
+
+#[tokio::test]
+async fn an_interim_row_written_like_pricing_drains_through_the_processor() {
+    let (db, broker, harness) = fixture().await;
+    let faulty = FaultInjectingBroker::new(Arc::clone(&broker));
+    let producer = DbProducer::builder()
+        .broker(faulty.clone() as Arc<dyn EventBrokerApi>)
+        .db(db)
+        .security_context(toolkit_security::SecurityContext::anonymous())
+        .identity(
+            ProducerIdentity::new()
+                .source("bss-pricing")
+                .client_agent("bss-pricing"),
+        )
+        .deduplication(
+            DbDeduplication::managed(ProducerMode::Monotonic)
+                .key("bss-pricing")
+                .build()
+                .expect("managed deduplication with a key"),
+        )
+        .topics([TOPIC])
+        .event_type_patterns([EVENT_TYPE])
+        .prepare_all()
+        .await
+        .unwrap();
+    let event_id = Uuid::parse_str("0190a5b2-7c3d-7e4f-8a1b-2c3d4e5f6a7c").unwrap();
+    let order_id = Uuid::parse_str("0190a5b2-7c3d-7e4f-8a1b-000000000043").unwrap();
+    // The interim envelope bss pricing hand-writes in `interim_envelope`
+    // (`gears/bss/pricing/pricing/src/infra/events.rs`); an SDK envelope
+    // change must keep this row draining.
+    let payload = serde_json::json!({
+        "version": 1,
+        "event_id": event_id,
+        "type": EVENT_TYPE,
+        "topic": TOPIC,
+        "tenant_id": test_tenant(),
+        "source": "bss-pricing",
+        "subject": order_id.to_string(),
+        "subject_type": SUBJECT_TYPE,
+        "occurred_at": "2026-11-03T10:15:30.123456789Z",
+        "trace_parent": null,
+        "data": {"order_id": order_id, "total_cents": 1250},
+        "producer_mode": "stateless",
+        "diagnostic_metadata": {"sdk_client_agent": "bss-pricing"},
+    });
+
+    let result = producer
+        .process_outbox_payload_for_test(serde_json::to_vec(&payload).unwrap(), 1)
+        .await;
+
+    assert!(
+        matches!(result, toolkit_db::outbox::MessageResult::Ok),
+        "expected Ok, got {result:?}"
+    );
+    assert_eq!(producer.registrations_for_test().await.unwrap(), vec![]);
+    let delivered = faulty.delivered_publishes();
+    let [publish] = delivered.as_slice() else {
+        panic!("expected one delivered publish, got {delivered:?}");
+    };
+    assert_eq!(
+        (
+            publish.event_id,
+            publish.subject.as_str(),
+            publish.meta.is_none(),
+            publish.outcome.clone(),
+            publish.ack_lost
+        ),
+        (
+            event_id,
+            order_id.to_string().as_str(),
+            true,
+            DeliveredOutcome::Accepted,
+            false
+        )
+    );
+    wait_for_stored(&harness, TOPIC, 1).await;
+    let mut stored = Vec::new();
+    for partition in 0..FIXTURE_BROKER_PARTITIONS {
+        let at = TopicPartition::new(
+            GtsInstanceId::try_new(TOPIC).unwrap(),
+            Partition::new(partition),
+        );
+        stored.extend(
+            harness
+                .backend()
+                .read(&at, Sequence::NONE, 16, Wait::No)
+                .await
+                .unwrap(),
+        );
+    }
+    let [event] = stored.as_slice() else {
+        panic!("expected one stored event, got {stored:?}");
+    };
+    assert_eq!(
+        (
+            event.id,
+            event.type_id.as_ref(),
+            event.tenant_id,
+            event.source.as_str(),
+            event.subject.clone(),
+            event.subject_type.as_ref(),
+            event
+                .occurred_at
+                .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
+            event.trace_parent.as_deref(),
+            event.data.clone(),
+            event.partition,
+            event.sequence,
+            (event.sequence_time.is_some(), event.meta.is_none()),
+        ),
+        (
+            event_id,
+            EVENT_TYPE,
+            test_tenant(),
+            "bss-pricing",
+            order_id.to_string(),
+            SUBJECT_TYPE,
+            "2026-11-03T10:15:30.123456789Z".to_owned(),
+            None,
+            Some(serde_json::json!({"order_id": order_id, "total_cents": 1250})),
+            Some(2),
+            Some(Sequence::assigned(1)),
+            (true, true),
+        )
     );
 }
 
@@ -270,7 +536,7 @@ async fn a_partition_id_is_registered_on_its_first_drain() {
 /// the drain that sees `404 ProducerNotFound` registers a replacement for that
 /// partition (generation 2) and asks for a retry, and the retry publishes under
 /// it. Nothing is rejected. Drives the real gear: `harness.forget_producer`
-/// deletes the `evbk_producer` row.
+/// deletes the `event_broker_producer` row.
 #[tokio::test]
 async fn an_unknown_producer_id_is_replaced_and_the_message_retried() {
     let (db, broker, harness) = fixture().await;
@@ -424,7 +690,7 @@ async fn managed_envelope_carries_no_producer_id_and_no_chain_fields() {
     let (_, envelope) = producer.outbox_envelope(order(None), 4).await.unwrap();
     let json = envelope_json(&envelope);
 
-    assert_eq!(json["version"], 2);
+    assert_eq!(json["version"], 1);
     assert_eq!(json["type"], EVENT_TYPE);
     assert_eq!(json["producer_mode"], "chained");
     assert!(json.get("producer_id").is_none());
@@ -587,7 +853,86 @@ async fn outbox_processor_treats_duplicate_as_ok() {
     let result = producer.process_outbox_payload_for_test(envelope, 1).await;
 
     assert_message_ok(result);
+    wait_for_stored(&harness, TOPIC, 1).await;
     assert_eq!(stored_count(&harness, TOPIC).await, 1);
+}
+
+/// The broker appends A but its ack is lost, so the queue redelivers A and the
+/// broker answers that resend `Duplicate`. B must then chain straight onto A,
+/// not go out with the chain head from before A and need a violation round
+/// trip to recover.
+#[tokio::test]
+async fn an_outbox_duplicate_ack_advances_the_chain() {
+    let (db, broker, harness) = fixture().await;
+    let faulty = FaultInjectingBroker::new(Arc::clone(&broker));
+    let producer = managed_producer(db.clone(), faulty.clone() as Arc<dyn EventBrokerApi>).await;
+    let producer_handle = producer
+        .outbox_queue(QUEUE, toolkit_db::outbox::Partitions::of(1))
+        .unwrap()
+        .start(toolkit_db::outbox::Outbox::builder(db.clone()))
+        .await
+        .unwrap();
+    let conn = db.conn().unwrap();
+    faulty.lose_publish_acks(1);
+
+    producer_handle
+        .outbox()
+        .enqueue(&conn, order(None))
+        .await
+        .unwrap()
+        .fire();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while faulty.delivered() < 2 {
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for the resend of A"
+        );
+        sleep(Duration::from_millis(10)).await;
+    }
+    producer_handle
+        .outbox()
+        .enqueue(&conn, order(None))
+        .await
+        .unwrap()
+        .fire();
+    wait_for_stored(&harness, TOPIC, 2).await;
+    producer_handle.stop().await;
+
+    let delivered = faulty.delivered_publishes();
+    let [lost, resent, b] = delivered.as_slice() else {
+        panic!("expected A, its resend and B, got {delivered:?}");
+    };
+    let a_meta = lost.meta.as_ref().expect("a chained publish carries meta");
+    let producer_id = a_meta.producer_id;
+    let a_sequence = a_meta.sequence.expect("a chained publish has a sequence");
+    let stamp = |meta: &Option<ProducerMeta>| {
+        meta.as_ref()
+            .map(|meta| (meta.version, meta.producer_id, meta.previous, meta.sequence))
+    };
+    assert_eq!(
+        [
+            (stamp(&lost.meta), lost.outcome.clone(), lost.ack_lost),
+            (stamp(&resent.meta), resent.outcome.clone(), resent.ack_lost),
+            (stamp(&b.meta), b.outcome.clone(), b.ack_lost),
+        ],
+        [
+            (
+                Some((1, producer_id, Some(-1), Some(a_sequence))),
+                DeliveredOutcome::Accepted,
+                true
+            ),
+            (
+                Some((1, producer_id, Some(-1), Some(a_sequence))),
+                DeliveredOutcome::Duplicate,
+                false
+            ),
+            (
+                Some((1, producer_id, Some(a_sequence), Some(a_sequence + 1))),
+                DeliveredOutcome::Accepted,
+                false
+            ),
+        ]
+    );
 }
 
 /// A transient publish failure (here a rate limit, armed on the harness) makes
@@ -782,7 +1127,7 @@ async fn stored_count(harness: &EventBrokerHarness, topic: &str) -> usize {
 }
 
 async fn wait_for_stored(harness: &EventBrokerHarness, topic: &str, count: usize) {
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         if stored_count(harness, topic).await >= count {
             return;
@@ -877,7 +1222,12 @@ async fn managed_producer(db: toolkit_db::Db, broker: Arc<dyn EventBrokerApi>) -
                 .source("order-service")
                 .client_agent("order-service/1.0"),
         )
-        .deduplication(DbDeduplication::managed(ProducerMode::Chained).key("orders"))
+        .deduplication(
+            DbDeduplication::managed(ProducerMode::Chained)
+                .key("orders")
+                .build()
+                .expect("managed deduplication with a key"),
+        )
         .topics([TOPIC])
         .event_type_patterns([EVENT_TYPE])
         .prepare_all()

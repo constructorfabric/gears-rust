@@ -44,7 +44,7 @@ fn hex(bytes: &[u8]) -> String {
 }
 /// SHA-256 of production bytes (the FIPS provider production hashes with); not an encoder.
 fn sha(bytes: &[u8]) -> String {
-    hex(aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, bytes).as_ref())
+    hex(toolkit_security::crypto::hash::Sha256::digest(bytes).as_ref())
 }
 fn unhex(s: &str) -> Option<Vec<u8>> {
     if !s.len().is_multiple_of(2) || !s.is_ascii() {

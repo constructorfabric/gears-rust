@@ -271,7 +271,9 @@ pub async fn find_in_collection(
 
 /// Bounded private persistence authority (08 §3.5): restricted service database role plus a
 /// scope bound to an authorized order, the authenticated principal or the refusal subject.
-/// It is not a PDP grant and never authorizes a business read or another order.
+/// It is not a PDP grant and never authorizes a business read or another order; the cross-order
+/// overlap readers under [`PrivateScope::for_payer_count`] return counts or held-key sets and
+/// never name a holder (D-180; predicates 7 and 9).
 pub struct PrivateScope(AccessScope);
 impl PrivateScope {
     /// Committed audit/idempotency evidence of the locked, authorized order.
@@ -303,6 +305,21 @@ impl PrivateScope {
     pub fn for_principal(principal_scope: &str) -> Self {
         Self(AccessScope::single(ScopeConstraint::new(vec![
             ScopeFilter::eq("principal_scope", principal_scope.to_owned()),
+        ])))
+    }
+    /// The privileged overlap readers (F03 §4.2 predicates 7 and 9; D-225 item 6): every order
+    /// of one payer, read only for line counts or same-resource held keys.
+    ///
+    /// Only counts per requested key or requested keys held for the same payer/resource tuple
+    /// may be returned: never a holder row or identity. This is never a business read. Crate
+    /// private for the two `repo::inflight` readers.
+    #[must_use]
+    pub(crate) fn for_payer_count(payer_tenant_id: Uuid) -> Self {
+        Self(AccessScope::single(ScopeConstraint::new(vec![
+            ScopeFilter::eq(
+                crate::gts::permissions::properties::PAYER_TENANT_ID,
+                payer_tenant_id,
+            ),
         ])))
     }
     /// The underlying access scope.

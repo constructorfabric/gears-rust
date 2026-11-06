@@ -114,6 +114,16 @@ impl ConsumptionStore for RecordingConsumptionStore {
         Err(StorageError::Internal("not part of this test".into()))
     }
 
+    async fn bulk_read_quota_snapshot(
+        &self,
+        _ctx: &SecurityContext,
+        _scope: &AccessScope,
+        _pairs: &[ApplicableQuotas],
+        _page: quota_enforcement_sdk::PageRequest,
+    ) -> Result<quota_enforcement_sdk::PageResult<QuotaSnapshot>, StorageError> {
+        Err(StorageError::Internal("not part of this test".into()))
+    }
+
     async fn lookup_idempotency(
         &self,
         scope: &IdempotencyScope,

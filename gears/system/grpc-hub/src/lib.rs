@@ -4,5 +4,6 @@
 //! This gear builds and hosts the single `tonic::Server` instance for the process.
 
 // === MODULE DEFINITION ===
+mod dynamic_routes;
 pub mod gear;
 pub use gear::{GrpcHub, GrpcHubConfig};

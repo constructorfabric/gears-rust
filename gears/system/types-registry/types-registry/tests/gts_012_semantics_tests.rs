@@ -181,5 +181,5 @@ fn candidate_object_levels_classify_every_level_including_partial() {
 #[test]
 fn workspace_uses_expected_gts_release() {
     assert_eq!(GTS_SPECIFICATION_VERSION, "0.17");
-    assert_eq!(GTS_IMPLEMENTATION_VERSION, "0.16.1");
+    assert_eq!(GTS_IMPLEMENTATION_VERSION, "0.16.2");
 }

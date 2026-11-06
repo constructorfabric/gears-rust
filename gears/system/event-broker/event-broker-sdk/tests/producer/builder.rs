@@ -62,6 +62,16 @@ fn typestate_builder_compile_failures_are_checked() {
     }
 }
 
+// An unbuilt managed builder can be missing its key or carry an invalid one,
+// so `DbProducerBuilder::deduplication` takes only a built `DbDeduplication`,
+// and the caller handles `build()`'s error.
+#[cfg(all(not(coverage_nightly), feature = "db"))]
+#[test]
+fn an_incomplete_managed_builder_is_not_accepted_as_deduplication() {
+    let tests = trybuild::TestCases::new();
+    tests.compile_fail("tests/trybuild/producer/db_requires_built_managed_dedup.rs");
+}
+
 trait ProducerIdentityTestExt {
     fn validate_pub_for_test(&self) -> Result<(), EventBrokerError>;
 }

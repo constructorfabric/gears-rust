@@ -14,7 +14,7 @@ use crate::infra::events::payload::{
     LineRef, OrderCancelled, OrderHeld, OrderResumed, OrderSubmitted,
 };
 use crate::infra::events::test_support::{Root, root};
-use crate::infra::events::test_support::{encoded_max_events, max_events, registry_client};
+use crate::infra::events::test_support::{encoded_max_events, max_events, platform_registry};
 use crate::infra::events::{
     self as events, EventEnqueueError, EventKind, EventSink, OrderSummary, QUEUE, TOPIC, TxEvents,
 };
@@ -24,7 +24,7 @@ use bss_orders_sdk::catalog::{OrderState, Trigger};
 use event_broker::test_support::{
     DeliveredOutcome, DeliveredPublish, EventBrokerHarness, FaultInjectingBroker, TransientFault,
 };
-use event_broker_sdk::backend::{Backend, Partition, TopicPartition, Wait};
+use event_broker_sdk::backend::{Partition, TopicPartition, Wait};
 use event_broker_sdk::{EventBrokerApi, GtsInstanceId, Sequence};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -42,10 +42,14 @@ fn settings() -> ProducerSettings {
         tenant_id: u(1_101),
     }
 }
+/// Fast retries, plus a short idle poll: after a restart nothing signals a message that is
+/// already queued, so an idle processor must re-poll rather than wait out the profile's
+/// ten-minute idle interval.
 fn fast_retry() -> toolkit_db::outbox::WorkerTuning {
     toolkit_db::outbox::WorkerTuning::processor_high_throughput()
         .retry_base(Duration::from_millis(20))
         .retry_max(Duration::from_millis(100))
+        .idle_interval(Duration::from_millis(200))
 }
 
 /// Explicit grants at the broker's PEP: only the Orders producer may produce the Orders event
@@ -137,7 +141,7 @@ impl Env {
         let granted = Arc::new(AtomicBool::new(true));
         let pdp = grants(Arc::clone(&granted));
         let harness = EventBrokerHarness::builder()
-            .with_types_registry_client(registry_client(), &[(TOPIC, partitions)])
+            .with_types_registry_client(platform_registry(), &[(TOPIC, partitions)])
             .with_policy_enforcer(authz_resolver_sdk::PolicyEnforcer::new(
                 Arc::clone(&pdp) as Arc<dyn authz_resolver_sdk::AuthZResolverApi>
             ))
@@ -776,7 +780,9 @@ async fn lost_acknowledgement_retries_after_restart_with_cursor_recovery() -> an
     env.faulty.reconnect();
     let bound = env.bind().await;
     assert_eq!(env.registrations().await, registered);
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    // Longer than the default 30 s partition lease: if the stopped processor's release did
+    // not commit, the restarted one re-polls until that lease expires.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(45);
     while count(&env.pg, UNACKNOWLEDGED).await > 0 {
         assert!(
             tokio::time::Instant::now() < deadline,
@@ -1399,9 +1405,19 @@ async fn every_event_is_stored_whatever_the_broker_partition_count() -> anyhow::
             .all(|p| p.outcome == DeliveredOutcome::Accepted && !p.ack_lost),
         "no duplicate or sequence-violation answer"
     );
+    // A leased processor also raises `attempts` for as long as it holds a partition's lease:
+    // acquiring it counts one attempt as a crash marker, and the release after an idle poll or
+    // the acknowledgement resets it. The test workers re-poll every 200 ms, so a processor in
+    // the middle of an idle poll is not a retry. A real retry records `last_error` and gives the
+    // lease up; a crash leaves `attempts > 0` on a lease nobody renews, which expires. Taking an
+    // expired lease over adds to the attempts the crash left, so a live lease above one attempt
+    // is a crash too: only a single attempt on a live lease is the healthy in-flight state.
     let errors = count(
         &env.pg,
-        "SELECT count(*) AS n FROM toolkit_outbox_processor WHERE last_error IS NOT NULL OR attempts > 0",
+        "SELECT count(*) AS n FROM toolkit_outbox_processor \
+         WHERE last_error IS NOT NULL \
+            OR attempts > 1 \
+            OR (attempts = 1 AND (locked_by IS NULL OR locked_until < now()))",
     )
     .await;
     assert_eq!(errors, 0, "no retry or error is visible on the queue");

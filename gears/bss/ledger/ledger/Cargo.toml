@@ -43,7 +43,6 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 # FIPS-validated SHA-256 for the idempotency payload fingerprint (same
 # provider the platform installs at bootstrap); no non-FIPS hasher.
-aws-lc-rs = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }

@@ -30,7 +30,7 @@ These are the features you reach for while building, and the entry point for eac
   `/health` & `/healthz`; build outbound clients with `HttpClient::builder().with_otel()`.
   See [Add observability](../../build-with-gears/add-observability/).
 - **Lifecycle & background tasks** — declare the `stateful` capability; the runtime drives
-  ordered startup, a `post_init` barrier, and cancellation-aware shutdown. See
+  ordered startup, a per-group `post_init` barrier, and cancellation-aware shutdown. See
   [Runtime and lifecycle](../../concepts/runtime-and-lifecycle/).
 - **Out-of-process gears** — same SDK trait, gRPC transport, selected by config
   (`runtime.type: local | oop`). See

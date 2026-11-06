@@ -2,7 +2,8 @@
 //!
 //! Concrete resources use their own GTS id as the PEP resource type
 //! (`docs/DESIGN.md` §3.3). The id is also sent as a resource property.
-//! Tenant scope is checked separately through the deployed authorization policy.
+//! Event and topic decisions carry the target tenant as `owner_tenant_id`;
+//! tenant authority is also checked independently through the deployed policy.
 
 use std::sync::LazyLock;
 
@@ -53,7 +54,10 @@ pub fn event_type_resource(event_type: &GtsTypeId) -> Result<ResourceType, Domai
             resource: event_type.to_string(),
         });
     }
-    Ok(ResourceType::new(event_type.as_ref().to_owned(), &[]))
+    Ok(ResourceType::new(
+        event_type.as_ref().to_owned(),
+        &[pep_properties::OWNER_TENANT_ID],
+    ))
 }
 
 /// PEP resource for a JOIN event-type interest (`consume`).
@@ -83,16 +87,22 @@ pub fn event_type_interest_resource(pattern: &GtsIdPattern) -> Result<ResourceTy
         .iter()
         .any(GtsIdPatternSegment::is_wildcard);
     Ok(if wildcard {
-        ResourceType::from_static(EventV1::TYPE_ID, &[])
+        ResourceType::from_static(EventV1::TYPE_ID, &[pep_properties::OWNER_TENANT_ID])
     } else {
-        ResourceType::new(pattern.pattern().to_owned(), &[])
+        ResourceType::new(
+            pattern.pattern().to_owned(),
+            &[pep_properties::OWNER_TENANT_ID],
+        )
     })
 }
 
 /// PEP resource for one concrete topic (`topic:consume` on JOIN).
 #[must_use]
 pub fn topic_resource(topic: &GtsInstanceId) -> ResourceType {
-    ResourceType::new(topic.as_ref().to_owned(), &[])
+    ResourceType::new(
+        topic.as_ref().to_owned(),
+        &[pep_properties::OWNER_TENANT_ID],
+    )
 }
 
 /// PEP resource for an existing named consumer group.

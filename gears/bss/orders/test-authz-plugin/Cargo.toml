@@ -1,0 +1,52 @@
+[package]
+name = "cf-gears-bss-orders-test-authz-plugin"
+version = "0.1.0"
+publish = false
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Orders-owned authorization fixture for Orders tests and isolated development hosts"
+repository.workspace = true
+readme = "README.md"
+keywords = ["constructorfabric", "cf-gears", "authorization"]
+categories = ["authentication"]
+metadata.docs.rs.all-features = true
+
+[lib]
+name = "bss_orders_test_authz_plugin"
+
+[lints]
+workspace = true
+
+[dependencies]
+# Local dependencies
+authz-resolver-sdk = { workspace = true }
+types-registry-sdk = { workspace = true }
+types-registry = { workspace = true }
+
+# ToolKit dependencies
+toolkit = { workspace = true }
+toolkit-macros = { workspace = true }
+
+# Async runtime
+async-trait = { workspace = true }
+
+# Data structures
+uuid = { workspace = true }
+
+# Error handling
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+
+# Required by toolkit::gear macro
+inventory = { workspace = true }
+
+[dev-dependencies]
+serde-saphyr = { workspace = true }

@@ -268,7 +268,8 @@ async fn consumer_resolves_provider_local_impl_through_the_hub() {
 
     // The consumer's own code (ChargeProxyService) resolves `PaymentApi` from the
     // shared hub and forwards a charge — in-process, local-wins.
-    let proxy = ChargeProxyService::new(Arc::clone(&hub));
+    // The consumer gear's own view: a proxy wired by its `#[consumes]` is its own.
+    let proxy = ChargeProxyService::new(hub.for_gear("api-contracts-consumer"));
     let resp = proxy
         .place_charge(SecurityContext::anonymous(), charge_req())
         .await
@@ -368,7 +369,8 @@ async fn consumer_resolves_provider_via_generated_rest_client() {
     // `PaymentApiRestResolvingClient`. directory-register (after the gateway
     // binds) advertises the provider; the resolving client then reaches it over
     // real HTTP. Poll the consumer's charge until eventual readiness converges.
-    let proxy = ChargeProxyService::new(Arc::clone(&hub));
+    // The consumer gear's own view: a proxy wired by its `#[consumes]` is its own.
+    let proxy = ChargeProxyService::new(hub.for_gear("api-contracts-consumer"));
     let deadline = Instant::now() + Duration::from_secs(15);
     let resp = loop {
         assert!(

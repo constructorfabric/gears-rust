@@ -508,8 +508,8 @@ pub struct DiscoveredExecution {
 }
 #[expect(
     dead_code,
-    reason = "the D-188/D-198 continuation bodies that read these facts are Stage 5 ports; no \
-              caller reads them yet, tests included"
+    reason = "the D-188/D-198 continuation bodies that read these facts are Stage 5 ports; the \
+              maintenance tests no longer read them, so they stay unused in test builds too"
 )]
 impl DiscoveredExecution {
     /// The table the execution lives in.

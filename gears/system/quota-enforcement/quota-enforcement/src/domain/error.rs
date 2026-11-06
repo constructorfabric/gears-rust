@@ -25,12 +25,15 @@ use super::tokens;
 pub enum PluginKind {
     /// `QuotaEnforcementStoragePluginV1`.
     Storage,
+    /// `QuotaNotificationSinkV1`.
+    NotificationSink,
 }
 
 impl fmt::Display for PluginKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             Self::Storage => "storage",
+            Self::NotificationSink => "notification sink",
         })
     }
 }
@@ -51,6 +54,8 @@ pub enum Dependency {
     Catalog,
     /// The statically registered resolution engines and their artifacts.
     Engine,
+    /// The registered notification sinks.
+    NotificationSinks,
 }
 
 impl Dependency {
@@ -64,6 +69,7 @@ impl Dependency {
             Self::TypesRegistry => "types_registry",
             Self::Catalog => "catalog",
             Self::Engine => "engine",
+            Self::NotificationSinks => "notification_sinks",
         }
     }
 }
@@ -268,6 +274,19 @@ pub enum DomainError {
         /// Closed `UPPER_SNAKE` reason token.
         reason: &'static str,
     },
+    // --- snapshot reads ---
+    /// A snapshot request is refused: its shape before the PDP, or a subject
+    /// the catalogue does not map after it. `index` names the subject when the
+    /// refusal is about one.
+    #[error("invalid snapshot {field}: {reason}")]
+    InvalidSnapshot {
+        /// The subject's position in the request, when one is at fault.
+        index: Option<usize>,
+        /// The request or subject field.
+        field: &'static str,
+        /// Closed `UPPER_SNAKE` reason token.
+        reason: &'static str,
+    },
     /// The batch has more items than the configured maximum.
     #[error("batch of {items} items exceeds the maximum of {max}")]
     BulkTooLarge {
@@ -408,6 +427,17 @@ pub enum DomainError {
     /// Last-resort opaque failure. Never carries caller-facing detail.
     #[error("internal error: {0}")]
     Internal(String),
+
+    // --- bulk quota CRUD ---
+    /// One item of a bulk envelope failed; nothing of the envelope was
+    /// applied. The cause keeps its own canonical category.
+    #[error("bulk item {index}: {cause}")]
+    BulkItem {
+        /// The item's position in the request.
+        index: usize,
+        /// What failed, as the single-item operation reports it.
+        cause: Box<Self>,
+    },
 }
 
 impl DomainError {
@@ -534,6 +564,18 @@ impl From<StorageError> for DomainError {
                 "storage reported schema major {installed} (expected {expected}) after bootstrap"
             )),
             StorageError::Internal(detail) => Self::Internal(detail),
+            StorageError::BulkItem { index, cause } => Self::from(*cause).at_item(index),
+        }
+    }
+}
+
+impl DomainError {
+    /// `self` as the failure of the bulk envelope's item at `index`.
+    #[must_use]
+    pub fn at_item(self, index: usize) -> Self {
+        Self::BulkItem {
+            index,
+            cause: Box::new(self),
         }
     }
 }

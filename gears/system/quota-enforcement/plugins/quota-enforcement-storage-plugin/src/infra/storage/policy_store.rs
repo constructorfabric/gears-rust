@@ -1,9 +1,8 @@
-//! Atomic platform policy version transitions. This adapter remains unpublished
-//! until the full storage plugin contract is implemented.
+//! Atomic platform policy version transitions.
 use super::cursor;
 use super::entity::{policy, policy_operation_log, policy_version};
 use super::repo::policy_repo as repo;
-use crate::infra::outbox::{EnqueueError, NotificationEnqueuer};
+use crate::infra::outbox::{AttemptWakes, EnqueueError, NotificationOutbox, settling};
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use quota_enforcement_sdk::{
@@ -23,7 +22,7 @@ const LOG_TARGET: &str = "qe.storage";
 #[derive(Clone)]
 pub struct SqlPolicyStore {
     db: Db,
-    enqueuer: Arc<dyn NotificationEnqueuer>,
+    enqueuer: Arc<dyn NotificationOutbox>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -228,7 +227,7 @@ fn decode_cursor(cursor: &str) -> Result<u32, StorageError> {
 impl SqlPolicyStore {
     /// Bind the database and same-transaction event enqueuer.
     #[must_use]
-    pub fn new(db: Db, enqueuer: Arc<dyn NotificationEnqueuer>) -> Self {
+    pub fn new(db: Db, enqueuer: Arc<dyn NotificationOutbox>) -> Self {
         Self { db, enqueuer }
     }
 
@@ -243,10 +242,12 @@ impl SqlPolicyStore {
         events: &[NotificationEvent],
     ) -> Result<PolicyVersion, StorageError> {
         let actor = ctx.subject_id().to_string();
-        let enqueuer = self.enqueuer.clone();
+        let wakes = AttemptWakes::begin(&self.enqueuer);
+        let enqueuer = wakes.enqueuer();
         let events = events.to_vec();
-        self.db
-            .transaction_ref_mapped(move |tx| {
+        settling(
+            wakes,
+            self.db.transaction_ref_mapped(move |tx| {
                 Box::pin(async move {
                     let id = if matches!(draft.scope, PolicyScope::Global) {
                         PolicyId::global()
@@ -299,9 +300,10 @@ impl SqlPolicyStore {
                         .await?;
                     Ok(value)
                 })
-            })
-            .await
-            .map_err(|error| lift("create policy", error))
+            }),
+        )
+        .await
+        .map_err(|error| lift("create policy", error))
     }
 
     /// Create a version above the high-water mark after locking the header.
@@ -316,10 +318,12 @@ impl SqlPolicyStore {
         events: &[NotificationEvent],
     ) -> Result<PolicyVersion, StorageError> {
         let actor = ctx.subject_id().to_string();
-        let enqueuer = self.enqueuer.clone();
+        let wakes = AttemptWakes::begin(&self.enqueuer);
+        let enqueuer = wakes.enqueuer();
         let events = events.to_vec();
-        self.db
-            .transaction_ref_mapped(move |tx| {
+        settling(
+            wakes,
+            self.db.transaction_ref_mapped(move |tx| {
                 Box::pin(async move {
                     let header = repo::header(tx, id.as_str(), true).await?.ok_or_else(|| {
                         StorageError::PolicyNotFound {
@@ -372,9 +376,10 @@ impl SqlPolicyStore {
                     enqueuer.enqueue_all(tx, &events).await?;
                     Ok(value)
                 })
-            })
-            .await
-            .map_err(|error| lift("update policy", error))
+            }),
+        )
+        .await
+        .map_err(|error| lift("update policy", error))
     }
 
     /// Roll back to a retained non-terminal version.
@@ -394,10 +399,12 @@ impl SqlPolicyStore {
         events: &[NotificationEvent],
     ) -> Result<TransitionOutcome<PolicyVersion>, StorageError> {
         let actor = ctx.subject_id().to_string();
-        let enqueuer = self.enqueuer.clone();
+        let wakes = AttemptWakes::begin(&self.enqueuer);
+        let enqueuer = wakes.enqueuer();
         let events = events.to_vec();
-        self.db
-            .transaction_ref_mapped(move |tx| {
+        settling(
+            wakes,
+            self.db.transaction_ref_mapped(move |tx| {
                 Box::pin(async move {
                     let header = repo::header(tx, id.as_str(), true).await?.ok_or_else(|| {
                         StorageError::PolicyNotFound {
@@ -457,9 +464,10 @@ impl SqlPolicyStore {
                     // @cpt-end:cpt-cf-quota-enforcement-flow-policy-rollback:p1:inst-prd-rollback-apply
                     Ok(TransitionOutcome::Applied(value))
                 })
-            })
-            .await
-            .map_err(|error| lift("roll back policy", error))
+            }),
+        )
+        .await
+        .map_err(|error| lift("roll back policy", error))
     }
 
     /// Soft-delete a metric policy.
@@ -485,10 +493,12 @@ impl SqlPolicyStore {
         }
         // @cpt-end:cpt-cf-quota-enforcement-flow-policy-delete:p1:inst-prd-global-if
         let actor = ctx.subject_id().to_string();
-        let enqueuer = self.enqueuer.clone();
+        let wakes = AttemptWakes::begin(&self.enqueuer);
+        let enqueuer = wakes.enqueuer();
         let events = events.to_vec();
-        self.db
-            .transaction_ref_mapped(move |tx| {
+        settling(
+            wakes,
+            self.db.transaction_ref_mapped(move |tx| {
                 Box::pin(async move {
                     let header = repo::header(tx, id.as_str(), true).await?.ok_or_else(|| {
                         StorageError::PolicyNotFound {
@@ -513,9 +523,10 @@ impl SqlPolicyStore {
                     // @cpt-end:cpt-cf-quota-enforcement-flow-policy-delete:p1:inst-prd-delete-apply
                     Ok(TransitionOutcome::Applied(()))
                 })
-            })
-            .await
-            .map_err(|error| lift("delete policy", error))
+            }),
+        )
+        .await
+        .map_err(|error| lift("delete policy", error))
     }
 
     /// Read one retained version.

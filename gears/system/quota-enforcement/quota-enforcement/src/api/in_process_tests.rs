@@ -65,6 +65,7 @@ fn unbound_service_with(pdp: Arc<dyn authz_resolver_sdk::AuthZResolverApi>) -> A
             metadata_max_bytes: 4096,
             list_max_limit: 500,
             list_max_ids: 100,
+            bulk_max_items: 50,
         },
         crate::test_support::policy_limits(),
         crate::domain::service::OperationsRuntime {
@@ -73,6 +74,7 @@ fn unbound_service_with(pdp: Arc<dyn authz_resolver_sdk::AuthZResolverApi>) -> A
             preparation_max_attempts: std::num::NonZeroU32::new(3).expect("attempts"),
             leases: crate::domain::operations::LeaseLimits::default(),
             batch: crate::domain::operations::BatchLimits::default(),
+            snapshot: crate::domain::operations::SnapshotLimits::default(),
         },
     ))
 }

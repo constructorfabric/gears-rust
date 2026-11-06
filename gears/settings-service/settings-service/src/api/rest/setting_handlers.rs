@@ -919,11 +919,13 @@ mod setting_handlers_tests;
 /// the target is outside its subtree or standalone; 404 when no declaration
 /// exists at the key or it is outside the caller's administrative domain; 503
 /// when the store cannot answer.
+#[allow(clippy::too_many_arguments)]
 pub async fn get_history(
     Extension(ctx): Extension<SecurityContext>,
     Extension(resolver): Extension<Arc<ConcreteResolver>>,
     Extension(db): Extension<Arc<toolkit_db::DBProvider<toolkit_db::DbError>>>,
     Extension(enforcer): Extension<Arc<authz_resolver_sdk::PolicyEnforcer>>,
+    Extension(names): Extension<Arc<crate::infra::actor_names::ActorNameResolver>>,
     Path(key): Path<String>,
     Query(params): Query<TenantParam>,
     OData(query): OData,
@@ -998,10 +1000,10 @@ pub async fn get_history(
     // target's chain from the reader. A definition record has no tenant, so
     // its actor is on no path.
     let reader = Reader::new(ctx.subject_tenant_id(), root);
-    let target_chain = resolver.chain_of(target.tenant_id(root)).await?;
+    let target_chain = target_chain(&resolver, reader, target.tenant_id(root)).await?;
     let to_target = reader.path_in(&target_chain);
     // @cpt-end:cpt-cf-settings-service-flow-audit-store-history:p1:inst-as-hist-10
-    let items: Vec<AuditRecordDto> = page
+    let mut items: Vec<AuditRecordDto> = page
         .items
         .iter()
         .map(|r| {
@@ -1018,6 +1020,22 @@ pub async fn get_history(
             )
         })
         .collect();
+    // @cpt-end:cpt-cf-settings-service-flow-audit-store-history:p1:inst-as-hist-9
+    let actors: Vec<crate::infra::actor_names::ActorRef> = page
+        .items
+        .iter()
+        .zip(&items)
+        .map(|(record, item)| crate::infra::actor_names::ActorRef {
+            actor_tenant_id: record.actor_tenant_id,
+            actor: item.actor.clone(),
+            masked: item.actor_masked,
+        })
+        .collect();
+    let actor_names = names.names_for_page(&ctx, &actors).await;
+    for (item, name) in items.iter_mut().zip(actor_names) {
+        item.actor_name = name.as_str().map(str::to_owned);
+    }
+    // @cpt-begin:cpt-cf-settings-service-flow-audit-store-history:p1:inst-as-hist-9
     Ok(Json(PageDto {
         items,
         page_info: PageInfoDto::of(page.page_info, Some(page.total_count)),

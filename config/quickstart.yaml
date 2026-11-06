@@ -191,9 +191,10 @@ gears:
       vendor: "constructorfabric"
       priority: 100
 
-  # Requires --features quota-enforcement. The storage plugin publishes no
-  # client until the storage contract is complete, so the gear's bootstrap
-  # fails by design in a live server (see gears/system/quota-enforcement).
+  # Requires --features quota-enforcement. Quotas also need a catalog: the
+  # metric base, metrics, subject projections and request/constraint
+  # contracts in types-registry `entities`, and the projections listed under
+  # `catalog`. testing/e2e/suites/quota_enforcement/e2e.yaml is a worked example.
   quota-enforcement:
     config:
       storage_vendor: "constructorfabric"
@@ -556,7 +557,7 @@ gears:
     config:
       sidecar_base_url: "http://localhost:8099"
       storage_root: "./.file-storage-data"
-      signing_key_seed: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+      signing_key_pkcs8: "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgvyXv0q8GjreoBuf_PpNaMtOTjopTQiDanrRzE0yTGY2hRANCAAQZ2L6QZ1TYiDoNOYAetCY5SuDm9FiW2tOcy3DSKnbz8Wy9bwdzDx6plcpgtLoifYSjTnIR3X14G1M5Rrg1sj5D"
       # dev only
       finalize_internal_secret: "dev-file-storage-internal-secret"
 

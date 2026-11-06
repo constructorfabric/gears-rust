@@ -1,8 +1,9 @@
 use crate::domain::model::{HttpMethod, ListQuery, ManagedBy, Route};
-use crate::domain::repo::{RepositoryError, RouteOverlap, RouteRepository, Tags};
+use crate::domain::repo::{RepositoryError, RouteOverlap, RouteRepository, RowKey, Tags};
 use crate::domain::route_matching::{match_rank, parse_method};
 use async_trait::async_trait;
 use dashmap::DashMap;
+use std::collections::HashSet;
 use toolkit_macros::domain_model;
 use uuid::Uuid;
 
@@ -222,6 +223,46 @@ impl RouteRepository for InMemoryRouteRepo {
             route.tags.clear();
         }
         Ok(route)
+    }
+
+    async fn list_proxy_routes(
+        &self,
+        upstreams: &[RowKey],
+    ) -> Result<Vec<(RowKey, Vec<Route>)>, RepositoryError> {
+        let mut seen = HashSet::new();
+        Ok(upstreams
+            .iter()
+            .filter(|key| seen.insert(**key))
+            .map(|key| {
+                let route_ids: Vec<Uuid> = self
+                    .upstream_index
+                    .get(&key.id)
+                    .map(|ids| ids.clone())
+                    .unwrap_or_default();
+                let mut routes: Vec<Route> = route_ids
+                    .iter()
+                    .filter_map(|id| {
+                        self.store
+                            .get(id)
+                            .filter(|r| {
+                                r.tenant_id == key.tenant_id
+                                    && r.upstream_id == key.id
+                                    && r.enabled
+                                    && r.match_rules
+                                        .http
+                                        .as_ref()
+                                        .is_some_and(|http| !http.methods.is_empty())
+                            })
+                            .map(|r| r.clone())
+                    })
+                    .collect();
+                routes.sort_by_key(|r| r.id);
+                for route in &mut routes {
+                    route.tags.clear();
+                }
+                (*key, routes)
+            })
+            .collect())
     }
 
     async fn update(&self, mut route: Route) -> Result<Route, RepositoryError> {

@@ -117,9 +117,75 @@ struct Document {
     #[serde(with = "scalars::instant")]
     activation_deadline: OffsetDateTime,
 }
+/// Encode a frozen Pricing request in the schema-2 receipt codec's `query` spelling (exact
+/// decimal text, canonical UTC instants, lowercase hexadecimal digests, selections in request
+/// order): the form a D-188 attempt stores per line, so the request a receipt later echoes is
+/// compared member for member with the one Orders froze.
+///
+/// # Errors
+/// `Unsupported` for a value the encoder refuses to write (for example an instant outside the
+/// four-digit year encoding).
+pub fn encode_new_sale_query(query: &NewSaleQuery) -> Result<serde_json::Value, CodecError> {
+    wire::NewSaleQueryDef::serialize(query, serde_json::value::Serializer)
+        .map_err(|_| CodecError::Unsupported)
+}
+/// Encode every native accepted binding member using the schema-2 receipt spelling.
+/// Rating receives the same producer values and digests as the immutable receipt codec.
+///
+/// # Errors
+/// `Unsupported` when a scalar cannot be represented by the codec.
+pub fn encode_accepted_binding(binding: &AcceptedBinding) -> Result<serde_json::Value, CodecError> {
+    wire::AcceptedBindingDef::serialize(binding, serde_json::value::Serializer)
+        .map_err(|_| CodecError::Unsupported)
+}
+/// Decode a frozen Pricing request stored in the [`encode_new_sale_query`] spelling (every
+/// member required, unknown members refused).
+///
+/// # Errors
+/// `Malformed` for a value that is not that spelling.
+pub fn decode_new_sale_query(value: &serde_json::Value) -> Result<NewSaleQuery, CodecError> {
+    wire::NewSaleQueryDef::deserialize(value)
+        .map_err(|e| CodecError::Malformed(MalformedKind::of(&e)))
+}
+/// Encode an issued Pricing receipt in the schema-2 receipt codec's spelling (the `receipt`
+/// member of an [`OrderPin`]): the form a D-188 attempt records per line before the commit, so
+/// the commit rebuilds the pin from exactly the receipt Pricing issued. No integrity check is
+/// made here; the commit's [`OrderPin::new`] validates.
+///
+/// # Errors
+/// `Unsupported` for a value the encoder refuses to write.
+pub fn encode_acceptance_receipt(
+    receipt: &AcceptanceReceipt,
+) -> Result<serde_json::Value, CodecError> {
+    wire::AcceptanceReceiptDef::serialize(receipt, serde_json::value::Serializer)
+        .map_err(|_| CodecError::Unsupported)
+}
+/// Decode a receipt recorded with [`encode_acceptance_receipt`].
+///
+/// # Errors
+/// `Malformed` for a value that is not that spelling.
+pub fn decode_acceptance_receipt(
+    value: &serde_json::Value,
+) -> Result<AcceptanceReceipt, CodecError> {
+    wire::AcceptanceReceiptDef::deserialize(value)
+        .map_err(|e| CodecError::Malformed(MalformedKind::of(&e)))
+}
 /// Validated immutable evidence. Construct/decode through checked methods only.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OrderPin(Document);
+impl Serialize for OrderPin {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.0.serialize(serializer)
+    }
+}
+impl<'de> Deserialize<'de> for OrderPin {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let pin = Self(Document::deserialize(deserializer)?);
+        pin.validate().map_err(serde::de::Error::custom)?;
+        Ok(pin)
+    }
+}
+
 impl OrderPin {
     /// Wrap an issued native receipt without changing issuer digests or terms.
     /// # Errors
@@ -173,6 +239,11 @@ impl OrderPin {
     #[must_use]
     pub fn receipt(&self) -> &AcceptanceReceipt {
         &self.0.receipt
+    }
+    /// The persisted assessment identity shared by the version's resolved totals.
+    #[must_use]
+    pub fn assessment_id(&self) -> Uuid {
+        self.0.assessment_id
     }
     #[must_use]
     pub fn activation_deadline(&self) -> OffsetDateTime {

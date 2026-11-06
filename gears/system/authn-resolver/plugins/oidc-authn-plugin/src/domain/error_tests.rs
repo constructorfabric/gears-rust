@@ -148,3 +148,13 @@ fn token_endpoint_not_configured_maps_to_token_acquisition_failed() {
         AuthNResolverError::TokenAcquisitionFailed(msg) if msg == "token endpoint not configured"
     ));
 }
+
+#[test]
+fn local_crypto_failure_is_unavailable_not_unauthorized_or_an_idp_failure() {
+    let error = AuthNError::CryptoUnavailable("backend failed".to_owned());
+    assert!(!error.is_idp_failure());
+    assert!(matches!(
+        AuthNResolverError::from(error),
+        AuthNResolverError::ServiceUnavailable(_)
+    ));
+}

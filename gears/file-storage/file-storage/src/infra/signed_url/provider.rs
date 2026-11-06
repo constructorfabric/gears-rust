@@ -4,20 +4,21 @@
 //! signing primitive (and, in a FIPS deployment, the validated module behind it) is
 //! replaceable without touching the codec.
 //!
-//! `Ed25519Provider` (Ed25519 via `ring`, FIPS 186-5 approved) is the default; a FIPS
-//! deployment can implement the same traits over a validated module.
+//! `EcdsaP256Provider` uses P-256/SHA-256 through toolkit-security. Private
+//! keys are PKCS#8 DER, public keys are uncompressed SEC1 points, and
+//! signatures are ASN.1 DER. FIPS builds use the configured native provider.
 
 use std::sync::Arc;
 
-use ring::rand::SystemRandom;
-use ring::signature::{self, Ed25519KeyPair, KeyPair, UnparsedPublicKey};
+use toolkit_security::crypto::CryptoError;
+use toolkit_security::crypto::signature::{EcdsaP256KeyPair, EcdsaP256VerifyingKey};
 
 use crate::domain::error::DomainError;
 
 /// Minting side (control plane): signs payloads and yields a matching verifier.
 pub trait SignatureProvider: Send + Sync {
     /// Sign `message`, returning the raw signature bytes.
-    fn sign(&self, message: &[u8]) -> Vec<u8>;
+    fn sign(&self, message: &[u8]) -> Result<Vec<u8>, DomainError>;
     /// The public-key bytes a peer verifier needs (shared with the sidecar).
     fn public_key(&self) -> Vec<u8>;
     /// A verifier for the tokens this provider mints.
@@ -31,33 +32,30 @@ pub trait SignatureVerifier: Send + Sync {
     fn verify(&self, message: &[u8], signature: &[u8]) -> Result<(), DomainError>;
 }
 
-/// Default provider: Ed25519 via `ring`.
-pub struct Ed25519Provider {
-    key_pair: Ed25519KeyPair,
+/// Default provider: ECDSA P-256/SHA-256 through the toolkit-security crypto facade.
+pub struct EcdsaP256Provider {
+    key_pair: EcdsaP256KeyPair,
     public_key: Vec<u8>,
 }
 
-impl Ed25519Provider {
+impl EcdsaP256Provider {
     /// Generate a fresh static keypair (no rotation).
     pub fn generate() -> Result<Self, DomainError> {
-        let rng = SystemRandom::new();
-        let pkcs8 = Ed25519KeyPair::generate_pkcs8(&rng)
-            .map_err(|_| DomainError::token_invalid("failed to generate signing key"))?;
-        let key_pair = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref())
-            .map_err(|_| DomainError::token_invalid("failed to load signing key"))?;
-        let public_key = key_pair.public_key().as_ref().to_vec();
+        let key_pair = EcdsaP256KeyPair::generate().map_err(|error| {
+            tracing::error!(%error, "signed-URL key generation failed");
+            DomainError::InternalError
+        })?;
+        let public_key = key_pair.public_key().to_vec();
         Ok(Self {
             key_pair,
             public_key,
         })
     }
 
-    /// Construct from a 32-byte Ed25519 seed, so the keypair is stable across restarts.
-    pub fn from_seed(seed: &[u8]) -> Result<Self, DomainError> {
-        let key_pair = Ed25519KeyPair::from_seed_unchecked(seed).map_err(|_| {
-            DomainError::token_invalid("invalid Ed25519 signing seed (expected 32 bytes)")
-        })?;
-        let public_key = key_pair.public_key().as_ref().to_vec();
+    /// Construct from a PKCS#8 DER P-256 private key, so the keypair is stable across restarts.
+    pub fn from_pkcs8(bytes: &[u8]) -> Result<Self, DomainError> {
+        let key_pair = EcdsaP256KeyPair::from_pkcs8(bytes).map_err(map_crypto_error)?;
+        let public_key = key_pair.public_key().to_vec();
         Ok(Self {
             key_pair,
             public_key,
@@ -65,9 +63,12 @@ impl Ed25519Provider {
     }
 }
 
-impl SignatureProvider for Ed25519Provider {
-    fn sign(&self, message: &[u8]) -> Vec<u8> {
-        self.key_pair.sign(message).as_ref().to_vec()
+impl SignatureProvider for EcdsaP256Provider {
+    fn sign(&self, message: &[u8]) -> Result<Vec<u8>, DomainError> {
+        self.key_pair.sign(message).map_err(|error| {
+            tracing::error!(%error, "signed-URL signing failed");
+            DomainError::InternalError
+        })
     }
 
     fn public_key(&self) -> Vec<u8> {
@@ -75,27 +76,42 @@ impl SignatureProvider for Ed25519Provider {
     }
 
     fn verifier(&self) -> Arc<dyn SignatureVerifier> {
-        Arc::new(Ed25519Verifier::new(self.public_key.clone()))
+        Arc::new(EcdsaP256Verifier {
+            key: self.key_pair.verifying_key(),
+        })
     }
 }
 
-/// Verifier for `Ed25519Provider`-minted tokens (public key only).
-pub struct Ed25519Verifier {
-    public_key: Vec<u8>,
+/// Verifier for `EcdsaP256Provider`-minted tokens (public key only).
+pub struct EcdsaP256Verifier {
+    key: EcdsaP256VerifyingKey,
 }
 
-impl Ed25519Verifier {
-    /// Construct from raw Ed25519 public-key bytes (e.g. sidecar config).
-    #[must_use]
-    pub fn new(public_key: Vec<u8>) -> Self {
-        Self { public_key }
+impl EcdsaP256Verifier {
+    /// Construct from an uncompressed SEC1 P-256 public key (e.g. sidecar config).
+    pub fn from_sec1_bytes(public_key: &[u8]) -> Result<Self, DomainError> {
+        EcdsaP256VerifyingKey::from_sec1_bytes(public_key)
+            .map(|key| Self { key })
+            .map_err(map_crypto_error)
     }
 }
 
-impl SignatureVerifier for Ed25519Verifier {
+impl SignatureVerifier for EcdsaP256Verifier {
     fn verify(&self, message: &[u8], signature: &[u8]) -> Result<(), DomainError> {
-        UnparsedPublicKey::new(&signature::ED25519, &self.public_key)
+        self.key
             .verify(message, signature)
-            .map_err(|_| DomainError::token_invalid("signature verification failed"))
+            .map_err(map_crypto_error)
+    }
+}
+
+fn map_crypto_error(error: CryptoError) -> DomainError {
+    match error {
+        CryptoError::InvalidKey | CryptoError::InvalidSignature | CryptoError::MessageTooLong => {
+            DomainError::token_invalid(format!("invalid signed-URL key or signature: {error}"))
+        }
+        _ => {
+            tracing::error!(%error, "signed-URL crypto backend failed");
+            DomainError::InternalError
+        }
     }
 }

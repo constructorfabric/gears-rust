@@ -8,11 +8,15 @@ use async_trait::async_trait;
 use toolkit_canonical_errors::CanonicalError;
 use toolkit_security::SecurityContext;
 
+use crate::bulk::{
+    BulkCreateQuotasRequest, BulkCreated, BulkDeactivateQuotasRequest, BulkDeactivated,
+    BulkUpdateQuotasRequest, BulkUpdated,
+};
 use crate::models::{
     AcquireLeaseOutcome, AcquireLeaseRequest, BatchDebitRequest, BatchDecision, CommitLeaseRequest,
     CreditRequest, DeactivateOutcome, DebitRequest, Decision, DecisionPreview, PageRequest,
-    PageResult, PreviewRequest, QuotaFilter, QuotaId, QuotaPatch, QuotaSpec, QuotaView,
-    ReleaseLeaseRequest, RollbackRequest,
+    PageResult, PreviewRequest, QuotaFilter, QuotaId, QuotaPatch, QuotaSnapshot, QuotaSpec,
+    QuotaView, ReleaseLeaseRequest, RollbackRequest, SnapshotRequest,
 };
 
 /// Error of every client method: the platform canonical error.
@@ -95,6 +99,46 @@ pub trait QuotaManagerClientV1: Send + Sync + 'static {
         ctx: &SecurityContext,
         request: CreditRequest,
     ) -> Result<Decision, QuotaEnforcementError>;
+
+    /// Create every listed Quota of one tenant in one transaction, or none.
+    /// A replay of the envelope key returns the original outcome.
+    ///
+    /// # Errors
+    ///
+    /// `InvalidArgument` (`BULK_TOO_LARGE`) for too many items; the canonical
+    /// error of the first failing item, pointing at `items[index]`; `Aborted`
+    /// (`IDEMPOTENCY_PAYLOAD_MISMATCH`) when the key was used for other items.
+    async fn bulk_create_quotas(
+        &self,
+        ctx: &SecurityContext,
+        request: BulkCreateQuotasRequest,
+    ) -> Result<BulkCreated, QuotaEnforcementError>;
+
+    /// Apply every listed patch to one tenant's Quotas in one transaction, or
+    /// none.
+    ///
+    /// # Errors
+    ///
+    /// As [`QuotaManagerClientV1::bulk_create_quotas`], with the item errors
+    /// of [`QuotaManagerClientV1::update_quota`].
+    async fn bulk_update_quotas(
+        &self,
+        ctx: &SecurityContext,
+        request: BulkUpdateQuotasRequest,
+    ) -> Result<BulkUpdated, QuotaEnforcementError>;
+
+    /// Deactivate every listed Quota of one tenant in one transaction, or
+    /// none, resolving their active leases with it.
+    ///
+    /// # Errors
+    ///
+    /// As [`QuotaManagerClientV1::bulk_create_quotas`], with the item errors
+    /// of [`QuotaManagerClientV1::deactivate_quota`].
+    async fn bulk_deactivate_quotas(
+        &self,
+        ctx: &SecurityContext,
+        request: BulkDeactivateQuotasRequest,
+    ) -> Result<BulkDeactivated, QuotaEnforcementError>;
 }
 
 /// Performs guarded consumption operations.
@@ -224,6 +268,24 @@ pub trait QuotaEnforcementClientV1: Send + Sync + 'static {
         ctx: &SecurityContext,
         request: BatchDebitRequest,
     ) -> Result<BatchDecision, QuotaEnforcementError>;
+
+    /// Read the per-Quota state of explicit targets: every active Quota the
+    /// targets select, once each, ordered by `quota_id`, with no policy
+    /// attribution and no aggregate figure. A target matching nothing is an
+    /// empty page, not an error.
+    ///
+    /// # Errors
+    ///
+    /// `InvalidArgument` for no subjects, too many, a bad `limit`, a malformed
+    /// target (naming the subject), a `tenant` subject naming another tenant,
+    /// a metric or kind the catalogue does not admit, or a cursor the service
+    /// did not issue; `PermissionDenied` when the PDP refuses any target;
+    /// `ServiceUnavailable` when the PDP or storage cannot answer.
+    async fn snapshot(
+        &self,
+        ctx: &SecurityContext,
+        request: SnapshotRequest,
+    ) -> Result<PageResult<QuotaSnapshot>, QuotaEnforcementError>;
 }
 
 /// Platform operator policy surface. Every method requires explicit PDP admission.

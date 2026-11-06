@@ -25,10 +25,26 @@ updates:
     open-pull-requests-limit: 5
     commit-message:
       prefix: "chore(deps)"
+    # rdkafka-sys is pinned to =4.9.0 on purpose (see the comment in Cargo.toml):
+    # librdkafka 2.12.1 in 4.10 includes <curl/curl.h> even with curl off, so the
+    # build fails (#5616). rdkafka 0.39 requires rdkafka-sys 4.10. Only these
+    # releases are skipped, so a later fixed release still gets proposed.
+    ignore:
+      - dependency-name: "rdkafka-sys"
+        versions: [">= 4.10.0, < 4.11.0"]
+      - dependency-name: "rdkafka"
+        versions: [">= 0.39.0, < 0.40.0"]
     groups:
+      # apalis crates are pinned with `=` and must move in lockstep: #5543 bumped
+      # apalis-core/apalis-postgres to 1.0.0 via cargo-patch but left apalis on
+      # rc.10, which does not compile. Groups match in order, so this one must
+      # stay above cargo-patch.
+      apalis:
+        patterns:
+          - "apalis*"
       # RustCrypto crates share trait versions (digest/signature): bumping one
       # alone does not compile (#5350: sha2 0.11 against rsa's digest 0.10).
-      # Listed first so these never fall into the patch group below.
+      # Listed above cargo-patch so these never fall into the patch group.
       # pkcs8/sec1 are direct deps locked to rsa's generation (rustls-corecrypto-provider).
       rustcrypto:
         patterns:
@@ -52,6 +68,13 @@ updates:
           - "sha2"
           - "sha3"
           - "signature"
+      # opentelemetry-rust crates release in lockstep and tracing-opentelemetry
+      # tracks them: bumping opentelemetry_sdk alone does not compile (#5613).
+      # Listed above cargo-patch so these never fall into the patch group.
+      opentelemetry:
+        patterns:
+          - "opentelemetry*"
+          - "tracing-opentelemetry"
       # Patch only: in cargo a 0.x minor bump is a breaking change (#4900:
       # base64 0.22 -> 0.23), and one breaking crate would block the whole group.
       # Minor bumps stay individual PRs.
@@ -79,6 +102,17 @@ updates:
     open-pull-requests-limit: 5
     commit-message:
       prefix: "chore(deps)"
+    # The rust builder image must match rust-toolchain.toml (`make docker-pins`).
+    # Dependabot cannot see that link: on its own it moved the image to 1.99.1
+    # while the toolchain stayed on 1.98.1 (#5735). Version bumps of `rust` go
+    # in by hand together with the toolchain bump; digest refreshes of the
+    # pinned tag still come through.
+    ignore:
+      - dependency-name: "rust"
+        update-types:
+          - "version-update:semver-major"
+          - "version-update:semver-minor"
+          - "version-update:semver-patch"
     groups:
       # One PR for all three directories: the same rust image bump used to
       # arrive as three PRs (#5393, #5394, #5396).

@@ -44,7 +44,7 @@ Five plugins are shipped with this version, covering PDFs, HTML, spreadsheets, p
 
 #### Third-party Library Constraints
 
-`kreuzberg` ≥ 4.8.0 uses Elastic License 2.0 (EL-2.0). The dependency is pinned at `=4.9.4`. An explicit exception is declared in `deny.toml` with rationale: Gears' document parsing is not sold as a standalone competing product. Any upgrade requires re-verifying the exception still applies.
+`kreuzberg` 4.8.0–4.9.x used Elastic License 2.0 (EL-2.0); 4.10.x is MIT again. The dependency is pinned at `=4.10.4` (MIT) and `deny.toml` has no exception for it. The exact pin stays because upstream has changed license before; any upgrade requires re-checking the license, and a non-allow-listed license fails `cargo deny check`. Each bump must also re-check kreuzberg's own exact pins on transitive crates: 4.10.4 pins `quick-xml =0.41.0`, so a quick-xml advisory cannot be fixed by `cargo update` until kreuzberg moves.
 
 #### Architecture Decisions
 
@@ -61,7 +61,7 @@ Parser Gateway       (src/domain/service.rs — FileParserService)
 │  FileParserBackend plugins  (src/infra/parsers/)                    │
 │                                                                     │
 │  PlainTextParser   txt, log, md          (internal)                 │
-│  KreuzbergParser   pdf, html, xlsx, pptx (kreuzberg =4.9.4)        │
+│  KreuzbergParser   pdf, html, xlsx, pptx (kreuzberg =4.10.4)       │
 │  DocxParser        docx                  (docx-rust)                │
 │  ImageParser       png, jpg, webp, gif   (internal / base64)        │
 │  StubParser        doc, rtf, odt, …      (fallback stub)            │
@@ -133,7 +133,7 @@ Currently supported:
 - `ImageParser`: `png`, `jpg`, `jpeg`, `webp`, `gif`
 - `StubParser` (fallback): `doc`, `rtf`, `odt`, `xls`, `xlsx`, `ppt`, `pptx`
 
-**Known limitations of `KreuzbergParser` at kreuzberg 4.9.4**:
+**Known limitations of `KreuzbergParser` (kreuzberg 4.9.4 through 4.10.4)**:
 - PPTX multi-slide presentations: slides are emitted as `##` headings rather than distinct nodes; `PageBreak` blocks between slides are not produced.
 - PPTX tables: structured `Table` blocks are not produced; table cell content is extracted as plain paragraphs.
 <!-- fdd-id-content -->
@@ -142,7 +142,7 @@ Currently supported:
 
 - [ ] `p1` - **ID**: `cpt-cf-file-parser-constraint-version-pin`
 
-`kreuzberg` is declared as `=4.9.4` in `Cargo.toml`. This prevents `cargo update` from silently upgrading to a newer release with a different or changed license. An explicit `deny.toml` exception permits Elastic-2.0 for this crate at this version. Any upgrade is a deliberate, reviewed action.
+`kreuzberg` is declared as `=4.10.4` (MIT) in `Cargo.toml`. This prevents `cargo update` from silently upgrading to a newer release with a different or changed license. `deny.toml` has no exception for this crate, so a non-allow-listed license fails `cargo deny check`. Any upgrade is a deliberate, reviewed action.
 
 ## 3. Technical Architecture
 
@@ -205,7 +205,7 @@ Each plugin implements `FileParserBackend` (`src/domain/parser.rs`) and is regis
 | # | Plugin | Handled extensions | Backend library |
 |---|---|---|---|
 | 1 | `PlainTextParser` | `txt`, `log`, `md` | internal |
-| 2 | `KreuzbergParser` | `pdf`, `html`, `htm`, `xlsx`, `xls`, `xlsm`, `xlsb`, `pptx` | `kreuzberg =4.9.4` (Elastic-2.0, `deny.toml` exception) |
+| 2 | `KreuzbergParser` | `pdf`, `html`, `htm`, `xlsx`, `xls`, `xlsm`, `xlsb`, `pptx` | `kreuzberg =4.10.4` (MIT) |
 | 3 | `DocxParser` | `docx` | `docx-rust` |
 | 4 | `ImageParser` | `png`, `jpg`, `jpeg`, `webp`, `gif` | internal (base64 encoding) |
 | 5 | `StubParser` | `doc`, `rtf`, `odt`, `xls`, `xlsx`, `ppt`, `pptx` | stub fallback |
@@ -290,7 +290,7 @@ Plugin registration is done at gear startup in `src/gear.rs`. The gateway select
 
 | Dependency | Version | License | Role |
 |---|---|---|---|
-| `kreuzberg` | `=4.9.4` | Elastic-2.0 (exception in `deny.toml`) | Document extraction for PDF, HTML, XLSX, PPTX (used by `KreuzbergParser`) |
+| `kreuzberg` | `=4.10.4` | MIT (no `deny.toml` exception) | Document extraction for PDF, HTML, XLSX, PPTX (used by `KreuzbergParser`) |
 | `pdfium` | bundled via kreuzberg | BSD-3 | PDF rendering (bundled, no separate install) |
 | `docx-rust` | workspace | MIT | DOCX parsing (used by `DocxParser`) |
 
@@ -377,3 +377,4 @@ file_parser:
 | 2026-02-17 | 0.3.0 | Security | Added path-traversal protections for `parse-local` endpoints: `..` rejection, path canonicalization, `allowed_local_base_dir` enforcement, symlink-escape prevention, `PathTraversalBlocked` error (HTTP 403). Added constraint `fdd-file-parser-constraint-local-path-security-v1`. |
 | 2026-04-29 | 0.4.0 | Engineering | Restructured to match cypilot SDLC DESIGN template. Consolidated four format-specific parsers (`HtmlParser`, `PdfParser`, `XlsxParser`, `PptxParser`) into `KreuzbergParser` backed by `kreuzberg =4.9.4` (Elastic-2.0). Retained `DocxParser`, `ImageParser`, `PlainTextParser`, `StubParser` plugins. Documented domain model, component model, API contracts, and interaction sequences. |
 | 2026-04-30 | 0.5.0 | Engineering | Rewrote to be accurate to the full gateway+plugin architecture. Corrected domain model (actual `ParsedBlock` variants, `ParsedDocument` fields, `ParsedSource`). Fixed `FileParserBackend` trait signature. Fixed `/info` response key. Added plugin registration order table. Corrected file size limit (100 MB default). Removed kreuzberg-specific wording from gateway-level descriptions. |
+| 2026-11-03 | 0.6.0 | Engineering | Bumped `kreuzberg` `=4.9.8` → `=4.10.4` (MIT again; `deny.toml` Elastic-2.0 exception removed). Re-verified the PPTX multi-slide / table known limitations: still present at 4.10.4. Parser tests now require their fixtures instead of silently skipping (issue #5649). |

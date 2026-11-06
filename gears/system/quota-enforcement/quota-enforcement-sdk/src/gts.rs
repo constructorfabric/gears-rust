@@ -190,6 +190,21 @@ inventory::submit! {
 )]
 pub struct QuotaEnforcementStoragePluginSpecV1;
 
+/// GTS plugin specification for notification sinks. Unlike storage, every
+/// registered instance of every vendor receives every event.
+///
+/// Instance id shape:
+/// `gts.cf.toolkit.plugins.plugin.v1~cf.core.qe.notification_sink.v1~<vendor>.<pkg>.<ns>.<name>.v1`
+#[derive(Default)]
+#[gts_type_schema(
+    dir_path = "schemas",
+    base = PluginV1,
+    type_id = gts_id!("cf.toolkit.plugins.plugin.v1~cf.core.qe.notification_sink.v1~"),
+    description = "Quota Enforcement notification sink specification",
+    properties = "",
+)]
+pub struct QuotaNotificationSinkSpecV1;
+
 // Coordination uses the platform cluster profile rather than a plugin spec.
 
 #[cfg(test)]

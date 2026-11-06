@@ -7,6 +7,8 @@ pub mod handlers;
 pub mod routes;
 
 pub mod batch;
+pub mod bulk;
 pub mod leases;
 pub mod operations;
 pub mod policies;
+pub mod snapshot;

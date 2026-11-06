@@ -356,11 +356,11 @@ Inside the gear crate, layers are kept strictly separated (DDD-light): `domain/`
 
 7.  ### Compose and run
 
-    The server crate lists the gears to link (system gears + plugins + your gear); the
+    The server crate lists the gears to link (core gears + plugins + your gear); the
     runtime discovers them via `inventory`, orders them by dependency, and boots:
 
     ```rust title="users-info-server/src/registered_gears.rs"
-    // System gears
+    // Core gears
     use api_gateway as _;
     use authn_resolver as _;
     use authz_resolver as _;

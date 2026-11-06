@@ -3,6 +3,9 @@
 
 # Technical Design — Orders
 
+> **D-242 protected-capacity amendment (2026-10-27):** [Proposed Orders / Subscriptions contract](SUBSCRIPTIONS_CONTRACT.md) adopts PR5516's three-count full-tuple semantics, confirmation-before-capture reservation, protected own conversion/resume and lower-limit preservation. It supersedes active-only/release-on-leaving-active and activation-intent-only reservation wording below for the target contract. Historical/local active-only behavior remains legacy development behavior. Item mapping and versioned observation DTOs now have an Orders-local implementation (`a81090675`, `cd82261cf`) of the proposed contract. Real owner SDKs, atomic reservation/financial protocols, Workflow integration and bilateral conformance remain open. No provider checkbox is closed.
+
+
 
 <!-- toc -->
 
@@ -1442,7 +1445,7 @@ The interfaces each slice owns are defined here and specified normatively in [§
 | `authz-resolver-sdk` | Shared `PolicyEnforcer` adapter | PDP decisions and compiled AccessScopes for reads, transitions and service-owned operations |
 | `event-broker-sdk` | `EventBrokerApi`, `DbProducer`, `ProducerOutboxQueue` (`outbox` feature) | Typed event validation, managed chained producer registration, broker partitioning and asynchronous publication |
 | `toolkit-db` advisory locks | `Db::lock` / `Db::try_lock`, `DbLockGuard` | Session-bound coordination for the authoritative worker roster in [Foundation contract §3.8](DESIGN.md#contract-01-3-8); toolkit owns outbox coordination |
-| `types-registry` | SDK client | Register and resolve event, subject, refusal-reason and category types before readiness; registration failure prevents startup |
+| `types-registry` | SDK client | Register subject, refusal-reason and category types before readiness and resolve the event types, whose contract the registry seeds from the GTS inventory; registration failure prevents startup |
 | `orders-workflow` | SDK client and published events | Bidirectional seam: Workflow calls transition operations and consumes state notifications. This gear makes no call to Workflow |
 
 **Dependency Rules** (per project conventions):
@@ -3176,7 +3179,7 @@ refused by `04`'s `administrative-edit-unchanged` (D-149), not by this reason.
 |-------------------|----------------|----------|
 | `toolkit-db` | Runtime-scoped database access plus `outbox` | The one transaction per transition, append-only stores, toolkit outbox migrations and the managed producer queue |
 | `event-broker-sdk` | `EventBrokerApi`, `DbProducer`, `ProducerOutboxQueue` (`outbox` feature) | Typed validation, managed chained producer registration, broker partitioning and asynchronous publication |
-| `types-registry` | SDK client | Resolving and registering the GTS event, subject, error and category types of §4.7; a type that fails to register fails the boot |
+| `types-registry` | SDK client | Resolving the GTS event types of §4.7, which the registry seeds from the GTS inventory, and registering the subject, error and category types; a type that fails to register fails the boot |
 | `toolkit-db` advisory locks | `Db::lock` / `Db::try_lock`, `DbLockGuard` | Session-bound coordination for the Orders worker roster in §3.8; toolkit manages its own outbox workers |
 
 **Dependency Rules** (per project conventions):
@@ -4908,10 +4911,11 @@ serializes the standard producer envelope into toolkit-db's opaque payload. Orde
 index or query event payloads in its database; Event Broker is the event query and replay surface.
 
 **Subject type.** Orders owns and registers `gts.cf.bss.orders.order.v1~` as the GTS entity type
-of an order before registering its event schemas. This is a type identifier, not an event type
-or an instance ID; it does not publish order state as a separate event or change the REST model.
-All eleven event types use it as `SUBJECT_TYPE` and in `allowed_subject_types`. This registration
-is required implementation work, not a claim that the type already exists in the registry.
+of an order at init. This is a type identifier, not an event type or an instance ID; it does not
+publish order state as a separate event or change the REST model.
+All eleven event types use it as `SUBJECT_TYPE` and in `allowed_subject_types`. The event contract
+itself (topic, abstract base, eleven final types) is a set of GTS inventory entries that
+`types-registry` seeds at its own init, before the `init` of any gear that depends on it.
 
 **Event tenancy and routing (D-95).** All eleven internal lifecycle event types **MUST** explicitly
 return the canonical platform-root tenant UUID from `TypedEvent::tenant_id()`. The Event Broker
@@ -4995,6 +4999,7 @@ pairs distinguish Orders reasons from similarly named failures in other gears.
 | `line-cap-exceeded` | `LINE_CAP_EXCEEDED` | InvalidArgument | 400 |
 | `date-cascade-invalid` | `DATE_CASCADE_INVALID` | InvalidArgument | 400 |
 | `axis-invalid` | `AXIS_INVALID` | InvalidArgument | 400 |
+| `payer-relationship-unconfirmed` | `PAYER_RELATIONSHIP_UNCONFIRMED` | FailedPrecondition | 400 |
 | `contract-not-active` | `CONTRACT_NOT_ACTIVE` | FailedPrecondition | 400 |
 | `contract-party-ineligible` | `CONTRACT_PARTY_INELIGIBLE` | FailedPrecondition | 400 |
 | `quantity-below-floor` | `QUANTITY_BELOW_FLOOR` | InvalidArgument | 400 |
@@ -5013,6 +5018,7 @@ pairs distinguish Orders reasons from similarly named failures in other gears.
 | `catalog-pin-composition-unavailable` | `CATALOG_PIN_COMPOSITION_UNAVAILABLE` | ServiceUnavailable | 503 |
 | `order-binding-expired` | `ORDER_BINDING_EXPIRED` | FailedPrecondition | 400 |
 | `order-binding-policy-missing` | `ORDER_BINDING_POLICY_MISSING` | ServiceUnavailable | 503 |
+| `billing-terms-unsupported` | `BILLING_TERMS_UNSUPPORTED` | FailedPrecondition | 400 |
 | `purchase-capacity-exceeded` | `PURCHASE_CAPACITY_EXCEEDED` | ResourceExhausted | 429 |
 | `overlap-key-unavailable` | `OVERLAP_KEY_UNAVAILABLE` | ServiceUnavailable | 503 |
 | `catalog-predicate-failed` | `CATALOG_PREDICATE_FAILED` | FailedPrecondition | 400 |
@@ -5081,9 +5087,16 @@ audit reasons — the closed committed-entry tokens of §3.7 *Committed audit re
 Adopted catalog reasons retain their upstream identifiers and meaning in the gate report; their
 adapter must supply the upstream canonical category and domain/code mapping, not invent Orders
 aliases or put an upstream reason URI in `type`. Validate that contract during integration.
-For an all-failures response, retain the complete authorized report in `context.data`; select
-the first unavailable result in declared predicate order from the **blocking** result set,
-otherwise the first failed blocking result in that order. D-195's versioned applicability mapping
+For an all-failures response, retain the complete authorized report in `context.data` as the
+optional `assessment` member (D-233): the assessment id, the mapping version, every public outcome
+(predicate, line/item identity, selection, verdict, reason, applicability tokens; no producer
+results or evidence) and the failure list. Every composite-gate refusal of a submit or amendment
+may carry it; no other refusal does, and a decoder treats its absence as no report. Select
+from the **blocking** result set, in declared predicate order, the first failed definitive local
+refusal (D-234: axis validity, including `payer-relationship-unconfirmed` and the withheld
+payer-dependent rows that carry predicate 1's reason; reference resolution; single currency;
+quantity floor; dates), otherwise the first unavailable result (D-195), otherwise the first
+failed blocking result in that order. D-195's versioned applicability mapping
 excludes approved D-189/D-193 optional-context TCV unevaluability and D-191 optional forecast
 absence from that set: it preserves successful
 Preview with `tcvWithheld` and remains in the diagnostic vector. Required sellability checks remain
@@ -5170,8 +5183,10 @@ precedence; `request-invalid` is the fallback, never a second name for them. An 
 optional here and compared only at §3.6 *Attempt Transition* step 12 (D-147).
 
 The **registry** is the platform `types-registry`, reached as an SDK client (`§3.4`). Consumers
-resolve event schemas and reason types there; this gear registers its types at startup, and a
-type that fails to register fails the boot rather than a request.
+resolve event schemas and reason types there; this gear registers its resource and reason types
+at startup, and one that fails to register fails the boot rather than a request; its event
+contract is a set of GTS inventory entries, so a bad event-contract document fails the registry's
+startup in every host that links `cf-gears-bss-orders`.
 
 <a id="contract-01-traits-and-versioning"></a>
 
@@ -5209,8 +5224,9 @@ know. A **major** bump is a breaking change and follows `§4.6`'s dual-publicati
 adds is that compatibility is *checked* at registration by the registry rather than asserted in
 prose.
 
-**Required implementation verification (not yet implemented).** Register the topic, subject
-type, abstract event and all eleven concrete schemas against the deployed registry/broker.
+**Required implementation verification (not yet implemented).** Verify against the deployed
+registry/broker that the topic, abstract event and all eleven concrete schemas are present (GTS
+inventory entries the registry seeds) and that the subject type Orders registers at init is present.
 Verify the resolved common and concrete `data` constraints, required members, supported traits
 and `/subject` pointer; reject unknown traits and invalid/missing business fields. Serialize
 each type through the SDK producer and verify the seven publish-required fields in §4.4,
@@ -5976,7 +5992,7 @@ reset a deadline. D-150/D-158 define the assessment dependency graph.
 |---|---|---|
 | `PricingReadV1::current_revision` | 250 ms | Currentness and availability of each line's revision under §4.1; no implicit latest revision |
 | `PricingReadV1::resolve` | 250 ms | The item roster, chain matrix, SKU versions and descriptors under §4.1; separate diagnostic matrix; the D-192 commercial pin contains selected receipt bindings only; issued deadlines come from acceptance, not this read (D-191) |
-| `ProductsClient::get_sku` | 250 ms | `sellable` and `lifecycle` per consumed SKU under §4.1, until resolve echoes them |
+| `ProductsClient::get_sku` | 250 ms | `sellable` and `lifecycle` per consumed SKU under §4.1; an interim read that the D-189 assessment retires, not command availability (D-231) |
 | Subscriptions SUB-G1 key | 250 ms | The registry overlap key per prospective line (D-163); owner adoption pending |
 | Identity/payer profile | 250 ms | Tenant axes and authoritative payer market |
 | Rating pre-purchase evaluation | 500 ms | Requires exact selected binding result; never runs independently against latest prices |
@@ -5991,12 +6007,12 @@ the completed binding, and occupancy only from completed keys. Independent Contr
 checks may overlap. Preserve diagnostics for failed/unevaluable predicates; missing prerequisites
 skip dependent calls and record their source reason. Where one Pricing call supplies predicates and
 bindings, its total shared deadline cannot exceed their combined 500 ms budget. This specification
-requires bounded batching; the current REST-only resolver does not establish those latency targets.
+requires bounded batching; the typed `PricingReadV1` (D-187) replaces the earlier REST resolver but does not by itself establish those latency targets; `current_revision` uses the Pricing clock and may promote (D-187, D-231).
 
 Retry at most twice on transient errors within the original deadline; never retry an elapsed deadline.
 Retain shared circuit-breaker baseline 0.5 failures over 30 s/open 10 s, bulkhead 32 calls per port,
 submit 10/minute/caller and Preview 60/minute/caller. Per-assessment adapter concurrency is capped by
-§4.3. Use shared platform adapters; missing shared breaker capability remains a release prerequisite.
+§4.3. Use shared platform adapters where they exist; the gate's breaker is gear-local until the platform ships one (D-237; cpt-cf-bss-orders-upreq-shared-circuit-breaker).
 The durable transition p95 target is separate from resolution and publication. Q-11/Q-26 still require
 measurement/ratification; no one-second end-to-end latency claim is made.
 
@@ -6061,7 +6077,7 @@ guarantees, and no consumer — Workflow, a buyer surface, an operator report �
 either as one. Orders' own contribution to the open axis is narrow and stated: the claim index
 admits at most **one** in-flight order per `(payer_tenant_id, resource_tenant_id,
 overlap_scope_key)` (D-179), and while Subscriptions' occupancy answer is coarser than that tuple
-(per payer, as its `provenance` says) predicate 7 also counts this payer's *other* in-flight orders
+(per payer, as its explicit count scope says) predicate 7 also counts this payer's *other* in-flight orders
 claiming the same key under another resource tenant ([03 §4.2](features/03-gate-and-pin.md#contract-03-4-2) predicate 7) — a pre-check over
 Orders-owned claim data, so two concurrent submits can still both pass it. The residual race is
 with entries into `active` that do not pass through Orders — a direct subscription, `resume`, an
@@ -6346,10 +6362,10 @@ field, omits `tcv` and states why in `tcvWithheld` (§4.6, D-125); it does not r
 | `POST` | `/bss-orders/v1/orders/{orderId}/submit` | Run the gate, capture pin and total, transition `draft → submitted` | unstable |
 | `POST` | `/bss-orders/v1/orders/preview` | Run the gate and evaluation over a supplied basket, creating no order; rate-limited, and open to PDP-authorized partner admins and direct customers; no seller-only grant | unstable |
 
-**Reasons contributed to the registry**: axis-invalid, contract-not-active, contract-party-ineligible, quantity-below-floor,
+**Reasons contributed to the registry**: axis-invalid, payer-relationship-unconfirmed (D-232), contract-not-active, contract-party-ineligible, quantity-below-floor,
 market-inconsistent, reference-unresolvable, reference-duplicated,
 overlap-cardinality-exceeded, order-in-flight-for-key, overlap-key-unresolvable, pin-unresolvable,
-no-lines; and exactly one unavailable reason for each port:
+no-lines; and, per engine input, exactly one unavailable reason for each port (a port that feeds two engine inputs, such as resolve for catalog predicates and pin composition, reports one reason per input; an answered-missing policy, `order-binding-policy-missing`, is a business answer, not an unavailability):
 catalog-predicates-unavailable, identity-party-unavailable, contract-resolution-unavailable,
 overlap-presence-unevaluable (to which the overlap predicate's unevaluable outcome also resolves,
 so the condition has one name and not two), evaluation-unavailable, indicative-tax-unavailable,
@@ -6379,13 +6395,32 @@ the port's own unavailable reason listed above (`identity-party-unavailable` or
 
 **Contract**: `cpt-cf-bss-orders-interface-gate-ports` (`p1`), defined in [§3.3 Slice interfaces](#register-interfaces).
 
-**Nine logical outbound operations** are listed in §2.2. All use owning SDKs before the
+**Nine logical outbound operations** are listed in §2.2, one per registered unavailable reason; the inventory below (D-231) realises them as twelve gate ports, each reporting the reason of the operation it serves. All use owning SDKs before the
 transition transaction. One Pricing assessment may implement predicates and composition together;
 Rating must consume its exact selected bindings, not resolve independently. The overlap-key resolver
 returns key and provenance; Subscriptions occupancy returns `(activeCount, maxConcurrentActive,
 provenance)` per distinct payer/key, excluding drafts. Contracts alone answers contract status,
 party eligibility and the live acceptance-required declaration. Identity alone supplies tenant axes
 and payer market. Preview alone requests indicative tax.
+
+**Port inventory (D-231).**
+
+| Port | SDK method | Status on 2026-10-22 | Feeds | Unavailable reason | Missing → | Deadline |
+|---|---|---|---|---|---|---|
+| current-revision | `PricingReadV1::current_revision` | exists (main) | PricingRevision | `pricing-revision-unavailable` | grants: `…-upreq-commercial-service-provisioning`, `…-upreq-pricing-catalog-tenant-reads` | 250 ms |
+| resolve | `PricingReadV1::resolve` | exists | CatalogPredicates, PinComposition | `catalog-predicates-unavailable` (predicates), `catalog-pin-composition-unavailable` (pin) | same grants | 250 ms |
+| sku-read | `ProductsClient::get_sku` | exists | CatalogPredicates | `catalog-predicates-unavailable` | `…-upreq-products-sku-read-grant` | 250 ms |
+| assessment | `PricingAssessmentV1::assess` (D-189) | **missing** | CatalogPredicates | `catalog-predicates-unavailable` | S3-03; `…-upreq-pricing-purchase-assessment`, `…-upreq-pricing-bundle-sellability` | 250 ms (unratified, Q7) |
+| billing-terms | Subscriptions resolver (D-193) | **missing** | PinComposition | `catalog-pin-composition-unavailable` | S3-04; `…-upreq-pre-subscription-billing-terms` | 250 ms (unratified) |
+| acceptance-policy | Pricing policy discovery (D-191) | **missing** | PinComposition | answered-missing: `order-binding-policy-missing`; unavailable: `catalog-pin-composition-unavailable` | S3-05; `…-upreq-pricing-acceptance-policy` | 250 ms (unratified) |
+| identity-profile | AM payer profile | **missing** (`get_tenant` only) | Identity | `identity-party-unavailable` | S4-02; `…-upreq-payer-commercial-profile` | 250 ms |
+| contract-resolution | Contracts batched status/eligibility | **missing** | ContractResolution | `contract-resolution-unavailable` | S4-02; `…-upreq-contract-party-eligibility` | 250 ms |
+| overlap-key | Subscriptions SUB-G1 keys | **missing** | OverlapKey | `overlap-key-unavailable` | S5-06a; `…-upreq-catalog-subscription-product-key` | 250 ms |
+| occupancy | Subscriptions SUB-O5 | **missing** | Occupancy | `overlap-presence-unevaluable` | S5-06a; `…-upreq-overlap-presence-read` | 250 ms |
+| evaluation | Rating exact-binding evaluation (D-197) | **missing** | Evaluation | `evaluation-unavailable` | S3-07; `…-upreq-rating-evaluation` | 500 ms |
+| indicative-tax | unowned (D-168) | **missing** | none (Preview only) | `indicative-tax-unavailable` | S3-08; `…-upreq-indicative-tax-read` (p2) | 250 ms |
+
+A port that feeds two engine inputs reports both unresolvable; each answer is `Answered(T)` or `Unavailable{Outage, Denied, Deadline, Malformed, Missing}`, and the kind maps to the reason of each engine input the port feeds and is operator diagnostics only. A port that gave no answer (outage, denied, deadline, malformed envelope, missing provider) is `catalog-predicates-unavailable` on the catalog predicates; an answered read that cannot evaluate a predicate is `catalog-predicate-unevaluable` (D-231 item 9).
 
 Every response is tied to the assessment, authorized seller and input line identities; missing
 required results are unavailable rather than implicitly passing. The nine unavailable reasons are
@@ -6958,8 +6993,12 @@ and required.
 #### Capacity and publication
 
 Authoring admits at most 200 acquisition lines. The existing 200 consumed-item per-order
-limit remains an admission obligation (D-158), subject to the separately resolved purchase
-model. D-192 replaces the former full-matrix bound-slot accounting for the commercial pin:
+limit counts the sum of `selected_items.len()` across every draft line, without
+quantity multiplication or deduplication (D-158). Submit detects an excess before any date or
+catalog port call or commercial reservation, settles `gate.binding-admission` with
+`purchase-capacity-exceeded` over the locked draft, and rechecks at commit. Preview runs no
+admission guard, so it adds no annotation for this cap. D-192 replaces the former full-matrix
+bound-slot accounting for the commercial pin:
 cap **selected receipt bindings at 1,000 per line**, before any deduplication. The **1 MiB**
 serialized immutable-version limit counts the entire schema-2 receipt/query/bindings and all
 other persisted version content, not merely price IDs; exceeding it refuses
@@ -6969,7 +7008,8 @@ if retained inside a version they also consume its byte budget. Large unselected
 cannot be silently dropped when needed to prove a required sale predicate: unavailable or
 truncated required evidence fails closed. Provider result/request limits remain separately
 enforced by the adapter. One logical batched request per port may be split by revision/item,
-at most 200 subrequests, maximum 8 concurrent, under one shared per-port deadline. These
+at most 200 subrequests, maximum 8 concurrent, under one shared per-port deadline (all three per
+port per run; a further call waits for a slot within that deadline, D-231 item 5). These
 are design limits, not measured throughput or proof of full-roster availability.
 
 Events carry `orderId` and `orderVersion` as the immutable read reference, plus the existing bounded
@@ -10352,7 +10392,7 @@ The composed read **MUST** carry the order document at its current version, each
 status with the subscription linkage.
 
 It **MUST** also carry the **fulfillment inputs** of the current version: each line's stored
-`overlap_scope_key`, the version's market (`market_currency`, `market_region`), the version's
+overlap keys (`overlap_item_keys`, or the legacy scalar `overlap_scope_key`), the version's market (`market_currency`, `market_region`), the version's
 `payer_tenant_id`, each line's `activation_deadline` (Workflow's check before each activation
 dispatch) and the `accepted_version_ref` it hands to Subscriptions (D-190). Workflow executes the activation re-check that
 [03-gate-and-pin — Interactions and Sequences](features/03-gate-and-pin.md#contract-03-3-6) *Re-check Activation Preconditions* specifies —
@@ -10701,8 +10741,10 @@ basket, submitting and amending **MUST** confirm the payer ↔ resource-tenant r
 payer commercial profile Account Management returns (`cpt-cf-bss-orders-upreq-payer-commercial-profile`),
 alongside the payer ↔ seller relationship of D-128, **before** resolving or disclosing any
 payer-related commercial fact. An unconfirmed relationship refuses `payer-relationship-unconfirmed`
-(registered with the Stage 3 gate); an unavailable or late answer is the existing
-`identity-party-unavailable`. A draft may name any payer: it commits nothing, and an earlier draft
+(a result of gate predicate 1, FailedPrecondition/400, registered by D-232); an unavailable or late answer is the existing
+`identity-party-unavailable`. Until the relationship is confirmed the payer-dependent predicates
+(contract, market, overlap, in-flight) carry `payer-relationship-unconfirmed`, their ports are not
+called and their engine inputs are precluded (D-232 item 6). A draft may name any payer: it commits nothing, and an earlier draft
 edit or Preview **MUST NOT** substitute for the check at submit. Knowing the payer's identifier, its
 eligibility, or the existence of an active contract establishes nothing; eligibility and contract
 validity remain separate business checks. This rule does not widen actor permissions, permit
@@ -11492,8 +11534,10 @@ NULL to the literal string `default`. Constraint tests must distinguish
 plan-level/no-selection, selected NULL and literal `default`. This narrowly supersedes the old
 D-159 diagnostic encoding, not Pricing's native selection types or commercial receipt schema.
 
-Only blocking outcomes enter primary Problem selection: first unavailable, otherwise first failed,
-in the existing declared predicate/line/item/selection order. D-189/D-193 missing optional Preview
+Only blocking outcomes enter primary Problem selection: a failed definitive local refusal first
+(D-234: axis validity, including `payer-relationship-unconfirmed` and the withheld payer-dependent
+rows that carry predicate 1's reason; reference resolution; single currency; quantity floor;
+dates), otherwise first unavailable, otherwise first failed, in the existing declared predicate/line/item/selection order. D-189/D-193 missing optional Preview
 term/cycle produces TCV-only unevaluability and successful `tcvWithheld`, while genuinely required
 sellability uncertainty still blocks. Applicability is never inferred solely from the caller or
 provider flag. Business failures and other TCV/forecast failures retain their registered behavior; this exception

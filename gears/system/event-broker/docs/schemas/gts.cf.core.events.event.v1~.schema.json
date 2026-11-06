@@ -104,7 +104,7 @@
           "default": null
         },
         "previous": {
-          "description": "Predecessor's sequence for chain dedup. Required and only valid in chained mode. On the first chained-mode publish for a (producer_id, topic, partition), set to 0.",
+          "description": "Predecessor's sequence for chain dedup. Required and only valid in chained mode. On the first chained-mode publish for a (producer_id, topic), set to 0.",
           "type": [
             "integer",
             "null"
@@ -114,7 +114,7 @@
           "default": null
         },
         "sequence": {
-          "description": "Producer-assigned monotonic sequence per (producer_id, topic, partition). Required in chained and monotonic modes; omitted in stateless.",
+          "description": "Producer-assigned monotonic sequence per (producer_id, topic). Required in chained and monotonic modes; omitted in stateless.",
           "type": [
             "integer",
             "null"
@@ -153,7 +153,7 @@
         "x-gts-instance-ref": "gts.cf.core.events.topic.v1~"
       },
       "allowed_subject_types": {
-        "description": "GTS Type-id patterns describing which subject types an event of this type may declare in subject_type (concrete Type match, wildcard suffix <prefix>.*, or bare base Type <base>~ with implicit derived-type coverage). Enforced at publish time, independent of the subject_type:produce/:consume authorization check.",
+        "description": "GTS Type-id patterns describing which subject types an event of this type may declare in subject_type (concrete Type match, wildcard suffix `<prefix>.*`, or bare base Type `<base>~` with implicit derived-type coverage). Enforced at publish time, independent of the subject_type:produce/:consume authorization check.",
         "type": "array",
         "items": {
           "type": "string",

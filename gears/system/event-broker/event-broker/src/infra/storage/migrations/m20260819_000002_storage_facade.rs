@@ -9,9 +9,9 @@ use sea_orm_migration::prelude::*;
 use super::columns::{create_index, gts_id, timestamp};
 
 /// `anonymous` or `named`.
-const KIND_LEN: u32 = 16;
+const KIND_LEN: u32 = 9;
 /// `chained` or `monotonic`.
-const MODE_LEN: u32 = 32;
+const MODE_LEN: u32 = 9;
 /// `validate::client_agent`: at most 256 bytes of printable ASCII.
 const CLIENT_AGENT_LEN: u32 = 256;
 /// `validate::description`: at most 1024 bytes of printable ASCII.

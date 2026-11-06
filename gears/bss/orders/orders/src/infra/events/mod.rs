@@ -55,7 +55,7 @@ pub const EVENT_BASE: &str =
 /// The producer's declared event-type pattern: exactly the Orders family.
 pub const EVENT_TYPE_WILDCARD: &str =
     toolkit_gts::gts_id!("cf.core.events.event.v1~cf.bss.orders.event.v1~cf.bss.orders.*");
-/// The order subject type, registered by Orders before its event schemas (§4.7).
+/// The order subject type, which Orders registers at init (§4.7).
 pub const ORDER_SUBJECT_TYPE: &str = crate::gts::permissions::labels::ORDER;
 /// Partition routing: the order UUID subject, never the root tenant (§4.7, D-95).
 pub const PARTITION_KEY: &str = "/subject";
@@ -303,8 +303,7 @@ impl TxEvents {
     }
 
     /// Test-only: skip Orders' own contract and size admission to prove the platform's checks.
-    /// Its only caller is the #5381-dependent events suite (D-229).
-    #[cfg(all(test, orders_event_broker_test_support))]
+    #[cfg(test)]
     pub(crate) async fn enqueue_unchecked<T: TransactionRunner + Sync, K: EventKind>(
         &self,
         locked: &LockedOrder<'_, T>,

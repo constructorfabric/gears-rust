@@ -105,11 +105,11 @@ All queues use the same partition count, `outbox.num_partitions` (power of two, 
 
 | Queue (default name, config key) | Payload | Partition key | Handler | Lease | Retry bound |
 |---|---|---|---|---|---|
-| `mini-chat.usage_snapshot` (`outbox.queue_name`) | `UsageEvent` (SDK) | `tenant_id` | usage handler → model-policy plugin `publish_usage()` | default (30 s) | none; `Retry` until the plugin succeeds or returns `Permanent` |
+| `mini-chat.usage_snapshot` (`outbox.queue_name`) | `UsageEvent` (SDK) | `tenant_id` | usage handler → model-policy plugin `publish_usage()` | default (30 s) | 120 attempts (`Retry` on a transient error, a plugin resolution failure, or plugin resolution and `publish_usage()` together taking over 20 s, then `Reject`); `Reject` at once on `Permanent` or a payload that does not deserialize. Each `Reject` is counted in `mini_chat_outbox_dead_total{queue="usage",reason}` |
 | `mini-chat.attachment_cleanup` (`outbox.cleanup_queue_name`) | attachment cleanup event (enqueued by attachment deletion and by the upload reaper, `event_type = attachment_upload_abandoned`, without `secondary_ref`) | `tenant_id` | attachment cleanup handler → provider file delete, then Anthropic secondary delete | default | `cleanup_worker.max_attempts`, counted in `attachments.cleanup_attempts`; then the attachment is `failed` and the message `Reject` (dead letter). A delete answered with 2xx or 404 is success, any other status a failed attempt |
 | `mini-chat.chat_cleanup` (`outbox.chat_cleanup_queue_name`) | chat cleanup event | `chat_id` | chat cleanup handler → per-attachment file deletes, vector store delete | default | `cleanup_worker.max_attempts` per attachment (attachment then `failed`, handler continues). A failing vector-store delete returns `Retry` until the delivery that reaches `cleanup_worker.max_attempts` (the message's `attempts`; deliveries that waited for pending attachments count), then `Reject`; the `chat_vector_stores` row is kept for a dead-letter replay |
 | `mini-chat.thread_summary` (`outbox.thread_summary_queue_name`) | thread summary task | `chat_id` | thread-summary handler → non-streaming LLM call, summary persist, system usage event | `thread_summary_worker.claim_timeout_secs` | `thread_summary_worker.max_attempts` (the message's `attempts`); then `Reject`. A summary model missing from the catalog or disabled → `Reject` at once (`result = model_unavailable`) |
-| `mini-chat.audit` (`outbox.audit_queue_name`) | audit envelope (turn / mutation / delete event) | `tenant_id` | audit handler → audit plugin `emit_*` | 60 s | none; `Retry` on transient errors. A payload that does not deserialize → `Reject`, checked before the plugin is resolved. No audit plugin registered → `Ok` (event dropped, counted as `audit_emit_total{result="dropped"}`; looked up again on the next delivery). Instance found but its client missing from ClientHub → `Retry` |
+| `mini-chat.audit` (`outbox.audit_queue_name`) | audit envelope (turn / mutation / delete event) | `tenant_id` | audit handler → audit plugin `emit_*` | 60 s | 120 attempts; `Retry` on transient errors, then `Reject`. A payload that does not deserialize → `Reject`, checked before the plugin is resolved. No audit plugin registered → `Ok` (event dropped, counted as `audit_emit_total{result="dropped"}`; looked up again on the next delivery). Instance found but its client missing from ClientHub → `Retry` |
 
 Partitioning by `chat_id` serialises work for one chat (cleanup and summaries for the same chat run in order). Partitioning by `tenant_id` keeps one tenant's usage and audit events in order.
 
@@ -158,7 +158,7 @@ The thread-summary lease comes from `claim_timeout_secs` because the handler mak
 **Behavior (normative)**:
 - Processing is sequential within a partition and parallel across partitions. Any instance can process any partition; ownership is the lease in `toolkit_outbox_processor` (`locked_by`, `locked_until`), taken with a conditional update (`locked_by IS NULL OR locked_until < now()`).
 - The handler is called outside a DB transaction. The library cancels the handler future at `lease.duration - lease.headroom` so the ack can still commit inside the lease.
-- A `Retry` blocks the rest of its partition until it succeeds. Handlers whose failures can persist SHOULD bound retries and return `Reject` after a limit (Mini Chat does this for cleanup and thread-summary queues; section 1.8).
+- A `Retry` blocks the rest of its partition until it succeeds. Handlers whose failures can persist SHOULD bound retries and return `Reject` after a limit (Mini Chat does this for the cleanup, thread-summary, usage and audit queues; section 1.8).
 - The handler MUST NOT interpret delivery as exactly-once.
 
 **Idempotency requirement**:
@@ -224,7 +224,7 @@ The thread-summary lease comes from `claim_timeout_secs` because the handler mak
 - The library has no `max_attempts`. Bounding retries is the handler's job, using the message's `attempts` or its own counter:
   - the thread-summary handler returns `Reject` when the delivery is its `thread_summary_worker.max_attempts`-th, and at once when the summary model is missing from the catalog or disabled (`mini_chat_thread_summary_execution_total{result="model_unavailable"}`);
   - the attachment cleanup handler counts failures in `attachments.cleanup_attempts` and returns `Reject` at `cleanup_worker.max_attempts`; the chat cleanup handler marks such an attachment `failed` and continues, and returns `Reject` for a failing vector-store delete on the delivery that reaches `cleanup_worker.max_attempts` (the message's `attempts`);
-  - the usage and audit handlers retry until the plugin succeeds or reports a permanent error; the audit handler rejects a corrupt payload at once.
+  - the usage and audit handlers return `Reject` when a retry would be the 120th attempt, at once on a permanent plugin error, and at once on a corrupt payload.
 
 ## 4. States (CDSL)
 

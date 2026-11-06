@@ -20,14 +20,14 @@ use sea_orm_migration::MigratorTrait;
 use serde_json::json;
 use time::OffsetDateTime;
 use toolkit_db::migration_runner::run_migrations_for_testing;
-use toolkit_db::outbox::{OutboxHandle, OutboxMessageId};
+use toolkit_db::outbox::{OutboxHandle, Wake};
 use toolkit_db::secure::{DBRunner, SecureEntityExt};
 use toolkit_db::{ConnectOpts, Db, connect_db};
 use toolkit_security::{AccessScope, SecurityContext};
 use uuid::Uuid;
 
 use crate::domain::ports::{Actor, PolicyStore, QuotaStore, StoreError};
-use crate::infra::outbox::{EnqueueError, NotificationEnqueuer, QeOutbox, start_outbox};
+use crate::infra::outbox::{EnqueueError, NotificationOutbox, QeOutbox, start_undelivered_outbox};
 use crate::infra::storage::Migrator;
 
 /// The `llm_gateway` user projection the gear's fixtures use.
@@ -59,7 +59,9 @@ pub async fn test_db() -> Db {
 /// The outbox pipeline on `db` with the notification queue registered, and
 /// a bound handle over it. Stop the handle at the end of the test.
 pub async fn bound_outbox(db: &Db) -> (OutboxHandle, Arc<QeOutbox>) {
-    let handle = start_outbox(db.clone()).await.expect("start outbox");
+    let handle = start_undelivered_outbox(db.clone())
+        .await
+        .expect("start outbox");
     let outbox = Arc::new(QeOutbox::new());
     outbox.bind(Arc::clone(handle.outbox())).expect("bind once");
     (handle, outbox)
@@ -180,12 +182,12 @@ pub async fn count_rows<E: EntityTrait + toolkit_db::secure::ScopableEntity>(db:
 pub struct FailingEnqueuer;
 
 #[async_trait]
-impl NotificationEnqueuer for FailingEnqueuer {
-    async fn enqueue_all(
+impl NotificationOutbox for FailingEnqueuer {
+    async fn enqueue(
         &self,
         _runner: &(dyn DBRunner + Sync),
         _events: &[NotificationEvent],
-    ) -> Result<Vec<OutboxMessageId>, EnqueueError> {
+    ) -> Result<Wake, EnqueueError> {
         Err(EnqueueError::Serialize("injected".to_owned()))
     }
 }
@@ -279,6 +281,61 @@ impl QuotaStore for FakeQuotaStore {
     async fn read_active_quota_counts(&self) -> Result<ActiveQuotaCounts, StoreError> {
         self.check(None)?;
         Ok(ActiveQuotaCounts::default())
+    }
+
+    async fn bulk_create_quotas(
+        &self,
+        actor: &Actor,
+        envelope: &quota_enforcement_sdk::BulkCreateEnvelope,
+    ) -> Result<
+        quota_enforcement_sdk::TransitionOutcome<quota_enforcement_sdk::BulkCreated>,
+        StoreError,
+    > {
+        self.check(Some(actor))?;
+        Ok(quota_enforcement_sdk::TransitionOutcome::Applied(
+            quota_enforcement_sdk::BulkCreated {
+                items: envelope
+                    .items
+                    .iter()
+                    .enumerate()
+                    .map(|(index, item)| quota_enforcement_sdk::BulkCreatedItem {
+                        index,
+                        idempotency_key: item.idempotency_key.clone(),
+                        quota_id: QuotaId::generate(),
+                    })
+                    .collect(),
+            },
+        ))
+    }
+
+    async fn bulk_update_quotas(
+        &self,
+        actor: &Actor,
+        envelope: &quota_enforcement_sdk::BulkUpdateEnvelope,
+    ) -> Result<
+        quota_enforcement_sdk::TransitionOutcome<quota_enforcement_sdk::BulkUpdated>,
+        StoreError,
+    > {
+        self.check(Some(actor))?;
+        let id = envelope
+            .items
+            .first()
+            .map_or_else(QuotaId::generate, |item| item.quota_id);
+        Err(StoreError::QuotaNotFound { id }.at_item(0))
+    }
+
+    async fn bulk_deactivate_quotas(
+        &self,
+        actor: &Actor,
+        _envelope: &quota_enforcement_sdk::BulkDeactivateEnvelope,
+    ) -> Result<
+        quota_enforcement_sdk::TransitionOutcome<quota_enforcement_sdk::BulkDeactivated>,
+        StoreError,
+    > {
+        self.check(Some(actor))?;
+        Ok(quota_enforcement_sdk::TransitionOutcome::Applied(
+            quota_enforcement_sdk::BulkDeactivated { items: Vec::new() },
+        ))
     }
 }
 
@@ -506,6 +563,17 @@ impl crate::domain::ConsumptionStore for FakeConsumptionStore {
         _scope: &AccessScope,
         _applicable: &quota_enforcement_sdk::ApplicableQuotas,
     ) -> Result<Vec<quota_enforcement_sdk::QuotaSnapshot>, StorageError> {
+        Err(unreached())
+    }
+
+    async fn bulk_read_quota_snapshot(
+        &self,
+        _ctx: &SecurityContext,
+        _scope: &AccessScope,
+        _pairs: &[quota_enforcement_sdk::ApplicableQuotas],
+        _page: quota_enforcement_sdk::PageRequest,
+    ) -> Result<quota_enforcement_sdk::PageResult<quota_enforcement_sdk::QuotaSnapshot>, StorageError>
+    {
         Err(unreached())
     }
 

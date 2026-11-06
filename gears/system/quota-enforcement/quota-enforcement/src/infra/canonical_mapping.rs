@@ -44,6 +44,9 @@ pub mod reason {
 impl From<DomainError> for CanonicalError {
     fn from(err: DomainError) -> Self {
         match err {
+            // --- bulk envelopes: the item's own error, pointed at the item ---
+            DomainError::BulkItem { index, cause } => at_item(index, Self::from(*cause)),
+
             // --- quota lifecycle, decided before storage (400 / 501) ---
             DomainError::CapMustBeNonNegative { .. }
             | DomainError::ThresholdsRequireBoundedCap
@@ -66,6 +69,11 @@ impl From<DomainError> for CanonicalError {
             DomainError::InvalidBatchItem { .. }
             | DomainError::BulkTooLarge { .. }
             | DomainError::BatchTimeout => batch(err),
+            DomainError::InvalidSnapshot {
+                index,
+                field,
+                reason,
+            } => snapshot_violation(index, field, reason),
             DomainError::ProjectionNotRegistered { projection } => {
                 QuotaResource::invalid_argument()
                     .with_field_violation(
@@ -251,6 +259,52 @@ impl From<DomainError> for CanonicalError {
 mod canonical_mapping_tests;
 
 /// The lifts of the quota-lifecycle rejections decided before storage.
+/// `err`, the failure of the bulk envelope's item at `index`: its category is
+/// kept, and `items[index]` is prefixed where that category says where it
+/// failed — every field violation's field, every precondition violation's
+/// subject, and the detail. An `Internal` stays opaque.
+fn at_item(index: usize, mut err: CanonicalError) -> CanonicalError {
+    let at = format!("items[{index}]");
+    match &mut err {
+        CanonicalError::InvalidArgument {
+            ctx: toolkit_canonical_errors::InvalidArgument::FieldViolations { field_violations },
+            ..
+        } => {
+            for violation in field_violations {
+                violation.field = format!("{at}.{}", violation.field);
+            }
+        }
+        CanonicalError::FailedPrecondition { ctx, .. } => {
+            for violation in &mut ctx.violations {
+                violation.subject = format!("{at}.{}", violation.subject);
+            }
+        }
+        _ => {}
+    }
+    // An `Internal` stays opaque: it falls to the wildcard.
+    match &mut err {
+        CanonicalError::Cancelled { detail, .. }
+        | CanonicalError::Unknown { detail, .. }
+        | CanonicalError::InvalidArgument { detail, .. }
+        | CanonicalError::DeadlineExceeded { detail, .. }
+        | CanonicalError::NotFound { detail, .. }
+        | CanonicalError::AlreadyExists { detail, .. }
+        | CanonicalError::PermissionDenied { detail, .. }
+        | CanonicalError::ResourceExhausted { detail, .. }
+        | CanonicalError::FailedPrecondition { detail, .. }
+        | CanonicalError::Aborted { detail, .. }
+        | CanonicalError::OutOfRange { detail, .. }
+        | CanonicalError::Unimplemented { detail, .. }
+        | CanonicalError::ServiceUnavailable { detail, .. }
+        | CanonicalError::DataLoss { detail, .. }
+        | CanonicalError::Unauthenticated { detail, .. } => {
+            *detail = format!("{at}: {detail}");
+        }
+        _ => {}
+    }
+    err
+}
+
 /// A Quota or operation `detail` leads with its `UNKNOWN_*` token.
 fn not_found(kind: ResourceKind, id: String) -> CanonicalError {
     let detail = format!("{kind} {id} not found");
@@ -317,6 +371,26 @@ fn quota_lifecycle(err: DomainError) -> CanonicalError {
         .create(),
         other => CanonicalError::from(other),
     }
+}
+
+/// A refused snapshot request, naming the subject when one is at fault. A
+/// snapshot reads Quota records, so the violation is the Quota resource's.
+fn snapshot_violation(
+    index: Option<usize>,
+    field: &'static str,
+    reason: &'static str,
+) -> CanonicalError {
+    let at = index.map_or_else(
+        || field.to_owned(),
+        |index| format!("subjects[{index}].{field}"),
+    );
+    QuotaResource::invalid_argument()
+        .with_field_violation(
+            at.clone(),
+            format!("invalid argument {at}: {reason}"),
+            reason,
+        )
+        .create()
 }
 
 /// The batch debit's envelope rejections and its timeout.

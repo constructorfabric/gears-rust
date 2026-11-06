@@ -13,7 +13,7 @@ use super::{
     dto::PricingPriceBookReadDto,
     support::{
         authz_failure, if_none_match, invalid_because, require_authenticated, revalidate_header,
-        transaction, weak_etag_header,
+        transaction_read, weak_etag_header,
     },
 };
 use crate::{
@@ -308,7 +308,7 @@ async fn list_books(
     let tenant = ctx.subject_tenant_id();
     let backend = state.db.db().backend();
     let today = time::OffsetDateTime::now_utc().date();
-    let mut page = transaction(&state.db.db(), move |tx| {
+    let mut page = transaction_read(&state.db.db(), move |tx| {
         let (scope, filter, odata) = (scope.clone(), filter.clone(), odata.clone());
         Box::pin(
             async move { books::page(tx, &scope, tenant, backend, &filter, &odata, today).await },

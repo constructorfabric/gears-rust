@@ -433,6 +433,46 @@ mod database_merge {
         assert!(matches!(result.unwrap(), DbOptions::Manager(_)));
     }
 
+    /// A unit co-hosting gears gives each one naming a database in the local config
+    /// its own database, not only the unit's gear.
+    #[tokio::test]
+    async fn test_local_db_config_reaches_co_hosted_gears() {
+        let home_dir = tempfile::tempdir().expect("temp dir");
+
+        let mut local_config = minimal_app_config();
+        local_config.database = Some(create_global_db_config());
+        for (gear, file) in [("test_gear", "own.db"), ("co_hosted", "co_hosted.db")] {
+            local_config.gears.insert(
+                gear.to_owned(),
+                json!({ "database": { "server": "sqlite_main", "file": file } }),
+            );
+        }
+        local_config
+            .gears
+            .insert("no_database".to_owned(), json!({ "config": {} }));
+
+        let DbOptions::Manager(manager) =
+            build_merged_db_options(home_dir.path(), "test_gear", None, &local_config)
+                .expect("db options")
+        else {
+            panic!("a database manager");
+        };
+
+        for gear in ["test_gear", "co_hosted"] {
+            assert!(
+                manager.get(gear).await.expect("resolves").is_some(),
+                "{gear} gets its database"
+            );
+        }
+        assert!(
+            manager
+                .get("no_database")
+                .await
+                .expect("resolves")
+                .is_none()
+        );
+    }
+
     #[test]
     fn test_rendered_db_config_local_overrides_pool() {
         // Local config should override pool settings from master
@@ -1140,6 +1180,152 @@ mod auth_disabled {
         assert!(
             serve_auth_disabled(serde_json::json!({ "auth_disabled": true })).await,
             "true"
+        );
+    }
+}
+
+/// The deployment publication job and the `OoP` runtime build the same GTS
+/// manifest from the same local file and rendered master configuration, and
+/// the job opens no database.
+mod publication_config_tests {
+    use crate::bootstrap::config::AppConfig;
+    use crate::bootstrap::oop::{
+        OopRunOptions, build_oop_config_and_db, oop_publication_config_from, parse_rendered_config,
+    };
+    use crate::gts_publication::{
+        DeclarationSource, GtsPublicationBackend, GtsPublicationDescriptor, GtsPublicationInputs,
+    };
+    use serde_json::json;
+
+    fn no_declarations() -> Vec<DeclarationSource> {
+        Vec::new()
+    }
+
+    /// The gear's whole effective config section, as one document.
+    fn config_document(
+        inputs: &GtsPublicationInputs<'_>,
+    ) -> anyhow::Result<Vec<(gts::GtsId, serde_json::Value)>> {
+        let cfg: serde_json::Value = inputs.config_or_default()?;
+        Ok(vec![(
+            gts::GtsId::try_new("gts.cf.test.publication.config.v1~")?,
+            cfg,
+        )])
+    }
+
+    fn unused_backend(_: &crate::ClientHub) -> anyhow::Result<GtsPublicationBackend> {
+        anyhow::bail!("not used")
+    }
+
+    #[allow(
+        clippy::unnecessary_wraps,
+        clippy::needless_pass_by_value,
+        reason = "must match the WireFn signature the gear macro emits"
+    )]
+    fn unused_wire(
+        _: &crate::ClientHub,
+        _: std::sync::Arc<dyn crate::discovery::EndpointResolver>,
+        _: toolkit_contract::wiring::ClientTuning,
+    ) -> anyhow::Result<crate::discovery::WireOutcome> {
+        anyhow::bail!("not used")
+    }
+
+    static DESCRIPTOR: GtsPublicationDescriptor = GtsPublicationDescriptor {
+        gear: "test_gear",
+        publisher_version: "1.0.0",
+        declarations: no_declarations,
+        entities: Some(config_document),
+        backend: unused_backend,
+        provider: "registry",
+        wire: unused_wire,
+    };
+
+    fn db_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut found = Vec::new();
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return found;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                found.extend(db_files(&path));
+            } else if path.extension().is_some_and(|e| e == "db") {
+                found.push(path);
+            }
+        }
+        found
+    }
+
+    fn check(local_gear_section: &str, expected: &serde_json::Value) {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let config_path = dir.path().join("unit.yaml");
+        std::fs::write(
+            &config_path,
+            format!(
+                "server:\n  home_dir: \"{}\"\ngears:\n  test_gear:\n{local_gear_section}",
+                home.display()
+            ),
+        )
+        .unwrap();
+        let rendered = json!({
+            "config": { "vendor": "master", "priority": 3 },
+            "database": {
+                "global": { "servers": { "sqlite": { "engine": "sqlite" } } },
+                "gear": { "server": "sqlite", "file": "unit.db" },
+            },
+        })
+        .to_string();
+        let opts = OopRunOptions {
+            gear_name: "test_gear".to_owned(),
+            config_path: Some(config_path.clone()),
+            ..Default::default()
+        };
+
+        let rendered = parse_rendered_config(Some(&rendered)).unwrap();
+        let deploy = oop_publication_config_from(&opts, rendered.as_ref()).unwrap();
+        assert!(db_files(dir.path()).is_empty(), "the job opens no database");
+
+        let mut local = AppConfig::load_or_default(Some(&config_path)).unwrap();
+        local.apply_cli_overrides(0);
+        let rendered = rendered.unwrap();
+        let (runtime, _, _) =
+            build_oop_config_and_db(&local, "test_gear", Some(&rendered)).unwrap();
+
+        let deploy = DESCRIPTOR.build_gts_manifest(&deploy).unwrap();
+        let runtime = DESCRIPTOR.build_gts_manifest(&runtime).unwrap();
+        assert_eq!(deploy, runtime);
+        assert_eq!(&deploy.documents()[0].1, expected);
+    }
+
+    // `AppConfig::load_or_default` reads the process `APP__` environment, which
+    // the `#[serial]` config tests set.
+    #[test]
+    #[serial_test::serial]
+    fn the_master_config_reaches_the_manifest_when_the_unit_has_none() {
+        check("    {}\n", &json!({ "vendor": "master", "priority": 3 }));
+    }
+
+    // `AppConfig::load_or_default` reads the process `APP__` environment, which
+    // the `#[serial]` config tests set.
+    #[test]
+    #[serial_test::serial]
+    fn a_local_config_section_overrides_the_master_one_in_both_paths() {
+        check(
+            "    config:\n      vendor: \"local\"\n",
+            &json!({ "vendor": "local" }),
+        );
+    }
+
+    /// An absent variable is standalone mode; a present but invalid one fails,
+    /// for the runtime and the deployment job alike (both read it through
+    /// `rendered_config_from_env`).
+    #[test]
+    fn a_present_but_invalid_rendered_config_fails() {
+        assert!(parse_rendered_config(None).unwrap().is_none());
+        let err = parse_rendered_config(Some("{not json")).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("TOOLKIT_MODULE_CONFIG is set but invalid"),
+            "{err:#}"
         );
     }
 }

@@ -24,6 +24,6 @@ pub use append::{AppendRequest, Appended, Dedup, Fence, Flush, Head, KeyedEvent}
 pub use build::{BuildContext, Role};
 pub use error::BackendError;
 pub use ids::{FenceKey, FenceSeq, LogId, Partition, TopicPartition};
-pub use provision::{LogClaim, Provisioning, Replacing, Retention, TopicSpec};
+pub use provision::{LogClaim, Provisioning, Replacing, Retention, Stored, TopicSpec};
 pub use read::Wait;
 pub use watch::{HeadWatch, Watch};

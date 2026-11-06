@@ -45,7 +45,7 @@
 
 ### 1.1 Overview
 
-The event broker offers three producer modes - **chained**, **monotonic**, **stateless** - that trade off strictness of idempotent publishing against per-publish overhead. **Mode is declared once at producer registration** (`POST /v1/producers`) and enforced per request by the broker. Producer-protocol fields (`producer_id`, `previous`, `sequence`) live inside the publish-time `meta` block on the event (marked `writeOnly`, stripped on read); stateless publishes omit `meta` entirely. Chained and monotonic producers maintain ingest-side dedup state in `evbk_producer_state`, keyed by `(producer_id, topic)`. A producer id is not bound to a topic; the partition is the backend's ([feature 0007](0007-storage-backend-api.md)) and is not part of the chain.
+The event broker offers three producer modes - **chained**, **monotonic**, **stateless** - that trade off strictness of idempotent publishing against per-publish overhead. **Mode is declared once at producer registration** (`POST /v1/producers`) and enforced per request by the broker. Producer-protocol fields (`producer_id`, `previous`, `sequence`) live inside the publish-time `meta` block on the event (marked `writeOnly`, stripped on read); stateless publishes omit `meta` entirely. Chained and monotonic producers maintain ingest-side dedup state in `event_broker_producer_sequence`, keyed by `(producer_id, topic)`. A producer id is not bound to a topic; the partition is the backend's ([feature 0007](0007-storage-backend-api.md)) and is not part of the chain.
 
 ### 1.2 Purpose
 
@@ -54,8 +54,8 @@ Idempotent-producer support lets producers retry safely after transport failures
 ### 1.3 Actors
 
 - **Producer SDK** (`cf-gears-event-broker-sdk`): on first publish, calls `POST /v1/producers` to obtain a `producer_id` bound to its principal - one per producer partition for a partitioned producer such as `DbProducer` (see §2.5); populates `meta.producer_id` / `meta.previous` / `meta.sequence` per the registered mode; retries on transient failures.
-- **IngestService** (broker): validates `meta`-shape against the registered mode of `meta.producer_id`; performs chain check; updates `evbk_producer_state` and `evbk_producer.last_seen_at` atomically with the outbox enqueue.
-- **Reaper worker** (broker): purges stale `evbk_producer` rows (per producer-registration TTL, default `P30D`) together with their `evbk_producer_state` rows.
+- **IngestService** (broker): validates `meta`-shape against the registered mode of `meta.producer_id`; performs chain check; updates `event_broker_producer_sequence` and `event_broker_producer.last_seen_at` (not yet implemented, tracked in #5651) atomically with the outbox enqueue.
+- **Reaper worker** (broker): purges stale `event_broker_producer` rows (per producer-registration TTL, default `P30D`) together with their `event_broker_producer_sequence` rows (not yet implemented, tracked in #5651).
 - **Operator**: invokes `POST /v1/producers/{id}:reset` for chain reset on a live `producer_id`; reads `GET /v1/producers/{id}/cursors` for diagnostics.
 
 ### 1.4 References
@@ -65,7 +65,7 @@ Idempotent-producer support lets producers retry safely after transport failures
 - [ADR-0004 Idempotent Producer Protocol](../ADR/0004-idempotent-producer-protocol.md)
 - DESIGN.md §3.1 Domain Model, §3.2 Producer Modes, §3.6 Two Sequences
 - `schemas/gts.cf.core.events.event.v1~.schema.json` — single canonical event schema (publish + read; per-direction semantics via `readOnly` / `writeOnly` markers)
-- `migration.sql` — `evbk_producer`, `evbk_producer_state` DDL
+- `migration.sql` - `event_broker_producer`, `event_broker_producer_sequence` DDL
 - PRD.md FR `cpt-cf-evbk-fr-producer-modes`
 
 ## 2. Choosing a Producer Mode
@@ -94,7 +94,7 @@ Idempotent-producer support lets producers retry safely after transport failures
 
 - One-time `POST /v1/producers { "mode": "monotonic" }` → broker mints `producer_id`.
 - Per publish: `meta = { version, producer_id, sequence }`. The producer assigns `sequence` strictly increasing per `(producer_id, topic)`; gaps are allowed.
-- Broker check: `meta.sequence > evbk_producer_state.last_sequence` → accept and advance; duplicates (`meta.sequence <= last_sequence`) -> `200 OK`, status only.
+- Broker check: `meta.sequence > event_broker_producer_sequence.last_sequence` → accept and advance; duplicates (`meta.sequence <= last_sequence`) -> `200 OK`, status only.
 - **Recovery on error**: `GET /v1/producers/{producer_id}/cursors` → reconcile local view → resume.
 - Cheaper than chained: no `meta.previous` field; broker check is one comparison.
 
@@ -168,7 +168,7 @@ distribute_to_fleet(producer_id)  # write to DB, ConfigMap, env var, secret stor
 
 Both `mode` and `client_agent` are required. `client_agent` is an informational diagnostic hint (RFC 9110 User-Agent grammar; ASCII; 1–256 bytes) — persisted on the producer row, surfaced in logs and metrics, immutable. Validation failure surfaces as the canonical RFC 9457 `400` problem type. The HTTP `User-Agent` request header is captured in access logs independently and is NOT a fallback. See §7 (Hard-Error Catalog).
 
-Re-registration: any subsequent `POST /v1/producers` from the same principal mints a fresh `producer_id` (broker does NOT reuse). Old `producer_id` ages out via the producer-registration TTL Reaper (see §4.7).
+Re-registration: any subsequent `POST /v1/producers` from the same principal mints a fresh `producer_id` (broker does NOT reuse). Old `producer_id` ages out via the producer-registration TTL Reaper (not yet implemented, tracked in #5651; see §4.7).
 
 ### 4.2 Chained Mode Publish
 
@@ -203,25 +203,25 @@ async def chained_ack_poll(producer_id):
 # head after this attempt read it) rolls back and runs again (bounded).
 loop:
     BEGIN:
-        row = SELECT evbk_producer_state WHERE (producer_id, topic) = (meta.producer_id, topic)
+        row = SELECT event_broker_producer_sequence WHERE (producer_id, topic) = (meta.producer_id, topic)
 
         if row is None:
             # First accepted publish for this chain: takes its numbers, seeds last_sequence.
             outbox.enqueue(event)
-            INSERT evbk_producer_state(producer_id, topic, last_sequence=meta.sequence)
+            INSERT event_broker_producer_sequence(producer_id, topic, last_sequence=meta.sequence)
               # a concurrent first insert wins on the primary key -> ROLLBACK, retry
-            UPDATE evbk_producer SET last_seen_at=now() WHERE producer_id=meta.producer_id
+            UPDATE event_broker_producer SET last_seen_at=now() WHERE id=meta.producer_id  # not yet implemented, tracked in #5651
             COMMIT
             return 202_Accepted
 
         last = row.last_sequence
         if meta.previous == last and meta.sequence > last:
             outbox.enqueue(event)
-            UPDATE evbk_producer_state SET last_sequence=meta.sequence
+            UPDATE event_broker_producer_sequence SET last_sequence=meta.sequence
              WHERE (producer_id, topic) = (meta.producer_id, topic)
                AND last_sequence = last
               # 0 rows changed -> ROLLBACK (the outbox row with it), retry
-            UPDATE evbk_producer SET last_seen_at=now() WHERE producer_id=meta.producer_id
+            UPDATE event_broker_producer SET last_seen_at=now() WHERE id=meta.producer_id  # not yet implemented, tracked in #5651
             COMMIT
             return 202_Accepted
         elif meta.sequence == last:
@@ -259,17 +259,17 @@ def publish_monotonic(event_data, next_sequence):
         raise PublishError(...)            # caller decides retry policy
 
 # Broker side
-row = state["evbk_producer_state"].get((meta.producer_id, topic))
+row = state["event_broker_producer_sequence"].get((meta.producer_id, topic))
 
 if row is None or meta.sequence > row.last_sequence:   # first accepted publish takes its numbers
     BEGIN:
         outbox.enqueue(event)
-        UPSERT evbk_producer_state(producer_id, topic, last_sequence=meta.sequence)
-        UPDATE evbk_producer SET last_seen_at=now() WHERE producer_id=meta.producer_id
+        UPSERT event_broker_producer_sequence(producer_id, topic, last_sequence=meta.sequence)
+        UPDATE event_broker_producer SET last_seen_at=now() WHERE id=meta.producer_id  # not yet implemented, tracked in #5651
     COMMIT
     return 202_Accepted
 else:
-    touch evbk_producer.last_seen_at              # a duplicate also counts as activity
+    touch event_broker_producer.last_seen_at      # a duplicate also counts as activity; not yet implemented, tracked in #5651
     return 200_OK                                 # duplicate; status only
 ```
 
@@ -305,7 +305,7 @@ async def desync_recover(producer_id):
     resp = await http.GET(f"/v1/producers/{producer_id}/cursors")
     # 200 OK: {producer_id, client_agent, topics: [{topic, last_sequence}]}
     # 403 ProducerPrincipalMismatch — calling with a non-owning principal
-    # 404 ProducerNotFound — producer aged out by TTL or never existed
+    # 404 ProducerNotFound - producer aged out by TTL (not yet implemented, tracked in #5651) or never existed
 
     for t in resp["topics"]:
         local_state[t["topic"]] = t["last_sequence"]
@@ -315,7 +315,7 @@ async def desync_recover(producer_id):
 **Edge case: producer-ahead-of-broker.** If the producer's locally-tracked `last_sequence` is HIGHER than the broker's known `last_sequence` (e.g., broker DB restored from older backup, or a `:reset` the producer did not observe):
 
 - The producer SHOULD log an operator-facing warning. The local view is more advanced than the broker's; either the broker lost state or the producer has stale-but-untrusted local state.
-- **Default**: register a fresh `producer_id` and start a new chain. The old `producer_id` ages out per TTL.
+- **Default**: register a fresh `producer_id` and start a new chain. The old `producer_id` ages out per TTL (not yet implemented, tracked in #5651).
 - **Alternative**: if the operator confirms the broker's view is authoritative (e.g., disaster-recovery scenario where the older backup is the intended state), rewind the producer's local cursor to the broker's view. Chain continuity is broken; reset semantics apply.
 
 ### 4.6 Chain Reset (Operator-Driven)
@@ -326,7 +326,7 @@ Scenario: producer's fleet is alive and well, but the chain state needs to be cl
 # Operator (or owner-principal automation)
 resp = http.POST(f"/v1/producers/{producer_id}:reset",
                  json={"topic": T})  # body optional; absent = reset all topics of the producer
-# 200 OK with audit-record reference
+# 200 OK, no body
 # 403 ProducerPrincipalMismatch - non-owning principal
 # 404 ProducerNotFound
 
@@ -335,22 +335,24 @@ resp = http.POST(f"/v1/producers/{producer_id}:reset",
 #   meta = { version: 1, producer_id: P, previous: 0, sequence: 1 }
 ```
 
-Audit record fields: `producer_id`, `requested_scope` (full or `topic`), `operator_principal`, `timestamp`, `outcome`.
+Audit record: a successful reset emits one `kind = "producer.chain_reset"` record on the `event_broker.events` tracing target, with `actor_subject_id`, `actor_subject_type`, `actor_tenant_id`, `producer_id`, `scope` (`all` or `topic`) and `topic` (the topic id, or `*` for all). A failed reset emits none.
 
 ### 4.7 Producer Registration TTL (Natural Reset)
 
-Producer rows track `evbk_producer.last_seen_at`, updated with every publish of the producer id, on any topic. The Reaper purges rows older than the platform-wide producer-registration TTL (default `P30D`).
+Not yet implemented; tracked in #5651.
+
+Producer rows track `event_broker_producer.last_seen_at`, updated with every publish of the producer id, on any topic. The Reaper purges rows older than the platform-wide producer-registration TTL (default `P30D`).
 
 ```python
 # Reaper sweep (broker-internal)
 async def reap_idle_producers():
     cutoff = now() - PRODUCER_TTL
-    for row in evbk_producer.find(last_seen_at__lt=cutoff):
+    for row in event_broker_producer.find(last_seen_at__lt=cutoff):
         BEGIN:
-            DELETE FROM evbk_producer_state WHERE producer_id = row.producer_id
-            DELETE FROM evbk_producer       WHERE producer_id = row.producer_id
+            DELETE FROM event_broker_producer_sequence WHERE producer_id = row.id
+            DELETE FROM event_broker_producer          WHERE id = row.id
         COMMIT
-        log("reaped idle producer", producer_id=row.producer_id, last_seen_at=row.last_seen_at)
+        log("reaped idle producer", producer_id=row.id, last_seen_at=row.last_seen_at)
 
 # Producer-side: next publish after age-out
 resp = http.POST("/v1/events", json={..., "meta": {"producer_id": P, ...}})
@@ -369,7 +371,7 @@ The "exactly-once via idempotent producer" property is derived from a chain of g
 1. **Producer business transaction → toolkit-db outbox**: the producer's business code writes both its domain state and the outbox row in one transaction. If the business txn rolls back, the outbox row is never persisted.
 2. **toolkit-db outbox → SDK publish call**: the outbox pipeline reads pending rows in order and calls the SDK `publish` function. Network failures cause the SDK to retry the same outbox row.
 3. **SDK publish call → broker ingest**: the SDK serializes the event with `meta.{producer_id, previous, sequence}` and POSTs to `/v1/events`. On any non-2xx, the SDK does not advance its outbox cursor.
-4. **Broker ingest dedup → atomic enqueue + state update**: the broker checks the chain; if accepted, the ingest outbox enqueue, the `evbk_producer_state.last_sequence` advance, and the `evbk_producer.last_seen_at` touch happen in **one transaction**.
+4. **Broker ingest dedup → atomic enqueue + state update**: the broker checks the chain; if accepted, the ingest outbox enqueue, the `event_broker_producer_sequence.last_sequence` advance, and the `event_broker_producer.last_seen_at` touch (not yet implemented, tracked in #5651) happen in **one transaction**.
 5. **Ingest outbox -> storage backend**: every `append` carries a `Fence` - an opaque key ingest builds from the outbox identity and ingest partition, plus the message seq - and the backend stores each fence once ([feature 0007](0007-storage-backend-api.md) §2.2). A backend that declares `Dedup::AtLeastOnce` breaks this link: on it, exactly-once becomes at-least-once.
 
 Failure modes and recovery:
@@ -387,7 +389,7 @@ The producer outbox considers an event "delivered" when the broker returns `201 
 
 ### 5.2 Batch Publish
 
-`POST /v1/events:batch` carries events of any producer ids and topics, and stateless events, in one request. Each event's `meta` passes mode-shape enforcement on its own; the broker then splits the chained and monotonic events into runs, one per `(producer_id, topic)`, each keeping request order. Stateless events belong to no run; a single-event publish is a run of one.
+`POST /v1/events:batch` targets one topic and carries events of any producer ids, and stateless events, in one request; a batch whose events resolve to more than one topic is rejected with `400 MixedTopics`. Each event's `meta` passes mode-shape enforcement on its own; the broker then splits the chained and monotonic events into runs, one per `(producer_id, topic)`, each keeping request order. Stateless events belong to no run; a single-event publish is a run of one.
 
 ```python
 # Broker side - one batch, all-or-nothing
@@ -401,31 +403,31 @@ for run in runs:                # R3: in-run shape, before any chain state is re
         return 400_BadRequest("malformed_run", index=i)
 enqueue = [e for e in batch if e.meta is None]                     # stateless
 for (pid, topic), run in runs.items():
-    last = state["evbk_producer_state"].get((pid, topic))         # None -> first event takes its numbers
+    last = state["event_broker_producer_sequence"].get((pid, topic)) # None -> first event takes its numbers
     fresh = new_events(run, last, mode_of(pid))                    # R4 / R5; None = violation
     if fresh is None:
         return 412_SequenceViolation(index=run[0].index, producer_id=pid,
                                      topic=topic, last_sequence=last)   # nothing enqueued
     enqueue += fresh            # duplicates skipped
 if not enqueue:
-    touch evbk_producer.last_seen_at
+    touch event_broker_producer.last_seen_at       # not yet implemented, tracked in #5651
     return 200_OK               # every event a duplicate; status only
-BEGIN: enqueue all, advance each run's row, touch evbk_producer.last_seen_at; COMMIT
+BEGIN: enqueue all, advance each run's row, touch event_broker_producer.last_seen_at (not yet implemented, tracked in #5651); COMMIT
 return 202_Accepted             # or 201 / 202 under Prefer: wait=N
 ```
 
 Rules:
 
 - **R1** - empty batch -> `400 empty_batch`.
-- **R3** - in-run shape, checked first: in a chained run every event has `sequence > previous`, and every event after the first has `previous` equal to the prior event's `sequence`; a monotonic run's sequences strictly increase. Violation -> `400 malformed_run { index }`.
+- **R3** - in-run shape, checked first: in a chained run every event has `sequence > previous`, and every event after the first has `previous` equal to the prior event's `sequence`; a monotonic run's sequences strictly increase. Violation -> `400 malformed_run`, naming the event at `events[<index>].meta`.
 - **R4 (chained run vs `last`)** - advances if the first event's `previous == last`; the whole run is a duplicate if its last event's `sequence == last`; if an event `e[k]` has `sequence == last`, events through `e[k]` are a duplicate prefix and the rest advances; anything else -> `412`.
 - **R5 (monotonic run vs `last`)** - the leading events with `sequence <= last` are a duplicate prefix; the rest exceeds `last` and advances.
-- **R13** - an `event.id` repeated within the batch -> `400 duplicate_event_id { index }`.
-- **Outcome** - the first violation rejects the whole batch with `412 { index, producer_id, topic, last_sequence }`; nothing is enqueued. Duplicates are skipped and the rest is enqueued; a batch of only duplicates is answered `200 OK`. Runs are checked independently, and the batch promises no order between runs beyond per-key order (ADR-0002).
+- **R13** - an `event.id` repeated within the batch -> `400 duplicate_event_id`, naming the event at `events[<index>].id`.
+- **Outcome** - the first violation rejects the whole batch with `412`, the canonical error of DESIGN.md §3.3 "Error Response Format": its `sequence_mismatch` violation's `description` names `index`, `producer_id`, `topic` and `last_sequence` as `key=value` text, not as structured fields; nothing is enqueued. Duplicates are skipped and the rest is enqueued; a batch of only duplicates is answered `200 OK`. Runs are checked independently, and the batch promises no order between runs beyond per-key order (ADR-0002).
 
 ## 6. States
 
-`evbk_producer[producer_id]`:
+`event_broker_producer[producer_id]` (not yet implemented, tracked in #5651):
 
 | State | Meaning |
 |---|---|
@@ -433,16 +435,16 @@ Rules:
 | Idle | `last_seen_at` approaching but not past the TTL window |
 | Reaped | Row deleted by the Reaper; `producer_id` returns `404 ProducerNotFound` (naming the producer) on subsequent publish |
 
-`evbk_producer_state[(producer_id, topic)]`:
+`event_broker_producer_sequence[(producer_id, topic)]`:
 
 | State | Meaning |
 |---|---|
 | Absent | No event has been accepted for this pair yet, or `:reset` cleared the row. The next accepted publish creates the row and takes its numbers |
-| Present | Row exists with `last_sequence = N`. Next chained event advances with `meta.previous = N` and `meta.sequence > N`, or is a duplicate with `meta.sequence = N`; next monotonic event advances with `meta.sequence > N`. The row lives as long as its `evbk_producer` row and is reaped with it |
+| Present | Row exists with `last_sequence = N`. Next chained event advances with `meta.previous = N` and `meta.sequence > N`, or is a duplicate with `meta.sequence = N`; next monotonic event advances with `meta.sequence > N`. The row lives as long as its `event_broker_producer` row and is reaped with it (not yet implemented, tracked in #5651) |
 
 ## 7. Hard-Error Catalog
 
-Every publish-path error names the targeted stream as its resource: `context.resource_type = "gts.cf.core.events.topic.v1~"`, `context.resource_name` = the resolved topic id. The specific fault lives in the `field_violations` / `violations` entry; error bodies never echo submitted values. See DESIGN.md §3.3 "Error Response Format" for the canonical category / `context` shape of each row.
+A publish-path error about the stream names the targeted stream as its resource: `context.resource_type = "gts.cf.core.events.topic.v1~"`, `context.resource_name` = the resolved topic id. A request-level `400` (the batch shape: `empty_batch`, `duplicate_event_id`, `malformed_run`) names the request instead: `context.resource_type = "gts.cf.core.events.request.v1~"`. The specific fault lives in the `field_violations` / `violations` entry. Error bodies never echo submitted content - payloads or field values; identifiers the broker issued (a `producer_id`, a resolved topic id) and request positions (an event `index`) may appear. See DESIGN.md §3.3 "Error Response Format" for the canonical category / `context` shape of each row.
 
 | HTTP | Code | When |
 |---|---|---|
@@ -451,17 +453,18 @@ Every publish-path error names the targeted stream as its resource: `context.res
 | 400 | `ChainModeFieldsMissing` | Chained-mode publish missing `meta.previous` or `meta.sequence` |
 | 400 | `MonotonicModeFieldsViolation` | Monotonic-mode publish with forbidden `meta.previous` or missing `meta.sequence` |
 | 400 | `MetaWithoutProducerId` | `meta` has `previous` / `sequence` but no `producer_id` |
-| 404 | `ProducerNotFound` | `meta.producer_id` not in registry (or aged out by TTL); names the producer resource, not the topic |
+| 404 | `ProducerNotFound` | `meta.producer_id` not in registry (or aged out by TTL, not yet implemented, tracked in #5651); names the producer resource, not the topic |
 | 400 | `UnknownMetaVersion` | `meta.version > current_supported` |
 | 400 | `InvalidEventFieldEncoding` | Non-ASCII bytes in any event field |
 | 400 | `EventFieldTooLong` | Event string field exceeds length cap |
 | 400 | `BadRequest` (`empty_batch`) | `POST /v1/events:batch` with no events (§5.2 R1) |
-| 400 | `BadRequest` (`malformed_run`) | A batch run's events do not link (chained) or strictly increase (monotonic); names the event `index` (§5.2 R3) |
-| 400 | `BadRequest` (`duplicate_event_id`) | An `event.id` repeated within one batch; names the event `index` (§5.2 R13) |
+| 400 | `BadRequest` (`malformed_run`) | A batch run's events do not link (chained) or strictly increase (monotonic); names the event at `events[<index>].meta` (§5.2 R3) |
+| 400 | `BadRequest` (`duplicate_event_id`) | An `event.id` repeated within one batch; names the event at `events[<index>].id` (§5.2 R13) |
+| 400 | `MixedTopics` | `POST /v1/events:batch` whose event types resolve to more than one topic (§5.2) |
 | 403 | `ProducerPrincipalMismatch` | Cross-principal use of `producer_id` (publish / cursor read / reset) |
 | 403 | `TenantIdNotAuthorized` | Platform authz resolver denied the supplied `tenant_id` |
 | 404 | `ProducerNotFound` | `GET /v1/producers/{id}/cursors` or `POST :reset` for an unknown `producer_id` |
-| 412 | `SequenceViolation` | Chained mode: a run neither advances nor duplicates the chain head (a stale/behind sequence or a broken link); the `sequence_mismatch` violation carries `{index, producer_id, topic, last_sequence}` (the broker's known `last_sequence`) |
+| 412 | `SequenceViolation` | Chained mode: a run neither advances nor duplicates the chain head (a stale/behind sequence or a broken link); the `sequence_mismatch` violation's `description` names `index`, `producer_id`, `topic` and `last_sequence` as `key=value` text (`last_sequence` is the broker's known head) |
 | 422 | `SchemaViolation` | Event `data` does not satisfy the event type's `data_schema`; `(payload)`/`schema_validation` field violation |
 
 ## 8. Definitions of Done
@@ -470,60 +473,60 @@ Every publish-path error names the targeted stream as its resource: `context.res
 
 - [ ] `p1` - **ID**: `cpt-cf-evbk-dod-idempotent-producers`
 
-- `evbk_producer` and `evbk_producer_state` tables created per `migration.sql`.
-- `POST /v1/producers` mints `producer_id`, stores `mode` + `owner_principal` + `last_seen_at`.
+- `event_broker_producer` and `event_broker_producer_sequence` tables created per `migration.sql`.
+- `POST /v1/producers` mints `producer_id`, stores `mode` + `owner_id` + `last_seen_at` (not yet implemented, tracked in #5651).
 - `POST /v1/events` and `POST /v1/events:batch` enforce mode-shape rules per the registered mode; reject mode mismatches with the documented `400` codes; reject chain mismatches with `412 SequenceViolation`.
 - `GET /v1/producers/{producer_id}/cursors` returns per-topic `last_sequence` (`{producer_id, client_agent, topics: [{topic, last_sequence}]}`); principal-bound.
 - `POST /v1/producers/{producer_id}:reset` clears state rows (full, or one topic with `{ "topic": "..." }`); emits audit record; principal-bound.
 - `POST /v1/events:batch` applies the run rules of §5.2, all-or-nothing.
 - `Prefer: wait=N` answers `201` / `202` / `200` per §5.1.
-- Reaper deletes stale `evbk_producer` rows (per platform-wide producer-registration TTL) together with their state rows.
-- Ingest performs the outbox-enqueue + state-update + `evbk_producer.last_seen_at` touch in one transaction.
+- Reaper deletes stale `event_broker_producer` rows (per platform-wide producer-registration TTL) together with their state rows (not yet implemented, tracked in #5651).
+- Ingest performs the outbox-enqueue + state-update + `event_broker_producer.last_seen_at` touch (not yet implemented, tracked in #5651) in one transaction.
 - Producer SDK declares mode at startup, registers one producer id per producer partition, sends `meta` per the registered mode.
 - Metrics: `evbk_producer_sequence_violation_total`, `evbk_producer_duplicate_total`, `evbk_producer_state_rows`, `evbk_producer_rows`, `evbk_producer_reaper_deleted_total`.
 
 ## 9. Acceptance Criteria
 
-- **AC-1**: A chained producer publishes `(previous=0, sequence=1)` then `(previous=1, sequence=2)`; both land; `evbk_producer_state.last_sequence = 2`.
+- **AC-1**: A chained producer publishes `(previous=0, sequence=1)` then `(previous=1, sequence=2)`; both land; `event_broker_producer_sequence.last_sequence = 2`.
 - **AC-2**: A chained producer re-publishes `(previous=1, sequence=2)` (its current head) after a transport timeout; broker returns `200 OK` with no body; no duplicate in the log.
 - **AC-3**: A chained producer publishes `(previous=5, sequence=6)` when `last_sequence = 4`; broker returns `412 SequenceViolation` carrying `last_sequence=4`; no row mutation.
 - **AC-4**: A monotonic producer publishes `sequence=10` then `sequence=20`; both land; `last_sequence = 20`.
-- **AC-5**: A stateless producer publishes 1000 events with no `meta`; all 1000 are persisted distinctly; `evbk_producer_state` has no rows for the principal.
+- **AC-5**: A stateless producer publishes 1000 events with no `meta`; all 1000 are persisted distinctly; `event_broker_producer_sequence` has no rows for the principal.
 - **AC-6**: One producer id publishes to topics A and B; their chains advance independently, and `GET /cursors` lists both; while the producer keeps publishing to A, B's state row is kept however long B stays quiet.
-- **AC-7**: A producer remains idle past the producer-registration TTL; Reaper deletes `evbk_producer`; the next publish from the producer's fleet using the old `meta.producer_id` returns `404 ProducerNotFound`.
+- **AC-7**: A producer remains idle past the producer-registration TTL; Reaper deletes `event_broker_producer`; the next publish from the producer's fleet using the old `meta.producer_id` returns `404 ProducerNotFound` (not yet implemented, tracked in #5651).
 - **AC-8**: Operator calls `POST /v1/producers/{id}:reset` (full scope); state rows deleted; audit record created; next chained publish with `meta.previous=0` accepted.
 - **AC-9**: Operator calls `POST /v1/producers/{id}:reset { "topic": T }`; only the `(producer_id, T)` state row is deleted; the producer's other topic rows untouched.
 - **AC-10**: Principal A registers a producer; principal B publishes with A's `meta.producer_id` → `403 ProducerPrincipalMismatch`.
 - **AC-11**: Producer publishes with `meta.version` greater than broker's supported → `400 UnknownMetaVersion`.
 - **AC-12**: Producer publishes with `meta` containing `sequence` but no `producer_id` → `400 MetaWithoutProducerId`.
-- **AC-13**: A batch carries a chained run for `(P, A)` that advances and a chained run for `(P, B)` whose first `previous` does not match B's `last_sequence = 7`; broker returns `412 { index, producer_id: P, topic: B, last_sequence: 7 }` with `index` of the B run's first event; nothing from the batch is enqueued.
+- **AC-13**: A batch on topic A carries a chained run for `(P, A)` that advances and a chained run for `(Q, A)` whose first `previous` does not match Q's `last_sequence = 7`; broker returns the canonical `412` (DESIGN.md §3.3 "Error Response Format") whose `sequence_mismatch` violation's `description` names `index` (the Q run's first event), `producer_id=Q`, `topic=A` and `last_sequence=7` as `key=value` text; nothing from the batch is enqueued.
 - **AC-14**: A chained producer at `last_sequence = 10` resends the batch `[9->10, 10->11, 11->12]`; the first event is a duplicate prefix, the rest advances; `last_sequence = 12`.
-- **AC-15**: A batch in which every event is a duplicate is answered `200 OK`; a batch with no events is answered `400 empty_batch`; a batch repeating an `event.id` is answered `400 duplicate_event_id` naming the repeat's index.
+- **AC-15**: A batch in which every event is a duplicate is answered `200 OK`; a batch with no events is answered `400 empty_batch`; a batch repeating an `event.id` is answered `400 duplicate_event_id` naming the repeat at `events[<index>].id`.
 - **AC-16**: A publish with `Prefer: wait=5` is answered `201 Created` once the backend stores its events, or `202 Accepted` if 5 seconds pass first.
 
 ## 10. Unit Test Plan
 
 - **Mode-shape matrix**: chained / monotonic / stateless × valid / missing-required / forbidden-present / wrong-mode-for-registered-id → each cell produces the documented outcome.
-- **Chain check**: parameterize over (`evbk_producer_state` row state × incoming `meta.previous` × incoming `meta.sequence`) → expected (accept / duplicate / chain-broken, row delta); an absent row accepts any first numbers; an advance across a gap is accepted.
-- **Batch runs**: batches mixing producer ids, topics and stateless events → split into runs per `(producer_id, topic)` in request order; each of R1, R3, R4, R5, R13 produces its documented outcome; a violation leaves nothing enqueued.
+- **Chain check**: parameterize over (`event_broker_producer_sequence` row state × incoming `meta.previous` × incoming `meta.sequence`) → expected (accept / duplicate / chain-broken, row delta); an absent row accepts any first numbers; an advance across a gap is accepted.
+- **Batch runs**: batches of one topic mixing producer ids and stateless events → split into runs per `(producer_id, topic)` in request order; each of R1, R3, R4, R5, R13 produces its documented outcome; a violation leaves nothing enqueued.
 - **Monotonic gap acceptance**: `last_sequence = 10`, incoming `sequence = 15` → accepted; rows `11–14` are never delivered.
-- **Stateless skip**: event with no `meta` → broker does not touch `evbk_producer_state`.
-- **Atomicity**: simulated ingest crash between outbox enqueue and `evbk_producer_state` update → no half-state after recovery.
+- **Stateless skip**: event with no `meta` → broker does not touch `event_broker_producer_sequence`.
+- **Atomicity**: simulated ingest crash between outbox enqueue and `event_broker_producer_sequence` update → no half-state after recovery.
 - **Principal binding**: cross-principal publish / cursor read / reset → `403 ProducerPrincipalMismatch`.
-- **TTL Reaper**: producer-row TTL elapses → row deleted on next sweep; cascade purge of orphaned state rows.
+- **TTL Reaper**: producer-row TTL elapses → row deleted on next sweep; cascade purge of orphaned state rows (not yet implemented, tracked in #5651).
 - **`meta.version` accept / reject**: `version <= supported` accepted; `version > supported` → `400 UnknownMetaVersion`.
 - **Event field encoding**: non-ASCII bytes in any event field → `400 InvalidEventFieldEncoding`.
 - **Reset audit**: every successful reset emits an audit record.
 
 ## 11. E2E Test Plan
 
-- **E1 — Chained happy path**: producer fleet registers; publishes a chain of 100 events; consumer receives all in order; `last_sequence = 100`; producer-row `last_seen_at` advances.
+- **E1 - Chained happy path**: producer fleet registers; publishes a chain of 100 events; consumer receives all in order; `last_sequence = 100`; producer-row `last_seen_at` advances (not yet implemented, tracked in #5651).
 - **E2 — Retry after timeout**: producer publishes event N; simulated transport timeout; producer retries; consumer sees event N exactly once; broker returns `200 OK` on the retry.
 - **E3 — Chain break recovery**: producer publishes `(previous=0, sequence=1)`, then `(previous=99, sequence=100)` → `412 SequenceViolation` carrying `last_sequence=1`; producer calls `GET /cursors`, observes `last_sequence=1`, corrects to `(previous=1, sequence=2)`, retries → accepted.
 - **E4 — Monotonic recovery**: monotonic producer's local DB is restored to a prior backup; producer calls `GET /cursors`, sees `last_sequence=N` higher than its local view; operator confirms broker is authoritative; producer rewinds local cursor to `N+1` and resumes.
 - **E5 — Async windowed publish (chained)**: producer fires 1000 events into an async / lossy channel; ack-poll loop calls `GET /cursors` every 5s; on detecting stalled cursor, re-publishes from stall point; eventually all 1000 land; `last_sequence = 1000`.
 - **E6 - Multi-topic producer id**: one chained producer id publishes chains to two topics; each topic's chain advances independently; `GET /cursors` returns both topics; a `412` on one topic leaves the other unaffected.
-- **E7 — Producer-registration Reaper (TTL)**: configure producer-registration TTL = `PT10S`; chained producer publishes one event; waits 15s; next publish with same `meta.producer_id` -> `404 ProducerNotFound`; producer re-registers, distributes new id, resumes.
+- **E7 - Producer-registration Reaper (TTL)**: configure producer-registration TTL = `PT10S`; chained producer publishes one event; waits 15s; next publish with same `meta.producer_id` -> `404 ProducerNotFound`; producer re-registers, distributes new id, resumes (not yet implemented, tracked in #5651).
 - **E8 — Operator reset (full)**: operator calls `POST /v1/producers/{id}:reset`; verifies all state rows gone; producer's next chained publish with `meta.previous=0` is accepted; audit record present.
 - **E9 - Operator reset (scoped)**: operator calls reset with `{topic}`; only that topic's row deleted; chains on the producer's other topics continue normally.
 - **E10 — Cross-principal rejection**: principal B attempts publish / cursor read / reset on principal A's `producer_id` → `403 ProducerPrincipalMismatch` for all three.
@@ -544,7 +547,7 @@ Every publish-path error names the targeted stream as its resource: `context.res
   - §3.1 Domain Model
   - §3.2 Producer Modes (shrunk to summary + link to this feature doc)
   - §3.6 Two Sequences
-  - §3.7 Database schemas — `evbk_producer`, `evbk_producer_state` rows
+  - §3.7 Database schemas - `event_broker_producer`, `event_broker_producer_sequence` rows
 - **Schemas**:
   - [`schemas/gts.cf.core.events.event.v1~.schema.json`](../schemas/gts.cf.core.events.event.v1~.schema.json) — publish input
   - [`schemas/gts.cf.core.events.event.v1~.schema.json`](../schemas/gts.cf.core.events.event.v1~.schema.json) — single canonical event schema; read responses surface `readOnly` `partition`/`sequence`/`sequence_time` and strip `writeOnly` `meta`

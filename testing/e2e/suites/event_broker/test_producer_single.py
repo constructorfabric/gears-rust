@@ -71,7 +71,7 @@ async def test_schema_validation_failure_returns_422(api):
     EVENT_TYPE_STRICT is registered with a data schema that requires
     ``strict_field`` (string).  Publishing without it fails validation: the
     body parsed, its ``data`` does not satisfy the type's schema, so the
-    answer is 422 ``PayloadValidationFailed`` (``docs/openapi.yaml``).
+    answer is 422 ``SchemaViolation`` (``docs/openapi.yaml``).
     """
     tenant_id = str(uuid.uuid4())
     async with api() as client:

@@ -18,7 +18,7 @@ use toolkit_security::AccessScope;
 
 use super::SqlQuotaStore;
 use crate::domain::ports::{QuotaStore, StoreError};
-use crate::infra::outbox::NotificationEnqueuer;
+use crate::infra::outbox::NotificationOutbox;
 use crate::infra::storage::entity::{operation_log, quota, quota_allocation_counter};
 use crate::infra::storage::repo::operation_log_repo::{
     self, OP_QUOTA_CREATE, OP_QUOTA_DEACTIVATE, OP_QUOTA_UPDATE,
@@ -719,7 +719,7 @@ async fn a_failing_or_unbound_enqueue_rolls_back_every_row() {
         .expect_err("enqueue fails");
     assert!(matches!(err, StoreError::Corrupt { .. }), "{err:?}");
 
-    let unbound: Arc<dyn NotificationEnqueuer> = Arc::new(crate::infra::outbox::QeOutbox::new());
+    let unbound: Arc<dyn NotificationOutbox> = Arc::new(crate::infra::outbox::QeOutbox::new());
     let store = SqlQuotaStore::new(db.clone(), unbound);
     let err = store
         .create_quota(

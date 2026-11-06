@@ -53,7 +53,7 @@ const EXPECTED_DRAFT_REVISION: &str = "expected_draft_revision";
 const TAG: &str = "Orders";
 /// 412 for every existing-order write: a stale `If-Match` is settled and audited, kept apart from
 /// the 409 draft-revision conflict.
-const STALE_IF_MATCH: &str =
+pub(super) const STALE_IF_MATCH: &str =
     "PRECONDITION_FAILED: If-Match is not the current version (names current_version)";
 
 fn invalid() -> OrdersError {
@@ -221,8 +221,9 @@ pub fn patch_line_body(body: &[u8]) -> Result<(Option<DraftRevision>, LinePatch)
     ))
 }
 
-/// Existing-order write metadata: version, key, proof, then the body's draft revision.
-fn write_meta(headers: &HeaderMap) -> Result<CallMeta, OrdersError> {
+/// Existing-order write metadata: version, key, proof, then the body's draft revision. Shared
+/// with the development-delivery submit route ([`super::gate::submit_router`]).
+pub(super) fn write_meta(headers: &HeaderMap) -> Result<CallMeta, OrdersError> {
     let expected_version = expected_version(headers)?;
     let idempotency_key = idempotency_key(headers)?;
     let delegation_proof_ref = super::delegation_proof(headers)?;
@@ -236,11 +237,14 @@ fn write_meta(headers: &HeaderMap) -> Result<CallMeta, OrdersError> {
 
 /// The stored response exactly as stored; a replay additionally carries
 /// `Idempotency-Replayed: true` (DNA REST §8), a settled refusal included (ADR-0005, D-212).
-fn render(settled: Settled) -> Response {
+pub(super) fn render(settled: Settled) -> Response {
     let Settled {
         response, replayed, ..
     } = settled;
-    let (status, body, stored_headers) = response.into_parts();
+    let (status, mut body, stored_headers) = response.into_parts();
+    // JSONB storage may reorder object keys, and host feature unification may enable
+    // serde_json/preserve_order. Normalize recursively so first and replay bytes agree.
+    body.sort_all_objects();
     let status = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
     let problem = !status.is_success();
     let mut out = (status, axum::Json(body)).into_response();
@@ -395,17 +399,17 @@ async fn remove_line(
     Ok(render(settled))
 }
 
-fn if_match() -> ParamSpec {
+pub(super) fn if_match() -> ParamSpec {
     ParamSpec::header("If-Match")
         .required(true)
         .description("Strong commercial-version ETag \"N\"; absent or malformed is 428")
 }
-fn key_param() -> ParamSpec {
+pub(super) fn key_param() -> ParamSpec {
     ParamSpec::header("Idempotency-Key")
         .required(true)
         .description("1-255 printable ASCII bytes, preserved exactly; same key replays the outcome")
 }
-fn etag() -> ResponseHeaderSpec {
+pub(super) fn etag() -> ResponseHeaderSpec {
     ResponseHeaderSpec::new(
         "ETag",
         "The current commercial version to send back as If-Match",

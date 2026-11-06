@@ -2,7 +2,9 @@
 -- `m20261012_000001_create_registry_state`. `oagw_plugin` is not created yet.
 --
 -- Query frequency:
---  * per request — every proxied request (3 SELECTs; config is not cached)
+--  * per miss    — a proxied request that misses the proxy configuration cache
+--                  (ADR-0020): 1 SELECT per section that missed, none on a hit
+--  * per request — every proxied request with the cache off (3 SELECTs)
 --  * per call    — Management API / SDK CRUD
 --  * per check   — registry reconcile gate, every pod once per re-check interval
 --  * per run     — registry reconcile, only when the registry content changed
@@ -38,8 +40,8 @@ CREATE TABLE oagw_upstream (
     PRIMARY KEY (id)                              -- get / update / delete (per call)
 );
 
--- Alias resolution across the tenant chain (per request); ancestor and budget
--- lookups (per call).
+-- Alias resolution across the tenant chain (per miss; per request with the
+-- cache off); ancestor and budget lookups (per call).
 CREATE UNIQUE INDEX uq_oagw_upstream_tenant_alias ON oagw_upstream (tenant_id, alias);
 
 -- Child foreign keys; upstream list (per call).
@@ -104,8 +106,9 @@ CREATE TABLE oagw_route (
 -- Child foreign keys; route list (per call).
 CREATE UNIQUE INDEX uq_oagw_route_tenant_id ON oagw_route (tenant_id, id);
 
--- Route candidates (per request); route list and conflict check (per call);
--- cascade from oagw_upstream.
+-- Route load of the cache (per miss); route candidates (per request with the
+-- cache off); route list and conflict check (per call); cascade from
+-- oagw_upstream.
 CREATE INDEX idx_oagw_route_tenant_upstream ON oagw_route (tenant_id, upstream_id);
 
 -- Registry reconcile (per run).

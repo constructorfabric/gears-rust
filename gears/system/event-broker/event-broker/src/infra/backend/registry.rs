@@ -1,9 +1,9 @@
-use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::collections::{BTreeMap, HashSet};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use event_broker_sdk::backend::{Backend, BuildContext, Provider, Role};
 use event_broker_sdk::gts::TopicV1;
-use toolkit_gts::GtsSchema;
+use toolkit_gts::{GtsInstanceId, GtsSchema};
 
 use crate::config::checks::{self, Deployment};
 use crate::domain::backend::{self, BackendResolver, Routing};
@@ -19,6 +19,12 @@ pub struct Registry {
     /// The instance-less route's backend, kept apart so resolution has an
     /// answer for every topic without a lookup that could miss.
     base: Arc<dyn Backend>,
+    /// Every topic and recorded entry name already warned about, so a stale
+    /// record warns once rather than on every append and read. Bounded by
+    /// topics times recorded names. Locked only when the recorded entry is
+    /// missing, never on a hit, and never held across an await: `resolve`
+    /// is synchronous.
+    warned: Mutex<HashSet<(GtsInstanceId, backend::Name)>>,
 }
 
 /// A registry entry that could not be built: C1 and C2 of feature 0005 §2.4.
@@ -128,6 +134,7 @@ impl Registry {
             backends,
             routing,
             base,
+            warned: Mutex::default(),
         })
     }
 }
@@ -136,11 +143,31 @@ impl BackendResolver for Registry {
     /// The topic's resolved route names its entry. The routing is consulted
     /// only if that name is not in this registry - a record resolved under
     /// another configuration - and the instance-less route answers last.
+    /// Such a fallback is warned about once per topic and recorded entry: it
+    /// most likely reads a backend that does not hold the topic's log.
     fn resolve(&self, topic: &Topic) -> Arc<dyn Backend> {
-        self.backends
-            .get(topic.settings.backend().value())
-            .or_else(|| self.backends.get(self.routing.resolve(&topic.id).value()))
-            .unwrap_or(&self.base)
-            .clone()
+        let recorded = topic.settings.backend().value();
+        if let Some(backend) = self.backends.get(recorded) {
+            return backend.clone();
+        }
+        let routed = self.routing.resolve(&topic.id);
+        let (chosen, backend) = match self.backends.get(routed.value()) {
+            Some(backend) => (routed.value(), backend),
+            None => (self.routing.base(), &self.base),
+        };
+        let first = self
+            .warned
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert((topic.id.clone(), recorded.clone()));
+        if first {
+            tracing::warn!(
+                topic = %topic.id,
+                recorded = %recorded,
+                chosen = %chosen,
+                "topic names a backend entry this registry lacks"
+            );
+        }
+        backend.clone()
     }
 }

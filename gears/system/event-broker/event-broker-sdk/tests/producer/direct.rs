@@ -4,10 +4,12 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use event_broker::test_support::{EventBrokerHarness, StaticTypesRegistry};
+use event_broker::test_support::{
+    DeliveredOutcome, EventBrokerHarness, FaultInjectingBroker, StaticTypesRegistry,
+};
 use event_broker_sdk::backend::{Partition, TopicPartition, Wait};
 use event_broker_sdk::{
-    DirectDeduplication, EventBrokerError, GtsInstanceId, IngestOutcome, Producer,
+    DirectDeduplication, EventBrokerApi, EventBrokerError, GtsInstanceId, IngestOutcome, Producer,
     ProducerIdentity, ProducerMode, Sequence, TypedEvent, gts_id,
 };
 use toolkit_security::SecurityContext;
@@ -60,7 +62,7 @@ async fn stored_count(harness: &EventBrokerHarness, partition: u32) -> usize {
 /// The real broker admits a publish (`Accepted`) and persists asynchronously through
 /// its ingest outbox, so the read-back must poll rather than assert immediately.
 async fn wait_for_stored(harness: &EventBrokerHarness, partition: u32, expected: usize) {
-    for _ in 0..200 {
+    for _ in 0..1000 {
         if stored_count(harness, partition).await >= expected {
             assert_eq!(stored_count(harness, partition).await, expected);
             return;
@@ -228,8 +230,9 @@ async fn reuse_monotonic_primes_from_broker_cursor() {
 /// `publish_persisted` asks for a durable-write confirmation, but the in-process
 /// broker enqueues to its async ingest outbox and exposes no persist-confirm hook
 /// (see `local_broker.rs`: the REST layer answers `501` for `Prefer: wait`), so
-/// the honest outcome is `Accepted`, not `Persisted`. The mock reported `Persisted`
-/// unconditionally; the real broker does not assert a write it has not confirmed.
+/// the honest outcome is `Accepted`, not `Persisted`: the broker does not assert a
+/// write it has not confirmed.
+// #5655: the in-process broker confirms no durable write until synchronous publish lands.
 #[tokio::test]
 async fn persisted_publish_is_accepted_without_a_persist_confirm_hook() {
     let harness = harness().await;
@@ -275,6 +278,82 @@ async fn batch_publish_routes_through_event_broker() {
         outcomes,
         vec![IngestOutcome::Accepted, IngestOutcome::Accepted]
     );
+    wait_for_stored(&harness, TENANT_PARTITION, 2).await;
+}
+
+/// The broker appends A but its ack is lost, so the caller sees a transport
+/// fault and resends A under the same sequence; the in-process broker answers
+/// that resend `Duplicate`. B must then chain onto A instead of being stamped
+/// with A's numbers again and dropped as one more duplicate.
+#[tokio::test]
+async fn a_local_broker_duplicate_ack_advances_the_local_chain() {
+    let harness = harness().await;
+    let broker = FaultInjectingBroker::new(harness.broker());
+    let producer = Producer::builder()
+        .broker(Arc::clone(&broker) as Arc<dyn EventBrokerApi>)
+        .security_context(SecurityContext::anonymous())
+        .identity(ProducerIdentity::new().source("order-service"))
+        .deduplication(DirectDeduplication::register_on_start(
+            ProducerMode::Chained,
+        ))
+        .topics([TOPIC])
+        .event_type_patterns(["gts.cf.core.events.event.v1~example.sdk.producer.*"])
+        .prepare_all()
+        .await
+        .unwrap();
+    let producer_id = producer.producer_id().expect("producer id is minted");
+    broker.lose_publish_acks(1);
+
+    let lost = producer.publish(order()).await;
+    let resent = producer.publish(order()).await;
+    let b = producer.publish(order()).await;
+
+    assert!(
+        matches!(lost, Err(EventBrokerError::Transport(_))),
+        "the lost ack surfaces as a transport fault, got {lost:?}"
+    );
+    assert_eq!(
+        (resent.unwrap(), b.unwrap()),
+        (IngestOutcome::Duplicate, IngestOutcome::Accepted)
+    );
+    let delivered = broker
+        .delivered_publishes()
+        .into_iter()
+        .map(|publish| {
+            let meta = publish.meta.expect("a chained publish carries meta");
+            (
+                (meta.version, meta.producer_id, meta.previous, meta.sequence),
+                publish.outcome,
+                publish.ack_lost,
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        delivered,
+        vec![
+            (
+                (1, Some(producer_id.0), Some(-1), Some(0)),
+                DeliveredOutcome::Accepted,
+                true
+            ),
+            (
+                (1, Some(producer_id.0), Some(-1), Some(0)),
+                DeliveredOutcome::Duplicate,
+                false
+            ),
+            (
+                (1, Some(producer_id.0), Some(0), Some(1)),
+                DeliveredOutcome::Accepted,
+                false
+            ),
+        ]
+    );
+    let cursors = harness
+        .broker()
+        .get_producer_cursors(&SecurityContext::anonymous(), producer_id)
+        .await
+        .unwrap();
+    assert_eq!(cursors.last_sequence(&topic_instance()), Some(1));
     wait_for_stored(&harness, TENANT_PARTITION, 2).await;
 }
 

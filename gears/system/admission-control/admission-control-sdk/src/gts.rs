@@ -2,9 +2,9 @@
 //!
 //! Compile-time entries reach `types-registry` through the `toolkit-gts`
 //! link-time inventory: the engine plugin specification, the admission
-//! resource type and the shared audit topic instance. The refusal event type
-//! is a derived schema under the broker's event base and is registered by the
-//! gear at init from [`refusal_event_type_schema`].
+//! resource type, the shared audit topic instance and the refusal event type,
+//! a derived schema under the broker's event base built by
+//! [`refusal_event_type_schema`].
 
 use gts::GtsInstanceId;
 use schemars::generate::{Contract, SchemaSettings};
@@ -65,6 +65,13 @@ gts_instance! {
         id: gts_id!("cf.core.events.topic.v1~cf.core.admission_control.audit.v1"),
         description: "Admission audit stream: admission-control refusal and shadow-finding events".to_owned(),
         retention: None,
+    }
+}
+
+toolkit_gts::inventory::submit! {
+    toolkit_gts::InventoryTypeSchema {
+        type_id: REFUSAL_EVENT_TYPE,
+        schema_fn: || refusal_event_type_schema().to_string(),
     }
 }
 

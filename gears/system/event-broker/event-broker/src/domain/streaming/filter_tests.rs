@@ -215,8 +215,7 @@ async fn concrete_type_permission_is_rechecked_for_each_event() {
         PolicyEnforcer::new(Arc::new(DenyingAuthZ {
             deny_if: move |request: &EvaluationRequest| {
                 assert_eq!(request.action.name, "consume");
-                assert_eq!(request.resource.resource_type, CREATED);
-                policy_denied.load(Ordering::Relaxed)
+                request.resource.resource_type == CREATED && policy_denied.load(Ordering::Relaxed)
             },
         })),
         toolkit_security::SecurityContext::builder()
@@ -229,4 +228,102 @@ async fn concrete_type_permission_is_rechecked_for_each_event() {
     assert!(filter.allows(&candidate).await.unwrap());
     denied.store(true, Ordering::Relaxed);
     assert!(!filter.allows(&candidate).await.unwrap());
+}
+
+/// Every independent delivery grant can be revoked after the stream opens.
+#[tokio::test]
+async fn delivery_rechecks_all_three_gates_in_the_event_tenant() {
+    use super::filter::AuthorizedInterestFilter;
+    use crate::test_support::DenyingAuthZ;
+    use authz_resolver_sdk::{EvaluationRequest, PolicyEnforcer};
+    use std::sync::{Arc, Mutex};
+    for revoked_resource in [
+        event_broker_sdk::gts::REQUEST_RESOURCE_TYPE,
+        topic().as_ref(),
+        CREATED,
+    ] {
+        let denied = Arc::new(Mutex::new(None::<String>));
+        let policy_denied = Arc::clone(&denied);
+        let tenant = Uuid::new_v4();
+        let filter = AuthorizedInterestFilter::new(
+            &[interest(tenant, &[CREATED])],
+            PolicyEnforcer::new(Arc::new(DenyingAuthZ {
+                deny_if: move |request: &EvaluationRequest| {
+                    assert_eq!(
+                        request.resource.properties.get("owner_tenant_id"),
+                        Some(&json!(tenant))
+                    );
+                    policy_denied.lock().unwrap().as_deref()
+                        == Some(request.resource.resource_type.as_str())
+                },
+            })),
+            toolkit_security::SecurityContext::builder()
+                .subject_tenant_id(Uuid::new_v4())
+                .subject_id(Uuid::new_v4())
+                .build()
+                .unwrap(),
+        );
+        let candidate = event(tenant, topic(), CREATED);
+        assert!(filter.allows(&candidate).await.unwrap());
+        *denied.lock().unwrap() = Some(revoked_resource.to_owned());
+        assert!(
+            !filter.allows(&candidate).await.unwrap(),
+            "revoked {revoked_resource}"
+        );
+    }
+}
+
+/// An unavailable policy service at any gate is an error, never a skipped event.
+#[tokio::test]
+async fn delivery_preserves_evaluation_errors_from_each_gate() {
+    use super::filter::AuthorizedInterestFilter;
+    use authz_resolver_sdk::{
+        AuthZResolverApi, EvaluationRequest, EvaluationResponse, EvaluationResponseContext,
+        PolicyEnforcer,
+    };
+    use std::sync::Arc;
+    use toolkit_canonical_errors::CanonicalError;
+    use toolkit_security::PlatformSecurityContext;
+
+    struct UnavailableAt(String);
+    #[async_trait::async_trait]
+    impl AuthZResolverApi for UnavailableAt {
+        async fn evaluate(
+            &self,
+            _ctx: PlatformSecurityContext,
+            request: EvaluationRequest,
+        ) -> Result<EvaluationResponse, CanonicalError> {
+            if request.resource.resource_type == self.0 {
+                Err(CanonicalError::service_unavailable().create())
+            } else {
+                Ok(EvaluationResponse {
+                    decision: true,
+                    context: EvaluationResponseContext::default(),
+                })
+            }
+        }
+    }
+    for unavailable in [
+        event_broker_sdk::gts::REQUEST_RESOURCE_TYPE,
+        topic().as_ref(),
+        CREATED,
+    ] {
+        let tenant = Uuid::new_v4();
+        let filter = AuthorizedInterestFilter::new(
+            &[interest(tenant, &[CREATED])],
+            PolicyEnforcer::new(Arc::new(UnavailableAt(unavailable.to_owned()))),
+            toolkit_security::SecurityContext::builder()
+                .subject_tenant_id(tenant)
+                .subject_id(Uuid::new_v4())
+                .build()
+                .unwrap(),
+        );
+        assert!(
+            matches!(
+                filter.allows(&event(tenant, topic(), CREATED)).await,
+                Err(crate::domain::error::DomainError::Internal(_))
+            ),
+            "unavailable {unavailable}"
+        );
+    }
 }

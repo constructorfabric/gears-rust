@@ -69,24 +69,31 @@ Every attempt mints a **log id** and hands it to the backend, which stores it wi
 
 ### 2.2 Binding Record
 
-The specification manager, on ingest instances, is the only writer. Portable types only, so the table runs on SQLite, PostgreSQL and MySQL/MariaDB.
+The specification manager, on ingest instances, is the only writer. The table runs on SQLite, PostgreSQL and MySQL/MariaDB, with each engine's UUID type: `uuid` on PostgreSQL, `binary(16)` on MySQL/MariaDB and `uuid_text` on SQLite; `topic_id` is ASCII with a binary collation on MySQL/MariaDB.
 
 ```sql
 CREATE TABLE event_broker__topic_binding (
-    topic_uuid  VARCHAR(36)   PRIMARY KEY,   -- GtsId::to_uuid(topic_id), deterministic
+    topic_uuid  UUID          PRIMARY KEY,   -- GtsId::to_uuid(topic_id), deterministic
     topic_id    VARCHAR(1024) NOT NULL,      -- GTS topic instance identifier; for operators, not indexed
-    log_id      VARCHAR(36)   NOT NULL,      -- UUID v4: the current attempt's, then the provisioned log's
-    state       VARCHAR(16)   NOT NULL,      -- 'provisioning' | 'provisioned'
-    attempt_at  VARCHAR(32)   NOT NULL,      -- RFC 3339 UTC, database time: when the current attempt last acted
-    partitions  BIGINT                       -- the count the backend holds; set when provisioned
+    log_id      UUID          NOT NULL,      -- UUID v4: the current attempt's, then the provisioned log's
+    state       VARCHAR(12)   NOT NULL,      -- 'provisioning' | 'provisioned'
+    attempt_at  VARCHAR(24)   NOT NULL,      -- YYYY-MM-DDTHH:MM:SS.sssZ, database time: when the current attempt last acted
+    partitions  BIGINT,                      -- the count the backend holds; set when provisioned
+    retention_max_age_ms BIGINT,             -- the retention max age last recorded, ms; NULL = unbounded
+    retention_max_bytes  BIGINT,             -- the retention max bytes last recorded; NULL = unbounded
+    retention_version    BIGINT  NOT NULL,   -- bumped by every write of the retention columns or of retention_confirmed
+    retention_confirmed  BOOLEAN NOT NULL    -- false while the backend may hold a retention other than the recorded one
 );
 ```
 
 - The primary key is the topic's deterministic UUID, so the 1024-character identifier never needs an index.
 - The record says which log a topic has, not where it is: every instance resolves the backend from its own routing, and every instance carries the same routing (feature 0005 §2).
-- `state` separates "not created yet" from "created". A `provisioned` topic is provisioned again only when its resolved settings change (its retention): the same log id, so the backend adopts the new settings without a new attempt (feature 0007 §2.6).
+- `state` separates "not created yet" from "created". A `provisioned` topic is provisioned again only when its resolved settings change (its retention) or its record is unconfirmed: the same log id, so the backend adopts the new settings without a new attempt (feature 0007 §2.6).
 - `partitions` is the count every role uses for the topic once it is provisioned (feature 0007 §2.6).
-- `attempt_at` is written and compared with the database's clock in the same statement, so clock skew between ingest hosts never decides whether an attempt is abandoned.
+- `retention_max_age_ms` and `retention_max_bytes` hold the retention last recorded; the backend holds it while `retention_confirmed` is true. They are set when the topic is provisioned and again on each re-provision that answers `Ready` and wins the compare-and-set on `retention_version`. A NULL bound is unbounded, and a bound past what `BIGINT` holds is stored as its maximum. The resolved retention is compared with them in these units to decide whether a `provisioned` topic is provisioned again.
+- `retention_version` is bumped by every write of the retention columns or of `retention_confirmed`: the write that makes the topic `provisioned`, the mark before a re-provision call, the retention write after it, and every unconfirmed mark. The mark before the call compares-and-sets on the version its pass read, and the re-provision records its retention only while the version is the one that mark wrote. A counter never repeats, so a write that read before another one always loses, even when the retention went back to the value it read.
+- `retention_confirmed` is false while the backend may hold a retention other than the recorded one: from the mark before a re-provision call until that call's answer wins the compare-and-set, so also after a call dropped mid-flight, a call whose answer was not seen and a record write that lost its compare-and-set; and after a first provisioning whose call answered `Ready` but whose write to `provisioned` lost to another instance driving the same attempt, or whose call answered `Pending`, timed out or failed after that instance recorded the topic. An unconfirmed `provisioned` topic is provisioned again on the next pass even when its resolved retention equals the recorded one. A new attempt inserts version `0` and unconfirmed, and the write that makes the topic `provisioned` confirms it.
+- `attempt_at` is written and compared with the database's clock in the same statement, so clock skew between ingest hosts never decides whether an attempt is abandoned. It is text of one fixed width on every engine, so it compares as text.
 
 ### 2.3 Backend Contract
 
@@ -95,13 +102,22 @@ One operation on the backend trait (feature 0007 §2.6):
 ```rust
 /// Creates whatever the backend needs to hold `topic`'s log, and stores `claim.new` as its log id.
 ///
-/// Compare-and-set: accepted when nothing is stored for the topic, when the stored id is the
-/// one `claim.replacing` names (the attempt being replaced), or when it is already `claim.new`
-/// (the same attempt, continued). Any other stored id is `BackendError::LogConflict`.
+/// Compare-and-set: accepted when the stored id is already `claim.new` (the same attempt,
+/// continued), when it is the one `claim.replacing` names (the attempt being replaced), or when
+/// nothing is stored and the claim is not `Held`. A `Held` claim over nothing is
+/// `BackendError::NotProvisioned`, and the backend creates nothing; any other stored id is
+/// `BackendError::LogConflict`.
 async fn provision(&self, topic: &TopicSpec, claim: &LogClaim) -> Result<Provisioning, BackendError>;
 
 pub struct LogClaim { pub replacing: Replacing, pub new: LogId }
-pub enum Replacing { Nothing, Log(LogId) }
+pub enum Replacing {
+    /// No earlier attempt is being replaced.
+    Nothing,
+    /// The attempt being replaced.
+    Log(LogId),
+    /// The log is already held under `new`: apply the settings only, never create.
+    Held,
+}
 
 pub enum Provisioning {
     /// The log exists and accepts writes; `partitions` is the count the backend holds.
@@ -138,7 +154,7 @@ modules:
 #   main.provision(orders/4, replacing=Nothing, new=L7) -> Ready(4) -> (L7, provisioned, 4)
 
 # ingest-2, a moment later
-#   row provisioned, partitions match -> nothing to do
+#   row provisioned, partitions match, retention unchanged -> nothing to do
 ```
 
 ### 3.2 An Attempt Is Abandoned
@@ -168,12 +184,13 @@ Pseudo-code below is Python-ish - not runnable; intent over syntax.
 
 ### 4.1 Provisioning Attempt
 
-The specification manager owns each topic's lifecycle: it is the only writer of the binding record and it drives the attempts. Every specification refresh pass on an ingest instance ends with a provisioning pass over every registered topic - at start, before the instance serves, and after each load, so a topic the refresh registers is provisioned in the same pass. While a pass leaves any topic unprovisioned - its backend still starting, or answering `Pending` or `LogConflict` - provisioning alone is retried on a short backoff (1 s, doubling up to the refresh interval). At start, the instance waits up to 10 s for its topics to be provisioned before it takes traffic: a backend that is still starting is waited for, one that is down delays the start by that much and never fails it. A provisioned topic is handed its current settings again under the same log id, so its backend adopts changed retention. Each `provision` call carries a timeout, so a backend that never answers costs one timeout per pass and never stalls the refresh or other topics. The compare-and-set on the record decides which instance acts.
+The specification manager owns each topic's lifecycle: it is the only writer of the binding record and it drives the attempts. Every specification refresh pass on an ingest instance ends with a provisioning pass over every registered topic - at start, before the instance serves, and after each load, so a topic the refresh registers is provisioned in the same pass. While a pass leaves any topic unprovisioned - its backend still starting, or answering `Pending` or `LogConflict` - provisioning alone is retried on a short backoff. At start, the instance waits up to 10 s for its topics to be provisioned before it takes traffic, retrying after 250 ms, doubling up to 1 s, while another retry still fits in the 10 s; once it serves, it retries after 1 s, doubling up to the refresh interval, and starts again at 1 s after each refresh: a backend that is still starting is waited for, one that is down delays the start by that much and never fails it. A provisioned topic is provisioned again, as a `Held` claim under the same log id and with its recorded partition count, only when its resolved retention differs from the retention its record holds, or its record is unconfirmed. Before the call the record is marked unconfirmed by a compare-and-set on the `retention_version` the pass read; when that loses, another write happened since the read, and the pass leaves the topic to the next pass. On `Ready` the retention is recorded and confirmed by a compare-and-set on the version the mark wrote; a lost compare-and-set, and a call answering `Pending`, timing out or failing, mark the record unconfirmed again, because the backend may hold or still apply another retention; a refusal (`NotProvisioned`, `LogConflict`) leaves it unconfirmed from the mark. In every case but a won compare-and-set, the next pass calls again. A first provisioning call answering `Pending`, timing out or failing marks the record unconfirmed as well, since the backend may still apply it: when another instance driving the same attempt has recorded the topic meanwhile, the mark keeps that record from holding a retention the backend may not hold; while the topic is `provisioning`, the mark matches nothing. Each `provision` call carries a timeout, so a backend that never answers costs one timeout per pass and never stalls the refresh or other topics. The compare-and-set on the record decides which instance acts.
 
 ```python
 def provision_topic(topic):
     backend = registry[routing(topic)]                     # feature 0005 §2.2
-    spec = TopicSpec(topic, partitions=settings(topic).partitions)
+    spec = TopicSpec(topic, partitions=settings(topic).partitions,
+                     retention=settings(topic).retention)
     row = binding.get(topic.uuid)
 
     if row is None:
@@ -186,6 +203,29 @@ def provision_topic(topic):
         if row.partitions != spec.partitions:
             log.error("topic partition count differs from the provisioned count",
                       topic=topic)                         # the recorded count stays in force
+        if row.retention_confirmed and row.retention == spec.retention:   # compared in the stored units
+            return                                         # nothing to do
+        if not binding.cas(topic.uuid, (row.log_id, "provisioned", row.retention_version),
+                           retention_version=row.retention_version + 1,
+                           retention_confirmed=False):    # marked before the call
+            return                                         # written since the read: next pass
+        held = TopicSpec(topic, partitions=row.partitions, retention=spec.retention)
+        match backend.provision(held, LogClaim(Held, row.log_id)) within call_timeout:
+            case Ready(_):
+                if not binding.cas(topic.uuid, (row.log_id, "provisioned", row.retention_version + 1),
+                                   retention=spec.retention,
+                                   retention_version=row.retention_version + 2,
+                                   retention_confirmed=True):     # a concurrent write won
+                    binding.mark_unconfirmed(topic.uuid, (row.log_id, "provisioned"))
+            case NotProvisioned:
+                log.error("the backend this topic is routed to holds no log for it",
+                          topic=topic)                     # unconfirmed from the mark: retried next pass
+            case LogConflict:
+                log.error("the backend this topic is routed to holds another log id",
+                          topic=topic)                     # unconfirmed from the mark: retried next pass
+            case _:                                        # Pending, timeout, failure
+                binding.mark_unconfirmed(topic.uuid, (row.log_id, "provisioned"))
+                log.warn("re-provisioning failed", topic=topic)   # the backend may still apply it
         return
 
     if not binding.older_than(topic.uuid, attempt_timeout):   # compared in the database
@@ -200,22 +240,29 @@ def provision_topic(topic):
 def drive(topic, backend, spec, replacing, new):
     match backend.provision(spec, LogClaim(replacing, new)) within call_timeout:
         case Ready(partitions):
-            binding.cas(topic.uuid, (new, "provisioning"), (new, "provisioned", partitions))
+            if not binding.cas(topic.uuid, (new, "provisioning"),
+                               (new, "provisioned", partitions, spec.retention)):   # another driver won
+                binding.mark_unconfirmed(topic.uuid, (new, "provisioned"))   # no match if replaced
         case Pending:
             binding.touch(topic.uuid, new, db_now())       # same `new`, retried on backoff
+            binding.mark_unconfirmed(topic.uuid, (new, "provisioned"))   # matches once another driver recorded it
         case LogConflict:
             binding.touch(topic.uuid, new, db_now())       # same `new`; never treated as abandoned
             log.error("topic provisioning refused: the backend holds another log id",
                       topic=topic, log_id=new)             # reaction: ADR-0008
         case timeout | Unavailable:
-            pass                                           # retried on backoff; ages toward replacement
+            binding.mark_unconfirmed(topic.uuid, (new, "provisioned"))   # matches once another driver recorded it
+            # retried on backoff; ages toward replacement
 ```
 
 - **One live attempt.** The record admits one attempt at a time: the insert for a new topic, and the compare-and-set for a replacement. Any instance may continue a live attempt, because continuing it sends the same log id.
 - **At most one backend holds the recorded log id.** The backend accepts a new id only over nothing, over the attempt it replaces, or over itself. An abandoned attempt that reached another backend - under routing that changed in between - leaves an id there that no record names; that backend stays writable to anyone still routed to it until ADR-0008 O1 decides how operations are checked.
+- **A re-provision never creates.** It is a `Held` claim: a backend holding the log applies the new retention, one holding nothing for the topic - a routing change moved it there - answers `NotProvisioned` and creates nothing, and one holding another id answers `LogConflict`. So a routing change and a retention change together never plant the log on a second backend; the record keeps its retention, and every pass calls again while the retention differs.
 - **Pending is not a new attempt.** The backend is called again with the same id until it answers `Ready`.
 - **A refused attempt is not abandoned.** `LogConflict` refreshes `attempt_at` and keeps the same id, so the record does not churn through new log ids; the topic stays `provisioning` and its publishes keep answering `503` until an operator acts (ADR-0008 O2).
 - **Only silence ages an attempt.** An attempt is replaced only when no instance has acted on it for `attempt_timeout` - a crash, or a backend that never answers.
+- **A rollout converges.** Instances that resolve different retention during a rollout interleave their calls and record writes. The record of a `provisioned` topic is unconfirmed from the mark before each re-provision call until that call's answer wins its compare-and-set, so a re-provision that interleaves with another, is answered late, is not answered, or is dropped mid-flight (a shutdown, the start-up wait cut, a crash) leaves it unconfirmed; so does a first provisioning whose write to `provisioned` loses to another instance driving the same attempt, or whose call answers `Pending`, times out or fails after that instance records the topic. An unconfirmed record is provisioned again on the next pass, so once every instance resolves the same retention, the backend and the record hold it. Not covered: a call whose answer is never seen and that the backend applies after every later write. The record cannot fence a write that lands after all of them; the mark keeps that window to the call's own lifetime. One such call is a first-provisioning call dropped mid-flight (a shutdown, the start-up wait cut, a crash) after another instance records the topic: the record is still `provisioning` when the call starts, so there is nothing to mark before it, and if the backend applies the call after that record write, the record stays confirmed at the other instance's retention. So does a first-provisioning call that answers `Pending`, times out or fails before the other instance records the topic, when the backend applies it after that record write: its mark comes while the record is still `provisioning` and matches nothing.
+- **A mark outlives every earlier read.** `mark_unconfirmed` (`retention_confirmed = false`, `retention_version + 1`) matches the record whatever its version, and the bump makes any compare-and-set read before it lose, so a write that read before the mark cannot clear the doubt the mark records.
 
 ### 4.2 Publishing to a Topic Not Yet Provisioned
 
@@ -252,7 +299,7 @@ Changing a provisioned topic's partition count is out of scope as well.
 - [ ] `p1` - **ID**: `cpt-cf-evbk-dod-topic-provisioning`
 
 - `backend::Backend` carries `provision` (§2.3); every linked backend plugin implements it, compare-and-set included, and reports the partition count it holds.
-- `event_broker__topic_binding` exists in the ingest database with portable types, written by the specification manager only.
+- `event_broker__topic_binding` exists in the ingest database with the columns of §2.2, written by the specification manager only.
 - The specification manager runs provisioning attempts (§4.1) at the end of every specification refresh pass, with a per-call timeout, for every registered topic; `attempt_at` uses the database's clock.
 - `provisioning.attempt_timeout` is a setting.
 
@@ -267,7 +314,7 @@ Changing a provisioned topic's partition count is out of scope as well.
 
 ## 9. Unit Test Plan
 
-- **attempt**: one test per branch of §4.1 - no row, insert lost, provisioned, provisioned with a differing partition count, live attempt continued, abandoned attempt replaced, replacement CAS lost.
+- **attempt**: one test per branch of §4.1 - no row, insert lost, provisioned with unchanged retention (no call), provisioned with changed retention (one call under the same log id, recorded on `Ready`, retried after a failure), re-provision compare-and-set lost to another instance's record write (marked unconfirmed; one more call once the configurations agree, including when the losing call was applied last), a mark after a lost record that a re-provision read before it cannot clear, re-provision answer not seen (marked unconfirmed; called again even when the configuration returns to the recorded retention), re-provision dropped mid-call (unconfirmed from the mark before the call; called again once the configuration returns), mark before the call lost (the pass skips the topic; not covered: needs a pause seam between the binding read and the mark), first provisioning whose write to `provisioned` lost to another driver of the same attempt (marked unconfirmed; one more call once the configurations agree), first provisioning call answered `Pending` or failing after another driver of the same attempt recorded the topic (marked unconfirmed; one more call once the configurations agree), provisioned with a differing partition count (logged on every pass), live attempt continued, abandoned attempt replaced, replacement CAS lost.
 - **backend CAS** (per plugin): nothing stored; stored equals the id `replacing` names; stored equals `new`; any other stored id is `LogConflict`.
 - **pending / conflict**: `Pending` and `LogConflict` leave the record `provisioning`, refresh `attempt_at`, and the next call uses the same id.
 - **clock**: `attempt_at` is set and compared by the database, not the host.

@@ -94,15 +94,21 @@ impl Drop for SqliteFile {
     }
 }
 
-/// A fresh migrated `SQLite` database whose statements are recorded. The
-/// migration statements are cleared from the recorder.
-pub(crate) async fn recorded_sqlite() -> (Db, QueryRecorder) {
-    let (db, recorder) = connect_with_recorder(&shared_sqlite_dsn(), opts(4))
+/// Connect to `dsn` recording its statements and apply the migrations,
+/// whose statements are cleared from the recorder.
+async fn recorded(dsn: &str) -> (Db, QueryRecorder) {
+    let (db, recorder) = connect_with_recorder(dsn, opts(4))
         .await
         .expect("connect recorded test database");
     migrate(&db).await;
     recorder.clear();
     (db, recorder)
+}
+
+/// A fresh migrated `SQLite` database whose statements are recorded. The
+/// migration statements are cleared from the recorder.
+pub(crate) async fn recorded_sqlite() -> (Db, QueryRecorder) {
+    recorded(&shared_sqlite_dsn()).await
 }
 
 /// A migrated database in a fresh `PostgreSQL` container (pinned in
@@ -112,6 +118,15 @@ pub(crate) async fn postgres() -> (impl std::any::Any, Db) {
     let (container, host, port) = start_postgres().await;
     let db = migrated(&format!("postgres://user:pass@{host}:{port}/oagw"), 4).await;
     (container, db)
+}
+
+/// [`postgres`], with the database's statements recorded (the migration
+/// statements cleared).
+#[cfg(feature = "integration")]
+pub(crate) async fn recorded_postgres() -> (impl std::any::Any, Db, QueryRecorder) {
+    let (container, host, port) = start_postgres().await;
+    let (db, recorder) = recorded(&format!("postgres://user:pass@{host}:{port}/oagw")).await;
+    (container, db, recorder)
 }
 
 /// A started `PostgreSQL` container accepting connections, with its host and port.
@@ -162,6 +177,15 @@ pub(crate) async fn mysql() -> (impl std::any::Any, Db) {
     let (container, host, port) = start_mysql().await;
     let db = migrated(&format!("mysql://user:pass@{host}:{port}/oagw"), 4).await;
     (container, db)
+}
+
+/// [`mysql`], with the database's statements recorded (the migration
+/// statements cleared).
+#[cfg(feature = "integration")]
+pub(crate) async fn recorded_mysql() -> (impl std::any::Any, Db, QueryRecorder) {
+    let (container, host, port) = start_mysql().await;
+    let (db, recorder) = recorded(&format!("mysql://user:pass@{host}:{port}/oagw")).await;
+    (container, db, recorder)
 }
 
 /// A started `MySQL` container accepting connections, with its host and port.

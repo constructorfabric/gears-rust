@@ -30,8 +30,14 @@ pub mod diagnostics;
 pub mod engine;
 /// Typed events, their GTS contract and the transition-transaction enqueue (S2-08). The S2-04
 /// engine is the production caller; no business operation emits yet.
+pub mod error_mapping;
 pub mod events;
 pub mod execution;
+/// Bounded gate port calls: per-port deadline, single retry, bulkheads and run caps (S3-09).
+/// Preview (S3-11) and submit (S3-12) are the callers.
+pub mod gate;
+/// Full jitter for retry pauses (the producer binding and the gate retry).
+pub mod jitter;
 pub mod maintenance;
 /// Authorized reads with access logging (early S6-01/S6-04).
 pub mod read;
@@ -39,4 +45,5 @@ pub mod storage;
 /// The five Orders-owned workers: scheduling, locking, class connections, retention purge,
 /// idempotency cleanup with the D-188/D-198 continuation port, and audit verification/
 /// checkpointing (S2-11). Expiry/auto-void bodies are Stage 5 ports.
+pub mod throttle;
 pub mod workers;

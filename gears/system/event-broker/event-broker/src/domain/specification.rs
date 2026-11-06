@@ -45,11 +45,26 @@ pub struct ProvisioningLimits {
 #[async_trait]
 pub trait SpecificationManager: Send + Sync {
     /// The topic as the broker holds it: the projection of its registered
-    /// instance, and the settings this deployment resolved for it.
-    async fn get_topic(&self, id: &GtsInstanceId) -> Option<Topic>;
+    /// instance, and the settings this deployment resolved for it, with the
+    /// partition count its backend holds once it is provisioned. `None` when
+    /// `id` is not registered, or its stored record does not deserialize
+    /// (logged as a warning).
+    ///
+    /// # Errors
+    ///
+    /// Returns `DomainError::StorageUnavailable` if the topic's record or its
+    /// provisioning record cannot be read.
+    async fn get_topic(&self, id: &GtsInstanceId) -> Result<Option<Topic>, DomainError>;
     /// The event type as the broker holds it, projected from its registered
-    /// derived type schema. Keyed by a GTS **type** identifier.
-    async fn get_event_type(&self, id: &GtsTypeId) -> Option<EventType>;
+    /// derived type schema. Keyed by a GTS **type** identifier. `None` when
+    /// `id` is not registered, or its stored record does not deserialize
+    /// (logged as a warning).
+    ///
+    /// # Errors
+    ///
+    /// Returns `DomainError::StorageUnavailable` if the event type's record
+    /// cannot be read.
+    async fn get_event_type(&self, id: &GtsTypeId) -> Result<Option<EventType>, DomainError>;
     async fn validate_event_data(
         &self,
         event_type: &EventType,
@@ -57,12 +72,23 @@ pub trait SpecificationManager: Send + Sync {
     ) -> Result<(), DomainError>;
 
     /// `GET /v1/topics` - unfiltered/unpaginated; the REST handler applies
-    /// `$filter`/pagination (`api/rest/pagination.rs`).
-    async fn list_topics(&self) -> Vec<Topic>;
+    /// `$filter`/pagination (`api/rest/pagination.rs`). Each topic is as
+    /// [`get_topic`](Self::get_topic) returns it.
+    ///
+    /// # Errors
+    ///
+    /// Returns `DomainError::StorageUnavailable` if the topic records or their
+    /// provisioning records cannot be read.
+    async fn list_topics(&self) -> Result<Vec<Topic>, DomainError>;
 
     /// `GET /v1/event-types` - unfiltered/unpaginated, same rationale as
     /// `list_topics`.
-    async fn list_event_types(&self) -> Vec<EventType>;
+    ///
+    /// # Errors
+    ///
+    /// Returns `DomainError::StorageUnavailable` if the event type records
+    /// cannot be read.
+    async fn list_event_types(&self) -> Result<Vec<EventType>, DomainError>;
 
     /// Resolves a topic's stable integer surrogate id
     /// (eb-single-process-implementation D1/D6) - what `Storage`'s durable
@@ -125,8 +151,8 @@ pub fn compile_schema(event_type: &EventType) -> Result<jsonschema::Validator, D
 /// Checks `data` against an already-compiled `validator`.
 ///
 /// # Errors
-/// Returns `DomainError::Validation { code: "SchemaViolation", .. }` if `data`
-/// fails validation.
+///
+/// Returns `DomainError::SchemaViolation` if `data` fails validation.
 pub fn check_against_schema(
     validator: &jsonschema::Validator,
     event_type: &EventType,

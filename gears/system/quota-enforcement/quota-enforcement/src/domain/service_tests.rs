@@ -20,6 +20,7 @@ fn limits() -> QuotaLimits {
         metadata_max_bytes: 4096,
         list_max_limit: 500,
         list_max_ids: 100,
+        bulk_max_items: 50,
     }
 }
 
@@ -36,6 +37,7 @@ fn service() -> Service {
             preparation_max_attempts: std::num::NonZeroU32::new(3).expect("attempts"),
             leases: crate::domain::operations::LeaseLimits::default(),
             batch: crate::domain::operations::BatchLimits::default(),
+            snapshot: crate::domain::operations::SnapshotLimits::default(),
         },
     )
 }

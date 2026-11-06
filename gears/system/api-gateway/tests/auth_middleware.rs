@@ -2038,3 +2038,121 @@ async fn a_bearer_on_an_anonymous_route_is_ignored_at_the_gateway() {
         );
     }
 }
+
+/// A raw HTTP/1.1 GET with `headers`, returning the status code.
+async fn listener_status(endpoint: &str, path: &str, headers: &[(&str, &str)]) -> u16 {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    let uri: http::Uri = endpoint.parse().expect("advertised endpoint URI");
+    let addr = uri.authority().expect("endpoint authority").as_str();
+    let mut stream = tokio::net::TcpStream::connect(addr)
+        .await
+        .expect("connects");
+    let mut request = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\n");
+    for (name, value) in headers {
+        request.push_str(name);
+        request.push_str(": ");
+        request.push_str(value);
+        request.push_str("\r\n");
+    }
+    request.push_str("Connection: close\r\n\r\n");
+    stream.write_all(request.as_bytes()).await.unwrap();
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).await.unwrap();
+    let response = String::from_utf8_lossy(&response);
+    response
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|code| code.parse().ok())
+        .expect("a status line")
+}
+
+/// The application gateway starts once with its complete, prefixed surface.
+/// A healthy listener already serves tenant, platform and `OpenAPI` routes.
+#[tokio::test]
+async fn the_gateway_starts_with_the_complete_prefixed_surface() {
+    use toolkit::contracts::RunnableCapability as _;
+
+    let mut config = axis_config(true);
+    config["bind_addr"] = json!("127.0.0.1:0");
+    config["prefix_path"] = json!("/cf");
+    config["enable_docs"] = json!(true);
+    let hub = Arc::new(ClientHub::new());
+    hub.register::<dyn AuthNResolverClient>(Arc::new(mock_accepting_token(
+        AXIS_BEARER,
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+    )));
+    let ctx = GearCtx::new(
+        "api-gateway",
+        Uuid::new_v4(),
+        Arc::new(TestConfigProvider {
+            config: json!({ "api-gateway": { "config": config } }),
+        }),
+        hub,
+        tokio_util::sync::CancellationToken::new(),
+    );
+    let gateway = api_gateway::ApiGateway::default();
+    gateway
+        .init(&ctx)
+        .await
+        .expect("resolver initialized first");
+    let health = Arc::new(toolkit::RestHealthcheckRegistry::new());
+    let base = gateway
+        .rest_prepare(&ctx, Router::new(), Arc::clone(&health))
+        .unwrap();
+    let routes = TestAxisGear
+        .register_rest(&create_test_gear_ctx(), base, &gateway)
+        .unwrap();
+    let _router = gateway.rest_finalize(&ctx, routes, health).unwrap();
+    assert!(
+        gateway.bound_endpoint().is_none(),
+        "no listener during init"
+    );
+
+    let gear = gateway.into_gear();
+    gear.start(tokio_util::sync::CancellationToken::new())
+        .await
+        .unwrap();
+    // `start` schedules the lifecycle task; the endpoint is published when
+    // that task binds the socket, before it signals readiness.
+    let endpoint = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if let Some(endpoint) = gear.inner().bound_endpoint() {
+                break endpoint;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("listener bound");
+    let bearer = format!("Bearer {AXIS_BEARER}");
+    let tenant = [("authorization", bearer.as_str())];
+    let platform = [(AXIS_INTERNAL_HEADER, AXIS_INTERNAL_SECRET)];
+
+    assert_eq!(listener_status(&endpoint, "/cf/healthz", &[]).await, 200);
+    assert_eq!(listener_status(&endpoint, "/cf/readyz", &[]).await, 200);
+    assert_eq!(
+        listener_status(&endpoint, "/cf/openapi.json", &[]).await,
+        200
+    );
+    assert_eq!(
+        listener_status(&endpoint, &format!("/cf{AXIS_PATH}"), &tenant).await,
+        200,
+        "tenant routes are available on the first serving router"
+    );
+    assert_eq!(
+        listener_status(&endpoint, &format!("/cf{AXIS_PLATFORM_PATH}"), &platform).await,
+        200
+    );
+    assert_eq!(
+        listener_status(&endpoint, &format!("/cf{AXIS_PATH}"), &[]).await,
+        401,
+        "the complete surface enforces authentication"
+    );
+    assert_eq!(listener_status(&endpoint, "/readyz", &[]).await, 404);
+
+    gear.stop(tokio_util::sync::CancellationToken::new())
+        .await
+        .unwrap();
+}

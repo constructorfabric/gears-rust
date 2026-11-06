@@ -88,6 +88,41 @@ fn map_write_error(err: &toolkit_db::secure::ScopeError) -> DomainError {
     }
 }
 
+/// `ON DELETE RESTRICT` as `PostgreSQL` reports it: SQLSTATE `restrict_violation`.
+const PG_RESTRICT_VIOLATION: &str = "23001";
+/// A plain foreign-key rejection on `PostgreSQL`: SQLSTATE `foreign_key_violation`.
+const PG_FOREIGN_KEY_VIOLATION: &str = "23503";
+/// `ON DELETE RESTRICT` as `SQLite` reports it: extended code `SQLITE_CONSTRAINT_TRIGGER`.
+const SQLITE_CONSTRAINT_TRIGGER: &str = "1811";
+/// A plain foreign-key rejection on `SQLite`: extended code `SQLITE_CONSTRAINT_FOREIGNKEY`.
+const SQLITE_CONSTRAINT_FOREIGNKEY: &str = "787";
+
+/// Whether the driver itself reported a foreign-key refusal, by code.
+///
+/// `SeaORM`'s `sql_err()` files only the plain foreign-key pair, and the
+/// toolkit's classifier then falls back to English message text, which a
+/// `PostgreSQL` running with another `lc_messages` does not produce. The code is
+/// read off the driver error here, so the race path does not depend on wording.
+fn driver_reports_fk_refusal(err: &toolkit_db::secure::ScopeError) -> bool {
+    use sea_orm::{DbErr, RuntimeErr, sqlx};
+
+    let toolkit_db::secure::ScopeError::Db(DbErr::Exec(RuntimeErr::SqlxError(driver))) = err else {
+        return false;
+    };
+    let sqlx::Error::Database(db) = driver.as_ref() else {
+        return false;
+    };
+    db.code().is_some_and(|code| {
+        matches!(
+            code.as_ref(),
+            PG_RESTRICT_VIOLATION
+                | PG_FOREIGN_KEY_VIOLATION
+                | SQLITE_CONSTRAINT_TRIGGER
+                | SQLITE_CONSTRAINT_FOREIGNKEY
+        )
+    })
+}
+
 /// Project a delete failure.
 ///
 /// A foreign-key rejection means a declaration still references the category.
@@ -97,13 +132,9 @@ fn map_write_error(err: &toolkit_db::secure::ScopeError) -> DomainError {
 /// error would turn a correct refusal into a 500.
 // @cpt-begin:cpt-cf-settings-service-flow-category-management-delete:p1:inst-cat-delete-11
 fn map_delete_error(err: &toolkit_db::secure::ScopeError) -> DomainError {
-    let is_fk_violation = matches!(
-        err,
-        toolkit_db::secure::ScopeError::Db(db) if matches!(
-            db.sql_err(),
-            Some(sea_orm::SqlErr::ForeignKeyConstraintViolation(_))
-        )
-    );
+    // The driver's code first, the toolkit's classifier as the second chance
+    // for an error that was re-wrapped and lost its typed shape.
+    let is_fk_violation = driver_reports_fk_refusal(err) || err.is_foreign_key_violation();
     if is_fk_violation {
         DomainError::Conflict {
             detail: "the category still has declarations referencing it".to_owned(),
@@ -418,3 +449,7 @@ impl CategoryRepository for CategoryRepo {
         // @cpt-end:cpt-cf-settings-service-algo-category-management-no-orphan-guard:p1:inst-cat-orphan-1
     }
 }
+
+#[cfg(test)]
+#[path = "category_repo_tests.rs"]
+mod category_repo_tests;

@@ -20,16 +20,10 @@ use uuid::Uuid;
 use ::gts::{GtsInstanceId, GtsTypeId};
 
 use super::type_cache::ConsumerTypeCache;
-use crate::api::{
-    EventBrokerApi, FrameStream, IngestOutcome, JoinRequest, ProducerCursors, ProducerMode,
-    SeekPosition, SeekResult, SubscriptionAssignment,
-};
+use crate::api::EventBrokerApi;
+use crate::broker_stub::BrokerStub;
 use crate::error::EventBrokerError;
-use crate::ids::{ConsumerGroupId, ProducerId, SubscriptionId};
-use crate::models::{
-    ConsumerGroup, ConsumerGroupQuery, CreateConsumerGroupRequest, Event, EventType, Page,
-    PartitionRange, ResetScope, Subscription, Topic, TopicSegment,
-};
+use crate::models::EventType;
 
 const TOPIC: &str = "gts.cf.core.events.topic.v1~example.cache.broker.orders.v1";
 const OTHER_TOPIC: &str = "gts.cf.core.events.topic.v1~example.cache.broker.audit.v1";
@@ -78,7 +72,7 @@ fn broker_with(bindings: &[(&str, &str)]) -> Arc<dyn EventBrokerApi> {
 }
 
 #[async_trait]
-impl EventBrokerApi for CannedBroker {
+impl BrokerStub for CannedBroker {
     async fn list_event_types(
         &self,
         _ctx: &SecurityContext,
@@ -99,127 +93,6 @@ impl EventBrokerApi for CannedBroker {
                 type_id: id.to_owned(),
                 detail: "no such event type".to_owned(),
             })
-    }
-
-    async fn register_producer(
-        &self,
-        _ctx: &SecurityContext,
-        _mode: ProducerMode,
-        _client_agent: &str,
-    ) -> Result<ProducerId, EventBrokerError> {
-        unimplemented!("CannedBroker only serves type lookups")
-    }
-    async fn publish(
-        &self,
-        _ctx: &SecurityContext,
-        _event: &Event,
-    ) -> Result<IngestOutcome, EventBrokerError> {
-        unimplemented!("CannedBroker only serves type lookups")
-    }
-    async fn publish_batch(
-        &self,
-        _ctx: &SecurityContext,
-        _events: &[Event],
-    ) -> Result<IngestOutcome, EventBrokerError> {
-        unimplemented!("CannedBroker only serves type lookups")
-    }
-    async fn get_producer_cursors(
-        &self,
-        _ctx: &SecurityContext,
-        _producer_id: ProducerId,
-    ) -> Result<ProducerCursors, EventBrokerError> {
-        unimplemented!("CannedBroker only serves type lookups")
-    }
-    async fn reset_producer_chain(
-        &self,
-        _ctx: &SecurityContext,
-        _producer_id: ProducerId,
-        _scope: ResetScope<'_>,
-    ) -> Result<(), EventBrokerError> {
-        unimplemented!("CannedBroker only serves type lookups")
-    }
-    async fn create_consumer_group(
-        &self,
-        _ctx: &SecurityContext,
-        _req: CreateConsumerGroupRequest,
-    ) -> Result<ConsumerGroup, EventBrokerError> {
-        unimplemented!("CannedBroker only serves type lookups")
-    }
-    async fn get_consumer_group(
-        &self,
-        _ctx: &SecurityContext,
-        _id: &ConsumerGroupId,
-    ) -> Result<ConsumerGroup, EventBrokerError> {
-        unimplemented!("CannedBroker only serves type lookups")
-    }
-    async fn list_consumer_groups(
-        &self,
-        _ctx: &SecurityContext,
-        _query: ConsumerGroupQuery,
-    ) -> Result<Page<ConsumerGroup>, EventBrokerError> {
-        unimplemented!("CannedBroker only serves type lookups")
-    }
-    async fn delete_consumer_group(
-        &self,
-        _ctx: &SecurityContext,
-        _id: &ConsumerGroupId,
-    ) -> Result<(), EventBrokerError> {
-        unimplemented!("CannedBroker only serves type lookups")
-    }
-    async fn join(
-        &self,
-        _ctx: &SecurityContext,
-        _req: JoinRequest,
-    ) -> Result<SubscriptionAssignment, EventBrokerError> {
-        unimplemented!("CannedBroker only serves type lookups")
-    }
-    async fn get_subscription(
-        &self,
-        _ctx: &SecurityContext,
-        _id: SubscriptionId,
-    ) -> Result<Subscription, EventBrokerError> {
-        unimplemented!("CannedBroker only serves type lookups")
-    }
-    async fn list_subscriptions(
-        &self,
-        _ctx: &SecurityContext,
-    ) -> Result<Vec<Subscription>, EventBrokerError> {
-        unimplemented!("CannedBroker only serves type lookups")
-    }
-    async fn leave(
-        &self,
-        _ctx: &SecurityContext,
-        _id: SubscriptionId,
-    ) -> Result<(), EventBrokerError> {
-        unimplemented!("CannedBroker only serves type lookups")
-    }
-    async fn stream(
-        &self,
-        _ctx: &SecurityContext,
-        _id: SubscriptionId,
-    ) -> Result<FrameStream, EventBrokerError> {
-        unimplemented!("CannedBroker only serves type lookups")
-    }
-    async fn seek(
-        &self,
-        _ctx: &SecurityContext,
-        _id: SubscriptionId,
-        _topology_version: i64,
-        _positions: &[SeekPosition],
-    ) -> Result<Vec<SeekResult>, EventBrokerError> {
-        unimplemented!("CannedBroker only serves type lookups")
-    }
-    async fn list_topics(&self, _ctx: &SecurityContext) -> Result<Vec<Topic>, EventBrokerError> {
-        unimplemented!("CannedBroker only serves type lookups")
-    }
-    async fn list_topic_segments(
-        &self,
-        _ctx: &SecurityContext,
-        _topic: &str,
-        _partition: u32,
-        _range: PartitionRange,
-    ) -> Result<TopicSegment, EventBrokerError> {
-        unimplemented!("CannedBroker only serves type lookups")
     }
 }
 

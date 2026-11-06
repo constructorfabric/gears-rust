@@ -12,6 +12,7 @@ pub mod policy_store;
 pub mod quota_mapping;
 pub mod quota_store;
 pub mod repo;
+pub mod snapshot_store;
 
 pub use consumption_store::SqlConsumptionStore;
 pub use foundation_store::SqlFoundationStore;

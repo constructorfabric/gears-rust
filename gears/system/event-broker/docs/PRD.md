@@ -212,7 +212,7 @@ Subscription *  ──*  Partition       (a subscription is assigned partitions 
 
 **ID**: `cpt-cf-evbk-actor-types-registry`
 
-- **Role**: Stores GTS schema and instance registrations. The broker uses it to validate topic / event-type / consumer-group GTS identifiers; to resolve the event-type `data_schema` against which event payloads are validated at ingest; reads named consumer-group instances at startup to upsert `evbk_consumer_group` rows.
+- **Role**: Stores GTS schema and instance registrations. The broker uses it to validate topic / event-type / consumer-group GTS identifiers; to resolve the event-type `data_schema` against which event payloads are validated at ingest; reads named consumer-group instances at startup to upsert `event_broker_consumer_group` rows.
 
 #### Storage Backend Plugin
 
@@ -242,7 +242,7 @@ The Event Broker follows standard Gears module conventions. Module-specific depl
 - GTS-typed topics, event types, subject types, consumer groups; full GTS pattern wildcards in authorization.
 - Storage backend plugin contract; first-party and vendor backends alike are plugins linked through a `backend::Provider`.
 - Per-(resource, action) authorization via the `authz-resolver` framework (4 resource types × 3 actions: `produce`, `consume`, `define`).
-- Persistent consumer-group registry (`evbk_consumer_group`) with two exclusive provisioning paths (anonymous via REST, named via `types_registry`).
+- Persistent consumer-group registry (`event_broker_consumer_group`) with two exclusive provisioning paths (anonymous via REST, named via `types_registry`).
 - Per-event size limit (64 KiB combined headers + payload); per-batch limit (100 events / 1 MiB).
 - Cluster-mode failover with `DirectoryService` as source of truth for delivery-shard liveness.
 - Standalone and cluster deployment topologies; affinity-preferring dispatcher routing over instances that each handle every topic.
@@ -310,7 +310,7 @@ The system MUST accept single-event publish requests. The event MUST carry `id` 
 
 - [ ] `p1` - **ID**: `cpt-cf-evbk-fr-publish-batch`
 
-The system MUST accept batch publish via `POST /v1/events:batch`. A batch MAY carry events of several producer ids and topics; it is validated per `(producer_id, topic)` run (rules in DESIGN §3.3 and ADR-0004). Hard limits: 100 events per batch, 1 MiB total payload, 64 KiB per event. The batch is atomic - if any event fails dedup validation, the entire batch is rejected and nothing is enqueued.
+The system MUST accept batch publish via `POST /v1/events:batch`. A batch targets one topic and MAY carry events of several producer ids; it is validated per `(producer_id, topic)` run (rules in DESIGN §3.3 and ADR-0004). Hard limits: 100 events per batch, 1 MiB total payload, 64 KiB per event. The batch is atomic - if any event fails dedup validation, the entire batch is rejected and nothing is enqueued.
 
 - **Rationale**: High-throughput producers benefit from batching; ingest cannot know an event's partition, so a batch is not bounded by one.
 - **Actors**: `cpt-cf-evbk-actor-module-dev-producer`
@@ -319,7 +319,7 @@ The system MUST accept batch publish via `POST /v1/events:batch`. A batch MAY ca
 
 - [ ] `p1` - **ID**: `cpt-cf-evbk-fr-producer-modes`
 
-The system MUST recognize three producer modes, declared at registration and validated against the fields set on each event: **chained** (`producer_id` + `previous` + `sequence`), **monotonic** (`producer_id` + `sequence` only), **stateless** (none). Chained mode MUST verify `event.previous == state.last_sequence` AND `event.sequence > state.last_sequence` against `evbk_producer_state`; mismatched chains MUST surface as `412 SequenceViolation`. Monotonic mode MUST verify only `event.sequence > state.last_sequence`. Stateless mode MUST do no broker-side dedup. On `412 SequenceViolation` there are two cases. **(1) Transient async retry / duplicate** - resolved automatically with no human involvement: a duplicate is treated as success, and a benign reorder is re-driven from the broker's cursor. **(2) Genuine divergence** - e.g. the producer's local DB was restored from backup and its sequence regressed - which cannot be reconciled silently and MUST surface for **operator acknowledgement**; the operator reconciles against `GET /v1/producers/{producer_id}/cursors` (resume from `last_sequence + 1`) or rotates to a fresh `producer_id` to start a new chain.
+The system MUST recognize three producer modes, declared at registration and validated against the fields set on each event: **chained** (`producer_id` + `previous` + `sequence`), **monotonic** (`producer_id` + `sequence` only), **stateless** (none). Chained mode MUST verify `event.previous == state.last_sequence` AND `event.sequence > state.last_sequence` against `event_broker_producer_sequence`; mismatched chains MUST surface as `412 SequenceViolation`. Monotonic mode MUST verify only `event.sequence > state.last_sequence`. Stateless mode MUST do no broker-side dedup. On `412 SequenceViolation` there are two cases. **(1) Transient async retry / duplicate** - resolved automatically with no human involvement: a duplicate is treated as success, and a benign reorder is re-driven from the broker's cursor. **(2) Genuine divergence** - e.g. the producer's local DB was restored from backup and its sequence regressed - which cannot be reconciled silently and MUST surface for **operator acknowledgement**; the operator reconciles against `GET /v1/producers/{producer_id}/cursors` (resume from `last_sequence + 1`) or rotates to a fresh `producer_id` to start a new chain.
 
 - **Rationale**: Different producer profiles need different dedup guarantees; chain-of-custody is the broker-side primitive that supports all three without an event.id index.
 - **Actors**: `cpt-cf-evbk-actor-module-dev-producer`
@@ -375,7 +375,7 @@ The system MUST serve `GET /v1/events:stream?subscription_id={uuid}` as a long-l
 
 - [ ] `p1` - **ID**: `cpt-cf-evbk-fr-ack-seek`
 
-The system MUST support `POST /v1/subscriptions/{id}:seek` (advance cursor via SEEK, sets `cursor.offset` per `(topic, partition)`; forward-only during streaming via `MAX(current, requested)`; unrestricted before streaming opens). Cursor state MUST be group-scoped (shared across all subscriptions in the group), held in the cluster cache (no SQL `evbk_cursor` table).
+The system MUST support `POST /v1/subscriptions/{id}:seek` (advance cursor via SEEK, sets `cursor.offset` per `(topic, partition)`; forward-only during streaming via `MAX(current, requested)`; unrestricted before streaming opens). Cursor state MUST be group-scoped (shared across all subscriptions in the group), held in the cluster cache (no SQL cursor table).
 
 - **Rationale**: Replay and cursor advance require seek; cursor's lifetime should match the group's, not any specific subscription.
 - **Actors**: `cpt-cf-evbk-actor-module-dev-consumer`
@@ -395,7 +395,7 @@ The system MUST distinguish graceful delivery-shard shutdown (in-flight streams 
 
 - [ ] `p1` - **ID**: `cpt-cf-evbk-fr-anonymous-group-create`
 
-The system MUST accept `POST /v1/consumer-groups` with a UUID-backed GTS identifier (`gts.cf.core.events.consumer_group.v1~{uuid}`). The row's `tenant_id` and `owner_principal` MUST come from `SecurityContext` and be non-overridable. Named (vendor-namespaced) identifiers MUST be rejected with `400 NamedGroupRequiresRegistry`.
+The system MUST accept `POST /v1/consumer-groups` with a UUID-backed GTS identifier (`gts.cf.core.events.consumer_group.v1~{uuid}`). The row's `tenant_id` and `owner_principal_id` MUST come from `SecurityContext` and be non-overridable. Named (vendor-namespaced) identifiers MUST be rejected with `400 NamedGroupRequiresRegistry`.
 
 - **Rationale**: Anonymous groups are caller-driven, tenant-private; this endpoint is the only path. Named groups have a separate, authority-controlled path.
 - **Actors**: `cpt-cf-evbk-actor-module-dev-consumer`
@@ -404,7 +404,7 @@ The system MUST accept `POST /v1/consumer-groups` with a UUID-backed GTS identif
 
 - [ ] `p1` - **ID**: `cpt-cf-evbk-fr-named-group-provisioning`
 
-The system MUST read `types_registry` at startup for instances of `gts.cf.core.events.consumer_group.v1~` and upsert each into `evbk_consumer_group` with `kind='named'` and `owner_principal` set to the registering module's principal. The upsert MUST be idempotent — re-running startup MUST NOT change ownership of existing named groups.
+The system MUST read `types_registry` at startup for instances of `gts.cf.core.events.consumer_group.v1~` and upsert each into `event_broker_consumer_group` with `kind='named'` and `owner_principal_id` set to the registering module's principal. The upsert MUST be idempotent - re-running startup MUST NOT change ownership of existing named groups.
 
 - **Rationale**: Named groups are platform-level resources; their lifecycle is tied to module registration, not REST.
 - **Actors**: `cpt-cf-evbk-actor-platform-operator`, `cpt-cf-evbk-actor-types-registry`
@@ -549,7 +549,7 @@ The Event Broker exposes its capability via a versioned REST API. The full surfa
 
 ```
 POST   /v1/events                                # produce single event
-POST   /v1/events:batch                          # produce batch (atomic; any producer ids and topics)
+POST   /v1/events:batch                          # produce batch (atomic; one topic, any producer ids)
 GET    /v1/events:stream?subscription_id=...       # streaming consume
 
 POST   /v1/producers                             # register producer (server-issued id)
@@ -665,7 +665,7 @@ GET    /v1/event-types/{id}                      # read event-type schema and al
 2. The producer resumes publishing with the next `sequence` after `last_sequence`.
 
 **Postconditions**:
-- Publishing continues with no chain breaks; broker's `evbk_producer_state` advances normally.
+- Publishing continues with no chain breaks; broker's `event_broker_producer_sequence` advances normally.
 
 **Alternative Flows**:
 - **Local DB restored from backup (sequence regressed)**: producer detects the divergence (e.g., business data has rows newer than `last_sequence` claims), calls `GET /v1/producers/{producer_id}/cursors` to read the broker's authoritative view; producer either reconciles its own state or registers a fresh `producer_id` via `POST /v1/producers` to start a new chain.

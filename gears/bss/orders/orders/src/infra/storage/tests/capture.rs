@@ -1100,7 +1100,7 @@ async fn location_keeps_the_gateway_prefix_on_create_and_replay() {
     assert_eq!(read.2["order"]["order_id"], json!(id));
 }
 
-/// One in-process HTTP exchange through the mounted router (no TCP listener or host gateway).
+/// One in-process HTTP exchange through the mounted router (not the S2-12 live E2E).
 pub(super) async fn http(
     router: &axum::Router,
     method: &str,

@@ -6,10 +6,10 @@
 //! Content hashing has two modes (both SHA-256): whole-object, implemented here, and the
 //! multipart offset-manifest composite (see `hash_mode`).
 //!
-//! This is the only SHA-256 call site in the gear (the DE0708 FIPS-hasher allow-list); the
-//! signed-URL signing primitive lives behind its own provider abstraction (ADR-0004).
+//! All SHA-256 operations route through the toolkit-security crypto facade;
+//! signed-URL signing uses the same facade behind its provider abstraction (ADR-0004).
 
-use sha2::{Digest, Sha256};
+use toolkit_security::crypto::hash::Sha256;
 
 /// The hash algorithm label stored on every version row.
 pub const ALGORITHM: &str = "SHA-256";

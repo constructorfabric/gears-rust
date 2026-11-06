@@ -77,12 +77,13 @@ async fn submit_and_await<A: PlatformTypesRegistryApi + ?Sized>(
     budget: Duration,
     cancel: &CancellationToken,
 ) -> Result<RegistrationOperation, CanonicalError> {
-    let deadline = crate::reconcile::submit::deadline_after(tokio::time::Instant::now(), budget)?;
-    crate::reconcile::submit::await_registration(api, &ctx(), key, request, deadline, cancel)
+    let deadline =
+        crate::reconciliation::submit::deadline_after(tokio::time::Instant::now(), budget)?;
+    crate::reconciliation::submit::await_registration(api, &ctx(), key, request, deadline, cancel)
         .await
         .map_or_else(
             |stop| Err(stop.into_error()),
-            |answer| answer.map_err(crate::reconcile::submit::Failure::into_error),
+            |answer| answer.map_err(crate::reconciliation::submit::Failure::into_error),
         )
 }
 

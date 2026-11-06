@@ -29,11 +29,11 @@ gear(
         path = "../file-storage-sdk",
     ),
 
-    # The operator's knobs. Not offered: `signing_key_seed` and
+    # The operator's knobs. Not offered: `signing_key_pkcs8` and
     # `finalize_internal_secret`, which are secrets -- a form that saved one
     # would write it into the description; `s3_backends`, a list of nested
     # backend records; and `default_backend_id`, which only means something
-    # against that list. `require_signing_key_seed`, which guards the seed, is
+    # against that list. `require_signing_key`, which guards the private key, is
     # offered, since it is policy rather than a credential.
     config_schema = config(exposes = [
         "storage_root",
@@ -44,7 +44,7 @@ gear(
         "max_page_size",
         "idempotency_ttl_secs",
         "enable_in_memory_backend",
-        "require_signing_key_seed",
+        "require_signing_key",
     ]),
 
     # `default = []` is the only feature and enables nothing.

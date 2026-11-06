@@ -2,7 +2,7 @@
 name = "cf-gears-oidc-authn-plugin"
 edition.workspace = true
 license.workspace = true
-version = "0.3.1"
+version = "0.3.2"
 description = "OIDC Authentication Resolver Plugin"
 keywords = ["constructorfabric", "cf-gears"]
 metadata.docs.rs.all-features = true
@@ -31,7 +31,7 @@ authn-resolver = { workspace = true }
 toolkit.workspace = true
 toolkit-gts = { workspace = true }
 toolkit-macros.workspace = true
-toolkit-security.workspace = true
+toolkit-security = { workspace = true, features = ["jwt"] }
 inventory.workspace = true
 
 # JWT validation
