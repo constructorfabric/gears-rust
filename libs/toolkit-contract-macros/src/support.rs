@@ -1,9 +1,200 @@
 //! Shared helpers used by every macro in this crate.
 
 use proc_macro2::TokenStream;
-use quote::quote;
+use quote::{ToTokens, quote};
+use syn::parse::{Parse, ParseStream};
 use syn::punctuated::Punctuated;
-use syn::{Ident, Path, PathArguments, PathSegment, Token};
+use syn::{Expr, Ident, Path, PathArguments, PathSegment, Token};
+
+/// `key = value` argument of a macro attribute.
+pub struct KeyValue {
+    /// Argument name.
+    pub key: Ident,
+    /// Argument value, interpreted by the macro that owns the key.
+    pub value: Expr,
+}
+
+impl Parse for KeyValue {
+    fn parse(input: ParseStream) -> syn::Result<Self> {
+        let key: Ident = input.parse()?;
+        let _: Token![=] = input.parse()?;
+        let value: Expr = input.parse()?;
+        Ok(Self { key, value })
+    }
+}
+
+/// One contract named by `contract = ...`, with the options given on it in
+/// the list form: `contract = [sdk::Api(key = value, ...), sdk::OtherApi]`.
+pub struct ContractEntry {
+    /// Path of the contract trait.
+    pub path: Path,
+    /// Options from `(...)` after the path; empty when none are given.
+    pub opts: Vec<KeyValue>,
+}
+
+impl Parse for ContractEntry {
+    fn parse(input: ParseStream) -> syn::Result<Self> {
+        // Mod-style: plain `Path::parse` reads `Api(...)` as `Fn(..)` sugar.
+        let path = Path::parse_mod_style(input)?;
+        let mut opts = Vec::new();
+        if input.peek(syn::token::Paren) {
+            let content;
+            syn::parenthesized!(content in input);
+            let items: Punctuated<KeyValue, Token![,]> = Punctuated::parse_terminated(&content)?;
+            for kv in items {
+                if kv.key == "contract" {
+                    return Err(syn::Error::new(
+                        kv.key.span(),
+                        "`contract` cannot be set on a list entry",
+                    ));
+                }
+                opts.push(kv);
+            }
+        }
+        Ok(Self { path, opts })
+    }
+}
+
+/// Arguments of `#[toolkit::consumes]` / `#[toolkit::provides]`: the contracts
+/// named by `contract` plus every other top-level `key = value`.
+///
+/// `contract = path` is one entry with no options. `contract = [...]` is the
+/// list form, where each entry may carry its own options.
+pub struct ContractArgs {
+    /// Contracts named by `contract`; empty when the key is missing.
+    pub contracts: Vec<ContractEntry>,
+    /// Whether `contract` was given in the list form.
+    pub list: bool,
+    /// Top-level arguments other than `contract`, in order.
+    pub rest: Vec<KeyValue>,
+}
+
+impl Parse for ContractArgs {
+    fn parse(input: ParseStream) -> syn::Result<Self> {
+        let mut contracts = Vec::new();
+        let mut list = false;
+        let mut rest = Vec::new();
+        while !input.is_empty() {
+            let key: Ident = input.parse()?;
+            let _: Token![=] = input.parse()?;
+            if key != "contract" {
+                rest.push(KeyValue {
+                    key,
+                    value: input.parse()?,
+                });
+            } else if !contracts.is_empty() && (list || input.peek(syn::token::Bracket)) {
+                // A repeated single `contract = path` keeps its old last-wins
+                // meaning; with a list, the repeat would drop whole entries.
+                return Err(syn::Error::new(
+                    key.span(),
+                    "`contract` is given more than once",
+                ));
+            } else if input.peek(syn::token::Bracket) {
+                let content;
+                let brackets = syn::bracketed!(content in input);
+                let items: Punctuated<ContractEntry, Token![,]> =
+                    Punctuated::parse_terminated(&content)?;
+                if items.is_empty() {
+                    return Err(syn::Error::new(
+                        brackets.span.join(),
+                        "`contract = [...]` lists no contracts",
+                    ));
+                }
+                contracts = items.into_iter().collect();
+                list = true;
+            } else {
+                contracts = vec![ContractEntry {
+                    path: expr_into_path(input.parse()?, &key)?,
+                    opts: Vec::new(),
+                }];
+                list = false;
+            }
+            if input.is_empty() {
+                break;
+            }
+            let _: Token![,] = input.parse()?;
+        }
+
+        let mut seen = std::collections::HashSet::new();
+        for entry in &contracts {
+            if !seen.insert(entry.path.to_token_stream().to_string()) {
+                return Err(syn::Error::new_spanned(
+                    &entry.path,
+                    "contract is listed more than once",
+                ));
+            }
+        }
+        Ok(Self {
+            contracts,
+            list,
+            rest,
+        })
+    }
+}
+
+impl ContractArgs {
+    /// Error when no `contract` was given. Callers check their other keys
+    /// first, so a misspelled `contract` is reported as an unknown key.
+    pub fn require_contract(&self) -> syn::Result<()> {
+        if self.contracts.is_empty() {
+            return Err(syn::Error::new(
+                proc_macro2::Span::call_site(),
+                "missing required arg `contract = path::to::TraitName`",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Error for a per-contract `key` given at the top level of a list with
+    /// several contracts, where it would be ambiguous.
+    pub fn check_per_contract_key(&self, key: &Ident) -> syn::Result<()> {
+        if self.contracts.len() > 1 {
+            return Err(syn::Error::new(
+                key.span(),
+                format!(
+                    "`{key}` is per contract; with several contracts set it on the list entry: \
+                     `contract = [path::Api({key} = ...), ...]`"
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Where to report an error about `entry`: the entry in the list form, the
+    /// whole attribute otherwise (as before the list form existed).
+    pub fn error_at(&self, entry: &ContractEntry, msg: impl std::fmt::Display) -> syn::Error {
+        if self.list {
+            syn::Error::new_spanned(&entry.path, msg)
+        } else {
+            syn::Error::new(proc_macro2::Span::call_site(), msg)
+        }
+    }
+}
+
+/// `value` as a path, or an error naming `key`.
+pub fn expr_into_path(value: Expr, key: &Ident) -> syn::Result<Path> {
+    match value {
+        Expr::Path(p) => Ok(p.path),
+        other => Err(syn::Error::new_spanned(
+            other,
+            format!("`{key}` expects a path"),
+        )),
+    }
+}
+
+/// `value` as a string literal, or an error naming `key`.
+pub fn expr_into_string(value: Expr, key: &Ident) -> syn::Result<String> {
+    match value {
+        Expr::Lit(syn::ExprLit {
+            lit: syn::Lit::Str(s),
+            ..
+        }) => Ok(s.value()),
+        other => Err(syn::Error::new_spanned(
+            other,
+            format!("`{key}` expects a string literal"),
+        )),
+    }
+}
 
 /// Take all segments of `path` except the last (the trait name itself):
 /// `foo::bar::Baz` → `foo::bar`. A single-segment path yields an empty path so

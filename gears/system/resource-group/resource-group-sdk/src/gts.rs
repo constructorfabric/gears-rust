@@ -10,8 +10,8 @@ use toolkit_gts::gts_type_schema;
 /// `allowed_parent_types`, `allowed_membership_types`.
 ///
 /// "Is this type a tenant?" is **not** a trait — it is derived from the type
-/// code: any type whose GTS chain starts with [`TENANT_RG_TYPE_PATH`] is a
-/// tenant type.
+/// code: any type whose GTS chain starts with one of the configured tenant
+/// type prefixes (default: [`TENANT_RG_TYPE_PATH`]) is a tenant type.
 ///
 /// All chained RG types (tenant, department, branch, etc.) inherit from this
 /// base contract via `allOf` + `$ref`.
@@ -79,13 +79,18 @@ pub const GROUP_MEMBERSHIP_RESOURCE_TYPE: &str = gts_id!("cf.core.rg.group_membe
 /// Canonical GTS resource type for a type-registry type definition.
 pub const TYPE_RESOURCE_TYPE: &str = gts_id!("cf.core.rg.type.v1~");
 
-/// GTS type path for the tenant resource-group type.
+/// Default GTS type path for the tenant resource-group type.
 ///
-/// Any RG type whose code **starts with** this path is considered a tenant
-/// type — creating a group of such a type starts a new tenant scope
-/// (`tenant_id = group.id`). Non-tenant types inherit `tenant_id` from their
-/// parent. There is no explicit `is_tenant` boolean on the type record; the
-/// prefix is the single source of truth.
+/// Any RG type whose code **starts with** a configured tenant-type path is
+/// considered a tenant type — creating a group of such a type starts a new
+/// tenant scope (`tenant_id = group.id`). Non-tenant types inherit
+/// `tenant_id` from their parent. There is no explicit `is_tenant` boolean on
+/// the type record; the prefix is the single source of truth.
+///
+/// This constant is the default of the resource-group gear's
+/// `tenant_type_paths` and the rg-tr-plugin's `tenant_types` config; a
+/// deployment with its own vendor overrides both lists (e.g.
+/// `gts.cf.core.rg.type.v1~acme.core._.tenant.v1~`).
 ///
 /// The tenant RG type itself is seeded externally (via API/config) with
 /// `can_be_root: true` so root tenants are valid placements.

@@ -10,7 +10,7 @@ use super::dto::{PublishBatchRequest, PublishEventRequest};
 use crate::api::rest::error::EventBrokerResourceError;
 use crate::api::rest::state::HandlerState;
 use crate::domain::error::{DomainError, ErrorCode};
-use crate::domain::ingest::{PublishAck, PublishRequest};
+use crate::domain::ingest::{BatchAck, PublishAck, PublishRequest};
 
 /// `true` when the caller opted into synchronous persistence via the standard
 /// `Prefer: wait` header (RFC 7240) - asking the broker to hold the response
@@ -60,11 +60,13 @@ fn parse_body<T: serde::de::DeserializeOwned>(body: &Bytes) -> Result<T, DomainE
 }
 
 /// # Errors
+///
 /// Returns the mapped `CanonicalError` for any `DomainError`
-/// `IngestService::publish_event` produces (topic/event-type not found,
-/// payload validation, sequence violation, unknown producer), `400` when the
-/// body carries a read-only/unknown field, or `501` when the caller requests
-/// synchronous persistence via `Prefer: wait`.
+/// `IngestService::publish_event` produces (an unauthorized event type or
+/// tenant, topic/event-type not found, payload validation, sequence
+/// violation, unknown producer), `400` when the body carries a
+/// read-only/unknown field, or `501` when the caller requests synchronous
+/// persistence via `Prefer: wait`.
 pub async fn publish_event(
     Extension(ctx): Extension<SecurityContext>,
     Extension(state): Extension<HandlerState>,
@@ -87,19 +89,19 @@ pub async fn publish_event(
     )
 }
 
-/// `docs/openapi.yaml` documents no response body for this endpoint (202/
-/// 400/403/412/413, status only) - `BatchResult`'s per-event
-/// accepted/failed detail isn't surfaced on success, matching that
-/// documented contract exactly rather than inventing an undocumented body
-/// shape. A batch is all-or-nothing: any one event's rejection rejects the
-/// whole request (`IngestService::publish_batch`).
+/// Every answer is status only (`docs/openapi.yaml`). A batch is
+/// all-or-nothing: any one event's rejection rejects the whole request
+/// (`IngestService::publish_batch`, feature 0001 §5.2).
 ///
 /// # Errors
+///
 /// Returns the mapped `CanonicalError` for any `DomainError`
-/// `IngestService::publish_batch` produces (mixed topics, batch too large,
-/// payload validation, or a sequence violation), `400` when the body carries
-/// a read-only/unknown field, or `501` when the caller requests synchronous
-/// persistence via `Prefer: wait`.
+/// `IngestService::publish_batch` produces (an empty batch, a repeated event
+/// id, a malformed run, mixed topics, batch too large, an unauthorized event
+/// type or tenant, topic/event-type not found, unknown producer, payload
+/// validation, a sequence violation, or an unavailable store), `400` when the
+/// body carries a read-only/unknown field, or `501` when the caller requests
+/// synchronous persistence via `Prefer: wait`.
 pub async fn publish_batch(
     Extension(ctx): Extension<SecurityContext>,
     Extension(state): Extension<HandlerState>,
@@ -115,6 +117,10 @@ pub async fn publish_batch(
         .into_iter()
         .map(PublishRequest::try_from)
         .collect::<Result<Vec<_>, _>>()?;
-    state.ingest.publish_batch(&ctx, requests).await?;
-    Ok(StatusCode::ACCEPTED)
+    Ok(match state.ingest.publish_batch(&ctx, requests).await? {
+        // Every event a duplicate - a lost-ack resend: nothing new is written
+        // (feature 0001 §5.2 "Outcome").
+        BatchAck::Duplicate => StatusCode::OK,
+        BatchAck::Accepted => StatusCode::ACCEPTED,
+    })
 }

@@ -936,7 +936,8 @@ async fn parent_subscription_does_not_deliver_a_denied_derived_type() {
     let policy = PolicyEnforcer::new(Arc::new(DenyingAuthZ {
         deny_if: |request: &EvaluationRequest| {
             assert_eq!(request.action.name, "consume");
-            request.resource.resource_type != CREATED
+            request.resource.properties.contains_key("event_type_id")
+                && request.resource.resource_type != CREATED
         },
     }));
     let mut harness = open_with_policy(vec![(0, held)], tenant, Some(policy));
@@ -958,7 +959,7 @@ async fn parent_subscription_does_not_deliver_a_denied_derived_type() {
     );
 }
 
-/// A PDP outage after one allow must not publish a partial batch or report a
+/// A PDP outage after one authorized event must not publish a partial batch or report a
 /// cursor beyond events whose authorization could not be established.
 #[tokio::test]
 async fn authorization_outage_closes_without_advancing_the_batch_frontier() {
@@ -969,7 +970,7 @@ async fn authorization_outage_closes_without_advancing_the_batch_frontier() {
     use toolkit_canonical_errors::CanonicalError;
     use toolkit_security::PlatformSecurityContext;
 
-    struct FailsAfterOneAllow(std::sync::atomic::AtomicBool);
+    struct FailsAfterOneAllow(std::sync::atomic::AtomicUsize);
 
     #[async_trait::async_trait]
     impl AuthZResolverApi for FailsAfterOneAllow {
@@ -978,7 +979,7 @@ async fn authorization_outage_closes_without_advancing_the_batch_frontier() {
             _ctx: PlatformSecurityContext,
             _request: EvaluationRequest,
         ) -> Result<EvaluationResponse, CanonicalError> {
-            if self.0.swap(true, Ordering::Relaxed) {
+            if self.0.fetch_add(1, Ordering::Relaxed) >= 3 {
                 Err(CanonicalError::service_unavailable().create())
             } else {
                 Ok(EvaluationResponse {
@@ -991,7 +992,7 @@ async fn authorization_outage_closes_without_advancing_the_batch_frontier() {
 
     let tenant = Uuid::new_v4();
     let policy = PolicyEnforcer::new(Arc::new(FailsAfterOneAllow(
-        std::sync::atomic::AtomicBool::new(false),
+        std::sync::atomic::AtomicUsize::new(0),
     )));
     let held = StubPartition::holding(vec![event(tenant, 1), event(tenant, 2)]);
     let mut harness = open_with_policy(vec![(0, held)], tenant, Some(policy));

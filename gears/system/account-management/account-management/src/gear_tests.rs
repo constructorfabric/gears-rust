@@ -746,7 +746,7 @@ mod no_seed_startup_tests {
             Arc::new(GrpcInstallerStore::new()),
         );
         types_registry_gear
-            .post_init(&sys)
+            .legacy_finalize_after_application_init(&sys)
             .await
             .expect("Types Registry semantic validation and ready transition");
 

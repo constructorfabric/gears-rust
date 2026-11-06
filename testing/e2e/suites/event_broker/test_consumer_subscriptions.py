@@ -546,7 +546,7 @@ async def test_cross_tenant_join_anonymous_group_returns_403(api):
 
     Tenant A creates an anonymous group; tenant B's POST /subscriptions
     targeting that group must return 403.  In standalone mode auth is disabled
-    so the server returns 201 — hence strict xfail.
+    so the server returns 201 - hence strict xfail.
     """
     tenant_id = str(uuid.uuid4())
     async with api() as client:

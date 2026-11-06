@@ -20,7 +20,7 @@ use tokio_util::sync::CancellationToken;
 use toolkit::api::OpenApiRegistry;
 #[cfg(feature = "cluster")]
 use toolkit::client_hub::ClientHub;
-use toolkit::contracts::{RunnableCapability, SystemCapability};
+use toolkit::contracts::RunnableCapability;
 use toolkit::{
     DatabaseCapability, Gear, GearCtx, Healthcheck, HealthcheckResult, HealthcheckStatus,
     RestApiCapability,
@@ -50,7 +50,7 @@ use crate::infra::proxy_cache::{
     ProxyConfigCache, WriteHook,
 };
 #[cfg(feature = "cluster")]
-use crate::infra::proxy_cache::{ChangeFeed, WatchHealth, WatchStatus};
+use crate::infra::proxy_cache::{ChangeFeed, StaleHealth, WatchHealth, WatchStatus};
 use crate::infra::storage::{
     DbRegistryRowRepo, DbRegistryStateStore, DbRouteRepo, DbUpstreamRepo, InMemoryRegistryRowRepo,
     InMemoryRouteRepo, InMemoryUpstreamRepo, Migrator,
@@ -74,7 +74,7 @@ pub struct AppState {
 #[toolkit::gear(
     name = "oagw",
     deps = [types_registry, credstore, tenant_resolver],
-    capabilities = [system, db, rest, stateful]
+    capabilities = [db, rest, stateful]
 )]
 pub struct OutboundApiGatewayGear {
     state: arc_swap::ArcSwapOption<AppState>,
@@ -210,6 +210,7 @@ impl OutboundApiGatewayGear {
             // cluster change log for the other replicas (ADR-0020).
             let cache = Arc::new(ProxyConfigCache::new(
                 proxy_cache.ttl,
+                proxy_cache.max_stale,
                 proxy_cache.max_entries,
                 Arc::clone(metrics),
             ));
@@ -467,11 +468,17 @@ impl Gear for OutboundApiGatewayGear {
 
         Ok(())
     }
+
+    async fn post_init(&self, _ctx: &GearCtx) -> anyhow::Result<()> {
+        self.prepare_registry_provisioning().await
+    }
 }
 
-#[async_trait]
-impl SystemCapability for OutboundApiGatewayGear {
-    async fn post_init(&self, _sys: &toolkit::runtime::SystemContext) -> anyhow::Result<()> {
+impl OutboundApiGatewayGear {
+    /// `post_init`: prepare the registry provisioning once every gear of the
+    /// group initialized — reconciled now in memory, by `start`'s background
+    /// task on a database.
+    async fn prepare_registry_provisioning(&self) -> anyhow::Result<()> {
         let registry = self
             .registry_client
             .get()
@@ -739,8 +746,8 @@ impl DatabaseCapability for OutboundApiGatewayGear {
 }
 
 /// The gear's readiness: on a database with the cache enabled the proxy
-/// configuration change log watch and the cluster requirements, then
-/// registry provisioning. The worst part decides the status and the code;
+/// configuration change log watch, the cluster requirements and the cache's
+/// stale answers, then registry provisioning. The worst part decides the status and the code;
 /// on a tie, the earlier part. The message joins those of every part that is
 /// not healthy, in order, so a second degraded part is not hidden.
 struct OagwHealth(Vec<Arc<dyn Healthcheck>>);
@@ -937,8 +944,8 @@ fn severity(status: HealthcheckStatus) -> u8 {
 }
 
 impl OutboundApiGatewayGear {
-    /// On a database with the cache enabled: the change log watch and the
-    /// cluster requirements.
+    /// On a database with the cache enabled: the change log watch, the
+    /// cluster requirements and stale answers.
     #[cfg(feature = "cluster")]
     fn cache_health(&self) -> Vec<Arc<dyn Healthcheck>> {
         let mut parts: Vec<Arc<dyn Healthcheck>> = Vec::new();
@@ -947,6 +954,7 @@ impl OutboundApiGatewayGear {
             parts.push(Arc::new(ClusterHealth::new(
                 cluster_sdk::cluster_readiness(Arc::clone(&sync.hub)),
             )));
+            parts.push(Arc::new(StaleHealth(Arc::clone(sync.hook.cache()))));
         }
         parts
     }

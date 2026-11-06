@@ -1181,8 +1181,9 @@ their guard *registrations* and their reason *entries*, never their logic.
 ### R14 event platform integration (D-200)
 
 Use the [existing platform producer/broker integration contract](../DESIGN.md#contract-01-event-platform-integration).
-The broker implementation and initial chained-cursor transient retry already exist; Orders wiring,
-eleven schema registrations, root identity/grants, exact deployment evidence and conformance remain
-work. Preserve same-transaction enqueue, post-commit Wake and at-least-once consumer semantics.
+The broker implementation and initial chained-cursor transient retry already exist, and the eleven
+event types are GTS inventory entries the registry seeds; Orders wiring, root identity/grants, exact
+deployment evidence and conformance remain work. Preserve same-transaction enqueue, post-commit Wake
+and at-least-once consumer semantics.
 Supported producer dead-letter republication and shared operator recovery remain release gates;
 toolkit message claiming and consumer DLQ support alone do not satisfy them.

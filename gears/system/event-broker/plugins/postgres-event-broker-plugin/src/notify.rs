@@ -9,6 +9,7 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Duration;
 
 use event_broker_sdk::backend::Partition;
 use sqlx::{PgPool, Postgres};
@@ -19,6 +20,14 @@ use toolkit_taskward::{Directive, PanicPolicy, TracingListener, WorkerAction, Wo
 use uuid::Uuid;
 
 use crate::names;
+
+/// The first wait after a failed pass, doubled per failure in a row up to
+/// [`NOTIFY_BACKOFF_MAX`]: it bounds how late the heads of a brief failure are
+/// notified.
+pub const NOTIFY_BACKOFF_FIRST: Duration = Duration::from_secs(1);
+/// The longest wait between failed passes: it bounds how late heads are
+/// notified once the database is back.
+pub const NOTIFY_BACKOFF_MAX: Duration = Duration::from_secs(30);
 
 /// Sends one notification per `(topic, partition, sequence)` head, in one
 /// statement.
@@ -63,15 +72,19 @@ impl HeadsToNotify {
         }
     }
 
-    fn take(&self) -> HashMap<(Uuid, Partition), i64> {
+    /// Everything queued, leaving nothing behind.
+    pub fn take(&self) -> HashMap<(Uuid, Partition), i64> {
         std::mem::take(&mut *self.latest.lock().unwrap_or_else(PoisonError::into_inner))
     }
 }
 
 /// The worker that notifies what [`HeadsToNotify`] holds.
-struct Notifier {
+pub struct Notifier {
     heads: Arc<HeadsToNotify>,
     pool: PgPool,
+    /// The wait after the next failed pass: back to the first after a pass
+    /// that succeeds.
+    backoff: Duration,
 }
 
 impl WorkerAction for Notifier {
@@ -89,14 +102,29 @@ impl WorkerAction for Notifier {
             .collect();
         if let Err(err) = self.notify(&heads).await {
             // Back for the next pass; a later head of the same partition wins.
+            // A sleep, not an error: an error idles the worker until the next
+            // offer, and the merge does not wake it.
             self.heads.merge(taken);
-            return Err(err);
+            let backoff = self.backoff;
+            self.backoff = (backoff * 2).min(NOTIFY_BACKOFF_MAX);
+            tracing::warn!(%err, ?backoff, "postgres event-broker head notify failed; retrying");
+            return Ok(Directive::sleep(backoff));
         }
+        self.backoff = NOTIFY_BACKOFF_FIRST;
         Ok(Directive::proceed())
     }
 }
 
 impl Notifier {
+    /// A worker notifying `heads` over `pool`.
+    pub fn new(heads: Arc<HeadsToNotify>, pool: PgPool) -> Self {
+        Self {
+            heads,
+            pool,
+            backoff: NOTIFY_BACKOFF_FIRST,
+        }
+    }
+
     async fn notify(&self, heads: &[(Uuid, Partition, i64)]) -> Result<(), sqlx::Error> {
         let mut tx = self.pool.begin().await?;
         // A notification lost to a crash is lost before the flush or after it
@@ -121,9 +149,6 @@ pub fn spawn(
         .notifier(Arc::clone(&heads.wakeup))
         .listener(TracingListener)
         .on_panic(PanicPolicy::CatchAndRetry)
-        .build(Notifier {
-            heads: Arc::clone(heads),
-            pool: pool.clone(),
-        });
+        .build(Notifier::new(Arc::clone(heads), pool.clone()));
     tasks.spawn(worker.run());
 }

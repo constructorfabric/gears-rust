@@ -38,6 +38,9 @@ struct StubDirectory {
     fail_resolve: AtomicUsize,
     reject_kind: Option<Rejection>,
     rejecting: AtomicBool,
+    /// While set, `register` waits for `released` after counting the call.
+    holding: AtomicBool,
+    released: tokio::sync::Notify,
 }
 
 impl StubDirectory {
@@ -50,6 +53,8 @@ impl StubDirectory {
             fail_resolve: AtomicUsize::new(fail_resolve),
             reject_kind: None,
             rejecting: AtomicBool::new(false),
+            holding: AtomicBool::new(false),
+            released: tokio::sync::Notify::new(),
         }
     }
 
@@ -99,6 +104,9 @@ impl DirectoryClient for StubDirectory {
 
     async fn register_instance(&self, _info: RegisterInstanceInfo) -> anyhow::Result<()> {
         self.register_calls.fetch_add(1, Ordering::SeqCst);
+        if self.holding.load(Ordering::SeqCst) {
+            self.released.notified().await;
+        }
         if self.rejecting.load(Ordering::SeqCst) {
             match self.reject_kind {
                 Some(Rejection::InvalidArgument) => {
@@ -237,6 +245,90 @@ async fn presence_loop_registers_once_then_heartbeats_until_cancel() {
     assert!(
         stub.heartbeats.load(Ordering::SeqCst) >= 1,
         "the single presence task must send heartbeats"
+    );
+
+    cancel.cancel();
+    task.await.unwrap();
+}
+
+/// The heartbeats keep their schedule while an info update's registration
+/// is in flight.
+#[tokio::test(start_paused = true)]
+async fn an_info_update_in_flight_does_not_hold_the_heartbeats() {
+    let stub = Arc::new(StubDirectory::new(0, 0));
+    let directory: Arc<dyn DirectoryClient> = stub.clone();
+    let cancel = CancellationToken::new();
+    let (updates, presence) = tokio::sync::watch::channel(info());
+    let task = tokio::spawn(presence_loop_with_updates(
+        Arc::clone(&directory),
+        presence,
+        Duration::from_secs(1),
+        cancel.clone(),
+    ));
+    while stub.register_ok.load(Ordering::SeqCst) == 0 {
+        tokio::task::yield_now().await;
+    }
+
+    stub.holding.store(true, Ordering::SeqCst);
+    updates.send_replace(info().with_openapi_spec(r#"{"paths":{"/full":{}}}"#));
+    let heartbeats = stub.heartbeats.load(Ordering::SeqCst);
+    // Past the periodic re-registration too.
+    tokio::time::sleep(RE_REGISTER_INTERVAL + Duration::from_millis(5500)).await;
+
+    assert_eq!(
+        stub.register_calls.load(Ordering::SeqCst),
+        2,
+        "in flight, with no periodic registration beside it"
+    );
+    assert_eq!(stub.register_ok.load(Ordering::SeqCst), 1, "not finished");
+    assert!(
+        stub.heartbeats.load(Ordering::SeqCst) - heartbeats >= 35,
+        "a heartbeat every second meanwhile"
+    );
+    stub.holding.store(false, Ordering::SeqCst);
+    stub.released.notify_waiters();
+    while stub.register_ok.load(Ordering::SeqCst) < 2 {
+        tokio::task::yield_now().await;
+    }
+
+    cancel.cancel();
+    task.await.unwrap();
+}
+
+/// An info update is registered at once and the heartbeats keep their
+/// schedule, even while that registration fails.
+#[tokio::test(start_paused = true)]
+async fn an_info_update_keeps_the_heartbeats_though_its_registration_fails() {
+    let stub = Arc::new(StubDirectory {
+        reject_kind: Some(Rejection::Conflict),
+        ..StubDirectory::new(0, 0)
+    });
+    let directory: Arc<dyn DirectoryClient> = stub.clone();
+    let cancel = CancellationToken::new();
+    let (updates, presence) = tokio::sync::watch::channel(info());
+    let task = tokio::spawn(presence_loop_with_updates(
+        Arc::clone(&directory),
+        presence,
+        Duration::from_secs(1),
+        cancel.clone(),
+    ));
+    while stub.register_ok.load(Ordering::SeqCst) == 0 {
+        tokio::task::yield_now().await;
+    }
+
+    stub.rejecting.store(true, Ordering::SeqCst);
+    updates.send_replace(info().with_openapi_spec(r#"{"paths":{"/full":{}}}"#));
+    let heartbeats = stub.heartbeats.load(Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_millis(5500)).await;
+
+    assert_eq!(
+        stub.register_calls.load(Ordering::SeqCst),
+        2,
+        "the update is registered once at once, not retried in a backoff loop"
+    );
+    assert!(
+        stub.heartbeats.load(Ordering::SeqCst) - heartbeats >= 5,
+        "a heartbeat every second meanwhile"
     );
 
     cancel.cancel();

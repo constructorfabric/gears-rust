@@ -23,7 +23,9 @@ use crate::domain::precondition::ETag;
 use crate::domain::resolution::{EffectiveCache, TenantHierarchy};
 
 pub use repo::AccessRepository;
-pub use service::{AccessActor, AccessListing, AccessReadout, AccessService};
+pub use service::{
+    AccessActor, AccessListing, AccessReadout, AccessService, TenantHierarchyChains,
+};
 
 /// What a tenant may do with a setting.
 ///

@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use event_broker_sdk::backend::support::topic_uuid;
-use event_broker_sdk::backend::{BackendError, LogClaim, Provisioning, TopicSpec};
+use event_broker_sdk::backend::{BackendError, LogClaim, Provisioning, Stored, TopicSpec};
 use rdkafka::admin::{AlterConfig, NewTopic, ResourceSpecifier, TopicReplication};
 use rdkafka::error::{KafkaError, RDKafkaErrorCode};
 use rdkafka::producer::{FutureProducer, FutureRecord, Producer};
@@ -84,8 +84,9 @@ pub struct Job {
 /// The jobs of an instance, by topic uuid.
 pub type Jobs = Mutex<HashMap<Uuid, Job>>;
 
-/// Claims the topic's log for `claim` and creates its Kafka topic;
-/// `LogConflict` when the stored log id is not one the claim accepts.
+/// Claims the topic's log for `claim` and creates its Kafka topic; refused
+/// per [`LogClaim::check`]. A `Held` claim never creates: with no log record,
+/// or with the record but no Kafka event topic, it answers `NotProvisioned`.
 ///
 /// The work runs as a task of the instance, not in the caller's future: a
 /// caller that gives up (the gear bounds startup provisioning) cancels
@@ -216,11 +217,19 @@ async fn claimed(
     let key = log_key(topic);
     let mut logs = shared.logs(OP).await?;
     let stored = logs.get(&key).and_then(LogRecord::decode);
-    if !claim.accepts(stored.as_ref().map(LogRecord::log_id)) {
-        return Err(BackendError::log_conflict(OP.name()));
-    }
+    claim.check(
+        OP.name(),
+        stored
+            .as_ref()
+            .map_or(Stored::Nothing, |record| Stored::Log(record.log_id())),
+    )?;
     let admin = shared.admin(OP)?;
     let Some(partitions) = ready_partitions(shared, &admin, name).await? else {
+        // A held log whose event topic is gone is not recreated: a `Held`
+        // claim never creates.
+        if !claim.allows_creation() {
+            return Err(BackendError::not_provisioned(OP.name()));
+        }
         create(shared, &admin, spec, name).await?;
         return Ok((Provisioning::Pending, 0));
     };

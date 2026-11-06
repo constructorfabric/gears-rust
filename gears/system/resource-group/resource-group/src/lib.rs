@@ -5,6 +5,7 @@
 #![cfg_attr(coverage_nightly, feature(coverage_attribute))]
 
 // === MODULE DEFINITION ===
+pub mod config;
 pub mod gear;
 pub use gear::ResourceGroup;
 

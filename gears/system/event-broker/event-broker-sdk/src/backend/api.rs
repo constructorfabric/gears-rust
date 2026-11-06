@@ -28,10 +28,12 @@ use crate::sequence::Sequence;
 #[async_trait]
 pub trait Backend: Send + Sync {
     /// Creates whatever the backend needs to hold the topic's log and stores
-    /// `claim.new` as its log id; compare-and-set per [`LogClaim::accepts`],
-    /// anything else is [`BackendError::LogConflict`]. Called again with the
-    /// same log id when the topic's retention changes, and the backend adopts
-    /// the new bounds.
+    /// `claim.new` as its log id; compare-and-set per [`LogClaim::check`],
+    /// whose error it answers. Called again with the same log id and
+    /// [`Replacing::Held`](super::Replacing::Held) when the topic's retention
+    /// changes: the backend adopts the new bounds, and one holding nothing
+    /// for the topic creates nothing and answers
+    /// [`BackendError::NotProvisioned`].
     async fn provision(
         &self,
         topic: &TopicSpec,
@@ -62,7 +64,7 @@ pub trait Backend: Send + Sync {
 
     /// `Exact`, `Earliest`, `Latest`, `At(t)` to the offset a cursor may hold.
     /// `Latest` is the highest sequence ever assigned, never lowered by
-    /// removal.
+    /// removal; [`Sequence::NONE`] when none has been assigned.
     async fn resolve(
         &self,
         at: &TopicPartition,

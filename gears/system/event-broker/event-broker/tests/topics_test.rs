@@ -1,4 +1,4 @@
-//! Topic introspection (scenarios topics/1.01-1.04, features 0003 and 0007
+//! Topic introspection (scenarios topics/1.01 and 1.03-1.05, features 0003 and 0007
 //! §2.6): the topic list, a partition's segment manifest, the event-type
 //! list. In-process: real services and router, `SQLite` gear database, memory
 //! backend.
@@ -62,7 +62,7 @@ async fn list_topics_returns_a_paged_list_of_every_registered_topic() {
     );
 }
 
-// scenario: topics/1.02-positive-list-topic-segments.md
+// scenario: topics/1.05-positive-segments-empty-partition.md
 #[tokio::test]
 async fn segments_of_an_empty_partition_report_an_empty_manifest() {
     let harness = harness().await;
@@ -85,7 +85,7 @@ async fn segments_of_an_empty_partition_report_an_empty_manifest() {
             "end_sequence": 0,
             "start_time": null,
             "end_time": null,
-            "segments": [{ "start_sequence": 0, "end_sequence": 0, "event_count": 0 }],
+            "segments": [],
         })
     );
 }
@@ -147,7 +147,12 @@ async fn list_event_types_of_a_topic_returns_a_paged_list() {
                 "partition_key": "/tenant_id",
                 "data_schema": {
                     "allOf": [
-                        { "type": ["object", "null"] },
+                        {
+                            "additionalProperties": true,
+                            "default": null,
+                            "description": "Event payload, validated at ingest against the resolved schema of the event's type. The only field where UTF-8 (or any non-ASCII bytes) is permitted; all other event fields are ASCII per platform convention. May be absent for body-less events (e.g., notification-only events whose semantics are fully carried by `type` + `subject`).",
+                            "type": ["object", "null"],
+                        },
                         { "type": ["object", "null"] },
                     ],
                 },

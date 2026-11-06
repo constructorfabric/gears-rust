@@ -291,7 +291,7 @@ COLUMN public.bss_pricing_outbox_vacuum_counter partition_id bigint NOT NULL DEF
 COLUMN public.event_broker_producer_registrations client_agent character varying(256) NOT NULL DEFAULT -
 COLUMN public.event_broker_producer_registrations created_at timestamp with time zone NOT NULL DEFAULT now()
 COLUMN public.event_broker_producer_registrations generation bigint NOT NULL DEFAULT -
-COLUMN public.event_broker_producer_registrations mode character varying(32) NOT NULL DEFAULT -
+COLUMN public.event_broker_producer_registrations mode character varying(9) NOT NULL DEFAULT -
 COLUMN public.event_broker_producer_registrations outbox_partition bigint NOT NULL DEFAULT -
 COLUMN public.event_broker_producer_registrations producer_id uuid NOT NULL DEFAULT -
 COLUMN public.event_broker_producer_registrations queue character varying(255) NOT NULL DEFAULT -

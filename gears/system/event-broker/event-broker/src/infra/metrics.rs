@@ -28,6 +28,8 @@ pub enum RetryCause {
     UndecodablePayload,
     /// The payload names a topic the registry does not hold.
     UnregisteredTopic,
+    /// The payload's topic could not be looked up in the gear database.
+    SpecificationUnavailable,
 }
 
 impl RetryCause {
@@ -47,6 +49,7 @@ impl RetryCause {
             },
             Self::UndecodablePayload => "undecodable_payload",
             Self::UnregisteredTopic => "unregistered_topic",
+            Self::SpecificationUnavailable => "specification_unavailable",
         }
     }
 }

@@ -154,7 +154,7 @@ TABLE event_broker_producer_registrations
   COLUMN client_agent TEXT NOT NULL DEFAULT - PK 0
   COLUMN created_at TEXT NOT NULL DEFAULT datetime('now') PK 0
   COLUMN generation INTEGER NOT NULL DEFAULT - PK 0
-  COLUMN mode TEXT NOT NULL DEFAULT - PK 0
+  COLUMN mode VARCHAR(9) NOT NULL DEFAULT - PK 0
   COLUMN outbox_partition INTEGER NOT NULL DEFAULT - PK 3
   COLUMN producer_id TEXT NOT NULL DEFAULT - PK 0
   COLUMN queue TEXT NOT NULL DEFAULT - PK 2

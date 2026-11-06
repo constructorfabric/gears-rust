@@ -1,4 +1,25 @@
-use std::collections::HashMap;
+//! The direct producer: stamps each event's producer metadata from a local
+//! chain head per `(producer_id, topic)` and publishes it straight to the
+//! broker.
+//!
+//! The broker accepts a single writer per `producer_id` (ADR-0004 "Producer
+//! Concurrency"), and a `Producer` is that writer, so it serializes its own
+//! concurrent publishes per topic. Each topic has a `tokio::sync::Mutex`,
+//! held from stamping through the broker's answer to the advance of the head.
+//! Without it, two concurrent publishes would read the same head, carry the
+//! same numbers, and the broker would store one and answer the other
+//! `Duplicate`. A failed publish drops the lock without advancing, so the
+//! next publish re-stamps the same numbers. If the failed publish was stored
+//! after all, the re-stamped event is answered `Duplicate` and lost (tracked
+//! in #5660). Topics do not share a lock, so they still publish in parallel.
+//!
+//! Lock order: the topic locks first, then the `sequence_state` `RwLock`. A
+//! batch takes every topic lock it needs in ascending topic order, so two
+//! batches cannot deadlock. The `RwLock` is a `std` lock, taken only for a
+//! synchronous read or write: it is never held across an await, and never
+//! while waiting for a topic lock.
+
+use std::collections::{BTreeSet, HashMap};
 use std::marker::PhantomData;
 use std::sync::Arc;
 
@@ -24,6 +45,9 @@ type ProducerBuilderState<Broker, Ctx, Identity, Dedup, Topics, Patterns> =
 type ProducerSequenceKey = (ProducerId, String);
 pub(super) type ProducerSequenceCursor = HashMap<ProducerSequenceKey, i64>;
 type SharedProducerSequenceCursor = Arc<std::sync::RwLock<ProducerSequenceCursor>>;
+/// Keyed by topic alone: a `Producer`'s `producer_id` is fixed, so the topic
+/// names its chain.
+type TopicPublishLocks = HashMap<String, tokio::sync::Mutex<()>>;
 
 pub struct ProducerBuilder<
     Broker = Missing,
@@ -163,10 +187,27 @@ impl<B, C, I, D, T, P> ProducerBuilder<B, C, I, D, T, P> {
 }
 
 impl ProducerBuilder<Has, Has, Has, Has, Has, Has> {
+    /// Builds the producer and prepares every declared topic and event type
+    /// now, whatever the validation timing.
+    ///
+    /// # Errors
+    ///
+    /// [`EventBrokerError::InvalidProducerOptions`] for an empty or blank topic
+    /// or event-type pattern list, a blank identity source, or a registering
+    /// deduplication in stateless mode; otherwise whatever preparing the
+    /// topics and event types, registering the producer, or reading its
+    /// cursors fails with.
     pub async fn prepare_all(self) -> Result<Producer, EventBrokerError> {
         self.build_inner(true).await
     }
 
+    /// Builds the producer. Unless [`lazy_validation`](Self::lazy_validation)
+    /// was set, every declared topic and event type is prepared now.
+    ///
+    /// # Errors
+    ///
+    /// As [`prepare_all`](Self::prepare_all), except that a lazy builder
+    /// reports a preparation error on the first publish of the event type.
     pub async fn build(self) -> Result<Producer, EventBrokerError> {
         let prepare_all = matches!(self.validation_timing, ValidationTiming::Eager);
         self.build_inner(prepare_all).await
@@ -204,6 +245,11 @@ impl ProducerBuilder<Has, Has, Has, Has, Has, Has> {
             DirectDeduplication::Reuse { mode, producer_id } => (Some(producer_id), mode),
         };
 
+        let publish_locks = self
+            .topics
+            .iter()
+            .map(|topic| (topic.clone(), tokio::sync::Mutex::new(())))
+            .collect();
         let producer = Producer {
             broker,
             ctx,
@@ -215,12 +261,19 @@ impl ProducerBuilder<Has, Has, Has, Has, Has, Has> {
             validation_timing: self.validation_timing,
             cache,
             sequence_state: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            publish_locks,
         };
         producer.prime_sequence_state().await?;
         Ok(producer)
     }
 }
 
+/// Publishes typed events straight to the broker.
+///
+/// Concurrent publishes on one `Producer` are serialized per topic, so each
+/// one is stamped after the previous one on its topic was answered; different
+/// topics publish in parallel. Stateless producers stamp nothing and take no
+/// lock.
 pub struct Producer {
     broker: Arc<dyn EventBrokerApi>,
     ctx: SecurityContext,
@@ -232,14 +285,27 @@ pub struct Producer {
     validation_timing: ValidationTiming,
     cache: Arc<ProducerSchemaCache>,
     sequence_state: SharedProducerSequenceCursor,
+    publish_locks: TopicPublishLocks,
 }
 
 impl Producer {
+    /// Starts building a direct producer.
     #[must_use]
     pub fn builder() -> ProducerBuilder {
         ProducerBuilder::new()
     }
 
+    /// Prepares `E`'s event type and the declared topics, so a lazy
+    /// producer's first publish of `E` looks nothing up.
+    ///
+    /// # Errors
+    ///
+    /// [`EventBrokerError::EventTypeNotDeclared`] if `E` matches no declared
+    /// pattern, [`EventBrokerError::TopicNotFound`] for a declared topic the
+    /// broker does not list, [`EventBrokerError::TypeNotInDeclaredTopic`] if
+    /// `E` belongs to an undeclared topic, [`EventBrokerError::Internal`] if
+    /// its data schema does not compile; otherwise whatever the broker's
+    /// lookups fail with.
     pub async fn prepare<E: TypedEvent>(&self) -> Result<(), EventBrokerError> {
         self.cache
             .prepare_one(
@@ -252,6 +318,17 @@ impl Producer {
             .await
     }
 
+    /// Prepares every event type the declared patterns match, and the
+    /// declared topics.
+    ///
+    /// # Errors
+    ///
+    /// [`EventBrokerError::TopicNotFound`] for a declared topic the broker
+    /// does not list, [`EventBrokerError::EventTypeUnknown`] if the patterns
+    /// match no event type, [`EventBrokerError::TypeNotInDeclaredTopic`] if a
+    /// matched type belongs to an undeclared topic,
+    /// [`EventBrokerError::Internal`] if a matched type's data schema does not
+    /// compile; otherwise whatever the broker's lookups fail with.
     pub async fn prepare_all(&self) -> Result<(), EventBrokerError> {
         self.cache
             .prepare_all(
@@ -263,10 +340,23 @@ impl Producer {
             .await
     }
 
+    /// The broker-registered id stamped on this producer's events; `None` for
+    /// a stateless producer.
     pub fn producer_id(&self) -> Option<ProducerId> {
         self.producer_id
     }
 
+    /// Publishes `event` through [`EventBrokerApi::publish`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the error of preparing `event` or of the broker's publish, or
+    /// [`EventBrokerError::Internal`] on a broken internal invariant (no
+    /// publish lock for the event's declared topic).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the producer's sequence-state lock is poisoned.
     pub async fn publish<E: TypedEvent>(
         &self,
         event: E,
@@ -274,6 +364,21 @@ impl Producer {
         self.publish_inner(event, false).await
     }
 
+    /// Publishes `event` through [`EventBrokerApi::publish_sync`]. Until #5655
+    /// neither broker confirms the durable write: the REST client publishes
+    /// asynchronously and reports the server's status, and the in-process
+    /// `LocalBroker` inherits the trait default that delegates to `publish`;
+    /// both report `Accepted` or `Duplicate`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error of preparing `event` or of the broker's publish, or
+    /// [`EventBrokerError::Internal`] on a broken internal invariant (no
+    /// publish lock for the event's declared topic).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the producer's sequence-state lock is poisoned.
     pub async fn publish_persisted<E: TypedEvent>(
         &self,
         event: E,
@@ -281,35 +386,60 @@ impl Producer {
         self.publish_inner(event, true).await
     }
 
+    /// Publishes `events` as one all-or-nothing batch through
+    /// [`EventBrokerApi::publish_batch`]. An empty `events` publishes nothing
+    /// and returns no outcomes.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error of preparing an event or of the broker's publish, or
+    /// [`EventBrokerError::Internal`] on a broken internal invariant (no
+    /// publish lock for an event's declared topic).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the producer's sequence-state lock is poisoned.
     pub async fn publish_batch<E: TypedEvent>(
         &self,
         events: Vec<E>,
     ) -> Result<Vec<IngestOutcome>, EventBrokerError> {
+        if events.is_empty() {
+            return Ok(Vec::new());
+        }
         let mut prepared = Vec::with_capacity(events.len());
+        for event in events {
+            prepared.push(self.prepare_wire_event(event).await?);
+        }
+        let mut publish_guards = Vec::new();
+        if self.producer_id.is_some() {
+            let topics = prepared
+                .iter()
+                .map(|prepared| prepared.topic.as_str())
+                .collect::<BTreeSet<_>>();
+            for topic in topics {
+                publish_guards.push(self.publish_lock(topic)?.lock().await);
+            }
+        }
         let mut batch_sequence_state = self
             .sequence_state
             .read()
             .expect("producer sequence state lock poisoned")
             .clone();
-        for event in events {
-            let event = self
-                .prepare_wire_event_with_meta(event, |topic| {
-                    self.producer_meta_from_cursor(&batch_sequence_state, topic)
-                })
-                .await?;
+        for prepared in &mut prepared {
+            prepared.event.meta =
+                self.producer_meta_from_cursor(&batch_sequence_state, &prepared.topic);
             advance_cursor(
                 &mut batch_sequence_state,
-                &event.topic,
-                event.event.meta.as_ref(),
+                &prepared.topic,
+                prepared.event.meta.as_ref(),
             );
-            prepared.push(event);
         }
         let wire_events = prepared
             .iter()
             .map(|prepared| prepared.event.clone())
             .collect::<Vec<_>>();
-        // A batch is all-or-nothing: the broker reports one outcome for the
-        // whole batch. Apply it to every prepared event's local chain state.
+        // A batch is all-or-nothing: its one outcome means the broker holds
+        // every event, so each one advances the local chain.
         let outcome = self.broker.publish_batch(&self.ctx, &wire_events).await?;
         for prepared in &prepared {
             self.advance_after_acceptance(prepared, outcome).await;
@@ -317,6 +447,13 @@ impl Producer {
         Ok(vec![outcome; prepared.len()])
     }
 
+    /// Resets this producer's chain on the broker, over `scope`.
+    ///
+    /// # Errors
+    ///
+    /// [`EventBrokerError::Internal`] if called on a stateless producer, a
+    /// caller error since it has no chain; otherwise whatever the broker's
+    /// reset fails with.
     pub async fn reset_chain(&self, scope: ResetScope<'_>) -> Result<(), EventBrokerError> {
         let producer_id = self.producer_id.ok_or_else(|| {
             EventBrokerError::Internal("reset_chain called on a stateless producer".to_owned())
@@ -331,7 +468,12 @@ impl Producer {
         event: E,
         persisted: bool,
     ) -> Result<IngestOutcome, EventBrokerError> {
-        let prepared = self.prepare_wire_event(event).await?;
+        let mut prepared = self.prepare_wire_event(event).await?;
+        let _publish_guard = match self.producer_id {
+            Some(_) => Some(self.publish_lock(&prepared.topic)?.lock().await),
+            None => None,
+        };
+        prepared.event.meta = self.producer_meta(&prepared.topic);
         let outcome = if persisted {
             self.broker.publish_sync(&self.ctx, &prepared.event).await?
         } else {
@@ -341,18 +483,11 @@ impl Producer {
         Ok(outcome)
     }
 
+    /// Prepares the event unstamped: its producer metadata is set only under
+    /// the topic's publish lock.
     async fn prepare_wire_event<E: TypedEvent>(
         &self,
         event: E,
-    ) -> Result<super::event_factory::PreparedEvent, EventBrokerError> {
-        self.prepare_wire_event_with_meta(event, |topic| self.producer_meta(topic))
-            .await
-    }
-
-    async fn prepare_wire_event_with_meta<E: TypedEvent>(
-        &self,
-        event: E,
-        meta_for_topic: impl FnOnce(&str) -> Option<ProducerMeta>,
     ) -> Result<super::event_factory::PreparedEvent, EventBrokerError> {
         self.cache
             .ensure_declared(&self.event_type_patterns, E::TYPE_ID)
@@ -362,14 +497,15 @@ impl Producer {
         {
             self.prepare::<E>().await?;
         }
-        prepare_event(
-            &self.cache,
-            &self.identity,
-            &self.ctx,
-            event,
-            meta_for_topic,
-        )
-        .await
+        prepare_event(&self.cache, &self.identity, &self.ctx, event).await
+    }
+
+    /// A miss is an internal fault: preparing an event already checked that its
+    /// topic is declared, and every declared topic has a lock.
+    fn publish_lock(&self, topic: &str) -> Result<&tokio::sync::Mutex<()>, EventBrokerError> {
+        self.publish_locks.get(topic).ok_or_else(|| {
+            EventBrokerError::Internal(format!("no publish lock for the declared topic {topic}"))
+        })
     }
 
     fn producer_meta(&self, topic: &str) -> Option<ProducerMeta> {
@@ -393,24 +529,35 @@ impl Producer {
         producer_meta_for_last(self.mode, producer_id, last)
     }
 
-    async fn advance_after_acceptance(
+    /// Moves the local chain up to `prepared`'s sequence once the broker
+    /// holds the event. Every outcome means it does: a `Duplicate` says the
+    /// broker already holds this sequence or a later one, so staying behind
+    /// would re-stamp every following event with these numbers and have each
+    /// dropped as one more duplicate. The caller holds the topic's publish
+    /// lock, so `prepared` carries the head's next sequence; the state only
+    /// ever moves forward.
+    pub(super) async fn advance_after_acceptance(
         &self,
         prepared: &super::event_factory::PreparedEvent,
         outcome: IngestOutcome,
     ) {
-        if !matches!(outcome, IngestOutcome::Accepted | IngestOutcome::Persisted) {
-            return;
-        }
+        // Irrefutable, so a new outcome has to decide whether it advances.
+        let (IngestOutcome::Accepted | IngestOutcome::Persisted | IngestOutcome::Duplicate) =
+            outcome;
         let Some(meta) = &prepared.event.meta else {
             return;
         };
         let (Some(producer_id), Some(sequence)) = (meta.producer_id, meta.sequence) else {
             return;
         };
-        self.sequence_state
+        let mut sequence_state = self
+            .sequence_state
             .write()
-            .expect("producer sequence state lock poisoned")
-            .insert((ProducerId(producer_id), prepared.topic.clone()), sequence);
+            .expect("producer sequence state lock poisoned");
+        let last = sequence_state
+            .entry((ProducerId(producer_id), prepared.topic.clone()))
+            .or_insert(sequence);
+        *last = (*last).max(sequence);
     }
 
     async fn prime_sequence_state(&self) -> Result<(), EventBrokerError> {

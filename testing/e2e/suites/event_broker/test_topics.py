@@ -1,4 +1,4 @@
-"""Topic introspection scenarios (topics/1.01-1.04).
+"""Topic introspection scenarios (topics/1.01-1.05).
 
 All tests are read-only.  The pre-provisioned topics injected into the
 session-scoped server at startup (``TOPIC_STREAM``, ``TOPIC_LONGPOLL``,
@@ -16,6 +16,7 @@ from .conftest import (
     TOPIC_LONGPOLL,
     TOPIC_PREFILLED,
     TOPIC_STREAM,
+    TOPIC_STRICT,
     TRACE_ID,
 )
 
@@ -64,6 +65,24 @@ async def test_list_topic_segments_returns_manifest(api):
         "segments": body["segments"],
     }
     assert isinstance(body["segments"], list)
+
+
+async def test_segments_of_an_empty_partition_report_an_empty_manifest(api):
+    """scenario: topics/1.05-positive-segments-empty-partition.md"""
+    # TOPIC_STRICT only ever sees publishes the broker refuses, so it stores no events.
+    async with api() as client:
+        resp = await client.get(f"/topics/segments?topic={TOPIC_STRICT}&partition=0")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body == {
+        "topic": TOPIC_STRICT,
+        "partition": 0,
+        "start_sequence": 0,
+        "end_sequence": 0,
+        "start_time": None,
+        "end_time": None,
+        "segments": [],
+    }
 
 
 async def test_segments_for_unknown_topic_returns_404(api):

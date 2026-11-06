@@ -1,0 +1,5 @@
+error[E0425]: cannot find function `gts_declarations` in crate `gts_kit`
+ --> tests/ui/declarations_of_an_undeclared_crate.rs:4:22
+  |
+4 |     let _ = gts_kit::gts_declarations();
+  |                      ^^^^^^^^^^^^^^^^ not found in `gts_kit`

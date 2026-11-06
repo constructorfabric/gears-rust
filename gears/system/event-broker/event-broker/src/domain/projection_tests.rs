@@ -1,16 +1,18 @@
 //! Tests for [`crate::domain::projection`], the single place a resolved GTS type
 //! schema becomes one of the broker's API shapes.
 //!
-//! Fixtures are built the way production builds them: the base is the schema the
-//! broker's own declaration emits, so its `x-gts-traits-schema` - and therefore
-//! trait defaulting - is exercised rather than bypassed, and every derived
-//! schema carries its resolved parent, which `GtsTypeSchema::try_new` requires.
+//! Fixtures are built the way production builds them: the bases are the schemas
+//! the broker's own declarations emit into the GTS inventory, so the event
+//! base's `x-gts-traits-schema` - and therefore trait defaulting - is exercised
+//! rather than bypassed, and each fixture is listed through
+//! `PlatformTypesRegistryApi` from a registry that resolves it. A fixture the
+//! registry would refuse to admit is built as a `TypeSchema` literal instead.
 
-use std::sync::Arc;
-
-use event_broker_sdk::gts::{EventV1, TopicV1};
+use gts::{GtsIdPattern, GtsTypeId};
 use serde_json::json;
-use types_registry_sdk::{GtsInstance, GtsTypeSchema};
+use types_registry_sdk::testing_platform::MockTypesRegistry;
+use types_registry_sdk::{Instance, ListEntitiesRequest, PlatformTypesRegistryApiExt, TypeSchema};
+use uuid::Uuid;
 
 use crate::api::rest::handlers::ingest::dto::EventTypeDto;
 use crate::domain::error::DomainError;
@@ -44,34 +46,56 @@ fn base_data_member() -> serde_json::Value {
 
 // -- Fixture construction ------------------------------------------------------
 
-fn topic_base() -> Arc<GtsTypeSchema> {
-    base(TOPIC_BASE, &TopicV1::gts_schema_with_refs_as_string())
+/// A registry holding the inventory bases and `documents`, keyed by id.
+fn registry(documents: &[(&str, serde_json::Value)]) -> MockTypesRegistry {
+    let registry = MockTypesRegistry::new();
+    registry.seed_inventory();
+    for (id, document) in documents {
+        registry.seed(id, document.clone());
+    }
+    registry
 }
 
-fn event_base() -> Arc<GtsTypeSchema> {
-    base(EVENT_BASE, &EventV1::gts_schema_with_refs_as_string())
+/// `type_id` as `list_type_schemas` reports it from a registry holding the
+/// inventory bases and `documents`.
+async fn listed_event_type(type_id: &str, documents: &[(&str, serde_json::Value)]) -> TypeSchema {
+    let listed = registry(documents)
+        .list_type_schemas(
+            &toolkit_security::PlatformSecurityContext::outbound_marker(),
+            ListEntitiesRequest::matching(
+                GtsIdPattern::try_new(&format!("{EVENT_BASE}*")).expect("a valid pattern"),
+            ),
+        )
+        .await
+        .expect("the registry resolves every fixture");
+    let matching: Vec<&TypeSchema> = listed
+        .iter()
+        .filter(|schema| schema.type_id.as_ref() == type_id)
+        .collect();
+    let [schema] = matching.as_slice() else {
+        panic!("expected one listed {type_id}, got {matching:?}");
+    };
+    (*schema).clone()
 }
 
-fn base(type_id: &str, emitted: &str) -> Arc<GtsTypeSchema> {
-    let raw_schema = serde_json::from_str(emitted).expect("emitted base schema is valid JSON");
-    Arc::new(
-        GtsTypeSchema::try_new(gts::GtsTypeId::new(type_id), raw_schema, None, None)
-            .expect("base schema fixture"),
-    )
-}
-
-fn derived(
-    type_id: &str,
-    raw_schema: serde_json::Value,
-    parent: &Arc<GtsTypeSchema>,
-) -> GtsTypeSchema {
-    GtsTypeSchema::try_new(
-        gts::GtsTypeId::new(type_id),
-        raw_schema,
-        None,
-        Some(Arc::clone(parent)),
-    )
-    .expect("derived schema fixture")
+/// An event type the registry would refuse to admit, as it would reach the
+/// broker had it been admitted: `effective_traits` is what resolution would
+/// have merged, and the resolved schema is the event base with no narrowing.
+fn unadmitted_event_type(type_id: &str, effective_traits: serde_json::Value) -> TypeSchema {
+    TypeSchema {
+        type_id: GtsTypeId::new(type_id),
+        type_uuid: Uuid::nil(),
+        lifecycle_status: types_registry_sdk::LifecycleStatus::Active,
+        origin: None,
+        content: Some(body(type_id, EVENT_BASE, &effective_traits)),
+        resolved_schema: Some(json!({
+            "type": "object",
+            "allOf": [{ "type": "object", "properties": { "data": base_data_member() } }],
+        })),
+        effective_traits: Some(effective_traits),
+        effective_traits_schema: None,
+        provenance: None,
+    }
 }
 
 /// A derived schema body: the trait values it fixes, plus a `$ref` to the type
@@ -86,20 +110,26 @@ fn body(type_id: &str, parent_type_id: &str, traits: &serde_json::Value) -> serd
     })
 }
 
-/// A registered topic: the instance document, chained under the topic base whose
-/// properties it must satisfy. Built the way production builds it, so the base's
-/// own declaration is what the instance is held to.
-fn topic_instance(document: serde_json::Value) -> GtsInstance {
+/// A registered topic: the instance document as `list_instances` reports it.
+async fn topic_instance(document: serde_json::Value) -> Instance {
     let id = document["id"]
         .as_str()
-        .expect("fixture document carries an id");
-    GtsInstance::try_new(
-        gts::GtsInstanceId::try_new(id).expect("fixture topic id is an instance id"),
-        document,
-        None,
-        topic_base(),
-    )
-    .expect("topic instance fixture")
+        .expect("fixture document carries an id")
+        .to_owned();
+    let listed = registry(&[(&id, document)])
+        .list_instances(
+            &toolkit_security::PlatformSecurityContext::outbound_marker(),
+            ListEntitiesRequest::matching(
+                GtsIdPattern::try_new(&format!("{TOPIC_BASE}*")).expect("a valid pattern"),
+            ),
+        )
+        .await
+        .expect("the registry lists topics");
+    let [instance] = listed.as_slice() else {
+        panic!("expected one listed topic, got {listed:?}");
+    };
+    assert_eq!(instance.id.as_ref(), id);
+    instance.clone()
 }
 
 fn internal_detail(err: DomainError) -> String {
@@ -111,14 +141,15 @@ fn internal_detail(err: DomainError) -> String {
 
 // -- topic ---------------------------------------------------------------------
 
-#[test]
-fn topic_projects_a_document_that_declares_no_retention() {
+#[tokio::test]
+async fn topic_projects_a_document_that_declares_no_retention() {
     // `retention` is optional on the base, so a topic that declares none projects
     // with it absent - the broker's configured default applies instead.
     let instance = topic_instance(json!({
         "id": AUDIT_TOPIC,
         "description": "Audit stream.",
-    }));
+    }))
+    .await;
 
     let topic = projection::topic(&instance).unwrap();
     assert_eq!(topic.id.as_ref(), AUDIT_TOPIC);
@@ -126,15 +157,16 @@ fn topic_projects_a_document_that_declares_no_retention() {
     assert_eq!(topic.retention, None);
 }
 
-#[test]
-fn topic_projects_a_declared_retention_in_canonical_units() {
+#[tokio::test]
+async fn topic_projects_a_declared_retention_in_canonical_units() {
     // Authored with a day component on purpose: the projection parses the value
     // into a duration, so the reported form below is canonical hours.
     let instance = topic_instance(json!({
         "id": NOTIFY_TOPIC,
         "description": "Notification stream.",
         "retention": "P7D",
-    }));
+    }))
+    .await;
 
     let topic = projection::topic(&instance).unwrap();
     assert_eq!(topic.id.as_ref(), NOTIFY_TOPIC);
@@ -145,11 +177,11 @@ fn topic_projects_a_declared_retention_in_canonical_units() {
     );
 }
 
-#[test]
-fn topic_without_a_description_is_internal() {
+#[tokio::test]
+async fn topic_without_a_description_is_internal() {
     // The base requires `description`, so a document without one is a
     // registration `types-registry` should not have admitted.
-    let instance = topic_instance(json!({ "id": AUDIT_TOPIC }));
+    let instance = topic_instance(json!({ "id": AUDIT_TOPIC })).await;
 
     assert_eq!(
         internal_detail(projection::topic(&instance).unwrap_err()),
@@ -158,13 +190,14 @@ fn topic_without_a_description_is_internal() {
     );
 }
 
-#[test]
-fn topic_with_an_unparseable_retention_is_internal() {
+#[tokio::test]
+async fn topic_with_an_unparseable_retention_is_internal() {
     let instance = topic_instance(json!({
         "id": AUDIT_TOPIC,
         "description": "Audit stream.",
         "retention": "7 days",
-    }));
+    }))
+    .await;
 
     assert!(
         internal_detail(projection::topic(&instance).unwrap_err()).starts_with(
@@ -181,14 +214,17 @@ fn topic_with_an_unparseable_retention_is_internal() {
 
 // -- event_type ----------------------------------------------------------------
 
-#[test]
-fn event_type_defaults_allowed_subject_types_to_empty() {
+#[tokio::test]
+async fn event_type_defaults_allowed_subject_types_to_empty() {
     // No level of the chain declares the trait, so the base's default stands.
-    let schema = derived(
+    let schema = listed_event_type(
         ORDER_TYPE,
-        body(ORDER_TYPE, EVENT_BASE, &json!({ "topic": AUDIT_TOPIC })),
-        &event_base(),
-    );
+        &[(
+            ORDER_TYPE,
+            body(ORDER_TYPE, EVENT_BASE, &json!({ "topic": AUDIT_TOPIC })),
+        )],
+    )
+    .await;
 
     assert_eq!(
         serde_json::to_value(EventTypeDto::from(projection::event_type(&schema).unwrap())).unwrap(),
@@ -205,27 +241,29 @@ fn event_type_defaults_allowed_subject_types_to_empty() {
     );
 }
 
-#[test]
-fn event_type_inherits_traits_from_an_ancestor() {
+#[tokio::test]
+async fn event_type_inherits_traits_from_an_ancestor() {
     // The leaf re-anchors the type to another topic but says nothing about
     // subject types, so the parent's list resolves.
-    let parent = Arc::new(derived(
+    let parent = body(
         ORDER_TYPE,
-        body(
-            ORDER_TYPE,
-            EVENT_BASE,
-            &json!({
-                "topic": AUDIT_TOPIC,
-                "allowed_subject_types": ["gts.cf.core.events.subject.v1~example.proj.shop.order.v1~"],
-            }),
-        ),
-        &event_base(),
-    ));
-    let schema = derived(
-        ORDER_EU_TYPE,
-        body(ORDER_EU_TYPE, ORDER_TYPE, &json!({ "topic": NOTIFY_TOPIC })),
-        &parent,
+        EVENT_BASE,
+        &json!({
+            "topic": AUDIT_TOPIC,
+            "allowed_subject_types": ["gts.cf.core.events.subject.v1~example.proj.shop.order.v1~"],
+        }),
     );
+    let schema = listed_event_type(
+        ORDER_EU_TYPE,
+        &[
+            (ORDER_TYPE, parent),
+            (
+                ORDER_EU_TYPE,
+                body(ORDER_EU_TYPE, ORDER_TYPE, &json!({ "topic": NOTIFY_TOPIC })),
+            ),
+        ],
+    )
+    .await;
 
     assert_eq!(
         serde_json::to_value(EventTypeDto::from(projection::event_type(&schema).unwrap())).unwrap(),
@@ -244,27 +282,30 @@ fn event_type_inherits_traits_from_an_ancestor() {
     );
 }
 
-#[test]
-fn event_type_composes_the_data_narrowings_with_the_leaf_last() {
-    let schema = derived(
+#[tokio::test]
+async fn event_type_composes_the_data_narrowings_with_the_leaf_last() {
+    let schema = listed_event_type(
         ORDER_TYPE,
-        json!({
-            "$id": format!("gts://{ORDER_TYPE}"),
-            "$schema": "http://json-schema.org/draft-07/schema#",
-            "x-gts-traits": { "topic": AUDIT_TOPIC },
-            "type": "object",
-            "allOf": [
-                { "$ref": format!("gts://{EVENT_BASE}") },
-                {
-                    "type": "object",
-                    "properties": {
-                        "data": { "type": "object", "required": ["order_id"] },
+        &[(
+            ORDER_TYPE,
+            json!({
+                "$id": format!("gts://{ORDER_TYPE}"),
+                "$schema": "http://json-schema.org/draft-07/schema#",
+                "x-gts-traits": { "topic": AUDIT_TOPIC },
+                "type": "object",
+                "allOf": [
+                    { "$ref": format!("gts://{EVENT_BASE}") },
+                    {
+                        "type": "object",
+                        "properties": {
+                            "data": { "type": "object", "required": ["order_id"] },
+                        },
                     },
-                },
-            ],
-        }),
-        &event_base(),
-    );
+                ],
+            }),
+        )],
+    )
+    .await;
 
     assert_eq!(
         serde_json::to_value(EventTypeDto::from(projection::event_type(&schema).unwrap())).unwrap(),
@@ -286,14 +327,11 @@ fn event_type_composes_the_data_narrowings_with_the_leaf_last() {
 
 #[test]
 fn event_type_without_a_topic_trait_is_internal() {
-    let schema = derived(
+    // `topic` is required by the base's trait schema, so the registry refuses
+    // a type that resolves none.
+    let schema = unadmitted_event_type(
         ORDER_TYPE,
-        body(
-            ORDER_TYPE,
-            EVENT_BASE,
-            &json!({ "allowed_subject_types": [] }),
-        ),
-        &event_base(),
+        json!({ "allowed_subject_types": [], "partition_key": "/tenant_id" }),
     );
 
     assert_eq!(
@@ -307,10 +345,15 @@ fn event_type_naming_a_type_shaped_topic_is_internal() {
     // A topic is an instance, so an id with the trailing `~` names a type and
     // cannot be the stream an event type publishes to.
     let type_shaped = "gts.cf.core.events.topic.v1~example.proj.broker.audit.v1~";
-    let schema = derived(
+    // The base narrows `topic` to an instance of the topic base type, so the
+    // registry refuses this type.
+    let schema = unadmitted_event_type(
         ORDER_TYPE,
-        body(ORDER_TYPE, EVENT_BASE, &json!({ "topic": type_shaped })),
-        &event_base(),
+        json!({
+            "topic": type_shaped,
+            "allowed_subject_types": [],
+            "partition_key": "/tenant_id",
+        }),
     );
 
     assert_eq!(

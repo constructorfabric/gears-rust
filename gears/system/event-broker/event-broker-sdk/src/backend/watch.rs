@@ -12,7 +12,8 @@ pub enum Watch<'a> {
     /// The medium pushes head changes.
     Native(&'a dyn HeadWatch),
     /// The gear polls `resolve(Latest)` for each watched partition at this
-    /// interval ([`support::poll_heads`](super::support::poll_heads)).
+    /// interval ([`support::poll_heads`](super::support::poll_heads)). An
+    /// interval under 1 ms polls every 1 ms.
     Poll(Duration),
 }
 

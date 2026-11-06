@@ -5,8 +5,8 @@ use clap::{Parser, Subcommand};
 use mimalloc::MiMalloc;
 use serde_json::Value;
 use toolkit::bootstrap::{
-    AppConfig, dump_effective_gears_config_json, dump_effective_gears_config_yaml, list_gear_names,
-    run_migrate, run_server,
+    AppConfig, PublishGtsOptions, dump_effective_gears_config_json,
+    dump_effective_gears_config_yaml, list_gear_names, run_migrate, run_publish_gts, run_server,
 };
 
 use std::{collections::hash_map::Entry, path::PathBuf};
@@ -61,6 +61,16 @@ enum Commands {
     Check,
     /// Run database migrations and exit (for cloud deployments)
     Migrate,
+    /// Publish every linked gear's GTS documents to a remote types-registry and
+    /// exit (a deployment step; runs no gear)
+    PublishGts {
+        /// Base URI of the remote types-registry
+        #[arg(long)]
+        registry: String,
+        /// Overall deadline in seconds; a nonzero exit when it passes
+        #[arg(long, default_value_t = 300)]
+        deadline_secs: u64,
+    },
 }
 
 fn apply_port_override(config: &mut AppConfig, port: u16) -> Result<()> {
@@ -143,6 +153,19 @@ async fn main() -> Result<()> {
     match cli.command.unwrap_or(Commands::Run) {
         Commands::Run => run_server(config).await,
         Commands::Migrate => run_migrate(config).await,
+        Commands::PublishGts {
+            registry,
+            deadline_secs,
+        } => {
+            run_publish_gts(
+                config,
+                PublishGtsOptions {
+                    registry_endpoint: registry,
+                    deadline: std::time::Duration::from_secs(deadline_secs),
+                },
+            )
+            .await
+        }
         Commands::Check => Ok(()),
     }
 }

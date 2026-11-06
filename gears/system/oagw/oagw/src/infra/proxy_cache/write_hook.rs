@@ -96,7 +96,7 @@ impl WriteHook {
 
     /// The cache writes evict from.
     #[cfg(feature = "cluster")]
-    pub(super) fn cache(&self) -> &Arc<ProxyConfigCache> {
+    pub(crate) fn cache(&self) -> &Arc<ProxyConfigCache> {
         &self.cache
     }
 

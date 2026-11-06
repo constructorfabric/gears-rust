@@ -337,9 +337,51 @@ fn expired_tokens(scope: &AccessScope, now: OffsetDateTime) -> SelectStatement {
         .into_query()
 }
 
-/// Active leases holding `quota_id` that have not expired, locked in token
-/// order (rank 3). The deactivation cascade resolves exactly these; expired
-/// ones are already released (I4) and belong to the sweeper.
+/// Active leases holding `quota_id` that have not expired, in token order.
+/// The deactivation cascade resolves exactly these; expired ones are already
+/// released (I4) and belong to the sweeper.
+fn active_on_quota_query(
+    scope: &AccessScope,
+    quota_id: Uuid,
+    now: OffsetDateTime,
+) -> sea_orm::Select<lease::Entity> {
+    // A subquery, not a bound token list: the unreturned holds have no upper bound.
+    let holders = lease_hold::Entity::find()
+        .filter(lease_hold::Column::QuotaId.eq(quota_id))
+        .filter(lease_hold::Column::ReturnedAt.is_null())
+        .secure()
+        .scope_with(scope)
+        .into_inner()
+        .select_only()
+        .column(lease_hold::Column::LeaseToken)
+        .into_query();
+    lease::Entity::find()
+        .filter(lease::Column::Token.in_subquery(holders))
+        .filter(lease::Column::State.eq(STATE_ACTIVE))
+        .filter(lease::Column::ExpiryAt.gt(now))
+        .order_by(lease::Column::Token, Order::Asc)
+}
+
+/// [`active_on_quota_for_update`], read without a lock: what a caller must
+/// know before it takes rank 3.
+///
+/// # Errors
+///
+/// The scope or database error of the read.
+pub async fn active_on_quota(
+    runner: &impl DBRunner,
+    scope: &AccessScope,
+    quota_id: Uuid,
+    now: OffsetDateTime,
+) -> Result<Vec<lease::Model>, ScopeError> {
+    active_on_quota_query(scope, quota_id, now)
+        .secure()
+        .scope_with(scope)
+        .all(runner)
+        .await
+}
+
+/// The live leases holding `quota_id`, locked in token order (rank 3).
 ///
 /// # Errors
 ///
@@ -351,23 +393,11 @@ pub async fn active_on_quota_for_update(
     now: OffsetDateTime,
     wait: RowWait,
 ) -> Result<Vec<lease::Model>, ScopeError> {
-    // A subquery, not a bound token list: the unreturned holds have no upper bound.
-    let holders = lease_hold::Entity::find()
-        .filter(lease_hold::Column::QuotaId.eq(quota_id))
-        .filter(lease_hold::Column::ReturnedAt.is_null())
+    wait.apply(active_on_quota_query(scope, quota_id, now))
         .secure()
         .scope_with(scope)
-        .into_inner()
-        .select_only()
-        .column(lease_hold::Column::LeaseToken)
-        .into_query();
-    let query = lease::Entity::find()
-        .filter(lease::Column::Token.in_subquery(holders))
-        .filter(lease::Column::State.eq(STATE_ACTIVE))
-        .filter(lease::Column::ExpiryAt.gt(now))
-        .order_by(lease::Column::Token, Order::Asc);
-    let query = wait.apply(query);
-    query.secure().scope_with(scope).all(runner).await
+        .all(runner)
+        .await
 }
 
 /// Up to `batch_size` leases expired at or before `before`, locked (rank 3).

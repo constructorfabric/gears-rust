@@ -1371,7 +1371,7 @@ service discovery state. Persistent state (if needed for multi-host P2) will be 
 └────────────┘  └────────────┘
 ```
 
-- Flight Control runs system gears and optionally some application gears.
+- Flight Control runs selected core gears: gears in the system gear group and its application AuthN resolver/plugin. Core gears are all gears under `gears/system/` (possibly `gears/core/` in the future); only the `system` capability selects the early startup group.
 - OoP gears are separate processes on the same host (UDS) or remote hosts (TCP, P2: mTLS).
 - api-gateway reverse-proxies public OoP routes via `ToolKitGatewayProvider`.
 - DirectoryService tracks all gear endpoints.
@@ -1902,7 +1902,7 @@ Flight Control itself.** OoP gears register with Flight Control's directory and 
 | service-discovery (DirectoryService) | Service registration + discovery | No DB; in-memory registry. Gears re-register on heartbeat, so restart recovery is handled. | Serves gRPC via grpc-hub; its REST surface (co-hosted on api-gateway) enables k8s-native discovery. **One per installation** — see below. |
 | grpc-hub | gRPC transport for the directory + platform-plane RPCs | Stateless. | Hosts the DirectoryService gRPC endpoint. |
 | api-gateway | Edge + REST host: reverse-proxies exposed OoP routes and co-hosts the other control-plane gears' REST routes (directory, types-registry) on one HTTP server | No DB; in-memory route table populated from directory registrations. | Built-in edge in Profile 2 and Profile 3 Mode A; in Mode B an external gateway (Kong/Tyk) replaces the edge. |
-| types-registry | GTS catalogue | In-memory (link-time inventory + config seed + runtime registrations). Shared/DB persistence is a future optimization for multi-instance. | `post_init` graph validation must see a consistent view across distributed registrations. |
+| types-registry | GTS catalogue | Database-backed admission and reads; the legacy in-memory catalogue remains during migration. | System startup prepares registry seeds; application GTS publication waits for admission before application `init`. Legacy finalization runs after application `init`. |
 | authn-resolver | Edge JWT validation (bearer token → tenant `SecurityContext`) | No DB; JWKS cache only. | Stateless. Runs at the edge here and also embeds in each OoP pod for per-hop re-validation. |
 
 ##### One directory per installation

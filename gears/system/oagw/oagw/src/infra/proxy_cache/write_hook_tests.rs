@@ -136,6 +136,7 @@ impl Fixture {
         let metrics = Arc::new(CacheMetrics::default());
         let cache = Arc::new(ProxyConfigCache::new(
             Duration::from_secs(60),
+            Duration::ZERO,
             100,
             metrics.clone(),
         ));

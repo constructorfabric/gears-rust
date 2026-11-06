@@ -6,7 +6,6 @@ use async_trait::async_trait;
 use license_resolver_sdk::LicenseResolverApi;
 use toolkit::api::OpenApiRegistry;
 use toolkit::context::GearCtx;
-use toolkit::contracts::SystemCapability;
 use toolkit::{Gear, RestApiCapability};
 use toolkit_contract::policy::PolicyStack;
 use tracing::info;
@@ -27,7 +26,7 @@ use crate::infra::{GtsContractRegistry, metrics};
 #[toolkit::gear(
     name = "license-resolver",
     deps = [types_registry],
-    capabilities = [system, rest]
+    capabilities = [rest]
 )]
 #[toolkit::provides(
     contract = license_resolver_sdk::LicenseResolverApi,
@@ -56,10 +55,6 @@ impl LicenseResolver {
         Ok(Arc::new(LicenseResolverLocalClient::new(svc)))
     }
 }
-
-// Marked as `system` so that init() runs in the system-gear phase, making the
-// client available in ClientHub before other system gears that gate on a license.
-impl SystemCapability for LicenseResolver {}
 
 #[async_trait]
 impl Gear for LicenseResolver {

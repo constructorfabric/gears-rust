@@ -37,7 +37,6 @@ use quota_enforcement_sdk::{
 };
 use sea_orm::EntityTrait as _;
 use sea_orm_migration::prelude::*;
-use testcontainers::core::ExecCommand;
 use testcontainers::runners::AsyncRunner;
 use testcontainers::{ContainerAsync, ImageExt};
 use testcontainers_modules::postgres::Postgres;
@@ -387,20 +386,8 @@ impl PgHarness {
             .expect("debit");
     }
 
-    /// Sessions `PostgreSQL` shows waiting on a lock.
     async fn lock_waiters(&self) -> u32 {
-        let sql = "SELECT count(*) FROM pg_stat_activity WHERE wait_event_type = 'Lock'";
-        let args = ["psql", "-tA", "-U", "user", "-d", "app", "-c", sql];
-        let mut output = self
-            .container
-            .exec(ExecCommand::new(args.map(str::to_owned)))
-            .await
-            .expect("psql runs in the container");
-        let stdout = output.stdout_to_vec().await.expect("psql output");
-        String::from_utf8_lossy(&stdout)
-            .trim()
-            .parse()
-            .expect("a count")
+        common::lock_waiters(&self.container).await
     }
 
     async fn periods(&self, id: QuotaId) -> Vec<quota_consumption_counter::Model> {

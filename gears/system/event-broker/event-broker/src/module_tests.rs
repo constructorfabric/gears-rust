@@ -17,10 +17,14 @@ use toolkit::{ClientHub, Gear, GearCtx, RestApiCapability};
 use tower::ServiceExt;
 use uuid::Uuid;
 
-use super::EventBrokerModule;
+use super::{BACKEND_STOP_GRACE, EventBrokerModule, start_backends, stop_backends};
 use crate::config::{DeploymentMode, EventBrokerConfig};
 use crate::test_support::module_boot::StaticConfigProvider;
-use event_broker_sdk::backend::Role;
+use event_broker_sdk::backend::{
+    AppendRequest, Appended, Backend, BackendError, Dedup, LogClaim, Provisioning, Role,
+    TopicPartition, TopicSpec, Wait, Watch,
+};
+use event_broker_sdk::{Event, PartitionRange, Position, Sequence, TopicSegment};
 
 struct NoopOpenApiRegistry;
 
@@ -294,8 +298,8 @@ async fn standalone_register_rest_builds_router_and_serves_a_route_with_no_auth_
     hub.register::<dyn authz_resolver_sdk::AuthZResolverApi>(Arc::new(
         crate::test_support::authz_doubles::AllowAllAuthZ,
     ));
-    hub.register::<dyn types_registry_sdk::TypesRegistryClient>(Arc::new(
-        types_registry_sdk::testing::MockTypesRegistryClient::new(),
+    hub.register::<dyn types_registry_sdk::PlatformTypesRegistryApi>(Arc::new(
+        types_registry_sdk::testing_platform::MockTypesRegistry::new(),
     ));
     let ctx = make_ctx_with_hub("standalone", hub).await;
     let module = EventBrokerModule::default();
@@ -559,4 +563,211 @@ async fn an_unreachable_backend_does_not_stop_the_start_and_its_topics_are_unava
         .await
         .expect("serve task must not panic")
         .expect("serve must return Ok on cancellation");
+}
+
+/// A stop while the startup registry load waits on a registry that never
+/// answers ends the start promptly: a process stopped right after launch
+/// exits instead of hanging on the load.
+#[tokio::test]
+async fn a_stop_during_the_startup_registry_load_ends_the_start_promptly() {
+    let hub = Arc::new(ClientHub::new());
+    let ctx = make_ctx_with_hub("standalone", Arc::clone(&hub)).await;
+    let module = Arc::new(EventBrokerModule::default());
+    module.init(&ctx).await.expect("init must succeed");
+    // After `init`: `serve()` resolves the registry for the startup load. Its
+    // list calls never answer, as a registry that is unreachable without
+    // refusing the connection would.
+    let registry = Arc::new(types_registry_sdk::testing_platform::MockTypesRegistry::new());
+    registry.inject(
+        types_registry_sdk::testing_platform::Fault::on(
+            types_registry_sdk::testing_platform::Call::List,
+        )
+        .delay(Duration::from_secs(3600)),
+    );
+    hub.register::<dyn types_registry_sdk::PlatformTypesRegistryApi>(
+        Arc::clone(&registry) as Arc<dyn types_registry_sdk::PlatformTypesRegistryApi>
+    );
+
+    let cancel = CancellationToken::new();
+    let serve_task = crate::test_support::module_boot::spawn_serve(&module, &cancel);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while registry.calls(types_registry_sdk::testing_platform::Call::List) < 1 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the startup load must reach the registry's list call within 2s");
+    assert!(
+        !serve_task.is_finished(),
+        "the start waits on the registry load until the stop"
+    );
+
+    cancel.cancel();
+    tokio::time::timeout(Duration::from_secs(2), serve_task)
+        .await
+        .expect("serve must return within 2s of the stop")
+        .expect("serve task must not panic")
+        .expect("serve must return Ok on a stop");
+}
+
+/// Bounds each await of the backend start and stop tests, so a stop that
+/// never returns fails the test instead of hanging it.
+const BOUND: Duration = Duration::from_secs(1);
+
+/// A `start` or `stop` a [`LifecycleBackend`] saw, naming the backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Lifecycle {
+    Start(u8),
+    Stop(u8),
+}
+
+type Journal = Arc<std::sync::Mutex<Vec<(Lifecycle, Duration)>>>;
+
+/// Records each `start` and `stop` with the time it returned, measured from
+/// `epoch`. Its `start` fails when `fails_start`; its `stop` returns only once
+/// the deadline is cancelled when `waits_for_deadline`, and at once otherwise.
+struct LifecycleBackend {
+    id: u8,
+    fails_start: bool,
+    waits_for_deadline: bool,
+    epoch: tokio::time::Instant,
+    journal: Journal,
+}
+
+impl LifecycleBackend {
+    fn record(&self, call: Lifecycle) {
+        self.journal
+            .lock()
+            .expect("journal lock")
+            .push((call, self.epoch.elapsed()));
+    }
+}
+
+fn not_called() -> BackendError {
+    BackendError::Internal("only start and stop are called".to_owned())
+}
+
+#[async_trait::async_trait]
+impl Backend for LifecycleBackend {
+    async fn provision(&self, _: &TopicSpec, _: &LogClaim) -> Result<Provisioning, BackendError> {
+        Err(not_called())
+    }
+    async fn append(&self, _: &AppendRequest<'_>) -> Result<Appended, BackendError> {
+        Err(not_called())
+    }
+    fn dedup(&self) -> Dedup {
+        Dedup::Fenced
+    }
+    fn max_events_per_append(&self) -> usize {
+        1
+    }
+    async fn read(
+        &self,
+        _: &TopicPartition,
+        _: Sequence,
+        _: usize,
+        _: Wait,
+    ) -> Result<Vec<Event>, BackendError> {
+        Err(not_called())
+    }
+    async fn resolve(&self, _: &TopicPartition, _: Position) -> Result<Sequence, BackendError> {
+        Err(not_called())
+    }
+    fn watch(&self) -> Watch<'_> {
+        Watch::Poll(Duration::from_secs(1))
+    }
+    async fn query(
+        &self,
+        _: &TopicPartition,
+        _: PartitionRange,
+    ) -> Result<Vec<TopicSegment>, BackendError> {
+        Err(not_called())
+    }
+    async fn start(&self) -> Result<(), BackendError> {
+        self.record(Lifecycle::Start(self.id));
+        if self.fails_start {
+            return Err(BackendError::Internal("the medium refused".to_owned()));
+        }
+        Ok(())
+    }
+    async fn stop(&self, deadline: CancellationToken) {
+        if self.waits_for_deadline {
+            deadline.cancelled().await;
+        }
+        self.record(Lifecycle::Stop(self.id));
+    }
+}
+
+fn lifecycle_backends(ids: &[(u8, bool, bool)], journal: &Journal) -> Vec<Arc<dyn Backend>> {
+    let epoch = tokio::time::Instant::now();
+    ids.iter()
+        .map(|&(id, fails_start, waits_for_deadline)| {
+            Arc::new(LifecycleBackend {
+                id,
+                fails_start,
+                waits_for_deadline,
+                epoch,
+                journal: Arc::clone(journal),
+            }) as Arc<dyn Backend>
+        })
+        .collect()
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_failed_backend_start_stops_the_started_ones_in_reverse() {
+    let journal = Journal::default();
+    let backends = lifecycle_backends(
+        &[(1, false, false), (2, false, false), (3, true, false)],
+        &journal,
+    );
+
+    let result = tokio::time::timeout(BOUND, start_backends(&backends))
+        .await
+        .expect("the start returns in time");
+
+    let Err(error) = result else {
+        panic!("a failed backend start fails the start");
+    };
+    assert_eq!(
+        error.to_string(),
+        "could not start the storage backend: internal: the medium refused"
+    );
+    assert_eq!(
+        *journal.lock().expect("journal lock"),
+        vec![
+            (Lifecycle::Start(1), Duration::ZERO),
+            (Lifecycle::Start(2), Duration::ZERO),
+            (Lifecycle::Start(3), Duration::ZERO),
+            (Lifecycle::Stop(2), Duration::ZERO),
+            (Lifecycle::Stop(1), Duration::ZERO),
+        ]
+    );
+}
+
+/// One grace covers the whole stop: backends stopping later get only what
+/// remains of it, possibly none, before the shared deadline is cancelled.
+#[tokio::test(start_paused = true)]
+async fn stopping_backends_waits_out_one_shared_grace_then_cancels() {
+    let journal = Journal::default();
+    let backends = lifecycle_backends(&[(1, false, true), (2, false, true)], &journal);
+    let epoch = tokio::time::Instant::now();
+
+    tokio::time::timeout(BACKEND_STOP_GRACE + BOUND, stop_backends(&backends))
+        .await
+        .expect("the stop returns once the grace elapses");
+
+    let elapsed = epoch.elapsed();
+    assert!(
+        (BACKEND_STOP_GRACE..BACKEND_STOP_GRACE + Duration::from_millis(1)).contains(&elapsed),
+        "the stop returns when the grace elapses, not before: {elapsed:?}"
+    );
+    let journal = journal.lock().expect("journal lock").clone();
+    let [(Lifecycle::Stop(2), second), (Lifecycle::Stop(1), first)] = journal.as_slice() else {
+        panic!("both backends stop, in reverse: {journal:?}");
+    };
+    assert_eq!(
+        (*second, *first),
+        (elapsed, elapsed),
+        "the cancelled deadline ends every waiting stop at once"
+    );
 }

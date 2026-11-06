@@ -68,15 +68,19 @@ let producer = Producer::builder()
     .await?;
 
 producer.publish(OrderCreated { order_id, total_cents: 4299 }).await?;
+// Reports `Accepted` or `Duplicate`, never `Persisted`, until #5655 serves synchronous publish.
 producer.publish_persisted(OrderCreated { order_id, total_cents: 4299 }).await?;
 ```
+
+A chained or monotonic `Producer` serializes its publishes per topic. After a
+publish whose outcome it does not see, it may reuse a sequence (tracked in #5660).
 
 ### DB-aware managed outbox producer (`outbox` feature)
 
 ```rust
 use event_broker_sdk::{
-    DbDeduplication, DbProducer, MissingProducerRegistration, ProducerIdentity,
-    ProducerMode, UnknownProducerRegistration, producer_registration_migrations,
+    DbDeduplication, DbProducer, ProducerIdentity, ProducerMode,
+    producer_registration_migrations,
 };
 use toolkit_db::outbox::{Outbox, Partitions};
 
@@ -100,8 +104,7 @@ let producer = DbProducer::builder()
     .deduplication(
         DbDeduplication::managed(ProducerMode::Chained)
             .key("orders.created")
-            .on_missing(MissingProducerRegistration::RegisterNew)
-            .on_unknown(UnknownProducerRegistration::RegisterNew),
+            .build()?,
     )
     .topics(["gts.cf.core.events.topic.v1~orders.v1"])
     .event_type_patterns(["gts.cf.core.events.event.v1~orders.*"])
@@ -115,12 +118,12 @@ let outbox_handle = event_outbox
     .await?;
 let producer_outbox = event_outbox.bind(&outbox_handle);
 
-// in_transaction flushes the producer-outbox handle only if the transaction
-// commits, so nothing is published for a rolled-back write.
+// in_transaction fires the returned wake only if the transaction commits, so
+// nothing is published for a rolled-back write.
 toolkit_db::outbox::in_transaction(&db, |txn| Box::pin(async move {
     write_business_state(txn).await?;
-    let flush = producer_outbox.enqueue(txn, OrderCreated { ... }).await?;
-    Ok(((), flush))
+    let wake = producer_outbox.enqueue(txn, OrderCreated { ... }).await?;
+    Ok(((), wake))
 })).await?;
 ```
 
@@ -129,10 +132,12 @@ validation mode, call `producer.prepare::<OrderCreated>().await?` or
 `producer.prepare_all().await?` before opening the business transaction; enqueue
 does not call Event Broker while the transaction is open.
 
+A registration key and an outbox queue name are non-blank, carry no leading or trailing whitespace, and are at most 255 bytes.
+
 ### Producer configuration matrix
 
 | Surface | Deduplication | Local DB | Producer id | Multi-instance notes |
-|---|---|---|---|
+|---|---|---|---|---|
 | `Producer` | `DirectDeduplication::stateless()` | No | None | Safe for horizontally scaled producers when consumers are idempotent |
 | `Producer` | `register_on_start(mode)` | No | Fresh broker-issued id per process | Deduplication identity resets on process restart |
 | `Producer` | `reuse(mode, producer_id)` | No | Caller-supplied broker-issued id | Caller must provide durable id storage and single-writer coordination |
@@ -284,13 +289,13 @@ impl TxSingleEventHandler<LocalDbOffsetManager> for MyHandler {
                 .attempts(attempts)
                 .build();
 
-            // in_transaction flushes the DLQ handle only after the commit lands.
-            // Enqueue last, so an error on the offset write never leaves a handle
-            // to drop.
+            // in_transaction fires the returned wake only if the transaction
+            // commits. Enqueue last, so an error on the offset write never drops
+            // an unfired wake.
             toolkit_db::outbox::in_transaction(&self.db, |tx| Box::pin(async move {
                 commit.commit_offset_in_tx(tx, event.offset).await?;
-                let flush = self.dlq.enqueue(tx, record).await?;
-                Ok(((), flush))
+                let wake = self.dlq.enqueue(tx, record).await?;
+                Ok(((), wake))
             })).await?;
 
             return Ok(HandlerOutcome::Success);

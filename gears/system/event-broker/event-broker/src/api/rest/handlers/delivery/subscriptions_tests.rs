@@ -430,6 +430,55 @@ async fn join_unregistered_topic_returns_404() {
     );
 }
 
+/// A topic lookup that cannot be read is not an unregistered topic: the JOIN
+/// is answered `503`, retryable, and leaves no subscription behind.
+#[tokio::test]
+async fn a_join_during_a_spec_cache_fault_answers_503() {
+    const TENANT: Uuid = Uuid::from_u128(0x7e7a_0503);
+    let harness = EventBrokerHarness::builder()
+        .with_type_registry(StaticTypesRegistry::of(json!([
+            { "id": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1", "partitions": 3 },
+        ])))
+        .build()
+        .await;
+    let group = harness.api_v1().post_consumer_groups().send().await.json()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    harness.drop_metadata_table("event_broker_spec_cache").await;
+
+    let resp = harness
+        .api_v1()
+        .post_subscriptions()
+        .with_body(Json(&json!({
+            "consumer_group": group,
+            "client_agent": "test-agent",
+            "interests": [{
+                "topic": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
+                "tenant_id": TENANT,
+                "types": ["gts.cf.core.events.event.v1~x.eb.t1.foo.v1~"],
+            }],
+        })))
+        .send()
+        .await;
+
+    resp.assert_status(503);
+    assert_eq!(
+        resp.json(),
+        json!({
+            "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.service_unavailable.v1~",
+            "title": "Service Unavailable",
+            "status": 503,
+            "detail": "database scope resolution failed",
+            "instance": "/event-broker/v1/subscriptions",
+            "context": {},
+        })
+    );
+    let listed = harness.api_v1().get_subscriptions().send().await;
+    listed.assert_status(200);
+    assert_eq!(listed.json()["items"], json!([]));
+}
+
 #[tokio::test]
 async fn join_bad_type_pattern_returns_400() {
     let harness = EventBrokerHarness::builder()
@@ -820,6 +869,7 @@ async fn join_rejected_for_missing_topic_consume_permission_returns_403() {
 
 #[tokio::test]
 async fn join_checks_consume_on_the_concrete_topic_and_types() {
+    let target_tenant = Uuid::new_v4();
     let asked = Arc::new(std::sync::Mutex::new(Vec::<(String, String)>::new()));
     let recorder = Arc::clone(&asked);
     let harness = EventBrokerHarness::builder()
@@ -828,6 +878,14 @@ async fn join_checks_consume_on_the_concrete_topic_and_types() {
         ])))
         .with_policy_enforcer(PolicyEnforcer::new(Arc::new(DenyingAuthZ {
             deny_if: move |req: &EvaluationRequest| {
+                if req.resource.properties.contains_key("event_type_id")
+                    || req.resource.properties.contains_key("topic_id")
+                {
+                    assert_eq!(
+                        req.resource.properties.get("owner_tenant_id"),
+                        Some(&json!(target_tenant))
+                    );
+                }
                 recorder
                     .lock()
                     .unwrap()
@@ -851,7 +909,7 @@ async fn join_checks_consume_on_the_concrete_topic_and_types() {
             "client_agent": "test-agent",
             "interests": [{
                 "topic": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
-                "tenant_id": Uuid::new_v4(),
+                "tenant_id": target_tenant,
                 "types": [
                     "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
                     "gts.cf.core.events.event.v1~x.eb.t1.*",

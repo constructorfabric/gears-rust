@@ -9,6 +9,7 @@ use event_broker_sdk::backend::BackendError;
 
 const STORE: &str = "store";
 const RETENTION_INTERVAL_MS: &str = "retention_interval_ms";
+const SINGLE_PROCESS: &str = "single_process";
 const MAX_STORE_LEN: usize = 255;
 
 /// One registry entry's settings, defaults applied.
@@ -18,6 +19,9 @@ pub struct MemorySettings {
     pub store: String,
     /// How often the retention worker runs. Default 1 s.
     pub retention_interval: Duration,
+    /// Test-only: lets a cluster role build this backend, for a test process
+    /// that runs every role in-process. Default `false`.
+    pub single_process: bool,
 }
 
 impl Default for MemorySettings {
@@ -25,6 +29,7 @@ impl Default for MemorySettings {
         Self {
             store: "default".to_owned(),
             retention_interval: Duration::from_secs(1),
+            single_process: false,
         }
     }
 }
@@ -56,6 +61,13 @@ impl MemorySettings {
                         ))
                     })?;
                     parsed.retention_interval = Duration::from_millis(millis);
+                }
+                SINGLE_PROCESS => {
+                    parsed.single_process = value.as_bool().ok_or_else(|| {
+                        BackendError::invalid_config(format!(
+                            "`{SINGLE_PROCESS}` must be a boolean"
+                        ))
+                    })?;
                 }
                 other => {
                     return Err(BackendError::invalid_config(format!(

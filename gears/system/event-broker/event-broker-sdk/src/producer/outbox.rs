@@ -10,10 +10,17 @@ use crate::ids::ProducerId;
 use crate::models::{Event, ProducerMeta};
 
 use super::db::DbProducer;
+use super::registration::MAX_NAME_LEN;
 
-pub const PRODUCER_OUTBOX_ENVELOPE_VERSION: u16 = 2;
+/// The `ProducerOutboxEnvelope` shape version written on every producer-outbox
+/// row; an envelope of any other version is refused as
+/// [`EventBrokerError::Internal`].
+pub const PRODUCER_OUTBOX_ENVELOPE_VERSION: u16 = 1;
+/// The outbox payload type the SDK writes on every producer-outbox row. No
+/// outbox claim filters on it: the processor decodes every row of its queue as
+/// a `ProducerOutboxEnvelope`.
 pub const PRODUCER_OUTBOX_PAYLOAD_TYPE: &str =
-    "application/vnd.constructorfabric.event-broker.producer-outbox+json;version=2";
+    "application/vnd.constructorfabric.event-broker.producer-outbox+json;version=1";
 
 /// A producer's chain is kept per `(producer_id, topic)` (ADR-0004 "Chain Scope").
 type ProducerOutboxCursorKey = (ProducerId, String);
@@ -285,7 +292,13 @@ pub struct ProducerOutboxQueue {
 }
 
 impl ProducerOutboxQueue {
-    /// Creates a queue over `producer`; fails on a blank queue name.
+    /// Creates a queue over `producer`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EventBrokerError::InvalidProducerOptions`] on the first
+    /// failing check, in this order: a blank queue name, one with leading or
+    /// trailing whitespace, and one longer than the registration row holds.
     pub(crate) fn new(
         producer: DbProducer,
         queue: String,
@@ -294,6 +307,17 @@ impl ProducerOutboxQueue {
         if queue.trim().is_empty() {
             return Err(EventBrokerError::InvalidProducerOptions {
                 detail: "producer outbox queue name must not be empty".to_owned(),
+            });
+        }
+        if queue != queue.trim() {
+            return Err(EventBrokerError::InvalidProducerOptions {
+                detail: "producer outbox queue name must not have leading or trailing whitespace"
+                    .to_owned(),
+            });
+        }
+        if queue.len() > MAX_NAME_LEN {
+            return Err(EventBrokerError::InvalidProducerOptions {
+                detail: format!("producer outbox queue name must be at most {MAX_NAME_LEN} bytes"),
             });
         }
         Ok(Self {
@@ -361,12 +385,24 @@ impl DbProducer {
     /// The producer id messages of `partition` of `queue` publish under,
     /// registering it now if the partition has none yet - as its first drain
     /// would.
+    ///
+    /// # Errors
+    ///
+    /// [`EventBrokerError::InvalidProducerOptions`] if `queue` is not a valid
+    /// outbox queue name; [`EventBrokerError::Internal`] if the producer is
+    /// stateless or the registration task panics; otherwise whatever the
+    /// broker or the registration store fail with.
     #[doc(hidden)]
     pub async fn partition_producer_for_test(
         &self,
         queue: &str,
         partition: i64,
     ) -> Result<ProducerId, EventBrokerError> {
+        ProducerOutboxQueue::new(
+            self.clone(),
+            queue.to_owned(),
+            toolkit_db::outbox::Partitions::of(1),
+        )?;
         self.partition_producer(queue, partition).await
     }
 
@@ -559,22 +595,31 @@ impl ProducerOutboxProcessor {
         }
     }
 
-    /// Publishes `event` and, once accepted, records its sequence as the
-    /// chain's last for `topic`.
+    /// Publishes `event` and records its sequence as the chain's last for
+    /// `topic`. Every outcome means the broker holds the event: a `Duplicate`
+    /// says it holds this sequence or a later one, so the next message chains
+    /// onto it instead of paying a violation and a cursor refresh. The cursor
+    /// only ever moves forward.
     async fn publish(&self, topic: &str, event: &Event) -> Result<IngestOutcome, EventBrokerError> {
         let outcome = self
             .producer
             .broker
             .publish(&self.producer.ctx, event)
             .await?;
-        if matches!(outcome, IngestOutcome::Accepted | IngestOutcome::Persisted)
-            && let Some(meta) = &event.meta
+        // Irrefutable, so a new outcome has to decide whether it advances.
+        let (IngestOutcome::Accepted | IngestOutcome::Persisted | IngestOutcome::Duplicate) =
+            outcome;
+        if let Some(meta) = &event.meta
             && let (Some(producer_id), Some(sequence)) = (meta.producer_id, meta.sequence)
         {
-            self.cursor_state
+            let mut cursor_state = self
+                .cursor_state
                 .lock()
-                .expect("producer outbox cursor state lock poisoned")
-                .insert((ProducerId(producer_id), topic.to_owned()), sequence);
+                .expect("producer outbox cursor state lock poisoned");
+            let last = cursor_state
+                .entry((ProducerId(producer_id), topic.to_owned()))
+                .or_insert(sequence);
+            *last = (*last).max(sequence);
         }
         Ok(outcome)
     }
