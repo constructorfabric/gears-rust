@@ -77,7 +77,8 @@ impl SecretRepoImpl {
 /// The database's current instant as SQL text, in the column's own format:
 /// `now()` on `PostgreSQL`, an ISO-8601 `strftime` on `SQLite` (timestamps are
 /// TEXT there). Never bound from the process, so instances with skewed clocks
-/// agree on when a lease is over.
+/// agree on when a lease is over. The database clock in the column's format
+/// is not expressible in the ORM: a deliberate exception to TOOLKIT-DB-002.
 pub(super) fn db_now_sql(backend: DbBackend) -> &'static str {
     match backend {
         DbBackend::Sqlite => "strftime('%Y-%m-%dT%H:%M:%fZ', 'now')",

@@ -101,35 +101,34 @@ pub(super) async fn insert_active_tx(
     attempt: &WriteAttempt,
     version: &ValueVersion,
 ) -> Result<IntentCommit<()>, DomainError> {
+    // The row values (tenant, `secret_type`, `reference`) are checked against
+    // the scope in memory (`scope_with_model`, fail-closed). A denial here is
+    // a caller bug, so `ScopeError::Denied` stays `Internal`: only the PDP
+    // decision in the service yields 403. The check runs before the intent is
+    // retired so a refusal leaves the intent untouched.
+    let insert = insert_unless_taken(am.clone())
+        .secure()
+        .scope_with_model(scope, &am)
+        .map_err(map_scope_err)?;
     // The intent first: if it was healed, nothing else may happen.
     if !delete_intent_tx(tx, attempt.attempt_id).await? {
         return Ok(IntentCommit::IntentLost);
     }
-    // `scope_unchecked`: an INSERT cannot subtree-clamp on a row that doesn't
-    // exist yet.
-    let inserted = insert_unless_taken(am)
-        .secure()
-        .scope_unchecked(scope)
-        .map_err(map_scope_err)?
-        .exec(tx)
-        .await;
+    let inserted = insert.exec(tx).await;
     match inserted {
         Ok(_) => Ok(IntentCommit::Committed {
             value: (),
             debts: Vec::new(),
             healed: 0,
         }),
-        // The reference is taken: a definite loss. The fresh record id can
-        // never get a row, so the whole key is dead.
+        // The insert hit a conflict. `ON CONFLICT DO NOTHING` without a
+        // target swallows both a conflict on the reference (the fresh id has
+        // no row, so the whole key is dead and the purge applies) and one on
+        // the primary key (a live row with this id exists, so only this
+        // attempt's version is destroyed). `row_exists` tells them apart.
         Err(ScopeError::Db(DbErr::RecordNotInserted)) => {
-            let tasks = cleanup_tasks(
-                DeadContent::LostWrite {
-                    key: &attempt.key,
-                    version,
-                    row_exists: false,
-                },
-                attempt.destroy_supported,
-            );
+            let tasks =
+                lost_write_tasks(tx, &attempt.key, version, attempt.destroy_supported).await?;
             let debts = record_debts(tx, tasks).await?;
             Ok(IntentCommit::Lost { debts })
         }
@@ -163,11 +162,13 @@ pub(super) async fn insert_declared(
         fallback: ActiveValue::Set(DbFallback::from(new.fallback)),
     };
     let conn = repo.db.conn()?;
-    // `scope_unchecked`: an INSERT cannot subtree-clamp on a row that doesn't
-    // exist yet.
-    entity::secrets::Entity::insert(am)
+    // The row values (tenant, `secret_type`, `reference`) are checked against
+    // the scope in memory (`scope_with_model`, fail-closed). A denial here is
+    // a caller bug, so `ScopeError::Denied` stays `Internal`: only the PDP
+    // decision in the service yields 403.
+    entity::secrets::Entity::insert(am.clone())
         .secure()
-        .scope_unchecked(scope)
+        .scope_with_model(scope, &am)
         .map_err(map_scope_err)?
         .exec(&conn)
         .await
@@ -580,7 +581,11 @@ pub(super) async fn delete_row_tx(
     key: &StoreKey,
     expected_version: Option<i64>,
 ) -> Result<Vec<CleanupDebt>, DomainError> {
-    let mut filter = Condition::all().add(entity::secrets::Column::Id.eq(key.record_id));
+    // The row is looked up by the full key, as in `verify_delete`, so the
+    // `Purge(key)` debt always refers to the row that was deleted.
+    let mut filter = Condition::all()
+        .add(entity::secrets::Column::Id.eq(key.record_id))
+        .add(entity::secrets::Column::TenantId.eq(key.tenant_id.0));
     if let Some(v) = expected_version {
         filter = filter.add(entity::secrets::Column::Version.eq(v));
     }

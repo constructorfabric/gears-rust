@@ -605,7 +605,10 @@ lane_args_settings-service-pg = -p cf-gears-settings-service --features integrat
 ## beside `m0002_value_versions` runs a table rebuild; PostgreSQL gets in-place
 ## DDL (`DO` blocks, `pg_constraint` look-ups) that suite never executes; this
 ## lane runs the migration on the backend it ships on.
+## CREDSTORE_PG_REQUIRE_DOCKER=1 turns an unreachable Docker into a failure;
+## otherwise the test skips silently.
 lane_args_credstore-pg = -p cf-gears-credstore-v2 --features integration --test pg_migrations_test
+lane_env_credstore-pg = CREDSTORE_PG_REQUIRE_DOCKER=1
 
 ## bss-pricing's Postgres tier (Docker required; each suite spins up its own
 ## postgres container via testcontainers).

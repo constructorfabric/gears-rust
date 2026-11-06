@@ -11,10 +11,10 @@
 //! `EXISTS` point lookups on `(tenant_id, record_id)`, never a `COUNT`.
 
 use credstore_sdk::{OwnerId, SecretRef, SharingMode, TenantId};
-use sea_orm::sea_query::Expr;
+use sea_orm::sea_query::{Expr, Query};
 use sea_orm::{
-    ColumnTrait, Condition, DbBackend, EntityTrait, FromQueryResult, Iterable, QueryOrder,
-    QuerySelect,
+    ColumnTrait, Condition, DbBackend, EntityTrait, ExprTrait, FromQueryResult, Iterable,
+    QueryOrder, QuerySelect,
 };
 use time::OffsetDateTime;
 use toolkit_db::secure::{DBRunner, Scoped, SecureEntityExt, SecureSelect};
@@ -25,9 +25,8 @@ use crate::domain::error::DomainError;
 use crate::domain::secret::model::{HealFlags, SecretRow};
 use crate::infra::storage::entity;
 use crate::infra::storage::entity::enums::{DbFallback, DbSharing, DbStatus};
-use crate::infra::storage::repo_impl::helpers::{
-    SecretRepoImpl, db_now_sql, entity_to_model, map_scope_err,
-};
+use crate::infra::storage::repo_impl::helpers::{SecretRepoImpl, entity_to_model, map_scope_err};
+use crate::infra::storage::repo_impl::intents::db_now;
 
 /// A `credstore_secrets` row with the two heal flags computed beside it.
 #[derive(FromQueryResult)]
@@ -85,16 +84,53 @@ async fn rows_with_flags(
     runner: &impl DBRunner,
     backend: DbBackend,
 ) -> Result<Vec<RowWithFlags>, DomainError> {
-    let has_debts = Expr::cust(
-        "EXISTS (SELECT 1 FROM credstore_store_cleanup c \
-         WHERE c.tenant_id = credstore_secrets.tenant_id AND c.record_id = credstore_secrets.id)",
+    let has_debts = Expr::exists(
+        Query::select()
+            .expr(Expr::val(1))
+            .from(entity::store_cleanup::Entity)
+            .and_where(
+                Expr::col((
+                    entity::store_cleanup::Entity,
+                    entity::store_cleanup::Column::TenantId,
+                ))
+                .equals((entity::secrets::Entity, entity::secrets::Column::TenantId)),
+            )
+            .and_where(
+                Expr::col((
+                    entity::store_cleanup::Entity,
+                    entity::store_cleanup::Column::RecordId,
+                ))
+                .equals((entity::secrets::Entity, entity::secrets::Column::Id)),
+            )
+            .to_owned(),
     );
-    let has_expired_intents = Expr::cust(format!(
-        "EXISTS (SELECT 1 FROM credstore_write_intents i \
-         WHERE i.tenant_id = credstore_secrets.tenant_id AND i.record_id = credstore_secrets.id \
-         AND i.lease_until < {})",
-        db_now_sql(backend)
-    ));
+    let has_expired_intents = Expr::exists(
+        Query::select()
+            .expr(Expr::val(1))
+            .from(entity::write_intents::Entity)
+            .and_where(
+                Expr::col((
+                    entity::write_intents::Entity,
+                    entity::write_intents::Column::TenantId,
+                ))
+                .equals((entity::secrets::Entity, entity::secrets::Column::TenantId)),
+            )
+            .and_where(
+                Expr::col((
+                    entity::write_intents::Entity,
+                    entity::write_intents::Column::RecordId,
+                ))
+                .equals((entity::secrets::Entity, entity::secrets::Column::Id)),
+            )
+            .and_where(
+                Expr::col((
+                    entity::write_intents::Entity,
+                    entity::write_intents::Column::LeaseUntil,
+                ))
+                .lt(db_now(backend)),
+            )
+            .to_owned(),
+    );
     select
         .project_all(runner, |sel| {
             sel.select_only()
@@ -354,8 +390,8 @@ pub(super) async fn list_tenants_with_other_type(
 /// by `reference` (`desc` when `desc`), keyset-paginated by `cursor`
 /// (exclusive: `reference > cursor` ascending, `reference < cursor`
 /// descending). Fetches at most `limit` references — the caller passes
-/// `page_limit + 1` to detect a next page; the count reflects only
-/// references admitted by the permitted-type clamp.
+/// `page_limit + 1` to detect a next page; only references admitted by the
+/// permitted-type clamp are returned.
 #[allow(
     clippy::too_many_arguments,
     reason = "every clamp the collection read's step 1 query supports, named rather than \

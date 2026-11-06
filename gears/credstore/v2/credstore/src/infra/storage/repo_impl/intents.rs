@@ -19,7 +19,7 @@ use std::time::Duration;
 use credstore_sdk::{SecretRef, StoreKey, TenantId, ValueVersion};
 use sea_orm::sea_query::{Expr, Query, SelectStatement, SimpleExpr};
 use sea_orm::{
-    ActiveValue, ColumnTrait, Condition, DbBackend, EntityTrait, ExprTrait, QueryFilter,
+    ActiveValue, ColumnTrait, Condition, DbBackend, EntityTrait, ExprTrait, Order, QueryFilter,
 };
 use toolkit_db::secure::{
     DBRunner, DbTx, SecureDeleteExt, SecureEntityExt, SecureInsertExt, secure_insert_from_select,
@@ -35,12 +35,16 @@ use crate::infra::storage::repo_impl::helpers::{
     SecretRepoImpl, TxFuture, db_now_sql, entity_to_debt, map_scope_err, task_to_columns,
 };
 
-/// The database's current instant, in the column's own format.
+/// The database's current instant, in the column's own format
+/// (`strftime('%Y-%m-%dT%H:%M:%fZ', ...)` on `SQLite`, `now()` on
+/// `PostgreSQL`). The ORM cannot express it: a deliberate exception to
+/// TOOLKIT-DB-002, like `make_interval` in `db_now_plus`.
 pub(super) fn db_now(backend: DbBackend) -> SimpleExpr {
     Expr::cust(db_now_sql(backend))
 }
 
 /// The database's current instant plus `lease`, in the column's own format.
+/// Raw SQL on purpose, see [`db_now`].
 fn db_now_plus(backend: DbBackend, lease: Duration) -> SimpleExpr {
     match backend {
         DbBackend::Sqlite => Expr::cust_with_values(
@@ -220,6 +224,11 @@ pub(super) async fn record_debts(
     Ok(debts)
 }
 
+/// The most expired orphan intents one heal call takes. The rest are healed
+/// by the next access to the same reference (heal on access), so the size of
+/// the transaction and the number of backend calls per request stay bounded.
+pub(super) const HEAL_BATCH: u64 = 100;
+
 /// The expired intents of `(tenant, reference)` whose record id has no row:
 /// what a failed create leaves behind. A plain read; it finds nothing on the
 /// usual path and then nothing is written.
@@ -237,11 +246,25 @@ async fn expired_orphan_intents(
                 .add(entity::write_intents::Column::TenantId.eq(tenant.0))
                 .add(entity::write_intents::Column::Reference.eq(reference.as_ref()))
                 .add(Expr::col(entity::write_intents::Column::LeaseUntil).lt(db_now(backend)))
-                .add(Expr::cust(
-                    "NOT EXISTS (SELECT 1 FROM credstore_secrets s \
-                     WHERE s.id = credstore_write_intents.record_id)",
-                )),
+                .add(
+                    Expr::exists(
+                        Query::select()
+                            .expr(Expr::val(1))
+                            .from(entity::secrets::Entity)
+                            .and_where(
+                                Expr::col((entity::secrets::Entity, entity::secrets::Column::Id))
+                                    .equals((
+                                        entity::write_intents::Entity,
+                                        entity::write_intents::Column::RecordId,
+                                    )),
+                            )
+                            .to_owned(),
+                    )
+                    .not(),
+                ),
         )
+        .order_by(entity::write_intents::Column::LeaseUntil, Order::Asc)
+        .limit(HEAL_BATCH)
         .all(runner)
         .await
         .map_err(map_scope_err)

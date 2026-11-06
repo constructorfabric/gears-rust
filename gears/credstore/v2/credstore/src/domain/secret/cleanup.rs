@@ -26,7 +26,8 @@ pub enum DeadContent<'a> {
     /// A write of `version` lost definitively or was not applied; `row_exists`
     /// says whether a row with this record id still exists. Produced by a
     /// create that lost to a concurrent create (`SecretRepo::insert_active`,
-    /// `row_exists: false`), a lost CAS (`SecretRepo::switch_value`), and the
+    /// `row_exists` read in the same transaction), a lost CAS
+    /// (`SecretRepo::switch_value`), and the
     /// verification "not applied" outcome (`SecretRepo::verify_insert_active`,
     /// `SecretRepo::verify_switch_value`).
     LostWrite {
