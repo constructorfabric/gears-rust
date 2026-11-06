@@ -865,6 +865,15 @@ pub enum RegistryError {
     #[error("operation cancelled by termination signal")]
     Cancelled,
 
+    /// A gear's context construction + `init()` did not finish within the
+    /// configured init deadline (the async path; a synchronous block that wedges
+    /// a runtime worker is caught by the force-exit watchdog instead).
+    #[error("initialization timed out for gear '{gear}' after {timeout:?}")]
+    InitTimeout {
+        gear: &'static str,
+        timeout: std::time::Duration,
+    },
+
     // Build/topo-sort errors
     #[error("unknown gear '{0}'")]
     UnknownGear(String),

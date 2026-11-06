@@ -677,6 +677,10 @@ pub async fn run_oop_with_options(opts: OopRunOptions) -> Result<()> {
     // Capture OoP HTTP config (if any) before moving the config into the provider.
     let oop_http = final_config.oop_http.clone();
 
+    // Apply configured lifecycle deadlines (absent fields keep framework defaults).
+    let init_deadline = final_config.server.init_deadline();
+    let shutdown_deadline = final_config.server.shutdown_deadline();
+
     // Build config provider for gears
     let config_provider = Arc::new(final_config);
 
@@ -691,7 +695,9 @@ pub async fn run_oop_with_options(opts: OopRunOptions) -> Result<()> {
     .with_clients(vec![ClientRegistration::new::<dyn DirectoryClient>(
         Arc::clone(&directory_api),
     )])
-    .with_internal_token_provider(internal_token_provider);
+    .with_internal_token_provider(internal_token_provider)
+    .with_init_deadline(init_deadline)
+    .with_shutdown_deadline(shutdown_deadline);
 
     // When `oop_http` is configured, run the HTTP-serving lifecycle:
     // Axum server + probes + directory presence (registration + heartbeat +

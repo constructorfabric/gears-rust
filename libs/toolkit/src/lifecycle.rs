@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use parking_lot::Mutex;
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, AtomicU8, Ordering},
+    atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
 };
 use std::time::Duration;
 use tokio::sync::{Notify, oneshot};
@@ -24,6 +24,18 @@ type ReadyFn<T> = fn(
     ReadySignal,
 )
     -> std::pin::Pin<Box<dyn std::future::Future<Output = TaskResult<()>> + Send>>;
+
+/// Default readiness warning period for ready-mode starts (60 seconds).
+///
+/// A *warning*, not a hard deadline: expiry logs an error naming the gear but
+/// keeps waiting; a later [`ReadySignal::notify`] still flips to `Running`.
+pub const DEFAULT_READY_WARN_AFTER: Duration = Duration::from_secs(60);
+
+/// Saturating conversion of a `Duration` to whole milliseconds (for atomics).
+#[inline]
+fn duration_to_ms(d: Duration) -> u64 {
+    u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
+}
 
 // ----- Status model ----------------------------------------------------------
 
@@ -126,6 +138,9 @@ pub struct Lifecycle {
     was_cancelled: Arc<AtomicBool>,
     /// Notifies all waiters when the task finishes.
     finished_notify: Arc<Notify>,
+    /// Readiness warning period (ms). Atomic so [`WithLifecycle`] can set it on
+    /// the shared `Lifecycle` at start without unique ownership.
+    ready_warn_after_ms: AtomicU64,
 }
 
 impl Lifecycle {
@@ -139,12 +154,35 @@ impl Lifecycle {
             finished: Arc::new(AtomicBool::new(false)),
             was_cancelled: Arc::new(AtomicBool::new(false)),
             finished_notify: Arc::new(Notify::new()),
+            ready_warn_after_ms: AtomicU64::new(duration_to_ms(DEFAULT_READY_WARN_AFTER)),
         }
     }
 
     #[must_use]
     pub fn new() -> Self {
         Self::new_named("lifecycle")
+    }
+
+    /// Set the readiness warning period for subsequent ready-mode starts
+    /// (non-fatal; defaults to [`DEFAULT_READY_WARN_AFTER`]).
+    #[must_use]
+    pub fn with_ready_warn_after(self, after: Duration) -> Self {
+        self.set_ready_warn_after(after);
+        self
+    }
+
+    /// Set the readiness warning period on a shared `Arc<Lifecycle>` (takes
+    /// `&self`; affects the next ready-mode start).
+    pub fn set_ready_warn_after(&self, after: Duration) {
+        self.ready_warn_after_ms
+            .store(duration_to_ms(after), Ordering::Relaxed);
+    }
+
+    /// Current readiness warning period.
+    #[inline]
+    #[must_use]
+    pub fn ready_warn_after(&self) -> Duration {
+        Duration::from_millis(self.ready_warn_after_ms.load(Ordering::Relaxed))
     }
 
     #[inline]
@@ -276,19 +314,52 @@ impl Lifecycle {
         let (ready_tx, ready_rx) = oneshot::channel::<()>();
         if ready_mode {
             let status_on_ready = self.status.clone();
+            let ready_warn_after = self.ready_warn_after();
+            let ready_name = self.name;
             tokio::spawn(async move {
-                if ready_rx.await.is_ok() {
-                    _ = status_on_ready.compare_exchange(
-                        Status::Starting.as_u8(),
-                        Status::Running.as_u8(),
-                        Ordering::AcqRel,
-                        Ordering::Acquire,
-                    );
-                    tracing::debug!("lifecycle status -> running (ready)");
-                } else {
-                    // Sender dropped: task didn't signal readiness; we will remain in Starting
-                    // until finish. This is usually a bug or early-drop scenario.
-                    tracing::debug!("ready signal dropped; staying in Starting until finish");
+                let mut ready_rx = ready_rx;
+                let ready_result = match tokio::time::timeout(ready_warn_after, &mut ready_rx).await
+                {
+                    Ok(result) => result,
+                    Err(_elapsed) => {
+                        // Warning period elapsed. Skip the log if the gear was stopped
+                        // meanwhile (shutdown noise); otherwise warn loudly but non-fatally.
+                        if Status::from_u8(status_on_ready.load(Ordering::Acquire))
+                            == Status::Starting
+                        {
+                            tracing::error!(
+                                gear = %ready_name,
+                                timeout_secs = ready_warn_after.as_secs(),
+                                "gear did not signal readiness within the deadline; still Starting"
+                            );
+                        }
+                        ready_rx.await
+                    }
+                };
+                match ready_result {
+                    Ok(()) => {
+                        _ = status_on_ready.compare_exchange(
+                            Status::Starting.as_u8(),
+                            Status::Running.as_u8(),
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        );
+                        tracing::debug!("lifecycle status -> running (ready)");
+                    }
+                    Err(_) => {
+                        // Sender dropped before notifying. On a normal stop this is
+                        // expected (stop() cancels the task, which drops the
+                        // ReadySignal), so only warn while the gear is still
+                        // Starting — matching the warning-period branch above.
+                        if Status::from_u8(status_on_ready.load(Ordering::Acquire))
+                            == Status::Starting
+                        {
+                            tracing::warn!(
+                                gear = %ready_name,
+                                "ready signal dropped before notifying; staying in Starting until finish"
+                            );
+                        }
+                    }
                 }
             });
         } else {
@@ -488,6 +559,8 @@ pub struct WithLifecycle<T: Runnable> {
     await_ready: bool,
     has_ready_handler: bool,
     run_ready_fn: Option<ReadyFn<T>>,
+    /// Readiness warning period, applied to the inner [`Lifecycle`] at start.
+    ready_warn_after: Duration,
 }
 
 impl<T: Runnable> WithLifecycle<T> {
@@ -500,6 +573,7 @@ impl<T: Runnable> WithLifecycle<T> {
             await_ready: false,
             has_ready_handler: false,
             run_ready_fn: None,
+            ready_warn_after: DEFAULT_READY_WARN_AFTER,
         }
     }
 
@@ -512,6 +586,7 @@ impl<T: Runnable> WithLifecycle<T> {
             await_ready: false,
             has_ready_handler: false,
             run_ready_fn: None,
+            ready_warn_after: DEFAULT_READY_WARN_AFTER,
         }
     }
 
@@ -524,6 +599,7 @@ impl<T: Runnable> WithLifecycle<T> {
             await_ready: false,
             has_ready_handler: false,
             run_ready_fn: None,
+            ready_warn_after: DEFAULT_READY_WARN_AFTER,
         }
     }
 
@@ -536,6 +612,7 @@ impl<T: Runnable> WithLifecycle<T> {
             await_ready: false,
             has_ready_handler: false,
             run_ready_fn: None,
+            ready_warn_after: DEFAULT_READY_WARN_AFTER,
         }
     }
 
@@ -566,6 +643,14 @@ impl<T: Runnable> WithLifecycle<T> {
     /// The host's deadline token still takes precedence.
     pub fn with_stop_timeout_fn(mut self, provider: fn(&T) -> Duration) -> Self {
         self.stop_timeout_fn = Some(provider);
+        self
+    }
+
+    /// Set the readiness warning period (non-fatal; see
+    /// [`Lifecycle::with_ready_warn_after`]). A plain field applied at start, so
+    /// it never panics regardless of ownership or state.
+    pub fn with_ready_warn_after(mut self, after: Duration) -> Self {
+        self.ready_warn_after = after;
         self
     }
 
@@ -614,6 +699,10 @@ impl<T: Runnable> crate::contracts::RunnableCapability for WithLifecycle<T> {
     async fn start(&self, external_cancel: CancellationToken) -> TaskResult<()> {
         let inner = self.inner.clone();
         let composed = external_cancel.child_token();
+
+        // Thread the configured readiness warning period into the shared
+        // lifecycle just before starting (only observed by ready-mode starts).
+        self.lc.set_ready_warn_after(self.ready_warn_after);
 
         if !self.await_ready {
             self.lc
@@ -806,6 +895,175 @@ mod tests {
             reason,
             StopReason::Cancelled | StopReason::Finished
         ));
+        assert_eq!(lc.status(), Status::Stopped);
+    }
+
+    #[test]
+    fn ready_warn_after_preserves_the_inner_lifecycle() {
+        let wrapper = WithLifecycle::new_with_name(TestRunnable::new(), "configured");
+        let lifecycle = Arc::as_ptr(&wrapper.lc);
+        let wrapper = wrapper.with_ready_warn_after(Duration::from_secs(7));
+
+        assert_eq!(Arc::as_ptr(&wrapper.lc), lifecycle);
+        assert_eq!(wrapper.lc.name(), "configured");
+        assert_eq!(wrapper.ready_warn_after, Duration::from_secs(7));
+    }
+
+    #[tokio::test]
+    async fn ready_warn_after_on_active_lifecycle_does_not_panic() {
+        use crate::contracts::RunnableCapability;
+        // It's a plain field applied at start, so configuring it after a start
+        // is harmless rather than a panic.
+        let wrapper = WithLifecycle::new(TestRunnable::new());
+        wrapper.start(CancellationToken::new()).await.unwrap();
+        let wrapper = wrapper.with_ready_warn_after(Duration::from_secs(7));
+        assert_eq!(wrapper.ready_warn_after, Duration::from_secs(7));
+        wrapper.stop(CancellationToken::new()).await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[tracing_test::traced_test]
+    async fn dropped_ready_signal_logs_a_warning_and_stays_starting() {
+        // Short warning period so the "deadline must NOT fire for a dropped
+        // sender" assertion below is meaningful (the 60s default never elapses
+        // under paused time).
+        let lc =
+            Lifecycle::new_named("dropped-ready").with_ready_warn_after(Duration::from_millis(30));
+        lc.start_with_ready(|cancel, ready| async move {
+            drop(ready);
+            cancel.cancelled().await;
+            Ok(())
+        })
+        .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !logs_contain("ready signal dropped before notifying") {
+                sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("dropped readiness must be logged immediately");
+        logs_assert(|lines: &[&str]| {
+            if lines.iter().any(|line| {
+                line.contains("ready signal dropped before notifying")
+                    && line.contains("WARN")
+                    && line.contains("dropped-ready")
+            }) {
+                Ok(())
+            } else {
+                Err("dropped readiness must log a warning naming the gear".to_owned())
+            }
+        });
+        // A dropped sender resolves immediately, so the deadline must never fire.
+        sleep(Duration::from_millis(80)).await;
+        assert!(!logs_contain(
+            "did not signal readiness within the deadline"
+        ));
+        assert_eq!(lc.status(), Status::Starting);
+
+        lc.stop(Duration::from_millis(100)).await.unwrap();
+        assert_eq!(lc.status(), Status::Stopped);
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[tracing_test::traced_test]
+    async fn ready_warn_after_times_out_loudly_but_stays_starting() {
+        // Never firing readiness must warn loudly (error log naming the gear) but
+        // stay non-fatal: the lifecycle stays Starting and can still recover.
+        let lc = Lifecycle::new_named("slowpoke").with_ready_warn_after(Duration::from_millis(30));
+
+        lc.start_with_ready(move |cancel, ready| async move {
+            let _held = ready; // hold without notifying so the deadline is what trips
+            cancel.cancelled().await;
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(lc.status(), Status::Starting);
+
+        sleep(Duration::from_millis(80)).await;
+
+        // One line must carry the message, ERROR level, and gear name, so the
+        // check fails if the error event or its `gear` field is dropped.
+        logs_assert(|lines: &[&str]| {
+            if lines.iter().any(|line| {
+                line.contains("did not signal readiness within the deadline")
+                    && line.contains("ERROR")
+                    && line.contains("slowpoke")
+            }) {
+                Ok(())
+            } else {
+                Err("expired readiness warning must log an ERROR naming the gear".to_owned())
+            }
+        });
+        assert_eq!(
+            lc.status(),
+            Status::Starting,
+            "must remain Starting, not fatal"
+        );
+
+        let _ = lc.stop(Duration::from_millis(100)).await.unwrap();
+        assert_eq!(lc.status(), Status::Stopped);
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[tracing_test::traced_test]
+    async fn ready_after_deadline_transitions_to_running() {
+        let lc = Lifecycle::new_named("late-ready").with_ready_warn_after(Duration::from_secs(1));
+        let (ready_tx, ready_rx) = oneshot::channel::<()>();
+        lc.start_with_ready(move |cancel, ready| async move {
+            ready_rx.await.unwrap();
+            ready.notify();
+            cancel.cancelled().await;
+            Ok(())
+        })
+        .unwrap();
+
+        sleep(Duration::from_secs(2)).await;
+        assert!(logs_contain("did not signal readiness within the deadline"));
+        assert_eq!(lc.status(), Status::Starting);
+
+        ready_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while lc.status() != Status::Running {
+                sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("late readiness must transition to Running");
+
+        lc.stop(Duration::from_millis(100)).await.unwrap();
+        assert_eq!(lc.status(), Status::Stopped);
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[tracing_test::traced_test]
+    async fn ready_before_deadline_does_not_time_out() {
+        // Normal startup: a gear that signals ready within the deadline flips to
+        // Running and never trips the timeout backstop.
+        let lc = Lifecycle::new().with_ready_warn_after(Duration::from_secs(5));
+
+        let (ready_tx, ready_rx) = oneshot::channel::<()>();
+        lc.start_with_ready(move |cancel, ready| async move {
+            ready_rx.await.unwrap();
+            ready.notify();
+            cancel.cancelled().await;
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(lc.status(), Status::Starting);
+        ready_tx.send(()).unwrap();
+        sleep(Duration::from_millis(20)).await;
+        assert_eq!(lc.status(), Status::Running);
+
+        sleep(Duration::from_secs(6)).await;
+        assert_eq!(lc.status(), Status::Running);
+        assert!(!logs_contain(
+            "did not signal readiness within the deadline"
+        ));
+
+        lc.stop(Duration::from_millis(100)).await.unwrap();
         assert_eq!(lc.status(), Status::Stopped);
     }
 

@@ -267,6 +267,29 @@ pub struct ServerConfig {
     pub name: String,
     #[serde(default = "default_home_dir")]
     pub home_dir: PathBuf, // will be normalized to absolute path
+    /// Per-gear deadline for context construction + `init()` (seconds); absent
+    /// keeps [`DEFAULT_INIT_DEADLINE`](crate::runtime::DEFAULT_INIT_DEADLINE).
+    #[serde(default)]
+    pub init_deadline_secs: Option<u64>,
+    /// Per-gear graceful-shutdown deadline before hard-stop (seconds); absent
+    /// keeps [`DEFAULT_SHUTDOWN_DEADLINE`](crate::runtime::DEFAULT_SHUTDOWN_DEADLINE).
+    #[serde(default)]
+    pub shutdown_deadline_secs: Option<u64>,
+}
+
+impl ServerConfig {
+    /// Configured per-gear init deadline, if set.
+    #[must_use]
+    pub fn init_deadline(&self) -> Option<std::time::Duration> {
+        self.init_deadline_secs.map(std::time::Duration::from_secs)
+    }
+
+    /// Configured per-gear graceful-shutdown deadline, if set.
+    #[must_use]
+    pub fn shutdown_deadline(&self) -> Option<std::time::Duration> {
+        self.shutdown_deadline_secs
+            .map(std::time::Duration::from_secs)
+    }
 }
 
 fn default_server_name() -> String {
@@ -282,6 +305,8 @@ impl Default for ServerConfig {
         Self {
             name: default_server_name(),
             home_dir: default_home_dir(),
+            init_deadline_secs: None,
+            shutdown_deadline_secs: None,
         }
     }
 }
