@@ -22,7 +22,7 @@ use crate::client_hub::ClientHub;
 /// Re-export so the `#[toolkit::consumes]`-generated wire fn can name the
 /// resolver type as `toolkit::discovery::EndpointResolver` without the consuming
 /// gear crate needing a direct `toolkit-contract` dependency.
-pub use toolkit_contract::runtime::resolving::{EndpointResolver, ResolveError};
+pub use toolkit_contract::runtime::resolving::{EndpointResolver, ResolveError, ResolveTarget};
 
 /// Adapts the service [`DirectoryClient`] into the contract-layer
 /// [`EndpointResolver`] consumed by `DirectoryResolvingClient`.
@@ -34,7 +34,11 @@ pub use toolkit_contract::runtime::resolving::{EndpointResolver, ResolveError};
 /// per-call resolving client does not incur a directory round-trip on every
 /// business call (the `OoP` directory is a network hop). Only `Ok(Some(uri))` is
 /// cached; `Ok(None)` / `Err` always re-resolve. The TTL is deliberately short
-/// so endpoint churn self-heals within ~TTL.
+/// so endpoint churn self-heals within ~TTL, and an endpoint failure seen by a
+/// client drops the entry at once ([`EndpointResolver::invalidate`]).
+///
+/// REST endpoints are looked up by gear name, gRPC endpoints by service name
+/// (`resolve_grpc_service`); the two are cached apart.
 pub struct DirectoryEndpointResolver {
     client: Arc<dyn DirectoryClient>,
     cache: parking_lot::Mutex<std::collections::HashMap<String, (String, std::time::Instant)>>,
@@ -44,8 +48,8 @@ impl DirectoryEndpointResolver {
     /// Memoization window for successful resolutions.
     ///
     /// Public because it bounds observable behaviour: a provider that moves is
-    /// followed within roughly this window, not instantly, since the cache
-    /// holds only successes and is not invalidated by a failed call.
+    /// followed within roughly this window, or at the next call after a client
+    /// saw the old endpoint fail.
     pub const TTL: std::time::Duration = std::time::Duration::from_millis(1500);
 
     /// Wrap a [`DirectoryClient`] with a short-TTL resolution cache.
@@ -57,26 +61,42 @@ impl DirectoryEndpointResolver {
         }
     }
 
-    fn cached(&self, gear: &str) -> Option<String> {
+    fn cached(&self, key: &str) -> Option<String> {
         self.cache
             .lock()
-            .get(gear)
+            .get(key)
             .filter(|(_, at)| at.elapsed() < Self::TTL)
             .map(|(uri, _)| uri.clone())
     }
 
-    fn store(&self, gear: &str, uri: &str) {
+    fn store(&self, key: &str, uri: &str) {
         self.cache
             .lock()
-            .insert(gear.to_owned(), (uri.to_owned(), std::time::Instant::now()));
+            .insert(key.to_owned(), (uri.to_owned(), std::time::Instant::now()));
     }
-}
 
-#[async_trait]
-impl EndpointResolver for DirectoryEndpointResolver {
-    async fn resolve_endpoint(&self, gear: &str) -> Result<Option<String>, ResolveError> {
+    fn cache_key(target: &ResolveTarget) -> String {
+        match target {
+            ResolveTarget::Grpc { service, .. } => format!("grpc:{service}"),
+            // `ResolveTarget` is non-exhaustive; anything else is keyed by gear.
+            other => format!("rest:{}", other.gear()),
+        }
+    }
+
+    /// Look `name` up through `lookup`, memoizing a hit under `key`. `name`
+    /// is the gear or service name, for errors and logs.
+    async fn resolve_cached<F, Fut>(
+        &self,
+        key: &str,
+        name: &str,
+        lookup: F,
+    ) -> Result<Option<String>, ResolveError>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = anyhow::Result<crate::ServiceEndpoint>>,
+    {
         // Fresh cache hit avoids the directory round-trip.
-        if let Some(uri) = self.cached(gear) {
+        if let Some(uri) = self.cached(key) {
             return Ok(Some(uri));
         }
         // Preserve the trait's `Ok(None)` (no live instance / not ready) vs
@@ -86,9 +106,9 @@ impl EndpointResolver for DirectoryEndpointResolver {
         // `DirectoryNotFound` sentinel for the not-found case; anything else is
         // a genuine backend/transport failure (relevant for the OoP gRPC
         // directory client).
-        match self.client.resolve_rest_service(gear).await {
+        match lookup().await {
             Ok(ep) => {
-                self.store(gear, &ep.uri);
+                self.store(key, &ep.uri);
                 Ok(Some(ep.uri))
             }
             Err(e) if e.downcast_ref::<DirectoryNotFound>().is_some() => Ok(None),
@@ -100,16 +120,35 @@ impl EndpointResolver for DirectoryEndpointResolver {
                 // "fix your config" message is not mistaken for a directory
                 // outage, and still return `Err` so the call fails.
                 tracing::error!(
-                    gear,
+                    name,
                     error = %e,
                     "provider name permanently rejected by the directory (invalid \
                      argument); this is a static configuration error, not a directory \
-                     outage, and will never resolve. Check the consumed gear name"
+                     outage, and will never resolve. Check the consumed gear or service name"
                 );
-                Err(ResolveError::new(gear, e))
+                Err(ResolveError::new(name, e))
             }
-            Err(e) => Err(ResolveError::new(gear, e)),
+            Err(e) => Err(ResolveError::new(name, e)),
         }
+    }
+}
+
+#[async_trait]
+impl EndpointResolver for DirectoryEndpointResolver {
+    async fn resolve_endpoint(&self, gear: &str) -> Result<Option<String>, ResolveError> {
+        let key = Self::cache_key(&ResolveTarget::rest(gear));
+        self.resolve_cached(&key, gear, || self.client.resolve_rest_service(gear))
+            .await
+    }
+
+    async fn resolve_grpc_endpoint(&self, service: &str) -> Result<Option<String>, ResolveError> {
+        let key = Self::cache_key(&ResolveTarget::grpc("", service));
+        self.resolve_cached(&key, service, || self.client.resolve_grpc_service(service))
+            .await
+    }
+
+    fn invalidate(&self, target: &ResolveTarget) {
+        self.cache.lock().remove(&Self::cache_key(target));
     }
 }
 
@@ -127,13 +166,14 @@ impl EndpointResolver for NullEndpointResolver {
     }
 }
 
-/// An [`EndpointResolver`] that always resolves to a single, fixed endpoint —
-/// the ADR-0004 static-endpoint override escape hatch for local development and
-/// integration testing. It bypasses the service directory: a consumer configured
-/// with `gears.<owner>.config.consumer_wiring.<dep> = "http://host:port"` wires a
-/// resolving client whose endpoint is this constant. Not for production use.
+/// An [`EndpointResolver`] that always resolves to a fixed endpoint — the
+/// ADR-0004 static-endpoint override. It bypasses the service directory: a
+/// consumer configured with `gears.<owner>.clients.consumes.<dep>.endpoint`
+/// wires a resolving client whose endpoint is this constant. gRPC lookups get
+/// `grpc_endpoint` when one is set, else the same endpoint.
 pub struct StaticEndpointResolver {
     endpoint: String,
+    grpc_endpoint: Option<String>,
 }
 
 impl StaticEndpointResolver {
@@ -142,7 +182,15 @@ impl StaticEndpointResolver {
     pub fn new(endpoint: impl Into<String>) -> Self {
         Self {
             endpoint: endpoint.into(),
+            grpc_endpoint: None,
         }
+    }
+
+    /// Resolve gRPC services to `endpoint` instead.
+    #[must_use]
+    pub fn with_grpc_endpoint(mut self, endpoint: impl Into<String>) -> Self {
+        self.grpc_endpoint = Some(endpoint.into());
+        self
     }
 }
 
@@ -151,23 +199,71 @@ impl EndpointResolver for StaticEndpointResolver {
     async fn resolve_endpoint(&self, _gear: &str) -> Result<Option<String>, ResolveError> {
         Ok(Some(self.endpoint.clone()))
     }
+
+    async fn resolve_grpc_endpoint(&self, _service: &str) -> Result<Option<String>, ResolveError> {
+        Ok(Some(
+            self.grpc_endpoint
+                .clone()
+                .unwrap_or_else(|| self.endpoint.clone()),
+        ))
+    }
+}
+
+/// Static overrides for some transports, the directory for the rest. Built by
+/// the proxy-wiring phase from `clients.consumes.<dep>.endpoint` /
+/// `grpc_endpoint`.
+pub(crate) struct OverrideResolver {
+    /// Fixed REST endpoint, from `endpoint`.
+    pub(crate) rest: Option<String>,
+    /// Fixed gRPC endpoint, from `grpc_endpoint`, else `endpoint`.
+    pub(crate) grpc: Option<String>,
+    /// Resolves a transport that has no override.
+    pub(crate) fallback: Arc<dyn EndpointResolver>,
+}
+
+#[async_trait]
+impl EndpointResolver for OverrideResolver {
+    async fn resolve_endpoint(&self, gear: &str) -> Result<Option<String>, ResolveError> {
+        match &self.rest {
+            Some(uri) => Ok(Some(uri.clone())),
+            None => self.fallback.resolve_endpoint(gear).await,
+        }
+    }
+
+    async fn resolve_grpc_endpoint(&self, service: &str) -> Result<Option<String>, ResolveError> {
+        match &self.grpc {
+            Some(uri) => Ok(Some(uri.clone())),
+            None => self.fallback.resolve_grpc_endpoint(service).await,
+        }
+    }
+
+    fn invalidate(&self, target: &ResolveTarget) {
+        self.fallback.invalidate(target);
+    }
 }
 
 /// Outcome of a [`ConsumerRegistration::wire`] call: whether the dependency was
 /// satisfied by a co-located compile-time impl (no directory dependency) or by
-/// a directory-resolving REST client that still needs endpoint resolution.
+/// a directory-resolving client that still needs endpoint resolution.
 ///
 /// The runtime uses this to gate readiness: `Local` deps are readiness-resolved
-/// immediately (no `/readyz` gating, no probe loop), while `Remote` deps gate
-/// readiness until the directory resolves them (ADR-0007).
+/// immediately (no `/readyz` gating, no probe loop), while remote deps gate
+/// readiness until the directory resolves what the client will call (ADR-0007).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum WireOutcome {
     /// A compile-time (in-process) impl was already registered — it won the
     /// `hub.try_get_local` short-circuit; no remote binding was created.
     Local,
-    /// A directory-resolving REST client was registered; its endpoint is
-    /// resolved lazily/at readiness-probe time.
+    /// A directory-resolving REST client was registered; readiness waits for
+    /// the provider gear's REST endpoint.
     Remote,
+    /// A directory-resolving gRPC client was registered; readiness waits for
+    /// the directory to resolve `service`.
+    RemoteGrpc {
+        /// Fully qualified gRPC service name (`package.Service`).
+        service: &'static str,
+    },
 }
 
 /// A consumer→provider contract wiring, registered by `#[toolkit::consumes]`
@@ -178,13 +274,14 @@ pub enum WireOutcome {
 ///   1. short-circuit returning [`WireOutcome::Local`] if a compile-time (local)
 ///      impl is already registered (`hub.try_get_local::<dyn Trait>().is_some()`),
 ///      so in-process providers win;
-///   2. otherwise register a directory-resolving REST client under the contract
+///   2. otherwise register a directory-resolving client under the contract
 ///      trait via [`ClientHub::register_remote_proxy`] (using the supplied
-///      [`EndpointResolver`]) and return [`WireOutcome::Remote`].
+///      [`EndpointResolver`]) and return [`WireOutcome::Remote`] for REST or
+///      [`WireOutcome::RemoteGrpc`] for gRPC.
 ///
 /// The runtime passes the owner gear's view ([`ClientHub::for_gear`]) when
 /// `owner_gear` is a gear in this process, so each consumer gets its own proxy
-/// built from its own `consumer_wiring.<dep>` settings; otherwise it passes the
+/// built from its own `clients.consumes.<dep>` settings; otherwise it passes the
 /// process-wide hub.
 ///
 /// Step 1 must use `try_get_local`, not `try_get`: `try_get` also returns a
@@ -204,7 +301,7 @@ pub struct ConsumerRegistration {
 
 /// The wiring function pointer emitted by `#[toolkit::consumes]`: registers the
 /// client into the `ClientHub` from an endpoint resolver and a prepared
-/// [`ClientTuning`](toolkit_contract::wiring::ClientTuning) (the `consumer_wiring`
+/// [`ClientTuning`](toolkit_contract::wiring::ClientTuning) (the `clients.consumes`
 /// knobs plus the process's platform-plane credential source). Aliased to keep
 /// the fn-pointer type readable.
 pub type WireFn = fn(
@@ -222,15 +319,17 @@ mod tests {
     use cf_system_sdks::directory::{RegisterInstanceInfo, ServiceEndpoint, ServiceInstanceInfo};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    /// Counts `resolve_rest_service` calls; all other methods are unused here.
+    /// Counts `resolve_rest_service` / `resolve_grpc_service` calls; all other
+    /// methods are unused here.
     struct CountingDirectory {
         calls: AtomicUsize,
     }
 
     #[async_trait]
     impl DirectoryClient for CountingDirectory {
-        async fn resolve_grpc_service(&self, _: &str) -> anyhow::Result<ServiceEndpoint> {
-            unimplemented!()
+        async fn resolve_grpc_service(&self, service: &str) -> anyhow::Result<ServiceEndpoint> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(ServiceEndpoint::new(format!("http://grpc.local/{service}")))
         }
         async fn resolve_rest_service(&self, gear: &str) -> anyhow::Result<ServiceEndpoint> {
             self.calls.fetch_add(1, Ordering::SeqCst);
@@ -272,6 +371,84 @@ mod tests {
             dir.calls.load(Ordering::SeqCst),
             1,
             "successful resolution must be memoized within the TTL (one directory lookup)"
+        );
+    }
+
+    #[tokio::test]
+    async fn grpc_lookups_go_by_service_name_and_are_cached_apart() {
+        let dir = Arc::new(CountingDirectory {
+            calls: AtomicUsize::new(0),
+        });
+        let resolver = DirectoryEndpointResolver::new(dir.clone());
+
+        let grpc = resolver
+            .resolve_grpc_endpoint("billing.v1.BillingApi")
+            .await
+            .unwrap();
+        assert_eq!(
+            grpc.as_deref(),
+            Some("http://grpc.local/billing.v1.BillingApi")
+        );
+        let rest = resolver.resolve_endpoint("billing").await.unwrap();
+        assert_eq!(rest.as_deref(), Some("http://billing.local"));
+        resolver
+            .resolve_grpc_endpoint("billing.v1.BillingApi")
+            .await
+            .unwrap();
+
+        assert_eq!(dir.calls.load(Ordering::SeqCst), 2, "one lookup per target");
+    }
+
+    #[tokio::test]
+    async fn invalidate_drops_only_that_targets_answer() {
+        let dir = Arc::new(CountingDirectory {
+            calls: AtomicUsize::new(0),
+        });
+        let resolver = DirectoryEndpointResolver::new(dir.clone());
+        resolver.resolve_endpoint("billing").await.unwrap();
+        resolver
+            .resolve_grpc_endpoint("billing.v1.BillingApi")
+            .await
+            .unwrap();
+
+        resolver.invalidate(&ResolveTarget::grpc("billing", "billing.v1.BillingApi"));
+        resolver.resolve_endpoint("billing").await.unwrap();
+        resolver
+            .resolve_grpc_endpoint("billing.v1.BillingApi")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            dir.calls.load(Ordering::SeqCst),
+            3,
+            "only the gRPC answer was looked up again"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_static_resolver_can_pin_grpc_apart() {
+        let both = StaticEndpointResolver::new("http://svc:8080");
+        let split =
+            StaticEndpointResolver::new("http://svc:8080").with_grpc_endpoint("http://svc:50051");
+
+        assert_eq!(
+            both.resolve_grpc_endpoint("x.v1.X")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("http://svc:8080")
+        );
+        assert_eq!(
+            split
+                .resolve_grpc_endpoint("x.v1.X")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("http://svc:50051")
+        );
+        assert_eq!(
+            split.resolve_endpoint("svc").await.unwrap().as_deref(),
+            Some("http://svc:8080")
         );
     }
 

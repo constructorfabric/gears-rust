@@ -434,11 +434,11 @@ mod tests {
 
     #[test]
     fn only_the_gts_publication_key_is_hidden() {
-        // `consumer_wiring` keeps reaching the gear's deserializer, as before.
-        let provider = strict_provider(&json!({ "consumer_wiring": {} }));
+        // Any other key keeps reaching the gear's deserializer.
+        let provider = strict_provider(&json!({ "publication": {} }));
         let err = gear_config_required::<StrictConfig>(&provider, "strict_gear").unwrap_err();
         assert!(
-            err.to_string().contains("unknown field `consumer_wiring`"),
+            err.to_string().contains("unknown field `publication`"),
             "{err}"
         );
     }

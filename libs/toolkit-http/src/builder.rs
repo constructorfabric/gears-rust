@@ -31,6 +31,7 @@ type InnerService =
 pub struct HttpClientBuilder {
     config: HttpClientConfig,
     auth_layer: Option<Box<dyn FnOnce(InnerService) -> InnerService + Send>>,
+    attempt_layer: Option<Box<dyn FnOnce(InnerService) -> InnerService + Send>>,
     metrics_layer: Option<Box<dyn FnOnce(InnerService) -> InnerService + Send>>,
 }
 
@@ -41,6 +42,7 @@ impl HttpClientBuilder {
         Self {
             config: HttpClientConfig::default(),
             auth_layer: None,
+            attempt_layer: None,
             metrics_layer: None,
         }
     }
@@ -51,6 +53,7 @@ impl HttpClientBuilder {
         Self {
             config,
             auth_layer: None,
+            attempt_layer: None,
             metrics_layer: None,
         }
     }
@@ -210,6 +213,23 @@ impl HttpClientBuilder {
         wrap: impl FnOnce(InnerService) -> InnerService + Send + 'static,
     ) -> Self {
         self.auth_layer = Some(Box::new(wrap));
+        self
+    }
+
+    /// Insert a layer that sees every attempt as it leaves for the network.
+    ///
+    /// Stack position: `… → Retry → Auth → **this layer** → ErrorMapping → Timeout → …`
+    ///
+    /// The layer runs once per attempt, after credentials are attached, and
+    /// sees the transport outcome of that attempt: a response with any status,
+    /// or a connect, TLS or timeout error. A circuit breaker belongs here.
+    /// Only one attempt layer can be set; a second call replaces the first.
+    #[must_use]
+    pub fn with_attempt_layer(
+        mut self,
+        wrap: impl FnOnce(InnerService) -> InnerService + Send + 'static,
+    ) -> Self {
+        self.attempt_layer = Some(Box::new(wrap));
         self
     }
 
@@ -418,7 +438,7 @@ impl HttpClientBuilder {
         //
         // Request flow (outer → inner):
         //   Buffer → OtelLayer → [MetricsLayer?] → LoadShed/Concurrency →
-        //   RetryLayer → [AuthLayer?] → ErrorMapping → Timeout → UserAgent →
+        //   RetryLayer → [AuthLayer?] → [AttemptLayer?] → ErrorMapping → Timeout → UserAgent →
         //   Decompression → FollowRedirect → hyper_client
         //
         // AuthLayer (if set via with_auth_layer) sits inside the retry
@@ -432,7 +452,7 @@ impl HttpClientBuilder {
         //
         // Response flow (inner → outer):
         //   hyper_client → FollowRedirect → Decompression → UserAgent →
-        //   Timeout → ErrorMapping → [AuthLayer?] → RetryLayer →
+        //   Timeout → ErrorMapping → [AttemptLayer?] → [AuthLayer?] → RetryLayer →
         //   LoadShed/Concurrency → [MetricsLayer?] → OtelLayer → Buffer
         //
         // Key semantics (reqwest-like):
@@ -470,6 +490,12 @@ impl HttpClientBuilder {
 
         // Box the service for type erasure
         let mut boxed_service = service.boxed_clone();
+
+        // Attempt layer (e.g. a circuit breaker): inside auth, so a failure to
+        // obtain credentials is not taken for a backend failure.
+        if let Some(wrap) = self.attempt_layer {
+            boxed_service = wrap(boxed_service);
+        }
 
         // Apply auth layer (between timeout and retry).
         // Inside retry so each retry attempt re-acquires the token.

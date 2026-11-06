@@ -15,19 +15,13 @@ fn defaults_fill_in_for_an_empty_table() {
 }
 
 #[test]
-fn client_wiring_is_accepted_so_a_split_deployment_can_boot() {
-    let cfg: ProductsConfig = serde_json::from_str(
-        r#"{
-            "client_wiring": {
-                "product_catalog_client_v1": {
-                    "transport": "rest",
-                    "endpoint": "http://bss-products.virtuozzo.svc:8080"
-                }
-            }
-        }"#,
-    )
-    .expect("the provides wiring key must not trip deny_unknown_fields");
-    assert!(cfg.client_wiring.is_object());
+fn a_client_wiring_key_in_the_gear_config_is_refused() {
+    // Provides wiring lives in `gears.bss-products.clients`, not in `config`.
+    let parsed: Result<ProductsConfig, _> = serde_json::from_str(r#"{ "client_wiring": {} }"#);
+    assert!(
+        parsed.is_err(),
+        "client_wiring is not a products config key"
+    );
 }
 
 #[test]
@@ -72,8 +66,8 @@ fn read_wiring_accepts_the_documented_rest_object() {
         "bss-products",
         uuid::Uuid::nil(),
         Arc::new(Documented(serde_json::json!({
-            "config": {
-                "client_wiring": {
+            "clients": {
+                "provides": {
                     "product_catalog_client_v1": {
                         "transport": "rest",
                         "endpoint": "http://bss-products.virtuozzo.svc:8080"

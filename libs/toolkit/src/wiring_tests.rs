@@ -47,7 +47,7 @@ fn missing_gear_yields_local() {
 }
 
 #[test]
-fn missing_client_wiring_yields_local() {
+fn missing_clients_section_yields_local() {
     let ctx = ctx_with("payments", json!({ "config": { "other": "value" } }));
     let w = read_wiring(&ctx, "payment_api").expect("default");
     assert!(matches!(w, ClientWiring::Local));
@@ -57,7 +57,7 @@ fn missing_client_wiring_yields_local() {
 fn missing_contract_key_yields_local() {
     let ctx = ctx_with(
         "payments",
-        json!({ "config": { "client_wiring": { "other_api": { "transport": "rest", "endpoint": "x" } } } }),
+        json!({ "clients": { "provides": { "other_api": { "transport": "rest", "endpoint": "x" } } } }),
     );
     let w = read_wiring(&ctx, "payment_api").expect("default");
     assert!(matches!(w, ClientWiring::Local));
@@ -68,8 +68,8 @@ fn rest_wiring_parses() {
     let ctx = ctx_with(
         "payments",
         json!({
-            "config": {
-                "client_wiring": {
+            "clients": {
+                "provides": {
                     "payment_api": {
                         "transport": "rest",
                         "endpoint": "https://payments.example",
@@ -92,8 +92,8 @@ fn malformed_wiring_returns_error_with_context() {
     let ctx = ctx_with(
         "payments",
         json!({
-            "config": {
-                "client_wiring": {
+            "clients": {
+                "provides": {
                     "payment_api": { "transport": "rest" }  // missing endpoint
                 }
             }
@@ -101,8 +101,10 @@ fn malformed_wiring_returns_error_with_context() {
     );
     let err = read_wiring(&ctx, "payment_api").expect_err("missing endpoint");
     let msg = format!("{err:#}");
-    assert!(msg.contains("payments"), "mentions gear: {msg}");
-    assert!(msg.contains("payment_api"), "mentions key: {msg}");
+    assert!(
+        msg.starts_with("gears.payments.clients.provides.payment_api:"),
+        "names the path: {msg}"
+    );
 }
 
 #[test]

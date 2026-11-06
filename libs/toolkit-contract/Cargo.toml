@@ -31,12 +31,13 @@ runtime-client = [
     "dep:rand",
     "dep:async-stream",
     "dep:secrecy",
+    "dep:toolkit-resilience",
+    "dep:tower",
 ]
-# Client-side REST: gates the `runtime::resolving` module here, and in the SDK
-# crate the `rest_contract` codegen puts both the generated `<Trait>RestClient`
-# and its directory-resolving wrapper `<Trait>RestResolvingClient` behind this
-# same name. The wrapper is a thin layer over the plain client and needs no
-# dependencies of its own, so splitting it into its own feature bought nothing.
+# Client-side REST. In the SDK crate the `rest_contract` codegen puts both the
+# generated `<Trait>RestClient` and its directory-resolving wrapper
+# `<Trait>RestResolvingClient` behind this same name. The wrapper's runtime
+# (`runtime::resolving`) is shared with gRPC and lives under `runtime-client`.
 rest-client = ["runtime-client"]
 # OpenTelemetry in generated clients. Activates `toolkit-http/otel`, which makes
 # the transport actually inject W3C `traceparent` (real distributed-trace
@@ -108,15 +109,19 @@ toolkit-canonical-errors = { workspace = true, optional = true }
 # before the handler runs — and rejected as an RFC 9457 Problem, like every
 # other error the generated server produces.
 axum = { workspace = true, optional = true }
+# Circuit breaker in front of every remote call a generated client makes.
+toolkit-resilience = { workspace = true, features = ["serde", "tower"], optional = true }
+tower = { workspace = true, features = ["util"], optional = true }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["full"] }
+tokio = { workspace = true, features = ["full", "test-util"] }
 parking_lot.workspace = true
 futures-core.workspace = true
 futures-util.workspace = true
 bytes.workspace = true
 axum.workspace = true
 toolkit-http.workspace = true
+toolkit-resilience = { workspace = true }
 secrecy.workspace = true
 toolkit-security.workspace = true
 uuid = { workspace = true, features = ["v4"] }

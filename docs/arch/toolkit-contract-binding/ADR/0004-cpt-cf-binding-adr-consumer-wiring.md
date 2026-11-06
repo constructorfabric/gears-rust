@@ -43,11 +43,11 @@ with the OoP bootstrap and the embedded (in-process) runtime.
 * **No static endpoint configuration** — the endpoint of a remote provider is resolved at runtime
   through `DirectoryService`, not hard-coded in `config.yaml` or source code. **Amended by
   `cpt-cf-adr-optional-service-discovery`:** this driver holds for directory-based deployments, but is superseded for
-  the explicit directory-less mode (`discovery: none`), where a static `consumer_wiring.<dep>.endpoint` is the
+  the explicit directory-less mode (`discovery: none`), where a static `clients.consumes.<dep>.endpoint` is the
   supported resolution mechanism (e.g. a k8s Service URL) rather than a dev/test-only escape hatch.
 * **Transparency across runtime profiles** — in Profile 1 (embedded), the local in-process
-  implementation is used without any HTTP hop; in Profile 2/3 (OoP), the generated REST client is
-  wired automatically. Gear business logic sees `Arc<dyn BillingApi>` in both cases.
+  implementation is used without any HTTP hop; in Profile 2/3 (OoP), the generated REST or gRPC
+  client is wired automatically. Gear business logic sees `Arc<dyn BillingApi>` in both cases.
 * **Readiness gating** — a gear must not signal readiness (`/readyz` returning 200) until all of its
   critical dependencies are resolved and wired, consistent with vision ADR-0007.
 * **Startup must not block on a dependency** — a consumer has to start, and keep starting cleanly,
@@ -107,6 +107,21 @@ pub struct OrdersGear { … }
 The list form expands to the same registrations as one attribute per contract. A contract consumed
 twice on one struct, in one list or across stacked attributes, is a compile error.
 
+`transport = grpc` (top level, or on one entry) consumes the contract over gRPC; `transport = rest`
+is the default:
+
+```rust
+#[toolkit::consumes(contract = payments_sdk::PaymentApi, from = "payments", transport = grpc)]
+pub struct OrdersGear { … }
+```
+
+The transport is chosen here, in code, not in config. REST wires
+`<parent>::<Contract>RestResolvingClient` (from `#[toolkit::rest_contract]`), resolved by gear
+name; gRPC wires `<parent>::<Contract>GrpcResolvingClient` (from `#[toolkit::grpc_contract]` on a
+projection named `<Contract>Grpc`), resolved by its gRPC service name. The SDK must be built with
+`rest-client` or `grpc-client` respectively and re-export the resolving client next to the base
+trait; `resolving_client = path` overrides the path.
+
 ### What the macro generates
 
 For each `#[toolkit::consumes(contract = C, from = "name")]` the macro emits an `inventory::submit!`
@@ -136,7 +151,7 @@ inventory::submit! {
                 return Ok(WireOutcome::Remote);
             }
             // `tuning` is prepared by the proxy-wiring phase from the consumer's
-            // `consumer_wiring.<dep>` config and already carries the process's
+            // `clients.consumes.<dep>` config and already carries the process's
             // platform-plane credential source, so the resolving client's
             // platform-plane methods attach `X-ToolKit-Internal-Token`
             // (no credential in Profile 1 attaches nothing).
@@ -148,10 +163,16 @@ inventory::submit! {
 }
 ```
 
+With `transport = grpc` the closure differs in two places: it builds
+`billing_sdk::BillingApiGrpcResolvingClient::new(resolver, "billing", tuning)`, and both remote
+returns are `WireOutcome::RemoteGrpc { service: billing_sdk::BillingApiGrpcResolvingClient::GRPC_SERVICE }`,
+so the runtime knows which gRPC service to probe for readiness. `WireFn` and
+`ConsumerRegistration` are the same for both transports.
+
 **Each consumer gets its own proxy.** The runtime calls `wire` with the owner gear's view of the
 hub, `ClientHub::for_gear(owner_gear)`. Local and scoped registrations are shared by all views;
 a proxy registered through `register_remote_proxy` belongs to the view's owner. So two gears that
-consume the same contract each get a proxy built from their own `consumer_wiring.<dep>` settings
+consume the same contract each get a proxy built from their own `clients.consumes.<dep>` settings
 (endpoint, timeout, retry, `require_tls`, pool), whatever the wiring order. `GearCtx::client_hub()`
 returns the gear's view, and `get`/`try_get` there return, in order: a local impl, the gear's own
 proxy, a process-wide proxy. A local impl registered after wiring still wins. A registration whose
@@ -172,10 +193,12 @@ Two details differ from the sketch this ADR originally carried, both load-bearin
   happens once, at startup, and the client resolves (and re-resolves) the provider address per call.
   A provider that restarts on a new address is picked up without re-wiring the consumer.
 * **`wire` returns [`WireOutcome`](../../../../libs/toolkit/src/discovery.rs)**, distinguishing a
-  dependency satisfied in-process (`Local`) from one bound to a remote client (`Remote`). Only
-  `Remote` deps gate `/readyz` and get a background resolve loop; a co-located local impl is marked
-  readiness-resolved immediately and spawns no directory probe. Returning `()` — as the original
-  sketch did — would have forced every embedded-profile gear to wait on a directory it never needs.
+  dependency satisfied in-process (`Local`) from one bound to a remote client: `Remote` for a REST
+  client, `RemoteGrpc { service }` for a gRPC client. Only remote deps gate `/readyz` and get a
+  background resolve loop; a co-located local impl is marked readiness-resolved immediately and
+  spawns no directory probe. Returning `()` — as the original sketch did — would have forced every
+  embedded-profile gear to wait on a directory it never needs. `WireOutcome` is
+  `#[non_exhaustive]`.
 
 **Topology: `#[toolkit::consumes]` does not inject a topo-sort dependency.** An earlier draft of this
 ADR had it insert `from` into the gear's `deps`; the shipped macro deliberately does not. Two reasons:
@@ -192,25 +215,43 @@ view of the hub, then spawns a resolve loop for the deps that bound through disc
 
 ```text
 for each ConsumerRegistration:
-    (endpoint, tuning) = read_consumer_wiring(owner_gear, dep_gear)  // parsed ConsumerWiring
+    (endpoint, grpc_endpoint, tuning) = read_consumer_wiring(owner_gear, dep_gear)  // ConsumerWiring
     hub = client_hub.for_gear(owner_gear) if owner_gear is a gear here, else client_hub
-    outcome = ConsumerRegistration.wire(hub, resolver_for(dep_gear, endpoint), tuning)?
-    if outcome == Local or endpoint is static:
-        resolve_now += dep_gear
-    else:
-        needs_probe += dep_gear
+    resolver = directory, with endpoint / grpc_endpoint (else endpoint) as static
+               overrides for REST / gRPC lookups
+    outcome = ConsumerRegistration.wire(hub, resolver, tuning)?
+    match outcome:
+        Local                                      → resolve_now += dep_gear
+        Remote, endpoint set                       → resolve_now += dep_gear
+        RemoteGrpc, grpc_endpoint or endpoint set  → resolve_now += dep_gear
+        Remote, in-process dep serves no REST API  → boot error
+        RemoteGrpc, in-process dep serves no gRPC  → boot error
+        Remote                                     → probes[dep_gear] += Rest
+        RemoteGrpc { service }                     → probes[dep_gear] += Grpc(service)
+    if owner_gear wires dep_gear over REST and gRPC and only `endpoint` is set → boot error
 
-mark readiness-resolved: resolve_now - needs_probe   // no directory probe at all
-spawn probe for needs_probe: loop with exponential backoff (100 ms → 200 ms → … → 30 s cap):
-    if DirectoryService.resolve_rest_service(dep_gear) is Ok:
-        mark dep_gear readiness-resolved
+mark readiness-resolved: resolve_now - keys(probes)   // no directory probe at all
+spawn probe for probes: loop with exponential backoff (100 ms → 200 ms → … → 30 s cap):
+    for each dep_gear, for each pending target:
+        Rest          → DirectoryService.resolve_rest_service(dep_gear)
+        Grpc(service) → DirectoryService.resolve_grpc_service(service)
+    mark dep_gear readiness-resolved once all of its targets resolved
+    after ~10 rounds, warn once per gRPC service still missing (grpc-hub listen_addr / advertise_addr)
 
 when no dep_gear remains unresolved:
     state = ready   →   /readyz responds HTTP 200
 ```
 
 A dep is resolved at wiring time only when no consumer of it needs discovery: with one consumer on
-a static endpoint and another on discovery, the dep waits for the probe.
+a static endpoint and another on discovery, the dep waits for the probe. A dep consumed over both
+transports (by one gear or by two) is probed for both targets and becomes ready only when its REST
+endpoint and its gRPC service both resolve.
+
+"Serves no gRPC" means the dep is a gear in this process without a gRPC service capability; a
+`RemoteGrpc` binding to it could never resolve. When a `RemoteGrpc` client's `clients.consumes` entry sets
+knobs a gRPC client does not apply (the REST-only `pool_max_idle_per_host`, `pool_idle_timeout`,
+`max_concurrent_requests`, and `stream_reconnect`, since gRPC streams do not reconnect yet), the
+phase logs a `warn!` that they have no effect. `clients.provides` with `transport: grpc` warns the same way.
 
 Wiring happens once and up front; the probe only drives *readiness*, not the binding. The client
 registered for a `Remote` dep resolves its endpoint per call through the same
@@ -235,8 +276,29 @@ directory outage, and the resolving client warns on *every* business call to a
 provider that has simply not started yet.
 
 **Endpoint resolution is memoized** for `DirectoryEndpointResolver::TTL` (1500 ms).
-Only successes are cached, and a failed call does not invalidate the entry, so a
-provider that moves is followed within roughly the TTL rather than instantly.
+Only successes are cached; REST answers are keyed by gear name and gRPC answers by
+service name, apart. An attempt that the client's circuit breaker classifies as an
+endpoint failure (`cpt-cf-binding-adr-client-circuit-breaker`) calls
+`EndpointResolver::invalidate(target)`, at most once per second per endpoint, which
+drops that entry; the next call asks the directory again. A provider that moves is
+therefore followed at the next call after its old endpoint fails, and otherwise
+within roughly the TTL.
+
+**gRPC resolves by service name, not by gear.** `ResolveTarget::Grpc { gear, service }`
+resolves through `DirectoryClient::resolve_grpc_service(service)`, which answers with
+any healthy instance advertising that service, whichever gear it belongs to (see
+`cpt-cf-adr-instance-addressable-discovery`). `from` names the providing gear for
+logs, errors, readiness and the in-process check; it does not filter the lookup.
+The directory refuses a gRPC service name already owned by another gear, so a name
+cannot silently move between gears. The service name carries the contract's major
+version (`cpt-cf-binding-adr-contract-versioning`), so each major resolves on its own.
+
+`EndpointResolver` gained default methods for this: `resolve_grpc_endpoint(service)`
+(default `Ok(None)`, so a resolver written before gRPC consumers leaves them
+unresolved rather than misrouted), `resolve_target(&ResolveTarget)`, and
+`invalidate(&ResolveTarget)` (default no-op). `DirectoryResolvingClient` serves both
+transports and keeps one client per endpoint URI (up to 16), each with its own
+breaker, so the directory's round-robin neither rebuilds clients nor resets breakers.
 
 ### Runtime integration — embedded profile (Profile 1)
 
@@ -253,31 +315,61 @@ in `deps` when you want the local path guaranteed.
 
 ### Consumer wiring: endpoint override + client tuning
 
-Each consumed dependency is configured per gear under the same `config` block the provider side uses
-for `client_wiring`, keyed by the dependency (provider) gear name. `consumer_wiring.<dep>` is an
-**object** (`ConsumerWiring`) carrying an optional `endpoint` plus a flattened `ClientTuning`:
+Client settings live in their own section of the gear's entry, `gears.<gear>.clients`, next to
+`config`, `database` and `runtime`, not inside the gear's `config`:
 
 ```yaml
 # config.yaml
 gears:
   orders:
-    config:
-      consumer_wiring:
-        api-contracts:
-          timeout: "5s"
+    config: { ... }                         # the gear's own configuration only
+    clients:
+      defaults:                             # tuning for every client this gear builds
+        timeout: "5s"
+        circuit_breaker: { open_for: "30s" }  # see cpt-cf-binding-adr-client-circuit-breaker
+      consumes:
+        api-contracts:                      # #[toolkit::consumes(from = "api-contracts")]
           max_concurrent_requests: 256
           pool_max_idle_per_host: 256
-          # endpoint: "http://localhost:8081"   # optional; omit to keep discovery
+          # endpoint: "http://localhost:8081"       # optional; omit to keep discovery
+          # grpc_endpoint: "http://localhost:50051" # optional; static address for gRPC clients
+      provides:
+        payment_api:                        # #[toolkit::provides], contract in snake case
+          transport: rest
+          endpoint: "http://payments:8080"
 ```
 
-The bare-string form earlier drafts accepted (`billing: "http://localhost:8081"`) is **no longer
-supported**: the override lives on the optional `endpoint` field, and a bare string is a boot error
-whose message names the object form.
+* `clients.consumes.<dep>` is keyed by the dependency (provider) gear name. It is an **object**
+  (`ConsumerWiring`) with an optional `endpoint`, an optional `grpc_endpoint`, and a flattened
+  `ClientTuning`.
+* `clients.provides.<contract>` is the provider side's `ClientWiring`, keyed by the contract trait in
+  snake case.
+* `clients.defaults` holds `ClientTuning` keys only. It is merged under every entry key by key,
+  nested objects (`circuit_breaker`, `retry`) included; the entry wins. A dep with no entry of its own
+  still gets the defaults. `defaults` alone never makes a provided contract remote.
+* Unknown keys anywhere in the section, and `endpoint` / `grpc_endpoint` / `transport` in `defaults`,
+  are boot errors that name the full path (`gears.orders.clients.consumes.billing.timout`). serde's
+  `deny_unknown_fields` does not work with a flattened struct, so the reader
+  (`toolkit::clients_config`) checks against `ClientTuning::KEYS`.
+* An OoP child receives the section from the master with its rendered config (`RenderedGearConfig`);
+  a `clients` section in the child's local `--config` replaces it, as `config` does.
 
-Because the consumer path is **REST-only** (`#[toolkit::consumes]` always wires a
-`<Contract>RestResolvingClient`; there is no gRPC resolving client), `ConsumerWiring` carries **no**
-`transport` tag and every `ClientTuning` knob applies — no gRPC disambiguation and no
-`rest_only_knobs_set` warning (contrast the provider-side `client_wiring`).
+**Why a separate section.** The keys belong to the framework, not to the gear. Inside `config` they
+reached the gear's own deserializer: a gear with `#[serde(deny_unknown_fields)]` refused them, so
+gears declared placeholder fields only to let them through. The same arrangement is common elsewhere:
+Spring Cloud OpenFeign keeps per-client settings under `spring.cloud.openfeign.client.config.<name>`
+with a `default` entry, Quarkus REST Client under `quarkus.rest-client."<key>"`, Resilience4j under
+`instances.<name>` with `configs.default`. The earlier `config.consumer_wiring` and
+`config.client_wiring` keys are not read any more.
+
+`ConsumerWiring` carries **no** `transport` tag (contrast the provider-side `ClientWiring`): the
+transport is chosen in code, by `transport = …` on `#[toolkit::consumes]`. One `clients.consumes.<dep>`
+entry therefore serves every client the gear builds for that dep. A gRPC client reads `timeout`,
+`retry`, `require_tls` and `circuit_breaker`; it ignores the REST pool and concurrency knobs, and
+the phase warns when they are set for it.
+
+The circuit breaker is on by default for every client wired here, REST and gRPC; `circuit_breaker:
+{ enabled: false }` turns it off for the dep (`cpt-cf-binding-adr-client-circuit-breaker`).
 
 This is the caller-owned config surface that [DESIGN §1.3](../DESIGN.md#13-operational-semantics)
 specifies for remote contracts — "Own config (URL, timeout, retry policy) via `ClientConfig`" — now
@@ -285,15 +377,22 @@ reachable on the actual high-concurrency gear-to-gear caller. `ConsumerWiring` d
 `ClientTuning` whose `apply_to(endpoint)` produces that per-call `ClientConfig`.
 
 The proxy-wiring phase (`host_runtime::run_proxy_wiring_phase`) reads the entry via
-`read_consumer_wiring(...)`, splits it into `(endpoint, tuning)`, threads the process's platform-plane
+`toolkit::clients_config::consumer_wiring(...)`, splits it into `(endpoint, tuning)`, threads the process's platform-plane
 credential onto the tuning, and hands it to `ConsumerRegistration::wire`. A present-but-unparseable
 entry — wrong shape, wrong-typed tuning, or a non-absolute `endpoint` (validated at parse time by
 `ConsumerWiring`'s `deserialize_with`) — is a boot error (`RegistryError::ProxyWiring`), matching the
-provider side's `client_wiring` (`toolkit::wiring::read_wiring`); it is never downgraded to discovery.
+provider side (`toolkit::wiring::read_wiring`); it is never downgraded to discovery.
 
-**`endpoint` present** → the dep is wired through a `StaticEndpointResolver` (`toolkit::discovery`),
-bypassing the directory and readiness-resolved immediately (no probe loop). This is the dev/test
-escape hatch, logged at `warn!`. **`endpoint` omitted** → discovery is untouched; only tuning applies.
+**`endpoint` present** → REST lookups for the dep return that address, bypassing the directory, and
+a REST client of it is readiness-resolved immediately (no probe loop). gRPC lookups return
+`grpc_endpoint` when set, else the same `endpoint`. Lookups for a transport with no override still
+go to the directory, so `grpc_endpoint` alone pins only the gRPC client. The override is logged at
+`warn!`. **Both omitted** → discovery is untouched; only tuning applies. (`StaticEndpointResolver`
+in `toolkit::discovery` has the same split through `with_grpc_endpoint`.)
+
+A gear that consumes one dep over **both** REST and gRPC with only `endpoint` set fails at boot
+(`RegistryError::ProxyWiring`): one address cannot serve an HTTP listener and a gRPC listener, and
+the error asks for `grpc_endpoint`.
 
 The `<owner>` segment is `ConsumerRegistration::owner_gear`. `#[toolkit::consumes]` takes it from
 `name = "..."` of a `#[toolkit::gear]` written below it on the same struct; otherwise it uses the
@@ -301,7 +400,7 @@ The `<owner>` segment is `ConsumerRegistration::owner_gear`. `#[toolkit::consume
 If `owner_gear` is not a registered gear, the key will not resolve; the proxy-wiring phase emits a
 `warn!` naming both rather than ignoring the override silently.
 
-Known limits of the escape hatch: exactly one address (no list, weights or failover), no fallback to
+Known limits of the escape hatch: exactly one address per transport (no list, weights or failover), no fallback to
 the directory if that address is dead, no metadata or version predicate, and it is read once at
 startup with no hot reload.
 
@@ -326,7 +425,7 @@ HTTP 503
 { "state": "starting", "ready": false, "unresolved_deps": ["billing"] }
 ```
 
-Once every `Remote` dependency has resolved:
+Once every remote (`Remote` or `RemoteGrpc`) dependency has resolved:
 
 ```json
 HTTP 200
@@ -358,6 +457,12 @@ are normally served by the *same* provider (ADR-0007: parallel traits on one
 router), so "the gear is up but serving the wrong major" means a genuinely
 mis-deployed topology rather than routine startup churn. And the failure is a
 clean 404 at the call site, not silent data corruption.
+
+A gRPC consumer is better placed: it resolves the service name, which carries the
+major version (`billing.v2.PaymentApi`), so it does not go Ready against a provider
+serving only another major. Within one major it still cannot tell an older minor
+release apart; a call to an RPC that release lacks returns canonical `Unimplemented`
+(`cpt-cf-binding-adr-contract-versioning`).
 
 Related and deliberate: `DependencyChecker` stores a bare `bool` per dependency,
 so `Local`, directory-resolved, and static-override all collapse into one
@@ -406,6 +511,15 @@ unit tests and manual integration setups.
   closure that compiles against `billing_sdk` alone (no `billing` impl crate in scope).
 * Unit test: `wire` short-circuits when `hub.try_get::<dyn BillingApi>().is_some()`, returning
   `WireOutcome::Local` so the dep never gates `/readyz`.
+* Unit tests (`consumes.rs`): `transport = grpc` wires `<Contract>GrpcResolvingClient` and returns
+  `RemoteGrpc { service: …::GRPC_SERVICE }`; REST is the default; an entry can set its own
+  transport; an unknown transport is a compile error.
+* Runtime tests (`host_runtime.rs`): a gRPC dep resolves only when its service is published (a REST
+  endpoint of the gear does not count); a dep consumed over both transports waits for both;
+  `grpc_endpoint` pins only the gRPC client; one `endpoint` for both transports is a boot error.
+* Integration tests (`api-contracts`): `grpc_consumer_runtime.rs` runs a gRPC consumer through the
+  `HostRuntime` phases against a provider published by a gRPC hub; `grpc_resolving.rs` covers
+  eventual readiness, a provider that moved, the breaker, per-major routing and `Unimplemented`.
 * Integration test (Profile 1): `OrdersGear` initialises after `BillingGear` (topo-sort);
   `wire` short-circuits; `hub.get::<dyn BillingApi>()` returns the local implementation.
 * Integration test (Profile 2/OoP): `OrdersGear` starts as OoP; bootstrap polls
@@ -473,7 +587,15 @@ Document the current pattern; require authors to configure static endpoints.
   semantics (`bearer_token` forwarded via `Authorization` header, full context via `x-secctx-bin`);
   the generated REST client must conform to this protocol.
 * Directory SDK extension: `libs/system-sdks/sdks/directory/src/api.rs` — `resolve_rest_service`
-  added in `c280de1`; this ADR depends on that method being present.
+  added in `c280de1`; this ADR depends on that method being present. gRPC consumers use
+  `resolve_grpc_service`.
+* `cpt-cf-binding-adr-grpc-projection` (ADR-0008) — the generated `<Contract>GrpcResolvingClient`
+  and `<BASE>_GRPC_SERVICE`.
+* `cpt-cf-binding-adr-client-circuit-breaker` (ADR-0009 in this folder) — the breaker in every
+  wired client and the endpoint-failure hook that calls `EndpointResolver::invalidate`.
+* Resolving runtime: `libs/toolkit-contract/src/runtime/resolving.rs` (`DirectoryResolvingClient`,
+  `ResolveTarget`, `EndpointResolver`), gated on `runtime-client`; resolvers in
+  `libs/toolkit/src/discovery.rs`.
 * Topo-sort entry point: `libs/toolkit/src/registry.rs` — `build_topo_sorted`; it sees only the
   `deps` declared on `#[toolkit::gear]`, never anything from `#[toolkit::consumes]`.
 * `ClientHub`: `libs/toolkit/src/client_hub.rs` — `try_get`, `register`, `get` are the three methods
@@ -483,6 +605,6 @@ Document the current pattern; require authors to configure static endpoints.
   shared by both runtime paths (in-process host and OoP serving); `bootstrap/oop.rs` contains no
   consumer-wiring code.
 * Consumer client tuning: this ADR's original scope was *discovery* (the endpoint alone), so the
-  wired client used a hardcoded `ClientTuning::default()`. It now parses `consumer_wiring.<dep>` into
+  wired client used a hardcoded `ClientTuning::default()`. It now parses `clients.consumes.<dep>` into
   `ConsumerWiring` (optional `endpoint` + flattened `ClientTuning`) and threads it through `WireFn`
   into the resolving client — the caller-owned config specified for remote contracts.

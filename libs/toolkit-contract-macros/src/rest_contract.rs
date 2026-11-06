@@ -26,6 +26,7 @@ const HTTP_ATTRS: &[&str] = &[
     "patch",
     "delete",
     "retryable",
+    "circuit_breaker",
     "streaming",
     "server_manual",
     "exposed",
@@ -691,6 +692,18 @@ fn generate_resolving_method(
     }
 }
 
+/// Marks the request of a `#[circuit_breaker(skip)]` method so the client's
+/// circuit breaker lets it through uncounted.
+fn rest_skip_marker(method: &RestMethodModel, support: &TokenStream) -> TokenStream {
+    if method.breaker_skip {
+        quote! {
+            __builder = __builder.extension(#support::runtime::breaker::SkipCircuitBreaker);
+        }
+    } else {
+        quote! {}
+    }
+}
+
 fn resolving_struct_ident(trait_ident: &syn::Ident) -> syn::Ident {
     format_ident!("{}ResolvingClient", trait_ident)
 }
@@ -735,6 +748,7 @@ fn generate_client_method(
     let binding_fn = format_ident!("__{}_http_binding", trait_snake);
     let method_name_str = method.ident.to_string();
     let method_ident = &method.ident;
+    let skip_marker = rest_skip_marker(method, support);
 
     let sig = render_method_signature(method);
     let fields_init = build_fields_json(method, support);
@@ -840,6 +854,7 @@ fn generate_client_method(
                     // attempt (not once before the retry loop) so a
                     // rotated/refreshed token is used on retries.
                     let mut __builder = self.http.#verb_call(&__url);
+                    #skip_marker
                     if let Some(ref __t) = __bearer {
                         __builder = __builder.bearer_auth(__t);
                     }
@@ -922,6 +937,7 @@ fn streaming_request_prelude(parts: &StreamingBody<'_>, bail: &TokenStream) -> T
     let err_ty = error_type(method);
     let verb_call = http_verb_call(method.http_method);
     let accept = method.stream_framing.media_type();
+    let skip_marker = rest_skip_marker(method, support);
     let convert_err = quote! {
         |__e| <#err_ty as ::std::convert::From<#support::runtime::transport_error::TransportError>>::from(__e)
     };
@@ -1002,6 +1018,7 @@ fn streaming_request_prelude(parts: &StreamingBody<'_>, bail: &TokenStream) -> T
             let mut __builder = __http
                 .#verb_call(&__url)
                 .header("accept", #accept);
+            #skip_marker
             // Tenant bearer via a sensitive `Authorization` header, or the
             // platform-plane runtime credential via a sensitive
             // `X-ToolKit-Internal-Token` (never `Authorization`); at most one

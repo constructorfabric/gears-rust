@@ -1506,6 +1506,7 @@ dependencies = [
  "cf-gears-toolkit-canonical-errors",
  "cf-gears-toolkit-contract",
  "cf-gears-toolkit-macros",
+ "cf-gears-toolkit-resilience",
  "cf-gears-toolkit-security",
  "cf-gears-toolkit-transport-grpc",
  "cf-gears-types-registry",
@@ -4732,6 +4733,7 @@ dependencies = [
  "cf-gears-toolkit-contract-macros",
  "cf-gears-toolkit-http",
  "cf-gears-toolkit-http-middleware",
+ "cf-gears-toolkit-resilience",
  "cf-gears-toolkit-security",
  "cf-gears-toolkit-transport-grpc",
  "cf-gears-toolkit-utils",
@@ -4752,6 +4754,7 @@ dependencies = [
  "thiserror 2.0.21",
  "tokio",
  "tonic",
+ "tower",
  "tracing",
  "tracing-opentelemetry",
  "tracing-subscriber",
@@ -5163,6 +5166,21 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.21",
  "time",
+]
+
+[[package]]
+name = "cf-gears-toolkit-resilience"
+version = "0.1.0"
+dependencies = [
+ "cf-gears-toolkit-utils",
+ "parking_lot",
+ "pin-project-lite",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+ "tokio",
+ "tower",
+ "tracing",
 ]
 
 [[package]]

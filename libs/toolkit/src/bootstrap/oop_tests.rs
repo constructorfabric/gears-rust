@@ -663,6 +663,7 @@ mod full_oop_config {
         let rendered = RenderedGearConfig {
             database: None,
             config: json!({"master_setting": "value"}),
+            clients: serde_json::Value::Null,
             logging: Some(
                 [(
                     "default".to_owned(),
@@ -708,6 +709,7 @@ mod full_oop_config {
                 "master_setting": "master_value",
                 "another": "setting"
             }),
+            clients: serde_json::Value::Null,
             logging: None,
             opentelemetry: None,
         };
@@ -722,6 +724,36 @@ mod full_oop_config {
         assert_eq!(gear_config["config"]["local_setting"], "local_value");
         // Master's settings should NOT be present
         assert!(gear_config["config"].get("master_setting").is_none());
+    }
+
+    #[test]
+    fn rendered_clients_reach_the_child_unless_it_sets_its_own() {
+        let rendered = RenderedGearConfig {
+            database: None,
+            config: json!({}),
+            clients: json!({ "consumes": { "billing": { "timeout": "2s" } } }),
+            logging: None,
+            opentelemetry: None,
+        };
+
+        let (from_master, _, _) =
+            build_oop_config_and_db(&minimal_app_config(), "test_gear", Some(&rendered)).unwrap();
+        assert_eq!(
+            from_master.gears["test_gear"]["clients"]["consumes"]["billing"]["timeout"],
+            "2s"
+        );
+
+        let mut local_config = minimal_app_config();
+        local_config.gears.insert(
+            "test_gear".to_owned(),
+            json!({ "clients": { "consumes": { "billing": { "timeout": "9s" } } } }),
+        );
+        let (local, _, _) =
+            build_oop_config_and_db(&local_config, "test_gear", Some(&rendered)).unwrap();
+        assert_eq!(
+            local.gears["test_gear"]["clients"]["consumes"]["billing"]["timeout"],
+            "9s"
+        );
     }
 
     #[test]
@@ -743,6 +775,7 @@ mod full_oop_config {
         let rendered = RenderedGearConfig {
             database: None,
             config: json!({}),
+            clients: serde_json::Value::Null,
             logging: Some(
                 [
                     (
@@ -804,6 +837,7 @@ mod full_oop_config {
         let rendered = RenderedGearConfig {
             database: None,
             config: json!({"master_setting": "value"}),
+            clients: serde_json::Value::Null,
             logging: None,
             opentelemetry: None,
         };
@@ -832,6 +866,7 @@ mod full_oop_config {
         let rendered = RenderedGearConfig {
             database: None,
             config: json!({"master_setting": "value"}),
+            clients: serde_json::Value::Null,
             logging: None,
             opentelemetry: None,
         };
@@ -869,6 +904,7 @@ mod full_oop_config {
         let rendered = RenderedGearConfig {
             database: None,
             config: json!({"master_setting": "value"}),
+            clients: serde_json::Value::Null,
             logging: None,
             opentelemetry: None,
         };

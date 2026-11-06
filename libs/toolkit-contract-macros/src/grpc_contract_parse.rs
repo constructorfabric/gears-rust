@@ -8,6 +8,8 @@
 //!   `async fn` the open is awaited and fallible, matching tonic's own client
 //!   and server shapes; on a plain `fn` it is the historical flattened form.
 //! - `#[retryable]` — wrap call in retry-with-backoff (re-used from base).
+//! - `#[circuit_breaker(skip)]` — the client's circuit breaker lets the call
+//!   through uncounted (long polls whose deadline is a normal outcome).
 //!
 //! Attribute on the trait itself: `#[grpc_contract(package = "...",
 //! service = "...", stubs_module = "crate::path::to::tonic::stubs")]`.
@@ -70,6 +72,9 @@ pub struct GrpcMethodModel {
     pub retryable: bool,
     /// Whether peers may omit this method (the trait declares a default body).
     pub optional: bool,
+    /// `#[circuit_breaker(skip)]`: the client's circuit breaker lets the call
+    /// through and does not count it.
+    pub breaker_skip: bool,
     /// Wire parameters of the method, excluding the receiver.
     pub params: Vec<GrpcParam>,
     /// `(ok, err)` extracted from `Result<T, E>` declared on the trait method.
@@ -250,6 +255,7 @@ fn parse_method(method: &TraitItemFn) -> syn::Result<GrpcMethodModel> {
     let mut server_streaming = false;
     let mut stream_open_arg: Option<StreamOpen> = None;
     let mut retryable = false;
+    let mut breaker_skip = false;
 
     for attr in &method.attrs {
         let path = attr.path();
@@ -290,6 +296,9 @@ fn parse_method(method: &TraitItemFn) -> syn::Result<GrpcMethodModel> {
             stream_open_arg = args.open;
         } else if path.is_ident("retryable") {
             retryable = true;
+        } else if path.is_ident("circuit_breaker") {
+            crate::support::parse_circuit_breaker_skip(attr)?;
+            breaker_skip = true;
         }
     }
 
@@ -340,6 +349,7 @@ fn parse_method(method: &TraitItemFn) -> syn::Result<GrpcMethodModel> {
         shape,
         retryable,
         optional,
+        breaker_skip,
         params,
         result_types,
     })

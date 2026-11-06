@@ -62,9 +62,13 @@ pub trait PaymentApiGrpc: PaymentApi {
     // already returns `Result<Response<Self::Stream>, Status>`. The open and
     // the messages are two phases on the wire; the generated client keeps them
     // apart instead of flattening the open into the stream's first item.
+    //
+    // `circuit_breaker(skip)`: a feed consumer re-opens the stream as long as
+    // it runs, so its opens say little about the provider and are not counted.
     #[rpc(name = "StreamPayments")]
     #[idempotency_level(NoSideEffects)]
     #[streaming(open = fallible)]
+    #[circuit_breaker(skip)]
     async fn stream_payments(
         &self,
         ctx: SecurityContext,

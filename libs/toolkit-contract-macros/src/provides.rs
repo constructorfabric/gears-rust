@@ -4,7 +4,7 @@
 //! inherent async method `wire_<contract_snake>(&self, &GearCtx)` that:
 //!   1. validates the contract IR (fail-fast at startup),
 //!   2. reads typed wiring config from
-//!      `gears.<gear>.config.client_wiring.<contract_snake>`,
+//!      `gears.<gear>.clients.provides.<contract_snake>`,
 //!   3. instantiates the local/REST/gRPC client per the wiring,
 //!   4. registers the resulting `Arc<dyn Trait>` in the
 //!      [`ClientHub`](toolkit::ClientHub).
@@ -327,18 +327,18 @@ fn generate_one(attr: &ProvidedContract, item: &ItemStruct) -> SynResult<TokenSt
     let rest_policy_warning = warn_policies_ignored("rest");
     let grpc_policy_warning = warn_policies_ignored("grpc");
 
-    // gRPC reads only `endpoint`, `timeout` and `require_tls`; the REST-only
-    // pool/concurrency tuning knobs on a `transport: grpc` wiring parse but go
+    // gRPC does not apply the REST-only pool/concurrency knobs or
+    // `stream_reconnect`; on a `transport: grpc` wiring they parse but go
     // nowhere. Warn at wiring time rather than dropping them silently. The
     // message is a static literal (built here) and the offending keys ride along
     // as the structured `ignored` field, mirroring `warn_policies_ignored`.
     let grpc_rest_only_warning_msg = format!(
-        "contract `{contract_ident}`: gRPC transport ignores REST-only client tuning knobs \
-         (pool_max_idle_per_host / pool_idle_timeout / max_concurrent_requests); they apply \
-         to the REST transport only"
+        "contract `{contract_ident}`: gRPC transport ignores these client tuning knobs; \
+         pool_max_idle_per_host, pool_idle_timeout and max_concurrent_requests are REST-only, \
+         and gRPC streams do not reconnect (stream_reconnect)"
     );
     let grpc_rest_only_warning = quote! {
-        let __ignored = tuning.rest_only_knobs_set();
+        let __ignored = tuning.grpc_ignored_knobs();
         if !__ignored.is_empty() {
             ::tracing::warn!(gear = ctx.gear_name(), ignored = ?__ignored, #grpc_rest_only_warning_msg);
         }
@@ -375,8 +375,12 @@ fn generate_one(attr: &ProvidedContract, item: &ItemStruct) -> SynResult<TokenSt
                 // client config so platform-plane (`PlatformSecurityContext`)
                 // methods attach `X-ToolKit-Internal-Token`. `None` (Profile 1 /
                 // no credential) attaches nothing (cpt-cf-adr-two-plane-auth).
+                let __breaker = tuning.circuit_breaker_for(
+                    &::std::format!("{}:{}", ctx.gear_name(), stringify!(#contract_ident)),
+                );
                 let __cfg = tuning.apply_to(endpoint)
-                    .with_internal_token_provider(ctx.internal_token_provider());
+                    .with_internal_token_provider(ctx.internal_token_provider())
+                    .with_circuit_breaker(__breaker);
                 ::std::sync::Arc::new(
                     #rest_client_path::new(__cfg)
                         .map_err(|e| ::anyhow::anyhow!(
@@ -405,8 +409,12 @@ fn generate_one(attr: &ProvidedContract, item: &ItemStruct) -> SynResult<TokenSt
                 #grpc_rest_only_warning
                 // See the REST arm: platform-plane methods attach the runtime
                 // internal credential as `x-toolkit-internal-token` metadata.
+                let __breaker = tuning.circuit_breaker_for(
+                    &::std::format!("{}:{}", ctx.gear_name(), stringify!(#contract_ident)),
+                );
                 let __cfg = tuning.apply_to(endpoint)
-                    .with_internal_token_provider(ctx.internal_token_provider());
+                    .with_internal_token_provider(ctx.internal_token_provider())
+                    .with_circuit_breaker(__breaker);
                 ::std::sync::Arc::new(
                     #grpc_client_path::connect(__cfg).await
                         .map_err(|e| ::anyhow::anyhow!(

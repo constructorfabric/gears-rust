@@ -244,6 +244,11 @@ name = "cf-gears-toolkit-contract-protogen"
 changelog_update = false
 git_release_enable = false
 
+[[package]]
+name = "cf-gears-toolkit-resilience"
+changelog_update = false
+git_release_enable = false
+
 # TLS/FIPS support crates (libs/rustls-*). Framework infrastructure, so they follow the
 # `libs/**` rule. Flip these two to `true` if they should ever get their own release
 # notes — they are the only judgement call in this list.

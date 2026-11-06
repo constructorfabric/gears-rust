@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
-use toolkit_contract::wiring::{ClientTuning, ConsumerWiring};
+use toolkit_contract::wiring::ClientTuning;
 
 use super::{
     GtsPublicationDescriptor, GtsPublicationError, PreparedGtsPublication, check_ownership,
@@ -104,20 +104,12 @@ fn publisher_tunings(
     descriptors
         .iter()
         .map(|descriptor| {
-            let value = config
-                .get_gear_config(descriptor.gear)
-                .and_then(|gear| gear.get("config"))
-                .and_then(|config| config.get("consumer_wiring"))
-                .and_then(|wiring| wiring.get(descriptor.provider));
-            let tuning = if let Some(value) = value {
-                let wiring: ConsumerWiring =
-                    serde_json::from_value(value.clone()).map_err(|error| {
-                        anyhow::anyhow!(
-                            "gear `{}`: invalid consumer_wiring.{}: {error}",
-                            descriptor.gear,
-                            descriptor.provider
-                        )
-                    })?;
+            let wiring = crate::clients_config::consumer_wiring(
+                config,
+                descriptor.gear,
+                descriptor.provider,
+            )?;
+            let tuning = if let Some(wiring) = wiring {
                 wiring
                     .tuning
                     .with_internal_token_provider(defaults.internal_token_provider.clone())
@@ -126,7 +118,7 @@ fn publisher_tunings(
             };
             anyhow::ensure!(
                 tuning.require_tls != Some(true) || endpoint.scheme_str() == Some("https"),
-                "gear `{}`: consumer_wiring.{} requires TLS, but registry endpoint is not https",
+                "gears.{}.clients.consumes.{} requires TLS, but registry endpoint is not https",
                 descriptor.gear,
                 descriptor.provider
             );

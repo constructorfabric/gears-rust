@@ -30,7 +30,8 @@ decision.
 * `#[toolkit::contract(gear = "…", version = "v1")]` records the version as
   **metadata only** — it lands in `ContractDescriptor.version` and
   `ContractIr.version` (`libs/toolkit-contract-macros/src/codegen.rs`) and does
-  **not** influence routing or URL construction.
+  **not** influence routing or URL construction. (It is now also exposed as
+  `ContractVersion::VERSION` for the gRPC package check in §3a.)
 * The URL version segment is written by hand in the projection's
   `base_path` (e.g. `#[toolkit::rest_contract(base_path = "/billing/v1")]`).
   The two are therefore **decoupled** and can drift.
@@ -151,7 +152,7 @@ already work with the shipped codegen:
   fully-qualified `type_name`). A consumer picks its version by the type it
   resolves — a compile-time choice.
 * **`#[toolkit::provides]`**: each version gets its own `wire_payment_api` /
-  `wire_payment_api_v2` method and its own `client_wiring` config key, so one
+  `wire_payment_api_v2` method and its own `clients.provides` config key, so one
   gear can provide both.
 * **Plugins** may implement both traits during the migration window (DESIGN §7
   (b)); each is an ordinary Rust trait impl.
@@ -205,6 +206,36 @@ agreement is a convention. Projections that opt into
 `#[toolkit::rest_contract(base_path = "…", require_full_coverage)]` additionally
 get this consistency asserted by the generated coverage test, alongside the
 base↔projection method-set check.
+
+### 3a. gRPC: the major is in the package and the service name
+
+A gRPC projection spells the major in its `package` (`billing.v1`, `billing.v2`),
+so the fully qualified service name (`billing.v2.PaymentApi`, the generated
+`<BASE>_GRPC_SERVICE`) carries it too.
+
+* **Checked at compile time.** `#[toolkit::grpc_contract]` emits
+  `assert_grpc_package_major::<dyn Base>(package)`: when the package's last
+  segment is `v<digits>`, it must equal the major of the base trait's
+  `#[toolkit::contract(version)]`, read through the `ContractVersion` trait that
+  `#[toolkit::contract]` implements. `billing.v2` for `version = "v1"` does not
+  compile, and `v1` does not match `v10`. A package without a version segment is
+  not checked.
+* **Routed per major.** The directory resolves gRPC by service name, and a
+  `#[toolkit::consumes(.., transport = grpc)]` client resolves its own
+  `GRPC_SERVICE`, so a v1 consumer and a v2 consumer each find a provider
+  serving their major, even when the two majors run in different processes.
+  This is stronger than the REST case under ADR-0004's "resolved is not
+  conformant" limitation, which resolves by gear name.
+* **Minor versions are additive only**, as in §1: new messages, new optional
+  fields and new RPCs. Field numbers are pinned in `proto.lock.toml`, so an
+  existing field keeps its number across regenerations and a removed one is not
+  reused.
+* **A missing RPC is `Unimplemented`.** A consumer built against a newer minor
+  that calls an RPC an older provider of the same major lacks gets tonic's
+  `UNIMPLEMENTED`, mapped to canonical `Unimplemented` ("provider does not
+  implement this RPC; it may run an older minor version"), not an internal
+  error. As with optional REST methods, a consumer that may meet older providers
+  handles that error.
 
 ### 4. Deprecation and sunset
 
@@ -260,6 +291,11 @@ base↔projection method-set check.
   `/api-contracts/v1/**` and `/api-contracts/v2/**` from one router —
   asserted by `tests/v1_v2_coexistence.rs`, which also pins that every
   `operationId` in the shared OpenAPI document is unique.
+* gRPC (§3a): `assert_grpc_package_major` unit tests in
+  `libs/toolkit-contract/src/contract.rs`; in
+  `examples/toolkit/api-contracts/api-contracts/tests/grpc_resolving.rs`,
+  `each_major_version_resolves_to_its_own_provider` and
+  `a_missing_rpc_is_reported_as_unimplemented`.
 
 ## Pros and Cons of the Options
 
@@ -347,6 +383,8 @@ base↔projection method-set check.
   router; `require_full_coverage` carries the `version`↔`base_path` assertion.
 * Breaking-change gate: `.github/workflows/api_contracts.yml` (`oasdiff
   breaking`, `breaking-api-acknowledged` override label).
+* `cpt-cf-binding-adr-grpc-projection` (ADR-0008) — the gRPC projection,
+  `<BASE>_GRPC_SERVICE` and the status mapping; `proto.lock.toml`.
 * Industry precedent: gRPC/protobuf package versioning (`pkg.v1` → `pkg.v2`,
   field numbers never reused); Kubernetes parallel API-group versions with
   conversion; Google AIP-180/185 (backwards-compatibility rules and versioning).

@@ -137,7 +137,7 @@ struct Storage {
     /// from `map` so a proxy is never mistaken for an in-process impl.
     ///
     /// Keyed by owner because each consumer wires the contract with its own
-    /// `consumer_wiring.<dep>` settings (endpoint, timeout, retry, TLS). One
+    /// `clients.consumes.<dep>` settings (endpoint, timeout, retry, TLS). One
     /// proxy per contract would hand every consumer the settings of whichever
     /// wired first.
     proxies: RwLock<HashMap<ProxyKey, Boxed>>,

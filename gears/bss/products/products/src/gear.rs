@@ -289,7 +289,7 @@ impl Gear for BssProductsGear {
 
         // `#[toolkit::provides]`-generated wiring: validates the contract IR
         // (and the browse HTTP binding), reads
-        // `client_wiring.product_catalog_client_v1` (absent → Local), and
+        // `clients.provides.product_catalog_client_v1` (absent → Local), and
         // registers `Arc<dyn ProductCatalogClientV1>` in the ClientHub.
         self.wire_product_catalog_client_v1(ctx).await?;
 

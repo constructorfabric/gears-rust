@@ -459,11 +459,20 @@ async fn init_refuses_a_retention_shorter_than_the_platform_keeps() {
 async fn init_refuses_a_remote_binding_for_a_trait_bound_in_process() {
     // R1 publishes no remote contract for either SDK trait, so a deployment
     // asking for one would resolve to nothing. Better a boot failure.
-    let ctx = context_with(
-        json!({ "client_wiring": { "settings_reader_client": { "transport": "rest" } } }),
+    let db = crate::test_support::sqlite_provider().await;
+    let ctx = GearCtx::new(
+        SettingsService::MODULE_NAME,
+        Uuid::new_v4(),
+        Arc::new(FixedConfig(json!({
+            "config": {},
+            "clients": { "provides": { "settings_reader_client": {
+                "transport": "rest", "endpoint": "http://elsewhere"
+            } } },
+        }))),
         wired_hub(),
+        tokio_util::sync::CancellationToken::new(),
     )
-    .await;
+    .with_db((*db).clone());
     let err = SettingsService::default()
         .init(&ctx)
         .await

@@ -258,12 +258,12 @@ async fn deployment_preserves_each_publishers_consumer_wiring() {
     let registry = Arc::new(RemoteRegistry::default());
     *REGISTRY.lock() = Some(Arc::clone(&registry));
     let config = PublicationConfig(json!({
-        "base-publisher": {"config": {"consumer_wiring": {"registry": {
+        "base-publisher": {"clients": {"consumes": {"registry": {
             "endpoint": "https://pod-registry.example",
             "timeout": "2s", "require_tls": true,
             "retry": {"max_attempts": 2}
         }}}},
-        "derived-publisher": {"config": {"consumer_wiring": {"registry": {
+        "derived-publisher": {"clients": {"consumes": {"registry": {
             "timeout": "7s", "require_tls": false,
             "retry": {"max_attempts": 5}
         }}}}
@@ -299,7 +299,7 @@ async fn deployment_rejects_invalid_consumer_wiring_before_publication() {
     let registry = Arc::new(RemoteRegistry::default());
     *REGISTRY.lock() = Some(Arc::clone(&registry));
     let config = PublicationConfig(json!({
-        "base-publisher": {"config": {"consumer_wiring": {"registry": {
+        "base-publisher": {"clients": {"consumes": {"registry": {
             "require_tls": "not-a-boolean"
         }}}}
     }));
@@ -327,7 +327,7 @@ async fn deployment_rejects_plaintext_before_wiring_any_publishers_credential() 
     // The second publisher requires TLS: even the first must not receive the
     // job's credential before all transport policies have been checked.
     let config = PublicationConfig(json!({
-        "derived-publisher": {"config": {"consumer_wiring": {"registry": {
+        "derived-publisher": {"clients": {"consumes": {"registry": {
             "require_tls": true
         }}}}
     }));
