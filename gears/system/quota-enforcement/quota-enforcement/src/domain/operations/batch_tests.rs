@@ -99,20 +99,20 @@ async fn a_batch_opens_the_same_spans_for_one_item_and_for_fifty() {
         .expect("warm");
     assert_eq!(warm.result, BatchResult::Allowed);
     let capture = SpanCapture::default();
-    let _guard = capture.install();
 
-    let single = h
-        .operations()
-        .batch_debit(&ctx(), batch(vec![item(1, "a0")], "one"))
+    let single = capture
+        .within(
+            h.operations()
+                .batch_debit(&ctx(), batch(vec![item(1, "a0")], "one")),
+        )
         .await
         .expect("one item");
     assert_eq!(single.result, BatchResult::Allowed);
     let one = capture.names();
     capture.clear();
     let fifty = (0..50).map(|i| item(1, &format!("b{i}"))).collect();
-    let many = h
-        .operations()
-        .batch_debit(&ctx(), batch(fifty, "fifty"))
+    let many = capture
+        .within(h.operations().batch_debit(&ctx(), batch(fifty, "fifty")))
         .await
         .expect("fifty items");
     assert_eq!(many.result, BatchResult::Allowed);

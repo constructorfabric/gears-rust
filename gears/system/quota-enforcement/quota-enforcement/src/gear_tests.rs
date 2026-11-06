@@ -838,11 +838,11 @@ async fn a_debit_over_the_sql_plugin_traces_admission_and_evaluation_under_the_o
         .expect("quota over the SQL plugin");
 
     let capture = crate::test_support::SpanCapture::default();
-    let guard = capture.install();
-    let decision = hub
+    let consumer = hub
         .get::<dyn quota_enforcement_sdk::QuotaEnforcementApi>()
-        .expect("consumer client")
-        .debit(
+        .expect("consumer client");
+    let decision = capture
+        .within(consumer.debit(
             &security_ctx(),
             quota_enforcement_sdk::DebitRequest {
                 attribution: quota_enforcement_sdk::EvaluationAttribution {
@@ -858,10 +858,9 @@ async fn a_debit_over_the_sql_plugin_traces_admission_and_evaluation_under_the_o
                 amount: 1,
                 idempotency_key: "traced".to_owned(),
             },
-        )
+        ))
         .await
         .expect("debit");
-    drop(guard);
     assert_eq!(
         decision.result,
         quota_enforcement_sdk::DecisionResult::Allowed
@@ -1028,10 +1027,8 @@ async fn bulk_envelopes_over_the_sql_plugin_open_the_same_spans_for_one_item_and
     let client = hub.get::<dyn QuotaManagerApi>().expect("manager client");
 
     let capture = crate::test_support::SpanCapture::default();
-    let guard = capture.install();
-    let one = bulk_step_spans(&client, &capture, 1).await;
-    let ten = bulk_step_spans(&client, &capture, 10).await;
-    drop(guard);
+    let one = capture.within(bulk_step_spans(&client, &capture, 1)).await;
+    let ten = capture.within(bulk_step_spans(&client, &capture, 10)).await;
     assert_eq!(one, ten);
     // The write transaction of each fresh envelope is still traced.
     for (step, storage) in [

@@ -6,7 +6,7 @@
 //! cache, pinning a compiled artifact, the engine's selection, and the counter
 //! and lease mutations against the in-memory storage double, each also under a
 //! subscriber that formats every span close as JSON into a sink. These cover the
-//! evaluation driver and the double only; `debit_span_overhead_over_the_sql_plugin`
+//! evaluation driver and the double only; `span_overhead_over_the_sql_plugin`
 //! times the whole gear.
 //!
 //! What they deliberately exclude: the PDP round trip, catalogue mapping, and

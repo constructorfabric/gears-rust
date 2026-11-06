@@ -296,18 +296,9 @@ async fn a_bulk_create_commits_every_draft_and_a_lowered_limit_refuses_its_repla
 }
 
 #[tokio::test]
-async fn a_bulk_envelope_opens_the_same_spans_for_one_item_and_for_ten() {
+async fn a_bulk_update_admits_every_item_under_one_admission_span() {
     let pdp = Arc::new(PermitTenantsPdp::new(vec![tenant().as_uuid()]));
     let h = Harness::new(pdp).await;
-    let capture = crate::test_support::SpanCapture::default();
-    let _guard = capture.install();
-
-    h.quotas()
-        .bulk_create(&ctx(), creates("one", vec![draft("u0")]))
-        .await
-        .expect("one draft");
-    let one = capture.names();
-    capture.clear();
     let created = h
         .quotas()
         .bulk_create(
@@ -316,27 +307,18 @@ async fn a_bulk_envelope_opens_the_same_spans_for_one_item_and_for_ten() {
         )
         .await
         .expect("ten drafts");
-    assert_eq!(capture.names(), one, "no span per created item");
-    capture.clear();
-
     let ids: Vec<QuotaId> = created.items.iter().map(|item| item.quota_id).collect();
-    h.quotas()
-        .bulk_update(&ctx(), updates("u-one", vec![(ids[0], cap_patch(200))]))
-        .await
-        .expect("one patch");
-    let one = capture.names();
-    capture.clear();
-    h.quotas()
-        .bulk_update(
+    let capture = crate::test_support::SpanCapture::default();
+    capture
+        .within(h.quotas().bulk_update(
             &ctx(),
             updates(
                 "u-ten",
                 ids.iter().map(|id| (*id, cap_patch(300))).collect(),
             ),
-        )
+        ))
         .await
         .expect("ten patches");
-    assert_eq!(capture.names(), one, "no span per patched item");
     let admission = capture
         .spans()
         .into_iter()
