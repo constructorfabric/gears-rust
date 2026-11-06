@@ -2,7 +2,7 @@ use toolkit_canonical_errors::{CanonicalError, Http, resource_error};
 use uuid::Uuid;
 
 use crate::domain::error::DomainError;
-use crate::domain::pagination::PageError;
+use crate::domain::pagination::QueryError;
 use crate::domain::record_intake::Refusal;
 use crate::domain::settings_scope::SettingsOutOfScope;
 
@@ -284,13 +284,13 @@ impl From<DomainError> for CanonicalError {
                     .create()
             }
             // The caller's query does not fit the list; the field violation
-            // says which part, so a client can tell the three apart.
+            // says which part, so a client can tell them apart.
             DomainError::InvalidQuery(err) => {
                 let (field, detail, reason) = match err {
-                    PageError::Filter(detail) => ("$filter", detail, "invalid_filter"),
-                    PageError::Order(detail) => ("$orderby", detail, "invalid_order"),
-                    PageError::Cursor(detail) => ("cursor", detail, "invalid_cursor"),
-                    PageError::Internal(detail) => ("page", detail, "internal"),
+                    QueryError::Filter(detail) => ("$filter", detail, "invalid_filter"),
+                    QueryError::Order(detail) => ("$orderby", detail, "invalid_order"),
+                    QueryError::Cursor(detail) => ("cursor", detail, "invalid_cursor"),
+                    QueryError::Select(detail) => ("$select", detail, "unsupported_select"),
                 };
                 SubjectFactsError::invalid_argument()
                     .with_field_violation(field, detail, reason)

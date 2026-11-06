@@ -52,6 +52,19 @@ pub enum OriginKind {
     Administrator,
 }
 
+impl OriginKind {
+    /// The origin's name on the wire and in a list's `origin` field.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Connector => "connector",
+            Self::Agent => "agent",
+            Self::Reviewer => "reviewer",
+            Self::Administrator => "administrator",
+        }
+    }
+}
+
 /// One stored fact as a reader sees it: its key, category, property and value,
 /// who it came from, when it was stored, and when its source asserted it.
 #[domain_model]

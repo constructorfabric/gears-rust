@@ -80,6 +80,11 @@ toolkit-macros = { workspace = true }
 toolkit-odata = { workspace = true, features = ["with-utoipa"] }
 toolkit-odata-macros = { workspace = true }
 
+# Reached only through a derive path (`toolkit_odata_macros::ODataFilterable`),
+# which `cargo shear --expand` no longer sees once the derive is expanded.
+[package.metadata.cargo-shear]
+ignored = ["toolkit-odata-macros"]
+
 [dev-dependencies]
 # Path-only: this adds only the test-support feature, so publishing this crate
 # needs no release of graph storage that has it.

@@ -168,6 +168,7 @@ async fn the_owner_sees_every_fact_newest_first_with_the_version_also_while_off_
         [SubjectControlEvent::Viewed {
             tenant_id: fixture.tenant,
             subject_id: fixture.subject,
+            caller: fixture.subject,
             categories: BTreeSet::from([Category::Skill, Category::Role]),
         }]
     );
@@ -200,6 +201,7 @@ async fn a_view_is_recorded_with_the_categories_served_and_not_at_all_for_a_bad_
         [SubjectControlEvent::Viewed {
             tenant_id: fixture.tenant,
             subject_id: fixture.subject,
+            caller: fixture.subject,
             categories: BTreeSet::from([Category::Skill]),
         }],
         "only the served page is recorded, with only what it served"
@@ -331,6 +333,7 @@ async fn one_fact_is_served_and_a_fact_the_subject_does_not_have_is_no_such_fact
         [SubjectControlEvent::Viewed {
             tenant_id: fixture.tenant,
             subject_id: fixture.subject,
+            caller: fixture.subject,
             categories: BTreeSet::from([Category::Skill]),
         }],
         "only the read that served a fact is an event"
@@ -385,6 +388,7 @@ async fn a_delete_writes_one_removal_as_the_subject_against_the_version_and_the_
         SubjectControlEvent::Deleted {
             tenant_id: fixture.tenant,
             subject_id: fixture.subject,
+            caller: fixture.subject,
             fact_id: skill,
             category: Category::Skill,
         }
@@ -419,10 +423,11 @@ async fn a_delete_reads_and_writes_again_on_a_conflict() {
     assert_eq!(fixture.profile.live().len(), 1);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_delete_gives_up_as_unavailable_once_the_reruns_are_spent() {
     let fixture = Fixture::new(10);
     let service = fixture.service(Arc::new(AllowResolver));
+    let started = tokio::time::Instant::now();
 
     let deleted = service
         .delete(
@@ -440,6 +445,13 @@ async fn a_delete_gives_up_as_unavailable_once_the_reruns_are_spent() {
         fixture.writer.plans().len(),
         3,
         "the first try and two reruns"
+    );
+    // Pauses of 20 to 40 and 40 to 80 ms before the reruns, and none after
+    // the last write, which would add at least 80 ms more.
+    let waited = started.elapsed();
+    assert!(
+        waited >= Duration::from_millis(60) && waited <= Duration::from_millis(120),
+        "{waited:?}"
     );
     assert_eq!(fixture.profile.live().len(), 2, "nothing was deleted");
     assert!(fixture.events.taken().is_empty());
@@ -725,4 +737,36 @@ async fn without_a_processing_identity_every_operation_is_not_configured() {
             "{result:?}"
         );
     }
+}
+
+#[tokio::test]
+async fn a_profile_too_large_to_read_is_the_gears_own_failure_for_the_view_the_export_and_the_delete()
+ {
+    let fixture = Fixture::new(0);
+    fixture
+        .profile
+        .too_large
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let service = fixture.service(Arc::new(AllowResolver));
+    let skill = fixture.fact_id(Category::Skill);
+
+    let view = service
+        .view(&fixture.owner(), fixture.subject, &ODataQuery::default())
+        .await;
+    let export = service.export(&fixture.owner(), fixture.subject).await;
+    let delete = service
+        .delete(&fixture.owner(), fixture.subject, &skill)
+        .await;
+
+    // Not the subject's state: removing facts is what it cannot do then.
+    assert!(matches!(view, Err(DomainError::Internal(_))), "{view:?}");
+    assert!(
+        matches!(export, Err(DomainError::Internal(_))),
+        "{export:?}"
+    );
+    assert!(
+        matches!(delete, Err(DomainError::Internal(_))),
+        "{delete:?}"
+    );
+    assert!(fixture.writer.plans().is_empty(), "nothing written");
 }

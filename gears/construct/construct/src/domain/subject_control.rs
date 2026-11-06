@@ -23,7 +23,7 @@ use super::plan::{Change, NodeKey, Origin, Plan, Step};
 use super::planner::manage::SUBJECT_FACTS_RESOURCE;
 use super::planner::processing::{PlanWriter, ProcessingContexts, Written};
 use super::profile::Category;
-use super::profile_read::{OriginKind, StoredFact, granted, settings_scope};
+use super::profile_read::{StoredFact, granted, read_failure, settings_scope};
 use super::subject_settings::{SubjectKey, SubjectSettings, SubjectSettingsReader};
 
 pub(crate) mod actions {
@@ -69,17 +69,6 @@ pub const SUBJECT_FACTS_LISTING: Listing<SubjectFactField> = Listing {
     tiebreaker: SubjectFactField::FactId,
 };
 
-/// The name of an origin in the list's `origin` field.
-#[must_use]
-pub fn origin_name(origin: OriginKind) -> &'static str {
-    match origin {
-        OriginKind::Connector => "connector",
-        OriginKind::Agent => "agent",
-        OriginKind::Reviewer => "reviewer",
-        OriginKind::Administrator => "administrator",
-    }
-}
-
 impl Listed for StoredFact {
     type Field = SubjectFactField;
 
@@ -87,7 +76,7 @@ impl Listed for StoredFact {
         Some(match field {
             SubjectFactField::FactId => Key::text(self.node_key.0.clone()),
             SubjectFactField::EntityKind => Key::text(self.category.name()),
-            SubjectFactField::Origin => Key::text(origin_name(self.origin)),
+            SubjectFactField::Origin => Key::text(self.origin.name()),
             SubjectFactField::StoredAt => Key::time(self.stored_at),
         })
     }
@@ -145,12 +134,14 @@ pub enum SubjectControlEvent {
     Viewed {
         tenant_id: Uuid,
         subject_id: Uuid,
+        caller: Uuid,
         categories: BTreeSet<Category>,
     },
     /// The subject deleted one of its facts.
     Deleted {
         tenant_id: Uuid,
         subject_id: Uuid,
+        caller: Uuid,
         fact_id: NodeKey,
         category: Category,
     },
@@ -239,6 +230,7 @@ impl SubjectControlService {
         self.ports.events.record(SubjectControlEvent::Viewed {
             tenant_id: key.tenant_id,
             subject_id,
+            caller: ctx.subject_id(),
             categories: categories_of(&page.items),
         });
         // @cpt-end:cpt-cf-construct-flow-subject-control-view:p1:inst-view-event
@@ -275,6 +267,7 @@ impl SubjectControlService {
         self.ports.events.record(SubjectControlEvent::Viewed {
             tenant_id: key.tenant_id,
             subject_id,
+            caller: ctx.subject_id(),
             categories: BTreeSet::from([fact.category]),
         });
         // @cpt-end:cpt-cf-construct-flow-subject-control-fact:p1:inst-fact-event
@@ -327,7 +320,8 @@ impl SubjectControlService {
                 self.ports.profiles.facts(&construct, key),
             )
             .await
-            .map_err(|_| out_of_time(fact_id))??;
+            .map_err(|_| out_of_time(fact_id))?
+            .map_err(read_failure)?;
             let fact = current
                 .facts
                 .iter()
@@ -348,6 +342,7 @@ impl SubjectControlService {
                     self.ports.events.record(SubjectControlEvent::Deleted {
                         tenant_id: key.tenant_id,
                         subject_id,
+                        caller: ctx.subject_id(),
                         fact_id: fact.node_key.clone(),
                         category: fact.category,
                     });
@@ -359,6 +354,9 @@ impl SubjectControlService {
                         version = ?current.version,
                         "construct: the profile changed under a delete; reading it again"
                     );
+                    if attempt == self.max_reruns {
+                        break;
+                    }
                     let pause = rerun_pause(attempt);
                     if Instant::now() + pause >= deadline {
                         break;
@@ -485,10 +483,16 @@ impl SubjectControlService {
         Ok(scope)
     }
 
-    /// The subject's live facts, read as Construct.
+    /// The subject's live facts, read as Construct. A profile too large to
+    /// read is the gear's own failure, as on the profile read, not the
+    /// subject's state.
     async fn facts(&self, key: SubjectKey) -> Result<SubjectFacts, DomainError> {
         let (construct, _) = self.ports.contexts.for_tenant(key.tenant_id).await?;
-        self.ports.profiles.facts(&construct, key).await
+        self.ports
+            .profiles
+            .facts(&construct, key)
+            .await
+            .map_err(read_failure)
     }
 }
 

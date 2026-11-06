@@ -295,22 +295,9 @@ async fn every_answer_is_no_store_with_the_security_headers() {
         ),
     ] {
         let answer = send(router, method.clone(), &uri).await;
-        for (name, value) in [
-            (header::CACHE_CONTROL, "no-store"),
-            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
-            (header::X_FRAME_OPTIONS, "DENY"),
-            (header::REFERRER_POLICY, "no-referrer"),
-            (
-                header::HeaderName::from_static("cross-origin-resource-policy"),
-                "same-origin",
-            ),
-            (
-                header::HeaderName::from_static("x-permitted-cross-domain-policies"),
-                "none",
-            ),
-        ] {
+        for (name, value) in crate::test_support::SECURITY_HEADERS {
             assert_eq!(
-                answer.headers.get(&name).and_then(|v| v.to_str().ok()),
+                answer.headers.get(name).and_then(|v| v.to_str().ok()),
                 Some(value),
                 "{name} on {method} {uri}"
             );
@@ -371,6 +358,7 @@ async fn a_bad_query_names_the_part_that_is_wrong() {
     for (query, field, reason) in [
         ("$filter=value eq 'x'", "$filter", "invalid_filter"),
         ("$orderby=value asc", "$orderby", "invalid_order"),
+        ("$select=fact_id", "$select", "unsupported_select"),
     ] {
         let answer = send(
             subject.own(),

@@ -1087,13 +1087,15 @@ pub fn stored_fact(
 
 /// One subject's profile in memory: its version and live facts. It keeps
 /// each read: the subject of the context it was read with, and the key.
-/// Each read takes `delay` first.
+/// Each read takes `delay` first, and fails as larger than one read takes
+/// while `too_large` is set.
 #[derive(Default)]
 pub struct MemoryProfile {
     pub version: std::sync::Mutex<Option<u64>>,
     pub facts: std::sync::Mutex<Vec<crate::domain::profile_read::StoredFact>>,
     pub reads: std::sync::Mutex<Vec<(Uuid, SubjectKey)>>,
     pub delay: std::sync::Mutex<std::time::Duration>,
+    pub too_large: std::sync::atomic::AtomicBool,
 }
 
 impl MemoryProfile {
@@ -1103,6 +1105,7 @@ impl MemoryProfile {
             facts: std::sync::Mutex::new(facts),
             reads: std::sync::Mutex::default(),
             delay: std::sync::Mutex::default(),
+            too_large: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -1122,6 +1125,15 @@ impl crate::domain::subject_control::SubjectProfiles for MemoryProfile {
         let delay = *self.delay.lock().unwrap();
         if !delay.is_zero() {
             tokio::time::sleep(delay).await;
+        }
+        if self.too_large.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(DomainError::ProfileFull(
+                crate::domain::profile::FullProfile {
+                    subject: key,
+                    facts: crate::domain::profile::FactCount::AtLeast(1000),
+                    limit: 999,
+                },
+            ));
         }
         Ok(crate::domain::subject_control::SubjectFacts {
             version: *self.version.lock().unwrap(),

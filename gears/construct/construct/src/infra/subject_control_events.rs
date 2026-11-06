@@ -29,19 +29,21 @@ impl SubjectControlEvents for LogSubjectControlEvents {
             SubjectControlEvent::Viewed {
                 tenant_id,
                 subject_id,
+                caller,
                 categories,
             } => tracing::info!(
                 target: "construct::audit",
                 event = "subject_facts_viewed",
                 %tenant_id,
                 %subject_id,
-                caller = %subject_id,
+                %caller,
                 categories = %names(&categories),
                 "subject viewed its facts"
             ),
             SubjectControlEvent::Deleted {
                 tenant_id,
                 subject_id,
+                caller,
                 fact_id,
                 category,
             } => tracing::info!(
@@ -49,7 +51,7 @@ impl SubjectControlEvents for LogSubjectControlEvents {
                 event = "subject_fact_deleted",
                 %tenant_id,
                 %subject_id,
-                caller = %subject_id,
+                %caller,
                 fact_id = %fact_id.0,
                 category = category.name(),
                 "subject deleted a fact"
@@ -107,14 +109,17 @@ mod tests {
     fn a_view_names_its_tenant_subject_caller_and_categories() {
         let ids = Ids::new();
 
+        let caller = Uuid::new_v4();
+
         LogSubjectControlEvents.record(SubjectControlEvent::Viewed {
             tenant_id: ids.tenant,
             subject_id: ids.subject,
+            caller,
             categories: BTreeSet::from([Category::Skill, Category::Role]),
         });
 
         assert!(logs_contain("event=\"subject_facts_viewed\""));
-        ids.assert_logged_with_caller(ids.subject, logs_contain);
+        ids.assert_logged_with_caller(caller, logs_contain);
         assert!(logs_contain("categories=role,skill"));
     }
 
@@ -123,15 +128,18 @@ mod tests {
     fn a_delete_names_the_fact_and_its_category_and_no_value() {
         let ids = Ids::new();
 
+        let caller = Uuid::new_v4();
+
         LogSubjectControlEvents.record(SubjectControlEvent::Deleted {
             tenant_id: ids.tenant,
             subject_id: ids.subject,
+            caller,
             fact_id: NodeKey("construct:t:fact-1".to_owned()),
             category: Category::Skill,
         });
 
         assert!(logs_contain("event=\"subject_fact_deleted\""));
-        ids.assert_logged_with_caller(ids.subject, logs_contain);
+        ids.assert_logged_with_caller(caller, logs_contain);
         assert!(logs_contain("fact_id=construct:t:fact-1"));
         assert!(logs_contain("category=\"skill\""));
     }

@@ -2,7 +2,7 @@ use toolkit_canonical_errors::CanonicalError;
 use toolkit_db::DbError;
 use toolkit_macros::domain_model;
 
-use super::pagination::PageError;
+use super::pagination::{PageError, QueryError};
 use super::profile::FullProfile;
 use super::refusal::Refusal;
 use super::settings_scope::SettingsOutOfScope;
@@ -42,7 +42,7 @@ pub enum DomainError {
 
     /// The caller's `$filter`, `$orderby` or cursor does not fit the list.
     #[error("Invalid query: {0:?}")]
-    InvalidQuery(PageError),
+    InvalidQuery(QueryError),
 
     #[error("Internal error: {0}")]
     Internal(String),
@@ -130,9 +130,7 @@ impl From<PageError> for DomainError {
     fn from(err: PageError) -> Self {
         match err {
             PageError::Internal(detail) => Self::Internal(detail),
-            caller @ (PageError::Filter(_) | PageError::Order(_) | PageError::Cursor(_)) => {
-                Self::InvalidQuery(caller)
-            }
+            PageError::Query(query) => Self::InvalidQuery(query),
         }
     }
 }

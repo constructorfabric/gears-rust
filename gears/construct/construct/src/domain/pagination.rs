@@ -70,15 +70,23 @@ pub struct Listing<F: FilterField> {
     pub tiebreaker: F,
 }
 
-/// Why a page cannot be cut. The first three are the caller's mistake: a
-/// bad `$filter`, an `$orderby` on a field the list does not have, or a
-/// cursor for another query. The last is Construct's own.
+/// A query the list refuses, the caller's mistake: a bad `$filter`, an
+/// `$orderby` on a field the list does not have, a cursor for another query,
+/// or a `$select`, which no list serves.
 #[domain_model]
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PageError {
+pub enum QueryError {
     Filter(String),
     Order(String),
     Cursor(String),
+    Select(String),
+}
+
+/// Why a page cannot be cut: the caller's query, or Construct's own failure.
+#[domain_model]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PageError {
+    Query(QueryError),
     Internal(String),
 }
 
@@ -96,13 +104,20 @@ pub fn page<T: Listed>(
     listing: &Listing<T::Field>,
 ) -> Result<Page<T>, PageError> {
     // @cpt-begin:cpt-cf-construct-algo-subject-control-paginate:p1:inst-page-limit
+    // A list serves whole items. A `$select` the list dropped would answer
+    // 200 with more than was asked for, so it is refused.
+    if query.has_select() {
+        return Err(PageError::Query(QueryError::Select(
+            "the list serves whole items and takes no $select".to_owned(),
+        )));
+    }
     let limit = query.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
     // @cpt-end:cpt-cf-construct-algo-subject-control-paginate:p1:inst-page-limit
     // @cpt-begin:cpt-cf-construct-algo-subject-control-paginate:p1:inst-page-filter
     let mut items = items;
     if let Some(expr) = query.filter.as_deref() {
         let filter = toolkit_odata::filter::convert_expr_to_filter_node::<T::Field>(expr)
-            .map_err(|err| PageError::Filter(err.to_string()))?;
+            .map_err(|err| PageError::Query(QueryError::Filter(err.to_string())))?;
         items.retain(|item| matches(item, &filter));
     }
     // @cpt-end:cpt-cf-construct-algo-subject-control-paginate:p1:inst-page-filter
@@ -120,7 +135,7 @@ pub fn page<T: Listed>(
     // @cpt-begin:cpt-cf-construct-algo-subject-control-paginate:p1:inst-page-cursor
     if let Some(cursor) = &query.cursor {
         toolkit_odata::validate_cursor_against(cursor, &order, query.filter_hash.as_deref())
-            .map_err(|err| PageError::Cursor(err.to_string()))?;
+            .map_err(|err| PageError::Query(QueryError::Cursor(err.to_string())))?;
         keyed.retain(|(keys, _)| compare(keys, &cursor.k, &order).is_gt());
     }
     // @cpt-end:cpt-cf-construct-algo-subject-control-paginate:p1:inst-page-cursor
@@ -167,7 +182,7 @@ fn effective_order<F: FilterField>(
         query.order.clone()
     } else if let Some(cursor) = &query.cursor {
         ODataOrderBy::from_signed_tokens(&cursor.s)
-            .map_err(|err| PageError::Cursor(err.to_string()))?
+            .map_err(|err| PageError::Query(QueryError::Cursor(err.to_string())))?
     } else {
         ODataOrderBy(
             listing
@@ -189,8 +204,12 @@ fn fields_of<F: FilterField>(order: &ODataOrderBy) -> Result<Vec<F>, PageError> 
         .0
         .iter()
         .map(|key| {
-            F::from_name(&key.field)
-                .ok_or_else(|| PageError::Order(format!("cannot order by {:?}", key.field)))
+            F::from_name(&key.field).ok_or_else(|| {
+                PageError::Query(QueryError::Order(format!(
+                    "cannot order by {:?}",
+                    key.field
+                )))
+            })
         })
         .collect()
 }

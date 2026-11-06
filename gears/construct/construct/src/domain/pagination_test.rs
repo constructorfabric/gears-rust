@@ -3,7 +3,7 @@
 use serde_json::json;
 use toolkit_odata::{CursorV1, ODataOrderBy, ODataQuery, OrderKey, SortDir};
 
-use super::pagination::{DEFAULT_LIMIT, MAX_LIMIT, PageError, page};
+use super::pagination::{DEFAULT_LIMIT, MAX_LIMIT, PageError, QueryError, page};
 use super::subject_control::SUBJECT_FACTS_LISTING;
 use crate::domain::profile::Category;
 use crate::domain::profile_read::StoredFact;
@@ -185,7 +185,7 @@ fn an_unknown_field_or_a_value_of_another_kind_is_the_callers_mistake() {
     ] {
         let result = page(skills(2), &filtered(raw), &SUBJECT_FACTS_LISTING);
         assert!(
-            matches!(result, Err(PageError::Filter(_))),
+            matches!(result, Err(PageError::Query(QueryError::Filter(_)))),
             "{raw}: {result:?}"
         );
     }
@@ -195,8 +195,22 @@ fn an_unknown_field_or_a_value_of_another_kind_is_the_callers_mistake() {
         &SUBJECT_FACTS_LISTING,
     );
     assert!(
-        matches!(unknown_order, Err(PageError::Order(_))),
+        matches!(unknown_order, Err(PageError::Query(QueryError::Order(_)))),
         "{unknown_order:?}"
+    );
+}
+
+#[test]
+fn a_select_is_refused_rather_than_dropped() {
+    let selected = page(
+        skills(2),
+        &ODataQuery::new().with_select(vec!["fact_id".to_owned()]),
+        &SUBJECT_FACTS_LISTING,
+    );
+
+    assert!(
+        matches!(selected, Err(PageError::Query(QueryError::Select(_)))),
+        "{selected:?}"
     );
 }
 
@@ -220,7 +234,7 @@ fn a_cursor_continued_under_another_filter_is_refused() {
             &SUBJECT_FACTS_LISTING,
         );
         assert!(
-            matches!(result, Err(PageError::Cursor(_))),
+            matches!(result, Err(PageError::Query(QueryError::Cursor(_)))),
             "{what}: {result:?}"
         );
     }
