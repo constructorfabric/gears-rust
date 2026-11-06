@@ -299,7 +299,7 @@ stateDiagram-v2
 
 - **Run deadline.** Set at acceptance ([§4.2](#42-configuration)) so that every plugin call, its outcome write, and the final transaction fit. A plugin call starts only when `plugin_call_timeout` + 2 × `storage_call_timeout` still fit before it, so the call, its outcome write, and the final transaction end by the deadline. When a call no longer fits, that plugin and every later one get `not_dispatched`, and the final transaction completes the operation as internal failure.
 - **Status guard.** Writes match only an open record before its deadline; the interruption step matches only one past it. The first final write wins.
-- **Interruption step.** One transaction sets interrupted, keeps the section outcomes so far, and inserts the finished event. For a seed, the same transaction writes the application record. The sweeper, the operation read, and the acceptance run it on an expired open operation, which covers a lost task and a failed final transaction.
+- **Interruption step.** One transaction sets interrupted, keeps the section outcomes so far, and inserts the finished event. The sweeper, the operation read, and the acceptance run it on an expired open operation, which covers a lost task and a failed final transaction.
 - **Supervisor completion.** When a request task fails after acceptance, the operation goes Running, then Completed as internal failure, with `not_dispatched` for plugins not yet called.
 - **Retention.** The sweeper purges a final record `operation_retention` after it finished.
 
@@ -655,7 +655,7 @@ sequenceDiagram
     end
 ```
 
-Plugins left when the loop stops early get `not_dispatched`, so the report ranks internal failure. A re-seed takes the same path. A failed section-outcome update keeps the outcome in memory for the final transaction. Every final transaction of a seed, including the interruption step and the supervisor completion, also writes the application record.
+Plugins left when the loop stops early get `not_dispatched`, so the report ranks internal failure. A re-seed takes the same path. A failed section-outcome update keeps the outcome in memory for the final transaction. Every final transaction of a seed, including the interruption step and the supervisor completion, also writes the application record, except one that ends as invalid manifest.
 
 #### Uninstall Operation
 
@@ -759,7 +759,7 @@ The table is insert-only, unrestricted, and kept without a purge. The operation 
 
 The table is unrestricted and kept without a purge. The operation repository is its only writer, in the final transactions that insert a finished event:
 
-- every final transaction of a seed upserts the row of its application;
+- every final transaction of a seed upserts the row of its application, except one that ends as invalid manifest;
 - the final transaction of an uninstall that completes as succeeded deletes it.
 
 ### 3.8 Deployment Topology
