@@ -143,6 +143,20 @@ def _check_name(c):
     return c.get("context") if c.get("__typename") == "StatusContext" else c.get("name")
 
 
+def _latest_runs(workflow_runs):
+    """Keep only the latest run per workflow (a re-run supersedes its cancelled predecessor); keyless runs stay."""
+    latest, keyless = {}, []
+    for i, r in enumerate(workflow_runs):
+        key = r.get("workflow_id") or r.get("name")
+        if key is None:
+            keyless.append(r)
+            continue
+        rank = (r.get("run_number") or 0, r.get("created_at") or "", i)
+        if key not in latest or rank > latest[key][0]:
+            latest[key] = (rank, r)
+    return [r for _, r in latest.values()] + keyless
+
+
 def ci_verdict(rollup, workflow_runs, total_runs, head_age_min):
     """'wait' | 'red' | 'green': the strict all-green gate for one head SHA.
 
@@ -159,10 +173,12 @@ def ci_verdict(rollup, workflow_runs, total_runs, head_age_min):
         verdicts.append(classify_checks(found))
     if not workflow_runs or total_runs > len(workflow_runs):
         verdicts.append("wait")
-    elif any(r.get("status") != "completed" for r in workflow_runs):
-        verdicts.append("wait")
-    elif any(r.get("conclusion") not in RUN_OK_CONCLUSIONS for r in workflow_runs):
-        verdicts.append("red")
+    else:
+        workflow_runs = _latest_runs(workflow_runs)
+        if any(r.get("status") != "completed" for r in workflow_runs):
+            verdicts.append("wait")
+        elif any(r.get("conclusion") not in RUN_OK_CONCLUSIONS for r in workflow_runs):
+            verdicts.append("red")
     if head_age_min < MIN_HEAD_AGE_MINUTES:
         verdicts.append("wait")
     if "wait" in verdicts:

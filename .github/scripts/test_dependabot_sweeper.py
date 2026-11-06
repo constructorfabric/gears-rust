@@ -140,6 +140,32 @@ class CiVerdict(unittest.TestCase):
     def test_run_cancelled(self):
         self.assertEqual(verdict(runs=[{"status": "completed", "conclusion": "cancelled"}]), "red")
 
+    def test_cancelled_older_run_superseded(self):
+        runs = [{"workflow_id": 1, "run_number": 1, "status": "completed", "conclusion": "cancelled"},
+                {"workflow_id": 1, "run_number": 2, "status": "completed", "conclusion": "success"}]
+        self.assertEqual(verdict(runs=runs, total=2), "green")
+
+    def test_cancelled_newer_run_stays_red(self):
+        runs = [{"workflow_id": 1, "run_number": 1, "status": "completed", "conclusion": "success"},
+                {"workflow_id": 1, "run_number": 2, "status": "completed", "conclusion": "cancelled"}]
+        self.assertEqual(verdict(runs=runs, total=2), "red")
+
+    def test_other_workflow_failure_stays_red(self):
+        runs = [{"workflow_id": 1, "run_number": 1, "status": "completed", "conclusion": "cancelled"},
+                {"workflow_id": 1, "run_number": 2, "status": "completed", "conclusion": "success"},
+                {"workflow_id": 2, "run_number": 1, "status": "completed", "conclusion": "failure"}]
+        self.assertEqual(verdict(runs=runs, total=3), "red")
+
+    def test_newer_run_in_progress_waits(self):
+        runs = [{"workflow_id": 1, "run_number": 1, "status": "completed", "conclusion": "success"},
+                {"workflow_id": 1, "run_number": 2, "status": "in_progress", "conclusion": None}]
+        self.assertEqual(verdict(runs=runs, total=2), "wait")
+
+    def test_keyless_runs_all_count(self):
+        runs = [{"status": "completed", "conclusion": "success"},
+                {"status": "completed", "conclusion": "cancelled"}]
+        self.assertEqual(verdict(runs=runs, total=2), "red")
+
     def test_run_action_required(self):
         self.assertEqual(verdict(runs=[{"status": "completed", "conclusion": "action_required"}]), "red")
 
