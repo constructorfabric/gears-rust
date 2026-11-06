@@ -445,6 +445,49 @@ struct Refused {
     constraint: &'static str,
 }
 
+/// The `indexdef` `PostgreSQL` reports for `index`, whitespace-normalised.
+async fn index_definition(conn: &DatabaseConnection, index: &str) -> String {
+    let rows = query(
+        conn,
+        &format!(
+            "SELECT indexdef FROM pg_indexes \
+             WHERE schemaname = current_schema() AND indexname = '{index}'"
+        ),
+    )
+    .await;
+    assert_eq!(rows.len(), 1, "index {index} must exist exactly once");
+    let definition: String = rows[0].try_get("", "indexdef").expect("indexdef");
+    definition.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// The identity indexes of a reference: unique per `(tenant, reference)` among
+/// the non-private rows, unique per `(tenant, reference, owner)` among the
+/// private ones. `PostgreSQL` normalises the text (`WHERE (sharing <> 1)`), so
+/// only the key fragments are compared.
+async fn assert_identity_index_definitions(conn: &DatabaseConnection) {
+    let nonprivate = index_definition(conn, "uq_credstore_nonprivate").await;
+    assert!(nonprivate.contains("CREATE UNIQUE INDEX"), "{nonprivate}");
+    assert!(
+        nonprivate.contains("(tenant_id, reference)"),
+        "non-private identity is (tenant_id, reference): {nonprivate}"
+    );
+    assert!(
+        nonprivate.contains("sharing <> 1"),
+        "non-private index covers the rows that are not private: {nonprivate}"
+    );
+
+    let private = index_definition(conn, "uq_credstore_private").await;
+    assert!(private.contains("CREATE UNIQUE INDEX"), "{private}");
+    assert!(
+        private.contains("(tenant_id, reference, owner_id)"),
+        "private identity is (tenant_id, reference, owner_id): {private}"
+    );
+    assert!(
+        private.contains("sharing = 1"),
+        "private index covers the private rows only: {private}"
+    );
+}
+
 /// The state `m0002` creates, beyond the table reshaping each test reads.
 async fn assert_m0002_schema(conn: &DatabaseConnection) {
     assert_eq!(columns(conn, "credstore_secrets").await, migrated_columns());
@@ -492,6 +535,71 @@ async fn assert_m0002_schema(conn: &DatabaseConnection) {
         !index_exists(conn, "idx_credstore_pending").await,
         "the reaper's sweep index has nothing left to sweep"
     );
+    assert_identity_index_definitions(conn).await;
+}
+
+/// Inserts an `active` row with the given identity (sharing: 1 private,
+/// 2 tenant, 3 shared), raw, so the unique indexes are what answers.
+async fn insert_identity_row(
+    conn: &DatabaseConnection,
+    tenant: Uuid,
+    reference: &str,
+    sharing: i16,
+    owner: Uuid,
+) -> Result<(), DbErr> {
+    conn.execute_unprepared(&format!(
+        "INSERT INTO credstore_secrets
+           (id, tenant_id, reference, sharing, owner_id, status, value_version, fallback,
+            secret_type_uuid)
+         VALUES ('{}', '{tenant}', '{reference}', {sharing}, '{owner}', 2, 'v1', 1, '{}')",
+        Uuid::new_v4(),
+        Uuid::from_u128(0x00C0_FFEE),
+    ))
+    .await
+    .map(|_| ())
+}
+
+/// A violation of the named unique index, nothing else.
+fn assert_unique_violation(result: Result<(), DbErr>, index: &str, what: &str) {
+    let err = result.expect_err(what);
+    let message = err.to_string();
+    assert!(
+        message.contains("unique") && message.contains(index),
+        "{what}: expected a violation of {index}, got: {message}"
+    );
+}
+
+/// What the identity indexes enforce on the rows, on the migrated schema.
+async fn assert_identity_indexes_enforce_uniqueness(conn: &DatabaseConnection) {
+    let tenant = Uuid::new_v4();
+    let (owner_a, owner_b) = (Uuid::new_v4(), Uuid::new_v4());
+
+    insert_identity_row(conn, tenant, "nonprivate", 2, owner_a)
+        .await
+        .expect("a first non-private row");
+    for sharing in [2, 3] {
+        assert_unique_violation(
+            insert_identity_row(conn, tenant, "nonprivate", sharing, owner_b).await,
+            "uq_credstore_nonprivate",
+            "a second non-private row of one (tenant, reference)",
+        );
+    }
+
+    insert_identity_row(conn, tenant, "nonprivate", 1, owner_a)
+        .await
+        .expect("a private row coexists with the tenant row of its reference");
+
+    insert_identity_row(conn, tenant, "private", 1, owner_a)
+        .await
+        .expect("a first private row");
+    assert_unique_violation(
+        insert_identity_row(conn, tenant, "private", 1, owner_a).await,
+        "uq_credstore_private",
+        "a second private row of one (tenant, reference, owner)",
+    );
+    insert_identity_row(conn, tenant, "private", 1, owner_b)
+        .await
+        .expect("private rows of different owners coexist");
 }
 
 /// A database that shipped with rows in every status, whose values the
@@ -670,6 +778,7 @@ async fn m0002_postgres_fresh_install_passes() {
         "nothing was invented"
     );
     assert_m0002_schema(&fixture.conn).await;
+    assert_identity_indexes_enforce_uniqueness(&fixture.conn).await;
     insert_migrated_row(&fixture.conn, 2, Some("v1"), 1)
         .await
         .expect("an `active` row with a pointer");

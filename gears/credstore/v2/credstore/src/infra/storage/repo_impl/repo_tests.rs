@@ -437,6 +437,111 @@ async fn insert_over_an_expired_row_conflicts_and_changes_nothing() {
     );
 }
 
+/// `insert_active` under `scope` must be refused as an internal error (a
+/// caller bug, never a 403), leave no row and keep the attempt's intent.
+async fn assert_insert_active_refused(
+    repo: &SecretRepoImpl,
+    scope: &AccessScope,
+    new: &NewSecret,
+    tenant: Uuid,
+) {
+    let attempt = begin(repo, tenant, new.id).await;
+    let err = repo
+        .insert_active(scope, new, &attempt)
+        .await
+        .expect_err("the row values are outside the scope");
+    assert!(matches!(err, DomainError::Internal { .. }), "{err:?}");
+    assert!(row_of(repo, tenant, new.id).await.is_none());
+    assert_eq!(
+        intent_ids(repo).await,
+        vec![attempt.attempt_id],
+        "the refused insert rolled back, the intent stays"
+    );
+    assert!(debt_tasks(repo).await.is_empty());
+}
+
+#[tokio::test]
+async fn insert_active_under_another_tenants_scope_is_internal_and_keeps_the_intent() {
+    let repo = setup().await;
+    let tenant = Uuid::new_v4();
+    let new = new_secret(tenant, Uuid::new_v4(), "k", SharingMode::Tenant, vv("1"));
+    let other = AccessScope::for_tenant(Uuid::new_v4());
+    assert_insert_active_refused(&repo, &other, &new, tenant).await;
+}
+
+#[tokio::test]
+async fn insert_active_under_deny_all_is_internal() {
+    let repo = setup().await;
+    let tenant = Uuid::new_v4();
+    let new = new_secret(tenant, Uuid::new_v4(), "k", SharingMode::Tenant, vv("1"));
+    assert_insert_active_refused(&repo, &AccessScope::deny_all(), &new, tenant).await;
+}
+
+#[tokio::test]
+async fn insert_active_outside_the_permitted_type_is_internal() {
+    let repo = setup().await;
+    let tenant = Uuid::new_v4();
+    let new = new_secret(tenant, Uuid::new_v4(), "k", SharingMode::Tenant, vv("1"));
+    let other_type = tenant_and_type_scope(tenant, vec![Uuid::new_v4()]);
+    assert_insert_active_refused(&repo, &other_type, &new, tenant).await;
+}
+
+#[tokio::test]
+async fn insert_declared_under_another_tenants_scope_is_internal_and_inserts_nothing() {
+    let repo = setup().await;
+    let tenant = Uuid::new_v4();
+    let new = new_declared_secret(
+        tenant,
+        Uuid::new_v4(),
+        "k",
+        SharingMode::Tenant,
+        Fallback::Inherit,
+    );
+    let err = repo
+        .insert_declared(&AccessScope::for_tenant(Uuid::new_v4()), &new)
+        .await
+        .expect_err("the row's tenant is outside the scope");
+    assert!(matches!(err, DomainError::Internal { .. }), "{err:?}");
+    assert!(row_of(&repo, tenant, new.id).await.is_none());
+}
+
+#[tokio::test]
+async fn primary_key_collision_destroys_only_the_attempts_version_and_keeps_the_live_row() {
+    let repo = setup().await;
+    let tenant = Uuid::new_v4();
+    let owner = Uuid::new_v4();
+    let scope = AccessScope::for_tenant(tenant);
+    let (id, live_version) = seed_active(&repo, tenant, owner, "a", SharingMode::Tenant).await;
+
+    // A new attempt reusing record id `id` under another reference: the
+    // insert conflicts on the primary key, not on the reference.
+    let mut clash = new_secret(tenant, owner, "b", SharingMode::Tenant, vv("new"));
+    clash.id = id;
+    let attempt = begin(&repo, tenant, id).await;
+    let outcome = repo
+        .insert_active(&scope, &clash, &attempt)
+        .await
+        .expect("a primary key conflict is a definite loss");
+    let IntentCommit::Lost { debts } = outcome else {
+        panic!("expected a definite loss: {outcome:?}");
+    };
+    let expected = vec![CleanupTask::Destroy {
+        key: StoreKey::new(TenantId(tenant), id),
+        selector: DestroySelector::Exactly(vv("new")),
+    }];
+    assert_eq!(tasks_of(debts), expected);
+    assert_eq!(debt_tasks(&repo).await, expected);
+    assert!(purged(&repo).await.is_empty(), "the live key is not purged");
+    assert_eq!(intent_ids(&repo).await, Vec::<Uuid>::new());
+    let row = repo
+        .find_own(&scope, TenantId(tenant), OwnerId(owner), &sref("a"))
+        .await
+        .expect("find")
+        .expect("live row stays");
+    assert_eq!(row.id, id);
+    assert_eq!(row.value_version, Some(live_version));
+}
+
 // ── write-intent journal: begin / drop / settle / heal ──────────────────────
 
 /// Inserts an intent row directly, with an explicit `lease_until`.
@@ -602,7 +707,7 @@ async fn row_reads_return_the_heal_flags_from_the_same_query() {
     }
 
     // A live (unexpired) intent is not an expired one.
-    let live = begin(&repo, tenant, id).await;
+    begin(&repo, tenant, id).await;
     for heal in read_all().await {
         assert!(!heal.expired_intents && !heal.debts, "{heal:?}");
     }
@@ -636,7 +741,6 @@ async fn row_reads_return_the_heal_flags_from_the_same_query() {
     for heal in read_all().await {
         assert!(heal.expired_intents && !heal.debts, "{heal:?}");
     }
-    drop(live);
 }
 
 #[tokio::test]
@@ -801,12 +905,16 @@ async fn heal_failed_creates_removes_expired_intents_without_a_row_and_purges_th
     }
     // Not to be touched: a live lease, another reference, another tenant, and
     // an expired intent whose record has a row.
-    let live = begin(&repo, tenant, Uuid::new_v4()).await;
-    let live = WriteAttempt {
-        reference: "wanted".to_owned(),
-        ..live
-    };
-    let _ = live;
+    let live_lease = Uuid::new_v4();
+    insert_raw_intent(
+        &repo,
+        live_lease,
+        &some_key(tenant),
+        "wanted",
+        hours_ago(-1),
+    )
+    .await
+    .expect("seed");
     let other_ref = Uuid::new_v4();
     insert_raw_intent(&repo, other_ref, &some_key(tenant), "other", hours_ago(1))
         .await
@@ -832,8 +940,7 @@ async fn heal_failed_creates_removes_expired_intents_without_a_row_and_purges_th
     )
     .await
     .expect("seed");
-    let live_attempt = intent_ids(&repo).await;
-    assert_eq!(live_attempt.len(), 7);
+    assert_eq!(intent_ids(&repo).await.len(), 7);
 
     let healed = repo
         .heal_failed_creates(TenantId(tenant), &reference)
@@ -846,16 +953,59 @@ async fn heal_failed_creates_removes_expired_intents_without_a_row_and_purges_th
     let mut purged_keys: Vec<StoreKey> = purged(&repo).await;
     purged_keys.sort_by_key(|k| k.record_id);
     assert_eq!(purged_keys, keys, "one purge per distinct dead key");
+    let recorded = debt_tasks(&repo).await;
+    assert_eq!(recorded.len(), 2);
     assert_eq!(
-        tasks_of(healed.debts).len(),
-        2,
-        "the returned debts are the recorded ones"
+        tasks_of(healed.debts),
+        recorded,
+        "the returned debts are the recorded ones, task for task"
     );
     let left = intent_ids(&repo).await;
     assert_eq!(left.len(), 4);
-    for kept in [other_ref, other_tenant, with_row] {
+    for kept in [live_lease, other_ref, other_tenant, with_row] {
         assert!(left.contains(&kept), "{kept} must stay");
     }
+}
+
+#[tokio::test]
+async fn heal_failed_creates_takes_at_most_one_batch_per_call() {
+    use crate::infra::storage::repo_impl::intents::HEAL_BATCH;
+    let repo = setup().await;
+    let tenant = Uuid::new_v4();
+    let reference = sref("many");
+    let total = HEAL_BATCH + 1;
+    for _ in 0..total {
+        insert_raw_intent(
+            &repo,
+            Uuid::new_v4(),
+            &some_key(tenant),
+            "many",
+            hours_ago(1),
+        )
+        .await
+        .expect("seed");
+    }
+
+    let first = repo
+        .heal_failed_creates(TenantId(tenant), &reference)
+        .await
+        .expect("heal");
+    assert_eq!(first.intents, HEAL_BATCH);
+    assert_eq!(intent_ids(&repo).await.len(), 1);
+
+    let second = repo
+        .heal_failed_creates(TenantId(tenant), &reference)
+        .await
+        .expect("heal");
+    assert_eq!(second.intents, 1);
+    assert!(intent_ids(&repo).await.is_empty());
+
+    let third = repo
+        .heal_failed_creates(TenantId(tenant), &reference)
+        .await
+        .expect("heal");
+    assert_eq!(third.intents, 0);
+    assert_eq!(purged(&repo).await.len() as u64, total);
 }
 
 #[tokio::test]
@@ -1057,7 +1207,6 @@ async fn switch_value_is_a_cas_that_bumps_the_row_version_and_moves_the_pointer(
     let repo = setup().await;
     let tenant = Uuid::new_v4();
     let owner = Uuid::new_v4();
-    let scope = AccessScope::for_tenant(tenant);
     let (id, _old) = seed_active(&repo, tenant, owner, "k", SharingMode::Tenant).await;
 
     let IntentCommit::Committed { value: row, .. } =
@@ -1068,7 +1217,6 @@ async fn switch_value_is_a_cas_that_bumps_the_row_version_and_moves_the_pointer(
     assert_eq!(row.version, 2);
     assert_eq!(row.value_version, Some(vv("2")));
     assert_eq!(row.status, SecretStatus::Active);
-    let _ = scope;
 }
 
 #[tokio::test]
@@ -1241,7 +1389,6 @@ async fn run_tx_runs_the_body_again_after_a_definite_rollback_and_commits_once()
     use sea_orm::{DbErr, RuntimeErr};
 
     use crate::infra::canonical_mapping::classify_db_err_to_domain;
-    use crate::infra::storage::repo_impl::helpers::TxFuture;
 
     let repo = setup().await;
     let attempts = Arc::new(AtomicU32::new(0));
@@ -1698,6 +1845,34 @@ async fn delete_by_id_with_stale_expected_version_is_not_found_and_enqueues_noth
 }
 
 #[tokio::test]
+async fn delete_by_id_filters_by_tenant_too_so_a_foreign_key_deletes_nothing() {
+    let repo = setup().await;
+    let tenant = Uuid::new_v4();
+    let owner = Uuid::new_v4();
+    let (id, _) = seed_active(&repo, tenant, owner, "keep", SharingMode::Tenant).await;
+    let foreign = StoreKey::new(TenantId(Uuid::new_v4()), id);
+
+    let err = repo
+        .delete_by_id(&AccessScope::allow_all(), &foreign, None)
+        .await
+        .expect_err("the row is not in that tenant");
+    assert!(matches!(err, DomainError::NotFound));
+    assert!(
+        repo.find_own(
+            &AccessScope::for_tenant(tenant),
+            TenantId(tenant),
+            OwnerId(owner),
+            &sref("keep")
+        )
+        .await
+        .expect("find")
+        .is_some(),
+        "row stays"
+    );
+    assert!(debt_tasks(&repo).await.is_empty(), "no debt is written");
+}
+
+#[tokio::test]
 async fn delete_then_create_only_put_under_the_same_reference_succeeds() {
     // No name retention (ADR-0006): a successor mints its own record id and
     // store key, so it can never collide with the predecessor's lagging purge.
@@ -2067,6 +2242,77 @@ async fn scope_includes_tenant_or_of_constraints_admits_on_broad_alternative() {
             .await
             .expect("broad OR alternative admits"),
         "a whole-tenant alternative must still grant despite a narrower sibling"
+    );
+}
+
+#[tokio::test]
+async fn scope_includes_tenant_row_filters_alone_never_admit_a_tenant() {
+    let repo = setup().await;
+    let t = Uuid::new_v4();
+    let by_type = ScopeFilter::in_uuids(
+        crate::domain::authz::SECRET_TYPE_PROP,
+        vec![SecretType::generic().uuid()],
+    );
+    let by_reference = ScopeFilter::r#in(
+        crate::domain::authz::REFERENCE_PROP,
+        vec![toolkit_security::ScopeValue::String("k".to_owned())],
+    );
+    for filters in [
+        vec![by_type.clone()],
+        vec![by_reference.clone()],
+        vec![by_type, by_reference],
+    ] {
+        let scope = AccessScope::single(ScopeConstraint::new(filters));
+        assert!(
+            !repo
+                .scope_includes_tenant(&scope, t)
+                .await
+                .expect("row filters only"),
+            "a constraint without an owner_tenant_id filter names no tenant"
+        );
+    }
+}
+
+#[tokio::test]
+async fn scope_includes_tenant_in_list_admits_only_a_listed_tenant() {
+    let repo = setup().await;
+    let (listed, also_listed, unlisted) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+    let scope = AccessScope::single(ScopeConstraint::new(vec![ScopeFilter::in_uuids(
+        pep_properties::OWNER_TENANT_ID,
+        vec![listed, also_listed],
+    )]));
+    for t in [listed, also_listed] {
+        assert!(
+            repo.scope_includes_tenant(&scope, t)
+                .await
+                .expect("listed tenant")
+        );
+    }
+    assert!(
+        !repo
+            .scope_includes_tenant(&scope, unlisted)
+            .await
+            .expect("unlisted tenant")
+    );
+
+    // A row filter beside the tenant list narrows rows, not tenants.
+    let with_row_filter = AccessScope::single(ScopeConstraint::new(vec![
+        ScopeFilter::in_uuids(pep_properties::OWNER_TENANT_ID, vec![listed]),
+        ScopeFilter::in_uuids(
+            crate::domain::authz::SECRET_TYPE_PROP,
+            vec![SecretType::generic().uuid()],
+        ),
+    ]));
+    assert!(
+        repo.scope_includes_tenant(&with_row_filter, listed)
+            .await
+            .expect("listed tenant with a row filter")
+    );
+    assert!(
+        !repo
+            .scope_includes_tenant(&with_row_filter, unlisted)
+            .await
+            .expect("unlisted tenant with a row filter")
     );
 }
 
@@ -2503,7 +2749,7 @@ async fn resolve_candidates_excludes_ancestor_declared_inherit_row() {
     );
 }
 
-// ── collection read: list_visible_types / list_candidate_references /
+// ── collection read: list_candidate_references /
 //    list_candidates_for_references (ADR-0005, ADR-0010) ──────────────────
 
 #[tokio::test]
@@ -3223,8 +3469,9 @@ async fn tenants_with_other_type_exclude_creator_and_same_type_and_page_by_tenan
     let same_type_tenant = Uuid::new_v4();
     let owner = Uuid::new_v4();
 
-    // Holders with another type: one tenant holds two rows (a tenant-shared
-    // and another owner's private one) and must be returned once.
+    // Holders with another type. The private row added for one holder is
+    // excluded by the non-private predicate, so that tenant is still
+    // returned once, through its tenant row only.
     for t in holders {
         seed_active_typed(&repo, t, owner, &name, SharingMode::Tenant, type_b).await;
     }
@@ -3284,4 +3531,511 @@ async fn tenants_with_other_type_exclude_creator_and_same_type_and_page_by_tenan
         holders.to_vec(),
         "keyset paging visits each tenant once"
     );
+}
+
+// ── resolution winners: nearest tenant, private over tenant, visibility ─────
+
+#[tokio::test]
+async fn resolve_non_private_picks_the_nearest_eligible_row_of_the_chain() {
+    let repo = setup().await;
+    let (child, mid, root) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+    let owner = Uuid::new_v4();
+    let chain = [child, mid, root];
+    let resolve = |name: &'static str| {
+        let repo = &repo;
+        async move {
+            repo.resolve_non_private(TenantId(child), &sref(name), &chain)
+                .await
+                .expect("resolve")
+        }
+    };
+
+    // A tenant row of an ancestor is never inherited.
+    seed_active(&repo, mid, owner, "only-mid", SharingMode::Tenant).await;
+    assert!(resolve("only-mid").await.is_none());
+
+    // The caller's own tenant row beats an ancestor's shared one.
+    seed_active(&repo, root, owner, "own", SharingMode::Shared).await;
+    let (own_id, _) = seed_active(&repo, child, owner, "own", SharingMode::Tenant).await;
+    assert_eq!(resolve("own").await.expect("own row").id, own_id);
+
+    // Of two shared rows, the nearer ancestor wins.
+    let (mid_id, _) = seed_active(&repo, mid, owner, "nearest", SharingMode::Shared).await;
+    seed_active(&repo, root, owner, "nearest", SharingMode::Shared).await;
+    let winner = resolve("nearest").await.expect("nearest shared row");
+    assert_eq!(winner.id, mid_id);
+    assert_eq!(winner.tenant_id, TenantId(mid));
+
+    // A declared row with fallback inherit is not eligible: the walk goes on.
+    repo.insert_declared(
+        &AccessScope::for_tenant(mid),
+        &new_declared_secret(
+            mid,
+            owner,
+            "skipped",
+            SharingMode::Shared,
+            Fallback::Inherit,
+        ),
+    )
+    .await
+    .expect("declare");
+    let (root_id, _) = seed_active(&repo, root, owner, "skipped", SharingMode::Shared).await;
+    assert_eq!(resolve("skipped").await.expect("root row").id, root_id);
+
+    // A declared row with fallback none blocks: it is the nearest and wins.
+    let blocking = new_declared_secret(mid, owner, "blocked", SharingMode::Shared, Fallback::None);
+    let blocking_id = blocking.id;
+    repo.insert_declared(&AccessScope::for_tenant(mid), &blocking)
+        .await
+        .expect("declare");
+    seed_active(&repo, root, owner, "blocked", SharingMode::Shared).await;
+    let winner = resolve("blocked").await.expect("blocking row");
+    assert_eq!(winner.id, blocking_id);
+    assert_eq!(winner.status, SecretStatus::Declared);
+}
+
+/// Seeds a private row of `owner` and a tenant row of another owner under
+/// `reference` in `tenant`, in the requested insertion order.
+async fn seed_private_and_tenant_rows(
+    repo: &SecretRepoImpl,
+    tenant: Uuid,
+    owner: Uuid,
+    reference: &str,
+    private_first: bool,
+) -> (Uuid, Uuid) {
+    let other_owner = Uuid::new_v4();
+    if private_first {
+        let (private, _) = seed_active(repo, tenant, owner, reference, SharingMode::Private).await;
+        let (shared, _) =
+            seed_active(repo, tenant, other_owner, reference, SharingMode::Tenant).await;
+        (private, shared)
+    } else {
+        let (shared, _) =
+            seed_active(repo, tenant, other_owner, reference, SharingMode::Tenant).await;
+        let (private, _) = seed_active(repo, tenant, owner, reference, SharingMode::Private).await;
+        (private, shared)
+    }
+}
+
+#[tokio::test]
+async fn resolve_for_get_prefers_the_owners_private_row_over_the_tenant_row_in_either_insert_order()
+{
+    for private_first in [true, false] {
+        let repo = setup().await;
+        let tenant = Uuid::new_v4();
+        let owner = Uuid::new_v4();
+        let (private_id, tenant_id) =
+            seed_private_and_tenant_rows(&repo, tenant, owner, "k", private_first).await;
+
+        let for_owner = repo
+            .resolve_for_get(TenantId(tenant), OwnerId(owner), &sref("k"), &[tenant])
+            .await
+            .expect("resolve")
+            .expect("row");
+        assert_eq!(
+            for_owner.id, private_id,
+            "the owner gets the private row (private_first={private_first})"
+        );
+
+        let for_other = repo
+            .resolve_for_get(
+                TenantId(tenant),
+                OwnerId(Uuid::new_v4()),
+                &sref("k"),
+                &[tenant],
+            )
+            .await
+            .expect("resolve")
+            .expect("row");
+        assert_eq!(
+            for_other.id, tenant_id,
+            "another subject gets the tenant row (private_first={private_first})"
+        );
+    }
+}
+
+#[tokio::test]
+async fn find_own_prefers_the_owners_private_row_over_the_tenant_row_in_either_insert_order() {
+    for private_first in [true, false] {
+        let repo = setup().await;
+        let tenant = Uuid::new_v4();
+        let owner = Uuid::new_v4();
+        let (private_id, tenant_id) =
+            seed_private_and_tenant_rows(&repo, tenant, owner, "k", private_first).await;
+        let scope = AccessScope::for_tenant(tenant);
+
+        let for_owner = repo
+            .find_own(&scope, TenantId(tenant), OwnerId(owner), &sref("k"))
+            .await
+            .expect("find_own")
+            .expect("row");
+        assert_eq!(
+            for_owner.id, private_id,
+            "the owner gets the private row (private_first={private_first})"
+        );
+
+        let for_other = repo
+            .find_own(
+                &scope,
+                TenantId(tenant),
+                OwnerId(Uuid::new_v4()),
+                &sref("k"),
+            )
+            .await
+            .expect("find_own")
+            .expect("row");
+        assert_eq!(for_other.id, tenant_id);
+    }
+}
+
+#[tokio::test]
+async fn resolve_for_get_hides_a_private_row_of_another_owner_in_the_own_tenant() {
+    let repo = setup().await;
+    let tenant = Uuid::new_v4();
+    let owner = Uuid::new_v4();
+    let stranger = OwnerId(Uuid::new_v4());
+    seed_active(&repo, tenant, owner, "k", SharingMode::Private).await;
+
+    assert!(
+        repo.resolve_for_get(TenantId(tenant), stranger, &sref("k"), &[tenant])
+            .await
+            .expect("resolve")
+            .is_none(),
+        "a private row is visible to its owner only"
+    );
+
+    let (tenant_row, _) =
+        seed_active(&repo, tenant, Uuid::new_v4(), "k", SharingMode::Tenant).await;
+    let row = repo
+        .resolve_for_get(TenantId(tenant), stranger, &sref("k"), &[tenant])
+        .await
+        .expect("resolve")
+        .expect("the tenant row");
+    assert_eq!(row.id, tenant_row);
+}
+
+// ── writes under a scope that excludes the row ──────────────────────────────
+
+/// The stored row `id` under reference "k" (version and value pointer).
+async fn stored(repo: &SecretRepoImpl, tenant: Uuid, id: Uuid) -> SecretRow {
+    row_of(repo, tenant, id).await.expect("row")
+}
+
+#[tokio::test]
+async fn switch_value_under_another_tenants_scope_loses_and_changes_nothing() {
+    let repo = setup().await;
+    let tenant = Uuid::new_v4();
+    let (id, _) = seed_active(&repo, tenant, Uuid::new_v4(), "k", SharingMode::Tenant).await;
+    let attempt = begin(&repo, tenant, id).await;
+
+    let outcome = repo
+        .switch_value(
+            &AccessScope::for_tenant(Uuid::new_v4()),
+            id,
+            1,
+            SharingMode::Shared,
+            Fallback::None,
+            None,
+            vv("2"),
+            &attempt,
+        )
+        .await
+        .expect("switch_value");
+
+    assert!(matches!(outcome, IntentCommit::Lost { .. }), "{outcome:?}");
+    let row = stored(&repo, tenant, id).await;
+    assert_eq!(row.version, 1);
+    assert_eq!(row.value_version, Some(vv("1")));
+    assert_eq!(row.sharing, SharingMode::Tenant);
+    assert_eq!(row.fallback, Fallback::Inherit);
+}
+
+#[tokio::test]
+async fn remove_value_under_another_tenants_scope_returns_none_and_changes_nothing() {
+    let repo = setup().await;
+    let tenant = Uuid::new_v4();
+    let (id, _) = seed_active(&repo, tenant, Uuid::new_v4(), "k", SharingMode::Tenant).await;
+
+    let result = repo
+        .remove_value(
+            &AccessScope::for_tenant(Uuid::new_v4()),
+            id,
+            Some(1),
+            SharingMode::Tenant,
+            Fallback::None,
+            None,
+            true,
+        )
+        .await
+        .expect("remove_value");
+
+    assert!(result.is_none());
+    let row = stored(&repo, tenant, id).await;
+    assert_eq!(row.version, 1);
+    assert_eq!(row.status, SecretStatus::Active);
+    assert_eq!(row.value_version, Some(vv("1")));
+    assert!(debt_tasks(&repo).await.is_empty());
+}
+
+#[tokio::test]
+async fn update_metadata_under_another_tenants_scope_returns_none_and_changes_nothing() {
+    let repo = setup().await;
+    let tenant = Uuid::new_v4();
+    let (id, _) = seed_active(&repo, tenant, Uuid::new_v4(), "k", SharingMode::Tenant).await;
+
+    let result = repo
+        .update_metadata(
+            &AccessScope::for_tenant(Uuid::new_v4()),
+            id,
+            Some(1),
+            SharingMode::Shared,
+            Fallback::None,
+            None,
+        )
+        .await
+        .expect("update_metadata");
+
+    assert!(result.is_none());
+    let row = stored(&repo, tenant, id).await;
+    assert_eq!(row.version, 1);
+    assert_eq!(row.sharing, SharingMode::Tenant);
+    assert_eq!(row.fallback, Fallback::Inherit);
+}
+
+#[tokio::test]
+async fn verify_delete_under_another_tenants_scope_is_a_precondition_failure_and_deletes_nothing() {
+    let repo = setup().await;
+    let tenant = Uuid::new_v4();
+    let (id, _) = seed_active(&repo, tenant, Uuid::new_v4(), "k", SharingMode::Tenant).await;
+    let key = StoreKey::new(TenantId(tenant), id);
+
+    let out = repo
+        .verify_delete(&AccessScope::for_tenant(Uuid::new_v4()), &key, Some(1))
+        .await
+        .expect("verify_delete");
+
+    assert!(
+        matches!(out, DeleteVerification::PreconditionFailed),
+        "{out:?}"
+    );
+    assert_eq!(stored(&repo, tenant, id).await.version, 1);
+    assert!(debt_tasks(&repo).await.is_empty());
+}
+
+// ── list_candidate_references: duplicates and descending cursor ────────────
+
+#[tokio::test]
+async fn list_candidate_references_returns_a_reference_once_however_many_rows_carry_it() {
+    let repo = setup().await;
+    let (child, parent) = (Uuid::new_v4(), Uuid::new_v4());
+    let owner = Uuid::new_v4();
+    let chain = [child, parent];
+
+    // "x": a tenant row and a private row of the caller in the child, and a
+    // shared row in the parent.
+    seed_active(&repo, child, owner, "x", SharingMode::Tenant).await;
+    seed_active(&repo, child, owner, "x", SharingMode::Private).await;
+    seed_active(&repo, parent, owner, "x", SharingMode::Shared).await;
+    seed_active(&repo, child, owner, "y", SharingMode::Tenant).await;
+    seed_active(&repo, child, owner, "z", SharingMode::Tenant).await;
+
+    let page = |cursor: Option<&'static str>, limit: u64| {
+        let repo = &repo;
+        async move {
+            repo.list_candidate_references(
+                TenantId(child),
+                OwnerId(owner),
+                &chain,
+                None,
+                &AccessScope::allow_all(),
+                cursor,
+                false,
+                limit,
+            )
+            .await
+            .expect("list")
+        }
+    };
+
+    assert_eq!(page(None, 10).await, vec!["x", "y", "z"]);
+    assert_eq!(page(None, 2).await, vec!["x", "y"]);
+    assert_eq!(page(Some("y"), 2).await, vec!["z"]);
+}
+
+#[tokio::test]
+async fn list_candidate_references_descending_cursor_is_exclusive_and_goes_down() {
+    let repo = setup().await;
+    let tenant = Uuid::new_v4();
+    let owner = Uuid::new_v4();
+    for name in ["a", "b", "c", "d"] {
+        seed_active(&repo, tenant, owner, name, SharingMode::Tenant).await;
+    }
+
+    let page = repo
+        .list_candidate_references(
+            TenantId(tenant),
+            OwnerId(owner),
+            &[tenant],
+            None,
+            &AccessScope::allow_all(),
+            Some("c"),
+            true,
+            10,
+        )
+        .await
+        .expect("list");
+
+    assert_eq!(page, vec!["b", "a"]);
+}
+
+// ── heal flags are per record ───────────────────────────────────────────────
+
+#[tokio::test]
+async fn the_expired_intent_flag_belongs_to_the_record_that_has_the_intent() {
+    let repo = setup().await;
+    let tenant = Uuid::new_v4();
+    let owner = Uuid::new_v4();
+    let scope = AccessScope::for_tenant(tenant);
+    let (id_k, _) = seed_active(&repo, tenant, owner, "k", SharingMode::Tenant).await;
+    let (id_other, _) = seed_active(&repo, tenant, owner, "other", SharingMode::Tenant).await;
+
+    // Only the other record has an expired intent.
+    insert_raw_intent(
+        &repo,
+        Uuid::new_v4(),
+        &StoreKey::new(TenantId(tenant), id_other),
+        "other",
+        hours_ago(1),
+    )
+    .await
+    .expect("seed");
+
+    let flags = |name: &'static str| {
+        let (repo, scope) = (&repo, &scope);
+        async move {
+            let get = repo
+                .resolve_for_get(TenantId(tenant), OwnerId(owner), &sref(name), &[tenant])
+                .await
+                .expect("resolve_for_get")
+                .expect("row");
+            let own = repo
+                .find_own(scope, TenantId(tenant), OwnerId(owner), &sref(name))
+                .await
+                .expect("find_own")
+                .expect("row");
+            assert_eq!(get.heal, own.heal);
+            get.heal
+        }
+    };
+    let k = flags("k").await;
+    assert!(
+        !k.expired_intents,
+        "an expired intent of another record must not flag record {id_k}"
+    );
+    assert!(flags("other").await.expired_intents);
+}
+
+// ── metadata writes store every field ───────────────────────────────────────
+
+fn fixed_expiry() -> time::OffsetDateTime {
+    time::OffsetDateTime::from_unix_timestamp(4_102_444_800).expect("2100-01-01")
+}
+
+/// Moves `updated_at` of record `id` to 2000-01-01 with a raw update.
+async fn backdate_updated_at(repo: &SecretRepoImpl, id: Uuid) -> time::OffsetDateTime {
+    use sea_orm::sea_query::Expr;
+    use sea_orm::{ColumnTrait, QueryFilter};
+    use toolkit_db::secure::SecureUpdateExt;
+
+    let long_ago = time::OffsetDateTime::from_unix_timestamp(946_684_800).expect("2000-01-01");
+    let conn = repo.db.conn().expect("conn");
+    entity::secrets::Entity::update_many()
+        .col_expr(entity::secrets::Column::UpdatedAt, Expr::value(long_ago))
+        .filter(entity::secrets::Column::Id.eq(id))
+        .secure()
+        .scope_with(&AccessScope::allow_all())
+        .exec(&conn)
+        .await
+        .expect("backdate");
+    long_ago
+}
+
+#[tokio::test]
+async fn switch_value_stores_the_expiry_and_refreshes_updated_at() {
+    let repo = setup().await;
+    let tenant = Uuid::new_v4();
+    let (id, _) = seed_active(&repo, tenant, Uuid::new_v4(), "k", SharingMode::Tenant).await;
+    let long_ago = backdate_updated_at(&repo, id).await;
+    let attempt = begin(&repo, tenant, id).await;
+
+    let outcome = repo
+        .switch_value(
+            &AccessScope::for_tenant(tenant),
+            id,
+            1,
+            SharingMode::Tenant,
+            Fallback::Inherit,
+            Some(fixed_expiry()),
+            vv("2"),
+            &attempt,
+        )
+        .await
+        .expect("switch_value");
+    assert!(
+        matches!(outcome, IntentCommit::Committed { .. }),
+        "{outcome:?}"
+    );
+
+    let row = stored(&repo, tenant, id).await;
+    assert_eq!(row.expires_at, Some(fixed_expiry()));
+    assert!(row.updated_at > long_ago, "updated_at {}", row.updated_at);
+}
+
+#[tokio::test]
+async fn update_metadata_stores_the_expiry_and_refreshes_updated_at() {
+    let repo = setup().await;
+    let tenant = Uuid::new_v4();
+    let (id, _) = seed_active(&repo, tenant, Uuid::new_v4(), "k", SharingMode::Tenant).await;
+    let long_ago = backdate_updated_at(&repo, id).await;
+
+    repo.update_metadata(
+        &AccessScope::for_tenant(tenant),
+        id,
+        Some(1),
+        SharingMode::Tenant,
+        Fallback::Inherit,
+        Some(fixed_expiry()),
+    )
+    .await
+    .expect("update_metadata")
+    .expect("row updated");
+
+    let row = stored(&repo, tenant, id).await;
+    assert_eq!(row.expires_at, Some(fixed_expiry()));
+    assert!(row.updated_at > long_ago, "updated_at {}", row.updated_at);
+}
+
+#[tokio::test]
+async fn remove_value_stores_the_expiry_and_refreshes_updated_at() {
+    let repo = setup().await;
+    let tenant = Uuid::new_v4();
+    let (id, _) = seed_active(&repo, tenant, Uuid::new_v4(), "k", SharingMode::Tenant).await;
+    let long_ago = backdate_updated_at(&repo, id).await;
+
+    repo.remove_value(
+        &AccessScope::for_tenant(tenant),
+        id,
+        Some(1),
+        SharingMode::Tenant,
+        Fallback::None,
+        Some(fixed_expiry()),
+        true,
+    )
+    .await
+    .expect("remove_value")
+    .expect("row updated");
+
+    let row = stored(&repo, tenant, id).await;
+    assert_eq!(row.expires_at, Some(fixed_expiry()));
+    assert!(row.updated_at > long_ago, "updated_at {}", row.updated_at);
 }
