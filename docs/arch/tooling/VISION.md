@@ -27,9 +27,12 @@ the architecture, the commands, the file formats or the implementation; those be
 and in the ADRs after it. It is written for the maintainers of `gears-rust`, `cargo-gears`,
 `gearbox` and the `studio-kit-gears` kit.
 
-**How to read it.** About thirty minutes end to end, and section 4 is half of that. Skip section 3
+**How to read it.** About thirty-five minutes end to end, and section 4 is half of that. Skip section 3
 if you already know what `cargo gears`, `gears.mk`, Studio and Gearbox each cover today. If you only
-need the decisions, read this block, the walk-through at the top of section 4, and section 6.
+need the decisions, read this block, the scenario at the top of section 4, and section 6.
+Section 1 is a glossary of ordinary words used narrowly — skim it and come back to it rather than
+trying to hold it. If you want the concrete shape first, the table at the end of section 1 and the
+one under "What this changes for `gears-rust`" in section 4 say it in files.
 
 ## Table of Contents
 
@@ -70,6 +73,27 @@ This document uses these terms with one meaning each.
 Reference, generate and copy are an order of preference, best first. A reference leaves no copy to
 drift. A generated file repairs itself on the next run. A copy is the last resort, and on upgrade the
 tool replaces it whole and never merges it.
+
+A convention is a unit a project selects. It brings a set of files and a way they arrive. Some bring
+no files at all, and exist only as a rule that the check answers. Against this repository the
+selection would look like this:
+
+| Convention | What it brings here | How it arrives |
+|---|---|---|
+| **Build rules** | the `Makefile` driver and `gears.mk` with its 32 targets | referenced by pin; the 74 targets in `gears-rust.mk` stay the project's |
+| **CI pipeline** | the 30 workflows, the 4 composite actions, the 24 pipeline scripts under `tools/scripts/` | referenced by tag; the triggers and the secrets stay the project's |
+| **Rust lint and toolchain** | `clippy.toml`, `rustfmt.toml`, `deny.toml`, `rust-toolchain.toml`, `.config/nextest.toml`, `.cargo/config.toml` | copied, and replaced whole under a version check |
+| **Dependency and lint baseline** | the 256 `[workspace.dependencies]` entries and the ~125 `[workspace.lints]` settings | generated from a shared source; Cargo has no cross-repository mechanism, so that source is new work |
+| **Repository layout** | the rule that `gears/`, `libs/`, `apps/` and the document roots are where a Gears repository puts them | setup creates the directories; after that there is no file to manage, and the rule is what the check answers |
+| **Gear layout** | the rule that states the complete set a gear carries: the crate, the `gear.gdl` descriptor, its documents, its workspace entry, its publish settings | nothing is written — the tool creates no gear. The check answers presence and placement; Gearbox still owns what the descriptor says, and `cfs` what the documents say |
+| **Document-first development** | the kit, its artifact templates, and the CI step that makes `cfs` run | referenced by kit version; the systems map in `artifacts.toml` stays the project's |
+| **Agent configuration** | the prompt and agent files for the five agent vendors this repository supports | generated from one source; today `toolkit-pr-review` exists five times and four copies have diverged |
+| **Platform guidelines** | the `guidelines/DNA` submodule and the platform documents beside it | referenced by submodule pin — the one convention here that already works this way |
+| **Repository boilerplate** | `CONTRIBUTING.md`, `CODEOWNERS`, the pull-request template, the legal files | written once at setup, then project-owned and never managed |
+
+Whether those are ten conventions or thirty is a design decision. What a convention *is* is not.
+Two of them install nothing. They exist only as something the check can answer, which is why
+conformance is not an afterthought to setup.
 
 ## 2. Problems
 
@@ -157,7 +181,11 @@ One precondition is not ours to meet. The conventions have to live where a pin c
 somebody has to put them there. Section 3 records that on the date above neither place existed, and
 that work changes `gears-rust` before it changes any new project.
 
-### One repository, start to finish
+### Scenario: one repository, start to finish
+
+*The four paragraphs below are a scenario, not a specification. They describe how the tool is meant
+to be used over the first month of a repository. The responsibilities they illustrate are defined
+after them.*
 
 A maintainer starts a gear repository. They pick a profile and adjust it: document-first development
 yes, FIPS no. Setup writes the layout, the build and CI wiring, the lint and toolchain
@@ -168,8 +196,9 @@ their machine. Nothing is hidden: the selection is a file in the repository, and
 A week later a developer adds a gear and runs the check before pushing. The crate is there, but the
 DESIGN document and the descriptor the declared conventions call for are not — the parts a new gear
 needs that nobody had written down for them. That absence is the tool's own finding; once the files
-exist, whether they are any good is Studio's and Gearbox's verdict, relayed in the same report. The
-check also runs on the pull request, so the answer does not depend on anyone remembering.
+exist, whether they are any good is Studio's and Gearbox's verdict, reported where those tools
+already report. The check also runs on the pull request, so the answer does not depend on anyone
+remembering.
 
 A month later a convention moves upstream. The scheduled job runs the update, and a pull request
 arrives changing four pins and two managed files. The diff is small, the reasoning is in the report,
@@ -241,24 +270,24 @@ and traceable is `cfs`'s judgement, descriptor correctness is Gearbox's, crate l
 dependency policy is `cargo-deny`'s. A second implementation of any of those gives a project two
 answers to one question.
 
-One report may still carry all of it. Aggregating a verdict is not recomputing it, and the reader
-should not have to run four tools to learn where a repository stands. But every finding is
-attributed, and the tool never invents an answer on a domain owner's behalf.
+**It configures other tools. It does not run them.** That is the whole of the relationship. Setup
+writes `clippy.toml` and the workflow that calls clippy; `make` and CI invoke it; dylint decides
+what the code deserves. The tool replaces no runner and no validator, and it does not stand between
+a project and its own results. Its own output is about its own files.
 
 That boundary creates the one thing this responsibility cannot get wrong. **A configured check is
 not a passing check**, and the report must not let the two blur. For every convention a project
-declared there are five distinct states, and only the last is good news:
+declared, the tool can answer four questions, and none of them is the fourth's verdict:
 
 - the convention is declared;
 - its reference resolves;
 - its configuration is intact — the declared pin resolves, and managed content matches that pin;
-- the check that enforces it is wired and ran;
-- that check passed.
+- the check that enforces it is configured and reachable by whoever runs it.
 
-The tool answers the first four itself and relays the fifth from its owner. Where it cannot reach an
-answer — a validator that did not run, a check it has no access to — it says so. **An unrun check is
-never reported as a passing one**, and a convention the project never took is reported as unselected
-rather than failed. A reader should be able to tell what was checked, what was not, and why.
+Whether that check then ran, and what it found, belongs to the validator and to CI. The tool does
+not fetch it, relay it, or stand in for it. **A configured check is never reported as a passing
+one**, a convention the project never took is reported as unselected rather than failed, and a
+reader should be able to tell what was checked, what was not, and who holds the rest.
 
 **It installs conventions. It does not obtain software.** Not because fetching a program is hard —
 plenty of tools do it — but because an unattended job that fetches and runs arbitrary programs is
@@ -343,7 +372,7 @@ Each promise is bounded by what the tool actually controls.
 | | It promises | It does not promise |
 |---|---|---|
 | **Setup** | Every selected convention is installed and pinned, a working update wiring is handed over, and anything missing is named | A green build. That needs tools installed, services configured and code written |
-| **Validation** | A truthful answer within its footprint, with the five states above kept apart and every gap in its own knowledge visible | That the repository is good — only that it is, or is not, what the project said it would be |
+| **Validation** | A truthful answer about its own files, with the four questions above kept apart from any verdict it does not own | That the repository is good — only that it is, or is not, what the project said it would be |
 | **Update** | Pins and managed files move reproducibly; an upgrade it cannot apply is reported as not applied, with the reason | That every upstream change applies by itself, or that anything delivers it |
 
 Three safety expectations hold across all three. Conventions resolve only from sources the project
@@ -358,7 +387,21 @@ project knows what it agreed to run when the scheduled job fires at three in the
 ### What this changes for `gears-rust`
 
 `gears-rust` becomes the reference implementation of these conventions, and a consumer of the same
-tool. It stops being the repository that everybody copies from.
+tool. It stops being the repository that everybody copies from. Against the inventory in section 3,
+concretely:
+
+| Today | After |
+|---|---|
+| `gears.mk` carries 32 targets and a header telling you to replace the file by hand | the same file, resolved by a pin |
+| 30 workflows live here and are copied outward | the same pipeline, called by tag; this repository holds callers like anybody else |
+| thirteen lint, audit, toolchain and test configs are copied, then diverge quietly | copied still, but replaced whole under a version check, with divergence declared rather than inferred |
+| the kit upgrades; nothing else does | every convention carries a pin, and one job proposes the bumps |
+| the complete set of parts a gear carries is folklore; four example gears have no `gear.gdl` | the gear layout convention names the set, and the check reports what is missing before review |
+| conformance debt collects as 37 `[[ignore]]` blocks | the check reports it where people read it |
+
+Nothing in that column is new behaviour for the build or for CI. `make` still runs the targets and
+CI still runs the checks; what changes is where the files come from and whether anything notices
+when they age.
 
 It also has to choose a direction. A tool can adapt to the build system that a project already has,
 or it can give a project the build system that it should have. Section 3 records an effort inside
@@ -436,19 +479,30 @@ is, so "later" is not the answer to any of them.
 
 ## 5. What the successful scaffolds share
 
-These are observations about tools people use every day, not a law. Each one is here because it
-decides something specific below. Taken together they point at one conclusion: **minimize
-unmanaged duplication, and make the lifecycle of whatever is generated or copied explicit.**
+Seven observations about tools people use every day. Each one decided something above.
 
-| Pattern | Evidence | What it decides here |
-|---|---|---|
-| **The cost of a scaffold is what it leaves unmanaged** | Create React App kept its build configuration inside a versioned dependency, `react-scripts`, and that part upgraded by bumping a version. What the generator wrote into the repository, and everything past `eject`, could not be upgraded at all. The React team deprecated it in February 2025 for having no active maintainers | Judge setup by how much of its output stays managed afterwards, not by how little it writes. An unmanaged file is a file somebody must keep correct by hand in every project that received it |
-| **Conventions that outlive their authors are distributed as versioned references** | Maven parent POMs and BOMs, Gradle convention plugins, GitHub Actions reusable workflows, ESLint shareable configs and `tsconfig` `extends` all put the content upstream and a version in the repository. This is about distribution, not about whether anything is generated — Expo below generates heavily and still upgrades cleanly | Prefer a reference where one is available, because one change then needs one release instead of one pull request per repository that copied it |
-| **A template is a versioned artifact, not a repository you copy** | `dotnet new` installs a template as a package at an exact version, from a public feed, a private server or a shared folder, with a version history | A convention with a version and a feed can be selected, pinned and rolled back. One in somebody's `main` branch can only be copied |
-| **Regenerate instead of edit, and make the exception explicit** | Expo regenerates native directories from the app config, so an upgrade is a bump plus a regeneration — the answer to what the 2022 React Native survey called the library's largest weakness. It never overwrites existing directories, and offers a named patch route | Prefer generation wherever a rule can produce the content. Where a project must diverge, give it a declared exception, or it will edit the file and say nothing |
-| **Where upgrades need to change a repository, they are explicit transformations, not merges** | `ng update`, `nx migrate`, `rails app:update` and `ember-cli-update` ship versioned transformations owned by the framework that caused the change, and each states what it touches. A three-way merge of a template fails quietly instead: no conflict markers, and the file still wrong | Why a managed file is replaced whole rather than merged, and why an upgrade that cannot be expressed that way stops and says so rather than guessing |
-| **The road is a default, not a mandate** | Netflix's Paved Road is a set of recommended products and practices that engineers follow by default and leave deliberately | A tool that fails a project for a convention it never took is a tool that teams route around |
-| **Diagnose, report, leave the repair to the operator** | `brew doctor` repairs nothing: it warns, exits non-zero, and leaves the command to the person. `flutter doctor` reports versions and missing parts. Both are the first command run when something breaks | The check command has the same shape |
+- **A scaffold costs what it leaves unmanaged.** Create React App upgraded its build configuration by
+  bumping `react-scripts`. What the generator wrote into the repository never upgraded at all. Judge
+  setup by how much of its output stays managed, not by how little it writes.
+- **Conventions that outlive their authors travel as versioned references.** Maven parent POMs,
+  Gradle convention plugins, reusable workflows, `tsconfig` `extends`. One change then needs one
+  release, instead of one pull request per repository that copied it.
+- **A template is a versioned artifact, not a branch you copy.** `dotnet new` installs a template
+  from a feed at an exact version. That can be pinned and rolled back. A branch can only be copied.
+- **Regenerate instead of edit, and make the exception explicit.** Expo regenerates the native
+  directories from the app config, and never overwrites one that exists. Where a project must
+  diverge, give it a declared exception, or it edits the file and says nothing.
+- **Upgrades are explicit transformations, not merges.** `ng update`, `nx migrate` and
+  `rails app:update` ship versioned steps owned by whoever caused the change. A three-way merge
+  fails quietly instead: no conflict markers, and the file still wrong.
+- **The road is a default, not a mandate.** Netflix's Paved Road is followed by default and left
+  deliberately. A tool that fails a project for a convention it never took is a tool teams route
+  around.
+- **Diagnose, report, leave the repair to the operator.** `brew doctor` repairs nothing. It warns,
+  exits non-zero, and hands the command back. The check command has the same shape.
+
+Together: **minimize unmanaged duplication, and make the lifecycle of whatever is generated or
+copied explicit.**
 
 ## 6. Principles
 
@@ -470,10 +524,13 @@ the rest together:
 
 **What it owns, and what it leaves alone**
 
-- **Own conformance, not domain judgement.** Presence and placement against the declared
-  conventions are the tool's. Content and correctness belong to the validator that owns them; relay
-  their verdict, attributed, and never substitute your own.
-- **Integrate rather than replace.** Reuse the build, CI, generation and validation that exist.
+- **Configure tools; do not run them.** Write the configuration a validator or a runner reads, and
+  leave invoking it to `make`, to CI, or to the developer.
+- **Validate your own files only.** Presence and placement against the declared conventions are the
+  tool's. Content and correctness belong to the validator that owns them, and so does reporting
+  them.
+- **Replace nothing that already exists.** No runner, no validator, no build system — the tool
+  configures what a project already has.
 - **One fact, one owner.** Several manifests describe one gear. Each fact belongs to one of them.
 - **Check the tools. Do not install them.** Report the missing tool and its required version.
 - **Managed content and owned content stay distinct.** An upgrade never asks a person which lines

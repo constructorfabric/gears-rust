@@ -98,6 +98,17 @@ The product is the arc, not any one step: **set up → check → update → chec
 
 ---
 
+## What a convention is, concretely
+
+**Installed and pinned** — build rules (`gears.mk`, 32 targets) · CI (30 workflows, 4 composite actions, 24 pipeline scripts) · Rust lint and toolchain (6 config files) · dependency baseline (256 deps, ~125 lints) · document-first development (the Studio kit) · agent configuration (5 vendors, one source) · platform guidelines (`guidelines/DNA`) · repository boilerplate
+
+**Checked only — nothing is installed** — repository layout · gear layout: the crate, `gear.gdl`, the documents, the workspace entry, the publish settings
+
+> A project takes the subset it wants — that is **P6**.
+> Two conventions write no file at all, which is why **the check is not an afterthought to setup**.
+
+---
+
 ## The one idea everything follows from
 
 > A project **declares its conventions and pins their versions.**
@@ -149,12 +160,12 @@ and shrink copying to the residue Rust leaves no alternative for.
 | It owns | Somebody else owns |
 |---|---|
 | Repository-level conformance: **presence and placement** | **Content and correctness** — `cfs`, Gearbox, dylint, `cargo-deny` |
-| Installing conventions | Obtaining and running software — an unattended job must not |
+| **Configuring** a validator or a runner | **Running** it — that is `make`, CI, or the developer |
+| Validating its own files | Judging the code — dylint, `cargo-deny`, Gearbox, `cfs` |
 | A command you run | Running a bot, hosting a service, opening pull requests |
-| Checking that a check is wired | Deciding a verdict its owner already decides |
 
-One report may carry all of it. **Aggregating a verdict is not recomputing it** —
-every finding is attributed, and the tool never answers on an owner's behalf.
+It writes `clippy.toml` and the workflow that calls clippy. It never calls clippy.
+**It replaces no runner and no validator**, and never stands between a project and its own results.
 
 ---
 
