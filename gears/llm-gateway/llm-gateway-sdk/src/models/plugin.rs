@@ -44,8 +44,9 @@ pub struct ProviderCallCtx {
     /// sets it on the outbound provider request, which goes only through OAGW,
     /// over HTTPS, to the model's upstream alias (`provider_settings.oagw_alias`).
     /// `None` for models without a secret reference (authentication handled by
-    /// OAGW, local provider). The
-    /// key is redacted in `Debug`, zeroed on drop, and must never be logged or
+    /// OAGW, local provider). Until `ModelInfoV1` exposes a secret reference
+    /// the gateway's Credential Broker is keyless and this is always `None`
+    /// (DESIGN § 4.9). The key is redacted in `Debug`, zeroed on drop, and must never be logged or
     /// persisted.
     pub api_key: Option<SecretString>,
 
@@ -114,9 +115,13 @@ pub enum MediaInputMode {
     /// Base64 data and external URLs are forwarded to the provider as-is; URLs
     /// stay URLs (`cpt-cf-llm-gateway-fr-vision-v1`).
     UrlForward,
-    /// The provider accepts only bytes: the core fetches external URLs before
-    /// dispatch and hands the plugin base64 content. `FileStorage` URLs are
-    /// resolved the same way from P2 (`cpt-cf-llm-gateway-fr-filestorage-media-v1`).
+    /// The provider accepts only bytes: every `image_url` and `file_data`
+    /// reaches the plugin as a `data:<mime>;base64,...` URI and `file_url` is
+    /// cleared (plain base64 `file_data` is typed from the filename). The core
+    /// fetches an `https` URL before dispatch only when a media egress route
+    /// exists; otherwise the request is rejected with `capability_not_supported`
+    /// (`media_url`). `FileStorage` URLs are resolved the same way from P2
+    /// (`cpt-cf-llm-gateway-fr-filestorage-media-v1`).
     PrefetchRequired,
 }
 

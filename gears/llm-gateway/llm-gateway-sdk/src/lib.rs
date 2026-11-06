@@ -20,7 +20,8 @@ pub mod plugin_api;
 
 pub use api::{LlmGatewayClientV1, ResponseEventStream};
 pub use errors::{
-    LlmGatewayError, MAX_PROVIDER_TEXT_CHARS, ProviderErrorCategory, ProviderFailure,
+    LlmGatewayError, MAX_PROVIDER_ID_CHARS, MAX_PROVIDER_TEXT_CHARS, ProviderErrorCategory,
+    ProviderFailure, truncate_provider_id,
 };
 pub use gts::LlmGatewayProviderPluginSpecV1;
 pub use models::content::{

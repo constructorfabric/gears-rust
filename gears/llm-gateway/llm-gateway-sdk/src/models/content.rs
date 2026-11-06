@@ -56,7 +56,9 @@ pub struct InputText {
     Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
 )]
 pub struct InputImage {
-    /// Image URL or base64 data URI (schema maximum 20 MiB).
+    /// Image URL or base64 data URI (schema maximum 20 MiB). Only an `https`
+    /// URL without user info or a `data:<mime>;base64,...` URI is accepted;
+    /// for a `PrefetchRequired` plugin the core replaces it with a data URI.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub image_url: Option<String>,
     /// File-storage identifier (Gears extension).
@@ -109,7 +111,9 @@ pub struct InputFile {
     /// Original filename for display.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub filename: Option<String>,
-    /// Base64-encoded file data (schema maximum 32 MiB).
+    /// Base64-encoded file data (schema maximum 32 MiB): plain base64 (typed
+    /// by the `filename` extension) or a `data:<mime>;base64,...` URI. For a
+    /// `PrefetchRequired` plugin the core always hands it over as a data URI.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub file_data: Option<String>,
     /// File URL.

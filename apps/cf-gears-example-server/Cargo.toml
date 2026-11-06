@@ -59,6 +59,8 @@ bss-rate-provider = [
 ]
 bss-ledger = ["dep:bss_ledger"]
 usage-collector = ["dep:usage_collector"]
+# LLM Gateway gear. Needs a Model Registry client in ClientHub at init.
+llm-gateway = ["dep:llm_gateway"]
 timescaledb-usage-collector = ["dep:timescaledb_usage_collector_plugin"]
 clickhouse-usage-collector = ["dep:clickhouse_usage_collector_plugin"]
 # Quota Enforcement gear, its storage plugin, and the platform cluster gear it
@@ -153,6 +155,9 @@ bss_ledger = { package = "cf-gears-bss-ledger", path = "../../gears/bss/ledger/l
 bss_rate_provider = { package = "cf-gears-bss-rate-provider", path = "../../gears/bss/rate-provider/rate-provider", optional = true }
 bss_rate_provider_ecb_plugin = { package = "cf-gears-bss-rate-provider-ecb-plugin", path = "../../gears/bss/rate-provider/plugins/ecb-plugin", optional = true }
 bss_rate_provider_http_json_plugin = { package = "cf-gears-bss-rate-provider-http-json-plugin", path = "../../gears/bss/rate-provider/plugins/http-json-plugin", optional = true }
+
+# Optional LLM Gateway gear
+llm_gateway = { package = "cf-gears-llm-gateway", path = "../../gears/llm-gateway/llm-gateway", optional = true }
 
 # Optional Usage Collector gear + its TimescaleDB / ClickHouse storage plugins
 usage_collector = { package = "cf-gears-usage-collector", path = "../../gears/system/usage-collector/usage-collector", optional = true }

@@ -185,7 +185,9 @@ pub enum LlmGatewayError {
     MediaNotFound { param: Option<String> },
 
     /// `credentials_unavailable` — the provider API key referenced by the
-    /// model cannot be fetched from `CredStore`.
+    /// model cannot be fetched from `CredStore`. Target design: until
+    /// `ModelInfoV1` exposes a secret reference the gateway fetches no keys
+    /// and never returns this error (DESIGN § 4.9).
     #[error("credentials unavailable")]
     CredentialsUnavailable,
 
@@ -257,6 +259,22 @@ fn truncate_provider_text(text: &str) -> String {
     }
 }
 
+/// Maximum length, in characters, of the provider-supplied identifiers
+/// (`provider_code`, `provider_request_id`) that leave the gateway in a
+/// Problem, a `response.failed` event, a log line or a usage record. Longer
+/// values are cut without a marker.
+pub const MAX_PROVIDER_ID_CHARS: usize = 256;
+
+/// Cut a provider identifier to [`MAX_PROVIDER_ID_CHARS`] characters, on a
+/// character boundary.
+#[must_use]
+pub fn truncate_provider_id(id: &str) -> String {
+    match id.char_indices().nth(MAX_PROVIDER_ID_CHARS) {
+        Some((cut, _)) => id[..cut].to_owned(),
+        None => id.to_owned(),
+    }
+}
+
 impl LlmGatewayError {
     /// Stable wire code of the error.
     #[must_use]
@@ -287,7 +305,8 @@ impl LlmGatewayError {
     /// the same code as the error and the provider originals when present.
     /// `Internal` errors expose only a generic message. For provider errors,
     /// the message and `provider_message` are truncated to
-    /// [`MAX_PROVIDER_TEXT_CHARS`], because they carry provider text. REST
+    /// [`MAX_PROVIDER_TEXT_CHARS`], because they carry provider text, and
+    /// `provider_code` / `provider_request_id` to [`MAX_PROVIDER_ID_CHARS`]. REST
     /// Problems must be built from the same object, so the rule holds on both
     /// paths.
     #[must_use]
@@ -308,14 +327,15 @@ impl LlmGatewayError {
             }
             Self::UnsupportedParameter { param } => error.param = Some(param.clone()),
             Self::Provider { details, .. } => {
-                error.provider_code.clone_from(&details.provider_code);
+                error.provider_code = details.provider_code.as_deref().map(truncate_provider_id);
                 error.provider_message = details
                     .provider_message
                     .as_deref()
                     .map(truncate_provider_text);
-                error
+                error.provider_request_id = details
                     .provider_request_id
-                    .clone_from(&details.provider_request_id);
+                    .as_deref()
+                    .map(truncate_provider_id);
                 error.retry_after = details.retry_after;
             }
             _ => {}
@@ -576,6 +596,28 @@ mod tests {
         assert!(provider_message.ends_with('\u{2026}'));
         assert_eq!(wire.message.chars().count(), MAX_PROVIDER_TEXT_CHARS + 1);
         assert!(wire.message.starts_with("invalid_request: "));
+    }
+
+    #[test]
+    fn provider_identifiers_are_truncated_on_the_wire() {
+        let long = "\u{436}".repeat(MAX_PROVIDER_ID_CHARS + 50);
+        let err = LlmGatewayError::provider(
+            ProviderErrorCategory::InvalidRequest,
+            "bad",
+            ProviderFailure::default()
+                .with_provider_code(long.clone())
+                .with_provider_request_id(long),
+        );
+        let wire = err.to_response_error();
+        assert_eq!(
+            wire.provider_code.unwrap().chars().count(),
+            MAX_PROVIDER_ID_CHARS
+        );
+        assert_eq!(
+            wire.provider_request_id.unwrap().chars().count(),
+            MAX_PROVIDER_ID_CHARS
+        );
+        assert_eq!(truncate_provider_id("req_1"), "req_1");
     }
 
     #[test]

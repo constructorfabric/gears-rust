@@ -2,22 +2,32 @@ gdl_version = "1.0"
 
 # Every GDL field: https://github.com/constructorfabric/gearbox/blob/main/docs/gdl.md
 #
-# Gearbox description for the llm-gateway gear, which has no crate yet.
+# Gearbox description for the llm-gateway gear. The crate exists
+# (`llm-gateway/`, `package = cargo(...)` below) and the gear is implemented in
+# slices: see README.md "Status". Pending: the OAGW-backed media fetcher
+# (slice 6b). The Credential Broker is keyless until `ModelInfoV1` exposes a
+# secret reference (DESIGN § 4.9).
 #
-# `implementation = "design"`: listed in the catalogue with its documents, and
-# not usable in a product (GBX0321). When the crate exists, describe it beside
-# the crate instead -- `package = cargo(...)` and a `maturity`, no `id`
-# (projected from #[toolkit::gear] then) -- and delete this file.
+# Convention for a gear with a crate is to keep this file beside the crate and
+# drop `id` (projected from #[toolkit::gear]); it stays here with an explicit
+# `id` until the file is moved.
 
 gear(
     source = git(url = "https://github.com/constructorfabric/gears-rust", path = "gears/llm-gateway"),
-    implementation = "design",
+    implementation = "in-progress",
     id = "llm-gateway",
     name = "LLM Gateway",
     description = "Unified LLM access with multimodal support, tool calling, and governance controls.",
     category = "gen-ai",
 
-    # The SDK is published ahead of the gear; the catalogue records where it is.
+    maturity = "preview",
+
+    package = cargo(
+        crate_name = "cf-gears-llm-gateway",
+        lib = "llm_gateway",
+        path = "llm-gateway",
+    ),
+
     sdk = cargo(
         crate_name = "cf-gears-llm-gateway-sdk",
         lib = "llm_gateway_sdk",
