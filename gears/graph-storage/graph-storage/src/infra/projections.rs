@@ -34,18 +34,6 @@ pub fn node_ident_columns(query: Select<node::Entity>) -> Select<node::Entity> {
         .column(node::Column::NodeKey)
 }
 
-/// A node's row id and nothing else: what a count reads per matching row, so
-/// its memory is eight bytes a row whatever the keys' length.
-#[derive(Debug, sea_orm::FromQueryResult)]
-pub struct NodeRowId {
-    #[expect(dead_code, reason = "the count reads the rows, not their ids")]
-    pub id: i64,
-}
-
-pub fn node_id_columns(query: Select<node::Entity>) -> Select<node::Entity> {
-    query.select_only().column(node::Column::Id)
-}
-
 /// A node's identity and its type: what an adjacency entry says about the
 /// node at the far end of an edge.
 #[derive(Debug, sea_orm::FromQueryResult)]
@@ -262,9 +250,9 @@ mod tests {
 
     use super::{
         edge, edge_ends_columns, edge_hop_columns, edge_owner_columns, edge_state_columns,
-        endpoint_pair_columns, gts_type, node, node_id_columns, node_ident_columns,
-        node_listing_select, node_state_columns, node_typed_columns, type_id_columns,
-        type_meta_columns, type_name_columns, type_traits_columns,
+        endpoint_pair_columns, gts_type, node, node_ident_columns, node_listing_select,
+        node_state_columns, node_typed_columns, type_id_columns, type_meta_columns,
+        type_name_columns, type_traits_columns,
     };
 
     /// The columns no projection here may read, by entity. Each of them is
@@ -292,16 +280,6 @@ mod tests {
             &rendered(&node_ident_columns(node::Entity::find())),
             &WIDE_NODE,
             &["id", "node_key"],
-        );
-    }
-
-    #[test]
-    fn a_counted_node_reads_its_id_alone() {
-        let sql = rendered(&node_id_columns(node::Entity::find()));
-        holds(&sql, &WIDE_NODE, &["\"id\""]);
-        assert!(
-            !sql.contains("node_key"),
-            "a count must not hold the keys it counts: {sql}"
         );
     }
 

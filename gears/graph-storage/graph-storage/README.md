@@ -166,8 +166,9 @@ Each is the shipped behaviour, with the contract that fixes it.
   /nodes:count` (`count_nodes` in process) takes the listing's
   `type_pattern` and `$filter` and answers how many rows all its pages hold,
   exactly up to `projection_count_max` (10 000 by default) and as that
-  ceiling with `capped: true` past it -- it reads the matching ids, so its
-  cost is bounded by the ceiling, not by the tenant. It refuses `$orderby`,
+  ceiling with `capped: true` past it -- the database counts at most one row
+  past the ceiling and answers one number, so its cost is bounded by the
+  ceiling, not by the tenant. It refuses `$orderby`,
   `$top`, `cursor` and `$select`. There is no offset in any form (#5108).
   A type that declares no `index` paths can be filtered by `node_key`, `name`,
   `created_at` and `updated_at` only, which is a scan of the tenant. The audit

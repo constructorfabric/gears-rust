@@ -20,9 +20,8 @@ use toolkit_odata::{Page as OdataPage, SortDir};
 use uuid::Uuid;
 
 use crate::infra::projections::{
-    EdgeHop, NodeIdent, NodeRowId, NodeTyped, TypeName, TypeTraits, edge_hop_columns,
-    node_id_columns, node_ident_columns, node_typed_columns, type_name_columns,
-    type_traits_columns,
+    EdgeHop, NodeIdent, NodeTyped, TypeName, TypeTraits, edge_hop_columns, node_ident_columns,
+    node_typed_columns, type_name_columns, type_traits_columns,
 };
 use crate::infra::storage::entity::{edge, graph_meta, gts_type, node};
 use crate::infra::storage::odata_mapper::NodeODataMapper;
@@ -704,12 +703,10 @@ pub async fn project_table(
 ///
 /// The same select and the same `$filter` as the listing -- the platform's
 /// column filter or the gear's payload plan, whichever the listing would use
-/// -- so the count cannot disagree with the pages. It reads the matching
-/// rows' ids, at most `max + 1`, rather than `COUNT(*)`: the bound is what
-/// makes its cost a function of configuration rather than of the tenant's
-/// size. The id alone, not the key: eight bytes a row, so even the largest
-/// `projection_count_max` holds a few megabytes, not the keys' length times
-/// the count.
+/// -- so the count cannot disagree with the pages. The database counts at
+/// most `max + 1` matching rows (`count_bound`), and one row comes back: the
+/// bound makes its cost a function of configuration rather than of the
+/// tenant's size, and nothing per row crosses the wire.
 pub async fn count_table(
     store: &PgGraphStore,
     ctx: &StoreCtx<'_>,
@@ -741,19 +738,28 @@ pub async fn count_table(
         select = select.filter(condition);
     }
 
-    let ids = select
-        .limit(max.saturating_add(1))
-        .project_all(&conn, |query| {
-            node_id_columns(query).into_model::<NodeRowId>()
-        })
+    let seen = count_bound(select, max)
+        .count(&conn)
         .await
         .map_err(map_scope_err)?;
-    let seen = ids.len() as u64;
     Ok(graph_storage_sdk::models::NodeCount {
         count: std::cmp::Ord::min(seen, max),
         capped: seen > max,
         revision: observed_revision(ctx, &conn).await?,
     })
+}
+
+/// The statement a count runs: the listing's select, limited to `max + 1`
+/// rows. `SecureSelect::count` is `SeaORM`'s `PaginatorTrait::count`, which
+/// wraps the select as it is in `SELECT COUNT(*) FROM (...)` and keeps its
+/// `LIMIT` (it clears only the ordering), so the database stops at the bound
+/// and answers one number. One past `max` is what tells "exactly `max`" from
+/// "more than `max`".
+fn count_bound(
+    select: toolkit_db::secure::SecureSelect<node::Entity, toolkit_db::secure::Scoped>,
+    max: u64,
+) -> toolkit_db::secure::SecureSelect<node::Entity, toolkit_db::secure::Scoped> {
+    select.limit(max.saturating_add(1))
 }
 
 /// The projection when a payload path is named: the shared plan rendered by
@@ -885,7 +891,24 @@ async fn rows_to_page(
 
 #[cfg(test)]
 mod tests {
-    use super::{node, stored_vector_columns};
+    use super::{count_bound, node, stored_vector_columns};
+
+    /// A count is bounded in the database: the statement it counts over
+    /// carries `LIMIT max + 1`. The answer would be the same without it --
+    /// `count_table` clamps to `max` -- so only the statement shows the
+    /// difference between counting the bound and counting the tenant.
+    #[test]
+    fn a_count_stops_one_row_past_its_ceiling() {
+        use sea_orm::{EntityTrait, QueryTrait};
+        use toolkit_db::secure::SecureEntityExt;
+
+        let scope = toolkit_security::AccessScope::for_tenant(uuid::Uuid::nil());
+        let sql = count_bound(node::Entity::find().secure().scope_with(&scope), 10_000)
+            .into_inner()
+            .build(sea_orm::DatabaseBackend::Postgres)
+            .to_string();
+        assert!(sql.contains("LIMIT 10001"), "{sql}");
+    }
 
     /// The embedding-state statement does not read the wide columns.
     ///

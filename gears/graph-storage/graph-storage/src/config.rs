@@ -156,8 +156,8 @@ pub struct GraphStorageConfig {
     ///
     /// Past it the answer is this number with `capped` set, so the cost of a
     /// count is bounded by configuration rather than by the size of the
-    /// tenant: the count reads the matching rows' ids, at most this many plus
-    /// one, and only the ids -- eight bytes a row, whatever the keys' length.
+    /// tenant: the database counts at most this many rows plus one and
+    /// answers one number.
     pub projection_count_max: u32,
     /// Absolute deadline for interactive operations, seconds.
     pub deadline_interactive_secs: u64,
