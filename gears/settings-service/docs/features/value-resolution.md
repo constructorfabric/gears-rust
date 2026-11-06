@@ -21,6 +21,7 @@
   - [Read an Effective Value Administratively](#read-an-effective-value-administratively)
   - [Browse Effective Values](#browse-effective-values)
   - [List Values Needing Review](#list-values-needing-review)
+  - [Read Anonymous-Exposable Values](#read-anonymous-exposable-values)
 - [3. Processes / Business Logic (CDSL)](#3-processes--business-logic-cdsl)
   - [Scope Class Resolution Dispatch](#scope-class-resolution-dispatch)
   - [Needs-Review Fallthrough](#needs-review-fallthrough)
@@ -40,6 +41,7 @@
   - [Hierarchy-Change Invalidation](#hierarchy-change-invalidation)
   - [Administrative Read Surface](#administrative-read-surface)
   - [Review Listing](#review-listing)
+  - [Anonymous Read Surface](#anonymous-read-surface)
   - [In-Process Reader Binding](#in-process-reader-binding)
 - [6. Acceptance Criteria](#6-acceptance-criteria)
 
@@ -83,7 +85,7 @@ Three properties matter more than the walk itself.
 - **DECOMPOSITION**: [DECOMPOSITION.md](../DECOMPOSITION.md) entry 2.5
 - **Dependencies**: entry 2.4 typed value validation, since the resolution chain terminates in a validated Schema Default and every value it walks is a validated typed value; entry 2.3 for the declaration model and its scope class; entry 2.1 for persistence, the reader trait, and the error taxonomy; entry 2.7 for the effective tenant access the administrative reads consult — until it lands, no restriction rows exist and every setting is visible.
 - **Sequences**: `cpt-cf-settings-service-seq-effective-value-read`
-- **Not applicable**: Cross-field search is R1 but its own feature, entry 2.11 (search-discoverability.md). The `mode` tag and, when set, the declaration's `display_name` (omitted when unset, never derived) are served here on every browse item, while the single read, the public read and the SDK readers (`get_effective`, `get_effective_bulk`) are value-only and carry neither; there is no mode filter and no `hidden_advanced_count`: mode is a tag a client groups by, never a filter (DESIGN §2.3). Licence gating and the anonymous read surface are R2 and out of scope here. The cross-replica `cache_invalidate` broadcast and its bounded-staleness guarantee ship with R2, when several replicas become the normal case. Tenant override writes, the cascading-impact report, and the validate-before-set check belong to the Value Writer of entry 2.8. Secret plaintext resolution is owned by the Secret Manager; this feature returns a secret-trait value in its masked handle form. The revert **action** is a value write like any other; only the resolution semantics of defaults are here.
+- **Not applicable**: Cross-field search is R1 but its own feature, entry 2.11 (search-discoverability.md). The `mode` tag and, when set, the declaration's `display_name` (omitted when unset, never derived) are served here on every browse item, while the single read, the public read and the SDK readers (`get_effective`, `get_effective_bulk`) are value-only and carry neither; there is no mode filter and no `hidden_advanced_count`: mode is a tag a client groups by, never a filter (DESIGN §2.3). Licence gating is R2 and out of scope here; the anonymous read surface is in scope, as its own flow and definition of done below. The cross-replica `cache_invalidate` broadcast and its bounded-staleness guarantee ship with R2, when several replicas become the normal case. Tenant override writes, the cascading-impact report, and the validate-before-set check belong to the Value Writer of entry 2.8. Secret plaintext resolution is owned by the Secret Manager; this feature returns a secret-trait value in its masked handle form. The revert **action** is a value write like any other; only the resolution semantics of defaults are here.
 
 ## 2. Actor Flows (CDSL)
 
@@ -258,6 +260,27 @@ Three properties matter more than the walk itself.
 8. [x] - `p1` - Mask each row's value by its declaration's classification and the setter identity for a caller without the PII entitlement - `inst-vr-review-8`
 9. [x] - `p1` - Apply the identity rule to each row's `set_by`: show it only when its recorded tenant (`set_by_tenant`) lies on the path from the reader tenant down to the row's tenant, the path taken from the target's chain extended by the walk's parent links, else withhold it — the mask token with `set_by_withheld: true`, whatever the PII entitlement; a platform administrator sees every identity - `inst-vr-review-10`
 10. [x] - `p1` - **RETURN** `200` with one item per row — `key`, `display_name` when set, `mode`, `tenant_id`, `scope`, `value`, `masked`, `needs_review_detail`, `last_change_at`, `set_by`, `set_by_withheld`, `etag` — and the page cursors - `inst-vr-review-9`
+
+### Read Anonymous-Exposable Values
+
+- [x] `p2` - **ID**: `cpt-cf-settings-service-flow-value-resolution-public-read`
+
+**Actor**: `cpt-cf-settings-service-actor-tenant-admin` (anyone: the route takes no token)
+
+**Success Scenarios**:
+- The effective values, at the named tenant, of every active declaration flagged `anonymous_exposable`, and nothing else
+- A missing, malformed or unknown `tenant`: the same `200` with an empty list
+
+**Error Scenarios**:
+- The database, the tenant resolver or the types registry cannot answer, or any failure other than the tenant being unknown: `503`, never an empty list
+
+**Steps**:
+1. [x] - `p2` - Client sends GET /settings-service/v1/public/settings with a `tenant` query parameter and no authentication; **IF** `tenant` is absent, empty or not a UUID → **RETURN** `200` with an empty list - `inst-vr-public-1`
+2. [x] - `p2` - Tenant hierarchy: look up the tenant's ancestor chain; **IF** the tenant is not found → **RETURN** `200` with an empty list; **IF** the lookup fails any other way → **RETURN** `503` - `inst-vr-public-2`
+3. [x] - `p2` - Take the active declarations with `anonymous_exposable` true, in key order, from the cache's stored selection when it is younger than the TTL; otherwise DB: SELECT them and store the selection under the declaration generation captured before the read, which a declaration change since refuses; **IF** the read fails → **RETURN** `503` - `inst-vr-public-3`
+4. [x] - `p2` - Resolve each declaration at the tenant by the ordinary cascade, Scope Class applied and tenant access restrictions not applied; a declaration retired or a tenant gone since the selection is skipped; **IF** a resolution fails any other way → **RETURN** `503` - `inst-vr-public-4`
+5. [x] - `p2` - Withhold any declaration whose classification is not `public` or whose value is secret-backed, which the schema `CHECK` makes unreachable and this step makes harmless - `inst-vr-public-5`
+6. [x] - `p2` - **RETURN** `200` with `{ items: [ { key, value } ] }`, one item per declaration, and nothing that describes the declaration or hints at any other setting - `inst-vr-public-6`
 
 ## 3. Processes / Business Logic (CDSL)
 
@@ -498,6 +521,21 @@ The system **MUST** serve `GET /settings-service/v1/settings/review` on the reso
 - API: `GET /settings-service/v1/settings/review`
 - Entities: `SettingValue`, `TenantAccess`
 
+### Anonymous Read Surface
+
+- [x] `p2` - **ID**: `cpt-cf-settings-service-dod-value-resolution-public-read`
+
+The system **MUST** serve `GET /settings-service/v1/public/settings?tenant={tenant_id}` as the one unauthenticated route of the gear, declared `.anonymous().exposed()` in a route module of its own, `GET` only, returning the effective values at the tenant of the active declarations flagged `anonymous_exposable` and nothing else. A missing, malformed or unknown `tenant` **MUST** answer the same `200` with an empty list as a tenant with nothing exposable, so the route gives no distinguishable error or `404` to find tenants by (a tenant with exposable values is recognisable by its content, which the gateway's rate limit mitigates), while a real failure **MUST** answer `503` and **MUST NOT** answer an empty list. The route **MUST NOT** carry an in-process rate limit: throttling it is the gateway's responsibility. The selection of flagged declarations is kept in the cache under the value cache's TTL and dropped at once by any declaration change on the replica, so a flag cleared or a declaration created is visible to the next read on that replica, while other replicas converge by the TTL.
+
+**Implements**:
+- `cpt-cf-settings-service-flow-value-resolution-public-read`
+
+**Constraints**: `cpt-cf-settings-service-constraint-supplied-as-gear`
+
+**Touches**:
+- API: `GET /settings-service/v1/public/settings`
+- Entities: `SettingDeclaration`, `EffectiveValue`
+
 ### In-Process Reader Binding
 
 - [x] `p1` - **ID**: `cpt-cf-settings-service-dod-value-resolution-reader-binding`
@@ -600,3 +638,8 @@ The system **MUST** implement `SettingsReaderClient` over the resolver — `get_
 - [x] An OData expression on an unmapped field returns `400` rather than an unfiltered page
 - [x] `SettingsReaderClient` is resolvable from `ClientHub` after init, and a configuration naming a remote binding for it fails startup
 - [x] A browse page item carries `display_name` when its declaration has one and omits it otherwise; `GET /settings-service/v1/settings/{key}`, `GET /settings-service/v1/public/settings`, `get_effective` and `get_effective_bulk` never carry it
+- [x] `GET /settings-service/v1/public/settings?tenant=…` without authentication returns the effective values of the flagged settings at that tenant, inherited ones included, and no setting that is not flagged
+- [x] A missing, malformed or unknown `tenant` answers a `200` with an empty list, byte-identical to a known tenant with nothing flagged
+- [x] An unreachable tenant resolver or database answers `503` on the anonymous read, never an empty list
+- [x] Every method other than `GET` on the anonymous path answers `405`
+- [x] The anonymous read's selection of flagged declarations is cached under the value cache's TTL, and a declaration change (flag cleared, declaration created or retired) on the same replica is visible to the next read

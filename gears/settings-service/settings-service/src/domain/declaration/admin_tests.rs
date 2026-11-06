@@ -2967,6 +2967,10 @@ impl SlowStore {
 
 #[async_trait::async_trait]
 impl crate::domain::ports::SecretManager for SlowStore {
+    fn is_configured(&self) -> bool {
+        true
+    }
+
     fn mint_reference(&self, _key: &str, _tenant: Uuid) -> String {
         unreachable!("a release mints nothing")
     }
@@ -3528,6 +3532,10 @@ struct PanicsOnTheSecond {
 
 #[async_trait::async_trait]
 impl crate::domain::ports::SecretManager for PanicsOnTheSecond {
+    fn is_configured(&self) -> bool {
+        true
+    }
+
     fn mint_reference(&self, _key: &str, _tenant: Uuid) -> String {
         unreachable!("a release mints nothing")
     }

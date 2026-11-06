@@ -5,14 +5,14 @@ gdl_version = "1.0"
 # Gearbox product metadata for the settings-service gear.
 #
 # Projected from #[toolkit::gear]: id, runtime_caps (db, rest, stateful),
-# colocated_deps (types-registry, credstore), lifecycle; the authz-resolver
+# colocated_deps (types-registry), lifecycle; the authz-resolver
 # edge from #[toolkit::consumes].
 
 
 AUTHZ_SDK = cargo(crate_name = "cf-gears-authz-resolver-sdk", lib = "authz_resolver_sdk", path = "../../system/authz-resolver/authz-resolver-sdk", features = ["rest-client"])
 
 gear(
-    deps = ["credstore", "types-registry"],
+    deps = ["types-registry"],
     # The authorization resolver is consumed, not linked: local when co-located,
     # REST with the platform token otherwise.
     consumes = [consume(contract = "AuthZResolverApi", rust = "authz_resolver_sdk::AuthZResolverApi", sdk = AUTHZ_SDK)],

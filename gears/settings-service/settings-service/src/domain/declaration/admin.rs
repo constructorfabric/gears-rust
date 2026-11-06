@@ -1055,6 +1055,12 @@ where
             .resolve_traits(&request.value_type_id)
             .await?;
         let derived = derive_classification(&traits, request.data_classification.as_deref())?;
+        // A new secret declaration (create, evolve or revive) is refused while
+        // no secret store is bound: its values could not be set anywhere.
+        if derived.has_secret_trait {
+            self.secrets
+                .require_configured("declaring a secret setting")?;
+        }
         // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-create:p1:inst-decl-create-10
         // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-create:p1:inst-decl-create-9
         // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-create:p1:inst-decl-create-8
@@ -1190,6 +1196,10 @@ where
         // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-create:p1:inst-decl-create-19
         // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-create:p1:inst-decl-create-18
         // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-create:p1:inst-decl-create-17
+        // A new key has no cached values, so this drops only the anonymous
+        // read's stored selection, which a new exposable declaration must
+        // enter. The caller evicts again once the transaction commits.
+        self.cache.invalidate_key(&inserted.key);
         // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-create:p1:inst-decl-create-20
         self.record(
             conn,
@@ -1835,6 +1845,13 @@ where
         // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-purge:p2:inst-decl-purge-11
         precondition::evaluate(if_match, &etag_of(&current))?;
         // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-purge:p2:inst-decl-purge-11
+        // The entries a purge releases live in the store: with none bound the
+        // purge is refused before it deletes anything, not committed with its
+        // entries left to orphan.
+        if current.has_secret_trait {
+            self.secrets
+                .require_configured("purging a secret setting")?;
+        }
         // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-purge:p2:inst-decl-purge-12
         // Collected under the lock and before the delete: the cascade removes
         // the rows, and with them the only record of what the store holds.

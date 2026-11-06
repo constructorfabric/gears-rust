@@ -9,3 +9,9 @@
 
 /// A conditional write whose `If-Match` no longer matches current state.
 pub const ETAG_MISMATCH: &str = "ETAG_MISMATCH";
+
+/// The operation needs secret storage and the deployment has none bound.
+///
+/// A deployment state, not an outage: the client must not retry until an
+/// operator binds the Credential Store.
+pub const SECRET_STORAGE_NOT_CONFIGURED: &str = "SECRET_STORAGE_NOT_CONFIGURED";

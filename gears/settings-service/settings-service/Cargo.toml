@@ -38,7 +38,6 @@ types-registry = { workspace = true }
 # The Credential Store behind the Secret Manager: plaintext lives there, the
 # settings row holds the reference (DESIGN.md §4.2 *Secret Manager*).
 credstore-sdk = { workspace = true }
-credstore = { workspace = true }
 uuid = { workspace = true }
 # Type Validator: structural + `format` assertions, and the regex trait check.
 jsonschema = { workspace = true }
@@ -103,8 +102,9 @@ tower = { workspace = true }
 # `MockTypesRegistryClient`, the SDK's own double for the registry the
 # declaration reads ask for a type's traits.
 types-registry-sdk = { workspace = true, features = ["test-util"] }
-# `MockCredStoreClient`, for the gear-init test: `init` resolves the credstore
-# client out of the hub, so the hub has to hold one.
+# `MockCredStoreClient`, for the gear tests that exercise the store present: init
+# takes the credstore client from the hub under `secret_storage: required`, so
+# the hub holds one wherever a test builds the gear with the store bound.
 credstore-sdk = { workspace = true, features = ["test-util"] }
 # The SQLite driver the repository tests run against. Only the driver: the
 # runtime and TLS come from the workspace, which pins `runtime-tokio` and

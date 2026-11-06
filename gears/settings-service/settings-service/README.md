@@ -85,14 +85,60 @@ validated by the platform's AuthN resolver. A blank or whitespace-padded pin
 or assurance entry is refused at init: no token could carry
 it, and it would refuse every step-up-gated write with no sign at boot.
 
+The optional `background` section switches the managed lifecycle's periodic
+passes on or off, each defaulting to `true`:
+
+```yaml
+config:
+  background:
+    pending_secret_sweep: true   # release unclaimed staged secrets, every minute
+    audit_retention: true        # prune audit records past their horizon, daily
+    needs_review_gauge: true     # refresh settings_needs_review_total, every minute
+```
+
+Every replica runs the same passes, so with several replicas the same work is
+done once per replica. A deployment can switch the loops off and have an
+external scheduler, for example a Kubernetes CronJob, request the sweep and the
+retention once per cluster through the internal maintenance routes below. A
+disabled pass never ticks; with all three disabled the lifecycle only waits for
+cancellation. The gauge has no route: switched off, it is not refreshed.
+
+The `secret_storage` key says whether this deployment stores secret settings:
+
+```yaml
+config:
+  secret_storage: required   # default; or: disabled
+```
+
+`required` makes `post_init` fail, naming `secret_storage`, when the host carries no
+Credential Store client, so a host that lost its store does not come up healthy
+and refuse every secret. `disabled` is the explicit choice of a deployment that
+stores none. A value other than these two is refused at startup.
+
 ## Dependencies and capabilities
 
 `deps = [types_registry]` — the one gear this service calls during its own
 init, to register the settings GTS schemas. The authorization resolver, the
-AuthN resolver, the tenant resolver and the Credential Store are fetched from
-`ClientHub` at first use on the request path, so they add no ordering edge: a
-gear that reads settings during *its* init names `settings-service` in its own
-`deps` and cannot close a cycle through this one.
+AuthN resolver and the tenant resolver are fetched from `ClientHub` at first
+use on the request path, so they add no ordering edge: a gear that reads
+settings during *its* init names `settings-service` in its own `deps` and
+cannot close a cycle through this one.
+
+The Credential Store is in neither `deps` nor `consumes`. With the default
+`secret_storage: required`, its client is looked up in `ClientHub` at first use
+and kept, and the gear's `post_init`, which the runtime calls after the init of
+every gear of the group and before routes are mounted, refuses to start without
+it. `credstore` is an ordinary application gear, so the order of its init
+relative to this one is not guaranteed, which is why the check is not in init.
+This crate does not link the `credstore`
+gear, so a host that stores secrets adds it, with a value-store plugin, as the
+example server's `settings-service` feature does. With `secret_storage: disabled` the gear
+does not look for the store, logs one warning at init, and serves every setting
+that is not secret; each operation that needs secret storage (setting,
+staging, removing or resolving a secret, purging a retired secret declaration,
+declaring a secret setting) is refused before anything is written with a
+`secret storage is not configured` failed precondition, which is not an outage
+and not worth retrying.
 
 Capabilities are `db`, `rest` and `stateful`; the managed lifecycle runs three
 passes: the minute sweep that releases staged secrets nobody claimed, the
@@ -104,6 +150,12 @@ retention pass that prunes records past their horizon.
 Everything under `/settings-service/v1/`: `categories`, `declarations`,
 `settings` (browse, read, history), `settings/{key}/value` and its `revert`,
 `clone` and `secret-stage` actions, `settings/batch`, `settings/{key}/validate`
-and `/impact`, and `settings/{key}/permissions`. The served document is at
-`/openapi.json`; the platform contract is mirrored in TypeSpec under
+and `/impact`, and `settings/{key}/permissions`. Two more routes stand apart:
+`public/settings?tenant=` is the one unauthenticated read, returning the
+effective values of the settings flagged `anonymous_exposable` and nothing else
+(an unknown or malformed tenant answers an empty list, a failure answers `503`,
+and throttling is the gateway's job), and `maintenance/pending-secrets/sweep`
+and `maintenance/audit/prune` are internal, authenticated, platform-scope
+routes that run one pass of the loops for an external scheduler. The served
+document is at `/openapi.json`; the platform contract is mirrored in TypeSpec under
 `vhp-architecture`.

@@ -281,3 +281,60 @@ async fn a_resolution_whose_record_cannot_be_written_yields_no_plaintext() {
         .expect_err("no record, no plaintext");
     assert!(matches!(err, DomainError::Unavailable { .. }), "{err:?}");
 }
+
+#[tokio::test]
+async fn resolving_without_secret_storage_is_not_configured_and_leaves_no_record() {
+    let h = Harness::new(Arc::new(AllowAllGate)).await;
+    let declaration = h.declare_secret("api_token").await;
+    let tenant = h.base.tree.root;
+    h.configure(declaration, tenant, "hunter2").await;
+    h.secrets.go_unconfigured();
+
+    let err = h
+        .resolve(&h.handle("api_token", tenant))
+        .await
+        .expect_err("no store to read from");
+
+    assert!(
+        matches!(err, DomainError::NotConfigured { .. }),
+        "not an outage and not an absent credential: {err:?}"
+    );
+    assert!(
+        h.audit.records().is_empty(),
+        "a resolution that did not happen"
+    );
+}
+
+#[tokio::test]
+async fn a_caller_without_the_grant_learns_nothing_of_the_missing_store() {
+    let h = Harness::new(Arc::new(DenyAllGate::default())).await;
+    let declaration = h.declare_secret("api_token").await;
+    let tenant = h.base.tree.root;
+    h.configure(declaration, tenant, "hunter2").await;
+    h.secrets.go_unconfigured();
+
+    let err = h
+        .resolve(&h.handle("api_token", tenant))
+        .await
+        .expect_err("denied");
+
+    assert!(matches!(err, DomainError::Unauthorized { .. }), "{err:?}");
+}
+
+#[tokio::test]
+async fn a_secret_with_no_credential_is_not_found_even_without_secret_storage() {
+    // The truthful answer for a setting nobody configured is the `NotFound`
+    // the SDK projects to `SecretNotConfigured`, store or no store: a
+    // consumer reading an optional secret keeps its fallback.
+    let h = Harness::new(Arc::new(AllowAllGate)).await;
+    h.declare_secret("api_token").await;
+    h.secrets.go_unconfigured();
+
+    let err = h
+        .resolve(&h.handle("api_token", h.base.tree.root))
+        .await
+        .expect_err("no credential");
+
+    assert!(matches!(err, DomainError::NotFound { .. }), "{err:?}");
+    assert!(h.audit.records().is_empty());
+}

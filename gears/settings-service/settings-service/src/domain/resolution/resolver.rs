@@ -971,6 +971,33 @@ where
         self.values.list_review(conn, request).await
     }
 
+    /// The active declarations flagged `anonymous_exposable`, in key order:
+    /// the selection of the unauthenticated read surface, read under no
+    /// caller's scope because there is no caller.
+    ///
+    /// The selection is kept in the cache under its time-to-live, so a warm
+    /// call does not reach the database. A declaration change on this replica
+    /// drops it, and a read that began before such a change is not stored.
+    ///
+    /// # Errors
+    /// [`DomainError`] when the read fails.
+    pub async fn exposable_declarations<C: DBRunner>(
+        &self,
+        conn: &C,
+    ) -> Result<Arc<[Declaration]>, DomainError> {
+        if let Some(selection) = self.cache.exposable() {
+            return Ok(selection);
+        }
+        let seen = self.cache.exposable_generation();
+        let selection: Arc<[Declaration]> = self
+            .declarations
+            .find_anonymous_exposable(conn, &AccessScope::allow_all())
+            .await?
+            .into();
+        self.cache.populate_exposable(Arc::clone(&selection), seen);
+        Ok(selection)
+    }
+
     /// The declarations with these ids, in one read — the rows of a page
     /// already passed the visibility predicates, so none is withheld here.
     ///

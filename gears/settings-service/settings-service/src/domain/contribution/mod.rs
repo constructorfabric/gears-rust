@@ -41,6 +41,10 @@ pub mod reason {
     pub const MAJOR_REGRESSION: &str = "major_regression";
     /// A higher major arrived; the upgrade migration is not built yet.
     pub const UPGRADE_UNSUPPORTED: &str = "upgrade_unsupported";
+    /// A `secret`-trait declaration arrived new, as an upgrade or as a revival,
+    /// while no secret storage is configured; the other items of the call are
+    /// unaffected.
+    pub const SECRET_STORAGE_NOT_CONFIGURED: &str = "secret_storage_not_configured";
     /// The key belongs to another module.
     pub const NOT_OWNER: &str = "not_owner";
     /// No declaration exists at the key.

@@ -468,7 +468,7 @@ The impact report **MUST** walk the target's descendants breadth-first under a n
 
 - [x] `p1` - **ID**: `cpt-cf-settings-service-dod-value-writes-secret-routing`
 
-A write to a `secret`-trait declaration **MUST** hand the plaintext to the Secret Manager port and persist only the reference it returns, **MUST** be refused as unavailable while nothing is bound to that port, and **MUST** never write plaintext to `value`. A clone of a `secret`-classified setting **MUST** be refused as `SecretNotCloneable`.
+A write to a `secret`-trait declaration **MUST** hand the plaintext to the Secret Manager port and persist only the reference it returns, **MUST** be refused with the `secret storage is not configured` failed precondition, not as unavailable, before any database write while no Credential Store is bound, and **MUST** never write plaintext to `value`. A clone of a `secret`-classified setting **MUST** be refused as `SecretNotCloneable`.
 
 **Implements**:
 - `cpt-cf-settings-service-algo-value-writes-commit`
@@ -522,7 +522,7 @@ Every committed change **MUST** publish `event_value_changed` and every rejected
 - [x] A batch of several step-up-gated reverts asks for one assertion, not one per entry
 - [x] A revert at a tenant scope returns the nearest-ancestor fallback and at the root tenant the Schema Default, which is unchanged
 - [x] A clone stores the source's effective value at the target with no continuing link, is refused `403` when the caller may not read the source, and is refused `SecretNotCloneable` on a secret setting
-- [x] A write to a secret-trait declaration with no Secret Manager bound is refused as unavailable, and no plaintext appears in `setting_values`
+- [x] A write to a secret-trait declaration with no Secret Manager bound is refused with the `secret storage is not configured` failed precondition before any row or intent record is written, and no plaintext appears in `setting_values`
 - [x] A valid set clears `needs_review` on the row
 - [x] The impact report omits standalone descendants from its list and its total, honours `limit` between one and five hundred, stops at the node budget with `truncated` set, and never blocks the write
 - [x] The impact walk over a subtree of a thousand tenants asks the tenant resolver and the database the same fixed number of times as over five hundred, and `validate` of a cascading setting carries that report; a walk whose subtree the tenant resolver never answers returns a truncated report with nothing scanned instead of waiting

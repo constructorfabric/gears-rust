@@ -54,7 +54,13 @@ pub mod declaration_handlers;
 pub mod declaration_routes;
 pub mod dto;
 pub mod handlers;
+pub mod maintenance_dto;
+pub mod maintenance_handlers;
+pub mod maintenance_routes;
 pub mod page_dto;
+pub mod public_dto;
+pub mod public_handlers;
+pub mod public_routes;
 pub mod revival_handlers;
 pub mod routes;
 pub mod search_dto;
@@ -158,6 +164,18 @@ mod declaration_purge_surface_tests;
 #[cfg(test)]
 #[path = "value_surface_tests.rs"]
 mod value_surface_tests;
+
+#[cfg(test)]
+#[path = "secret_storage_surface_tests.rs"]
+mod secret_storage_surface_tests;
+
+#[cfg(test)]
+#[path = "maintenance_surface_tests.rs"]
+mod maintenance_surface_tests;
+
+#[cfg(test)]
+#[path = "public_surface_tests.rs"]
+mod public_surface_tests;
 
 #[cfg(test)]
 #[path = "boundary_surface_tests.rs"]

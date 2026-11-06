@@ -124,6 +124,18 @@ pub enum DomainError {
         detail: String,
     },
 
+    /// The deployment has no secret storage bound, and the operation needs
+    /// it. Renders as the canonical `FailedPrecondition`, not `503`: the state
+    /// is a deployment choice, not an outage, so a client must not retry.
+    ///
+    /// `detail` reaches the problem body verbatim and says only what is
+    /// missing.
+    #[error("secret storage is not configured: {detail}")]
+    NotConfigured {
+        /// What cannot be done without it, safe for the wire.
+        detail: String,
+    },
+
     /// Anything unrecognized. Renders as `500` with a generic body.
     ///
     /// `diagnostic` stays in process: the platform keeps it out of the wire
@@ -201,6 +213,14 @@ impl DomainError {
         );
         Self::Unavailable {
             detail: format!("the {dependency} could not {operation}"),
+        }
+    }
+
+    /// The Credential Store is not bound, and `operation` needs it.
+    #[must_use]
+    pub fn secret_storage_not_configured(operation: &str) -> Self {
+        Self::NotConfigured {
+            detail: format!("{operation} is not possible"),
         }
     }
 

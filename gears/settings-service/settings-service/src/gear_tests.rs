@@ -199,19 +199,16 @@ async fn the_managed_lifecycle_sweeps_abandoned_stages_and_stops_when_cancelled(
     ));
 
     rx.await.expect("the sweep announces readiness");
-    // The sweep's database work runs on the blocking pool, so the release
-    // lands on another thread at a time this task cannot observe directly.
-    // The wait is therefore on the clock and not on scheduler turns: a
-    // fixed number of `yield_now`s is a race, and a slow machine loses it.
-    // The store release is the pass's last step, so waiting for it waits for
-    // the whole of it.
-    tokio::time::timeout(std::time::Duration::from_secs(30), async {
-        while !secrets.held().is_empty() {
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        }
-    })
-    .await
-    .expect("the first tick releases what has expired");
+    // The release is the pass's last store step, and the store tells us when
+    // it happens: no clock, no polling. The permit is kept if it fires first.
+    secrets.released.notified().await;
+    // The row is deleted just after the entry; the lifecycle stops only after
+    // the pass is over, so joining it below makes the next read exact.
+    cancel.cancel();
+    serving
+        .await
+        .expect("the task joins")
+        .expect("and returns cleanly");
 
     let conn = inner.db.conn().expect("connection");
     let scope = toolkit_security::AccessScope::allow_all();
@@ -223,12 +220,6 @@ async fn the_managed_lifecycle_sweeps_abandoned_stages_and_stops_when_cancelled(
             .is_none(),
         "and the row goes with the entry"
     );
-
-    cancel.cancel();
-    serving
-        .await
-        .expect("the task joins")
-        .expect("and returns cleanly");
 }
 
 #[tokio::test]
@@ -259,7 +250,8 @@ async fn a_sweep_pass_that_finds_nothing_is_not_an_event() {
         std::sync::Arc::new(crate::test_support::RecordingPublisher::default()),
         std::sync::Arc::new(crate::test_support::FixedStepUp::verified()),
     );
-    SettingsService::sweep_once(&writes, &tokio_util::sync::CancellationToken::new()).await;
+    crate::infra::maintenance::sweep_once(&writes, &tokio_util::sync::CancellationToken::new())
+        .await;
     assert!(secrets.held().is_empty());
 }
 
@@ -291,7 +283,8 @@ async fn a_store_that_cannot_release_keeps_the_row_for_the_next_tick_which_relea
     );
     secrets.go_down();
 
-    SettingsService::sweep_once(&writes, &tokio_util::sync::CancellationToken::new()).await;
+    crate::infra::maintenance::sweep_once(&writes, &tokio_util::sync::CancellationToken::new())
+        .await;
 
     let conn = inner.db.conn().expect("connection");
     let scope = toolkit_security::AccessScope::allow_all();
@@ -309,7 +302,8 @@ async fn a_store_that_cannot_release_keeps_the_row_for_the_next_tick_which_relea
     secrets
         .unavailable
         .store(false, std::sync::atomic::Ordering::SeqCst);
-    SettingsService::sweep_once(&writes, &tokio_util::sync::CancellationToken::new()).await;
+    crate::infra::maintenance::sweep_once(&writes, &tokio_util::sync::CancellationToken::new())
+        .await;
     assert!(
         crate::infra::storage::pending_secret_repo::PendingSecretRepo
             .find(&conn, &scope, pending_id)
@@ -322,6 +316,167 @@ async fn a_store_that_cannot_release_keeps_the_row_for_the_next_tick_which_relea
         secrets.deleted.lock().expect("lock").as_slice(),
         ["abandoned-ref".to_owned()]
     );
+}
+
+// ── Which loops run ──────────────────────────────────────────────────────────
+
+fn background(sweep: bool, retention: bool, review: bool) -> crate::config::BackgroundConfig {
+    crate::config::BackgroundConfig {
+        pending_secret_sweep: sweep,
+        audit_retention: retention,
+        needs_review_gauge: review,
+    }
+}
+
+#[tokio::test]
+async fn each_switch_selects_exactly_its_own_loop() {
+    for (sweep, retention, review) in [
+        (true, true, true),
+        (false, true, true),
+        (true, false, true),
+        (true, true, false),
+        (false, false, false),
+    ] {
+        let loops = super::Loops::from_config(background(sweep, retention, review));
+        assert_eq!(loops.sweep.is_some(), sweep);
+        assert_eq!(loops.retention.is_some(), retention);
+        assert_eq!(loops.review.is_some(), review);
+    }
+}
+
+#[tokio::test]
+async fn a_switched_off_loop_has_no_tick_to_wait_for() {
+    // Not even the immediate first tick an interval starts with: the future
+    // of a switched-off loop is pending until the runtime ends, so the
+    // lifecycle's select can never pick it.
+    let mut off: Option<tokio::time::Interval> = None;
+    let mut on = Some(tokio::time::interval(std::time::Duration::from_hours(1)));
+
+    assert!(
+        futures_util::poll!(std::pin::pin!(super::next_tick(&mut off))).is_pending(),
+        "a disabled loop never ticks"
+    );
+    // An interval's first tick is immediate, the contrast the line above is
+    // about: this one resolves with no time passing at all.
+    super::next_tick(&mut on).await;
+}
+
+/// Fires when the retention pass reports: the loop after the sweep in the
+/// lifecycle's biased select, so it is a barrier behind the sweep's slot.
+#[derive(Default)]
+struct RetentionBarrier {
+    passed: tokio::sync::Notify,
+}
+
+impl crate::domain::ports::LifecycleMetrics for RetentionBarrier {
+    fn needs_review(&self, _source: &'static str, _count: u64) {}
+    fn retention_pass(&self, _result: &'static str, _pruned: u64) {
+        self.passed.notify_one();
+    }
+}
+
+/// Run the lifecycle's loops with the sweep `on` or off and retention on, until
+/// the retention pass has reported, then stop. Every interval's first tick is
+/// immediate and the select is biased in the order sweep, retention, so a sweep
+/// that is on has always run before the retention that is the barrier here.
+async fn run_until_retention_reported(sweep_on: bool) -> Vec<String> {
+    let inner = crate::test_support::ResolutionHarness::new().await;
+    let secrets = std::sync::Arc::new(crate::test_support::RecordingSecrets::default());
+    let id = inner
+        .declare_typed(
+            "api_token",
+            "cascading",
+            serde_json::json!(""),
+            crate::test_support::SECRET,
+            "secret",
+        )
+        .await;
+    seed_expired_stage(&inner, &secrets, id).await;
+    let gear = gear_with_writes(&inner, &secrets);
+    let (writes, db) = (gear.writes().expect("writes"), gear.db().expect("db"));
+    let barrier = std::sync::Arc::new(RetentionBarrier::default());
+    let loops = super::Loops::from_config(background(sweep_on, true, false));
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let running = tokio::spawn({
+        let (barrier, cancel) = (std::sync::Arc::clone(&barrier), cancel.clone());
+        async move {
+            SettingsService::tick_until_cancelled(
+                &writes,
+                &db,
+                std::time::Duration::from_hours(365 * 24),
+                barrier.as_ref(),
+                loops,
+                &cancel,
+            )
+            .await;
+        }
+    });
+    barrier.passed.notified().await;
+    cancel.cancel();
+    running.await.expect("the loop stops when cancelled");
+    secrets.held()
+}
+
+#[tokio::test]
+async fn a_loop_that_is_on_runs_its_pass_at_once_and_one_that_is_off_never_does() {
+    // Positive control: with the sweep on, its first tick released the stage
+    // before the retention barrier was reached.
+    assert!(
+        run_until_retention_reported(true).await.is_empty(),
+        "the sweep ran and released the abandoned stage"
+    );
+    // The same flow with the sweep off: the barrier is reached and the stage
+    // is untouched, so the loop did not run.
+    assert_eq!(
+        run_until_retention_reported(false).await,
+        vec!["abandoned-ref".to_owned()]
+    );
+}
+
+#[tokio::test]
+async fn with_every_loop_off_the_lifecycle_announces_readiness_and_stops_on_cancellation() {
+    let inner = crate::test_support::ResolutionHarness::new().await;
+    let secrets = std::sync::Arc::new(crate::test_support::RecordingSecrets::default());
+    let gear = gear_with_writes(&inner, &secrets);
+    let rebuilt = SettingsService::default();
+    rebuilt
+        .writes
+        .set(gear.writes().expect("writes"))
+        .map_err(|_| "set")
+        .expect("fresh");
+    rebuilt
+        .db
+        .set(gear.db().expect("db"))
+        .map_err(|_| "set")
+        .expect("fresh");
+    rebuilt
+        .config
+        .set(std::sync::Arc::new(
+            serde_json::from_value(serde_json::json!({
+                "background": {
+                    "pending_secret_sweep": false,
+                    "audit_retention": false,
+                    "needs_review_gauge": false,
+                }
+            }))
+            .expect("parses"),
+        ))
+        .map_err(|_| "set")
+        .expect("fresh");
+
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let serving = tokio::spawn(SettingsService::serve(
+        std::sync::Arc::new(rebuilt),
+        cancel.clone(),
+        toolkit::lifecycle::ReadySignal::from_sender(tx),
+    ));
+    rx.await.expect("readiness is still announced");
+    cancel.cancel();
+    serving
+        .await
+        .expect("the task joins")
+        .expect("and returns cleanly");
 }
 
 // ── Init, over a real context ────────────────────────────────────────────────
@@ -512,20 +667,94 @@ async fn init_refuses_to_start_without_the_registry_it_calls_during_init() {
     assert!(err.to_string().contains("types registry"), "got `{err}`");
 }
 
-#[tokio::test]
-async fn init_refuses_to_start_without_the_credential_store() {
-    // Secrets never live in this gear's rows, so a deployment without the store
-    // could accept a secret setting and have nowhere to put its value.
+fn hub_with_registry_only() -> Arc<ClientHub> {
     let hub = Arc::new(ClientHub::new());
     hub.register::<dyn types_registry_sdk::TypesRegistryClient>(Arc::new(
         types_registry_sdk::testing::MockTypesRegistryClient::new(),
     ));
-    let ctx = context_with(json!({}), hub).await;
-    let err = SettingsService::default()
-        .init(&ctx)
+    hub
+}
+
+fn secrets_configured(gear: &SettingsService) -> bool {
+    gear.writes()
+        .expect("writes")
+        .writer()
+        .secrets()
+        .is_configured()
+}
+
+#[tokio::test]
+async fn post_init_refuses_to_start_without_the_credential_store_unless_secret_storage_is_disabled()
+{
+    // `required` is the default: a host that lost its store fails at post_init
+    // instead of coming up healthy and refusing every secret. Init itself
+    // passes, because credstore may not have initialized yet.
+    let ctx = context_with(json!({}), hub_with_registry_only()).await;
+    let gear = SettingsService::default();
+    gear.init(&ctx)
         .await
-        .expect_err("no credential store");
-    assert!(err.to_string().contains("credstore"), "got `{err}`");
+        .expect("init does not look for the store");
+    let err = gear.post_init(&ctx).await.expect_err("no credential store");
+    assert!(err.to_string().contains("secret_storage"), "got `{err}`");
+}
+
+#[tokio::test]
+async fn a_credential_store_registered_between_init_and_post_init_is_found() {
+    // credstore is an application gear outside `deps`: it may initialize after
+    // this gear, and its client is in the hub by post_init.
+    let hub = hub_with_registry_only();
+    let ctx = context_with(json!({}), Arc::clone(&hub)).await;
+    let gear = SettingsService::default();
+    gear.init(&ctx).await.expect("init");
+    assert!(!secrets_configured(&gear), "not registered yet");
+
+    hub.register::<dyn credstore_sdk::CredStoreClientV1>(Arc::new(
+        credstore_sdk::test_util::MockCredStoreClient::empty(),
+    ));
+
+    gear.post_init(&ctx).await.expect("post_init");
+    assert!(secrets_configured(&gear));
+}
+
+#[tokio::test]
+async fn a_credential_store_registered_before_init_is_found_when_secret_storage_is_required() {
+    let ctx = context_with(json!({}), wired_hub()).await;
+    let gear = SettingsService::default();
+    gear.init(&ctx).await.expect("init");
+    gear.post_init(&ctx).await.expect("post_init");
+    assert!(secrets_configured(&gear));
+}
+
+#[tokio::test]
+async fn the_gear_starts_without_the_credential_store_when_secret_storage_is_disabled() {
+    let hub = hub_with_registry_only();
+    let ctx = context_with(json!({ "secret_storage": "disabled" }), Arc::clone(&hub)).await;
+    let gear = SettingsService::default();
+    gear.init(&ctx)
+        .await
+        .expect("init needs no credential store when it is disabled");
+    gear.post_init(&ctx)
+        .await
+        .expect("nor does post_init when it is disabled");
+    assert!(gear.writes().is_ok() && gear.resolver().is_ok());
+    assert!(!secrets_configured(&gear), "no store is bound");
+    assert!(
+        hub.get::<dyn settings_service_sdk::api::SettingsReaderClient>()
+            .is_ok(),
+        "the reader is bound all the same"
+    );
+}
+
+#[tokio::test]
+async fn a_registered_credential_store_is_not_used_when_secret_storage_is_disabled() {
+    let ctx = context_with(json!({ "secret_storage": "disabled" }), wired_hub()).await;
+    let gear = SettingsService::default();
+    gear.init(&ctx).await.expect("init");
+    gear.post_init(&ctx).await.expect("post_init");
+    assert!(
+        !secrets_configured(&gear),
+        "the store in the hub is left alone"
+    );
 }
 
 // ── The REST capability ──────────────────────────────────────────────────────
@@ -678,17 +907,17 @@ async fn a_retention_pass_prunes_what_is_past_its_horizon_and_nothing_younger() 
 
     let live = tokio_util::sync::CancellationToken::new();
     let quiet = RecordingLifecycleMetrics::default();
-    let batches = super::PruneBatches {
+    let batches = crate::infra::maintenance::PruneBatches {
         size: 1_000,
-        per_tick: 10,
+        max_batches: 10,
     };
     assert_eq!(
-        SettingsService::prune_once(&db, year, now, batches, &live, &quiet).await,
+        crate::infra::maintenance::prune_once(&db, year, now, batches, &live, &quiet).await,
         0,
         "a fresh record stays"
     );
     assert_eq!(
-        SettingsService::prune_once(
+        crate::infra::maintenance::prune_once(
             &db,
             year,
             now + time::Duration::days(400),
@@ -732,20 +961,20 @@ async fn a_retention_pass_works_in_batches_up_to_its_cap_and_stops_when_cancelle
     let quiet = RecordingLifecycleMetrics::default();
 
     // Batches of two, two batches a tick: four go now, the last one next tick.
-    let capped = super::PruneBatches {
+    let capped = crate::infra::maintenance::PruneBatches {
         size: 2,
-        per_tick: 2,
+        max_batches: 2,
     };
     assert_eq!(
-        SettingsService::prune_once(&db, year, later, capped, &live, &quiet).await,
+        crate::infra::maintenance::prune_once(&db, year, later, capped, &live, &quiet).await,
         4
     );
     assert_eq!(
-        SettingsService::prune_once(&db, year, later, capped, &live, &quiet).await,
+        crate::infra::maintenance::prune_once(&db, year, later, capped, &live, &quiet).await,
         1
     );
     assert_eq!(
-        SettingsService::prune_once(&db, year, later, capped, &live, &quiet).await,
+        crate::infra::maintenance::prune_once(&db, year, later, capped, &live, &quiet).await,
         0
     );
 
@@ -771,7 +1000,7 @@ async fn a_retention_pass_works_in_batches_up_to_its_cap_and_stops_when_cancelle
     let stopped = tokio_util::sync::CancellationToken::new();
     stopped.cancel();
     assert_eq!(
-        SettingsService::prune_once(&db, year, later, capped, &stopped, &quiet).await,
+        crate::infra::maintenance::prune_once(&db, year, later, capped, &stopped, &quiet).await,
         0
     );
 }
@@ -809,7 +1038,7 @@ async fn a_review_pass_counts_the_flagged_overrides_by_source_and_says_zero_wher
     h.set(d, h.tree.root, serde_json::json!(false)).await;
 
     let metrics = RecordingLifecycleMetrics::default();
-    SettingsService::review_once(&h.db, &metrics).await;
+    crate::infra::maintenance::review_once(&h.db, &metrics).await;
     assert_eq!(
         *metrics.review.lock().expect("lock"),
         vec![("admin_authored", 0), ("module_contributed", 2)],
@@ -854,7 +1083,7 @@ async fn a_review_pass_counts_the_flagged_overrides_by_source_and_says_zero_wher
     h.set_flagged(admin, h.tree.a, serde_json::json!("often"))
         .await;
     let metrics = RecordingLifecycleMetrics::default();
-    SettingsService::review_once(&h.db, &metrics).await;
+    crate::infra::maintenance::review_once(&h.db, &metrics).await;
     assert_eq!(
         *metrics.review.lock().expect("lock"),
         vec![("admin_authored", 1), ("module_contributed", 2)]
@@ -867,16 +1096,16 @@ async fn a_retention_pass_reports_its_outcome_so_a_failure_is_not_a_quiet_zero()
     // zero; only the metric tells them apart, which is what an alert needs.
     let year = std::time::Duration::from_hours(365 * 24);
     let live = tokio_util::sync::CancellationToken::new();
-    let batches = super::PruneBatches {
+    let batches = crate::infra::maintenance::PruneBatches {
         size: 10,
-        per_tick: 1,
+        max_batches: 1,
     };
     let now = time::OffsetDateTime::now_utc();
 
     let healthy = crate::test_support::sqlite_provider().await;
     let metrics = RecordingLifecycleMetrics::default();
     assert_eq!(
-        SettingsService::prune_once(&healthy, year, now, batches, &live, &metrics).await,
+        crate::infra::maintenance::prune_once(&healthy, year, now, batches, &live, &metrics).await,
         0
     );
 
@@ -894,7 +1123,7 @@ async fn a_retention_pass_reports_its_outcome_so_a_failure_is_not_a_quiet_zero()
         .expect("an empty database"),
     );
     assert_eq!(
-        SettingsService::prune_once(&broken, year, now, batches, &live, &metrics).await,
+        crate::infra::maintenance::prune_once(&broken, year, now, batches, &live, &metrics).await,
         0
     );
 
@@ -922,7 +1151,7 @@ async fn a_failed_review_pass_publishes_nothing_so_the_gauge_keeps_its_last_valu
         .expect("an empty database"),
     );
     let metrics = RecordingLifecycleMetrics::default();
-    SettingsService::review_once(&broken, &metrics).await;
+    crate::infra::maintenance::review_once(&broken, &metrics).await;
     assert!(metrics.review.lock().expect("lock").is_empty());
 }
 
@@ -934,9 +1163,9 @@ async fn a_retention_pass_writes_the_configured_retention_where_the_trigger_read
     let db = crate::test_support::sqlite_provider().await;
     let live = tokio_util::sync::CancellationToken::new();
     let quiet = RecordingLifecycleMetrics::default();
-    let batches = super::PruneBatches {
+    let batches = crate::infra::maintenance::PruneBatches {
         size: 10,
-        per_tick: 1,
+        max_batches: 1,
     };
     let now = time::OffsetDateTime::now_utc();
     let recorded = || async {
@@ -951,11 +1180,11 @@ async fn a_retention_pass_writes_the_configured_retention_where_the_trigger_read
     assert_eq!(recorded().await, Some(365), "seeded before the first pass");
 
     let two_years = std::time::Duration::from_hours(730 * 24);
-    SettingsService::prune_once(&db, two_years, now, batches, &live, &quiet).await;
+    crate::infra::maintenance::prune_once(&db, two_years, now, batches, &live, &quiet).await;
     assert_eq!(recorded().await, Some(730));
 
     // A changed configuration is carried by the next pass.
     let year = std::time::Duration::from_hours(400 * 24);
-    SettingsService::prune_once(&db, year, now, batches, &live, &quiet).await;
+    crate::infra::maintenance::prune_once(&db, year, now, batches, &live, &quiet).await;
     assert_eq!(recorded().await, Some(400));
 }

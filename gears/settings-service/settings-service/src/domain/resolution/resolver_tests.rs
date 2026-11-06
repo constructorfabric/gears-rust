@@ -1515,3 +1515,33 @@ async fn a_batch_asks_the_registry_once_per_distinct_value_type() {
     assert!(outcomes.iter().all(Result::is_ok), "{outcomes:?}");
     assert_eq!(counting.traits.load(std::sync::atomic::Ordering::SeqCst), 2);
 }
+
+#[tokio::test]
+async fn a_second_read_of_the_exposable_selection_does_not_reach_the_database() {
+    let (h, recorder) = Harness::recorded().await;
+    let id = h
+        .declare("banner", scope_class::CASCADING, json!(false))
+        .await;
+    h.expose(id).await;
+    let conn = h.db.conn().expect("connection");
+
+    let first = h
+        .resolver
+        .exposable_declarations(&conn)
+        .await
+        .expect("read");
+    assert_eq!(first.len(), 1);
+    recorder.clear();
+    let second = h
+        .resolver
+        .exposable_declarations(&conn)
+        .await
+        .expect("read");
+
+    assert_eq!(second.len(), 1);
+    assert!(
+        recorder.events().is_empty(),
+        "the warm selection issues no statement: {:?}",
+        recorder.events()
+    );
+}

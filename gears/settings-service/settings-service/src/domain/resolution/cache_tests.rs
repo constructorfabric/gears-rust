@@ -278,3 +278,55 @@ fn a_local_or_tenant_set_invalidation_also_drops_a_store_it_has_passed() {
         "and leaves another key's read standing"
     );
 }
+
+// ── The anonymous read's selection ───────────────────────────────────────────
+
+fn selection() -> Arc<[crate::domain::declaration::Declaration]> {
+    Arc::from(Vec::new())
+}
+
+#[test]
+fn a_stored_selection_is_returned() {
+    let cache = EffectiveCache::new(Duration::from_secs(30));
+    assert!(cache.exposable().is_none(), "nothing stored yet");
+    let seen = cache.exposable_generation();
+    assert!(cache.populate_exposable(selection(), seen));
+    assert!(cache.exposable().is_some());
+}
+
+#[test]
+fn a_declaration_change_drops_the_selection() {
+    let cache = EffectiveCache::new(Duration::from_secs(30));
+    let seen = cache.exposable_generation();
+    assert!(cache.populate_exposable(selection(), seen));
+
+    cache.invalidate_key("k");
+
+    assert!(cache.exposable().is_none());
+}
+
+#[test]
+fn a_selection_read_before_a_declaration_change_is_not_stored_after_it() {
+    let cache = EffectiveCache::new(Duration::from_secs(30));
+    let seen = cache.exposable_generation();
+
+    cache.invalidate_key("k");
+
+    assert!(!cache.populate_exposable(selection(), seen));
+    assert!(cache.exposable().is_none());
+}
+
+#[test]
+fn a_value_write_or_a_subtree_eviction_leaves_the_selection_alone() {
+    let cache = EffectiveCache::new(Duration::from_secs(30));
+    let tenant = Uuid::new_v4();
+    let seen = cache.exposable_generation();
+    assert!(cache.populate_exposable(selection(), seen));
+
+    cache.invalidate("k", scope_class::LOCAL, Some(tenant));
+    cache.invalidate_subtree(&[tenant]);
+    cache.invalidate_tenants("k", &[tenant]);
+
+    assert!(cache.exposable().is_some());
+    assert_eq!(cache.exposable_generation(), seen);
+}

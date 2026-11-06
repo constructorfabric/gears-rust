@@ -444,3 +444,66 @@ async fn a_down_store_answers_unavailable_without_the_stores_own_text() {
         err.wire_message()
     );
 }
+
+// ── The store is bound lazily: found in the hub, or explicitly disabled ──────
+
+#[tokio::test]
+async fn a_disabled_manager_refuses_every_operation_as_not_configured() {
+    let manager = CredStoreSecretManager::disabled();
+    let tenant = Uuid::new_v4();
+    let reference = manager.mint_reference(KEY, tenant);
+
+    assert!(!manager.is_configured());
+    let stored = manager
+        .store_secret(KEY, tenant, &reference, &json!("hunter2"))
+        .await
+        .expect_err("nothing to store in");
+    let resolved = manager
+        .resolve_plaintext(KEY, tenant, &reference)
+        .await
+        .expect_err("nothing to read from");
+    let released = manager
+        .delete_secret(KEY, tenant, &reference)
+        .await
+        .expect_err("nothing to release from");
+    for err in [stored, resolved, released] {
+        assert!(
+            matches!(err, DomainError::NotConfigured { .. }),
+            "not an outage: {err:?}"
+        );
+    }
+}
+
+#[test]
+fn a_manager_over_a_client_is_configured() {
+    let manager = CredStoreSecretManager::new(Arc::new(MemoryCredStore::default()));
+    assert!(manager.is_configured());
+}
+
+#[tokio::test]
+async fn a_manager_over_the_hub_finds_a_store_registered_after_it_was_built() {
+    let hub = Arc::new(toolkit::ClientHub::new());
+    let manager = CredStoreSecretManager::from_hub(Arc::clone(&hub));
+    let tenant = Uuid::new_v4();
+    let reference = manager.mint_reference(KEY, tenant);
+
+    assert!(!manager.is_configured(), "no store in the hub yet");
+    let err = manager
+        .store_secret(KEY, tenant, &reference, &json!("hunter2"))
+        .await
+        .expect_err("nothing to store in");
+    assert!(matches!(err, DomainError::NotConfigured { .. }), "{err:?}");
+
+    hub.register::<dyn CredStoreClientV1>(Arc::new(MemoryCredStore::default()));
+
+    assert!(manager.is_configured(), "the late registration is found");
+    manager
+        .store_secret(KEY, tenant, &reference, &json!("hunter2"))
+        .await
+        .expect("stored");
+    let back = manager
+        .resolve_plaintext(KEY, tenant, &reference)
+        .await
+        .expect("read back");
+    assert_eq!(back.expose_secret(), "hunter2");
+}

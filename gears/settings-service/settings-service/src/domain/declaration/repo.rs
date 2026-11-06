@@ -491,6 +491,17 @@ pub trait DeclarationRepository: Send + Sync {
         keys: &[String],
     ) -> Result<Vec<String>, DomainError>;
 
+    /// Every active declaration flagged `anonymous_exposable`, in key order:
+    /// the selection of the unauthenticated read surface and nothing else.
+    ///
+    /// # Errors
+    /// [`DomainError`] when the read fails.
+    async fn find_anonymous_exposable<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+    ) -> Result<Vec<Declaration>, DomainError>;
+
     /// The declarations with these ids, in one read.
     ///
     /// # Errors

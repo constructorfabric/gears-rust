@@ -527,7 +527,7 @@ pub fn render_flagged(
 pub struct SettingItemDto {
     /// The setting key.
     pub key: String,
-    /// `resolved`, `not_found`, `retired`, `unavailable` or `error`.
+    /// `resolved`, `not_found`, `retired`, `unavailable`, `not_configured` or `error`.
     pub outcome: String,
     /// The effective value, when `outcome` is `resolved`.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -582,6 +582,7 @@ impl SettingItemDto {
             DomainError::NotFound { .. } => "not_found",
             DomainError::Retired { .. } => "retired",
             DomainError::Unavailable { .. } => "unavailable",
+            DomainError::NotConfigured { .. } => "not_configured",
             _ => "error",
         };
         Self {
