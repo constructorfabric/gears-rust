@@ -5192,7 +5192,7 @@ startup in every host that links `cf-gears-bss-orders`.
 
 #### Traits, and versioning
 
-The SDK's `EventTraits` rejects unknown keys. The abstract Orders event declares the following
+The SDK's `EventV1Traits` rejects unknown keys. The abstract Orders event declares the following
 traits, and each concrete type's resolved schema **MUST** retain these values:
 
 ```json

@@ -34,7 +34,7 @@ toolkit-gts = { workspace = true }
 toolkit-canonical-errors = { workspace = true }
 toolkit-security = { workspace = true }
 
-# The broker's topic base type + derived event-type schema helper.
+# The broker's topic and generic event base types.
 event-broker-sdk = { workspace = true }
 
 [dev-dependencies]

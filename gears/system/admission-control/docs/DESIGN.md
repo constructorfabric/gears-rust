@@ -216,12 +216,18 @@ timeout and drops the call's future when it fires, so implementations must be ca
 refusal event type `gts.cf.core.events.event.v1~cf.core.admission_control.refusal.v1~` on topic
 `gts.cf.core.events.topic.v1~cf.core.admission_control.audit.v1`.
 
+The SDK declares `RefusalEventV1` with `#[gts_type_schema(base = EventV1, ..)]`; the macro contributes
+the refusal schema to the GTS inventory. `RefusalEvent` is the serialized payload model, and tests
+validate every payload shape against the resolved declaration. Unknown payload and nested policy fields
+are rejected; optional fields are omitted and do not accept explicit `null`.
+The `refusal_event_type_schema()` accessor returns the macro-generated event schema.
+
 **Refusal event** (`cpt-cf-admission-control-contract-refusal-event`): the broker envelope carries the correlation id as
 `subject` (subject type `gts.cf.core.admission_control.admission.v1~`), the resource tenant as `tenant_id`, the decision
 instant as `occurred_at`; `trace_parent` is not set yet. The payload (`data`) does not repeat them: `enforcing_gear`,
 `action`, `resource_type`, `resource_id?`, `subject_id`, `subject_tenant_id`, `enforced`, `cause` (`policy`,
 `request_too_large`, `invalid_request`, `could_not_run`), `condition?`, `policy?`,
-`property_names` (names only). The `data` schema is generated from the payload type. Counts: policy denial with N
+`property_names` (names only). The `data` schema is declared by `RefusalEventV1`. Counts: policy denial with N
 denials gives N events; too-large, invalid-request and could-not-run give 1; each shadow denial gives 1 with
 `enforced: false`; admissions give none.
 

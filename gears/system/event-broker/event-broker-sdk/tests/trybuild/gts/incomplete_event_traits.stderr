@@ -1,0 +1,33 @@
+error[E0599]: no method named `build` found for struct `EventV1TraitsBuilder` in the current scope
+ --> tests/trybuild/gts/incomplete_event_traits.rs:5:38
+  |
+5 |     let _ = EventV1Traits::builder().build();
+  |                                      ^^^^^ method not found in `EventV1TraitsBuilder`
+  |
+  = note: the method was found for `EventV1TraitsBuilder<TopicRef, Vec<SubjectTypeRef>>`
+
+error[E0599]: no method named `build` found for struct `EventV1TraitsBuilder<TopicRef>` in the current scope
+ --> tests/trybuild/gts/incomplete_event_traits.rs:9:10
+  |
+7 |       let _ = EventV1Traits::builder()
+  |  _____________-
+8 | |         .with_topic(gts_id!("cf.core.events.topic.v1~example.eb.generic.topic.v1"))
+9 | |         .build();
+  | |         -^^^^^ method not found in `EventV1TraitsBuilder<TopicRef>`
+  | |_________|
+  |
+  |
+  = note: the method was found for `EventV1TraitsBuilder<TopicRef, Vec<SubjectTypeRef>>`
+
+error[E0599]: no method named `build` found for struct `EventV1TraitsBuilder<(), Vec<SubjectTypeRef>>` in the current scope
+  --> tests/trybuild/gts/incomplete_event_traits.rs:13:10
+   |
+11 |       let _ = EventV1Traits::builder()
+   |  _____________-
+12 | |         .with_allowed_subject_types([gts_id!("*")])
+13 | |         .build();
+   | |         -^^^^^ method not found in `EventV1TraitsBuilder<(), Vec<SubjectTypeRef>>`
+   | |_________|
+   |
+   |
+   = note: the method was found for `EventV1TraitsBuilder<TopicRef, Vec<SubjectTypeRef>>`
