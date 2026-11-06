@@ -126,6 +126,11 @@ class CiVerdict(unittest.TestCase):
     def test_zero_runs(self):
         self.assertEqual(s.ci_verdict(ok_rollup(), [], 0, 60), "wait")
 
+    def test_full_rollup_page_may_be_truncated(self):
+        full = ok_rollup() * s.ROLLUP_PAGE_LIMIT
+        self.assertGreaterEqual(len(full), s.ROLLUP_PAGE_LIMIT)
+        self.assertEqual(verdict(rollup=full), "wait")
+
     def test_run_in_progress(self):
         self.assertEqual(verdict(runs=[{"status": "in_progress", "conclusion": None}]), "wait")
 

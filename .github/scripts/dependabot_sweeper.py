@@ -37,6 +37,9 @@ LIVE_REF = "refs/heads/main"
 REPO_RE = r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+"
 TITLE_MAX = 100
 REQUIRED_CHECKS = ("DCO", "SonarCloud Code Analysis")
+# `gh pr view --json statusCheckRollup` returns at most this many contexts and gives no
+# totalCount, so a list this long may be truncated and cannot be trusted as complete.
+ROLLUP_PAGE_LIMIT = 100
 MIN_HEAD_AGE_MINUTES = 30
 RUN_OK_CONCLUSIONS = {"success", "skipped", "neutral"}
 GH_ERRORS = (subprocess.CalledProcessError, subprocess.TimeoutExpired, json.JSONDecodeError)
@@ -149,6 +152,8 @@ def ci_verdict(rollup, workflow_runs, total_runs, head_age_min):
     Wait beats red, as in classify_checks; when in doubt, never green.
     """
     verdicts = [classify_checks(rollup)]
+    if rollup and len(rollup) >= ROLLUP_PAGE_LIMIT:
+        verdicts.append("wait")  # possibly truncated: an omitted failing context must not turn green
     for name in REQUIRED_CHECKS:
         found = [c for c in rollup or [] if _check_name(c) == name]
         verdicts.append(classify_checks(found))
