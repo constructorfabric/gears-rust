@@ -665,9 +665,15 @@ impl Service {
             Mode::Sync => &self.inflight_sync,
             Mode::Stream => &self.inflight_streams,
         };
-        Arc::clone(pool)
+        let slot = Arc::clone(pool)
             .try_acquire_owned()
-            .map_err(|_| LlmGatewayError::GatewayUnavailable)
+            .map_err(|_| LlmGatewayError::GatewayUnavailable)?;
+        // The stop may have begun while the PEP call was pending: a request
+        // that only now gets its slot is not accepted (the slot drops here).
+        if self.shutdown.is_begun() {
+            return Err(LlmGatewayError::GatewayUnavailable);
+        }
+        Ok(slot)
     }
 
     /// Shared model resolution and plugin selection.

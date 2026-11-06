@@ -628,3 +628,41 @@ async fn the_reporter_waits_for_the_cut_requests_and_then_drains_their_usage() {
             .all(|c| c.at - stopped >= cut_after())
     );
 }
+
+// ── a stop that begins during the PEP call ──────────────────────────────────
+
+#[tokio::test(start_paused = true)]
+async fn a_stop_that_begins_during_the_pep_call_is_not_accepted() {
+    for mode in ["sync", "stream", "embeddings"] {
+        let mut h = Harness::new();
+        match mode {
+            "stream" => h.enable_streaming(),
+            "embeddings" => h.enable_embeddings(),
+            _ => {}
+        }
+        h.pdp.begin_on_evaluate(h.shutdown.clone());
+        let service = h.service();
+        let err = match mode {
+            "sync" => service
+                .create_response(&ctx(), body(MODEL))
+                .await
+                .expect_err(mode),
+            "stream" => service
+                .create_response_stream(&ctx(), body(MODEL))
+                .await
+                .err()
+                .expect(mode),
+            _ => service
+                .create_embedding(&ctx(), embedding_request())
+                .await
+                .map(|_| ())
+                .expect_err(mode),
+        };
+        assert_gateway_unavailable(&err);
+        assert_eq!(h.pdp.calls(), 1, "{mode}: authorized once");
+        assert_eq!(h.models.calls(), 0, "{mode}: not accepted after the PEP");
+        assert_eq!(h.plugin.calls(), 0, "{mode}");
+        // The slot taken after the stop began was given back.
+        service.quiescent().await;
+    }
+}

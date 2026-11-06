@@ -376,6 +376,9 @@ pub struct FakePdp {
     calls: AtomicUsize,
     log: Arc<CallLog>,
     last_request: Mutex<Option<EvaluationRequest>>,
+    /// Begun by the next `evaluate` call (a stop that starts while the PEP
+    /// call is pending).
+    begin_on_evaluate: Mutex<Option<ShutdownSignal>>,
 }
 
 impl FakePdp {
@@ -387,7 +390,13 @@ impl FakePdp {
             calls: AtomicUsize::new(0),
             log,
             last_request: Mutex::new(None),
+            begin_on_evaluate: Mutex::new(None),
         })
+    }
+
+    /// Begin `shutdown` when the next `evaluate` call runs.
+    pub fn begin_on_evaluate(&self, shutdown: ShutdownSignal) {
+        *self.begin_on_evaluate.lock().expect("shutdown") = Some(shutdown);
     }
 
     /// Number of `evaluate` calls.
@@ -419,6 +428,10 @@ impl AuthZResolverApi for FakePdp {
             .and_then(serde_json::Value::as_str)
             .map_or_else(|| Uuid::from_u128(2).to_string(), ToOwned::to_owned);
         *self.last_request.lock().expect("pdp request") = Some(request);
+        let begin = self.begin_on_evaluate.lock().expect("shutdown").take();
+        if let Some(shutdown) = begin {
+            shutdown.begin();
+        }
         match self.mode {
             PdpMode::Permit => Ok(EvaluationResponse {
                 decision: true,
