@@ -1,0 +1,70 @@
+[package]
+name = "cf-gears-task-engine-sdk"
+description = "SDK for the Task Engine gear: TaskEngineApi contract, REST projection, models and errors"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+readme = "README.md"
+keywords = ["constructorfabric", "cf-gears", "task-engine"]
+categories = ["asynchronous"]
+# Draft contract for the p1 design (gears/task-engine/docs/openapi.yaml); not
+# published until the gear that serves it exists.
+publish = false
+
+[package.metadata.docs.rs]
+all-features = true
+
+[lib]
+name = "task_engine_sdk"
+
+[features]
+default = []
+# Generated REST clients: `TaskEngineApiRestClient` and the directory-resolving
+# `TaskEngineApiRestResolvingClient`.
+rest-client = ["toolkit-contract/rest-client", "dep:toolkit-http", "dep:secrecy"]
+# OpenTelemetry in the generated clients (traceparent propagation + RED metrics).
+otel = ["rest-client", "toolkit-contract/otel"]
+# Generated server route registration (`register_task_engine_api_rest_routes`)
+# for every method that is not `#[server_manual]`.
+rest-server = ["toolkit-contract/rest-server", "dep:axum", "dep:http"]
+
+# `#[toolkit::contract]` puts `#[::async_trait::async_trait]` on the trait it
+# generates, so this crate needs `async-trait` in every feature set. cargo-shear
+# misses it because `--expand` expands that attribute away before it scans.
+[package.metadata.cargo-shear]
+ignored = ["async-trait"]
+
+[lints]
+workspace = true
+
+[dependencies]
+toolkit.workspace = true
+toolkit-contract.workspace = true
+toolkit-canonical-errors.workspace = true
+toolkit-canonical-errors-macro.workspace = true
+toolkit-security.workspace = true
+async-trait.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+schemars.workspace = true
+utoipa = { workspace = true, features = ["uuid", "chrono"] }
+uuid = { workspace = true, features = ["serde"] }
+# Typed GTS identifiers (`GtsTypeId`, `GtsInstanceId`) in the models.
+gts.workspace = true
+# `gts_id!` for the constants in `src/gts.rs`.
+toolkit-gts.workspace = true
+chrono = { workspace = true, features = ["serde"] }
+
+# Direct deps the macro emits into the generated REST client.
+toolkit-http = { workspace = true, optional = true }
+secrecy = { workspace = true, optional = true }
+
+# Direct deps the macro emits into generated server route registration.
+axum = { workspace = true, optional = true }
+http = { workspace = true, optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }

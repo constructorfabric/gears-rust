@@ -4513,6 +4513,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "cf-gears-task-engine-sdk"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "cf-gears-toolkit",
+ "cf-gears-toolkit-canonical-errors",
+ "cf-gears-toolkit-canonical-errors-macro",
+ "cf-gears-toolkit-contract",
+ "cf-gears-toolkit-gts",
+ "cf-gears-toolkit-http",
+ "cf-gears-toolkit-security",
+ "chrono",
+ "gts",
+ "http",
+ "schemars 1.2.3",
+ "secrecy",
+ "serde",
+ "serde_json",
+ "tokio",
+ "utoipa",
+ "uuid",
+]
+
+[[package]]
 name = "cf-gears-tenant-resolver"
 version = "0.1.44"
 dependencies = [
