@@ -19,7 +19,7 @@ use crate::test_support::{AllowResolver, DenyResolver, context_of};
 
 fn router(chain: &Chain, resolver: Arc<dyn AuthZResolverApi>, caller: Uuid) -> Router {
     let manage = ManageFacts::new(
-        chain.processing(),
+        Arc::new(chain.processing()),
         PolicyEnforcer::new(resolver),
         Duration::from_secs(20),
     );
@@ -184,4 +184,74 @@ async fn an_unreachable_profile_answers_unavailable() {
     .await;
 
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[tokio::test]
+async fn every_answer_of_the_route_is_no_store_with_the_security_headers() {
+    let chain = Chain::new(adding_rust(1), &[Ok(Written::Stored)]);
+
+    for (resolver, expected) in [
+        (
+            Arc::new(AllowResolver) as Arc<dyn AuthZResolverApi>,
+            StatusCode::OK,
+        ),
+        (Arc::new(DenyResolver) as _, StatusCode::NOT_FOUND),
+    ] {
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri(format!("/construct/v1/subjects/{SUBJECT}/facts/manage"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(said("I also know Rust.").to_string()))
+            .expect("a request");
+        let response = router(&chain, resolver, SUBJECT)
+            .oneshot(request)
+            .await
+            .expect("a response");
+
+        assert_eq!(response.status(), expected);
+        for (name, value) in [
+            (header::CACHE_CONTROL, "no-store"),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+            (header::X_FRAME_OPTIONS, "DENY"),
+            (
+                header::CONTENT_SECURITY_POLICY,
+                "default-src 'none'; frame-ancestors 'none'",
+            ),
+        ] {
+            assert_eq!(
+                response.headers().get(&name).and_then(|v| v.to_str().ok()),
+                Some(value),
+                "{name} on {expected}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn the_route_asks_the_policy_service_for_manage_on_the_subject_facts() {
+    let chain = Chain::new(adding_rust(1), &[Ok(Written::Stored)]);
+    let resolver = Arc::new(crate::test_support::RecordingResolver::default());
+
+    let (status, body) = post(
+        router(&chain, Arc::clone(&resolver) as _, SUBJECT),
+        SUBJECT,
+        &said("I also know Rust."),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let asked: Vec<(String, String)> = resolver
+        .asked
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(resource, action, ..)| (resource.clone(), action.clone()))
+        .collect();
+    assert_eq!(
+        asked,
+        [(
+            "gts.cf.construct.subject.facts.v1~".to_owned(),
+            "manage".to_owned()
+        )]
+    );
 }

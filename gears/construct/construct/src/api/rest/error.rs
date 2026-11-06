@@ -63,6 +63,10 @@ fn log_out_of_scope(refused: &SettingsOutOfScope) {
     );
 }
 
+/// Errors about a subject's profile.
+#[resource_error(gts_id!("cf.construct.subject.profile.v1~"))]
+pub struct ProfileError;
+
 /// Errors about a subject's settings.
 #[resource_error(gts_id!("cf.construct.subject.settings.v1~"))]
 pub struct SubjectSettingsError;
@@ -74,6 +78,10 @@ pub struct SubjectSettingsError;
 ///
 /// @cpt-dod:cpt-cf-construct-dod-subject-settings-routes:p1
 #[must_use]
+#[expect(
+    clippy::cognitive_complexity,
+    reason = "flat match on the domain enum; the tracing macros count toward the complexity"
+)]
 pub fn for_settings(e: DomainError) -> CanonicalError {
     match e {
         // @cpt-begin:cpt-cf-construct-algo-subject-settings-owner-only:p1:inst-owner-refuse-return
@@ -91,11 +99,24 @@ pub fn for_settings(e: DomainError) -> CanonicalError {
                 .with_reason("ACCESS_DENIED")
                 .create()
         }
+        // Answered on the settings resource, not as a profile's.
+        DomainError::NotVisible(msg) => {
+            tracing::warn!(msg = %msg, "construct subject settings not visible");
+            SubjectSettingsError::not_found("no such subject")
+                .with_resource("subject")
+                .create()
+        }
+        DomainError::NotConfigured(msg) => {
+            tracing::error!(msg = %msg, "construct is not configured for this call");
+            SubjectSettingsError::unimplemented("this deployment does not provide this call")
+                .create()
+        }
         // The settings routes refuse no record; a refusal here is mapped like
         // any other error.
         e @ (DomainError::Refused(_)
         | DomainError::Unavailable(_)
         | DomainError::Internal(_)
+        | DomainError::ProfileFull(_)
         | DomainError::Database(_)) => e.into(),
     }
 }
@@ -118,6 +139,10 @@ pub fn too_long(field: &str, limit: usize) -> CanonicalError {
 ///
 /// @cpt-dod:cpt-cf-construct-dod-planner-manage-route:p1
 #[must_use]
+#[expect(
+    clippy::cognitive_complexity,
+    reason = "flat match on the domain enum; the tracing macros count toward the complexity"
+)]
 pub fn for_facts(e: DomainError, subject_id: Uuid) -> CanonicalError {
     match e {
         DomainError::Forbidden(msg) => {
@@ -132,9 +157,21 @@ pub fn for_facts(e: DomainError, subject_id: Uuid) -> CanonicalError {
                 .with_resource(subject_id.to_string())
                 .create()
         }
+        // Answered on the subject facts resource, not as a profile's.
+        DomainError::NotVisible(msg) => {
+            tracing::warn!(msg = %msg, "construct subject facts not visible");
+            SubjectFactsError::not_found("no such subject")
+                .with_resource(subject_id.to_string())
+                .create()
+        }
+        DomainError::NotConfigured(msg) => {
+            tracing::error!(msg = %msg, "construct is not configured for this call");
+            SubjectFactsError::unimplemented("this deployment does not provide this call").create()
+        }
         e @ (DomainError::Refused(_)
         | DomainError::Unavailable(_)
         | DomainError::Internal(_)
+        | DomainError::ProfileFull(_)
         | DomainError::Database(_)) => e.into(),
     }
 }
@@ -164,6 +201,16 @@ impl From<DomainError> for CanonicalError {
             }
             // @cpt-end:cpt-cf-construct-algo-gear-foundation-map-errors:p1:inst-map-forbidden-return
             // @cpt-end:cpt-cf-construct-algo-gear-foundation-map-errors:p1:inst-map-forbidden
+            // @cpt-begin:cpt-cf-construct-algo-profile-reader-read:p1:inst-read-hide
+            // A subject the caller may not see is answered like one that does
+            // not exist, on every transport.
+            DomainError::NotVisible(msg) => {
+                tracing::warn!(msg = %msg, "construct profile read refused");
+                ProfileError::not_found("no such subject")
+                    .with_resource("subject")
+                    .create()
+            }
+            // @cpt-end:cpt-cf-construct-algo-profile-reader-read:p1:inst-read-hide
             // @cpt-begin:cpt-cf-construct-algo-gear-foundation-map-errors:p1:inst-map-unavailable
             // @cpt-begin:cpt-cf-construct-algo-gear-foundation-map-errors:p1:inst-map-unavailable-return
             DomainError::Unavailable(msg) => {
@@ -172,6 +219,31 @@ impl From<DomainError> for CanonicalError {
             }
             // @cpt-end:cpt-cf-construct-algo-gear-foundation-map-errors:p1:inst-map-unavailable-return
             // @cpt-end:cpt-cf-construct-algo-gear-foundation-map-errors:p1:inst-map-unavailable
+            // A deployment without what the call needs answers 501, which a
+            // caller does not retry, and the operator sees an error.
+            DomainError::NotConfigured(msg) => {
+                tracing::error!(msg = %msg, "construct is not configured for this call");
+                ProfileError::unimplemented("this deployment does not provide this call").create()
+            }
+            // A full profile takes no new fact until facts are removed: the
+            // caller's state, not the gear's failure. The subject stays in the
+            // log, out of the answer.
+            DomainError::ProfileFull(full) => {
+                tracing::warn!(
+                    tenant_id = %full.subject.tenant_id,
+                    subject_id = %full.subject.subject_id,
+                    facts = %full.facts,
+                    limit = full.limit,
+                    "construct profile full"
+                );
+                ProfileError::failed_precondition()
+                    .with_precondition_violation(
+                        "profile",
+                        "the profile holds the most facts it may; remove facts to add new ones",
+                        "PROFILE_FULL",
+                    )
+                    .create()
+            }
             // @cpt-begin:cpt-cf-construct-algo-gear-foundation-map-errors:p1:inst-map-internal
             // @cpt-begin:cpt-cf-construct-algo-gear-foundation-map-errors:p1:inst-map-internal-return
             DomainError::Internal(msg) => {

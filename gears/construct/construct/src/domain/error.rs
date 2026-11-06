@@ -2,6 +2,7 @@ use toolkit_canonical_errors::CanonicalError;
 use toolkit_db::DbError;
 use toolkit_macros::domain_model;
 
+use super::profile::FullProfile;
 use super::refusal::Refusal;
 use super::settings_scope::SettingsOutOfScope;
 
@@ -20,11 +21,27 @@ pub enum DomainError {
     #[error("Access forbidden: {0}")]
     OutOfScope(SettingsOutOfScope),
 
+    /// The caller may not see the resource. Answered like a resource that
+    /// does not exist, so the answer tells nothing about what exists.
+    #[error("Not visible: {0}")]
+    NotVisible(String),
+
     #[error("Service unavailable: {0}")]
     Unavailable(String),
 
+    /// The deployment does not configure what the call needs, such as the
+    /// processing identity. Not cured by a retry, so it is not `Unavailable`.
+    #[error("Not configured: {0}")]
+    NotConfigured(String),
+
     #[error("Internal error: {0}")]
     Internal(String),
+
+    /// The subject's profile holds as many facts as one read takes: it takes
+    /// no new fact, and a profile past that cannot be read whole. Not a
+    /// defect, and not cured by a retry.
+    #[error("Profile full: {0}")]
+    ProfileFull(FullProfile),
 
     #[error("Database error: {0}")]
     Database(#[from] DbError),
