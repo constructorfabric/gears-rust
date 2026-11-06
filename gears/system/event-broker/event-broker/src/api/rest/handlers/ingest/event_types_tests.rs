@@ -19,72 +19,31 @@ use std::collections::BTreeSet;
 
 use crate::test_support::{EventBrokerHarness, StaticTypesRegistry};
 use event_broker_sdk::gts::EventV1;
-use toolkit_gts::gts_type_schema;
 
-#[gts_type_schema(
-    dir_path = "schemas",
-    base = EventV1,
-    type_id = gts_id!("cf.core.events.event.v1~x.eb.t1.a.v1~"),
-    description = "Event type A",
-    properties = "",
-    traits = serde_json::json!({
-        "topic": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
-    }),
-)]
-#[schemars(extend("additionalProperties" = true))]
-struct AV1;
+crate::fixture_event_type!(
+    AV1 = "cf.core.events.event.v1~x.eb.t1.a.v1~",
+    topic = "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
+);
 
-#[gts_type_schema(
-    dir_path = "schemas",
-    base = EventV1,
-    type_id = gts_id!("cf.core.events.event.v1~x.eb.t2.b.v1~"),
-    description = "Event type B",
-    properties = "",
-    traits = serde_json::json!({
-        "topic": "gts.cf.core.events.topic.v1~x.eb.t2.topic.v1",
-    }),
-)]
-#[schemars(extend("additionalProperties" = true))]
-struct BV1;
+crate::fixture_event_type!(
+    BV1 = "cf.core.events.event.v1~x.eb.t2.b.v1~",
+    topic = "gts.cf.core.events.topic.v1~x.eb.t2.topic.v1",
+);
 
-#[gts_type_schema(
-    dir_path = "schemas",
-    base = EventV1,
-    type_id = gts_id!("cf.core.events.event.v1~x.eb.t1.type0.v1~"),
-    description = "An event type this test publishes.",
-    properties = "",
-    traits = serde_json::json!({
-        "topic": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
-    }),
-)]
-#[schemars(extend("additionalProperties" = true))]
-struct Type0V1;
+crate::fixture_event_type!(
+    Type0V1 = "cf.core.events.event.v1~x.eb.t1.type0.v1~",
+    topic = "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
+);
 
-#[gts_type_schema(
-    dir_path = "schemas",
-    base = EventV1,
-    type_id = gts_id!("cf.core.events.event.v1~x.eb.t1.type1.v1~"),
-    description = "An event type this test publishes.",
-    properties = "",
-    traits = serde_json::json!({
-        "topic": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
-    }),
-)]
-#[schemars(extend("additionalProperties" = true))]
-struct Type1V1;
+crate::fixture_event_type!(
+    Type1V1 = "cf.core.events.event.v1~x.eb.t1.type1.v1~",
+    topic = "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
+);
 
-#[gts_type_schema(
-    dir_path = "schemas",
-    base = EventV1,
-    type_id = gts_id!("cf.core.events.event.v1~x.eb.t1.type2.v1~"),
-    description = "An event type this test publishes.",
-    properties = "",
-    traits = serde_json::json!({
-        "topic": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
-    }),
-)]
-#[schemars(extend("additionalProperties" = true))]
-struct Type2V1;
+crate::fixture_event_type!(
+    Type2V1 = "cf.core.events.event.v1~x.eb.t1.type2.v1~",
+    topic = "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
+);
 
 /// The payload contract an event type serves: the base event's `data` member -
 /// as the SDK generates it - composed with the member the type declares.
@@ -126,7 +85,7 @@ async fn list_event_types_happy_path_returns_all_seeded_types() {
                 {
                     "id": "gts.cf.core.events.event.v1~x.eb.t1.a.v1~",
                     "topic": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
-                    "description": "Event type A",
+                    "description": <AV1 as gts::GtsSchema>::gts_schema_with_refs()["description"],
                     "allowed_subject_types": [],
                     "partition_key": "/tenant_id",
                     "data_schema": data_contract_of::<AV1>(),
@@ -134,7 +93,7 @@ async fn list_event_types_happy_path_returns_all_seeded_types() {
                 {
                     "id": "gts.cf.core.events.event.v1~x.eb.t2.b.v1~",
                     "topic": "gts.cf.core.events.topic.v1~x.eb.t2.topic.v1",
-                    "description": "Event type B",
+                    "description": <BV1 as gts::GtsSchema>::gts_schema_with_refs()["description"],
                     "allowed_subject_types": [],
                     "partition_key": "/tenant_id",
                     "data_schema": data_contract_of::<BV1>(),
@@ -176,7 +135,7 @@ async fn list_event_types_filters_by_id() {
             "items": [{
                 "id": "gts.cf.core.events.event.v1~x.eb.t1.a.v1~",
                 "topic": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
-                "description": "Event type A",
+                "description": <AV1 as gts::GtsSchema>::gts_schema_with_refs()["description"],
                 "allowed_subject_types": [],
                 "partition_key": "/tenant_id",
                 "data_schema": data_contract_of::<AV1>(),
@@ -217,7 +176,7 @@ async fn list_event_types_filters_by_topic() {
             "items": [{
                 "id": "gts.cf.core.events.event.v1~x.eb.t2.b.v1~",
                 "topic": "gts.cf.core.events.topic.v1~x.eb.t2.topic.v1",
-                "description": "Event type B",
+                "description": <BV1 as gts::GtsSchema>::gts_schema_with_refs()["description"],
                 "allowed_subject_types": [],
                 "partition_key": "/tenant_id",
                 "data_schema": data_contract_of::<BV1>(),

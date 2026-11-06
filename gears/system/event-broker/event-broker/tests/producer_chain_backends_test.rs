@@ -26,7 +26,6 @@ use std::time::Duration;
 use event_broker::test_support::{EventBrokerHarness, Json, PausePoint, StaticTypesRegistry};
 use event_broker_sdk::gts::EventV1;
 use serde_json::json;
-use toolkit_gts::gts_type_schema;
 
 use support::matrix::{Engine, Matrix};
 use support::stored::stored_ids;
@@ -35,20 +34,12 @@ const TOPIC: &str = "gts.cf.core.events.topic.v1~x.eb.chain.orders.v1";
 const EVENT_TYPE: &str = "gts.cf.core.events.event.v1~x.eb.chain.placed.v1~";
 const SUBJECT_TYPE: &str = "gts.x.eb.chain.order.v1~";
 
-/// Any object payload: an open type with no declared members.
-#[gts_type_schema(
-    dir_path = "schemas",
-    base = EventV1,
-    type_id = gts_id!("cf.core.events.event.v1~x.eb.chain.placed.v1~"),
-    description = "An event type admitting any object payload.",
-    properties = "",
-    traits = json!({
-        "topic": TOPIC,
-        "allowed_subject_types": [SUBJECT_TYPE],
-    }),
-)]
-#[schemars(extend("additionalProperties" = true))]
-struct PlacedV1;
+event_broker::fixture_event_type!(
+    /// Any object payload: an open type with no declared members.
+    PlacedV1 = "cf.core.events.event.v1~x.eb.chain.placed.v1~",
+    topic = TOPIC,
+    subjects = [SUBJECT_TYPE],
+);
 
 /// Concurrent copies of one chain step.
 const COPIES: usize = 8;

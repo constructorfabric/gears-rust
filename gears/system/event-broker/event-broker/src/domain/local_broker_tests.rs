@@ -3,7 +3,7 @@
 
 use chrono::{DateTime, Utc};
 use serde_json::json;
-use toolkit_gts::{GtsSchema, gts_id, gts_type_schema};
+use toolkit_gts::{GtsSchema, gts_id};
 use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
@@ -19,19 +19,11 @@ const EVENT_TYPE: &str = <CreatedV1 as GtsSchema>::TYPE_ID;
 const SUBJECT_TYPE: &str = gts_id!("cf.core.events.subject.v1~example.eb.local_broker.order.v1~");
 const TENANT: Uuid = Uuid::from_u128(1);
 
-#[gts_type_schema(
-    dir_path = "schemas",
-    base = EventV1,
-    type_id = gts_id!("cf.core.events.event.v1~example.eb.local_broker.created.v1~"),
-    description = "An order was created.",
-    properties = "",
-    traits = serde_json::json!({
-        "topic": TOPIC,
-        "allowed_subject_types": [SUBJECT_TYPE],
-    }),
-)]
-#[schemars(extend("additionalProperties" = true))]
-struct CreatedV1;
+crate::fixture_event_type!(
+    CreatedV1 = "cf.core.events.event.v1~example.eb.local_broker.created.v1~",
+    topic = TOPIC,
+    subjects = [SUBJECT_TYPE],
+);
 
 async fn harness() -> EventBrokerHarness {
     EventBrokerHarness::builder()

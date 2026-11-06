@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use event_broker_sdk::gts::EventV1;
 use serde_json::json;
-use toolkit_gts::{GtsInstanceId, GtsSchema, gts_type_schema};
+use toolkit_gts::{GtsInstanceId, GtsSchema};
 use uuid::Uuid;
 
 use crate::domain::model::Assignment;
@@ -21,19 +21,11 @@ use crate::test_support::{EventBrokerHarness, Json, StaticTypesRegistry};
 
 const TOPIC: &str = "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1";
 
-#[gts_type_schema(
-    dir_path = "schemas",
-    base = EventV1,
-    type_id = gts_id!("cf.core.events.event.v1~x.eb.t1.foo.v1~"),
-    description = "An event type this test publishes.",
-    properties = "",
-    traits = serde_json::json!({
-        "topic": TOPIC,
-        "allowed_subject_types": ["gts.x.eb.t1.subject.v1~"],
-    }),
-)]
-#[schemars(extend("additionalProperties" = true))]
-struct FooV1;
+crate::fixture_event_type!(
+    FooV1 = "cf.core.events.event.v1~x.eb.t1.foo.v1~",
+    topic = TOPIC,
+    subjects = ["gts.x.eb.t1.subject.v1~"],
+);
 
 const EVENT_TYPE: &str = <FooV1 as GtsSchema>::TYPE_ID;
 

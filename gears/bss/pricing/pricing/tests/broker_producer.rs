@@ -32,52 +32,46 @@ const DECIDED: &str = "gts.cf.core.events.event.v1~cf.bss.pricing.approval_unit_
 /// assumes when it declares none.
 const PARTITIONS: u32 = 8;
 
-/// Declares one pricing event type, on pricing's topic with its subject type, over any object
-/// payload (an open, body-less type): the broker is what these tests exercise, not the payloads.
-/// The ids repeat the `TypedEvent` constants, and a publish under a mismatched id fails at the
-/// broker.
-macro_rules! declare_event_type {
-    ($name:ident, $id:literal, $subject:literal) => {
-        #[toolkit_gts::gts_type_schema(
-                            dir_path = "schemas",
-                            base = EventV1,
-                            type_id = toolkit_gts::gts_id!($id),
-                            description = "A pricing event type, as the broker's tests know it",
-                            properties = "",
-                            traits = serde_json::json!({
-                                "topic": TOPIC,
-                                "allowed_subject_types": [toolkit_gts::gts_id!($subject)],
-                            }),
-                        )]
-        #[schemars(extend("additionalProperties" = true))]
-        struct $name;
-    };
-}
+// Fixture event types over any object payload: the broker is what these tests exercise, not the
+// payloads. The ids repeat the `TypedEvent` constants, and a publish under a mismatched id fails at
+// the broker.
 
-declare_event_type!(
-    PriceBookEntryReferenceLostTypeV1,
-    "cf.core.events.event.v1~cf.bss.pricing.price_book_entry_reference_lost.v1~",
-    "cf.core.events.subject.v1~cf.bss.pricing.price_book_entry.v1~"
+event_broker::fixture_event_type!(
+    PriceBookEntryReferenceLostTypeV1 =
+        "cf.core.events.event.v1~cf.bss.pricing.price_book_entry_reference_lost.v1~",
+    topic = TOPIC,
+    subjects = [toolkit_gts::gts_id!(
+        "cf.core.events.subject.v1~cf.bss.pricing.price_book_entry.v1~"
+    )],
 );
-declare_event_type!(
-    PlanReferenceLostTypeV1,
-    "cf.core.events.event.v1~cf.bss.pricing.plan_reference_lost.v1~",
-    "cf.core.events.subject.v1~cf.bss.pricing.plan_item.v1~"
+event_broker::fixture_event_type!(
+    PlanReferenceLostTypeV1 = "cf.core.events.event.v1~cf.bss.pricing.plan_reference_lost.v1~",
+    topic = TOPIC,
+    subjects = [toolkit_gts::gts_id!(
+        "cf.core.events.subject.v1~cf.bss.pricing.plan_item.v1~"
+    )],
 );
-declare_event_type!(
-    PricesPublishedTypeV1,
-    "cf.core.events.event.v1~cf.bss.pricing.prices_published.v1~",
-    "cf.core.events.subject.v1~cf.bss.pricing.price_book.v1~"
+event_broker::fixture_event_type!(
+    PricesPublishedTypeV1 = "cf.core.events.event.v1~cf.bss.pricing.prices_published.v1~",
+    topic = TOPIC,
+    subjects = [toolkit_gts::gts_id!(
+        "cf.core.events.subject.v1~cf.bss.pricing.price_book.v1~"
+    )],
 );
-declare_event_type!(
-    PlanRevisionPublishedTypeV1,
-    "cf.core.events.event.v1~cf.bss.pricing.plan_revision_published.v1~",
-    "cf.core.events.subject.v1~cf.bss.pricing.plan.v1~"
+event_broker::fixture_event_type!(
+    PlanRevisionPublishedTypeV1 =
+        "cf.core.events.event.v1~cf.bss.pricing.plan_revision_published.v1~",
+    topic = TOPIC,
+    subjects = [toolkit_gts::gts_id!(
+        "cf.core.events.subject.v1~cf.bss.pricing.plan.v1~"
+    )],
 );
-declare_event_type!(
-    ApprovalUnitDecidedTypeV1,
-    "cf.core.events.event.v1~cf.bss.pricing.approval_unit_decided.v1~",
-    "cf.core.events.subject.v1~cf.bss.pricing.approval_unit.v1~"
+event_broker::fixture_event_type!(
+    ApprovalUnitDecidedTypeV1 = "cf.core.events.event.v1~cf.bss.pricing.approval_unit_decided.v1~",
+    topic = TOPIC,
+    subjects = [toolkit_gts::gts_id!(
+        "cf.core.events.subject.v1~cf.bss.pricing.approval_unit.v1~"
+    )],
 );
 
 /// Adds one declared event type to a registry fixture.

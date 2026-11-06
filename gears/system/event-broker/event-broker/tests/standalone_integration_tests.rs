@@ -17,53 +17,29 @@ use std::time::Duration;
 
 use event_broker_sdk::gts::EventV1;
 use serde_json::json;
-use toolkit_gts::{GtsSchema, gts_type_schema};
+use toolkit_gts::GtsSchema;
 use uuid::Uuid;
 
-/// Any object payload: an open type with no declared members.
-#[gts_type_schema(
-    dir_path = "schemas",
-    base = EventV1,
-    type_id = gts_id!("cf.core.events.event.v1~x.eb.t10.foo.v1~"),
-    description = "An event type admitting any object payload.",
-    properties = "",
-    traits = json!({
-        "topic": "gts.cf.core.events.topic.v1~x.eb.t10.topic.v1",
-        "allowed_subject_types": ["gts.x.eb.t10.subject.v1~"],
-    }),
-)]
-#[schemars(extend("additionalProperties" = true))]
-struct FooT10V1;
+event_broker::fixture_event_type!(
+    /// Any object payload: an open type with no declared members.
+    FooT10V1 = "cf.core.events.event.v1~x.eb.t10.foo.v1~",
+    topic = "gts.cf.core.events.topic.v1~x.eb.t10.topic.v1",
+    subjects = ["gts.x.eb.t10.subject.v1~"],
+);
 
-/// Any object payload: an open type with no declared members.
-#[gts_type_schema(
-    dir_path = "schemas",
-    base = EventV1,
-    type_id = gts_id!("cf.core.events.event.v1~x.eb.t10r.foo.v1~"),
-    description = "An event type admitting any object payload.",
-    properties = "",
-    traits = json!({
-        "topic": "gts.cf.core.events.topic.v1~x.eb.t10r.topic.v1",
-        "allowed_subject_types": ["gts.x.eb.t10r.subject.v1~"],
-    }),
-)]
-#[schemars(extend("additionalProperties" = true))]
-struct FooT10rV1;
+event_broker::fixture_event_type!(
+    /// Any object payload: an open type with no declared members.
+    FooT10rV1 = "cf.core.events.event.v1~x.eb.t10r.foo.v1~",
+    topic = "gts.cf.core.events.topic.v1~x.eb.t10r.topic.v1",
+    subjects = ["gts.x.eb.t10r.subject.v1~"],
+);
 
-/// Any object payload: an open type with no declared members.
-#[gts_type_schema(
-    dir_path = "schemas",
-    base = EventV1,
-    type_id = gts_id!("cf.core.events.event.v1~x.eb.t10p.foo.v1~"),
-    description = "An event type admitting any object payload.",
-    properties = "",
-    traits = json!({
-        "topic": "gts.cf.core.events.topic.v1~x.eb.t10p.topic.v1",
-        "allowed_subject_types": ["gts.x.eb.t10p.subject.v1~"],
-    }),
-)]
-#[schemars(extend("additionalProperties" = true))]
-struct FooT10pV1;
+event_broker::fixture_event_type!(
+    /// Any object payload: an open type with no declared members.
+    FooT10pV1 = "cf.core.events.event.v1~x.eb.t10p.foo.v1~",
+    topic = "gts.cf.core.events.topic.v1~x.eb.t10p.topic.v1",
+    subjects = ["gts.x.eb.t10p.subject.v1~"],
+);
 
 use common::{EventLog, SseFrameReader, TestServer};
 

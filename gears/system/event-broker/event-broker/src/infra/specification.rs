@@ -542,7 +542,6 @@ mod tests {
     use crate::test_support::type_registry::registry_holding;
     use event_broker_sdk::gts::EventV1;
     use sea_orm_migration::MigratorTrait;
-    use toolkit_gts::gts_type_schema;
 
     const TOPIC_ID: &str = toolkit_gts::gts_id!("cf.core.events.topic.v1~example.eb.t1.topic.v1");
     const EVENT_TYPE_ID: &str = <FooV1 as GtsSchema>::TYPE_ID;
@@ -552,36 +551,20 @@ mod tests {
     /// The instance-less routing key every `backend_routing` requires.
     const BASE_ROUTE: &str = toolkit_gts::gts_id!("cf.core.events.topic.v1~");
 
-    /// An event type that states its own partition pointer.
-    #[gts_type_schema(
-        dir_path = "schemas",
-        base = EventV1,
-        type_id = gts_id!("cf.core.events.event.v1~example.eb.t1.foo.v1~"),
-        description = "events this test publishes",
-        properties = "",
-        traits = serde_json::json!({
-            "topic": TOPIC_ID,
-            "allowed_subject_types": [SUBJECT_TYPE],
-            "partition_key": "/tenant_id",
-        }),
-    )]
-    #[schemars(extend("additionalProperties" = true))]
-    struct FooV1;
+    crate::fixture_event_type!(
+        /// An event type that states its own partition pointer.
+        FooV1 = "cf.core.events.event.v1~example.eb.t1.foo.v1~",
+        topic = TOPIC_ID,
+        subjects = [SUBJECT_TYPE],
+        partition_key = "/tenant_id",
+    );
 
-    /// The same type declaring no partition pointer of its own.
-    #[gts_type_schema(
-        dir_path = "schemas",
-        base = EventV1,
-        type_id = gts_id!("cf.core.events.event.v1~example.eb.t1.foo.v1~"),
-        description = "events this test publishes",
-        properties = "",
-        traits = serde_json::json!({
-            "topic": TOPIC_ID,
-            "allowed_subject_types": [SUBJECT_TYPE],
-        }),
-    )]
-    #[schemars(extend("additionalProperties" = true))]
-    struct SilentFooV1;
+    crate::fixture_event_type!(
+        /// The same type declaring no partition pointer of its own.
+        SilentFooV1 = "cf.core.events.event.v1~example.eb.t1.foo.v1~",
+        topic = TOPIC_ID,
+        subjects = [SUBJECT_TYPE],
+    );
 
     /// A topic instance carrying exactly what its base type declares - the
     /// partition count is not among them, and a document that named one would

@@ -35,21 +35,12 @@ use toolkit_gts::GtsInstanceId;
 use crate::domain::streaming::source::PartitionKey;
 use crate::test_support::{EventBrokerHarness, Json, StaticTypesRegistry};
 use event_broker_sdk::gts::EventV1;
-use toolkit_gts::gts_type_schema;
 
-#[gts_type_schema(
-    dir_path = "schemas",
-    base = EventV1,
-    type_id = gts_id!("cf.core.events.event.v1~x.eb.t1.foo.v1~"),
-    description = "An event type this test publishes.",
-    properties = "",
-    traits = serde_json::json!({
-        "topic": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
-        "allowed_subject_types": ["gts.x.eb.t1.subject.v1~"],
-    }),
-)]
-#[schemars(extend("additionalProperties" = true))]
-struct FooV1;
+crate::fixture_event_type!(
+    FooV1 = "cf.core.events.event.v1~x.eb.t1.foo.v1~",
+    topic = "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
+    subjects = ["gts.x.eb.t1.subject.v1~"],
+);
 
 #[tokio::test]
 async fn stream_events_returns_409_positions_not_set_when_unseeded() {
@@ -1013,19 +1004,11 @@ async fn a_stream_delivers_only_events_matching_its_interests() {
     const WANTED: &str = <FooV1 as gts::GtsSchema>::TYPE_ID;
     const UNWANTED: &str = <BarV1 as gts::GtsSchema>::TYPE_ID;
 
-    #[gts_type_schema(
-        dir_path = "schemas",
-        base = EventV1,
-        type_id = gts_id!("cf.core.events.event.v1~x.eb.t1.bar.v1~"),
-        description = "An event type no interest asks for.",
-        properties = "",
-        traits = serde_json::json!({
-            "topic": TOPIC,
-            "allowed_subject_types": ["gts.x.eb.t1.subject.v1~"],
-        }),
-    )]
-    #[schemars(extend("additionalProperties" = true))]
-    struct BarV1;
+    crate::fixture_event_type!(
+        BarV1 = "cf.core.events.event.v1~x.eb.t1.bar.v1~",
+        topic = TOPIC,
+        subjects = ["gts.x.eb.t1.subject.v1~"],
+    );
 
     let harness = EventBrokerHarness::builder()
         .with_type_registry(

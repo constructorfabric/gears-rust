@@ -80,20 +80,12 @@ macro_rules! showcase_event_type {
         #[allow(dead_code, reason = "a fixture type no test publishes to")]
         const $konst: &str = toolkit_gts::gts_id!($id);
 
-        #[toolkit_gts::gts_type_schema(
-                    dir_path = "schemas",
-                    base = EventV1,
-                    type_id = toolkit_gts::gts_id!($id),
-                    description = "A fixture event type: any object payload.",
-                    properties = "",
-                    traits = serde_json::json!({
-                        "topic": $topic,
-                        "allowed_subject_types": [crate::consumer::common::SHOWCASE_SUBJECT_TYPE],
-                        "partition_key": $pointer,
-                    }),
-                )]
-        #[schemars(extend("additionalProperties" = true))]
-        struct $name;
+        event_broker::fixture_event_type!(
+            $name = $id,
+            topic = $topic,
+            subjects = [crate::consumer::common::SHOWCASE_SUBJECT_TYPE],
+            partition_key = $pointer,
+        );
     };
 }
 pub(crate) use showcase_event_type;

@@ -19,21 +19,12 @@ use std::collections::BTreeSet;
 
 use crate::test_support::{EventBrokerHarness, Json, StaticTypesRegistry};
 use event_broker_sdk::gts::EventV1;
-use toolkit_gts::gts_type_schema;
 
-#[gts_type_schema(
-    dir_path = "schemas",
-    base = EventV1,
-    type_id = gts_id!("cf.core.events.event.v1~x.eb.a.foo.v1~"),
-    description = "An event type this test publishes.",
-    properties = "",
-    traits = serde_json::json!({
-        "topic": "gts.cf.core.events.topic.v1~x.eb.a.topic.v1",
-        "allowed_subject_types": ["gts.x.eb.t1.subject.v1~"],
-    }),
-)]
-#[schemars(extend("additionalProperties" = true))]
-struct FooV1;
+crate::fixture_event_type!(
+    FooV1 = "cf.core.events.event.v1~x.eb.a.foo.v1~",
+    topic = "gts.cf.core.events.topic.v1~x.eb.a.topic.v1",
+    subjects = ["gts.x.eb.t1.subject.v1~"],
+);
 
 #[tokio::test]
 async fn list_topics_happy_path_returns_all_seeded_topics() {

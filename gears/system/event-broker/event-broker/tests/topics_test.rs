@@ -14,27 +14,18 @@ use event_broker_sdk::gts::EventV1;
 use event_broker_sdk::{Event, Sequence};
 use gts::GtsInstanceId;
 use serde_json::{Value, json};
-use toolkit_gts::gts_type_schema;
 
 const TOPIC: &str = "gts.cf.core.events.topic.v1~x.eb.topics.stream.v1";
 const OTHER_TOPIC: &str = "gts.cf.core.events.topic.v1~x.eb.topics.longpoll.v1";
 const EVENT_TYPE: &str = "gts.cf.core.events.event.v1~x.eb.topics.happy.v1~";
 const SUBJECT_TYPE: &str = "gts.x.eb.topics.subject.v1~";
 
-/// Any object payload: an open type with no declared members.
-#[gts_type_schema(
-    dir_path = "schemas",
-    base = EventV1,
-    type_id = gts_id!("cf.core.events.event.v1~x.eb.topics.happy.v1~"),
-    description = "An event type admitting any object payload.",
-    properties = "",
-    traits = json!({
-        "topic": TOPIC,
-        "allowed_subject_types": [SUBJECT_TYPE],
-    }),
-)]
-#[schemars(extend("additionalProperties" = true))]
-struct HappyEventV1;
+event_broker::fixture_event_type!(
+    /// Any object payload: an open type with no declared members.
+    HappyEventV1 = "cf.core.events.event.v1~x.eb.topics.happy.v1~",
+    topic = TOPIC,
+    subjects = [SUBJECT_TYPE],
+);
 
 async fn harness() -> EventBrokerHarness {
     EventBrokerHarness::builder()

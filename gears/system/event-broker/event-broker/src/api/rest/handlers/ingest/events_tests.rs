@@ -23,116 +23,52 @@ use crate::test_support::{DenyingAuthZ, EventBrokerHarness, Json, StaticTypesReg
 use event_broker_sdk::gts::EventV1;
 use toolkit_gts::gts_type_schema;
 
-#[gts_type_schema(
-    dir_path = "schemas",
-    base = EventV1,
-    type_id = gts_id!("cf.core.events.event.v1~x.eb.t1.foo.v1~"),
-    description = "An event type this test publishes.",
-    properties = "",
-    traits = serde_json::json!({
-        "topic": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
-        "allowed_subject_types": ["gts.x.eb.t1.subject.v1~"],
-    }),
-)]
-#[schemars(extend("additionalProperties" = true))]
-struct FooV1;
+crate::fixture_event_type!(
+    FooV1 = "cf.core.events.event.v1~x.eb.t1.foo.v1~",
+    topic = "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
+    subjects = ["gts.x.eb.t1.subject.v1~"],
+);
 
-#[gts_type_schema(
-    dir_path = "schemas",
-    base = EventV1,
-    type_id = gts_id!("cf.core.events.event.v1~x.eb.t1.foo.v1~"),
-    description = "An event type this test publishes.",
-    properties = "",
-    traits = serde_json::json!({
-        "topic": "gts.cf.core.events.topic.v1~x.eb.missing.topic.v1",
-        "allowed_subject_types": ["gts.x.eb.t1.subject.v1~"],
-    }),
-)]
-#[schemars(extend("additionalProperties" = true))]
-struct FooVar2V1;
+crate::fixture_event_type!(
+    FooVar2V1 = "cf.core.events.event.v1~x.eb.t1.foo.v1~",
+    topic = "gts.cf.core.events.topic.v1~x.eb.missing.topic.v1",
+    subjects = ["gts.x.eb.t1.subject.v1~"],
+);
 
-#[gts_type_schema(
-    dir_path = "schemas",
-    base = EventV1,
-    type_id = gts_id!("cf.core.events.event.v1~x.eb.t2.foo.v1~"),
-    description = "An event type this test publishes.",
-    properties = "",
-    traits = serde_json::json!({
-        "topic": "gts.cf.core.events.topic.v1~x.eb.t2.topic.v1",
-        "allowed_subject_types": ["gts.x.eb.t1.subject.v1~"],
-    }),
-)]
-#[schemars(extend("additionalProperties" = true))]
-struct FooVar3V1;
+crate::fixture_event_type!(
+    FooVar3V1 = "cf.core.events.event.v1~x.eb.t2.foo.v1~",
+    topic = "gts.cf.core.events.topic.v1~x.eb.t2.topic.v1",
+    subjects = ["gts.x.eb.t1.subject.v1~"],
+);
 
-#[gts_type_schema(
-    dir_path = "schemas",
-    base = EventV1,
-    type_id = gts_id!("cf.core.events.event.v1~x.eb.t1.bar.v1~"),
-    description = "An event type this test publishes.",
-    properties = "",
-    traits = serde_json::json!({
-        "topic": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
-        "allowed_subject_types": ["gts.x.eb.t1.subject.v1~"],
-    }),
-)]
-#[schemars(extend("additionalProperties" = true))]
-struct BarV1;
+crate::fixture_event_type!(
+    BarV1 = "cf.core.events.event.v1~x.eb.t1.bar.v1~",
+    topic = "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
+    subjects = ["gts.x.eb.t1.subject.v1~"],
+);
 
-#[gts_type_schema(
-    dir_path = "schemas",
-    base = EventV1,
-    type_id = gts_id!("cf.core.events.event.v1~acme.shop.orders.created.v1~"),
-    description = "An event type this test publishes.",
-    properties = "",
-    traits = serde_json::json!({
-        "topic": "gts.cf.core.events.topic.v1~acme.shop._.orders.v1",
-        "allowed_subject_types": ["gts.acme.shop.orders.order.v1~"],
-    }),
-)]
-#[schemars(extend("additionalProperties" = true))]
-struct OrdersCreatedV1;
+crate::fixture_event_type!(
+    OrdersCreatedV1 = "cf.core.events.event.v1~acme.shop.orders.created.v1~",
+    topic = "gts.cf.core.events.topic.v1~acme.shop._.orders.v1",
+    subjects = ["gts.acme.shop.orders.order.v1~"],
+);
 
-#[gts_type_schema(
-    dir_path = "schemas",
-    base = EventV1,
-    type_id = gts_id!("cf.core.events.event.v1~x.eb.t1.foo.v1~"),
-    description = "An event type this test publishes.",
-    properties = "",
-    traits = serde_json::json!({
-        "topic": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
-        "allowed_subject_types": ["gts.x.eb.t1.subject.v1~acme.*"],
-    }),
-)]
-#[schemars(extend("additionalProperties" = true))]
-struct FooVar4V1;
+crate::fixture_event_type!(
+    FooVar4V1 = "cf.core.events.event.v1~x.eb.t1.foo.v1~",
+    topic = "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
+    subjects = ["gts.x.eb.t1.subject.v1~acme.*"],
+);
 
-#[gts_type_schema(
-    dir_path = "schemas",
-    base = EventV1,
-    type_id = gts_id!("cf.core.events.event.v1~x.eb.t1.foo.v1~"),
-    description = "An event type this test publishes.",
-    properties = "",
-    traits = serde_json::json!({
-        "topic": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
-        "allowed_subject_types": ["gts.x.eb.t1.other_subject.v1~"],
-    }),
-)]
-#[schemars(extend("additionalProperties" = true))]
-struct FooVar5V1;
+crate::fixture_event_type!(
+    FooVar5V1 = "cf.core.events.event.v1~x.eb.t1.foo.v1~",
+    topic = "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
+    subjects = ["gts.x.eb.t1.other_subject.v1~"],
+);
 
-#[gts_type_schema(
-    dir_path = "schemas",
-    base = EventV1,
-    type_id = gts_id!("cf.core.events.event.v1~x.eb.t1.foo.v1~"),
-    description = "An event type this test publishes.",
-    properties = "",
-    traits = serde_json::json!({
-        "topic": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
-    }),
-)]
-#[schemars(extend("additionalProperties" = true))]
-struct FooVar6V1;
+crate::fixture_event_type!(
+    FooVar6V1 = "cf.core.events.event.v1~x.eb.t1.foo.v1~",
+    topic = "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
+);
 
 #[gts_type_schema(
     dir_path = "schemas",

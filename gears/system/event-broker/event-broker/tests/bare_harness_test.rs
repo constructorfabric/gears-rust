@@ -12,7 +12,7 @@ use event_broker_sdk::EventBrokerError;
 use event_broker_sdk::gts::{EventV1, TopicV1};
 use gts::GtsIdPattern;
 use serde_json::json;
-use toolkit_gts::{GtsSchema, gts_type_schema};
+use toolkit_gts::GtsSchema;
 use toolkit_security::PlatformSecurityContext;
 use types_registry_sdk::{ListEntitiesRequest, PlatformTypesRegistryApiExt};
 
@@ -30,18 +30,12 @@ toolkit_gts::inventory::submit! {
     }
 }
 
-/// The probe event type: a declaration in this binary's inventory, as a gear's own
-/// event types are.
-#[gts_type_schema(
-    dir_path = "schemas",
-    base = EventV1,
-    type_id = gts_id!("cf.core.events.event.v1~x.eb.inventory.probe.v1~"),
-    description = "A gear contract linked into this binary",
-    properties = "",
-    traits = json!({ "topic": PROBE_TOPIC }),
-)]
-#[schemars(extend("additionalProperties" = true))]
-struct ProbeEventV1;
+event_broker::fixture_event_type!(
+    /// The probe event type: a declaration in this binary's inventory, as a gear's own
+    /// event types are.
+    ProbeEventV1 = "cf.core.events.event.v1~x.eb.inventory.probe.v1~",
+    topic = PROBE_TOPIC,
+);
 
 fn pattern(pattern: &str) -> ListEntitiesRequest {
     ListEntitiesRequest::matching(GtsIdPattern::try_new(pattern).expect("a valid GTS pattern"))

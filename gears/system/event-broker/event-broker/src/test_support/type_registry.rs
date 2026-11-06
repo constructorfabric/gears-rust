@@ -228,3 +228,51 @@ impl StaticTypesRegistry {
         .expect("fixture configuration deserializes")
     }
 }
+
+/// Declares a fixture event type admitting any object payload (an open,
+/// body-less `#[gts_type_schema(base = EventV1)]` type), for
+/// [`StaticTypesRegistry::event_type`]. Tests exercise the broker, not
+/// payloads, so only the identity and the traits vary:
+///
+/// ```ignore
+/// use event_broker_sdk::gts::EventV1; // the macro names `EventV1` as the base
+///
+/// event_broker::fixture_event_type!(
+///     OrderPlacedV1 = "cf.core.events.event.v1~x.eb.t1.placed.v1~",
+///     topic = "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
+///     subjects = ["gts.x.eb.t1.subject.v1~"],
+///     partition_key = "/subject",
+/// );
+/// ```
+///
+/// `subjects` and `partition_key` are optional; omitted, the type declares no
+/// subject types and inherits the base's `/tenant_id` partition key. The
+/// calling crate needs `toolkit-gts`, `gts`, `schemars`, `serde` and
+/// `serde_json`, which the generated declaration names.
+#[macro_export]
+macro_rules! fixture_event_type {
+    (
+        $(#[$attr:meta])*
+        $vis:vis $name:ident = $id:literal,
+        topic = $topic:expr
+        $(, subjects = [$($subject:expr),* $(,)?])?
+        $(, partition_key = $pointer:expr)?
+        $(,)?
+    ) => {
+        #[toolkit_gts::gts_type_schema(
+            dir_path = "schemas",
+            base = EventV1,
+            type_id = toolkit_gts::gts_id!($id),
+            description = "A fixture event type admitting any object payload.",
+            properties = "",
+            traits = serde_json::json!({
+                "topic": $topic,
+                $("allowed_subject_types": [$($subject),*],)?
+                $("partition_key": $pointer,)?
+            }),
+        )]
+        #[schemars(extend("additionalProperties" = true))]
+        $(#[$attr])*
+        $vis struct $name;
+    };
+}

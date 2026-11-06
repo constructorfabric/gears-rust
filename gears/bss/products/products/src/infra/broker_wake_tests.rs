@@ -31,52 +31,45 @@ const AT_ONCE: Duration = Duration::from_secs(5);
 /// How long nothing may move after a rolled-back transaction.
 const QUIET: Duration = Duration::from_secs(2);
 
-/// Declares one products event type, on the products topic with its subject type, over any object
-/// payload (an open, body-less type): the broker is what these tests exercise, not the payloads.
-/// The ids repeat the `TypedEvent` constants, and a publish under a mismatched id fails at the
-/// broker.
-macro_rules! declare_event_type {
-    ($name:ident, $id:literal, $subject:literal) => {
-        #[toolkit_gts::gts_type_schema(
-                            dir_path = "schemas",
-                            base = EventV1,
-                            type_id = toolkit_gts::gts_id!($id),
-                            description = "A products event type, as the broker's tests know it",
-                            properties = "",
-                            traits = serde_json::json!({
-                                "topic": TOPIC,
-                                "allowed_subject_types": [toolkit_gts::gts_id!($subject)],
-                            }),
-                        )]
-        #[schemars(extend("additionalProperties" = true))]
-        struct $name;
-    };
-}
+// Fixture event types over any object payload: the broker is what these tests exercise, not the
+// payloads. The ids repeat the `TypedEvent` constants, and a publish under a mismatched id fails at
+// the broker.
 
-declare_event_type!(
-    SkuPublishedTypeV1,
-    "cf.core.events.event.v1~cf.bss.products.sku_published.v1~",
-    "cf.core.events.subject.v1~cf.bss.products.sku.v1~"
+event_broker::fixture_event_type!(
+    SkuPublishedTypeV1 = "cf.core.events.event.v1~cf.bss.products.sku_published.v1~",
+    topic = TOPIC,
+    subjects = [toolkit_gts::gts_id!(
+        "cf.core.events.subject.v1~cf.bss.products.sku.v1~"
+    )],
 );
-declare_event_type!(
-    SkuChangedTypeV1,
-    "cf.core.events.event.v1~cf.bss.products.sku_changed.v1~",
-    "cf.core.events.subject.v1~cf.bss.products.sku.v1~"
+event_broker::fixture_event_type!(
+    SkuChangedTypeV1 = "cf.core.events.event.v1~cf.bss.products.sku_changed.v1~",
+    topic = TOPIC,
+    subjects = [toolkit_gts::gts_id!(
+        "cf.core.events.subject.v1~cf.bss.products.sku.v1~"
+    )],
 );
-declare_event_type!(
-    SkuRetiredTypeV1,
-    "cf.core.events.event.v1~cf.bss.products.sku_retired.v1~",
-    "cf.core.events.subject.v1~cf.bss.products.sku.v1~"
+event_broker::fixture_event_type!(
+    SkuRetiredTypeV1 = "cf.core.events.event.v1~cf.bss.products.sku_retired.v1~",
+    topic = TOPIC,
+    subjects = [toolkit_gts::gts_id!(
+        "cf.core.events.subject.v1~cf.bss.products.sku.v1~"
+    )],
 );
-declare_event_type!(
-    ApprovalUnitDecidedTypeV1,
-    "cf.core.events.event.v1~cf.bss.products.approval_unit_decided.v1~",
-    "cf.core.events.subject.v1~cf.bss.products.approval_unit.v1~"
+event_broker::fixture_event_type!(
+    ApprovalUnitDecidedTypeV1 = "cf.core.events.event.v1~cf.bss.products.approval_unit_decided.v1~",
+    topic = TOPIC,
+    subjects = [toolkit_gts::gts_id!(
+        "cf.core.events.subject.v1~cf.bss.products.approval_unit.v1~"
+    )],
 );
-declare_event_type!(
-    ReferenceForceReleasedTypeV1,
-    "cf.core.events.event.v1~cf.bss.products.reference_force_released.v1~",
-    "cf.core.events.subject.v1~cf.bss.products.sku.v1~"
+event_broker::fixture_event_type!(
+    ReferenceForceReleasedTypeV1 =
+        "cf.core.events.event.v1~cf.bss.products.reference_force_released.v1~",
+    topic = TOPIC,
+    subjects = [toolkit_gts::gts_id!(
+        "cf.core.events.subject.v1~cf.bss.products.sku.v1~"
+    )],
 );
 
 /// A products state over a database with four connections (the door fixtures pin one), bound to
