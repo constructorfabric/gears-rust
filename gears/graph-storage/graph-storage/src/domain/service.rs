@@ -551,11 +551,12 @@ impl GraphServices {
     pub async fn ingest(
         &self,
         ctx: &SecurityContext,
-        request: IngestRequest,
+        mut request: IngestRequest,
     ) -> Result<IngestOutcome, DomainError> {
         let auth = self
             .authorize(ctx, &authz::node_resource(), authz::actions::WRITE)
             .await?;
+        admission::normalize_ingest(&mut request);
         admission::admit_ingest(&self.config, &request)?;
 
         let store_ctx = Self::store_ctx(&auth, None);

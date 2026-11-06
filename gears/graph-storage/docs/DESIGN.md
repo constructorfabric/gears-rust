@@ -499,8 +499,10 @@ is frequently the wrong field to embed.
 **The edge base declares no key, and the node base declares `node_key`.** The
 asymmetry is the rule applied, not an inconsistency: `edge_key` is a hash of
 type, endpoints and discriminator, so the gear derives it from fields already in
-the submission and a producer has nothing to author. It appears on the API
-envelope like any other gear-assigned field. `node_key`, by contrast, is the
+the submission and a producer has nothing to author. An empty discriminator is
+no discriminator: it hashes as an absent one, ingest stores and returns it as
+none, and an empty value in a traversal's `edge_discriminators` is refused. It
+appears on the API envelope like any other gear-assigned field. `node_key`, by contrast, is the
 producer's own name for the thing, and the next section says why the gear cannot
 mint it.
 

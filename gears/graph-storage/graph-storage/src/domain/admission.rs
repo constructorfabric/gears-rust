@@ -126,6 +126,21 @@ pub fn admit_identifier(
 /// database meets unbounded. The bound on `type_id` was missing for as long
 /// as this was a list of fields someone remembered to write down, while
 /// every field beside it was checked.
+/// Bring an ingest batch to its canonical form before anything reads it.
+///
+/// An empty discriminator is no discriminator: the edge key already hashes
+/// the two alike (`identity::derive_edge_key`), so the stored column must
+/// agree, or one edge identity reads back as `Some("")` or `None` by which
+/// write came first and an `edge_discriminators` filter matches some of its
+/// rows and not others.
+pub fn normalize_ingest(request: &mut IngestRequest) {
+    for edge in &mut request.edges {
+        if edge.discriminator.as_deref() == Some("") {
+            edge.discriminator = None;
+        }
+    }
+}
+
 pub fn admit_ingest(cfg: &GraphStorageConfig, request: &IngestRequest) -> Result<(), DomainError> {
     let IngestRequest {
         nodes,
@@ -449,6 +464,14 @@ pub fn admit_traverse(
     // match no stored edge, and every one is bound into the edge scan.
     for (index, discriminator) in edge_discriminators.iter().enumerate() {
         admit_identifier(cfg, &format!("edge_discriminators[{index}]"), discriminator)?;
+        // Ingest stores an empty discriminator as none, so `""` can match no
+        // edge; refused rather than answered with an empty walk.
+        if discriminator.is_empty() {
+            return Err(DomainError::invalid(format!(
+                "edge_discriminators[{index}] is empty; an edge ingested with an empty \
+                 discriminator has none, and no list matches an edge without one"
+            )));
+        }
     }
     Ok(())
 }

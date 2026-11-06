@@ -645,6 +645,62 @@ async fn a_walk_takes_a_direction_and_discriminators_and_reads_name_them() {
     );
 }
 
+/// An empty discriminator is no discriminator: the edge key already hashed
+/// the two alike, and now the edge reads back with none, whichever form came
+/// first. A filter value `""` could then match nothing, so it is refused.
+#[tokio::test]
+async fn an_empty_discriminator_is_stored_as_none_and_refused_as_a_filter() {
+    let stand = Stand::new(Harness::allowed());
+    seed(&stand).await;
+    let edge = |discriminator: Option<&str>| {
+        let mut edge = serde_json::json!({
+            "type_id": conformance::LINK, "src_node_key": "empty-a", "dst_node_key": "empty-b"
+        });
+        if let Some(value) = discriminator {
+            edge["discriminator"] = serde_json::json!(value);
+        }
+        edge
+    };
+    let (status, body) = stand
+        .post(
+            "/ingest",
+            &serde_json::json!({
+                "nodes": [
+                    {"node_key": "empty-a", "type_id": conformance::OWNED},
+                    {"node_key": "empty-b", "type_id": conformance::OWNED}
+                ],
+                "edges": [edge(Some(""))]
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = stand
+        .post("/ingest", &serde_json::json!({"edges": [edge(None)]}))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (status, node) = stand.get("/nodes/empty-a").await;
+    assert_eq!(status, StatusCode::OK, "{node}");
+    let adjacency = node["adjacency"].as_array().expect("adjacency is a list");
+    assert_eq!(adjacency.len(), 1, "one identity, one edge: {node}");
+    assert!(
+        adjacency[0]["discriminator"].is_null(),
+        "read back with none: {node}"
+    );
+
+    let (status, problem) = stand
+        .post(
+            "/graph/traverse",
+            &serde_json::json!({"seeds": ["empty-a"], "depth": 1, "edge_discriminators": [""]}),
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "an empty filter value is refused: {problem}"
+    );
+}
+
 /// `GET /nodes:count` answers the listing's total, and refuses the options a
 /// count has no use for rather than ignoring them (#5108 point 1, #5529
 /// item 2).

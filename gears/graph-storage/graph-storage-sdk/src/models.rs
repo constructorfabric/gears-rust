@@ -719,6 +719,8 @@ pub struct EdgeSpec {
     pub src_node_key: NodeKey,
     pub dst_node_key: NodeKey,
     /// Distinguishes parallel edges of one type between one endpoint pair.
+    /// An empty string is no discriminator: it derives the same edge key,
+    /// and the edge is stored and read back with `None`.
     pub discriminator: Option<String>,
     pub payload: Option<serde_json::Value>,
 }
@@ -1156,6 +1158,7 @@ pub struct TraverseRequest {
     /// Per-hop discriminator restriction: only edges whose discriminator is
     /// one of these values are followed. Empty follows every edge; an edge
     /// ingested without a discriminator never matches a non-empty list.
+    /// An empty value is refused: an edge ingested with `""` has none.
     ///
     /// Applied in the edge scan, so the edges it excludes spend neither the
     /// hop's edge budget nor the walk's node budget. At most 1 000 values;

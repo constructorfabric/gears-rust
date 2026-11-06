@@ -1352,6 +1352,70 @@ async fn the_hop_and_the_filtered_listing_have_an_index_to_use() {
     );
 }
 
+/// `m0011` brings an edge written with an empty discriminator to the form
+/// ingest now writes, none. The edge is written through the store, below the
+/// service's normalisation, which is how every such row was written before
+/// it.
+#[tokio::test]
+async fn m0011_stores_an_empty_discriminator_as_none() {
+    use sea_orm_migration::{MigrationTrait as _, SchemaManager};
+    let Some(stand) = stand().await else {
+        return;
+    };
+    let tenant = tenant_on(&stand).await;
+    let scope = AccessScope::for_tenant(tenant);
+    let ctx = conformance::ctx(tenant, &scope, None);
+    let store = stand.store.as_ref();
+    store
+        .register_types(&ctx, conformance::ontology_batch())
+        .await
+        .expect("the ontology registers");
+    conformance::ingest_batch(
+        store,
+        &ctx,
+        conformance::batch(
+            vec![
+                conformance::node("empty-a", "a"),
+                conformance::node("empty-b", "b"),
+            ],
+            vec![graph_storage_sdk::models::EdgeSpec {
+                discriminator: Some(String::new()),
+                ..conformance::edge("empty-a", "empty-b")
+            }],
+        ),
+    )
+    .await
+    .expect("the edge commits");
+    let key = "empty-a".to_owned();
+
+    let before = store
+        .get_node(&ctx, &key, 100)
+        .await
+        .expect("the node reads");
+    assert_eq!(
+        before.adjacency[0].discriminator.as_deref(),
+        Some(""),
+        "the store kept the empty string it was given"
+    );
+
+    let raw = sea_orm::Database::connect(&stand.dsn)
+        .await
+        .expect("a plain connection to the stand");
+    graph_storage::infra::storage::migrations::m0011_empty_discriminator::Migration
+        .up(&SchemaManager::new(&raw))
+        .await
+        .expect("m0011 applies");
+
+    let after = store
+        .get_node(&ctx, &key, 100)
+        .await
+        .expect("the node reads");
+    assert_eq!(
+        after.adjacency[0].discriminator, None,
+        "an empty discriminator is stored as none"
+    );
+}
+
 /// `m0010` drops a property graph `m0002` left behind, and does nothing on a
 /// server without SQL/PGQ, which is every server CI runs. Against a 19 beta
 /// 1–3 image the case re-creates the graph and shows the drop.
