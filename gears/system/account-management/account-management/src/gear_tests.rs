@@ -31,9 +31,6 @@ use crate::domain::bootstrap::BootstrapService;
 use crate::domain::tenant::TenantRepo;
 use crate::gear::handle_bootstrap_failure;
 
-const TENANT_SCHEMA: &str = gts_id!("cf.core.am.tenant.v1~");
-const TENANT_TYPE_SCHEMA: &str = gts_id!("cf.core.am.tenant_type.v1~");
-
 /// Test-only helper that combines bootstrap config validation + saga
 /// execution in one call, mirroring the split init/serve production
 /// flow. Generic over `R: TenantRepo` so tests can pass
@@ -47,7 +44,7 @@ async fn run_bootstrap_phase<R: TenantRepo + 'static>(
     idp_required: bool,
     repo: Arc<R>,
     idp: Arc<dyn IdpPluginClient>,
-    types_registry: Arc<dyn types_registry_sdk::TypesRegistryClient>,
+    types_registry: Arc<dyn types_registry_sdk::PlatformTypesRegistryApi>,
 ) -> anyhow::Result<()> {
     let Some(boot_cfg) = bootstrap else {
         return Ok(());
@@ -457,117 +454,10 @@ fn seed_root_with_binding(
     });
 }
 
-/// Minimal `TypesRegistryClient` that returns a canned root-level AM
-/// `tenant_type` schema from `get_type_schema`. Mirrors the stub in
-/// `domain/bootstrap/service_tests.rs::StubTypesRegistry`. Inlined
-/// here so gear-level tests do not depend on test-mod visibility
-/// from a sibling gear.
-fn stub_types_registry() -> Arc<dyn types_registry_sdk::TypesRegistryClient> {
-    use async_trait::async_trait;
-    use std::collections::HashMap;
-    use toolkit_canonical_errors::CanonicalError;
-    use types_registry_sdk::{
-        GtsInstance, GtsTypeId, GtsTypeSchema, InstanceQuery, RegisterResult, TypeSchemaQuery,
-        TypesRegistryClient,
-    };
-
-    struct Stub;
-
-    #[async_trait]
-    impl TypesRegistryClient for Stub {
-        async fn register(
-            &self,
-            _entities: Vec<serde_json::Value>,
-        ) -> Result<Vec<RegisterResult>, CanonicalError> {
-            unreachable!()
-        }
-        async fn register_type_schemas(
-            &self,
-            _type_schemas: Vec<serde_json::Value>,
-        ) -> Result<Vec<RegisterResult>, CanonicalError> {
-            unreachable!()
-        }
-        async fn get_type_schema(&self, type_id: &str) -> Result<GtsTypeSchema, CanonicalError> {
-            // Route per-id so the bootstrap-time GTS validation seam
-            // does not short-circuit before the IdP retry-loop branch
-            // these tests are designed to exercise. The AM tenant
-            // schema MUST advertise a `name` property; without it,
-            // `validate_tenant_name_via_gts` rejects `root_name` and
-            // the "valid config + CleanFailure" path never reaches
-            // `FakeOutcome::CleanFailure`.
-            let (id, body) = if type_id == TENANT_SCHEMA {
-                (
-                    TENANT_SCHEMA,
-                    serde_json::json!({
-                        "type": "object",
-                        "properties": {
-                            "name": { "type": "string", "minLength": 1, "maxLength": 255 }
-                        }
-                    }),
-                )
-            } else {
-                (TENANT_TYPE_SCHEMA, serde_json::json!({}))
-            };
-            Ok(GtsTypeSchema::try_new(GtsTypeId::new(id), body, None, None)
-                .expect("canned root schema must construct"))
-        }
-        async fn get_type_schema_by_uuid(
-            &self,
-            _type_uuid: Uuid,
-        ) -> Result<GtsTypeSchema, CanonicalError> {
-            unreachable!()
-        }
-        async fn get_type_schemas(
-            &self,
-            _type_ids: Vec<String>,
-        ) -> HashMap<String, Result<GtsTypeSchema, CanonicalError>> {
-            unreachable!()
-        }
-        async fn get_type_schemas_by_uuid(
-            &self,
-            _type_uuids: Vec<Uuid>,
-        ) -> HashMap<Uuid, Result<GtsTypeSchema, CanonicalError>> {
-            unreachable!()
-        }
-        async fn list_type_schemas(
-            &self,
-            _query: TypeSchemaQuery,
-        ) -> Result<Vec<GtsTypeSchema>, CanonicalError> {
-            unreachable!()
-        }
-        async fn register_instances(
-            &self,
-            _instances: Vec<serde_json::Value>,
-        ) -> Result<Vec<RegisterResult>, CanonicalError> {
-            unreachable!()
-        }
-        async fn get_instance(&self, _id: &str) -> Result<GtsInstance, CanonicalError> {
-            unreachable!()
-        }
-        async fn get_instance_by_uuid(&self, _uuid: Uuid) -> Result<GtsInstance, CanonicalError> {
-            unreachable!()
-        }
-        async fn get_instances(
-            &self,
-            _ids: Vec<String>,
-        ) -> HashMap<String, Result<GtsInstance, CanonicalError>> {
-            unreachable!()
-        }
-        async fn get_instances_by_uuid(
-            &self,
-            _uuids: Vec<Uuid>,
-        ) -> HashMap<Uuid, Result<GtsInstance, CanonicalError>> {
-            unreachable!()
-        }
-        async fn list_instances(
-            &self,
-            _query: InstanceQuery,
-        ) -> Result<Vec<GtsInstance>, CanonicalError> {
-            unreachable!()
-        }
-    }
-
-    Arc::new(Stub)
+/// The registry bootstrap preflight reads; see
+/// [`bootstrap_registry`](crate::infra::types_registry::test_helpers::bootstrap_registry).
+fn stub_types_registry() -> Arc<dyn types_registry_sdk::PlatformTypesRegistryApi> {
+    crate::infra::types_registry::test_helpers::bootstrap_registry()
 }
 
 mod no_seed_startup_tests {
@@ -580,14 +470,18 @@ mod no_seed_startup_tests {
     };
     use sea_orm_migration::{MigrationTrait, MigratorTrait};
     use serde_json::{Value, json};
-    use toolkit::contracts::SystemCapability;
-    use toolkit::runtime::{GearManager, GrpcInstallerStore, SystemContext};
+    use toolkit::gts_publication::GtsPublicationCapability as _;
     use toolkit::{ClientHub, ConfigProvider, Gear, GearCtx};
     use toolkit_canonical_errors::CanonicalError;
     use toolkit_db::migration_runner::run_migrations_for_testing;
     use toolkit_db::{ConnectOpts, DBProvider, Db, connect_db};
     use toolkit_security::PlatformSecurityContext;
-    use types_registry_sdk::TypesRegistryClient;
+    use types_registry_sdk::testing::MockTypesRegistryClient;
+    use types_registry_sdk::testing_platform::MockTypesRegistry;
+    use types_registry_sdk::{
+        EntityField, FieldSelection, GtsTypeId, PlatformTypesRegistryApi,
+        PlatformTypesRegistryApiExt, Projection, ReadOptions,
+    };
 
     use crate::gear::AccountManagementGear;
 
@@ -652,6 +546,70 @@ mod no_seed_startup_tests {
         .with_db(DBProvider::new(db))
     }
 
+    /// With only the request API in the hub, AM's publication cannot bind its
+    /// backend — the tenant API does not stand in for the platform API — and AM's
+    /// `init` refuses to build services without it. (Request paths read only
+    /// through the tenant API (P33); both are wired before the application group.)
+    #[tokio::test]
+    async fn without_the_platform_api_neither_publication_nor_init_proceeds() {
+        use toolkit::gts_publication::GtsPublicationCapability as _;
+
+        let config: Arc<dyn ConfigProvider> = Arc::new(StartupConfig {
+            account_management: json!({ "config": {} }),
+        });
+        let hub = Arc::new(ClientHub::new());
+        let authz: Arc<dyn AuthZResolverApi> = Arc::new(PermitAllAuthz);
+        hub.register::<dyn AuthZResolverApi>(authz);
+        let tenant: Arc<dyn types_registry_sdk::TypesRegistryApi> =
+            Arc::new(types_registry_sdk::testing_platform::MockTypesRegistry::new());
+        hub.register::<dyn types_registry_sdk::TypesRegistryApi>(tenant);
+        // AM's own init needs Resource Group — over the legacy registry client, as
+        // with an embedded legacy-only registry.
+        let legacy: Arc<dyn types_registry_sdk::TypesRegistryClient> =
+            Arc::new(types_registry_sdk::testing::MockTypesRegistryClient::new());
+        hub.register::<dyn types_registry_sdk::TypesRegistryClient>(legacy);
+        resource_group::gear::ResourceGroup::default()
+            .init(&context(
+                "resource-group",
+                Arc::clone(&config),
+                Arc::clone(&hub),
+                migrated_sqlite(resource_group::infra::storage::migrations::Migrator::migrations())
+                    .await,
+            ))
+            .await
+            .expect("Resource Group init");
+        let gear = AccountManagementGear::default();
+
+        let err = toolkit::gts_publication::PreparedGtsPublication::prepare(
+            gear.descriptor(),
+            config.as_ref(),
+            &hub,
+        )
+        .err()
+        .expect("no platform API to publish to");
+        assert!(
+            matches!(
+                err,
+                toolkit::gts_publication::GtsPublicationError::Backend { .. }
+            ),
+            "got: {err:#}"
+        );
+
+        let manifest = gear
+            .descriptor()
+            .build_gts_manifest(config.as_ref())
+            .expect("manifest");
+        let ctx = context(
+            "account-management",
+            config,
+            hub,
+            migrated_sqlite(crate::Migrator::migrations()).await,
+        )
+        .with_gts_publication_manifest_for_test(Arc::new(manifest));
+        let err = gear.init(&ctx).await.expect_err("no platform API");
+        assert!(format!("{err:#}").contains("platform API"), "got: {err:#}");
+    }
+
     #[tokio::test]
     async fn full_init_registers_and_validates_root_without_a_yaml_seed() {
         let config: Arc<dyn ConfigProvider> = Arc::new(StartupConfig {
@@ -673,29 +631,25 @@ mod no_seed_startup_tests {
         let authz: Arc<dyn AuthZResolverApi> = Arc::new(PermitAllAuthz);
         hub.register::<dyn AuthZResolverApi>(authz);
 
-        // Initialize the actual Types Registry gear with its default, seedless
-        // configuration. This publishes the process-local client in
-        // configuration mode, before its ready transition.
-        let types_registry_gear = types_registry::gear::TypesRegistryGear::default();
-        let types_registry_ctx = context(
-            "types-registry",
-            Arc::clone(&config),
-            Arc::clone(&hub),
-            migrated_sqlite(toolkit::contracts::DatabaseCapability::migrations(
-                &types_registry_gear,
-            ))
-            .await,
-        );
-        types_registry_gear
-            .init(&types_registry_ctx)
-            .await
-            .expect("Types Registry init");
+        // Seed declarations only: AM must publish its own root type.
+        let fake = Arc::new(MockTypesRegistry::new());
+        fake.seed_inventory();
+        fake.install(&hub);
+        // Resource Group still consumes the legacy registry contract.
+        hub.register::<dyn types_registry_sdk::TypesRegistryClient>(Arc::new(
+            MockTypesRegistryClient::new(),
+        ));
 
         let registry = hub
-            .get::<dyn TypesRegistryClient>()
-            .expect("Types Registry client");
+            .get::<dyn PlatformTypesRegistryApi>()
+            .expect("Types Registry platform API");
+        let platform = PlatformSecurityContext::outbound_marker();
+        let root_type = GtsTypeId::new(ROOT_TENANT_TYPE);
         assert!(
-            registry.get_type_schema(ROOT_TENANT_TYPE).await.is_err(),
+            registry
+                .get_type_schema(&platform, &root_type, ReadOptions::default())
+                .await
+                .is_err(),
             "the test must not accidentally provide a YAML root seed"
         );
 
@@ -714,13 +668,53 @@ mod no_seed_startup_tests {
             .await
             .expect("Resource Group init");
 
+        // The runtime publishes AM's manifest first and awaits its admission:
+        // the root is readable, with its materialized traits, before AM's `init`.
         let account_management_gear = AccountManagementGear::default();
+        let descriptor = account_management_gear.descriptor();
+        let manifest = Arc::new(
+            descriptor
+                .build_gts_manifest(config.as_ref())
+                .expect("manifest"),
+        );
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            toolkit::gts_publication::PreparedGtsPublication::bind(
+                descriptor,
+                Arc::clone(&manifest),
+                toolkit::gts_publication::GtsPublicationOptions::default(),
+                &hub,
+            )
+            .expect("platform API")
+            .publish(
+                &tokio_util::sync::CancellationToken::new(),
+                Arc::new(|_: &str| {}),
+            ),
+        )
+        .await
+        .expect("admitted in time")
+        .expect("admitted");
+        let runtime_root = registry
+            .get_type_schema(
+                &platform,
+                &root_type,
+                ReadOptions {
+                    projection: Projection::Select(FieldSelection::with(&[
+                        EntityField::EffectiveTraits,
+                        EntityField::ResolvedSchema,
+                    ])),
+                    ..ReadOptions::default()
+                },
+            )
+            .await;
+
         let account_management_ctx = context(
             "account-management",
             config,
             Arc::clone(&hub),
             migrated_sqlite(crate::Migrator::migrations()).await,
-        );
+        )
+        .with_gts_publication_manifest_for_test(manifest);
         let loaded: crate::config::AccountManagementConfig = account_management_ctx
             .config_or_default()
             .expect("load AM startup config");
@@ -735,36 +729,786 @@ mod no_seed_startup_tests {
             .init(&account_management_ctx)
             .await
             .expect("AM init without a YAML root seed");
-
-        // AM registration happens while the registry is in configuration mode,
-        // so the staged definition is intentionally not readable yet.
-        assert!(registry.get_type_schema(ROOT_TENANT_TYPE).await.is_err());
-
-        let sys = SystemContext::new(
-            uuid::Uuid::new_v4(),
-            Arc::new(GearManager::new()),
-            Arc::new(GrpcInstallerStore::new()),
-        );
-        types_registry_gear
-            .legacy_finalize_after_application_init(&sys)
-            .await
-            .expect("Types Registry semantic validation and ready transition");
-
-        let runtime_root = registry
-            .get_type_schema(ROOT_TENANT_TYPE)
-            .await
-            .expect("validated in-memory root type");
+        let runtime_root = runtime_root.expect("admitted root type");
         assert_eq!(runtime_root.type_id.as_ref(), ROOT_TENANT_TYPE);
         assert_eq!(
-            runtime_root.effective_traits(),
-            json!({"allowed_parent_types": [], "idp_provisioning": false})
+            runtime_root.effective_traits,
+            Some(json!({"allowed_parent_types": [], "idp_provisioning": false}))
+        );
+        assert!(
+            runtime_root.resolved_schema.is_some(),
+            "the root resolves against the seeded envelope"
+        );
+    }
+
+    /// AM's init over the SDK registry fake and an AM database holding a
+    /// platform root bound to another tenant type.
+    async fn init_over_a_mismatched_root(strict: bool) -> (anyhow::Error, Arc<ClientHub>) {
+        use sea_orm::ActiveValue;
+        use toolkit_db::secure::secure_insert;
+
+        use crate::infra::storage::entity::tenants;
+
+        let config: Arc<dyn ConfigProvider> = Arc::new(StartupConfig {
+            account_management: json!({
+                "config": {
+                    "root_tenant_type": {
+                        "gts_id": ROOT_TENANT_TYPE,
+                        "idp_provisioning": false
+                    },
+                    "bootstrap": {
+                        "root_id": "00000000-df51-5b42-9538-d2b56b7ee953",
+                        "root_name": "platform-root",
+                        "strict": strict
+                    }
+                }
+            }),
+        });
+        let hub = Arc::new(ClientHub::new());
+        let authz: Arc<dyn AuthZResolverApi> = Arc::new(PermitAllAuthz);
+        hub.register::<dyn AuthZResolverApi>(authz);
+        let fake = Arc::new(MockTypesRegistry::new());
+        fake.seed_inventory();
+        fake.install(&hub);
+        hub.register::<dyn types_registry_sdk::TypesRegistryClient>(Arc::new(
+            MockTypesRegistryClient::new(),
+        ));
+        let resource_group_gear = resource_group::gear::ResourceGroup::default();
+        resource_group_gear
+            .init(&context(
+                "resource-group",
+                Arc::clone(&config),
+                Arc::clone(&hub),
+                migrated_sqlite(resource_group::infra::storage::migrations::Migrator::migrations())
+                    .await,
+            ))
+            .await
+            .expect("Resource Group init");
+
+        let am_db = migrated_sqlite(crate::Migrator::migrations()).await;
+        let provider = crate::infra::storage::repo_impl::AmDbProvider::new(am_db.clone());
+        let now = time::OffsetDateTime::now_utc();
+        secure_insert::<tenants::Entity>(
+            tenants::ActiveModel {
+                id: ActiveValue::Set(
+                    uuid::Uuid::parse_str("00000000-df51-5b42-9538-d2b56b7ee953").expect("uuid"),
+                ),
+                parent_id: ActiveValue::Set(None),
+                name: ActiveValue::Set("platform-root".to_owned()),
+                status: ActiveValue::Set(
+                    crate::domain::tenant::model::TenantStatus::Active.as_smallint(),
+                ),
+                self_managed: ActiveValue::Set(false),
+                tenant_type_uuid: ActiveValue::Set(uuid::Uuid::nil()),
+                depth: ActiveValue::Set(0),
+                created_at: ActiveValue::Set(now),
+                updated_at: ActiveValue::Set(now),
+                deleted_at: ActiveValue::Set(None),
+                retention_window_secs: ActiveValue::Set(None),
+                claimed_by: ActiveValue::Set(None),
+                claimed_at: ActiveValue::Set(None),
+                terminal_failure_at: ActiveValue::Set(None),
+            },
+            &toolkit_db::secure::AccessScope::allow_all(),
+            &provider.conn().expect("conn"),
+        )
+        .await
+        .expect("seed a root bound to another tenant type");
+
+        let error = AccountManagementGear::default()
+            .init(&context(
+                "account-management",
+                config,
+                Arc::clone(&hub),
+                am_db,
+            ))
+            .await
+            .expect_err("a root binding mismatch fails init");
+        (error, hub)
+    }
+
+    #[tokio::test]
+    async fn a_root_binding_mismatch_fails_before_any_registry_write() {
+        for strict in [true, false] {
+            let (error, hub) = init_over_a_mismatched_root(strict).await;
+
+            assert!(
+                format!("{error:#}").contains("root binding mismatch"),
+                "strict={strict}: {error:#}"
+            );
+            let registry = hub
+                .get::<dyn PlatformTypesRegistryApi>()
+                .expect("Types Registry platform API");
+            let read = registry
+                .get_type_schema(
+                    &PlatformSecurityContext::outbound_marker(),
+                    &GtsTypeId::new(ROOT_TENANT_TYPE),
+                    ReadOptions::default(),
+                )
+                .await;
+            assert!(
+                matches!(read, Err(CanonicalError::NotFound { .. })),
+                "strict={strict}: no root schema was written, got {read:?}"
+            );
+        }
+    }
+}
+
+/// AM and Resource Group restarted over their SQLite files while the SDK
+/// registry fake retains publications between AM incarnations.
+mod restart_tests {
+    use std::sync::Arc;
+
+    use async_trait::async_trait;
+    use authz_resolver_sdk::{
+        AuthZResolverApi,
+        models::{EvaluationRequest, EvaluationResponse, EvaluationResponseContext},
+    };
+    use sea_orm::ActiveValue;
+    use sea_orm_migration::{MigrationTrait, MigratorTrait};
+    use serde_json::{Value, json};
+    use tenant_resolver_sdk::TenantId;
+    use tokio_util::sync::CancellationToken;
+    use toolkit::contracts::RunnableCapability;
+    use toolkit::{ClientHub, ConfigProvider, Gear, GearCtx};
+    use toolkit_canonical_errors::CanonicalError;
+    use toolkit_db::migration_runner::run_migrations_for_testing;
+    use toolkit_db::secure::{AccessScope, secure_insert};
+    use toolkit_db::{ConnectOpts, DBProvider, Db, connect_db};
+    use toolkit_security::{PlatformSecurityContext, SecurityContext};
+    use types_registry_sdk::testing::MockTypesRegistryClient;
+    use types_registry_sdk::testing_platform::MockTypesRegistry;
+    use types_registry_sdk::{
+        EntityField, FieldSelection, GtsTypeId, Origin, PlatformTypesRegistryApi,
+        PlatformTypesRegistryApiExt, Projection, ReadOptions, TypeSchema,
+    };
+    use uuid::Uuid;
+
+    use super::ROOT_TENANT_TYPE;
+    use crate::gear::AccountManagementGear;
+    use crate::infra::storage::entity::tenants;
+
+    const ROOT_ID: &str = "00000000-df51-5b42-9538-d2b56b7ee953";
+
+    struct Configs {
+        account_management: Value,
+    }
+
+    impl ConfigProvider for Configs {
+        fn get_gear_config(&self, gear_name: &str) -> Option<&Value> {
+            (gear_name == "account-management").then_some(&self.account_management)
+        }
+    }
+
+    struct PermitAllAuthz;
+
+    #[async_trait]
+    impl AuthZResolverApi for PermitAllAuthz {
+        async fn evaluate(
+            &self,
+            _ctx: PlatformSecurityContext,
+            _request: EvaluationRequest,
+        ) -> Result<EvaluationResponse, CanonicalError> {
+            Ok(EvaluationResponse {
+                decision: true,
+                context: EvaluationResponseContext::default(),
+            })
+        }
+    }
+
+    /// AM/RG storage and the registry state retained across AM restarts.
+    struct DataRoot {
+        directory: tempfile::TempDir,
+        registry: Arc<MockTypesRegistry>,
+    }
+
+    /// One AM incarnation; every test shuts its background tasks down.
+    struct Booted {
+        hub: Arc<ClientHub>,
+        am_db: Db,
+        am: Arc<toolkit::lifecycle::WithLifecycle<AccountManagementGear>>,
+        /// What the runtime does for AM: publication until admitted, `init`,
+        /// then `start` and `wait_ready`. Taken by [`startup_settled`].
+        startup: parking_lot::Mutex<Option<tokio::task::JoinHandle<anyhow::Result<()>>>>,
+        cancel: CancellationToken,
+    }
+
+    impl DataRoot {
+        fn new() -> Self {
+            let registry = Arc::new(MockTypesRegistry::new());
+            registry.seed_inventory();
+            Self {
+                directory: tempfile::tempdir().expect("temp dir"),
+                registry,
+            }
+        }
+
+        async fn database(&self, file: &str, migrations: Vec<Box<dyn MigrationTrait>>) -> Db {
+            let dsn = format!(
+                "sqlite://{}?mode=rwc",
+                self.directory.path().join(file).display()
+            );
+            let db = connect_db(
+                &dsn,
+                ConnectOpts {
+                    max_conns: Some(4),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("connect SQLite file");
+            run_migrations_for_testing(&db, migrations)
+                .await
+                .expect("apply gear migrations");
+            db
+        }
+
+        /// Install the SDK registry fake, initialize RG, then publish and start AM.
+        async fn boot(&self, am_config: Value) -> anyhow::Result<Booted> {
+            self.boot_into(Arc::new(ClientHub::new()), am_config).await
+        }
+
+        /// [`Self::boot`] over `hub`, which a failed boot leaves to inspect.
+        async fn boot_into(&self, hub: Arc<ClientHub>, am_config: Value) -> anyhow::Result<Booted> {
+            let booted = self.start_into(hub, am_config).await?;
+            match startup_settled(&booted).await {
+                Ok(()) => Ok(booted),
+                Err(error) => {
+                    booted.shutdown().await;
+                    Err(error)
+                }
+            }
+        }
+
+        /// [`Self::boot_into`] up to starting AM's startup, without awaiting it.
+        async fn start_into(
+            &self,
+            hub: Arc<ClientHub>,
+            am_config: Value,
+        ) -> anyhow::Result<Booted> {
+            let config: Arc<dyn ConfigProvider> = Arc::new(Configs {
+                account_management: json!({ "config": am_config }),
+            });
+            let authz: Arc<dyn AuthZResolverApi> = Arc::new(PermitAllAuthz);
+            hub.register::<dyn AuthZResolverApi>(authz);
+
+            self.registry.install(&hub);
+            // Resource Group still consumes the legacy registry contract.
+            hub.register::<dyn types_registry_sdk::TypesRegistryClient>(Arc::new(
+                MockTypesRegistryClient::new(),
+            ));
+
+            let rg_db = self
+                .database(
+                    "resource_group.db",
+                    resource_group::infra::storage::migrations::Migrator::migrations(),
+                )
+                .await;
+            resource_group::gear::ResourceGroup::default()
+                .init(&Self::context("resource-group", &config, &hub, rg_db))
+                .await?;
+
+            let am_db = self
+                .database("account_management.db", crate::Migrator::migrations())
+                .await;
+            let am_ctx = Self::context("account-management", &config, &hub, am_db.clone());
+            let am = Arc::new(AccountManagementGear::default().into_gear());
+            let cancel = CancellationToken::new();
+            let booted = Booted {
+                hub: Arc::clone(&hub),
+                am_db,
+                am: Arc::clone(&am),
+                startup: parking_lot::Mutex::new(None),
+                cancel: cancel.clone(),
+            };
+            *booted.startup.lock() = Some(tokio::spawn(async move {
+                // What the runtime does for AM: publish its manifest until
+                // admitted, then `init` with the admitted manifest and
+                // `start`; then wait for its `ReadySignal` (or `serve` ending).
+                use toolkit::gts_publication::GtsPublicationCapability as _;
+                let descriptor = am.inner().descriptor();
+                let manifest = Arc::new(descriptor.build_gts_manifest(config.as_ref())?);
+                toolkit::gts_publication::PreparedGtsPublication::bind(
+                    descriptor,
+                    Arc::clone(&manifest),
+                    toolkit::gts_publication::GtsPublicationOptions::default(),
+                    &hub,
+                )?
+                .publish(&cancel, Arc::new(|_: &str| {}))
+                .await?;
+                am.inner()
+                    .init(&am_ctx.with_gts_publication_manifest_for_test(manifest))
+                    .await?;
+                am.start(cancel.clone()).await?;
+                loop {
+                    match am.status() {
+                        toolkit::lifecycle::Status::Running => return Ok(()),
+                        toolkit::lifecycle::Status::Stopped => {
+                            anyhow::bail!("account-management: serve ended before ready")
+                        }
+                        _ => tokio::time::sleep(std::time::Duration::from_millis(10)).await,
+                    }
+                }
+            }));
+            Ok(booted)
+        }
+
+        fn context(
+            gear_name: &'static str,
+            config: &Arc<dyn ConfigProvider>,
+            hub: &Arc<ClientHub>,
+            db: Db,
+        ) -> GearCtx {
+            GearCtx::new(
+                gear_name,
+                Uuid::new_v4(),
+                Arc::clone(config),
+                Arc::clone(hub),
+                CancellationToken::new(),
+            )
+            .with_db(DBProvider::new(db))
+        }
+    }
+
+    /// Await AM's startup: `Ok` once AM is initialized, started and ready, `Err`
+    /// with its failure.
+    async fn startup_settled(booted: &Booted) -> anyhow::Result<()> {
+        let startup = booted
+            .startup
+            .lock()
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("startup already awaited"))?;
+        tokio::time::timeout(std::time::Duration::from_secs(60), startup)
+            .await
+            .map_err(|_| anyhow::anyhow!("startup never settled"))??
+    }
+
+    impl Booted {
+        /// Stop AM's background tasks; the SDK registry has no worker to drain.
+        async fn shutdown(self) {
+            self.cancel.cancel();
+            if let Some(startup) = self.startup.lock().take() {
+                startup.abort();
+            }
+            self.am
+                .stop(CancellationToken::new())
+                .await
+                .expect("AM stop");
+        }
+
+        async fn root(&self, type_id: &str) -> Result<TypeSchema, CanonicalError> {
+            self.hub
+                .get::<dyn PlatformTypesRegistryApi>()
+                .expect("platform API")
+                .get_type_schema(
+                    &PlatformSecurityContext::outbound_marker(),
+                    &GtsTypeId::new(type_id),
+                    ReadOptions {
+                        projection: Projection::Select(FieldSelection::with(&[
+                            EntityField::Origin,
+                            EntityField::EffectiveTraits,
+                        ])),
+                        ..ReadOptions::default()
+                    },
+                )
+                .await
+        }
+    }
+
+    /// The AM tenant-resolver plugin's instance identifier.
+    fn tr_instance_id() -> types_registry_sdk::GtsInstanceId {
+        tenant_resolver_sdk::TenantResolverPluginSpecV1::gts_make_instance_id(
+            "cf.builtin.account_management_tenant_resolver.plugin.v1",
+        )
+    }
+
+    /// The stored AM tenant-resolver plugin instance's revision and
+    /// document, if any.
+    async fn tr_instance(booted: &Booted) -> Option<(u64, Value)> {
+        let read = booted
+            .hub
+            .get::<dyn PlatformTypesRegistryApi>()
+            .expect("platform API")
+            .get_instance(
+                &PlatformSecurityContext::outbound_marker(),
+                &tr_instance_id(),
+                ReadOptions {
+                    projection: Projection::Select(FieldSelection::with(&[
+                        EntityField::Origin,
+                        EntityField::Content,
+                    ])),
+                    ..ReadOptions::default()
+                },
+            )
+            .await;
+        match read {
+            Ok(instance) => match instance.origin {
+                Some(Origin::Managed {
+                    resource_version, ..
+                }) => Some((
+                    resource_version,
+                    instance.content.expect("selected content"),
+                )),
+                other => panic!("a managed origin, got {other:?}"),
+            },
+            Err(CanonicalError::NotFound { .. }) => None,
+            Err(error) => panic!("instance read failed: {error:?}"),
+        }
+    }
+
+    /// The stored AM tenant-resolver plugin instance's revision, if any.
+    async fn tr_instance_revision(booted: &Booted) -> Option<u64> {
+        tr_instance(booted).await.map(|(revision, _)| revision)
+    }
+
+    fn resource_version(schema: &TypeSchema) -> u64 {
+        match schema.origin {
+            Some(Origin::Managed {
+                resource_version, ..
+            }) => resource_version,
+            ref other => panic!("a managed origin, got {other:?}"),
+        }
+    }
+
+    fn am_config(root_type: &str, idp_provisioning: bool, tr_plugin_enabled: bool) -> Value {
+        json!({
+            "root_tenant_type": { "gts_id": root_type, "idp_provisioning": idp_provisioning },
+            "tr_plugin": { "enabled": tr_plugin_enabled, "priority": 0 },
+        })
+    }
+
+    /// AM with its tenant-resolver plugin enabled at `priority`.
+    fn tr_plugin_config(priority: i16) -> Value {
+        json!({
+            "root_tenant_type": { "gts_id": ROOT_TENANT_TYPE, "idp_provisioning": false },
+            "tr_plugin": { "enabled": true, "priority": priority },
+        })
+    }
+
+    #[tokio::test]
+    async fn an_equal_restart_keeps_the_root_revision_and_an_allowed_change_converges() {
+        let data = DataRoot::new();
+
+        let first = data
+            .boot(am_config(ROOT_TENANT_TYPE, false, false))
+            .await
+            .expect("first boot");
+        let admitted = resource_version(&first.root(ROOT_TENANT_TYPE).await.expect("root"));
+        first.shutdown().await;
+
+        let equal = data
+            .boot(am_config(ROOT_TENANT_TYPE, false, false))
+            .await
+            .expect("equal restart");
+        let root = equal.root(ROOT_TENANT_TYPE).await.expect("root");
+        assert_eq!(
+            resource_version(&root),
+            admitted,
+            "an equal restart writes nothing"
+        );
+        equal.shutdown().await;
+
+        let changed = data
+            .boot(am_config(ROOT_TENANT_TYPE, true, false))
+            .await
+            .expect("idp_provisioning may change");
+        let root = changed.root(ROOT_TENANT_TYPE).await.expect("root");
+        assert!(
+            resource_version(&root) > admitted,
+            "the change is a new revision"
         );
         assert_eq!(
-            runtime_root
-                .parent
-                .as_ref()
-                .map(|parent| parent.type_id.as_ref()),
-            Some("gts.cf.core.am.tenant_type.v1~")
+            root.effective_traits,
+            Some(json!({"allowed_parent_types": [], "idp_provisioning": true}))
         );
+        changed.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_custom_root_type_is_published() {
+        let custom = "gts.cf.core.am.tenant_type.v1~acme.core.am.platform.v1~";
+        let data = DataRoot::new();
+        let booted = data
+            .boot(am_config(custom, false, false))
+            .await
+            .expect("AM publishes the configured custom root");
+        let root = booted.root(custom).await.expect("published custom root");
+        assert_eq!(root.type_id.as_ref(), custom);
+        booted.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_refused_root_publication_fails_before_am_init() {
+        let data = DataRoot::new();
+        data.registry.reject(
+            ROOT_TENANT_TYPE,
+            types_registry_sdk::AdmissionFailureReason::InvalidSchema,
+        );
+        let hub = Arc::new(ClientHub::new());
+        let error = data
+            .boot_into(Arc::clone(&hub), am_config(ROOT_TENANT_TYPE, false, false))
+            .await
+            .err()
+            .expect("the registry refused AM's root");
+        assert!(format!("{error:#}").contains(ROOT_TENANT_TYPE), "{error:#}");
+        assert!(
+            hub.try_get_local::<dyn account_management_sdk::AccountManagementClient>()
+                .is_none(),
+            "AM must not initialize after a refused root publication"
+        );
+    }
+
+    /// The tenant-resolver core over `booted`'s hub, reading a tenant.
+    async fn resolve_root(booted: &Booted) -> Result<tenant_resolver_sdk::TenantInfo, String> {
+        let service = tenant_resolver::domain::Service::new(
+            Arc::clone(&booted.hub),
+            "constructorfabric".to_owned(),
+        );
+        let ctx = SecurityContext::builder()
+            .subject_id(Uuid::from_u128(0xCAFE))
+            .subject_tenant_id(Uuid::parse_str(ROOT_ID).expect("uuid"))
+            .build()
+            .expect("ctx");
+        service
+            .get_tenant(&ctx, TenantId(Uuid::parse_str(ROOT_ID).expect("uuid")))
+            .await
+            .map_err(|error| format!("{error:?}"))
+    }
+
+    async fn seed_root(booted: &Booted) {
+        let now = time::OffsetDateTime::now_utc();
+        let provider = crate::infra::storage::repo_impl::AmDbProvider::new(booted.am_db.clone());
+        secure_insert::<tenants::Entity>(
+            tenants::ActiveModel {
+                id: ActiveValue::Set(Uuid::parse_str(ROOT_ID).expect("uuid")),
+                parent_id: ActiveValue::Set(None),
+                name: ActiveValue::Set("platform-root".to_owned()),
+                status: ActiveValue::Set(
+                    crate::domain::tenant::model::TenantStatus::Active.as_smallint(),
+                ),
+                self_managed: ActiveValue::Set(false),
+                tenant_type_uuid: ActiveValue::Set(
+                    gts::GtsId::try_new(ROOT_TENANT_TYPE)
+                        .expect("valid id")
+                        .to_uuid(),
+                ),
+                depth: ActiveValue::Set(0),
+                created_at: ActiveValue::Set(now),
+                updated_at: ActiveValue::Set(now),
+                deleted_at: ActiveValue::Set(None),
+                retention_window_secs: ActiveValue::Set(None),
+                claimed_by: ActiveValue::Set(None),
+                claimed_at: ActiveValue::Set(None),
+                terminal_failure_at: ActiveValue::Set(None),
+            },
+            &AccessScope::allow_all(),
+            &provider.conn().expect("conn"),
+        )
+        .await
+        .expect("seed the platform root");
+    }
+
+    #[tokio::test]
+    async fn the_am_tenant_resolver_plugin_serves_when_enabled_and_is_skipped_when_disabled() {
+        let data = DataRoot::new();
+
+        let enabled = data
+            .boot(am_config(ROOT_TENANT_TYPE, false, true))
+            .await
+            .expect("enabled boot");
+        seed_root(&enabled).await;
+        let info = resolve_root(&enabled)
+            .await
+            .expect("AM serves the tenant query");
+        assert_eq!(info.tenant_type.as_deref(), Some(ROOT_TENANT_TYPE));
+        let published = tr_instance_revision(&enabled)
+            .await
+            .expect("the enabled plugin published its instance");
+        enabled.shutdown().await;
+
+        // The instance published by the first boot is still stored; the
+        // disabled plugin registers no backend, so nothing selects it.
+        let disabled = data
+            .boot(am_config(ROOT_TENANT_TYPE, false, false))
+            .await
+            .expect("disabled boot");
+        let error = resolve_root(&disabled)
+            .await
+            .expect_err("no running plugin");
+        assert!(error.contains("PluginNotFound"), "{error}");
+        assert_eq!(
+            tr_instance_revision(&disabled).await,
+            Some(published),
+            "disabling neither deletes nor rewrites the stored instance"
+        );
+        disabled.shutdown().await;
+
+        let again = data
+            .boot(am_config(ROOT_TENANT_TYPE, false, true))
+            .await
+            .expect("re-enabled boot");
+        let info = resolve_root(&again)
+            .await
+            .expect("re-enabled AM serves again");
+        assert_eq!(info.id.0, Uuid::parse_str(ROOT_ID).expect("uuid"));
+        assert_eq!(
+            tr_instance_revision(&again).await,
+            Some(published),
+            "re-enabling with the same instance writes nothing"
+        );
+        again.shutdown().await;
+    }
+
+    /// A restart under a changed plugin spec revises the stored instance:
+    /// the revision advances and the stored document carries the new
+    /// priority, where the legacy registration refused a different spec.
+    #[tokio::test]
+    async fn a_restart_with_a_changed_priority_revises_the_instance() {
+        let data = DataRoot::new();
+
+        let first = data.boot(tr_plugin_config(0)).await.expect("first boot");
+        let (published, content) = tr_instance(&first).await.expect("published");
+        assert_eq!(content["priority"], json!(0));
+        first.shutdown().await;
+
+        let changed = data
+            .boot(tr_plugin_config(5))
+            .await
+            .expect("a changed priority is a revision");
+        let (revised, content) = tr_instance(&changed).await.expect("stored");
+        assert!(revised > published, "{revised} after {published}");
+        assert_eq!(content["priority"], json!(5));
+        changed.shutdown().await;
+    }
+
+    /// A refused publication fails AM's `startup` task naming the instance, and no
+    /// tenant-resolver plugin backend is bound for it.
+    #[tokio::test]
+    async fn a_refused_publication_fails_boot_and_binds_no_backend() {
+        let data = DataRoot::new();
+        let first = data.boot(tr_plugin_config(0)).await.expect("first boot");
+        let (revision, _) = tr_instance(&first).await.expect("published");
+        delete_tr_instance(&first, revision).await;
+        first.shutdown().await;
+
+        // A revision of a deleted entity is refused (`EntityDeleted`).
+        let hub = Arc::new(ClientHub::new());
+        let error = data
+            .boot_into(Arc::clone(&hub), tr_plugin_config(5))
+            .await
+            .err()
+            .expect("a refused publication fails startup");
+        let message = format!("{error:#}");
+        assert!(message.contains(tr_instance_id().as_ref()), "{message}");
+        assert!(message.contains("entity_deleted"), "{message}");
+        assert!(
+            hub.try_get_scoped::<dyn tenant_resolver_sdk::TenantResolverPluginClient>(
+                &toolkit::client_hub::ClientScope::gts_id(tr_instance_id().as_ref()),
+            )
+            .is_none(),
+            "no backend is bound for a refused instance"
+        );
+    }
+
+    /// A required `IdP` plugin that is not there goes through the bootstrap
+    /// saga's own policy, as before the GTS barrier: after `idp_wait_timeout`
+    /// a strict bootstrap fails `serve`, a non-strict one proceeds without a
+    /// root. Nothing waits for the plugin outside the saga.
+    #[tokio::test]
+    async fn a_missing_required_idp_plugin_reaches_the_bootstrap_policy() {
+        for strict in [true, false] {
+            let data = DataRoot::new();
+            let config = json!({
+                "root_tenant_type": { "gts_id": ROOT_TENANT_TYPE, "idp_provisioning": false },
+                "idp": { "required": true, "vendor": "cf" },
+                "bootstrap": {
+                    "root_id": ROOT_ID,
+                    "root_name": "platform-root",
+                    "strict": strict,
+                    "idp_wait_timeout": "1s",
+                    "idp_retry_backoff_initial": "100ms",
+                    "idp_retry_backoff_max": "200ms",
+                },
+            });
+            let booted = data
+                .start_into(Arc::new(ClientHub::new()), config)
+                .await
+                .expect("init");
+
+            let settled = startup_settled(&booted).await;
+            if strict {
+                assert!(settled.is_err(), "strict: serve fails, it does not wait");
+                assert_eq!(booted.am.status(), toolkit::lifecycle::Status::Stopped);
+            } else {
+                settled.expect("non-strict: serve proceeds");
+                assert_eq!(booted.am.status(), toolkit::lifecycle::Status::Running);
+            }
+            let repo = crate::infra::storage::repo_impl::TenantRepoImpl::new(Arc::new(
+                crate::infra::storage::repo_impl::AmDbProvider::new(booted.am_db.clone()),
+            ));
+            assert!(
+                crate::domain::tenant::TenantRepo::find_platform_root(
+                    &repo,
+                    &AccessScope::allow_all()
+                )
+                .await
+                .expect("read")
+                .is_none(),
+                "strict={strict}: no root without the IdP"
+            );
+            booted.shutdown().await;
+        }
+    }
+
+    /// Deletes the stored AM tenant-resolver plugin instance at `revision`
+    /// and waits for the deletion to complete.
+    async fn delete_tr_instance(booted: &Booted, revision: u64) {
+        let registry = booted
+            .hub
+            .get::<dyn PlatformTypesRegistryApi>()
+            .expect("platform API");
+        let ctx = PlatformSecurityContext::outbound_marker();
+        let accepted = registry
+            .delete_entities(
+                &ctx,
+                types_registry_sdk::IdempotencyKey::new("delete-am-tr-instance").expect("key"),
+                types_registry_sdk::DeleteEntitiesRequest {
+                    items: vec![types_registry_sdk::DeleteItem {
+                        key: types_registry_sdk::EntityKey::from(
+                            types_registry_sdk::GtsId::try_new(tr_instance_id().as_ref())
+                                .expect("valid id"),
+                        ),
+                        expected_resource_version: revision,
+                    }],
+                    dry_run: false,
+                    publisher: types_registry_sdk::PublisherContext {
+                        name: "test".to_owned(),
+                        version: "0.0.0".parse().expect("version"),
+                    },
+                },
+            )
+            .await
+            .expect("deletion accepted");
+        for _ in 0..200 {
+            let operation = registry
+                .get_operation(&ctx, accepted.operation_id)
+                .await
+                .expect("operation");
+            if let types_registry_sdk::Operation::Deletion(done) = &operation
+                && done.status == types_registry_sdk::OperationStatus::Completed
+            {
+                assert!(
+                    matches!(
+                        done.items[0].outcome,
+                        types_registry_sdk::DeletionOutcome::Succeeded { .. }
+                    ),
+                    "{:?}",
+                    done.items[0].outcome
+                );
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        panic!("the deletion did not complete");
     }
 }

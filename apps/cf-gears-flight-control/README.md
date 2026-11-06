@@ -80,3 +80,20 @@ flight-control --config <path> --print-config
 
 A ready-to-run dev config (the `static-authn` default) lives at
 `config/flight-control.yaml`.
+
+## Helm registry database
+
+The Helm chart stores the embedded types-registry catalogue in external PostgreSQL.
+Set `postgres.host`, `postgres.port`, `postgres.database`, `postgres.user` and
+`postgres.password` in chart values. Provision the database and user before starting
+the application; the chart does not install PostgreSQL. The password is rendered into
+a Kubernetes Secret and supplied as `DB_PASSWORD`, while the ConfigMap contains only
+`${DB_PASSWORD}`. The api-contracts example charts keep their local SQLite
+catalogues and do not require PostgreSQL.
+
+PostgreSQL wiring belongs to this chart. Its templates pass the connection settings,
+credentials and environment variable through `toolkit-common`'s existing `config.data`,
+`secrets[]` and `extraEnv` inputs. Explicit `config.data.database.servers.postgres` fields
+override the connection defaults; configuration and Secret checksums trigger pod rollouts.
+
+Local YAML examples under `config/` continue to use SQLite.

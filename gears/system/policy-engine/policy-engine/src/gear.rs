@@ -1,14 +1,13 @@
-//! Policy-engine wiring and readiness.
+//! Policy-engine wiring after the runtime's GTS admission barrier.
 //!
-//! `init` validates configuration, compiles built-ins, builds services and
-//! registers the management client and scoped admission plugin. Resource-type
-//! validation waits for `post_init`, after legacy registry finalization.
-//! Any validation finding fails startup. No background tasks run; the gear
-//! is ready after `post_init`.
+//! The runtime publishes this gear's SDK declarations and configured engine
+//! instance before `init`. Initialization validates and compiles all built-ins
+//! against the platform catalog, builds the services and binds the admitted
+//! scoped engine client. Request validation reads the catalog under its caller.
 
 use std::sync::{Arc, OnceLock};
 
-use admission_control_sdk::AdmissionEnginePluginClientV1;
+use admission_control_sdk::{AdmissionEnginePluginClientV1, AdmissionEnginePluginSpecV1};
 use anyhow::Context as _;
 use async_trait::async_trait;
 use authz_resolver_sdk::{AuthZResolverApi, PolicyEnforcer};
@@ -16,12 +15,13 @@ use policy_engine_sdk::PolicyManagementClientV1;
 use sea_orm_migration::MigratorTrait;
 use tenant_resolver_sdk::TenantResolverClient;
 use toolkit::api::OpenApiRegistry;
-use toolkit::client_hub::ClientScope;
 use toolkit::contracts::DatabaseCapability;
+use toolkit::gts_publication::GtsPublicationInputs;
+use toolkit::plugins::bind_plugin_instances;
 use toolkit::{ClientHub, Gear, GearCtx, Healthcheck, HealthcheckResult, RestApiCapability};
 use toolkit_db::Db;
 use toolkit_db::odata::LimitCfg;
-use types_registry_sdk::{RegisterResult, TypesRegistryClient};
+use types_registry_sdk::{GtsId, PlatformTypesRegistryApi, TypesRegistryApi};
 
 use crate::config::PolicyEngineConfig;
 use crate::domain::decision::{BuiltinPolicySet, CompileCache, DecisionMetrics, DecisionService};
@@ -30,7 +30,7 @@ use crate::domain::management::{
     ManagementService, ManagementServiceParts, PolicyManagementLocalClient, StoreSet,
 };
 use crate::domain::model::Document;
-use crate::domain::ports::{HierarchyPort, TypeCatalogPort};
+use crate::domain::ports::{HierarchyPort, TypeCatalogPort, TypeCatalogScope};
 use crate::domain::validation::{ContentValidator, Finding};
 use crate::infra::binding_source::DbBindingSource;
 use crate::infra::metrics::PolicyEngineMetrics;
@@ -50,20 +50,37 @@ type Store = StoreSet<OrmBundleRepository, OrmVersionRepository, OrmAssignmentRe
 
 struct Wired {
     management_client: Arc<dyn PolicyManagementClientV1>,
-    /// The built-in policies, for the registry check of `post_init`.
-    builtins: Vec<Document>,
-    validator: Arc<ContentValidator>,
 }
 
 /// The policy-engine gear.
+#[toolkit::consumes(contract = types_registry_sdk::PlatformTypesRegistryApi, from = "types-registry")]
+#[toolkit::consumes(contract = types_registry_sdk::TypesRegistryApi, from = "types-registry")]
 #[toolkit::gear(
     name = "policy-engine",
-    deps = [types_registry, tenant_resolver, authz_resolver],
-    capabilities = [db, rest]
+    deps = [tenant_resolver, authz_resolver],
+    capabilities = [db, rest],
+    gts_publication(crates = [policy_engine_sdk], entities = Self::plugin_instance),
 )]
 #[derive(Default)]
 pub struct PolicyEngine {
     wired: OnceLock<Wired>,
+}
+
+impl PolicyEngine {
+    /// The configured engine instance, published before any application init.
+    fn plugin_instance(
+        inputs: &GtsPublicationInputs<'_>,
+    ) -> anyhow::Result<Vec<(GtsId, serde_json::Value)>> {
+        let config: PolicyEngineConfig = inputs.config_or_default()?;
+        config
+            .validate()
+            .context("policy-engine: configuration rejected")?;
+        let (id, document) = engine_plugin::registration(
+            &config.engine_plugin.vendor,
+            config.engine_plugin.priority,
+        )?;
+        Ok(vec![(GtsId::try_new(id.as_ref())?, document)])
+    }
 }
 
 impl std::fmt::Debug for PolicyEngine {
@@ -77,6 +94,7 @@ impl std::fmt::Debug for PolicyEngine {
 #[async_trait]
 impl Gear for PolicyEngine {
     async fn init(&self, ctx: &GearCtx) -> anyhow::Result<()> {
+        let admitted = ctx.gts_publication_manifest()?;
         let config: PolicyEngineConfig = ctx
             .config_or_default()
             .context("policy-engine: invalid configuration")?;
@@ -95,23 +113,26 @@ impl Gear for PolicyEngine {
         let clients = Clients::resolve(ctx)?;
         let types: Arc<dyn TypeCatalogPort> = Arc::new(RegistryTypeCatalog::new(
             Arc::clone(&clients.types_registry),
+            Arc::clone(&clients.platform_registry),
             config.registry_timeout,
         ));
         let validator = Arc::new(ContentValidator::new(types, config.content_limits()));
         let documents = config.builtin_documents();
         let builtins = load_builtins(&validator, &documents)
+            .await
             .context("policy-engine: built-in policies rejected")?;
         let builtin_count = builtins.len();
         let (decision, management_client) =
             build_services(&config, &db, &clients, Arc::clone(&validator), builtins);
-        register_clients_and_plugin(&clients, &config, &decision, &management_client).await?;
+        register_clients_and_plugin(
+            &clients,
+            admitted.documents(),
+            &decision,
+            &management_client,
+        )?;
 
         self.wired
-            .set(Wired {
-                management_client,
-                builtins: documents,
-                validator,
-            })
+            .set(Wired { management_client })
             .map_err(|_| anyhow::anyhow!("{} gear already initialized", Self::MODULE_NAME))?;
         tracing::info!(
             builtin_policies = builtin_count,
@@ -121,33 +142,12 @@ impl Gear for PolicyEngine {
         );
         Ok(())
     }
-
-    /// Completes the built-ins' validation with the types registry, after
-    /// the runtime finalized every application gear's legacy registration.
-    async fn post_init(&self, _ctx: &GearCtx) -> anyhow::Result<()> {
-        let wired = self
-            .wired
-            .get()
-            .ok_or_else(|| anyhow::anyhow!("{}: not initialised", Self::MODULE_NAME))?;
-        if wired.builtins.is_empty() {
-            return Ok(());
-        }
-        let findings = wired
-            .validator
-            .validate(&wired.builtins)
-            .await
-            .map_err(|e| {
-                anyhow::anyhow!(
-                    "policy-engine: built-in policies rejected: types registry could not be consulted: {e}"
-                )
-            })?;
-        reject_findings(&findings).context("policy-engine: built-in policies rejected")
-    }
 }
 
 struct Clients {
     hub: Arc<ClientHub>,
-    types_registry: Arc<dyn TypesRegistryClient>,
+    types_registry: Arc<dyn TypesRegistryApi>,
+    platform_registry: Arc<dyn PlatformTypesRegistryApi>,
     tenant_resolver: Arc<dyn TenantResolverClient>,
     authz: Arc<dyn AuthZResolverApi>,
 }
@@ -155,8 +155,11 @@ struct Clients {
 impl Clients {
     fn resolve(ctx: &GearCtx) -> anyhow::Result<Self> {
         let hub = ctx.client_hub();
-        let types_registry = hub.get::<dyn TypesRegistryClient>().map_err(|e| {
+        let types_registry = hub.get::<dyn TypesRegistryApi>().map_err(|e| {
             anyhow::anyhow!("policy-engine: types-registry client unavailable: {e}")
+        })?;
+        let platform_registry = hub.get::<dyn PlatformTypesRegistryApi>().map_err(|e| {
+            anyhow::anyhow!("policy-engine: platform types-registry client unavailable: {e}")
         })?;
         let tenant_resolver = hub.get::<dyn TenantResolverClient>().map_err(|e| {
             anyhow::anyhow!("policy-engine: tenant-resolver client unavailable: {e}")
@@ -167,23 +170,25 @@ impl Clients {
         Ok(Self {
             hub,
             types_registry,
+            platform_registry,
             tenant_resolver,
             authz,
         })
     }
 }
 
-/// Validates the configured built-in policies like a bundle version's
-/// documents, except for the types registry check `post_init` completes,
-/// then compiles them.
-fn load_builtins(
+/// Fully validates configured built-ins after admission, then compiles them.
+async fn load_builtins(
     validator: &ContentValidator,
     documents: &[Document],
 ) -> anyhow::Result<BuiltinPolicySet> {
     if documents.is_empty() {
         return Ok(BuiltinPolicySet::default());
     }
-    reject_findings(&validator.validate_offline(documents))?;
+    let findings = validator
+        .validate(TypeCatalogScope::Platform, documents)
+        .await?;
+    reject_findings(&findings)?;
     Ok(BuiltinPolicySet::compile(documents)?)
 }
 
@@ -246,34 +251,18 @@ fn build_services(
     (decision, management_client)
 }
 
-async fn register_clients_and_plugin(
+fn register_clients_and_plugin(
     clients: &Clients,
-    config: &PolicyEngineConfig,
+    admitted: &[(GtsId, serde_json::Value)],
     decision: &Arc<DecisionService>,
     management_client: &Arc<dyn PolicyManagementClientV1>,
 ) -> anyhow::Result<()> {
+    let plugin: Arc<dyn AdmissionEnginePluginClientV1> =
+        Arc::new(PolicyEngineAdmissionPlugin::new(Arc::clone(decision)));
+    bind_plugin_instances::<AdmissionEnginePluginSpecV1, _>(&clients.hub, admitted, &plugin)?;
     clients
         .hub
         .register::<dyn PolicyManagementClientV1>(Arc::clone(management_client));
-
-    let (plugin_instance_id, plugin_json) =
-        engine_plugin::registration(&config.engine_plugin.vendor, config.engine_plugin.priority)
-            .map_err(|e| {
-                anyhow::anyhow!("policy-engine: engine plugin registration could not be built: {e}")
-            })?;
-    let results = clients
-        .types_registry
-        .register(vec![plugin_json])
-        .await
-        .map_err(|e| anyhow::anyhow!("policy-engine: engine plugin registration failed: {e}"))?;
-    RegisterResult::ensure_all_ok(&results)
-        .map_err(|e| anyhow::anyhow!("policy-engine: engine plugin registration rejected: {e}"))?;
-    clients
-        .hub
-        .register_scoped::<dyn AdmissionEnginePluginClientV1>(
-            ClientScope::gts_id(&plugin_instance_id),
-            Arc::new(PolicyEngineAdmissionPlugin::new(Arc::clone(decision))),
-        );
     Ok(())
 }
 

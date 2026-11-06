@@ -34,6 +34,8 @@ database:
 
 gears:
   types-registry:
+    # AuthN plugins publish their instances to, and authn-resolver selects them from,
+    # the registry's database-backed catalogue.
     # The platform API the event broker reads topics and event types through is
     # published only with a registry database. It persists under `home_dir`, in
     # `types-registry/types_registry.db`: a restart applies edits to the seeds

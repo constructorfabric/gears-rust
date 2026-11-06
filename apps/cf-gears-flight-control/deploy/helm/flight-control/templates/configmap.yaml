@@ -1,1 +1,3 @@
-{{- include "toolkit-common.configmap" . }}
+{{- $ctx := deepCopy . -}}
+{{- $_ := set $ctx.Values.config.data "database" (include "flight-control.postgres-config" . | fromYaml) -}}
+{{- include "toolkit-common.configmap" $ctx }}

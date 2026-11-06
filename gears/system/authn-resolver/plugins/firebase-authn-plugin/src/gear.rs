@@ -8,28 +8,50 @@ use authn_resolver_sdk::{
 };
 use secrecy::SecretString;
 use std::sync::{Arc, OnceLock};
-use toolkit::client_hub::ClientScope;
+use toolkit::gts_publication::GtsPublicationInputs;
+use toolkit::plugins::bind_plugin_instances;
 use toolkit::{Gear, GearCtx};
 use toolkit_gts::PluginV1;
 use toolkit_security::SecurityContext;
 use tracing::{debug, warn};
-use types_registry_sdk::{RegisterResult, TypesRegistryClient};
+use types_registry_sdk::GtsId;
 use uuid::Uuid;
 
 /// The GTS suffix this plugin registers under the `AuthN` resolver's plugin spec.
 pub const PLUGIN_SUFFIX: &str = "cf.builtin.firebase_authn.plugin.v1";
 
 /// The Firebase `AuthN` plugin gear. Registers one scoped
-/// [`AuthNResolverPluginClient`] for its configured vendor and priority.
-#[toolkit::gear(name = "firebase-authn-plugin", deps = [types_registry])]
+/// [`AuthNResolverPluginClient`] after the runtime admits its configured instance.
+#[toolkit::gear(
+    name = "firebase-authn-plugin",
+    gts_publication(entities = Self::plugin_instance),
+)]
 #[derive(Default)]
 pub struct FirebaseAuthnPlugin {
     service: OnceLock<Arc<FirebaseService>>,
 }
 
+impl FirebaseAuthnPlugin {
+    /// Validate configuration before publishing the instance, without constructing
+    /// the verifier or exposing configured identities in the GTS document.
+    fn plugin_instance(
+        inputs: &GtsPublicationInputs<'_>,
+    ) -> anyhow::Result<Vec<(GtsId, serde_json::Value)>> {
+        let config: FirebaseAuthnPluginConfig = inputs.config_expanded_or_default()?;
+        config.validate()?;
+        let (id, document) = PluginV1::<AuthNResolverPluginSpecV1>::build_registration(
+            PLUGIN_SUFFIX,
+            config.vendor,
+            config.priority,
+        )?;
+        Ok(vec![(GtsId::try_new(id.as_ref())?, document)])
+    }
+}
+
 #[async_trait]
 impl Gear for FirebaseAuthnPlugin {
     async fn init(&self, ctx: &GearCtx) -> anyhow::Result<()> {
+        let manifest = ctx.gts_publication_manifest()?;
         let config: FirebaseAuthnPluginConfig = ctx.config_expanded_or_default()?;
         config.validate()?;
         let verifier = FirebaseVerifier::new(
@@ -43,20 +65,16 @@ impl Gear for FirebaseAuthnPlugin {
                 })
                 .collect(),
         )?;
-        let (id, registration) = PluginV1::<AuthNResolverPluginSpecV1>::build_registration(
-            PLUGIN_SUFFIX,
-            config.vendor.clone(),
-            config.priority,
-        )?;
-        let registry = ctx.client_hub().get::<dyn TypesRegistryClient>()?;
-        RegisterResult::ensure_all_ok(&registry.register(vec![registration]).await?)?;
         let service = Arc::new(FirebaseService { config, verifier });
         self.service
             .set(service.clone())
             .map_err(|_| anyhow::anyhow!("Firebase plugin already initialized"))?;
-        ctx.client_hub()
-            .register_scoped::<dyn AuthNResolverPluginClient>(ClientScope::gts_id(&id), service);
-        Ok(())
+        let api: Arc<dyn AuthNResolverPluginClient> = service;
+        bind_plugin_instances::<AuthNResolverPluginSpecV1, _>(
+            &ctx.client_hub(),
+            manifest.documents(),
+            &api,
+        )
     }
 }
 
@@ -258,3 +276,7 @@ mod tests {
         ));
     }
 }
+
+#[cfg(test)]
+#[path = "gear_tests.rs"]
+mod gear_tests;

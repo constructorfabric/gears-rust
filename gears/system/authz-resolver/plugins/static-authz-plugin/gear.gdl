@@ -8,9 +8,11 @@ gdl_version = "1.0"
 # static, tenant-scoped policy. The point is declared by `implements`; vendor and
 # priority are read from source.
 #
+# Runtime `gts_publication(...)` publication uses the local or remote platform registry API.
+# The instance must be admitted before this application plugin binds its client in `init`.
 
 gear(
-    deps = ["types-registry"],
+    deps = [],
     source = git(url = "https://github.com/constructorfabric/gears-rust", path = "gears/system/authz-resolver/plugins/static-authz-plugin"),
     maturity = "preview",
     name = "Static AuthZ Plugin",

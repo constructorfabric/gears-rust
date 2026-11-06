@@ -26,7 +26,7 @@
 #
 # usage-collector itself declares no `db` capability (all durable usage rows
 # live in the bound storage plugin's own ClickHouse, via `database_url`
-# below) and types-registry is in-memory. BUT a top-level `database:` section
+# below). BUT a top-level `database:` section
 # IS required regardless: `credstore`, `resource-group`, `simple-user-settings`,
 # and `file-parser` are gears compiled unconditionally into
 # cf-gears-example-server (not gated by any cargo feature — see
@@ -78,6 +78,10 @@ gears:
       listen_addr: "uds:///tmp/cf-gears-grpc-uc-ch-e2e"
 
   types-registry:
+    # The tenant-resolver plugins publish through the database-backed registry API.
+    database:
+      server: "sqlite_uc_e2e"
+      file: "types_registry.db"
     config: {}
 
   tenant-resolver:

@@ -1,45 +1,35 @@
-//! `GtsTenantTypeChecker` — the production [`TenantTypeChecker`] wired
-//! against `types_registry_sdk::TypesRegistryClient` resolved from
-//! `ClientHub`.
+//! Production [`TenantTypeChecker`] over `types_registry_sdk::TypesRegistryApi`.
+//! Each check uses the request's context without retaining it (P33).
 //!
-//! Implements `algo-allowed-parent-types-evaluation` and
-//! `algo-same-type-nesting-admission` (FEATURE 2.3
-//! `tenant-type-enforcement`):
+//! For Feature 2.3 (`algo-allowed-parent-types-evaluation`,
+//! `algo-same-type-nesting-admission`):
 //!
-//! 1. Resolve the GTS [`GtsTypeSchema`] for the child (and, for
-//!    different-parent calls, also the parent) via
-//!    [`TypesRegistryClient::get_type_schemas_by_uuid`] — one batched
-//!    round-trip.
-//! 2. Reject children whose chain does not descend from the
-//!    `gts.cf.core.am.tenant_type.v1~` envelope (the only schema whose
-//!    `x-gts-traits-schema` defines `allowed_parent_types`).
-//! 3. Read the effective `allowed_parent_types` trait via
-//!    [`GtsTypeSchema::effective_traits`] (the SDK does the chain
-//!    merge: leaf-declared values win, then deepest-base defaults).
-//! 4. Admit iff the parent's chained GTS identifier is a member of the
-//!    list. Same-type nesting (`parent == child`) is admitted iff the
-//!    type's own identifier appears in its own `allowed_parent_types`
-//!    per `algo-same-type-nesting-admission`.
-//! 5. Map registry transport / trait-resolution failures onto
-//!    [`DomainError::ServiceUnavailable`]; not-registered children or
-//!    parents onto [`DomainError::InvalidTenantType`]; admitted-but-
-//!    rejected pairings onto [`DomainError::TypeNotAllowed`].
+//! 1. Batch-read the child and, if different, parent schemas' `effective_traits`.
+//! 2. Require the `gts.cf.core.am.tenant_type.v1~` envelope.
+//! 3. Admit only when the effective `allowed_parent_types` contains the parent's
+//!    chained ID, including the type's own ID for same-type nesting.
 //!
-//! The barrier MUST NOT cache schemas across calls
-//! (`dod-tenant-type-enforcement-gts-availability-surface`); every
-//! invocation re-resolves against GTS so trait updates and re-types
-//! take effect immediately. The SDK's `get_type_schemas_by_uuid`
-//! implementation is responsible for any short-lived caching it
-//! chooses to do internally.
+//! Admission materializes traits with leaf values taking precedence over
+//! deepest-base defaults. Missing selected traits are a contract break.
+//! Unregistered types map to [`DomainError::InvalidTenantType`], disallowed
+//! pairings to [`DomainError::TypeNotAllowed`]; registry faults use the caller
+//! error classifier.
+//!
+//! No adapter cache (`dod-tenant-type-enforcement-gts-availability-surface`);
+//! short-lived caching belongs to the SDK client.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use toolkit_gts::gts_id;
 
 use async_trait::async_trait;
 use serde_json::Value;
-use toolkit_canonical_errors::CanonicalError;
-use types_registry_sdk::{GtsTypeSchema, TypesRegistryClient};
+use toolkit_security::SecurityContext;
+use types_registry_sdk::{
+    EntityField, FieldSelection, GtsId, LifecycleStatus, Projection, ReadOptions, TypeSchema,
+    TypesRegistryApi, TypesRegistryApiExt,
+};
 use uuid::Uuid;
 
 use crate::domain::error::DomainError;
@@ -67,138 +57,109 @@ const DEFAULT_PROBE_TIMEOUT_MS: u64 = 2_000;
 
 /// Production [`TenantTypeChecker`] backed by the GTS Types Registry.
 pub struct GtsTenantTypeChecker {
-    registry: Arc<dyn TypesRegistryClient + Send + Sync>,
+    registry: Arc<dyn TypesRegistryApi>,
     probe_timeout: Duration,
 }
 
 impl GtsTenantTypeChecker {
     /// Construct a new checker around a registry client resolved from
-    /// `ClientHub`, using the backward-compatible default timeout.
+    /// `ClientHub`, using the default probe timeout.
     #[must_use]
-    pub fn new(registry: Arc<dyn TypesRegistryClient + Send + Sync>) -> Self {
+    pub fn new(registry: Arc<dyn TypesRegistryApi>) -> Self {
         Self::with_timeout(registry, DEFAULT_PROBE_TIMEOUT_MS)
     }
 
-    /// Construct a checker with the configured probe timeout.
+    /// Construct a checker with an explicit GTS probe timeout (ms).
     #[must_use]
-    pub fn with_timeout(
-        registry: Arc<dyn TypesRegistryClient + Send + Sync>,
-        probe_timeout_ms: u64,
-    ) -> Self {
+    pub fn with_timeout(registry: Arc<dyn TypesRegistryApi>, probe_timeout_ms: u64) -> Self {
         Self {
             registry,
             probe_timeout: Duration::from_millis(probe_timeout_ms.max(1)),
         }
     }
 
-    /// Whether `schema` descends from
-    /// [`TENANT_TYPE_BASE_GTS_ID`] in its inheritance chain. Walks
-    /// `ancestors()` (self → parent → ...) so a leaf, a mid-chain, and
-    /// the envelope itself all count as "under the envelope."
-    fn descends_from_tenant_type_envelope(schema: &GtsTypeSchema) -> bool {
-        schema
-            .ancestors()
-            .any(|s| s.type_id.as_ref() == TENANT_TYPE_BASE_GTS_ID)
+    /// Whether the schema's GTS chain starts at the AM tenant-type envelope.
+    fn descends_from_tenant_type_envelope(schema: &TypeSchema) -> bool {
+        GtsId::try_new(schema.type_id.as_ref())
+            .ok()
+            .and_then(|id| id.chain_ids().into_iter().next())
+            .is_some_and(|root| root == TENANT_TYPE_BASE_GTS_ID)
     }
 
-    /// Extract `allowed_parent_types` from an effective trait map.
-    /// Returns `None` on any malformed shape (missing key, non-array,
-    /// non-string entry, or string that fails `is_type_schema_id`) so
-    /// callers refuse the whole trait list — one malformed entry must
-    /// not slip through under cover of legitimate siblings. Per-entry
-    /// registry probes are skipped on cost grounds; the envelope check
-    /// still runs against the actual `parent_type` below.
+    /// Extract `allowed_parent_types` from an effective-trait map, or
+    /// `None` when the entry is missing or not an array of type-schema
+    /// identifiers (a single malformed entry collapses the whole list).
     fn extract_allowed_parents(traits: &Value) -> Option<Vec<String>> {
         let arr = traits.get(ALLOWED_PARENT_TYPES_TRAIT)?.as_array()?;
         let mut out = Vec::with_capacity(arr.len());
         for item in arr {
             let s = item.as_str()?;
-            if !types_registry_sdk::is_type_schema_id(s) {
+            if !GtsId::try_new(s).is_ok_and(|id| id.is_type()) {
                 return None;
             }
             out.push(s.to_owned());
         }
         Some(out)
     }
-}
 
-#[async_trait]
-impl TenantTypeChecker for GtsTenantTypeChecker {
-    // @cpt-begin:cpt-cf-account-management-algo-tenant-type-enforcement-allowed-parent-types-evaluation:p1:inst-algo-apte-gts-impl
-    // @cpt-begin:cpt-cf-account-management-algo-tenant-type-enforcement-same-type-nesting-admission:p1:inst-algo-stn-gts-impl
-    async fn check_parent_child(
-        &self,
-        parent_type: Uuid,
-        child_type: Uuid,
-    ) -> Result<(), DomainError> {
-        // Same-type nesting only needs the child schema; different
-        // parent needs both. Batch into one GTS round-trip either way.
-        let mut requested = vec![child_type];
-        if parent_type != child_type {
-            requested.push(parent_type);
-        }
-
-        // `am.dependency_health` mirrors the IdP-path emission shape
-        // (`target` / `op` / `outcome`) so a GTS outage shows up on
-        // the unified dependency-health dashboard.
-        let map = match tokio::time::timeout(
-            self.probe_timeout,
-            self.registry.get_type_schemas_by_uuid(requested.clone()),
-        )
-        .await
-        {
-            Err(_elapsed) => {
-                emit_metric(
-                    AM_DEPENDENCY_HEALTH,
-                    MetricKind::Counter,
-                    &[
-                        ("target", "types_registry"),
-                        ("op", "get_type_schemas_by_uuid"),
-                        ("outcome", "timeout"),
-                    ],
-                );
-                return Err(DomainError::service_unavailable(
-                    "types-registry: timeout exceeded",
-                ));
-            }
-            Ok(map) => map,
-        };
-
-        // Classify the call's transport-layer outcome BEFORE
-        // `resolve_schema` reshapes per-entry results. A successful
-        // batch return that nonetheless contains a per-entry
-        // transport-flavored error (or a missing required entry —
-        // a broken-client signal) is an `error` for dashboard
-        // purposes; per-entry `CanonicalError::NotFound` is a domain
-        // condition (`InvalidTenantType`), not a health signal.
-        let had_transport_error = requested.iter().any(|u| match map.get(u) {
-            None => true,
-            Some(Err(err)) => !matches!(err, CanonicalError::NotFound { .. }),
-            Some(Ok(_)) => false,
-        });
+    fn emit_probe(outcome: &'static str) {
         emit_metric(
             AM_DEPENDENCY_HEALTH,
             MetricKind::Counter,
             &[
                 ("target", "types_registry"),
                 ("op", "get_type_schemas_by_uuid"),
-                (
-                    "outcome",
-                    if had_transport_error {
-                        "error"
-                    } else {
-                        "success"
-                    },
-                ),
+                ("outcome", outcome),
             ],
         );
+    }
+}
 
-        // Resolve child schema first — trait extraction depends on it.
-        let child_schema = resolve_schema(map.get(&child_type), child_type, "child")?;
+#[async_trait]
+impl TenantTypeChecker for GtsTenantTypeChecker {
+    async fn check_parent_child(
+        &self,
+        ctx: &SecurityContext,
+        parent_type: Uuid,
+        child_type: Uuid,
+    ) -> Result<(), DomainError> {
+        let mut requested = vec![child_type];
+        if parent_type != child_type {
+            requested.push(parent_type);
+        }
+        let projection = Projection::Select(FieldSelection::with(&[EntityField::EffectiveTraits]));
 
-        // Step 3: child must descend from the AM tenant_type envelope.
-        // Anything else cannot legitimately carry `allowed_parent_types`,
-        // even if the effective-trait merge happens to produce a value.
+        let map = match tokio::time::timeout(
+            self.probe_timeout,
+            self.registry.batch_get_type_schemas_by_uuid(
+                ctx,
+                &requested,
+                ReadOptions {
+                    projection,
+                    ..ReadOptions::default()
+                },
+            ),
+        )
+        .await
+        {
+            Err(_elapsed) => {
+                Self::emit_probe("timeout");
+                return Err(DomainError::service_unavailable(
+                    "types-registry: timeout exceeded",
+                ));
+            }
+            Ok(Err(err)) => {
+                Self::emit_probe("error");
+                return Err(DomainError::caller_registry_failure(err, "types-registry"));
+            }
+            Ok(Ok(map)) => {
+                Self::emit_probe("success");
+                map
+            }
+        };
+
+        let child_schema = resolve_schema(&map, child_type, "child")?;
+
         if !Self::descends_from_tenant_type_envelope(child_schema) {
             return Err(DomainError::InvalidTenantType {
                 detail: format!(
@@ -210,13 +171,14 @@ impl TenantTypeChecker for GtsTenantTypeChecker {
             });
         }
 
-        // Step 4: resolve the effective trait map and pull the array.
-        // The base envelope's `x-gts-traits-schema` defines a `default: []`
-        // for `allowed_parent_types`, so a properly-derived child always
-        // has at least an empty array; missing/null/non-array shapes mean
-        // the child schema is malformed.
-        let effective = child_schema.effective_traits();
-        let allowed = Self::extract_allowed_parents(&effective).ok_or_else(|| {
+        let effective = child_schema.effective_traits.as_ref().ok_or_else(|| {
+            DomainError::internal(format!(
+                "types-registry answered child tenant type {} without the selected \
+                 effective_traits",
+                child_schema.type_id.as_ref(),
+            ))
+        })?;
+        let allowed = Self::extract_allowed_parents(effective).ok_or_else(|| {
             DomainError::InvalidTenantType {
                 detail: format!(
                     "child tenant type {} effective trait `{}` is missing or not an array of strings",
@@ -226,19 +188,10 @@ impl TenantTypeChecker for GtsTenantTypeChecker {
             }
         })?;
 
-        // Step 5: membership check. For same-type nesting the candidate
-        // is the child's own identifier; otherwise resolve the parent
-        // schema's identifier from the same batched response. The
-        // parent must descend from the AM tenant_type envelope as
-        // well — without that check a non-tenant-type GTS UUID could
-        // be passed in and the membership comparison would fail by
-        // luck (its `type_id` wouldn't appear in
-        // `allowed_parent_types`) with a misleading `TypeNotAllowed`
-        // message instead of the correct `InvalidTenantType`.
         let parent_id_string: String = if parent_type == child_type {
             child_schema.type_id.as_ref().to_owned()
         } else {
-            let parent_schema = resolve_schema(map.get(&parent_type), parent_type, "parent")?;
+            let parent_schema = resolve_schema(&map, parent_type, "parent")?;
             if !Self::descends_from_tenant_type_envelope(parent_schema) {
                 return Err(DomainError::InvalidTenantType {
                     detail: format!(
@@ -271,41 +224,33 @@ impl TenantTypeChecker for GtsTenantTypeChecker {
             })
         }
     }
-    // @cpt-end:cpt-cf-account-management-algo-tenant-type-enforcement-same-type-nesting-admission:p1:inst-algo-stn-gts-impl
-    // @cpt-end:cpt-cf-account-management-algo-tenant-type-enforcement-allowed-parent-types-evaluation:p1:inst-algo-apte-gts-impl
 }
 
-/// Map a `get_type_schemas_by_uuid` per-key result onto a `DomainError`:
-///
-/// * missing entry → `ServiceUnavailable` (the SDK contract guarantees
-///   one entry per requested UUID; a missing entry indicates a broken
-///   client implementation, not a domain condition)
-/// * `CanonicalError::NotFound` → `InvalidTenantType`
-/// * any other transport/registry error → `ServiceUnavailable`
-///
-/// `CanonicalError` Display is forwarded into the detail unredacted
-/// (no `redact_provider_detail` here). This is intentional: the GTS
-/// Types Registry is a CF-internal sibling gear whose error surface
-/// is curated and safe to expose to the caller, in contrast to the `IdP`
-/// plugin path (`account_management_sdk::idp`) where the error text comes
-/// from third-party vendor SDKs and must be redacted before crossing
-/// the AM boundary.
+/// Look up one requested UUID: an unanswered key is a contract break of
+/// the registry client (service unavailable), `None` is an unregistered
+/// tenant type, and a deleted one admits no new pairing either — exact
+/// reads answer tombstones, which the legacy catalogue never held.
 fn resolve_schema<'a>(
-    entry: Option<&'a Result<GtsTypeSchema, CanonicalError>>,
+    map: &'a HashMap<Uuid, Option<TypeSchema>>,
     uuid: Uuid,
     role: &'static str,
-) -> Result<&'a GtsTypeSchema, DomainError> {
-    match entry {
+) -> Result<&'a TypeSchema, DomainError> {
+    match map.get(&uuid) {
         None => Err(DomainError::service_unavailable(format!(
             "types-registry: {role} uuid {uuid} missing from response"
         ))),
-        Some(Ok(schema)) => Ok(schema),
-        Some(Err(CanonicalError::NotFound { .. })) => Err(DomainError::InvalidTenantType {
+        Some(None) => Err(DomainError::InvalidTenantType {
             detail: format!("{role} tenant type {uuid} not registered in GTS"),
         }),
-        Some(Err(other)) => Err(DomainError::service_unavailable(format!(
-            "types-registry: {other}"
-        ))),
+        Some(Some(schema)) if schema.lifecycle_status != LifecycleStatus::Active => {
+            Err(DomainError::InvalidTenantType {
+                detail: format!(
+                    "{role} tenant type {} ({uuid}) is deleted in GTS",
+                    schema.type_id.as_ref()
+                ),
+            })
+        }
+        Some(Some(schema)) => Ok(schema),
     }
 }
 

@@ -1,15 +1,17 @@
 //! GTS identifiers and schemas owned by admission-control.
 //!
 //! Compile-time entries reach `types-registry` through the `toolkit-gts`
-//! link-time inventory: the engine plugin specification, the admission
-//! resource type, the shared audit topic instance and the refusal event type,
-//! a derived schema under the broker's event base built by
-//! [`refusal_event_type_schema`].
+//! crate-local declarations: the engine plugin specification, the admission
+//! resource type, shared audit topic instance and derived refusal event type.
+//! Every declaration also enters the process-wide inventory: the event broker
+//! still reads that independent catalogue. The generated refusal schema uses
+//! an explicit declaration record because it has no matching Rust GTS struct.
 
 use gts::GtsInstanceId;
 use schemars::generate::{Contract, SchemaSettings};
 use serde_json::Value;
-use toolkit_gts::{PluginV1, gts_id, gts_instance, gts_type_schema};
+use toolkit_gts::local::{gts_instance, gts_type_schema};
+use toolkit_gts::{PluginV1, gts_id};
 
 use event_broker_sdk::gts::TopicV1;
 
@@ -68,13 +70,6 @@ gts_instance! {
     }
 }
 
-toolkit_gts::inventory::submit! {
-    toolkit_gts::InventoryTypeSchema {
-        type_id: REFUSAL_EVENT_TYPE,
-        schema_fn: || refusal_event_type_schema().to_string(),
-    }
-}
-
 /// `data` schema of a refusal event, generated from [`RefusalEvent`] as it
 /// serializes, so the schema cannot drift from the payload. Subschemas are
 /// inlined, since the schema is embedded in the event-type document where a
@@ -102,6 +97,25 @@ pub fn refusal_event_type_schema() -> Value {
         refusal_event_data_schema(),
         &[ADMISSION_CONTROL_RESOURCE],
     )
+}
+
+// This schema is generated from the event payload instead of a GTS struct.
+// Declare it in both catalogues exactly as the local GTS macros do: runtime
+// publication owns the SDK declarations, while inventory-based broker readers
+// need the same static schema without an init-time registration call.
+const REFUSAL_SCHEMA_DECLARATION: toolkit_gts::InventoryTypeSchema =
+    toolkit_gts::InventoryTypeSchema {
+        type_id: REFUSAL_EVENT_TYPE,
+        schema_fn: refusal_event_type_schema_string,
+    };
+
+toolkit_gts::inventory::submit! { REFUSAL_SCHEMA_DECLARATION }
+toolkit_gts::inventory::submit! {
+    crate::__toolkit_gts_inventory::TypeSchema(REFUSAL_SCHEMA_DECLARATION)
+}
+
+fn refusal_event_type_schema_string() -> String {
+    refusal_event_type_schema().to_string()
 }
 
 #[cfg(test)]

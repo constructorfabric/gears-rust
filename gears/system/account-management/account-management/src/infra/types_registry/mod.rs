@@ -1,17 +1,10 @@
-//! Infrastructure-layer wiring for the GTS Types Registry SDK.
+//! Production GTS adapters, including [`GtsTenantTypeChecker`] for Feature 2.3.
 //!
-//! Holds the [`GtsTenantTypeChecker`] adapter that connects the AM
-//! [`crate::domain::tenant_type::TenantTypeChecker`] domain trait to
-//! `types_registry_sdk::TypesRegistryClient` resolved from `ClientHub`
-//! (FEATURE 2.3 `tenant-type-enforcement`).
-//!
-//! The `ClientHub` binding is wired in the AM gear entry-point
-//! ([`crate::gear::AccountManagementGear`]): `types-registry` is
-//! a hard `deps` of AM, so the runtime guarantees its init runs first
-//! and the entry-point fail-closes `init` if `TypesRegistryClient`
-//! cannot be resolved. There is no production fallback to
-//! [`crate::domain::tenant_type::InertTenantTypeChecker`]; that
-//! checker is reserved for unit tests.
+//! [`crate::gear::AccountManagementGear`] builds its services over the registry's two
+//! APIs, taken from the hub in `init` — a linked registry's, or a remote one's resolving
+//! clients, wired before the application group (by `gts_publication(...)` and
+//! `#[toolkit::consumes]`); [`crate::domain::tenant_type::InertTenantTypeChecker`] is for
+//! unit tests only.
 
 pub(crate) mod checker;
 pub(crate) mod metadata_schema_registry;
@@ -26,4 +19,3 @@ pub(crate) mod test_helpers;
 // consumers go through `account-management-sdk`.
 pub(crate) use checker::GtsTenantTypeChecker;
 pub(crate) use metadata_schema_registry::GtsMetadataSchemaRegistry;
-pub(crate) use root_type::register_root_type;

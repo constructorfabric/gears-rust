@@ -1,8 +1,7 @@
 //! The admission-control gear: wiring and lifecycle.
 //!
 //! - **init**: loads and validates `gears.admission-control.config` (an
-//!   invalid one fails startup), registers the refusal event type (a rejection
-//!   fails startup; an unreachable registry is retried in the background),
+//!   invalid one fails startup), requires the admitted GTS manifest,
 //!   and registers `dyn AdmissionClientV1` in `ClientHub` with a configured
 //!   engine that resolves on first use, so a call that arrives before the
 //!   serve phase reaches the engine instead of finding none.
@@ -24,7 +23,7 @@ use toolkit::lifecycle::ReadySignal;
 use toolkit::{ClientHub, Gear, GearCtx};
 use toolkit_security::SecurityContext;
 use toolkit_security::constants::DEFAULT_TENANT_ID;
-use types_registry_sdk::TypesRegistryClient;
+use types_registry_sdk::PlatformTypesRegistryApi;
 use uuid::Uuid;
 
 use crate::config::AdmissionControlConfig;
@@ -32,7 +31,7 @@ use crate::domain::local_client::AdmissionLocalClient;
 use crate::domain::service::{AdmissionMetrics, AdmissionService, EngineSource};
 use crate::infra::engine::LazyEngine;
 use crate::infra::metrics::AdmissionControlMetrics;
-use crate::infra::publisher::{QueuePublisher, QueuedEvent, register_event_type, run};
+use crate::infra::publisher::{QueuePublisher, QueuedEvent, run};
 
 /// Subject identifier the gate publishes its events under: a hand-picked
 /// constant (version nibble 0, so it cannot collide with a v4/v5 identity).
@@ -53,18 +52,17 @@ pub const GATE_TOKEN_SCOPE: &str = "*";
 /// Everything `init` wires, consumed by `serve`.
 struct Wired {
     service: Arc<AdmissionService>,
-    registry: Arc<dyn TypesRegistryClient>,
     hub: Arc<ClientHub>,
     engine: Option<Arc<LazyEngine>>,
     events: Mutex<Option<mpsc::Receiver<QueuedEvent>>>,
-    registered: bool,
     metrics: Arc<AdmissionControlMetrics>,
 }
 
 /// The admission-control gear. See the module documentation.
+#[toolkit::consumes(contract = types_registry_sdk::PlatformTypesRegistryApi, from = "types-registry")]
 #[toolkit::gear(
     name = "admission-control",
-    deps = [types_registry],
+    gts_publication(crates = [admission_control_sdk]),
     capabilities = [stateful],
     lifecycle(entry = "serve", stop_timeout = "10s", await_ready)
 )]
@@ -91,13 +89,13 @@ impl Gear for AdmissionControl {
             .validate()
             .context("admission-control: invalid configuration")?;
 
+        ctx.gts_publication_manifest()
+            .context("admission-control: declarations must be admitted before init")?;
+
         let hub = ctx.client_hub();
-        let registry = hub.get::<dyn TypesRegistryClient>().map_err(|e| {
+        let registry = hub.get::<dyn PlatformTypesRegistryApi>().map_err(|e| {
             anyhow::anyhow!("admission-control: types-registry client unavailable: {e}")
         })?;
-        let registered = register_event_type(registry.as_ref())
-            .await
-            .context("admission-control: refusal event type registration rejected")?;
 
         let metrics = Arc::new(AdmissionControlMetrics::global());
         let (publisher, events) =
@@ -118,11 +116,9 @@ impl Gear for AdmissionControl {
 
         let wired = Wired {
             service: Arc::clone(&service),
-            registry,
             hub: Arc::clone(&hub),
             engine,
             events: Mutex::new(Some(events)),
-            registered,
             metrics,
         };
         self.wired
@@ -171,9 +167,7 @@ impl AdmissionControl {
         let publisher = tokio::spawn(run(
             events,
             Arc::clone(&wired.hub),
-            Arc::clone(&wired.registry),
             gate_identity()?,
-            wired.registered,
             Arc::clone(&wired.metrics),
             cancel.child_token(),
         ));

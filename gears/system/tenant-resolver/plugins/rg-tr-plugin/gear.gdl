@@ -8,8 +8,11 @@ gdl_version = "1.0"
 # point is declared by `implements`; this plugin's vendor and priority are read
 # from source.
 
+# Runtime `gts_publication(...)` publication uses the local or remote platform registry API.
+# The instance must be admitted before this application plugin binds its client in `init`.
+
 gear(
-    deps = ["resource-group", "types-registry"],
+    deps = ["resource-group"],
     source = git(url = "https://github.com/constructorfabric/gears-rust", path = "gears/system/tenant-resolver/plugins/rg-tr-plugin"),
     maturity = "preview",
     name = "Resource-Group Tenant Resolver Plugin",

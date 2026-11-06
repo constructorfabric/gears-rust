@@ -7,8 +7,12 @@ gdl_version = "1.0"
 # Fills the same extension point as static-authn-plugin and oidc-authn-plugin,
 # so they are alternatives: a product picks one per deployment profile.
 
+TR_SDK = cargo(crate_name = "cf-gears-types-registry-sdk", lib = "types_registry_sdk", path = "../../../types-registry/types-registry-sdk", features = ["rest-client"])
+
 gear(
-    deps = ["types-registry"],
+    deps = [],
+    # The runtime admits the configured instance before `init` binds its client.
+    consumes = [consume(contract = "PlatformTypesRegistryApi", rust = "types_registry_sdk::PlatformTypesRegistryApi", sdk = TR_SDK)],
     source = git(url = "https://github.com/constructorfabric/gears-rust", path = "gears/system/authn-resolver/plugins/firebase-authn-plugin"),
     maturity = "preview",
     name = "Firebase AuthN Plugin",

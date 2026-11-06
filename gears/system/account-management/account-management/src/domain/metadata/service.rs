@@ -403,8 +403,10 @@ impl MetadataService {
         // definition here), and silently skipping the row would mask
         // a data-integrity drift behind a partial page.
         let uuids: Vec<Uuid> = page.items.iter().map(|r| r.schema_uuid).collect();
-        let id_by_uuid: HashMap<Uuid, GtsTypeId> =
-            self.schema_registry.resolve_ids_by_uuid(&uuids).await?;
+        let id_by_uuid: HashMap<Uuid, GtsTypeId> = self
+            .schema_registry
+            .resolve_ids_by_uuid(ctx, &uuids)
+            .await?;
 
         // Per-row schema-scoped authorization. Per PRD §1848 ("list
         // responses omit entries the actor is not permitted to read")
@@ -513,7 +515,7 @@ impl MetadataService {
         // the requested id without re-parsing the path.
         let _policy = self
             .schema_registry
-            .resolve_inheritance_policy(parsed.as_gts())
+            .resolve_inheritance_policy(ctx, parsed.as_gts())
             .await?;
 
         // UUIDv5 derivation cached on `ParsedTypeId` (matches the
@@ -615,7 +617,7 @@ impl MetadataService {
 
         let _policy = self
             .schema_registry
-            .resolve_inheritance_policy(parsed.as_gts())
+            .resolve_inheritance_policy(ctx, parsed.as_gts())
             .await?;
 
         // GTS body validation. Runs AFTER the existence gate above so
@@ -623,7 +625,7 @@ impl MetadataService {
         // The registry's local-client cache amortizes the second
         // round-trip in the steady state.
         self.schema_registry
-            .validate_value(parsed.as_gts(), &value)
+            .validate_value(ctx, parsed.as_gts(), &value)
             .await?;
 
         let schema_uuid = parsed.uuid();
@@ -703,7 +705,7 @@ impl MetadataService {
 
         let _policy = self
             .schema_registry
-            .resolve_inheritance_policy(parsed.as_gts())
+            .resolve_inheritance_policy(ctx, parsed.as_gts())
             .await?;
 
         let schema_uuid = parsed.uuid();
@@ -776,7 +778,7 @@ impl MetadataService {
         // here BEFORE any walk is attempted.
         let policy = self
             .schema_registry
-            .resolve_inheritance_policy(parsed.as_gts())
+            .resolve_inheritance_policy(ctx, parsed.as_gts())
             .await?;
 
         let schema_uuid = parsed.uuid();

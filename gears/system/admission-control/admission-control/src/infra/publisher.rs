@@ -5,15 +5,12 @@
 //! task ([`run`]) drains the queue and publishes each event to the broker under
 //! the gate's own identity; with an absent, failing or stalled broker the event
 //! is dropped, logged and counted like a queue-full drop, and so are the events
-//! still queued at shutdown. Event-type registration is attempted at init and
-//! retried in the background while the registry is unreachable or does not
-//! answer; it never blocks admissions. Every registry and broker call is
-//! bounded in time and gives way to cancellation.
+//! still queued at shutdown. The refusal event type is admitted by the runtime
+//! before init. Broker calls are bounded in time and give way to cancellation.
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use admission_control_sdk::gts::refusal_event_type_schema;
 use admission_control_sdk::{ADMISSION_CONTROL_RESOURCE, REFUSAL_EVENT_TYPE, RefusalEvent};
 use chrono::{DateTime, Utc};
 use event_broker_sdk::{Event, EventBrokerApi, GtsTypeId};
@@ -21,7 +18,6 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use toolkit::ClientHub;
 use toolkit_security::SecurityContext;
-use types_registry_sdk::{RegisterResult, TypesRegistryClient};
 use uuid::Uuid;
 
 use crate::domain::service::{EventEnvelope, EventSink};
@@ -29,12 +25,6 @@ use crate::infra::metrics::AdmissionControlMetrics;
 
 /// `source` stamped on every event this gear publishes.
 pub const EVENT_SOURCE: &str = "admission-control";
-
-/// Interval between event-type registration retries.
-const REGISTRATION_RETRY: Duration = Duration::from_secs(5);
-
-/// Bound on one event-type registration call.
-const REGISTRATION_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Bound on one broker publication.
 const PUBLISH_TIMEOUT: Duration = Duration::from_secs(5);
@@ -103,66 +93,19 @@ pub fn to_broker_event(queued: &QueuedEvent) -> Event {
     }
 }
 
-/// Registers the refusal event type.
-///
-/// # Errors
-///
-/// `Ok(false)` when the registry is unreachable or does not answer within
-/// [`REGISTRATION_TIMEOUT`] (retry later); `Err` when it rejected the type (a
-/// wrong deployment: startup fails).
-///
-/// The call is bounded although today's in-process client answers without
-/// suspending: the client comes from `ClientHub`, and a remote one would
-/// replace it with no change here.
-pub async fn register_event_type(registry: &dyn TypesRegistryClient) -> anyhow::Result<bool> {
-    let registration = registry.register(vec![refusal_event_type_schema()]);
-    match tokio::time::timeout(REGISTRATION_TIMEOUT, registration).await {
-        Err(_elapsed) => {
-            tracing::warn!("types-registry did not answer; refusal event type pending");
-            Ok(false)
-        }
-        Ok(Err(error)) => {
-            tracing::warn!(error = %error, "types-registry unreachable; refusal event type pending");
-            Ok(false)
-        }
-        Ok(Ok(results)) => {
-            for result in results {
-                if let RegisterResult::Err { gts_id, error } = result {
-                    anyhow::bail!("types-registry rejected `{gts_id:?}`: {error}");
-                }
-            }
-            Ok(true)
-        }
-    }
-}
-
-/// The publisher task: retries registration while `registered` is false
-/// (until it succeeds or the registry rejects the type), then drains `rx`
-/// until `cancel` fires or the queue closes. Events still queued, or in
-/// flight, when `cancel` fires are dropped and counted.
+/// Drains the admitted gear's queue until cancellation or queue closure.
+/// Events still queued or in flight on cancellation are dropped and counted.
 pub async fn run(
     mut rx: mpsc::Receiver<QueuedEvent>,
     hub: Arc<ClientHub>,
-    registry: Arc<dyn TypesRegistryClient>,
     identity: SecurityContext,
-    registered: bool,
     metrics: Arc<AdmissionControlMetrics>,
     cancel: CancellationToken,
 ) {
-    let mut retrying = !registered;
-    let mut retry = tokio::time::interval(REGISTRATION_RETRY);
     loop {
         tokio::select! {
             biased;
             () = cancel.cancelled() => break,
-            _ = retry.tick(), if retrying => {
-                let outcome = tokio::select! {
-                    biased;
-                    () = cancel.cancelled() => break,
-                    outcome = register_event_type(registry.as_ref()) => outcome,
-                };
-                retrying = still_pending(outcome);
-            }
             received = rx.recv() => {
                 let Some(event) = received else { return };
                 tokio::select! {
@@ -177,23 +120,6 @@ pub async fn run(
         }
     }
     discard_queued(&mut rx, &metrics);
-}
-
-/// Whether registration must be retried after `outcome`: only while the
-/// registry is unreachable.
-fn still_pending(outcome: anyhow::Result<bool>) -> bool {
-    match outcome {
-        Ok(registered) => !registered,
-        Err(error) => {
-            // Startup fails on the same rejection; here the gate is already
-            // serving, so stop retrying and say so.
-            tracing::error!(
-                error = %error,
-                "types-registry rejected the refusal event type; not retrying"
-            );
-            false
-        }
-    }
 }
 
 /// Drops, counts and logs the events still queued at shutdown.

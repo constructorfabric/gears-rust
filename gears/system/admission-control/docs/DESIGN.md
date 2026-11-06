@@ -171,7 +171,7 @@ Registered in ClientHub through the local client.
 - [ ] `p1` - **ID**: `cpt-cf-admission-control-component-engine-client`
 
 Resolves the configured engine on first use, like the platform's other plugin hosts: lists engine plugin instances in
-types-registry, applies the pinned `instance_id` or picks the vendor's lowest-priority instance, and takes its scoped client from ClientHub. The
+types-registry over the platform API, traversing at most the SDK's `MAX_LIST_PAGES` within a 30-second discovery budget. It applies the pinned `instance_id` or picks the vendor's lowest-priority locally bound instance (ties break by identifier), excluding durable entries with no scoped client in this process, and takes its client from ClientHub. The
 result is cached (one caller resolves at a time; a failure is not cached, so the next call retries). The runtime
 starts serve phases without waiting for readiness and the API gateway may accept requests before the gate's serve runs,
 so a call can arrive first; it resolves the engine itself, under the engine timeout, and an engine that cannot be
@@ -185,8 +185,7 @@ configured engine that cannot be resolved fails startup; with none configured ev
 A bounded in-memory queue (`event_queue_capacity`) and one background task publishing to `EventBrokerApi` under the gate
 identity. A full queue drops the event and increments the dropped-events metric; an absent, failing or stalled broker
 (each publication is bounded in time), and every event still queued at shutdown, is logged, counted and dropped the
-same way. The event type is registered at init; if the registry is unreachable or does not answer (each call is bounded in time), registration retries
-in the background, and stops (logged as an error) if the registry rejects the type.
+same way. The runtime publishes the engine specification, admission resource schema, audit topic and generated refusal schema as gear-owned GTS Type Schemas and Instances before application init. Unavailable or pending registry admissions hold startup pending; a terminal rejection prevents init and readiness. Init requires all declared schemas and instances to be admitted and never publishes. The publisher makes no registry calls.
 
 #### Config Validator
 
@@ -232,9 +231,11 @@ Configuration (`gears.admission-control.config`, unknown keys rejected): `engine
 
 | Dependency Module | Interface Used                                   | Purpose                                                   |
 |-------------------|--------------------------------------------------|-----------------------------------------------------------|
-| `types-registry`  | `TypesRegistryClient`                            | Engine discovery, event registration                      |
+| `types-registry`  | `PlatformTypesRegistryApi`                            | Platform discovery; runtime GTS publication                      |
 | `event-broker`    | `EventBrokerApi` (optional, via ClientHub)       | Publish refusal events                                    |
 | Engine plugin     | `AdmissionEnginePluginClientV1` (scoped)         | Evaluate tenant policy (`policy-engine` by default)       |
+
+The registry is declared through `#[toolkit::consumes]` and the SDK's REST client feature; it introduces no hard dependency on the registry implementation. The local registry client is used when available, otherwise the directory resolving REST client is wired.
 
 ### 3.5 External Dependencies
 

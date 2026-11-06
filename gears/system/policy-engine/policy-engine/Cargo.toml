@@ -26,11 +26,10 @@ toolkit-policy-evaluation = { workspace = true }
 
 # Platform SDKs
 tenant-resolver-sdk = { workspace = true }
-types-registry-sdk = { workspace = true }
+types-registry-sdk = { workspace = true, features = ["rest-client"] }
 authz-resolver-sdk = { workspace = true }
 
-# Gear crates referenced by `#[toolkit::gear(deps = [types_registry, tenant_resolver, authz_resolver])]`
-types-registry = { workspace = true }
+# Same-process dependencies whose clients init resolves.
 tenant-resolver = { workspace = true }
 authz-resolver = { workspace = true }
 
@@ -77,6 +76,7 @@ parking_lot = { workspace = true }
 lru = { workspace = true }
 
 [dev-dependencies]
+toolkit = { workspace = true, features = ["test-support"] }
 # Linked by the real-registry GTS test: the topic and event bases the
 # admission-control SDK's audit topic instance needs.
 event-broker-sdk = { workspace = true }

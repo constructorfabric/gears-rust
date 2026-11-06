@@ -24,8 +24,7 @@ toolkit-security = { workspace = true, features = ["jwt"] }
 toolkit-http = { workspace = true }
 toolkit-gts = { workspace = true }
 authn-resolver-sdk = { package = "cf-gears-authn-resolver-sdk", version = "0.3.40", path = "../../authn-resolver-sdk" }
-types-registry = { workspace = true }
-types-registry-sdk = { package = "cf-gears-types-registry-sdk", version = "0.4.2", path = "../../../types-registry/types-registry-sdk" }
+types-registry-sdk = { package = "cf-gears-types-registry-sdk", version = "0.4.2", path = "../../../types-registry/types-registry-sdk", features = ["rest-client"] }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 inventory = { workspace = true }
@@ -40,6 +39,11 @@ http = { workspace = true }
 secrecy = { workspace = true }
 
 [dev-dependencies]
+# The transitional legacy client proves that publication cannot silently use it.
+types-registry = { package = "cf-gears-types-registry", path = "../../../types-registry/types-registry" }
+toolkit = { workspace = true, features = ["test-support"] }
+types-registry-sdk = { package = "cf-gears-types-registry-sdk", path = "../../../types-registry/types-registry-sdk", features = ["test-util"] }
+tokio-util = { workspace = true }
 base64 = { workspace = true }
 chrono = { workspace = true }
 rsa = { workspace = true }

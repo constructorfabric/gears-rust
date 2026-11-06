@@ -103,11 +103,8 @@ Other quick start examples:
 # Option 1: Run with SQLite database (recommended for development)
 cargo run --bin cf-gears-example-server -- --config config/quickstart.yaml run
 
-# Option 2: Run without database (no-db mode)
+# Option 2: Run without a persistent database (in-memory SQLite for Types Registry)
 cargo run --bin cf-gears-example-server -- --config config/no-db.yaml run
-
-# Option 3: Run with mock in-memory database for testing
-cargo run --bin cf-gears-example-server -- --config config/quickstart.yaml --mock run
 ```
 
 ### Example Configuration (config/quickstart.yaml)

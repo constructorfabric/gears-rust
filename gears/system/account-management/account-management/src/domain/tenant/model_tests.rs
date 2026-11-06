@@ -92,7 +92,7 @@ fn empty_update_is_empty() {
 // `domain::gts_validation::validate_tenant_name_via_gts` (the
 // resource-group `validate_metadata_via_gts` pattern). The schema-
 // driven path is exercised through service-level tests that wire a
-// `MockTypesRegistryClient` with the `gts.cf.core.am.tenant.v1~`
+// `MockTypesRegistry` with the `gts.cf.core.am.tenant.v1~`
 // schema registered.
 
 #[test]

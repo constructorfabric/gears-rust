@@ -70,7 +70,7 @@ From the repository root:
 make e2e-local SUITE=oagw
 
 # The sqlite profile: OAGW on SQLite, with one upstream and two routes
-# provisioned from types-registry `entities` (see e2e.yaml). Only this profile
+# provisioned from registry-fixtures.json after startup. Only this profile
 # runs the section 19 (configuration storage) tests; elsewhere they skip.
 make e2e-oagw-sqlite
 

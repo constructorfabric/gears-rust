@@ -1,8 +1,10 @@
 use std::future::Future;
 use std::sync::Arc;
+use std::time::Duration;
 
 use parking_lot::RwLock;
 use tokio::sync::Mutex;
+use toolkit_canonical_errors::CanonicalError;
 
 use crate::client_hub::{ClientHub, ClientScope};
 use crate::gts::PluginV1;
@@ -90,6 +92,36 @@ impl GtsPluginSelector {
         Ok(id)
     }
 
+    /// Resolves within one budget, including the single-flight lock wait.
+    ///
+    /// Expiry drops the in-flight resolution without caching it and creates the
+    /// caller's domain error through `on_timeout` with the plugin-discovery timeout
+    /// diagnostic. Dropping this future also
+    /// releases its lock without caching; another caller may retry. Successful
+    /// cached selections use the normal fast path without invoking either closure.
+    ///
+    /// # Errors
+    ///
+    /// Returns the resolver's error unchanged, or `on_timeout(message)` on expiry.
+    pub async fn get_or_init_with_timeout<F, Fut, E>(
+        &self,
+        timeout: Duration,
+        resolve: F,
+        on_timeout: impl FnOnce(String) -> E,
+    ) -> Result<Arc<str>, E>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<String, E>>,
+    {
+        tokio::time::timeout(timeout, self.get_or_init(resolve))
+            .await
+            .unwrap_or_else(|_| {
+                Err(on_timeout(format!(
+                    "plugin discovery did not finish within {timeout:?}"
+                )))
+            })
+    }
+
     /// Clears the cached selected instance ID.
     ///
     /// Returns `true` if there was a cached value, `false` otherwise.
@@ -98,6 +130,22 @@ impl GtsPluginSelector {
         let mut guard = self.cached.write();
         guard.take().is_some()
     }
+}
+
+/// Whether plugin discovery failed because the catalogue is temporarily unavailable.
+///
+/// Credential refusals and malformed/internal responses are not availability
+/// failures: resolvers must preserve those as faults instead of retryable outages.
+/// This is discovery policy, not a general retry classification for business calls.
+#[must_use]
+pub fn is_discovery_outage(error: &CanonicalError) -> bool {
+    matches!(
+        error,
+        CanonicalError::ServiceUnavailable { .. }
+            | CanonicalError::DeadlineExceeded { .. }
+            | CanonicalError::ResourceExhausted { .. }
+            | CanonicalError::Aborted { .. }
+    )
 }
 
 /// Error returned by [`choose_plugin_instance`].
@@ -685,3 +733,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "selection_tests.rs"]
+mod selection_tests;

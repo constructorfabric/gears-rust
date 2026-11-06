@@ -7,8 +7,11 @@ gdl_version = "1.0"
 # Projected from #[toolkit::gear] in src/gear.rs: id, runtime_caps (stateful)
 # and lifecycle; deps below is an exact checked mirror (GBX0214).
 
+TR_SDK = cargo(crate_name = "cf-gears-types-registry-sdk", lib = "types_registry_sdk", path = "../../types-registry/types-registry-sdk", features = ["rest-client"])
+
 gear(
-    deps = ["types-registry"],
+    deps = [],
+    consumes = [consume(contract = "PlatformTypesRegistryApi", rust = "types_registry_sdk::PlatformTypesRegistryApi", sdk = TR_SDK)],
     source = git(url = "https://github.com/constructorfabric/gears-rust", path = "gears/system/admission-control/admission-control"),
     maturity = "experimental",
     implementation = "in-progress",

@@ -3,176 +3,198 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use types_registry_sdk::testing::{MockTypesRegistryClient, make_test_type_schema};
+use toolkit_canonical_errors::CanonicalError;
+use types_registry_sdk::testing_platform::{Call, Fault, MockTypesRegistry, ProtocolFault, Seed};
+use types_registry_sdk::{PlatformTypesRegistryApi, TypesRegistryApi};
 
 use super::RegistryTypeCatalog;
-use crate::domain::ports::TypeCatalogPort;
+use crate::domain::ports::{PortError, TypeCatalogPort, TypeCatalogScope};
+use crate::test_support::{WIDGET, ctx};
 
-use crate::test_support::WIDGET;
+#[toolkit_canonical_errors::resource_error(toolkit_gts::gts_id!("cf.core.types_registry.entity.v1~"))]
+struct RegistryReadResource;
+
 const UNKNOWN: &str = "gts.cf.core.policy_engine.unknown.v1~";
 
-fn catalog() -> RegistryTypeCatalog {
-    let client = MockTypesRegistryClient::new().with_type_schemas([make_test_type_schema(WIDGET)]);
-    RegistryTypeCatalog::new(Arc::new(client), Duration::from_secs(1))
+fn registry() -> Arc<MockTypesRegistry> {
+    let registry = Arc::new(MockTypesRegistry::new());
+    registry.seed(
+        WIDGET,
+        serde_json::json!({
+            "$id": format!("gts://{WIDGET}"),
+            "$schema": "http://json-schema.org/draft-07/schema#",
+            "type": "object",
+        }),
+    );
+    registry
+}
+
+fn catalog(registry: &Arc<MockTypesRegistry>) -> RegistryTypeCatalog {
+    RegistryTypeCatalog::new(
+        Arc::clone(registry) as Arc<dyn TypesRegistryApi>,
+        Arc::clone(registry) as Arc<dyn PlatformTypesRegistryApi>,
+        Duration::from_secs(1),
+    )
 }
 
 #[tokio::test]
-async fn known_types_reports_only_registered_identifiers() {
-    let known = catalog()
-        .known_types(&[WIDGET.to_owned(), UNKNOWN.to_owned()])
+async fn known_types_reports_only_registered_type_identifiers() {
+    let registry = registry();
+    let known = catalog(&registry)
+        .known_types(
+            TypeCatalogScope::Platform,
+            &[
+                WIDGET.to_owned(),
+                UNKNOWN.to_owned(),
+                "not-an-id".to_owned(),
+                WIDGET.to_owned(),
+            ],
+        )
         .await
         .unwrap();
-    assert_eq!(known.len(), 1);
-    assert!(known.contains(WIDGET));
+    assert_eq!(known, std::collections::HashSet::from([WIDGET.to_owned()]));
+    assert_eq!(registry.platform_calls(Call::BatchGet), 1);
+}
+
+async fn assert_deleted_types_are_not_known(scope: TypeCatalogScope<'_>) {
+    let registry = registry();
+    registry.seed_entity(
+        Seed::new(
+            UNKNOWN,
+            serde_json::json!({
+                "$id": format!("gts://{UNKNOWN}"),
+                "$schema": "http://json-schema.org/draft-07/schema#",
+                "type": "object",
+            }),
+        )
+        .deleted(),
+    );
+
+    let known = catalog(&registry)
+        .known_types(scope, &[WIDGET.to_owned(), UNKNOWN.to_owned()])
+        .await
+        .unwrap();
+
+    assert_eq!(known, std::collections::HashSet::from([WIDGET.to_owned()]));
+}
+
+#[tokio::test]
+async fn platform_validation_excludes_deleted_resource_types() {
+    assert_deleted_types_are_not_known(TypeCatalogScope::Platform).await;
+}
+
+#[tokio::test]
+async fn caller_validation_excludes_deleted_resource_types() {
+    let caller = ctx(uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+    assert_deleted_types_are_not_known(TypeCatalogScope::Caller(&caller)).await;
 }
 
 #[tokio::test]
 async fn an_empty_request_does_not_call_the_registry() {
-    assert!(catalog().known_types(&[]).await.unwrap().is_empty());
-}
-
-/// How [`BatchOnly`] answers the batch lookup; every other call is unused.
-enum Batch {
-    /// Never answers.
-    Hang,
-    /// Answers the first id with an internal failure.
-    FailFirst,
-    /// Answers nothing at all.
-    Omit,
-}
-
-/// A registry fake for the outage paths the shared mock cannot produce.
-struct BatchOnly(Batch);
-
-#[async_trait::async_trait]
-impl types_registry_sdk::TypesRegistryClient for BatchOnly {
-    async fn register(
-        &self,
-        _entities: Vec<serde_json::Value>,
-    ) -> Result<Vec<types_registry_sdk::RegisterResult>, toolkit_canonical_errors::CanonicalError>
-    {
-        unreachable!("the catalog only reads type schemas in batch")
-    }
-    async fn register_type_schemas(
-        &self,
-        _type_schemas: Vec<serde_json::Value>,
-    ) -> Result<Vec<types_registry_sdk::RegisterResult>, toolkit_canonical_errors::CanonicalError>
-    {
-        unreachable!("the catalog only reads type schemas in batch")
-    }
-    async fn get_type_schema(
-        &self,
-        _type_id: &str,
-    ) -> Result<types_registry_sdk::GtsTypeSchema, toolkit_canonical_errors::CanonicalError> {
-        unreachable!("the catalog only reads type schemas in batch")
-    }
-    async fn get_type_schema_by_uuid(
-        &self,
-        _id: uuid::Uuid,
-    ) -> Result<types_registry_sdk::GtsTypeSchema, toolkit_canonical_errors::CanonicalError> {
-        unreachable!("the catalog only reads type schemas in batch")
-    }
-    async fn get_type_schemas(
-        &self,
-        ids: Vec<String>,
-    ) -> std::collections::HashMap<
-        String,
-        Result<types_registry_sdk::GtsTypeSchema, toolkit_canonical_errors::CanonicalError>,
-    > {
-        match self.0 {
-            Batch::Hang => std::future::pending().await,
-            Batch::FailFirst => ids
-                .into_iter()
-                .take(1)
-                .map(|id| {
-                    (
-                        id,
-                        Err(toolkit_canonical_errors::CanonicalError::internal("boom").create()),
-                    )
-                })
-                .collect(),
-            Batch::Omit => std::collections::HashMap::new(),
-        }
-    }
-    async fn get_type_schemas_by_uuid(
-        &self,
-        _ids: Vec<uuid::Uuid>,
-    ) -> std::collections::HashMap<
-        uuid::Uuid,
-        Result<types_registry_sdk::GtsTypeSchema, toolkit_canonical_errors::CanonicalError>,
-    > {
-        unreachable!("the catalog only reads type schemas in batch")
-    }
-    async fn list_type_schemas(
-        &self,
-        _query: types_registry_sdk::TypeSchemaQuery,
-    ) -> Result<Vec<types_registry_sdk::GtsTypeSchema>, toolkit_canonical_errors::CanonicalError>
-    {
-        unreachable!("the catalog only reads type schemas in batch")
-    }
-    async fn register_instances(
-        &self,
-        _instances: Vec<serde_json::Value>,
-    ) -> Result<Vec<types_registry_sdk::RegisterResult>, toolkit_canonical_errors::CanonicalError>
-    {
-        unreachable!("the catalog only reads type schemas in batch")
-    }
-    async fn get_instance(
-        &self,
-        _id: &str,
-    ) -> Result<types_registry_sdk::GtsInstance, toolkit_canonical_errors::CanonicalError> {
-        unreachable!("the catalog only reads type schemas in batch")
-    }
-    async fn get_instance_by_uuid(
-        &self,
-        _id: uuid::Uuid,
-    ) -> Result<types_registry_sdk::GtsInstance, toolkit_canonical_errors::CanonicalError> {
-        unreachable!("the catalog only reads type schemas in batch")
-    }
-    async fn get_instances(
-        &self,
-        _ids: Vec<String>,
-    ) -> std::collections::HashMap<
-        String,
-        Result<types_registry_sdk::GtsInstance, toolkit_canonical_errors::CanonicalError>,
-    > {
-        unreachable!("the catalog only reads type schemas in batch")
-    }
-    async fn get_instances_by_uuid(
-        &self,
-        _ids: Vec<uuid::Uuid>,
-    ) -> std::collections::HashMap<
-        uuid::Uuid,
-        Result<types_registry_sdk::GtsInstance, toolkit_canonical_errors::CanonicalError>,
-    > {
-        unreachable!("the catalog only reads type schemas in batch")
-    }
-    async fn list_instances(
-        &self,
-        _query: types_registry_sdk::InstanceQuery,
-    ) -> Result<Vec<types_registry_sdk::GtsInstance>, toolkit_canonical_errors::CanonicalError>
-    {
-        unreachable!("the catalog only reads type schemas in batch")
-    }
-}
-
-fn outage(batch: Batch) -> RegistryTypeCatalog {
-    RegistryTypeCatalog::new(Arc::new(BatchOnly(batch)), Duration::from_millis(20))
+    let registry = Arc::new(MockTypesRegistry::strict());
+    assert!(
+        catalog(&registry)
+            .known_types(TypeCatalogScope::Platform, &[])
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(registry.calls(Call::BatchGet), 0);
 }
 
 #[tokio::test]
-async fn an_outage_is_never_read_as_an_absence() {
-    use crate::domain::ports::PortError;
+async fn caller_reads_keep_the_request_identity_and_never_use_the_platform() {
+    let registry = registry();
+    let subject = uuid::Uuid::new_v4();
+    let tenant = uuid::Uuid::new_v4();
+    let caller = ctx(subject, tenant);
+    let known = catalog(&registry)
+        .known_types(TypeCatalogScope::Caller(&caller), &[WIDGET.to_owned()])
+        .await
+        .unwrap();
+    assert!(known.contains(WIDGET));
+    let contexts = registry.caller_contexts(Call::BatchGet);
+    assert_eq!(contexts.len(), 1);
+    assert_eq!(contexts[0].subject_id(), subject);
+    assert_eq!(contexts[0].subject_tenant_id(), tenant);
+    assert_eq!(registry.platform_calls(Call::BatchGet), 0);
+}
 
-    let ids = [WIDGET.to_owned()];
-    assert_eq!(
-        outage(Batch::Hang).known_types(&ids).await,
-        Err(PortError::Timeout)
+#[tokio::test]
+async fn caller_refusals_are_not_unknown_types_or_a_platform_fallback() {
+    for (error, expected) in [
+        (
+            CanonicalError::unauthenticated()
+                .with_reason("CALLER_AUTH")
+                .create(),
+            PortError::Unauthenticated,
+        ),
+        (
+            RegistryReadResource::permission_denied()
+                .with_reason("CALLER_DENIED")
+                .create(),
+            PortError::PermissionDenied,
+        ),
+    ] {
+        let registry = registry();
+        registry.inject(Fault::on(Call::BatchGet).fail(error));
+        let caller = ctx(uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+        let error = catalog(&registry)
+            .known_types(TypeCatalogScope::Caller(&caller), &[WIDGET.to_owned()])
+            .await
+            .unwrap_err();
+        assert_eq!(error, expected);
+        assert_eq!(registry.caller_contexts(Call::BatchGet).len(), 1);
+        assert_eq!(registry.platform_calls(Call::BatchGet), 0);
+    }
+}
+
+#[tokio::test]
+async fn a_platform_credential_refusal_is_a_dependency_failure() {
+    let registry = registry();
+    registry.inject(
+        Fault::on(Call::BatchGet).fail(
+            RegistryReadResource::permission_denied()
+                .with_reason("CALLER_DENIED")
+                .create(),
+        ),
     );
-    for batch in [Batch::FailFirst, Batch::Omit] {
-        assert!(matches!(
-            outage(batch).known_types(&ids).await,
-            Err(PortError::Unavailable(_))
-        ));
+    let error = catalog(&registry)
+        .known_types(TypeCatalogScope::Platform, &[WIDGET.to_owned()])
+        .await
+        .unwrap_err();
+    assert!(matches!(error, PortError::Unavailable(_)));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_stalled_batch_fails_at_the_configured_budget() {
+    let registry = registry();
+    registry.inject(Fault::on(Call::BatchGet).delay(Duration::from_secs(60)));
+    let error = catalog(&registry)
+        .known_types(TypeCatalogScope::Platform, &[WIDGET.to_owned()])
+        .await
+        .unwrap_err();
+    assert_eq!(error, PortError::Timeout);
+}
+
+#[tokio::test]
+async fn an_unusable_batch_never_becomes_a_partial_known_set() {
+    for malformed in [false, true] {
+        let registry = registry();
+        if malformed {
+            registry.protocol_fault(ProtocolFault::DropAnswers);
+        } else {
+            registry.inject(
+                Fault::on(Call::BatchGet).fail(CanonicalError::internal("outage").create()),
+            );
+        }
+        let error = catalog(&registry)
+            .known_types(
+                TypeCatalogScope::Platform,
+                &[WIDGET.to_owned(), UNKNOWN.to_owned()],
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, PortError::Unavailable(_)), "{error:?}");
     }
 }

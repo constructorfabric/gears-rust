@@ -1,6 +1,8 @@
 """Shared helpers for OAGW E2E tests."""
+import json
 import re
 import uuid
+from pathlib import Path
 from typing import Optional
 
 import httpx
@@ -13,7 +15,7 @@ import httpx
 UPSTREAM_SCHEMA = "gts.cf.core.oagw.upstream.v1~"
 ROUTE_SCHEMA = "gts.cf.core.oagw.route.v1~"
 
-# The types-registry entities of the suite's sqlite profile (e2e.yaml).
+# The sqlite profile's post-startup entities (registry-fixtures.json).
 REGISTRY_UPSTREAM_ID = f"{UPSTREAM_SCHEMA}5e0a1900-0000-4000-8000-000000000001"
 REGISTRY_ROUTE_ID = f"{ROUTE_SCHEMA}5e0a1900-0000-4000-8000-000000000002"
 BARE_UUID_ROUTE_ID = f"{ROUTE_SCHEMA}5e0a1900-0000-4000-8000-000000000003"
@@ -63,6 +65,25 @@ OAGW_INSTANCES = [
 ]
 
 ALL_OAGW_GTS_IDS = OAGW_SCHEMAS + OAGW_INSTANCES
+
+
+def seed_legacy_registry_fixtures(client: httpx.Client, base_url: str, headers: dict) -> None:
+    """Publish SQLite fixtures after OAGW registers its legacy schemas in init.
+
+    Until T38 migrates OAGW, its provisioner requires UUID-tail identities and
+    reads the legacy catalogue. Managed admission forbids those identities, so
+    these fixtures cannot be registry startup seeds. This is explicit legacy
+    setup, never a fallback from a failed managed publication.
+    """
+    entities = json.loads(Path(__file__).with_name("registry-fixtures.json").read_text())
+    response = client.post(
+        f"{base_url}/types-registry/v1/entities", headers=headers, json={"entities": entities}
+    )
+    response.raise_for_status()
+    result = response.json()
+    summary = result.get("summary", {})
+    if summary.get("succeeded") != len(entities) or summary.get("failed") != 0:
+        raise RuntimeError(f"OAGW registry fixture registration failed: {result}")
 
 
 async def list_oagw_types(

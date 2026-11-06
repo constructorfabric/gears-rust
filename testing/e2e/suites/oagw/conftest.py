@@ -10,7 +10,7 @@ from pathlib import Path
 import httpx
 import pytest
 
-from .helpers import Cleanup
+from .helpers import Cleanup, seed_legacy_registry_fixtures
 from .mock_upstream import MockUpstreamServer
 
 
@@ -180,12 +180,12 @@ REGISTRY_WAIT_SECS = 60
 
 @pytest.fixture(scope="session", autouse=True)
 def registry_provisioned():
-    """On the sqlite profile, wait until the registry rows exist.
+    """On the sqlite profile, publish fixtures and wait for registry-owned rows.
 
     With a database, OAGW reconciles the types-registry instances in a
     background task once it serves (ADR-0018), so ``/healthz`` can answer
     before the first run has written them. Poll the Management API for every
-    registry instance of the profile (``e2e.yaml``); fail with the last answer
+    registry instance in ``registry-fixtures.json``; fail with the last answer
     after ``REGISTRY_WAIT_SECS``. Other profiles provision synchronously.
     """
     if os.getenv("OAGW_E2E_PROFILE") != "sqlite":
@@ -193,8 +193,7 @@ def registry_provisioned():
     from .helpers import BARE_UUID_ROUTE_ID, REGISTRY_ROUTE_ID, REGISTRY_UPSTREAM_ID
 
     base_url = os.getenv("E2E_OAGW_BASE_URL", "http://localhost:8086")
-    token = os.getenv("E2E_AUTH_TOKEN", "e2e-token-tenant-a")
-    headers = {"Authorization": f"Bearer {token}"}
+    headers = _oagw_auth_headers()
     urls = [
         f"{base_url}/oagw/v1/upstreams/{REGISTRY_UPSTREAM_ID}",
         f"{base_url}/oagw/v1/routes/{REGISTRY_ROUTE_ID}",
@@ -203,6 +202,7 @@ def registry_provisioned():
     deadline = time.monotonic() + REGISTRY_WAIT_SECS
     last = "no response"
     with httpx.Client(timeout=5.0) as client:
+        seed_legacy_registry_fixtures(client, base_url, headers)
         while True:
             pending = []
             for url in urls:
@@ -236,13 +236,18 @@ def mock_upstream_url():
     return os.getenv("E2E_MOCK_UPSTREAM_URL", "http://127.0.0.1:19876")
 
 
-@pytest.fixture
-def oagw_headers():
-    """Standard headers for OAGW requests (auth only — tenant comes from the token)."""
+def _oagw_auth_headers():
+    """Fresh headers shared by registry setup and per-test OAGW requests."""
     token = os.getenv("E2E_AUTH_TOKEN", "e2e-token-tenant-a")
     return {
         "Authorization": f"Bearer {token}",
     }
+
+
+@pytest.fixture
+def oagw_headers():
+    """Standard headers for OAGW requests (auth only — tenant comes from the token)."""
+    return _oagw_auth_headers()
 
 
 # ---------------------------------------------------------------------------

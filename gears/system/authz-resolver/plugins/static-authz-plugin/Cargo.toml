@@ -20,8 +20,8 @@ workspace = true
 [dependencies]
 # Local dependencies
 authz-resolver-sdk = { package = "cf-gears-authz-resolver-sdk", version = "0.6.2", path = "../../authz-resolver-sdk" }
-types-registry-sdk = { package = "cf-gears-types-registry-sdk", version = "0.4.2", path = "../../../types-registry/types-registry-sdk" }
-types-registry = { workspace = true }
+# Publishes through the consumed platform API (local or resolving REST client).
+types-registry-sdk = { package = "cf-gears-types-registry-sdk", version = "0.4.2", path = "../../../types-registry/types-registry-sdk", features = ["rest-client"] }
 
 # ToolKit dependencies
 toolkit = { workspace = true }
@@ -49,4 +49,8 @@ tracing = { workspace = true }
 inventory = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["rt", "macros"] }
+toolkit = { workspace = true, features = ["test-support"] }
+tokio = { workspace = true, features = ["rt", "macros", "test-util"] }
+tokio-util = { workspace = true }
+# The in-memory platform registry the publication tests run against.
+types-registry-sdk = { package = "cf-gears-types-registry-sdk", path = "../../../types-registry/types-registry-sdk", features = ["test-util"] }

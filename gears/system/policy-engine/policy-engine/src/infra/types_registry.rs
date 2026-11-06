@@ -1,11 +1,8 @@
-//! [`TypeCatalogPort`] over the types-registry client.
+//! Caller-aware type catalog over the managed Types Registry contracts.
 //!
-//! Resolved by the batch `get_type_schemas` call under the configured
-//! registry bound. Identifiers the registry definitively does not know (not
-//! found, or not a valid identifier) are absent from the result; anything
-//! else - timeout, an outage, a per-item failure that is not a definitive
-//! absence, an answer that omits a requested item - fails the whole call, so
-//! a caller can never mistake an outage for an absence.
+//! Built-in validation is a platform read. Policy management keeps the
+//! request's identity. Missing schemas are absent from the result; a failed
+//! batch, timeout or omitted answer fails the complete validation.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -13,13 +10,18 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use toolkit_canonical_errors::CanonicalError;
-use types_registry_sdk::TypesRegistryClient;
+use toolkit_security::PlatformSecurityContext;
+use types_registry_sdk::{
+    GtsTypeId, LifecycleStatus, PlatformTypesRegistryApi, PlatformTypesRegistryApiExt, ReadOptions,
+    TypesRegistryApi, TypesRegistryApiExt,
+};
 
-use crate::domain::ports::{PortError, TypeCatalogPort};
+use crate::domain::ports::{PortError, TypeCatalogPort, TypeCatalogScope};
 
-/// [`TypeCatalogPort`] asking a [`TypesRegistryClient`].
+/// Registry reads for startup and for the policy management caller.
 pub struct RegistryTypeCatalog {
-    client: Arc<dyn TypesRegistryClient>,
+    caller: Arc<dyn TypesRegistryApi>,
+    platform: Arc<dyn PlatformTypesRegistryApi>,
     timeout: Duration,
 }
 
@@ -32,35 +34,65 @@ impl std::fmt::Debug for RegistryTypeCatalog {
 }
 
 impl RegistryTypeCatalog {
-    /// Asks `client`, bounding each call by `timeout`.
+    /// Reads through the selected identity, bounding the complete batch operation.
     #[must_use]
-    pub fn new(client: Arc<dyn TypesRegistryClient>, timeout: Duration) -> Self {
-        Self { client, timeout }
+    pub fn new(
+        caller: Arc<dyn TypesRegistryApi>,
+        platform: Arc<dyn PlatformTypesRegistryApi>,
+        timeout: Duration,
+    ) -> Self {
+        Self {
+            caller,
+            platform,
+            timeout,
+        }
     }
 }
 
 #[async_trait]
 impl TypeCatalogPort for RegistryTypeCatalog {
-    async fn known_types(&self, ids: &[String]) -> Result<HashSet<String>, PortError> {
-        if ids.is_empty() {
+    async fn known_types(
+        &self,
+        scope: TypeCatalogScope<'_>,
+        ids: &[String],
+    ) -> Result<HashSet<String>, PortError> {
+        let keys: Vec<GtsTypeId> = ids
+            .iter()
+            .filter_map(|id| GtsTypeId::try_new(id.as_str()).ok())
+            .collect();
+        if keys.is_empty() {
             return Ok(HashSet::new());
         }
-        let mut answers =
-            tokio::time::timeout(self.timeout, self.client.get_type_schemas(ids.to_vec()))
-                .await
-                .map_err(|_| PortError::Timeout)?;
+        let read = async {
+            let options = ReadOptions::new().with_fresh(true);
+            match scope {
+                TypeCatalogScope::Caller(ctx) => {
+                    self.caller
+                        .batch_get_type_schemas(ctx, &keys, options)
+                        .await
+                }
+                TypeCatalogScope::Platform => {
+                    self.platform
+                        .batch_get_type_schemas(
+                            &PlatformSecurityContext::outbound_marker(),
+                            &keys,
+                            options,
+                        )
+                        .await
+                }
+            }
+        };
+        let answers = tokio::time::timeout(self.timeout, read)
+            .await
+            .map_err(|_| PortError::Timeout)?
+            .map_err(|error| registry_error(scope, error))?;
         let mut known = HashSet::new();
-        for id in ids {
-            match answers.remove(id) {
-                Some(Ok(_)) => {
-                    known.insert(id.clone());
+        for id in keys {
+            match answers.get(&id) {
+                Some(Some(schema)) if schema.lifecycle_status == LifecycleStatus::Active => {
+                    known.insert(id.to_string());
                 }
-                Some(Err(
-                    CanonicalError::NotFound { .. } | CanonicalError::InvalidArgument { .. },
-                )) => {}
-                Some(Err(err)) => {
-                    return Err(PortError::Unavailable(format!("types registry: {err}")));
-                }
+                Some(_) => {}
                 None => {
                     return Err(PortError::Unavailable(
                         "types registry omitted a requested type".to_owned(),
@@ -69,6 +101,19 @@ impl TypeCatalogPort for RegistryTypeCatalog {
             }
         }
         Ok(known)
+    }
+}
+
+fn registry_error(scope: TypeCatalogScope<'_>, error: CanonicalError) -> PortError {
+    tracing::warn!(error = %error, "policy type catalog read failed");
+    match (scope, error) {
+        (TypeCatalogScope::Caller(_), CanonicalError::Unauthenticated { .. }) => {
+            PortError::Unauthenticated
+        }
+        (TypeCatalogScope::Caller(_), CanonicalError::PermissionDenied { .. }) => {
+            PortError::PermissionDenied
+        }
+        (_, error) => PortError::Unavailable(format!("types registry: {error}")),
     }
 }
 

@@ -5,29 +5,45 @@ use std::sync::{Arc, OnceLock};
 use async_trait::async_trait;
 use authz_resolver_sdk::{AuthZResolverPluginClient, AuthZResolverPluginSpecV1};
 use toolkit::Gear;
-use toolkit::client_hub::ClientScope;
 use toolkit::context::GearCtx;
 use toolkit::gts::PluginV1;
+use toolkit::gts_publication::GtsPublicationInputs;
+use toolkit::plugins::bind_plugin_instances;
 use tracing::info;
-use types_registry_sdk::{RegisterResult, TypesRegistryClient};
+use types_registry_sdk::GtsId;
 
 use crate::config::StaticAuthZPluginConfig;
 use crate::domain::Service;
 
+/// The GTS segment of this plugin's instance.
+const INSTANCE_SEGMENT: &str = "cf.builtin.static_authz_resolver.plugin.v1";
+
 /// Static `AuthZ` resolver plugin gear.
+///
+/// The runtime publishes the plugin instance built from the configuration
+/// (`entities`) and calls `init` only once it is admitted; `init` binds the
+/// scoped client to the admitted instance, before anything can select it.
 #[toolkit::gear(
     name = "static-authz-plugin",
-    deps = [types_registry]
+    gts_publication(entities = Self::plugin_instance),
 )]
+#[derive(Default)]
 pub struct StaticAuthZPlugin {
-    service: OnceLock<Arc<Service>>,
+    service: OnceLock<Arc<dyn AuthZResolverPluginClient>>,
 }
 
-impl Default for StaticAuthZPlugin {
-    fn default() -> Self {
-        Self {
-            service: OnceLock::new(),
-        }
+impl StaticAuthZPlugin {
+    /// The publication's config-only documents: the plugin instance.
+    fn plugin_instance(
+        inputs: &GtsPublicationInputs<'_>,
+    ) -> anyhow::Result<Vec<(GtsId, serde_json::Value)>> {
+        let cfg: StaticAuthZPluginConfig = inputs.config_or_default()?;
+        let (id, document) = PluginV1::<AuthZResolverPluginSpecV1>::build_registration(
+            INSTANCE_SEGMENT,
+            cfg.vendor,
+            cfg.priority,
+        )?;
+        Ok(vec![(GtsId::try_new(id.as_ref())?, document)])
     }
 }
 
@@ -40,35 +56,21 @@ impl Gear for StaticAuthZPlugin {
             priority = cfg.priority,
             "Loaded plugin configuration"
         );
-
-        // Build registration payload and instance id for this plugin.
-        let (instance_id, instance_json) =
-            PluginV1::<AuthZResolverPluginSpecV1>::build_registration(
-                "cf.builtin.static_authz_resolver.plugin.v1",
-                cfg.vendor.clone(),
-                cfg.priority,
-            )?;
-
-        // Publish to types-registry.
-        let registry = ctx.client_hub().get::<dyn TypesRegistryClient>()?;
-        let results = registry.register(vec![instance_json]).await?;
-        RegisterResult::ensure_all_ok(&results)?;
-
-        // Create service
-        let service = Arc::new(Service::new());
+        let service: Arc<dyn AuthZResolverPluginClient> = Arc::new(Service::new());
         self.service
-            .set(service.clone())
+            .set(Arc::clone(&service))
             .map_err(|_| anyhow::anyhow!("{} gear already initialized", Self::MODULE_NAME))?;
-
-        // Register scoped client in ClientHub
-        let api: Arc<dyn AuthZResolverPluginClient> = service;
-        ctx.client_hub()
-            .register_scoped::<dyn AuthZResolverPluginClient>(
-                ClientScope::gts_id(&instance_id),
-                api,
-            );
-
-        info!(instance_id = %instance_id);
-        Ok(())
+        // The instance was admitted before `init`: bind the scoped client to
+        // it, as the admitted manifest lists it.
+        bind_plugin_instances::<AuthZResolverPluginSpecV1, _>(
+            &ctx.client_hub(),
+            ctx.gts_publication_manifest()?.documents(),
+            &service,
+        )
     }
 }
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+#[path = "gear_tests.rs"]
+mod gear_tests;

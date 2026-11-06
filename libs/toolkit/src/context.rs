@@ -253,6 +253,19 @@ impl GearCtx {
         self
     }
 
+    /// Attach an admitted-manifest fixture in downstream gear tests.
+    ///
+    /// Requires the `test-support` feature, enabled through a dev-dependency.
+    /// This bypasses publication; tests of admission must exercise the runtime
+    /// or publish through `PreparedGtsPublication` before using this helper.
+    #[cfg(feature = "test-support")]
+    pub fn with_gts_publication_manifest_for_test(
+        self,
+        manifest: Arc<crate::gts_publication::GtsManifest>,
+    ) -> Self {
+        self.with_gts_publication_manifest(manifest)
+    }
+
     /// The documents of this gear's `gts_publication(...)`, admitted before `init`.
     /// Plugins bind scoped clients to its instances. This is the published manifest,
     /// never rebuilt from configuration.

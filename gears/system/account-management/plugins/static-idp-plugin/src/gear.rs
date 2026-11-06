@@ -5,46 +5,45 @@ use std::sync::{Arc, OnceLock};
 use account_management_sdk::{IdpPluginClient, IdpPluginSpecV1};
 use async_trait::async_trait;
 use toolkit::Gear;
-use toolkit::client_hub::ClientScope;
 use toolkit::context::GearCtx;
 use toolkit::gts::PluginV1;
+use toolkit::gts_publication::GtsPublicationInputs;
+use toolkit::plugins::bind_plugin_instances;
 use tracing::{info, warn};
-use types_registry_sdk::{RegisterResult, TypesRegistryClient};
+use types_registry_sdk::GtsId;
 
 use crate::config::StaticIdpPluginConfig;
 use crate::domain::Service;
 
-/// Static `IdP` plugin gear.
+/// The GTS segment of this plugin's instance.
+const INSTANCE_SEGMENT: &str = "cf.builtin.static_idp.plugin.v1";
+
+/// Static `IdP` plugin for bootstrap and tenant lifecycle without an external `IdP`.
 ///
-/// Registers the permissive echo [`Service`] as a scoped
-/// `IdpPluginClient` candidate so Account Management's bootstrap saga
-/// and tenant lifecycle flows succeed without a real `IdP` deployment.
-///
-/// Selection flow (symmetric with Tenant Resolver / `AuthN` Resolver):
-///
-///   1. Plugin init publishes a `PluginV1<IdpPluginSpecV1>` instance
-///      to types-registry carrying the configured `vendor` + `priority`.
-///   2. Plugin init registers the trait object under
-///      `ClientHub::register_scoped::<dyn IdpPluginClient>(scope = gts_id)`
-///      so coexisting `IdP` plugins cannot silently overwrite each other.
-///   3. AM resolves at gear init: enumerate every
-///      `PluginV1<IdpPluginSpecV1>` instance, `choose_plugin_instance`
-///      by `cfg.idp.vendor` (default `"cf"` — matches this plugin's
-///      default vendor) + priority tiebreak, then `get_scoped` keyed
-///      on the chosen `gts_id`.
+/// The runtime publishes the plugin instance built from the configuration
+/// (`entities`) and calls `init` only once it is admitted; `init` binds the
+/// scoped client to the admitted instance, before anything can select it.
 #[toolkit::gear(
     name = "static-idp-plugin",
-    deps = [types_registry]
+    gts_publication(entities = Self::plugin_instance),
 )]
+#[derive(Default)]
 pub struct StaticIdpPlugin {
-    service: OnceLock<Arc<Service>>,
+    service: OnceLock<Arc<dyn IdpPluginClient>>,
 }
 
-impl Default for StaticIdpPlugin {
-    fn default() -> Self {
-        Self {
-            service: OnceLock::new(),
-        }
+impl StaticIdpPlugin {
+    /// The publication's config-only documents: the plugin instance.
+    fn plugin_instance(
+        inputs: &GtsPublicationInputs<'_>,
+    ) -> anyhow::Result<Vec<(GtsId, serde_json::Value)>> {
+        let cfg: StaticIdpPluginConfig = inputs.config_or_default()?;
+        let (id, document) = PluginV1::<IdpPluginSpecV1>::build_registration(
+            INSTANCE_SEGMENT,
+            cfg.vendor,
+            cfg.priority,
+        )?;
+        Ok(vec![(GtsId::try_new(id.as_ref())?, document)])
     }
 }
 
@@ -62,68 +61,21 @@ impl Gear for StaticIdpPlugin {
             priority = cfg.priority,
             "Loaded plugin configuration"
         );
-
-        let service = Arc::new(Service::new());
-
-        // Build registration payload and instance id for this plugin.
-        let (instance_id, instance_json) = PluginV1::<IdpPluginSpecV1>::build_registration(
-            "cf.builtin.static_idp.plugin.v1",
-            cfg.vendor.clone(),
-            cfg.priority,
-        )?;
-
-        // Publish to types-registry for catalogue visibility.
-        let registry = ctx.client_hub().get::<dyn TypesRegistryClient>()?;
-        let results = registry.register(vec![instance_json.clone()]).await?;
-        // Idempotent restart: treat `AlreadyExists` as success only when
-        // the stored spec matches our current serialized instance; fail
-        // otherwise so a stale registration under the same ID surfaces
-        // immediately rather than masking a config drift. Mirrors the
-        // pattern in `account_management::gear::init` for the AM-
-        // owned TR plugin.
-        for result in &results {
-            if let RegisterResult::Err { error, .. } = result {
-                if matches!(
-                    error,
-                    toolkit_canonical_errors::CanonicalError::AlreadyExists { .. }
-                ) {
-                    let existing =
-                        registry
-                            .get_instance(instance_id.as_ref())
-                            .await
-                            .map_err(|e| {
-                                anyhow::anyhow!("static-idp-plugin: verify existing instance: {e}")
-                            })?;
-                    if existing.object != instance_json {
-                        return Err(anyhow::anyhow!(
-                            "static-idp-plugin: instance `{instance_id}` already registered \
-                             with a different spec",
-                        ));
-                    }
-                } else {
-                    return Err(anyhow::anyhow!(
-                        "static-idp-plugin: registration failed: {error}"
-                    ));
-                }
-            }
-        }
-
+        let service: Arc<dyn IdpPluginClient> = Arc::new(Service::new());
         self.service
-            .set(service.clone())
+            .set(Arc::clone(&service))
             .map_err(|_| anyhow::anyhow!("{} gear already initialized", Self::MODULE_NAME))?;
-
-        // AM's lazy IdP resolver (`account_management::infra::idp::
-        // LazyIdpProvider`) reads this scoped registration on first
-        // API call via `ClientHub::try_get_scoped` keyed on the
-        // catalogue instance id. The scope MUST equal `instance_id`
-        // (the same value `PluginV1::build_registration` derived
-        // above) so the lazy `choose_plugin_instance` → `get_scoped`
-        // chain finds this trait object.
-        let api: Arc<dyn IdpPluginClient> = service;
-        ctx.client_hub()
-            .register_scoped::<dyn IdpPluginClient>(ClientScope::gts_id(&instance_id), api);
-
-        info!(instance_id = %instance_id);
-        Ok(())
+        // The instance was admitted before `init`: bind the scoped client to
+        // it, as the admitted manifest lists it.
+        bind_plugin_instances::<IdpPluginSpecV1, _>(
+            &ctx.client_hub(),
+            ctx.gts_publication_manifest()?.documents(),
+            &service,
+        )
     }
 }
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+#[path = "gear_tests.rs"]
+mod gear_tests;

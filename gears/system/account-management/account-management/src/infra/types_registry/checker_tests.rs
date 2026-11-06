@@ -2,260 +2,108 @@
 //!
 //! Extracted into a companion file per `cargo gears lint` rule `DE1101` (inline test
 //! blocks > 100 lines must move out of the production source file).
-//! The fakes here are local to the checker's unit tests; the
-//! cross-gear `SlowRegistry` used by service-level integration
-//! tests lives in `super::test_helpers`.
+//! Schemas are real documents in `MockTypesRegistry`, which materializes
+//! `effective_traits` with `gts-rust` as admission does; the AM envelope is the
+//! linked inventory declaration.
 
 use super::*;
 use serde_json::json;
-use std::collections::HashMap;
-use std::sync::Mutex;
+use toolkit_canonical_errors::CanonicalError;
 use toolkit_gts::{GTS_ID_PREFIX, gts_id, gts_uri};
-use types_registry_sdk::{GtsInstance, GtsTypeId, InstanceQuery, RegisterResult, TypeSchemaQuery};
+use types_registry_sdk::testing_platform::{Call, Fault, MockTypesRegistry, Seed};
 
-/// Build a `GtsTypeSchema` for testing. `traits_schema` carries
-/// the `allowed_parent_types` default (empty array per the canonical
-/// AM envelope); `traits` is the leaf-declared override layer.
-fn schema(
-    type_id: &str,
-    parent: Option<Arc<GtsTypeSchema>>,
-    own_allowed_parents: Option<Vec<&str>>,
-) -> Arc<GtsTypeSchema> {
-    let mut raw = json!({
+use crate::infra::types_registry::test_helpers::{
+    CallerSpy, Tampered, assert_only_caller, at_the_boundary, caller, outages, refusals,
+};
+
+const PLATFORM: &str = gts_id!("cf.core.am.tenant_type.v1~acme.am.tenant_type.platform.v1~");
+const CUSTOMER: &str = gts_id!("cf.core.am.tenant_type.v1~acme.am.tenant_type.customer.v1~");
+const ALIEN_ROOT: &str = gts_id!("acme.core.events.type.v1~");
+const ALIEN_LEAF: &str = gts_id!("acme.core.events.type.v1~acme.commerce.orders.order.v1~");
+
+fn uuid(type_id: &str) -> Uuid {
+    GtsId::try_new(type_id).expect("valid id").to_uuid()
+}
+
+/// A registry holding the linked inventory, the AM envelope among it.
+fn registry() -> Arc<MockTypesRegistry> {
+    let registry = Arc::new(MockTypesRegistry::new());
+    registry.seed_inventory();
+    registry
+}
+
+/// A tenant type derived from the envelope, declaring `allowed_parent_types`
+/// when given.
+fn seed_tenant_type(registry: &MockTypesRegistry, type_id: &str, allowed: Option<Value>) {
+    let mut doc = json!({
         "$id": gts_uri!(type_id),
+        "$schema": "http://json-schema.org/draft-07/schema#",
         "type": "object",
+        "allOf": [{ "$ref": gts_uri!(TENANT_TYPE_BASE_GTS_ID) }],
     });
-    if let Some(parents) = own_allowed_parents {
-        raw["x-gts-traits"] = json!({
-            ALLOWED_PARENT_TYPES_TRAIT: parents,
-        });
+    if let Some(allowed) = allowed {
+        doc["x-gts-traits"] = json!({ ALLOWED_PARENT_TYPES_TRAIT: allowed });
     }
-    let schema =
-        GtsTypeSchema::try_new(GtsTypeId::new(type_id), raw, None, parent).expect("schema");
-    Arc::new(schema)
+    registry.seed(type_id, doc);
 }
 
-/// Build the canonical envelope (`gts.cf.core.am.tenant_type.v1~`)
-/// with the `x-gts-traits-schema` defaulting `allowed_parent_types`
-/// to `[]`, mirroring `docs/schemas/tenant_type.v1.schema.json`.
-fn envelope() -> Arc<GtsTypeSchema> {
-    let raw = json!({
-        "$id": gts_uri!(TENANT_TYPE_BASE_GTS_ID),
-        "type": "object",
-        "x-gts-traits-schema": {
+fn seed_alien(registry: &MockTypesRegistry) {
+    registry.seed(
+        ALIEN_ROOT,
+        json!({
+            "$id": gts_uri!(ALIEN_ROOT),
+            "$schema": "http://json-schema.org/draft-07/schema#",
             "type": "object",
-            "additionalProperties": false,
-            "properties": {
-                ALLOWED_PARENT_TYPES_TRAIT: {
-                    "type": "array",
-                    "items": { "type": "string" },
-                    "default": [],
-                },
-            },
-        },
-    });
-    Arc::new(
-        GtsTypeSchema::try_new(GtsTypeId::new(TENANT_TYPE_BASE_GTS_ID), raw, None, None)
-            .expect("envelope"),
-    )
+        }),
+    );
+    registry.seed(
+        ALIEN_LEAF,
+        json!({
+            "$id": gts_uri!(ALIEN_LEAF),
+            "$schema": "http://json-schema.org/draft-07/schema#",
+            "type": "object",
+            "allOf": [{ "$ref": gts_uri!(ALIEN_ROOT) }],
+        }),
+    );
 }
-
-/// Test fake `TypesRegistryClient` returning canned schemas keyed
-/// by UUID. The only methods the checker exercises are
-/// `get_type_schemas_by_uuid` and (transitively, via timeout)
-/// nothing else; the rest are `unreachable!()`.
-struct FakeRegistry {
-    schemas: Mutex<HashMap<Uuid, Result<GtsTypeSchema, CanonicalError>>>,
-    delay: Mutex<Option<Duration>>,
-    calls: Mutex<u32>,
-}
-
-impl FakeRegistry {
-    fn new(entries: Vec<(Uuid, Result<GtsTypeSchema, CanonicalError>)>) -> Self {
-        Self {
-            schemas: Mutex::new(entries.into_iter().collect()),
-            delay: Mutex::new(None),
-            calls: Mutex::new(0),
-        }
-    }
-
-    fn with_delay(mut self, delay: Duration) -> Self {
-        *self.delay.get_mut().expect("lock") = Some(delay);
-        self
-    }
-}
-
-#[async_trait]
-impl TypesRegistryClient for FakeRegistry {
-    async fn register(
-        &self,
-        _entities: Vec<serde_json::Value>,
-    ) -> Result<Vec<RegisterResult>, CanonicalError> {
-        unreachable!()
-    }
-    async fn register_type_schemas(
-        &self,
-        _type_schemas: Vec<serde_json::Value>,
-    ) -> Result<Vec<RegisterResult>, CanonicalError> {
-        unreachable!()
-    }
-    async fn get_type_schema(&self, _type_id: &str) -> Result<GtsTypeSchema, CanonicalError> {
-        unreachable!()
-    }
-    async fn get_type_schema_by_uuid(
-        &self,
-        _type_uuid: Uuid,
-    ) -> Result<GtsTypeSchema, CanonicalError> {
-        unreachable!("checker uses the batch variant")
-    }
-    async fn get_type_schemas(
-        &self,
-        _type_ids: Vec<String>,
-    ) -> HashMap<String, Result<GtsTypeSchema, CanonicalError>> {
-        unreachable!()
-    }
-    async fn get_type_schemas_by_uuid(
-        &self,
-        type_uuids: Vec<Uuid>,
-    ) -> HashMap<Uuid, Result<GtsTypeSchema, CanonicalError>> {
-        *self.calls.lock().expect("lock") += 1;
-        let delay = *self.delay.lock().expect("lock");
-        if let Some(d) = delay {
-            tokio::time::sleep(d).await;
-        }
-        let map = self.schemas.lock().expect("lock");
-        let mut out = HashMap::new();
-        for u in type_uuids {
-            let entry = map
-                .get(&u)
-                .cloned()
-                .unwrap_or_else(|| Err(types_registry_sdk::testing::not_found(u.to_string())));
-            out.insert(u, entry);
-        }
-        out
-    }
-    async fn list_type_schemas(
-        &self,
-        _query: TypeSchemaQuery,
-    ) -> Result<Vec<GtsTypeSchema>, CanonicalError> {
-        unreachable!()
-    }
-    async fn register_instances(
-        &self,
-        _instances: Vec<serde_json::Value>,
-    ) -> Result<Vec<RegisterResult>, CanonicalError> {
-        unreachable!()
-    }
-    async fn get_instance(&self, _id: &str) -> Result<GtsInstance, CanonicalError> {
-        unreachable!()
-    }
-    async fn get_instance_by_uuid(&self, _uuid: Uuid) -> Result<GtsInstance, CanonicalError> {
-        unreachable!()
-    }
-    async fn get_instances(
-        &self,
-        _ids: Vec<String>,
-    ) -> HashMap<String, Result<GtsInstance, CanonicalError>> {
-        unreachable!()
-    }
-    async fn get_instances_by_uuid(
-        &self,
-        _uuids: Vec<Uuid>,
-    ) -> HashMap<Uuid, Result<GtsInstance, CanonicalError>> {
-        unreachable!()
-    }
-    async fn list_instances(
-        &self,
-        _query: InstanceQuery,
-    ) -> Result<Vec<GtsInstance>, CanonicalError> {
-        unreachable!()
-    }
-}
-
-// -------- happy path --------
 
 #[tokio::test]
 async fn admits_when_parent_in_child_allowed_parent_types() {
-    let envelope = envelope();
-    let parent_schema = schema(
-        gts_id!("cf.core.am.tenant_type.v1~acme.am.tenant_type.platform.v1~"),
-        Some(envelope.clone()),
-        None,
-    );
-    let child_schema = schema(
-        gts_id!("cf.core.am.tenant_type.v1~acme.am.tenant_type.customer.v1~"),
-        Some(envelope),
-        Some(vec![gts_id!(
-            "cf.core.am.tenant_type.v1~acme.am.tenant_type.platform.v1~"
-        )]),
-    );
-    let parent_uuid = parent_schema.type_uuid;
-    let child_uuid = child_schema.type_uuid;
-
-    let registry = Arc::new(FakeRegistry::new(vec![
-        (
-            parent_uuid,
-            Ok(Arc::try_unwrap(parent_schema).unwrap_or_else(|a| (*a).clone())),
-        ),
-        (
-            child_uuid,
-            Ok(Arc::try_unwrap(child_schema).unwrap_or_else(|a| (*a).clone())),
-        ),
-    ]));
+    let registry = registry();
+    seed_tenant_type(&registry, PLATFORM, None);
+    seed_tenant_type(&registry, CUSTOMER, Some(json!([PLATFORM])));
     let checker = GtsTenantTypeChecker::new(registry.clone());
 
     checker
-        .check_parent_child(parent_uuid, child_uuid)
+        .check_parent_child(&caller(1), uuid(PLATFORM), uuid(CUSTOMER))
         .await
         .expect("admit when parent listed");
     // Single batch call — checker MUST NOT issue per-uuid round-trips.
-    assert_eq!(*registry.calls.lock().expect("lock"), 1);
+    assert_eq!(registry.calls(Call::BatchGet), 1);
 }
 
 // -------- same-type nesting --------
 
 #[tokio::test]
 async fn admits_same_type_nesting_when_self_listed() {
-    let envelope = envelope();
-    let nested = schema(
-        gts_id!("cf.core.am.tenant_type.v1~acme.am.tenant_type.partner.v1~"),
-        Some(envelope),
-        // Self-reference admits same-type nesting.
-        Some(vec![gts_id!(
-            "cf.core.am.tenant_type.v1~acme.am.tenant_type.partner.v1~"
-        )]),
-    );
-    let nested_uuid = nested.type_uuid;
-    let registry = Arc::new(FakeRegistry::new(vec![(
-        nested_uuid,
-        Ok(Arc::try_unwrap(nested).unwrap_or_else(|a| (*a).clone())),
-    )]));
+    let registry = registry();
+    seed_tenant_type(&registry, CUSTOMER, Some(json!([CUSTOMER])));
     let checker = GtsTenantTypeChecker::new(registry);
+
     checker
-        .check_parent_child(nested_uuid, nested_uuid)
+        .check_parent_child(&caller(1), uuid(CUSTOMER), uuid(CUSTOMER))
         .await
         .expect("admit when self-nesting allowed");
 }
 
 #[tokio::test]
 async fn rejects_same_type_nesting_when_self_not_listed() {
-    let envelope = envelope();
-    let leaf = schema(
-        gts_id!("cf.core.am.tenant_type.v1~acme.am.tenant_type.customer.v1~"),
-        Some(envelope),
-        // Self NOT in the list → same-type nesting disallowed.
-        Some(vec![gts_id!(
-            "cf.core.am.tenant_type.v1~acme.am.tenant_type.platform.v1~"
-        )]),
-    );
-    let leaf_uuid = leaf.type_uuid;
-    let registry = Arc::new(FakeRegistry::new(vec![(
-        leaf_uuid,
-        Ok(Arc::try_unwrap(leaf).unwrap_or_else(|a| (*a).clone())),
-    )]));
+    let registry = registry();
+    seed_tenant_type(&registry, CUSTOMER, Some(json!([PLATFORM])));
     let checker = GtsTenantTypeChecker::new(registry);
+
     let err = checker
-        .check_parent_child(leaf_uuid, leaf_uuid)
+        .check_parent_child(&caller(1), uuid(CUSTOMER), uuid(CUSTOMER))
         .await
         .expect_err("self-nesting must reject");
     assert!(matches!(err, DomainError::TypeNotAllowed { .. }));
@@ -266,29 +114,14 @@ async fn rejects_same_type_nesting_when_self_not_listed() {
 
 #[tokio::test]
 async fn rejects_when_parent_not_in_allowed_list() {
-    let envelope = envelope();
-    let parent_schema = schema(
-        gts_id!("cf.core.am.tenant_type.v1~acme.am.tenant_type.stranger.v1~"),
-        Some(envelope.clone()),
-        None,
-    );
-    let child_schema = schema(
-        gts_id!("cf.core.am.tenant_type.v1~acme.am.tenant_type.customer.v1~"),
-        Some(envelope),
-        Some(vec![gts_id!(
-            "cf.core.am.tenant_type.v1~acme.am.tenant_type.platform.v1~"
-        )]),
-    );
-    let parent_uuid = parent_schema.type_uuid;
-    let child_uuid = child_schema.type_uuid;
-
-    let registry = Arc::new(FakeRegistry::new(vec![
-        (parent_uuid, Ok((*parent_schema).clone())),
-        (child_uuid, Ok((*child_schema).clone())),
-    ]));
+    let stranger = gts_id!("cf.core.am.tenant_type.v1~acme.am.tenant_type.stranger.v1~");
+    let registry = registry();
+    seed_tenant_type(&registry, stranger, None);
+    seed_tenant_type(&registry, CUSTOMER, Some(json!([PLATFORM])));
     let checker = GtsTenantTypeChecker::new(registry);
+
     let err = checker
-        .check_parent_child(parent_uuid, child_uuid)
+        .check_parent_child(&caller(1), uuid(stranger), uuid(CUSTOMER))
         .await
         .expect_err("parent not listed must reject");
     assert!(matches!(err, DomainError::TypeNotAllowed { .. }));
@@ -296,35 +129,32 @@ async fn rejects_when_parent_not_in_allowed_list() {
 }
 
 #[tokio::test]
-async fn rejects_child_not_under_envelope_as_invalid_tenant_type() {
-    // Schema is registered, but its chain root is not the AM
-    // tenant_type envelope — every membership check would be against
-    // a meaningless trait map.
-    let alien_root = schema(gts_id!("acme.core.events.type.v1~"), None, None);
-    let alien_leaf = schema(
-        gts_id!("acme.core.events.type.v1~acme.commerce.orders.order.v1~"),
-        Some(alien_root),
-        Some(vec!["whatever"]),
-    );
-    let parent = Uuid::from_u128(0xDEAD);
-    let child_uuid = alien_leaf.type_uuid;
-
-    let registry = Arc::new(FakeRegistry::new(vec![
-        (
-            parent,
-            Ok(GtsTypeSchema::try_new(
-                GtsTypeId::new(gts_id!("acme.core.events.type.v1~")),
-                json!({"type": "object"}),
-                None,
-                None,
-            )
-            .expect("parent")),
-        ),
-        (child_uuid, Ok((*alien_leaf).clone())),
-    ]));
+async fn a_parent_without_its_own_traits_gets_the_envelope_default() {
+    // The envelope defaults `allowed_parent_types` to `[]`: a type that
+    // declares nothing admits no parent, itself included.
+    let registry = registry();
+    seed_tenant_type(&registry, PLATFORM, None);
     let checker = GtsTenantTypeChecker::new(registry);
+
     let err = checker
-        .check_parent_child(parent, child_uuid)
+        .check_parent_child(&caller(1), uuid(PLATFORM), uuid(PLATFORM))
+        .await
+        .expect_err("the default list is empty");
+    assert!(
+        matches!(err, DomainError::TypeNotAllowed { .. }),
+        "got: {err}"
+    );
+}
+
+#[tokio::test]
+async fn rejects_child_not_under_envelope_as_invalid_tenant_type() {
+    // Registered, but its chain root is not the AM tenant_type envelope.
+    let registry = registry();
+    seed_alien(&registry);
+    let checker = GtsTenantTypeChecker::new(registry);
+
+    let err = checker
+        .check_parent_child(&caller(1), uuid(ALIEN_ROOT), uuid(ALIEN_LEAF))
         .await
         .expect_err("alien child must reject");
     assert!(matches!(err, DomainError::InvalidTenantType { .. }));
@@ -333,45 +163,20 @@ async fn rejects_child_not_under_envelope_as_invalid_tenant_type() {
 
 #[tokio::test]
 async fn rejects_parent_not_under_envelope_as_invalid_tenant_type() {
-    // Child is a proper tenant-type envelope descendant and would
-    // accept the parent's `type_id` literally (its
-    // `allowed_parent_types` contains the alien id), but the parent
-    // resolves to a schema rooted in a different GTS namespace.
-    // Without the envelope re-check on the parent the membership
-    // would still match and admit a non-tenant-type parent; the
-    // envelope re-check turns this into a clear `InvalidTenantType`.
-    let envelope = envelope();
-    let alien_root = schema(gts_id!("acme.core.events.type.v1~"), None, None);
-    let alien_parent = schema(
-        gts_id!("acme.core.events.type.v1~acme.commerce.orders.order.v1~"),
-        Some(alien_root),
-        None,
-    );
-    let child_schema = schema(
-        gts_id!("cf.core.am.tenant_type.v1~acme.am.tenant_type.customer.v1~"),
-        Some(envelope),
-        // Deliberately list the alien parent's id — without the
-        // envelope re-check the membership would match and admit.
-        Some(vec![gts_id!(
-            "acme.core.events.type.v1~acme.commerce.orders.order.v1~"
-        )]),
-    );
-    let parent_uuid = alien_parent.type_uuid;
-    let child_uuid = child_schema.type_uuid;
+    // The child lists the alien parent literally — a value its traits
+    // schema (`x-gts-ref` to the envelope) keeps admission from storing —
+    // and only the envelope re-check on the parent refuses it.
+    let registry = registry();
+    seed_alien(&registry);
+    seed_tenant_type(&registry, CUSTOMER, Some(json!([PLATFORM])));
+    let checker = GtsTenantTypeChecker::new(Arc::new(Tampered::new(registry, |entity| {
+        if entity.gts_id.as_ref() == CUSTOMER {
+            entity.effective_traits = Some(json!({ ALLOWED_PARENT_TYPES_TRAIT: [ALIEN_LEAF] }));
+        }
+    })));
 
-    let registry = Arc::new(FakeRegistry::new(vec![
-        (
-            parent_uuid,
-            Ok(Arc::try_unwrap(alien_parent).unwrap_or_else(|a| (*a).clone())),
-        ),
-        (
-            child_uuid,
-            Ok(Arc::try_unwrap(child_schema).unwrap_or_else(|a| (*a).clone())),
-        ),
-    ]));
-    let checker = GtsTenantTypeChecker::new(registry);
     let err = checker
-        .check_parent_child(parent_uuid, child_uuid)
+        .check_parent_child(&caller(1), uuid(ALIEN_LEAF), uuid(CUSTOMER))
         .await
         .expect_err("alien parent must reject");
     assert!(matches!(err, DomainError::InvalidTenantType { .. }));
@@ -384,10 +189,10 @@ async fn rejects_parent_not_under_envelope_as_invalid_tenant_type() {
 
 #[tokio::test]
 async fn rejects_child_not_registered_as_invalid_tenant_type() {
-    let registry = Arc::new(FakeRegistry::new(vec![]));
-    let checker = GtsTenantTypeChecker::new(registry);
+    let checker = GtsTenantTypeChecker::new(registry());
+
     let err = checker
-        .check_parent_child(Uuid::from_u128(0x1), Uuid::from_u128(0x2))
+        .check_parent_child(&caller(1), Uuid::from_u128(0x1), Uuid::from_u128(0x2))
         .await
         .expect_err("unregistered child must reject");
     assert!(matches!(err, DomainError::InvalidTenantType { .. }));
@@ -396,143 +201,179 @@ async fn rejects_child_not_registered_as_invalid_tenant_type() {
 
 #[tokio::test]
 async fn rejects_parent_not_registered_as_invalid_tenant_type() {
-    let envelope = envelope();
-    let child_schema = schema(
-        gts_id!("cf.core.am.tenant_type.v1~acme.am.tenant_type.customer.v1~"),
-        Some(envelope),
-        Some(vec![gts_id!(
-            "cf.core.am.tenant_type.v1~acme.am.tenant_type.platform.v1~"
-        )]),
-    );
-    let child_uuid = child_schema.type_uuid;
-    let parent_uuid = Uuid::from_u128(0xCAFE);
-
-    let registry = Arc::new(FakeRegistry::new(vec![(
-        child_uuid,
-        Ok((*child_schema).clone()),
-    )]));
+    let registry = registry();
+    seed_tenant_type(&registry, CUSTOMER, Some(json!([PLATFORM])));
     let checker = GtsTenantTypeChecker::new(registry);
+
     let err = checker
-        .check_parent_child(parent_uuid, child_uuid)
+        .check_parent_child(&caller(1), Uuid::from_u128(0xCAFE), uuid(CUSTOMER))
         .await
         .expect_err("missing parent must reject");
     assert!(matches!(err, DomainError::InvalidTenantType { .. }));
     assert!(err.to_string().contains("parent tenant type"), "got: {err}");
 }
 
-// -------- malformed trait shapes --------
+fn delete(registry: &MockTypesRegistry, type_id: &str) {
+    let content = registry.content(type_id).expect("seeded");
+    registry.seed_entity(Seed::new(type_id, content).deleted());
+}
 
 #[tokio::test]
-async fn rejects_when_allowed_parent_types_contains_non_tenant_type_chained_id() {
-    // Codex P2: a malformed entry that does not parse as a
-    // tenant-type-shaped GTS id (i.e. does not end with `~`) MUST
-    // collapse the whole trait list to `InvalidTenantType` rather
-    // than silently admitting via a sibling well-formed entry.
-    // Without this, an operator who fat-fingers an instance id
-    // (e.g. `gts.acme.am.customer.v1~prod-acct-42`) into the array
-    // alongside a legit type id would see the malformed entry
-    // ignored at extraction time, and a parent whose chained id
-    // happens to match the legit entry would still admit — masking
-    // the misconfiguration.
-    let envelope = envelope();
-    // Child declares its own `allowed_parent_types` with a
-    // non-type-shape entry (instance, missing trailing `~`) and
-    // an otherwise legit type-shape entry. The whole list must
-    // collapse to malformed.
-    let raw = json!({
-        "$id": gts_uri!("cf.core.am.tenant_type.v1~acme.am.tenant_type.child.v1~"),
-        "type": "object",
-        "x-gts-traits": {
-            ALLOWED_PARENT_TYPES_TRAIT: [
-                gts_id!("cf.core.am.tenant_type.v1~acme.am.tenant_type.parent.v1~"),
-                format!("{GTS_ID_PREFIX}cf.core.am.tenant_type.v1~acme.am.tenant.customer.v1~prod_acct_42"),
-            ],
-        },
-    });
-    let child = GtsTypeSchema::try_new(
-        GtsTypeId::new(gts_id!(
-            "cf.core.am.tenant_type.v1~acme.am.tenant_type.child.v1~"
-        )),
-        raw,
-        None,
-        Some(envelope),
-    )
-    .expect("schema");
-    let child_uuid = child.type_uuid;
-    let registry = Arc::new(FakeRegistry::new(vec![(child_uuid, Ok(child))]));
+async fn a_deleted_child_type_admits_no_same_type_nesting() {
+    let registry = registry();
+    seed_tenant_type(&registry, CUSTOMER, Some(json!([CUSTOMER])));
+    delete(&registry, CUSTOMER);
     let checker = GtsTenantTypeChecker::new(registry);
+
     let err = checker
-        // Same-type-nesting probe — only the child schema is
-        // resolved, so the malformed list is the sole signal under
-        // test (no parent-schema lookup confounds the assertion).
-        .check_parent_child(child_uuid, child_uuid)
+        .check_parent_child(&caller(1), uuid(CUSTOMER), uuid(CUSTOMER))
+        .await
+        .expect_err("a tombstone is not a tenant type");
+    assert!(
+        matches!(err, DomainError::InvalidTenantType { .. }),
+        "got: {err}"
+    );
+    assert!(err.to_string().contains("deleted"), "got: {err}");
+}
+
+#[tokio::test]
+async fn a_deleted_child_type_admits_no_listed_parent() {
+    let registry = registry();
+    seed_tenant_type(&registry, PLATFORM, None);
+    seed_tenant_type(&registry, CUSTOMER, Some(json!([PLATFORM])));
+    delete(&registry, CUSTOMER);
+    let checker = GtsTenantTypeChecker::new(registry);
+
+    let err = checker
+        .check_parent_child(&caller(1), uuid(PLATFORM), uuid(CUSTOMER))
+        .await
+        .expect_err("a tombstone is not a tenant type");
+    assert!(
+        matches!(err, DomainError::InvalidTenantType { .. }),
+        "got: {err}"
+    );
+}
+
+#[tokio::test]
+async fn a_deleted_parent_type_is_refused_even_when_listed() {
+    let registry = registry();
+    seed_tenant_type(&registry, PLATFORM, None);
+    seed_tenant_type(&registry, CUSTOMER, Some(json!([PLATFORM])));
+    delete(&registry, PLATFORM);
+    let checker = GtsTenantTypeChecker::new(registry);
+
+    let err = checker
+        .check_parent_child(&caller(1), uuid(PLATFORM), uuid(CUSTOMER))
+        .await
+        .expect_err("a deleted parent type is refused");
+    assert!(
+        matches!(err, DomainError::InvalidTenantType { .. }),
+        "got: {err}"
+    );
+    assert!(err.to_string().contains("parent tenant type"), "got: {err}");
+}
+
+// -------- malformed trait values --------
+
+#[tokio::test]
+async fn rejects_when_allowed_parent_types_contains_an_instance_identifier() {
+    // One malformed entry collapses the whole list, so a sibling
+    // well-formed entry cannot admit through it.
+    // Admission refuses such a document by the envelope's `x-gts-ref`.
+    let instance =
+        format!("{GTS_ID_PREFIX}cf.core.am.tenant_type.v1~acme.am.tenant.customer.v1~prod_acct_42");
+    let registry = registry();
+    seed_tenant_type(&registry, CUSTOMER, Some(json!([CUSTOMER])));
+    let checker = GtsTenantTypeChecker::new(Arc::new(Tampered::new(registry, move |entity| {
+        entity.effective_traits = Some(json!({ ALLOWED_PARENT_TYPES_TRAIT: [CUSTOMER, instance] }));
+    })));
+
+    let err = checker
+        .check_parent_child(&caller(1), uuid(CUSTOMER), uuid(CUSTOMER))
         .await
         .expect_err("malformed entry must collapse the list to InvalidTenantType");
-    assert!(matches!(err, DomainError::InvalidTenantType { .. }));
+    assert!(
+        matches!(err, DomainError::InvalidTenantType { .. }),
+        "got: {err}"
+    );
 }
 
 #[tokio::test]
 async fn rejects_when_allowed_parent_types_is_not_an_array() {
-    // Build a child whose own `x-gts-traits` declares a malformed
-    // value (string instead of array). Leaf-declared values win,
-    // overriding the envelope's `default: []`.
-    let envelope = envelope();
-    let raw = json!({
-        "$id": gts_uri!("cf.core.am.tenant_type.v1~acme.am.tenant_type.broken.v1~"),
-        "type": "object",
-        "x-gts-traits": {
-            ALLOWED_PARENT_TYPES_TRAIT: "not an array",
-        },
-    });
-    let broken = GtsTypeSchema::try_new(
-        GtsTypeId::new(gts_id!(
-            "cf.core.am.tenant_type.v1~acme.am.tenant_type.broken.v1~"
-        )),
-        raw,
-        None,
-        Some(envelope),
-    )
-    .expect("schema");
-    let broken_uuid = broken.type_uuid;
-    let registry = Arc::new(FakeRegistry::new(vec![(broken_uuid, Ok(broken))]));
-    let checker = GtsTenantTypeChecker::new(registry);
+    let registry = registry();
+    seed_tenant_type(&registry, CUSTOMER, Some(json!([CUSTOMER])));
+    let checker = GtsTenantTypeChecker::new(Arc::new(Tampered::new(registry, |entity| {
+        entity.effective_traits = Some(json!({ ALLOWED_PARENT_TYPES_TRAIT: "not an array" }));
+    })));
+
     let err = checker
-        .check_parent_child(Uuid::from_u128(0xAB), broken_uuid)
+        .check_parent_child(&caller(1), uuid(CUSTOMER), uuid(CUSTOMER))
         .await
         .expect_err("malformed trait must reject");
-    assert!(matches!(err, DomainError::InvalidTenantType { .. }));
+    assert!(
+        matches!(err, DomainError::InvalidTenantType { .. }),
+        "got: {err}"
+    );
 }
 
-// -------- transport / infra --------
+// -------- registry faults and contract breaks --------
+
+/// A failed read for the request: an outage is a retryable 503, the
+/// registry's refusal of the caller stays that caller's 401 / 403, and
+/// anything else is internal.
+#[tokio::test]
+async fn a_failed_batch_read_is_classified_for_the_caller() {
+    let expected = outages()
+        .into_iter()
+        .map(|error| (error, Some(503)))
+        .chain(
+            refusals()
+                .into_iter()
+                .map(|(error, status)| (error, Some(status))),
+        )
+        .chain([(
+            CanonicalError::internal("registry exploded").create(),
+            Some(500),
+        )]);
+    for (error, status) in expected {
+        let registry = registry();
+        seed_tenant_type(&registry, CUSTOMER, Some(json!([CUSTOMER])));
+        registry.inject(Fault::on(Call::BatchGet).fail(error.clone()));
+        let checker = GtsTenantTypeChecker::new(registry);
+
+        let err = checker
+            .check_parent_child(&caller(1), uuid(CUSTOMER), uuid(CUSTOMER))
+            .await
+            .expect_err("registry error must propagate");
+        let (category, public_status) = at_the_boundary(err);
+        assert_eq!(public_status, status, "{error:?} -> {category}");
+        if status != Some(503) && status != Some(500) {
+            assert_eq!(category, error.gts_type(), "{error:?}");
+        }
+    }
+}
 
 #[tokio::test]
-async fn rejects_when_registry_returns_unrecognised_error_as_service_unavailable() {
-    let registry = Arc::new(FakeRegistry::new(vec![(
-        Uuid::from_u128(0x1),
-        Err(types_registry_sdk::testing::internal("registry exploded")),
-    )]));
-    let checker = GtsTenantTypeChecker::new(registry);
+async fn a_snapshot_without_the_selected_effective_traits_is_not_an_empty_list() {
+    let registry = registry();
+    seed_tenant_type(&registry, CUSTOMER, Some(json!([CUSTOMER])));
+    let checker = GtsTenantTypeChecker::new(Arc::new(Tampered::without_documents(registry)));
+
     let err = checker
-        .check_parent_child(Uuid::from_u128(0x1), Uuid::from_u128(0x1))
+        .check_parent_child(&caller(1), uuid(CUSTOMER), uuid(CUSTOMER))
         .await
-        .expect_err("registry error must propagate");
-    assert!(matches!(err, DomainError::ServiceUnavailable { .. }));
-    assert_eq!(err.code(), "service_unavailable");
-    assert_eq!(err.http_status(), 503);
+        .expect_err("an incomplete projection is a contract break");
+    assert!(matches!(err, DomainError::Internal { .. }), "got: {err}");
 }
 
 #[tokio::test(start_paused = true)]
 async fn rejects_when_registry_probe_times_out() {
-    let registry = Arc::new(
-        FakeRegistry::new(vec![(
-            Uuid::from_u128(0x1),
-            Err(types_registry_sdk::testing::internal("never reaches us")),
-        )])
-        .with_delay(Duration::from_millis(50)),
-    );
-    let checker = GtsTenantTypeChecker::with_timeout(registry.clone(), 10);
+    let registry = registry();
+    registry.inject(Fault::on(Call::BatchGet).delay(Duration::from_millis(50)));
+    let checker = GtsTenantTypeChecker::with_timeout(registry, 10);
+
     let err = checker
-        .check_parent_child(Uuid::from_u128(0x1), Uuid::from_u128(0x1))
+        .check_parent_child(&caller(1), Uuid::from_u128(0x1), Uuid::from_u128(0x1))
         .await
         .expect_err("slow registry must time out");
     assert!(matches!(err, DomainError::ServiceUnavailable { .. }));
@@ -540,4 +381,49 @@ async fn rejects_when_registry_probe_times_out() {
         err.to_string().contains("types-registry: timeout exceeded"),
         "got: {err}"
     );
+}
+
+// -------- who the schemas are read for (P33) --------
+
+/// One checker serves every request: each check reads for the caller it
+/// was given, and none reaches the platform API.
+#[tokio::test]
+async fn each_check_reads_for_its_own_caller() {
+    let registry = registry();
+    seed_tenant_type(&registry, PLATFORM, None);
+    seed_tenant_type(&registry, CUSTOMER, Some(json!([PLATFORM])));
+    let spy = CallerSpy::for_requests(registry);
+    let checker = GtsTenantTypeChecker::new(spy.clone());
+
+    for n in [1, 2] {
+        let ctx = caller(n);
+        checker
+            .check_parent_child(&ctx, uuid(PLATFORM), uuid(CUSTOMER))
+            .await
+            .expect("admit when parent listed");
+        assert_only_caller(&spy.callers(), &ctx);
+        spy.clear();
+    }
+}
+
+/// A failed tenant read is the check's answer; it is not retried on the
+/// platform API, which the spy refuses.
+#[tokio::test]
+async fn a_failed_read_does_not_fall_back_to_the_platform_api() {
+    let registry = registry();
+    registry.inject(Fault::on(Call::BatchGet).fail(CanonicalError::service_unavailable().create()));
+    let spy = CallerSpy::for_requests(registry);
+    let checker = GtsTenantTypeChecker::new(spy.clone());
+    let ctx = caller(1);
+
+    let err = checker
+        .check_parent_child(&ctx, uuid(PLATFORM), uuid(CUSTOMER))
+        .await
+        .expect_err("registry down");
+    assert!(
+        matches!(err, DomainError::ServiceUnavailable { .. }),
+        "got {err:?}"
+    );
+    assert_only_caller(&spy.callers(), &ctx);
+    assert_eq!(spy.platform_reads(), 0);
 }

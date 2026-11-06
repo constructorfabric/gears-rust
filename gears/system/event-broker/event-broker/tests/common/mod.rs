@@ -172,7 +172,8 @@ database:
 
 gears:
   # The broker reads topics and event types through the platform API, which the
-  # registry publishes only with a database.
+  # registry publishes only with a database. Resolvers and plugins also publish
+  # their GTS documents to this database-backed catalogue.
   types-registry:
     database:
       engine: sqlite

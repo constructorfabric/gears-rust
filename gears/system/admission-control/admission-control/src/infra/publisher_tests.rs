@@ -1,8 +1,6 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use admission_control_sdk::{
@@ -20,16 +18,10 @@ use event_broker_sdk::{
 use opentelemetry::metrics::MeterProvider as _;
 use opentelemetry_sdk::metrics::{InMemoryMetricExporter, PeriodicReader, SdkMeterProvider};
 use parking_lot::Mutex;
-use serde_json::Value;
 use time::OffsetDateTime;
 use tokio_util::sync::CancellationToken;
 use toolkit::ClientHub;
-use toolkit_canonical_errors::CanonicalError;
 use toolkit_security::SecurityContext;
-use types_registry_sdk::testing::MockTypesRegistryClient;
-use types_registry_sdk::{
-    GtsInstance, GtsTypeSchema, InstanceQuery, RegisterResult, TypeSchemaQuery, TypesRegistryClient,
-};
 use uuid::Uuid;
 
 use super::{EVENT_SOURCE, QueuePublisher, QueuedEvent, run, to_broker_event};
@@ -250,14 +242,11 @@ async fn the_task_publishes_under_the_gate_identity_and_survives_a_missing_broke
     let (metrics, exporter, provider) = recording();
     let (publisher, rx) = QueuePublisher::new(8, Arc::clone(&metrics));
     let hub = Arc::new(ClientHub::new());
-    let registry: Arc<dyn TypesRegistryClient> = Arc::new(MockTypesRegistryClient::new());
     let cancel = CancellationToken::new();
     let task = tokio::spawn(run(
         rx,
         Arc::clone(&hub),
-        registry,
         gate_identity().unwrap(),
-        true,
         metrics,
         cancel.clone(),
     ));
@@ -336,14 +325,11 @@ async fn a_missing_or_failing_broker_counts_the_dropped_event() {
     let (metrics, exporter, provider) = recording();
     let (publisher, rx) = QueuePublisher::new(8, Arc::clone(&metrics));
     let hub = Arc::new(ClientHub::new());
-    let registry: Arc<dyn TypesRegistryClient> = Arc::new(MockTypesRegistryClient::new());
     let cancel = CancellationToken::new();
     let task = tokio::spawn(run(
         rx,
         Arc::clone(&hub),
-        registry,
         gate_identity().unwrap(),
-        true,
         metrics,
         cancel.clone(),
     ));
@@ -378,180 +364,6 @@ async fn a_missing_or_failing_broker_counts_the_dropped_event() {
     task.await.unwrap();
 }
 
-/// Registry whose `register` answers from a script, one outcome per call
-/// (the last repeats); every other operation is the mock's.
-struct ScriptedRegistry {
-    inner: MockTypesRegistryClient,
-    script: Vec<Registration>,
-    calls: AtomicUsize,
-}
-
-#[derive(Clone, Copy)]
-enum Registration {
-    Unreachable,
-    /// Never answers.
-    Stalled,
-    Accept,
-    Reject,
-}
-
-impl ScriptedRegistry {
-    fn new(script: Vec<Registration>) -> Arc<Self> {
-        Arc::new(Self {
-            inner: MockTypesRegistryClient::new(),
-            script,
-            calls: AtomicUsize::new(0),
-        })
-    }
-
-    fn calls(&self) -> usize {
-        self.calls.load(Ordering::SeqCst)
-    }
-}
-
-#[async_trait]
-impl TypesRegistryClient for ScriptedRegistry {
-    async fn register(&self, entities: Vec<Value>) -> Result<Vec<RegisterResult>, CanonicalError> {
-        let call = self.calls.fetch_add(1, Ordering::SeqCst);
-        let outcome = self.script[call.min(self.script.len() - 1)];
-        let gts_id = |schema: &Value| schema["$id"].as_str().unwrap_or_default().to_owned();
-        match outcome {
-            Registration::Unreachable => Err(CanonicalError::service_unavailable().create()),
-            Registration::Stalled => std::future::pending().await,
-            Registration::Accept => Ok(entities
-                .iter()
-                .map(|schema| RegisterResult::Ok {
-                    gts_id: gts_id(schema),
-                })
-                .collect()),
-            Registration::Reject => Ok(entities
-                .iter()
-                .map(|schema| RegisterResult::Err {
-                    gts_id: Some(gts_id(schema)),
-                    error: CanonicalError::internal("conflicting schema").create(),
-                })
-                .collect()),
-        }
-    }
-    async fn register_type_schemas(
-        &self,
-        type_schemas: Vec<Value>,
-    ) -> Result<Vec<RegisterResult>, CanonicalError> {
-        self.inner.register_type_schemas(type_schemas).await
-    }
-    async fn get_type_schema(&self, type_id: &str) -> Result<GtsTypeSchema, CanonicalError> {
-        self.inner.get_type_schema(type_id).await
-    }
-    async fn get_type_schema_by_uuid(&self, id: Uuid) -> Result<GtsTypeSchema, CanonicalError> {
-        self.inner.get_type_schema_by_uuid(id).await
-    }
-    async fn get_type_schemas(
-        &self,
-        ids: Vec<String>,
-    ) -> HashMap<String, Result<GtsTypeSchema, CanonicalError>> {
-        self.inner.get_type_schemas(ids).await
-    }
-    async fn get_type_schemas_by_uuid(
-        &self,
-        ids: Vec<Uuid>,
-    ) -> HashMap<Uuid, Result<GtsTypeSchema, CanonicalError>> {
-        self.inner.get_type_schemas_by_uuid(ids).await
-    }
-    async fn list_type_schemas(
-        &self,
-        query: TypeSchemaQuery,
-    ) -> Result<Vec<GtsTypeSchema>, CanonicalError> {
-        self.inner.list_type_schemas(query).await
-    }
-    async fn register_instances(
-        &self,
-        instances: Vec<Value>,
-    ) -> Result<Vec<RegisterResult>, CanonicalError> {
-        self.inner.register_instances(instances).await
-    }
-    async fn get_instance(&self, id: &str) -> Result<GtsInstance, CanonicalError> {
-        self.inner.get_instance(id).await
-    }
-    async fn get_instance_by_uuid(&self, id: Uuid) -> Result<GtsInstance, CanonicalError> {
-        self.inner.get_instance_by_uuid(id).await
-    }
-    async fn get_instances(
-        &self,
-        ids: Vec<String>,
-    ) -> HashMap<String, Result<GtsInstance, CanonicalError>> {
-        self.inner.get_instances(ids).await
-    }
-    async fn get_instances_by_uuid(
-        &self,
-        ids: Vec<Uuid>,
-    ) -> HashMap<Uuid, Result<GtsInstance, CanonicalError>> {
-        self.inner.get_instances_by_uuid(ids).await
-    }
-    async fn list_instances(
-        &self,
-        query: InstanceQuery,
-    ) -> Result<Vec<GtsInstance>, CanonicalError> {
-        self.inner.list_instances(query).await
-    }
-}
-
-/// Starts the task over `registry` (not yet registered) and a recording
-/// broker.
-fn start_unregistered(
-    registry: Arc<ScriptedRegistry>,
-) -> (
-    QueuePublisher,
-    Arc<FakeBroker>,
-    CancellationToken,
-    tokio::task::JoinHandle<()>,
-) {
-    let metrics = Arc::new(AdmissionControlMetrics::global());
-    let (publisher, rx) = QueuePublisher::new(8, Arc::clone(&metrics));
-    let hub = Arc::new(ClientHub::new());
-    let broker = Arc::new(FakeBroker::default());
-    hub.register::<dyn EventBrokerApi>(Arc::clone(&broker) as Arc<dyn EventBrokerApi>);
-    let cancel = CancellationToken::new();
-    let task = tokio::spawn(run(
-        rx,
-        hub,
-        registry,
-        gate_identity().unwrap(),
-        false,
-        metrics,
-        cancel.clone(),
-    ));
-    (publisher, broker, cancel, task)
-}
-
-#[tokio::test(start_paused = true)]
-async fn registration_is_retried_until_it_succeeds_and_events_still_flow() {
-    let registry = ScriptedRegistry::new(vec![
-        Registration::Unreachable,
-        Registration::Unreachable,
-        Registration::Accept,
-    ]);
-    let (publisher, broker, cancel, task) = start_unregistered(Arc::clone(&registry));
-
-    // Queued while registration is still being retried.
-    publisher.emit(envelope(), event());
-    tokio::time::sleep(super::REGISTRATION_RETRY * 10).await;
-    assert_eq!(registry.calls(), 3, "retried twice, then stopped");
-    assert_eq!(broker.published.lock().len(), 1);
-
-    cancel.cancel();
-    task.await.unwrap();
-}
-
-#[tokio::test(start_paused = true)]
-async fn a_rejected_registration_is_not_retried() {
-    let registry = ScriptedRegistry::new(vec![Registration::Unreachable, Registration::Reject]);
-    let (_publisher, _broker, cancel, task) = start_unregistered(Arc::clone(&registry));
-    tokio::time::sleep(super::REGISTRATION_RETRY * 10).await;
-    assert_eq!(registry.calls(), 2);
-    cancel.cancel();
-    task.await.unwrap();
-}
-
 #[tokio::test]
 async fn events_queued_at_shutdown_are_counted_as_dropped() {
     let (metrics, exporter, provider) = recording();
@@ -564,9 +376,7 @@ async fn events_queued_at_shutdown_are_counted_as_dropped() {
     run(
         rx,
         Arc::new(ClientHub::new()),
-        Arc::new(MockTypesRegistryClient::new()),
         gate_identity().unwrap(),
-        true,
         metrics,
         cancel,
     )
@@ -587,9 +397,7 @@ async fn a_stalled_broker_neither_blocks_the_task_nor_shutdown() {
     let task = tokio::spawn(run(
         rx,
         hub,
-        Arc::new(MockTypesRegistryClient::new()),
         gate_identity().unwrap(),
-        true,
         metrics,
         cancel.clone(),
     ));
@@ -605,28 +413,4 @@ async fn a_stalled_broker_neither_blocks_the_task_nor_shutdown() {
     cancel.cancel();
     task.await.unwrap();
     assert_eq!(dropped(&exporter, &provider), 2);
-}
-
-#[tokio::test(start_paused = true)]
-async fn a_registry_that_never_answers_counts_as_unreachable() {
-    let registry = ScriptedRegistry::new(vec![Registration::Stalled]);
-    assert!(!super::register_event_type(registry.as_ref()).await.unwrap());
-}
-
-#[tokio::test(start_paused = true)]
-async fn a_stalled_registration_times_out_is_retried_and_events_still_flow() {
-    let registry = ScriptedRegistry::new(vec![Registration::Stalled, Registration::Accept]);
-    let (publisher, broker, cancel, task) = start_unregistered(Arc::clone(&registry));
-
-    publisher.emit(envelope(), event());
-    tokio::time::sleep((super::REGISTRATION_TIMEOUT + super::REGISTRATION_RETRY) * 4).await;
-    assert_eq!(
-        registry.calls(),
-        2,
-        "the stalled call timed out and was retried once"
-    );
-    assert_eq!(broker.published.lock().len(), 1);
-
-    cancel.cancel();
-    task.await.unwrap();
 }

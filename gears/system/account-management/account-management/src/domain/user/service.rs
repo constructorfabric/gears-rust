@@ -59,7 +59,7 @@ use toolkit_odata::filter::{FilterNode, FilterOp, ODataValue};
 use toolkit_odata::{CursorV1, ODataOrderBy, ODataQuery, OrderKey, SortDir};
 use toolkit_security::AccessScope;
 use toolkit_security::{SecurityContext, pep_properties};
-use types_registry_sdk::TypesRegistryClient;
+use types_registry_sdk::TypesRegistryApi;
 use uuid::Uuid;
 
 use crate::domain::error::DomainError;
@@ -159,7 +159,7 @@ pub struct UserService {
     /// GTS schema source for the user JSON-Schema contract — keeps
     /// structural rules (length, format) authoritative in the
     /// catalogue rather than duplicated in code.
-    types_registry: Arc<dyn TypesRegistryClient>,
+    types_registry: Arc<dyn TypesRegistryApi>,
     /// PEP gate run before any `IdP` / RG round trip.
     enforcer: PolicyEnforcer,
     /// RG client for `delete_user` membership cleanup. `None` in
@@ -223,7 +223,7 @@ impl UserService {
     pub fn new(
         tenant_repo: Arc<dyn TenantRepo>,
         idp_user: Arc<dyn IdpPluginClient>,
-        types_registry: Arc<dyn TypesRegistryClient>,
+        types_registry: Arc<dyn TypesRegistryApi>,
         enforcer: PolicyEnforcer,
     ) -> Self {
         Self {
@@ -387,7 +387,7 @@ impl UserService {
         // a request against a non-existent / soft-deleted / out-of-
         // scope tenant surfaces as `NotFound` / `Validation` without
         // leaking tenant topology through a payload-shape error.
-        let tenant_context = self.resolve_active_tenant(&scope, tenant_id).await?;
+        let tenant_context = self.resolve_active_tenant(ctx, &scope, tenant_id).await?;
         // @cpt-end:cpt-cf-account-management-dod-idp-user-operations-contract-authenticated-tenant-scoped-invocation:p1:inst-dod-authenticated-tenant-scoped-invocation-puser
         // @cpt-end:cpt-cf-account-management-flow-idp-user-operations-contract-provision-user:p1:inst-flow-puser-resolve-tenant
 
@@ -419,6 +419,7 @@ impl UserService {
         crate::domain::gts_validation::validate_new_user_payload_via_gts(
             &payload,
             &*self.types_registry,
+            ctx,
         )
         .await?;
 
@@ -546,7 +547,7 @@ impl UserService {
         // @cpt-begin:cpt-cf-account-management-dod-idp-user-operations-contract-authenticated-tenant-scoped-invocation:p1:inst-dod-authenticated-tenant-scoped-invocation-duser
         let scope = self.authorize(ctx, pep::actions::DELETE, tenant_id).await?;
         let actor = ctx.subject_id();
-        let tenant_context = self.resolve_active_tenant(&scope, tenant_id).await?;
+        let tenant_context = self.resolve_active_tenant(ctx, &scope, tenant_id).await?;
         // @cpt-end:cpt-cf-account-management-dod-idp-user-operations-contract-authenticated-tenant-scoped-invocation:p1:inst-dod-authenticated-tenant-scoped-invocation-duser
         // @cpt-end:cpt-cf-account-management-flow-idp-user-operations-contract-deprovision-user:p1:inst-flow-duser-resolve-tenant
 
@@ -697,7 +698,7 @@ impl UserService {
         // security ordering as create_user / delete_user.
         let scope = self.authorize(ctx, pep::actions::UPDATE, tenant_id).await?;
         let actor = ctx.subject_id();
-        let tenant_context = self.resolve_active_tenant(&scope, tenant_id).await?;
+        let tenant_context = self.resolve_active_tenant(ctx, &scope, tenant_id).await?;
         // @cpt-end:cpt-cf-account-management-dod-idp-user-operations-contract-authenticated-tenant-scoped-invocation:p1:inst-dod-authenticated-tenant-scoped-invocation-uuser
         // @cpt-end:cpt-cf-account-management-flow-idp-user-operations-contract-update-user:p1:inst-flow-uuser-resolve-tenant
 
@@ -733,8 +734,12 @@ impl UserService {
             "display_name",
             patch.display_name.as_ref().and_then(|d| d.as_deref()),
         )?;
-        crate::domain::gts_validation::validate_user_patch_via_gts(&patch, &*self.types_registry)
-            .await?;
+        crate::domain::gts_validation::validate_user_patch_via_gts(
+            &patch,
+            &*self.types_registry,
+            ctx,
+        )
+        .await?;
 
         // @cpt-begin:cpt-cf-account-management-flow-idp-user-operations-contract-update-user:p1:inst-flow-uuser-invoke-contract
         // Convert internal `TenantContext` → SDK `IdpTenantContext` at
@@ -899,7 +904,7 @@ impl UserService {
         // tenant topology through a pagination-shape error.
         // @cpt-begin:cpt-cf-account-management-flow-idp-user-operations-contract-list-users:p1:inst-flow-luser-resolve-tenant
         // @cpt-begin:cpt-cf-account-management-dod-idp-user-operations-contract-authenticated-tenant-scoped-invocation:p1:inst-dod-authenticated-tenant-scoped-invocation-luser
-        let tenant_context = self.resolve_active_tenant(&scope, tenant_id).await?;
+        let tenant_context = self.resolve_active_tenant(ctx, &scope, tenant_id).await?;
         // @cpt-end:cpt-cf-account-management-dod-idp-user-operations-contract-authenticated-tenant-scoped-invocation:p1:inst-dod-authenticated-tenant-scoped-invocation-luser
         // @cpt-end:cpt-cf-account-management-flow-idp-user-operations-contract-list-users:p1:inst-flow-luser-resolve-tenant
 
@@ -1009,23 +1014,12 @@ impl UserService {
     // Helpers
     // ----------------------------------------------------------------
 
-    /// Resolve `tenant_id` to an [`crate::domain::tenant::model::TenantStatus::Active`] tenant and
-    /// build the [`TenantContext`] forwarded to the `IdP` plugin.
-    ///
-    /// Centralised so each flow shares one tenant guard implementation
-    /// and CPT review can verify the precondition once instead of
-    /// three times.
-    ///
-    /// `tenant_type` on the returned context is mandatory: AM resolves
-    /// the chained GTS identifier via `TypesRegistryClient` and
-    /// surfaces an outage as [`DomainError::service_unavailable`]
-    /// rather than leaking an `Option` through the plugin contract.
-    /// The opaque `metadata` blob is loaded from `tenant_idp_metadata`
-    /// (whatever the `IdP` plugin returned at `provision_tenant` time
-    /// and AM persisted via `activate_tenant`) so every `IdP` call
-    /// receives the plugin's own per-tenant state inline.
+    /// Build an active tenant's [`TenantContext`] through the shared tenant guard.
+    /// Reads the mandatory chained type for `ctx` and includes the plugin's opaque
+    /// `tenant_idp_metadata`. Registry outages return [`DomainError::service_unavailable`].
     async fn resolve_active_tenant(
         &self,
+        ctx: &SecurityContext,
         scope: &AccessScope,
         tenant_id: Uuid,
     ) -> Result<TenantContext, DomainError> {
@@ -1036,6 +1030,7 @@ impl UserService {
         crate::domain::tenant::resolve::resolve_active_tenant(
             &*self.tenant_repo,
             &*self.types_registry,
+            ctx,
             scope,
             tenant_id,
         )

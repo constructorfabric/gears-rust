@@ -15,7 +15,11 @@ struct Catalog(Result<HashSet<String>, PortError>);
 
 #[async_trait]
 impl TypeCatalogPort for Catalog {
-    async fn known_types(&self, ids: &[String]) -> Result<HashSet<String>, PortError> {
+    async fn known_types(
+        &self,
+        _scope: TypeCatalogScope<'_>,
+        ids: &[String],
+    ) -> Result<HashSet<String>, PortError> {
         self.0
             .clone()
             .map(|known| ids.iter().filter(|i| known.contains(*i)).cloned().collect())
@@ -48,7 +52,7 @@ fn doc(name: &str, content: &str, types: &[&str]) -> Document {
 
 async fn codes(documents: &[Document]) -> Vec<&'static str> {
     validator(widget_catalog())
-        .validate(documents)
+        .validate(TypeCatalogScope::Platform, documents)
         .await
         .unwrap()
         .into_iter()
@@ -121,7 +125,7 @@ async fn version_level_problems_are_reported() {
 async fn a_registry_outage_is_an_error_not_a_finding() {
     let outage = Catalog(Err(PortError::Timeout));
     let result = validator(outage)
-        .validate(&[doc("a", GOOD, &[WIDGET])])
+        .validate(TypeCatalogScope::Platform, &[doc("a", GOOD, &[WIDGET])])
         .await;
     assert_eq!(result, Err(PortError::Timeout));
 }

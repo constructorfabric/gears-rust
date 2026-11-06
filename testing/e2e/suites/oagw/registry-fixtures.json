@@ -1,0 +1,46 @@
+[
+  {
+    "$id": "gts.cf.core.oagw.upstream.v1~5e0a1900-0000-4000-8000-000000000001",
+    "alias": "e2e-registry-upstream",
+    "server": {
+      "endpoints": [
+        {
+          "host": "127.0.0.1",
+          "port": 19876,
+          "scheme": "http"
+        }
+      ]
+    },
+    "protocol": "gts.cf.core.oagw.protocol.v1~cf.core.oagw.http.v1",
+    "tags": [
+      "e2e-registry"
+    ]
+  },
+  {
+    "$id": "gts.cf.core.oagw.route.v1~5e0a1900-0000-4000-8000-000000000002",
+    "upstream_id": "gts.cf.core.oagw.upstream.v1~5e0a1900-0000-4000-8000-000000000001",
+    "match": {
+      "http": {
+        "methods": [
+          "GET"
+        ],
+        "path": "/v1/models"
+      }
+    },
+    "tags": [
+      "e2e-registry"
+    ]
+  },
+  {
+    "$id": "gts.cf.core.oagw.route.v1~5e0a1900-0000-4000-8000-000000000003",
+    "upstream_id": "5e0a1900-0000-4000-8000-000000000001",
+    "match": {
+      "http": {
+        "methods": [
+          "GET"
+        ],
+        "path": "/v1/bare-uuid"
+      }
+    }
+  }
+]
