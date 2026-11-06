@@ -40,12 +40,57 @@ use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use event_broker::domain::consumer_group_coordinator::range_split;
+use event_broker_sdk::gts::EventV1;
 use serde_json::{Value, json};
+use toolkit_gts::{GtsSchema, gts_type_schema};
 use uuid::Uuid;
 
 use common::{SseFrameReader, TestServer};
 
 const PARTITION_COUNT: u32 = 8;
+
+/// Steering a publish to a partition means varying the member the type's
+/// `partition_key` names, so the type declares the payload member `pk` the
+/// pointer targets: the broker checks that when it admits the type, so a pointer
+/// at an undeclared member would drop the type rather than fail on every publish.
+#[gts_type_schema(
+    dir_path = "schemas",
+    base = EventV1,
+    type_id = gts_id!("cf.core.events.event.v1~x.eb.t11.foo.v1~"),
+    description = "An event type partitioned by its payload's `pk` member.",
+    properties = "pk",
+    traits = json!({
+        "topic": "gts.cf.core.events.topic.v1~x.eb.t11.rollout.v1",
+        "allowed_subject_types": ["gts.x.eb.t11.subject.v1~"],
+        "partition_key": "/data/pk",
+    }),
+)]
+#[schemars(extend("additionalProperties" = true))]
+struct SteeredT11V1 {
+    pk: String,
+}
+
+/// Steering a publish to a partition means varying the member the type's
+/// `partition_key` names, so the type declares the payload member `pk` the
+/// pointer targets: the broker checks that when it admits the type, so a pointer
+/// at an undeclared member would drop the type rather than fail on every publish.
+#[gts_type_schema(
+    dir_path = "schemas",
+    base = EventV1,
+    type_id = gts_id!("cf.core.events.event.v1~x.eb.t12.foo.v1~"),
+    description = "An event type partitioned by its payload's `pk` member.",
+    properties = "pk",
+    traits = json!({
+        "topic": "gts.cf.core.events.topic.v1~x.eb.t12.rollout.v1",
+        "allowed_subject_types": ["gts.x.eb.t12.subject.v1~"],
+        "partition_key": "/data/pk",
+    }),
+)]
+#[schemars(extend("additionalProperties" = true))]
+struct SteeredT12V1 {
+    pk: String,
+}
+
 const EVENTS_PER_PARTITION: i64 = 10;
 
 /// Finds a payload value that hashes to `target_partition` under the same
@@ -409,19 +454,7 @@ async fn two_subscribers_baseline_then_third_joins_mid_stream() {
 
     let server = TestServer::start(vec![
         json!({ "id": topic, "partitions": PARTITION_COUNT, }),
-        json!({
-            "id": event_type,
-            "topic_id": topic,
-            "allowed_subject_types": [subject_type],
-            // The member the pointer below names has to be one this type
-            // declares: the broker checks that when it admits the type, so a
-            // pointer at an undeclared member would drop the type rather than
-            // fail on every publish of it.
-            "data_schema": { "type": "object", "properties": { "pk": { "type": "string" } } },
-            // Steering a publish to a partition means varying the member the
-            // type names, so this type names the payload member the test sets.
-            "partition_key": "/data/pk",
-        }),
+        SteeredT11V1::gts_schema_with_refs(),
     ])
     .await;
     let client = reqwest::Client::new();
@@ -729,10 +762,10 @@ struct TestFixture {
     steering: Vec<String>,
 }
 
-async fn setup(test_tag: &str) -> TestFixture {
-    let topic = format!("gts.cf.core.events.topic.v1~x.eb.{test_tag}.rollout.v1");
-    let event_type = format!("gts.cf.core.events.event.v1~x.eb.{test_tag}.foo.v1~");
-    let subject_type = format!("gts.x.eb.{test_tag}.subject.v1~");
+async fn setup() -> TestFixture {
+    let topic = ("gts.cf.core.events.topic.v1~x.eb.t12.rollout.v1").to_owned();
+    let event_type = ("gts.cf.core.events.event.v1~x.eb.t12.foo.v1~").to_owned();
+    let subject_type = ("gts.x.eb.t12.subject.v1~").to_owned();
     // A 1s heartbeat (vs the 5s default). The server has no proactive disconnect
     // watcher, so it notices a member that departs by dropping its connection no
     // later than the next frame it fails to write - a heartbeat, for an idle
@@ -746,19 +779,7 @@ async fn setup(test_tag: &str) -> TestFixture {
     let server = TestServer::start_with_heartbeat(
         vec![
             json!({ "id": topic, "partitions": PARTITION_COUNT, }),
-            json!({
-                "id": event_type,
-                "topic_id": topic,
-                "allowed_subject_types": [subject_type],
-                // The member the pointer below names has to be one this type
-                // declares: the broker checks that when it admits the type, so a
-                // pointer at an undeclared member would drop the type rather than
-                // fail on every publish of it.
-                "data_schema": { "type": "object", "properties": { "pk": { "type": "string" } } },
-                // Steering a publish to a partition means varying the member the
-                // type names, so this type names the payload member the test sets.
-                "partition_key": "/data/pk",
-            }),
+            SteeredT12V1::gts_schema_with_refs(),
         ],
         Some(1),
     )
@@ -1212,7 +1233,7 @@ async fn two_way_steady_state(f: &TestFixture) -> (Member, Member) {
 
 #[tokio::test]
 async fn scale_down_via_delete() {
-    let f = setup("t12d").await;
+    let f = setup().await;
     let (a, b) = two_way_steady_state(&f).await;
     let mut members = vec![a, b];
 
@@ -1231,7 +1252,7 @@ async fn scale_down_via_delete() {
 
 #[tokio::test]
 async fn scale_down_via_disconnect() {
-    let f = setup("t12t").await;
+    let f = setup().await;
     // The departing member needs a short session_timeout - it never calls
     // DELETE, so the D7 grace-period timer is what evicts it.
     let mut a = join_member(&f, "consumer-a", Some("PT1S")).await;
@@ -1290,7 +1311,7 @@ async fn scale_down_via_disconnect() {
 
 #[tokio::test]
 async fn rolling_replacement_via_delete() {
-    let f = setup("t13d").await;
+    let f = setup().await;
     let (a, b) = two_way_steady_state(&f).await;
     let mut members = vec![a, b];
 
@@ -1345,7 +1366,7 @@ async fn rolling_replacement_via_delete() {
 
 #[tokio::test]
 async fn rolling_replacement_via_disconnect() {
-    let f = setup("t13t").await;
+    let f = setup().await;
     // A is the one that will depart by disconnect, so it needs a short
     // session_timeout from its very first JOIN.
     let mut a = join_member(&f, "consumer-a", Some("PT1S")).await;

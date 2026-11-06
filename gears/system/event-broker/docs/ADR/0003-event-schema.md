@@ -277,4 +277,4 @@ External references:
   - [`0002-partition-selection`](0002-partition-selection.md) — partition derivation contract
   - [`0004-idempotent-producer-protocol`](0004-idempotent-producer-protocol.md) — producer modes / `meta`-block-shape enforcement / registration TTL / reset endpoint
 - **Schemas**:
-  - [`schemas/gts.cf.core.events.event.v1~.schema.json`](../schemas/gts.cf.core.events.event.v1~.schema.json) — single canonical event schema (publish + read; per-direction semantics via `readOnly` / `writeOnly` markers)
+  - `EventV1<D>` in [`event-broker-sdk/src/gts.rs`](../../event-broker-sdk/src/gts.rs) — single canonical event schema, generated from Rust (publish + read; per-direction semantics via `readOnly` / `writeOnly` markers)

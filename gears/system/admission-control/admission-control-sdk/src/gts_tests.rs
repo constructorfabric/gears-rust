@@ -3,38 +3,14 @@
 use super::*;
 use crate::models::{FailureCondition, PolicyReference, RefusalEvent, RefusalEventCause};
 use crate::test_support::variants;
+use event_broker_sdk::gts::data_contract;
+use gts::GtsStore;
 use uuid::Uuid;
-
-#[test]
-fn identifiers_are_valid_and_consistent() {
-    assert_eq!(
-        <AdmissionEnginePluginSpecV1 as gts::GtsSchema>::TYPE_ID,
-        "gts.cf.toolkit.plugins.plugin.v1~cf.core.admission_control.engine.v1~"
-    );
-    for type_id in [ADMISSION_CONTROL_RESOURCE, REFUSAL_EVENT_TYPE] {
-        assert!(type_id.ends_with('~'), "{type_id} is not a type id");
-        gts::GtsId::try_new(type_id).unwrap();
-    }
-    gts::GtsId::try_new(AUDIT_TOPIC_ID).unwrap();
-    assert!(!AUDIT_TOPIC_ID.ends_with('~'));
-}
 
 #[test]
 fn audit_topic_instance_is_in_inventory() {
     let instances = toolkit_gts::all_inventory_instances().unwrap();
     assert!(instances.iter().any(|i| i["id"] == AUDIT_TOPIC_ID));
-}
-
-#[test]
-fn event_type_schema_names_topic_and_type() {
-    let schema = refusal_event_type_schema();
-    assert!(
-        schema["$id"]
-            .as_str()
-            .unwrap()
-            .ends_with(REFUSAL_EVENT_TYPE)
-    );
-    assert_eq!(schema["x-gts-traits"]["topic"], AUDIT_TOPIC_ID);
 }
 
 fn event() -> RefusalEvent {
@@ -56,8 +32,24 @@ fn event() -> RefusalEvent {
 /// Turns a valid serialized event into an invalid one.
 type Mutation = fn(&mut Value);
 
+/// The declared payload contract of the refusal event type, resolved against
+/// the event base the way the registry resolves it.
+fn data_schema() -> Value {
+    let mut store = GtsStore::new();
+    store
+        .register_schema(
+            EventV1::<()>::TYPE_ID,
+            &EventV1::<()>::gts_schema_with_refs(),
+        )
+        .unwrap();
+    let resolved = store
+        .resolve_schema_refs(&refusal_event_type_schema())
+        .unwrap();
+    data_contract(&resolved)
+}
+
 fn validator() -> jsonschema::Validator {
-    jsonschema::validator_for(&refusal_event_data_schema()).unwrap()
+    jsonschema::validator_for(&data_schema()).unwrap()
 }
 
 #[test]
@@ -137,12 +129,32 @@ fn the_data_schema_refuses_what_no_event_serializes_to() {
 }
 
 #[test]
-fn the_data_schema_is_self_contained() {
-    // Embedded under the event base's `data`: a `$ref` to generated
-    // definitions, or a nested `$schema`, would not resolve there.
-    let text = refusal_event_data_schema().to_string();
-    assert!(!text.contains("$ref"), "{text}");
-    assert!(!text.contains("$schema"), "{text}");
+fn the_declaration_names_every_field_of_the_payload() {
+    // The payload (`RefusalEvent`) is what is sent and the declaration is what is
+    // registered; a field on only one side would otherwise go unnoticed when it
+    // is optional.
+    let full = RefusalEvent {
+        resource_id: Some(Uuid::from_u128(2)),
+        condition: Some(variants::<FailureCondition>().remove(0)),
+        policy: Some(PolicyReference {
+            bundle_id: Uuid::from_u128(6),
+            version_id: Uuid::from_u128(7),
+            document_id: Uuid::from_u128(8),
+            document_name: "d".to_owned(),
+        }),
+        property_names: vec!["name".to_owned()],
+        ..event()
+    };
+    let sent = serde_json::to_value(full).unwrap();
+    let declared = RefusalEventV1::gts_schema_with_refs();
+    let declared = declared["allOf"][1]["properties"]["data"]["properties"]
+        .as_object()
+        .unwrap();
+    let mut sent_names: Vec<_> = sent.as_object().unwrap().keys().collect();
+    let mut declared_names: Vec<_> = declared.keys().collect();
+    sent_names.sort();
+    declared_names.sort();
+    assert_eq!(sent_names, declared_names);
 }
 
 #[test]

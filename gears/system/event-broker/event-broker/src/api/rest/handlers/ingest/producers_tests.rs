@@ -12,6 +12,50 @@ use uuid::Uuid;
 
 use crate::domain::ingest::{ProducerMode, ProducerRegistrationInput};
 use crate::test_support::{EventBrokerHarness, Json, StaticTypesRegistry, TestResponse};
+use event_broker_sdk::gts::EventV1;
+use toolkit_gts::gts_type_schema;
+
+#[gts_type_schema(
+    dir_path = "schemas",
+    base = EventV1,
+    type_id = gts_id!("cf.core.events.event.v1~x.eb.t1.foo.v1~"),
+    description = "An event type this test publishes.",
+    properties = "",
+    traits = serde_json::json!({
+        "topic": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
+        "allowed_subject_types": ["gts.x.eb.t1.subject.v1~"],
+    }),
+)]
+#[schemars(extend("additionalProperties" = true))]
+struct FooV1;
+
+#[gts_type_schema(
+    dir_path = "schemas",
+    base = EventV1,
+    type_id = gts_id!("cf.core.events.event.v1~x.eb.t1.foo_a.v1~"),
+    description = "An event type this test publishes.",
+    properties = "",
+    traits = serde_json::json!({
+        "topic": "gts.cf.core.events.topic.v1~x.eb.t1.topic_a.v1",
+        "allowed_subject_types": ["gts.x.eb.t1.subject.v1~"],
+    }),
+)]
+#[schemars(extend("additionalProperties" = true))]
+struct FooAV1;
+
+#[gts_type_schema(
+    dir_path = "schemas",
+    base = EventV1,
+    type_id = gts_id!("cf.core.events.event.v1~x.eb.t1.foo_b.v1~"),
+    description = "An event type this test publishes.",
+    properties = "",
+    traits = serde_json::json!({
+        "topic": "gts.cf.core.events.topic.v1~x.eb.t1.topic_b.v1",
+        "allowed_subject_types": ["gts.x.eb.t1.subject.v1~"],
+    }),
+)]
+#[schemars(extend("additionalProperties" = true))]
+struct FooBV1;
 
 #[tokio::test]
 async fn register_producer_chained_mode_returns_201_with_minted_id() {
@@ -229,14 +273,12 @@ async fn publish_chained_event(
 #[tokio::test]
 async fn reset_producer_full_scope_returns_200_with_no_body() {
     let harness = EventBrokerHarness::builder()
-        .with_type_registry(StaticTypesRegistry::of(json!([
-            { "id": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1", "partitions": 1 },
-            {
-                "id": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
-                "topic": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
-                "allowed_subject_types": ["gts.x.eb.t1.subject.v1~"],
-            },
-        ])))
+        .with_type_registry(
+            StaticTypesRegistry::of(json!([
+                { "id": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1", "partitions": 1 },
+            ]))
+            .event_type::<FooV1>(),
+        )
         .build()
         .await;
     let register = harness
@@ -304,20 +346,14 @@ async fn reset_producer_full_scope_returns_200_with_no_body() {
 #[tokio::test]
 async fn reset_producer_scoped_to_topic_returns_200_with_no_body() {
     let harness = EventBrokerHarness::builder()
-        .with_type_registry(StaticTypesRegistry::of(json!([
-            { "id": "gts.cf.core.events.topic.v1~x.eb.t1.topic_a.v1", "partitions": 1 },
-            { "id": "gts.cf.core.events.topic.v1~x.eb.t1.topic_b.v1", "partitions": 1 },
-            {
-                "id": "gts.cf.core.events.event.v1~x.eb.t1.foo_a.v1~",
-                "topic": "gts.cf.core.events.topic.v1~x.eb.t1.topic_a.v1",
-                "allowed_subject_types": ["gts.x.eb.t1.subject.v1~"],
-            },
-            {
-                "id": "gts.cf.core.events.event.v1~x.eb.t1.foo_b.v1~",
-                "topic": "gts.cf.core.events.topic.v1~x.eb.t1.topic_b.v1",
-                "allowed_subject_types": ["gts.x.eb.t1.subject.v1~"],
-            },
-        ])))
+        .with_type_registry(
+            StaticTypesRegistry::of(json!([
+                { "id": "gts.cf.core.events.topic.v1~x.eb.t1.topic_a.v1", "partitions": 1 },
+                { "id": "gts.cf.core.events.topic.v1~x.eb.t1.topic_b.v1", "partitions": 1 },
+            ]))
+            .event_type::<FooAV1>()
+            .event_type::<FooBV1>(),
+        )
         .build()
         .await;
     let register = harness

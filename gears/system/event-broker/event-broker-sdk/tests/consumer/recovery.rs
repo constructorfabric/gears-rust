@@ -12,15 +12,21 @@ use event_broker_sdk::{
 };
 use serde_json::json;
 
-use super::common::{publish_json, topic, topic_fixture};
+use super::common::{publish_json, showcase_event_type, topic, topic_fixture};
 use super::doubles::{BatchScopeRecorder, SeekFaultBroker};
+use event_broker_sdk::gts::EventV1;
 
 const TOPIC: &str = gts_id!("cf.core.events.topic.v1~example.mock.showcase.reseek.v1");
-const EVENT: &str = gts_id!("cf.core.events.event.v1~example.mock.showcase.reseek.v1~");
+showcase_event_type!(
+    EVENT,
+    ReseekEventV1,
+    "cf.core.events.event.v1~example.mock.showcase.reseek.v1~",
+    TOPIC
+);
 
 #[tokio::test]
 async fn seek_recovers_from_one_shot_topology_version_mismatch() {
-    let fx = topic_fixture(TOPIC, EVENT, 1).await;
+    let fx = topic_fixture::<ReseekEventV1>(TOPIC, 1).await;
 
     // Fault only the first seek: the consumer must re-read the subscription and
     // re-seek to recover, then deliver the event.
@@ -71,7 +77,7 @@ async fn seek_topology_mismatch_is_bounded_and_surfaces() {
     // tuning constant not reachable from an integration test).
     const RESEEK_ATTEMPTS: u32 = 5;
 
-    let fx = topic_fixture(TOPIC, EVENT, 1).await;
+    let fx = topic_fixture::<ReseekEventV1>(TOPIC, 1).await;
 
     // Every seek mismatches: recovery must give up after a bounded number of
     // re-reads and surface the error instead of looping forever.
@@ -120,7 +126,7 @@ async fn seek_topology_mismatch_is_bounded_and_surfaces() {
 
 #[tokio::test]
 async fn positions_not_set_at_open_is_not_masked() {
-    let fx = topic_fixture(TOPIC, EVENT, 1).await;
+    let fx = topic_fixture::<ReseekEventV1>(TOPIC, 1).await;
 
     // No seek fault; the first stream open reports PositionsNotSet. A compliant
     // consumer seeks before opening, so this is a protocol violation the runtime

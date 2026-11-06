@@ -1,5 +1,5 @@
 //! `POST /v1/events`, `POST /v1/events:batch` (`DESIGN.md:584`,
-//! `docs/schemas/gts.cf.core.events.event.v1~.schema.json`).
+//! `event_broker_sdk::gts::EventV1`).
 
 use axum::Extension;
 use axum::body::Bytes;

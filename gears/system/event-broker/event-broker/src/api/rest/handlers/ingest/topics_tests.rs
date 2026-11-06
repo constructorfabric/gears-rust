@@ -18,6 +18,22 @@ use serde_json::json;
 use std::collections::BTreeSet;
 
 use crate::test_support::{EventBrokerHarness, Json, StaticTypesRegistry};
+use event_broker_sdk::gts::EventV1;
+use toolkit_gts::gts_type_schema;
+
+#[gts_type_schema(
+    dir_path = "schemas",
+    base = EventV1,
+    type_id = gts_id!("cf.core.events.event.v1~x.eb.a.foo.v1~"),
+    description = "An event type this test publishes.",
+    properties = "",
+    traits = serde_json::json!({
+        "topic": "gts.cf.core.events.topic.v1~x.eb.a.topic.v1",
+        "allowed_subject_types": ["gts.x.eb.t1.subject.v1~"],
+    }),
+)]
+#[schemars(extend("additionalProperties" = true))]
+struct FooV1;
 
 #[tokio::test]
 async fn list_topics_happy_path_returns_all_seeded_topics() {
@@ -228,14 +244,12 @@ async fn list_topics_invalid_cursor_returns_400() {
 #[tokio::test]
 async fn get_topic_segments_happy_path_reflects_published_events() {
     let harness = EventBrokerHarness::builder()
-        .with_type_registry(StaticTypesRegistry::of(json!([
-            { "id": "gts.cf.core.events.topic.v1~x.eb.a.topic.v1", "partitions": 1 },
-            {
-                "id": "gts.cf.core.events.event.v1~x.eb.a.foo.v1~",
-                "topic": "gts.cf.core.events.topic.v1~x.eb.a.topic.v1",
-                "allowed_subject_types": ["gts.x.eb.t1.subject.v1~"],
-            },
-        ])))
+        .with_type_registry(
+            StaticTypesRegistry::of(json!([
+                { "id": "gts.cf.core.events.topic.v1~x.eb.a.topic.v1", "partitions": 1 },
+            ]))
+            .event_type::<FooV1>(),
+        )
         .build()
         .await;
 
@@ -424,14 +438,12 @@ async fn get_topic_segments_negative_partition_returns_400_invalid_partition() {
 async fn publishes_drain_through_an_outbox_with_a_configured_partition_count() {
     let topic = "gts.cf.core.events.topic.v1~x.eb.a.topic.v1";
     let harness = EventBrokerHarness::builder()
-        .with_type_registry(StaticTypesRegistry::of(json!([
-            { "id": topic, "partitions": 1 },
-            {
-                "id": "gts.cf.core.events.event.v1~x.eb.a.foo.v1~",
-                "topic": topic,
-                "allowed_subject_types": ["gts.x.eb.t1.subject.v1~"],
-            },
-        ])))
+        .with_type_registry(
+            StaticTypesRegistry::of(json!([
+                { "id": topic, "partitions": 1 },
+            ]))
+            .event_type::<FooV1>(),
+        )
         .with_outbox_partitions(
             crate::domain::outbox::OutboxPartitions::new(4).expect("a power of 2 within 64"),
         )

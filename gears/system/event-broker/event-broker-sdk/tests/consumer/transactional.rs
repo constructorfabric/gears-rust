@@ -17,10 +17,16 @@ use event_broker_sdk::{
 };
 use serde_json::json;
 
-use super::common::{publish_json, topic, topic_fixture};
+use super::common::{publish_json, showcase_event_type, topic, topic_fixture};
+use event_broker_sdk::gts::EventV1;
 
 const TOPIC: &str = gts_id!("cf.core.events.topic.v1~cf.core.orders.topic.v1");
-const EVENT_TYPE: &str = gts_id!("cf.core.events.event.v1~example.mock.showcase.tx.v1~");
+showcase_event_type!(
+    EVENT_TYPE,
+    EventTypeV1,
+    "cf.core.events.event.v1~example.mock.showcase.tx.v1~",
+    TOPIC
+);
 
 #[derive(Default)]
 struct RecordingTxOffsetManager;
@@ -154,7 +160,7 @@ impl TxSingleEventHandler<CountingTxOffsetManager> for NoCommitTxHandler {
 
 #[tokio::test]
 async fn transactional_consumer_start_paths_return_lifecycle_handles() {
-    let fx = topic_fixture(TOPIC, EVENT_TYPE, 3).await;
+    let fx = topic_fixture::<EventTypeV1>(TOPIC, 3).await;
 
     let single = ConsumerBuilder::new(fx.broker.clone())
         .group(ConsumerGroupRef::auto_anonymous("tx-single-start"))
@@ -207,7 +213,7 @@ async fn transactional_consumer_start_paths_return_lifecycle_handles() {
 
 #[tokio::test]
 async fn transactional_consumer_does_not_auto_commit_when_handler_omits_commit_in_tx() {
-    let fx = topic_fixture(TOPIC, EVENT_TYPE, 1).await;
+    let fx = topic_fixture::<EventTypeV1>(TOPIC, 1).await;
     let manager = CountingTxOffsetManager::default();
     let commits = manager.commits.clone();
     let handled = Arc::new(AtomicUsize::new(0));

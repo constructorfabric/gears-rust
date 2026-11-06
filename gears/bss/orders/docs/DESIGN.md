@@ -5209,9 +5209,9 @@ The `DbProducer` declares this topic and the
 `gts.cf.core.events.event.v1~cf.bss.orders.*` event-type pattern. `/subject` explicitly selects
 the order UUID independently of root envelope tenancy; omitting it would select the SDK's
 `/tenant_id` default. Partitioning co-locates an order's events; the delivery and parked-event
-ordering limitations remain those of §4.4. The SDK's `derived_event_type_schema` helper currently
-emits `/tenant_id`; implementation must set `/subject` in the registered schema, not accept that
-helper default unchanged.
+ordering limitations remain those of §4.4. An event type that declares no
+`partition_key` trait inherits the `/tenant_id` default from `EventV1`; the orders event types must
+declare `/subject` in their `#[gts_type_schema(base = EventV1)]` traits.
 
 Retention belongs to the registered `TopicV1` instance's optional `retention` property (an
 ISO 8601 duration); absence uses the broker-configured default. It is not an event trait or the

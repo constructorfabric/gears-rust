@@ -9,8 +9,9 @@
 use crate::domain::model::Sequence;
 use std::time::Duration;
 
+use event_broker_sdk::gts::EventV1;
 use serde_json::json;
-use toolkit_gts::GtsInstanceId;
+use toolkit_gts::{GtsInstanceId, GtsSchema, gts_type_schema};
 use uuid::Uuid;
 
 use crate::domain::model::Assignment;
@@ -19,17 +20,28 @@ use crate::infra::loader::attach::{AttachRequest, attach_readers};
 use crate::test_support::{EventBrokerHarness, Json, StaticTypesRegistry};
 
 const TOPIC: &str = "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1";
-const EVENT_TYPE: &str = "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~";
+
+#[gts_type_schema(
+    dir_path = "schemas",
+    base = EventV1,
+    type_id = gts_id!("cf.core.events.event.v1~x.eb.t1.foo.v1~"),
+    description = "An event type this test publishes.",
+    properties = "",
+    traits = serde_json::json!({
+        "topic": TOPIC,
+        "allowed_subject_types": ["gts.x.eb.t1.subject.v1~"],
+    }),
+)]
+#[schemars(extend("additionalProperties" = true))]
+struct FooV1;
+
+const EVENT_TYPE: &str = <FooV1 as GtsSchema>::TYPE_ID;
 
 fn registry() -> StaticTypesRegistry {
     StaticTypesRegistry::of(json!([
         { "id": TOPIC, "partitions": 1 },
-        {
-            "id": EVENT_TYPE,
-            "topic": TOPIC,
-            "allowed_subject_types": ["gts.x.eb.t1.subject.v1~"],
-        },
     ]))
+    .event_type::<FooV1>()
 }
 
 /// Polls until `f` holds or the budget runs out, so the assertion reports the

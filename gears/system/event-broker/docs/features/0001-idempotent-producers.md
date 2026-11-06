@@ -64,7 +64,7 @@ Idempotent-producer support lets producers retry safely after transport failures
 - [ADR-0003 Event Schema](../ADR/0003-event-schema.md)
 - [ADR-0004 Idempotent Producer Protocol](../ADR/0004-idempotent-producer-protocol.md)
 - DESIGN.md §3.1 Domain Model, §3.2 Producer Modes, §3.6 Two Sequences
-- `schemas/gts.cf.core.events.event.v1~.schema.json` — single canonical event schema (publish + read; per-direction semantics via `readOnly` / `writeOnly` markers)
+- `EventV1<D>` in [`event-broker-sdk/src/gts.rs`](../../event-broker-sdk/src/gts.rs) — single canonical event schema (publish + read; per-direction semantics via `readOnly` / `writeOnly` markers)
 - `migration.sql` - `event_broker_producer`, `event_broker_producer_sequence` DDL
 - PRD.md FR `cpt-cf-evbk-fr-producer-modes`
 
@@ -129,7 +129,7 @@ The rule is required. A sequence space shared across producer partitions interle
 
 ## 3. Wire Shapes (`meta` block)
 
-The `meta` block lives on the event (`gts.cf.core.events.event.v1~.schema.json`) and is marked `writeOnly` (publish-only). It is **optional**; absence = stateless. The broker strips `meta` from consumer-visible reads regardless of mode.
+The `meta` block lives on the event (`EventV1`) and is marked `writeOnly` (publish-only). It is **optional**; absence = stateless. The broker strips `meta` from consumer-visible reads regardless of mode.
 
 ```jsonc
 // Chained
@@ -549,5 +549,5 @@ A publish-path error about the stream names the targeted stream as its resource:
   - §3.6 Two Sequences
   - §3.7 Database schemas - `event_broker_producer`, `event_broker_producer_sequence` rows
 - **Schemas**:
-  - [`schemas/gts.cf.core.events.event.v1~.schema.json`](../schemas/gts.cf.core.events.event.v1~.schema.json) — publish input
-  - [`schemas/gts.cf.core.events.event.v1~.schema.json`](../schemas/gts.cf.core.events.event.v1~.schema.json) — single canonical event schema; read responses surface `readOnly` `partition`/`sequence`/`sequence_time` and strip `writeOnly` `meta`
+  - `EventV1<D>` in [`event-broker-sdk/src/gts.rs`](../../event-broker-sdk/src/gts.rs) — publish input
+  - `EventV1<D>` in [`event-broker-sdk/src/gts.rs`](../../event-broker-sdk/src/gts.rs) — single canonical event schema; read responses surface `readOnly` `partition`/`sequence`/`sequence_time` and strip `writeOnly` `meta`

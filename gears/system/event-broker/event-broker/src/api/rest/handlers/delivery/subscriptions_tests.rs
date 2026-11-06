@@ -36,6 +36,35 @@ use crate::domain::model::{ConsumerGroup, ConsumerGroupKind};
 use crate::domain::repo::{ConsumerGroupRepo, CursorRepo};
 use crate::domain::streaming::lease::StreamLeases;
 use crate::test_support::{DenyingAuthZ, EventBrokerHarness, Json, StaticTypesRegistry};
+use event_broker_sdk::gts::EventV1;
+use toolkit_gts::gts_type_schema;
+
+#[gts_type_schema(
+    dir_path = "schemas",
+    base = EventV1,
+    type_id = gts_id!("cf.core.events.event.v1~x.eb.t1.foo.v1~"),
+    description = "An event type this test publishes.",
+    properties = "",
+    traits = serde_json::json!({
+        "topic": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
+        "allowed_subject_types": ["gts.x.eb.t1.subject.v1~"],
+    }),
+)]
+#[schemars(extend("additionalProperties" = true))]
+struct FooVar2V1;
+
+#[gts_type_schema(
+    dir_path = "schemas",
+    base = EventV1,
+    type_id = gts_id!("cf.core.events.event.v1~x.eb.t1.foo.v1~"),
+    description = "An event type this test publishes.",
+    properties = "",
+    traits = serde_json::json!({
+        "topic": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
+    }),
+)]
+#[schemars(extend("additionalProperties" = true))]
+struct FooV1;
 
 // -- JOIN validation matrix --
 
@@ -1407,10 +1436,12 @@ async fn harness_with_subscription_then_deny_further_tenant_checks()
 -> (EventBrokerHarness, String, String) {
     let calls = std::sync::atomic::AtomicUsize::new(0);
     let harness = EventBrokerHarness::builder()
-        .with_type_registry(StaticTypesRegistry::of(json!([
-            { "id": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1", "partitions": 1 },
-            { "id": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~", "topic": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1" },
-        ])))
+        .with_type_registry(
+            StaticTypesRegistry::of(json!([
+                { "id": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1", "partitions": 1 },
+            ]))
+            .event_type::<FooV1>(),
+        )
         .with_policy_enforcer(PolicyEnforcer::new(Arc::new(DenyingAuthZ {
             deny_if: move |_: &EvaluationRequest| {
                 calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= 2
@@ -1760,14 +1791,12 @@ async fn seek_exact_offset_returns_200_with_resolved_value() {
     let topic = "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1";
     let tenant_id = Uuid::new_v4();
     let harness = EventBrokerHarness::builder()
-        .with_type_registry(StaticTypesRegistry::of(json!([
-            { "id": topic, "partitions": 1 },
-            {
-                "id": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
-                "topic": topic,
-                "allowed_subject_types": ["gts.x.eb.t1.subject.v1~"],
-            },
-        ])))
+        .with_type_registry(
+            StaticTypesRegistry::of(json!([
+                { "id": topic, "partitions": 1 },
+            ]))
+            .event_type::<FooVar2V1>(),
+        )
         .build()
         .await;
     let group = harness.api_v1().post_consumer_groups().send().await.json()["id"]
@@ -2292,14 +2321,12 @@ async fn seek_accepts_the_range_edges_and_rejects_one_step_outside_either() {
     let topic = "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1";
     let tenant_id = Uuid::new_v4();
     let harness = EventBrokerHarness::builder()
-        .with_type_registry(StaticTypesRegistry::of(json!([
-            { "id": topic, "partitions": 1 },
-            {
-                "id": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
-                "topic": topic,
-                "allowed_subject_types": ["gts.x.eb.t1.subject.v1~"],
-            },
-        ])))
+        .with_type_registry(
+            StaticTypesRegistry::of(json!([
+                { "id": topic, "partitions": 1 },
+            ]))
+            .event_type::<FooVar2V1>(),
+        )
         .build()
         .await;
     let group = harness.api_v1().post_consumer_groups().send().await.json()["id"]
@@ -2591,14 +2618,12 @@ async fn a_cursor_may_sit_on_an_erased_position_and_delivery_resumes_above_it() 
     let tenant_id = Uuid::new_v4();
     let memory = memory_event_broker_plugin::MemoryBackend::new();
     let harness = EventBrokerHarness::builder()
-        .with_type_registry(StaticTypesRegistry::of(json!([
-            { "id": topic, "partitions": 1 },
-            {
-                "id": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
-                "topic": topic,
-                "allowed_subject_types": ["gts.x.eb.t1.subject.v1~"],
-            },
-        ])))
+        .with_type_registry(
+            StaticTypesRegistry::of(json!([
+                { "id": topic, "partitions": 1 },
+            ]))
+            .event_type::<FooVar2V1>(),
+        )
         .with_backend(std::sync::Arc::new(memory.clone()))
         .build()
         .await;
@@ -2758,14 +2783,12 @@ async fn an_emptied_partition_admits_only_its_ceiling() {
     let tenant_id = Uuid::new_v4();
     let memory = memory_event_broker_plugin::MemoryBackend::new();
     let harness = EventBrokerHarness::builder()
-        .with_type_registry(StaticTypesRegistry::of(json!([
-            { "id": topic, "partitions": 1 },
-            {
-                "id": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
-                "topic": topic,
-                "allowed_subject_types": ["gts.x.eb.t1.subject.v1~"],
-            },
-        ])))
+        .with_type_registry(
+            StaticTypesRegistry::of(json!([
+                { "id": topic, "partitions": 1 },
+            ]))
+            .event_type::<FooVar2V1>(),
+        )
         .with_backend(std::sync::Arc::new(memory.clone()))
         .build()
         .await;

@@ -12,6 +12,7 @@ use crate::test_support::{authed_ctx, flat_in_enforcer, resolved_usage_types, te
 use axum::{Router, body::Body, http::Request};
 use event_broker::test_support::{EventBrokerHarness, StaticTypesRegistry};
 use event_broker_sdk::backend::{Partition, TopicPartition, Wait};
+use event_broker_sdk::gts::EventV1;
 use event_broker_sdk::{GtsInstanceId, Sequence, api::EventBrokerApi};
 use serde_json::{Value, json};
 use std::{collections::BTreeSet, time::Duration};
@@ -30,6 +31,54 @@ const AT_ONCE: Duration = Duration::from_secs(5);
 /// How long nothing may move after a rolled-back transaction.
 const QUIET: Duration = Duration::from_secs(2);
 
+/// Declares one products event type, on the products topic with its subject type, over any object
+/// payload (an open, body-less type): the broker is what these tests exercise, not the payloads.
+/// The ids repeat the `TypedEvent` constants, and a publish under a mismatched id fails at the
+/// broker.
+macro_rules! declare_event_type {
+    ($name:ident, $id:literal, $subject:literal) => {
+        #[toolkit_gts::gts_type_schema(
+                            dir_path = "schemas",
+                            base = EventV1,
+                            type_id = toolkit_gts::gts_id!($id),
+                            description = "A products event type, as the broker's tests know it",
+                            properties = "",
+                            traits = serde_json::json!({
+                                "topic": TOPIC,
+                                "allowed_subject_types": [toolkit_gts::gts_id!($subject)],
+                            }),
+                        )]
+        #[schemars(extend("additionalProperties" = true))]
+        struct $name;
+    };
+}
+
+declare_event_type!(
+    SkuPublishedTypeV1,
+    "cf.core.events.event.v1~cf.bss.products.sku_published.v1~",
+    "cf.core.events.subject.v1~cf.bss.products.sku.v1~"
+);
+declare_event_type!(
+    SkuChangedTypeV1,
+    "cf.core.events.event.v1~cf.bss.products.sku_changed.v1~",
+    "cf.core.events.subject.v1~cf.bss.products.sku.v1~"
+);
+declare_event_type!(
+    SkuRetiredTypeV1,
+    "cf.core.events.event.v1~cf.bss.products.sku_retired.v1~",
+    "cf.core.events.subject.v1~cf.bss.products.sku.v1~"
+);
+declare_event_type!(
+    ApprovalUnitDecidedTypeV1,
+    "cf.core.events.event.v1~cf.bss.products.approval_unit_decided.v1~",
+    "cf.core.events.subject.v1~cf.bss.products.approval_unit.v1~"
+);
+declare_event_type!(
+    ReferenceForceReleasedTypeV1,
+    "cf.core.events.event.v1~cf.bss.products.reference_force_released.v1~",
+    "cf.core.events.subject.v1~cf.bss.products.sku.v1~"
+);
+
 /// A products state over a database with four connections (the door fixtures pin one), bound to
 /// a real broker that knows every products event type: the outbox's sequencer then reads on a
 /// connection of its own while a transaction is still open, as it does in a deployment. The
@@ -41,23 +90,15 @@ async fn bound() -> (
     event_broker_sdk::ProducerOutboxHandle,
     EventBrokerHarness,
 ) {
-    let mut spec = vec![json!({"id": TOPIC, "partitions": PARTITIONS})];
-    for (type_id, subject) in [
-        (SkuPublished::TYPE_ID, SKU_SUBJECT_TYPE),
-        (SkuChanged::TYPE_ID, SKU_SUBJECT_TYPE),
-        (SkuRetired::TYPE_ID, SKU_SUBJECT_TYPE),
-        (ApprovalUnitDecided::TYPE_ID, APPROVAL_UNIT_SUBJECT_TYPE),
-        (ReferenceForceReleased::TYPE_ID, SKU_SUBJECT_TYPE),
-    ] {
-        spec.push(json!({
-            "id": type_id,
-            "topic": TOPIC,
-            "data_schema": {"type": "object"},
-            "allowed_subject_types": [subject],
-        }));
-    }
     let broker = EventBrokerHarness::builder()
-        .with_type_registry(StaticTypesRegistry::of(Value::Array(spec)))
+        .with_type_registry(
+            StaticTypesRegistry::of(json!([{"id": TOPIC, "partitions": PARTITIONS}]))
+                .event_type::<SkuPublishedTypeV1>()
+                .event_type::<SkuChangedTypeV1>()
+                .event_type::<SkuRetiredTypeV1>()
+                .event_type::<ApprovalUnitDecidedTypeV1>()
+                .event_type::<ReferenceForceReleasedTypeV1>(),
+        )
         .build()
         .await;
     let (db, _, tenant, dsn) = test_db_with(4).await;

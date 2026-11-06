@@ -196,7 +196,7 @@ pub enum FilterError {
 
 ### CEL Engine Filter Context (v1)
 
-The CEL engine binds one variable `event` whose fields are the read-side event (the same `gts.cf.core.events.event.v1~.schema.json` resource consumers receive — `meta` is stripped on read via its `writeOnly` marker; `partition`/`sequence`/`sequence_time` are server-stamped via `readOnly`):
+The CEL engine binds one variable `event` whose fields are the read-side event (the same `gts.cf.core.events.event.v1~` resource consumers receive — `meta` is stripped on read via its `writeOnly` marker; `partition`/`sequence`/`sequence_time` are server-stamped via `readOnly`):
 
 | CEL identifier | Type | Source |
 |---|---|---|
@@ -388,7 +388,7 @@ External references:
 - **Scenario and test coverage**: JOIN shape, interest body, pattern syntax, version resolution, topic / tenant / type authz, filter-engine resolution, expression compilation, per-event delivery, limits, and rolling deploy are covered by repository scenarios and tests.
 - **Related ADRs**:
   - [`0002-partition-selection`](0002-partition-selection.md) — partition derivation; the subscription rebalance still operates on `(topic, partition)`.
-  - [`0003-event-schema`](0003-event-schema.md) — read-side event fields exposed to the CEL filter context (the `gts.cf.core.events.event.v1~.schema.json` resource with `readOnly` fields populated and `writeOnly` `meta` stripped).
+  - [`0003-event-schema`](0003-event-schema.md) — read-side event fields exposed to the CEL filter context (the `gts.cf.core.events.event.v1~` resource with `readOnly` fields populated and `writeOnly` `meta` stripped).
   - [`0004-idempotent-producer-protocol`](0004-idempotent-producer-protocol.md) — `client_agent` field convention on resource-creating endpoints; JOIN reuses the consumer-group's `client_agent` rather than re-declaring per subscription.
 - **Feature doc**: [`docs/features/0002-consumer-subscription-lifecycle.md`](../features/0002-consumer-subscription-lifecycle.md) — CDSL flows, ACs, test plans.
 - **Schemas**:

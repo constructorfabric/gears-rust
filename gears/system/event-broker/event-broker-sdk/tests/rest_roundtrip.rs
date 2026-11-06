@@ -14,6 +14,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use event_broker::test_support::{EventBrokerHarness, StaticTypesRegistry};
+use event_broker_sdk::gts::EventV1;
 use event_broker_sdk::rest::{RestBroker, StreamTransport};
 use event_broker_sdk::{
     ConsumerBuilder, ConsumerError, ConsumerGroupRef, Event, EventBrokerApi, Fallback,
@@ -21,12 +22,29 @@ use event_broker_sdk::{
     gts_id,
 };
 use serde_json::json;
+use toolkit_gts::gts_type_schema;
 use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
 const TOPIC: &str = gts_id!("cf.core.events.topic.v1~example.mock.showcase.rest.v1");
 const EVENT_TYPE: &str = gts_id!("cf.core.events.event.v1~example.mock.showcase.rest.v1~");
 const SUBJECT_TYPE: &str = "gts.x.eb.showcase.subject.v1~";
+
+/// The registered event type: any object payload, partitioned by `/source`.
+#[gts_type_schema(
+    dir_path = "schemas",
+    base = EventV1,
+    type_id = gts_id!("cf.core.events.event.v1~example.mock.showcase.rest.v1~"),
+    description = "A fixture event type: any object payload.",
+    properties = "",
+    traits = json!({
+        "topic": TOPIC,
+        "allowed_subject_types": [SUBJECT_TYPE],
+        "partition_key": "/source",
+    }),
+)]
+#[schemars(extend("additionalProperties" = true))]
+struct ShowcaseEventV1;
 
 struct RecordingHandler {
     subjects: Arc<Mutex<Vec<String>>>,
@@ -58,16 +76,10 @@ async fn wait_until(mut predicate: impl FnMut() -> bool) {
 /// with the given stream framing.
 async fn rest_round_trip(framing: StreamTransport) {
     let harness = EventBrokerHarness::builder()
-        .with_type_registry(StaticTypesRegistry::of(json!([
-            { "id": TOPIC, "partitions": 1 },
-            {
-                "id": EVENT_TYPE,
-                "topic": TOPIC,
-                "data_schema": { "type": "object" },
-                "allowed_subject_types": [SUBJECT_TYPE],
-                "partition_key": "/source",
-            },
-        ])))
+        .with_type_registry(
+            StaticTypesRegistry::of(json!([{ "id": TOPIC, "partitions": 1 }]))
+                .event_type::<ShowcaseEventV1>(),
+        )
         .build()
         .await;
 

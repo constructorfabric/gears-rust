@@ -34,6 +34,22 @@ use toolkit_gts::GtsInstanceId;
 
 use crate::domain::streaming::source::PartitionKey;
 use crate::test_support::{EventBrokerHarness, Json, StaticTypesRegistry};
+use event_broker_sdk::gts::EventV1;
+use toolkit_gts::gts_type_schema;
+
+#[gts_type_schema(
+    dir_path = "schemas",
+    base = EventV1,
+    type_id = gts_id!("cf.core.events.event.v1~x.eb.t1.foo.v1~"),
+    description = "An event type this test publishes.",
+    properties = "",
+    traits = serde_json::json!({
+        "topic": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
+        "allowed_subject_types": ["gts.x.eb.t1.subject.v1~"],
+    }),
+)]
+#[schemars(extend("additionalProperties" = true))]
+struct FooV1;
 
 #[tokio::test]
 async fn stream_events_returns_409_positions_not_set_when_unseeded() {
@@ -444,14 +460,12 @@ async fn stream_events_delivers_a_published_event_on_a_polled_head() {
 async fn delivers_a_published_event_on_its_head_change(backend: Arc<dyn Backend>) {
     let harness = EventBrokerHarness::builder()
         .with_backend(backend)
-        .with_type_registry(StaticTypesRegistry::of(json!([
-            { "id": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1", "partitions": 1 },
-            {
-                "id": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
-                "topic": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
-                "allowed_subject_types": ["gts.x.eb.t1.subject.v1~"],
-            },
-        ])))
+        .with_type_registry(
+            StaticTypesRegistry::of(json!([
+                { "id": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1", "partitions": 1 },
+            ]))
+            .event_type::<FooV1>(),
+        )
         .build()
         .await;
     let group = harness.api_v1().post_consumer_groups().send().await.json()["id"]
@@ -996,23 +1010,31 @@ async fn sse_events_returns_406_when_accept_is_multipart_mixed() {
 #[tokio::test]
 async fn a_stream_delivers_only_events_matching_its_interests() {
     const TOPIC: &str = "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1";
-    const WANTED: &str = "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~";
-    const UNWANTED: &str = "gts.cf.core.events.event.v1~x.eb.t1.bar.v1~";
+    const WANTED: &str = <FooV1 as gts::GtsSchema>::TYPE_ID;
+    const UNWANTED: &str = <BarV1 as gts::GtsSchema>::TYPE_ID;
+
+    #[gts_type_schema(
+        dir_path = "schemas",
+        base = EventV1,
+        type_id = gts_id!("cf.core.events.event.v1~x.eb.t1.bar.v1~"),
+        description = "An event type no interest asks for.",
+        properties = "",
+        traits = serde_json::json!({
+            "topic": TOPIC,
+            "allowed_subject_types": ["gts.x.eb.t1.subject.v1~"],
+        }),
+    )]
+    #[schemars(extend("additionalProperties" = true))]
+    struct BarV1;
 
     let harness = EventBrokerHarness::builder()
-        .with_type_registry(StaticTypesRegistry::of(json!([
-            { "id": TOPIC, "partitions": 1 },
-            {
-                "id": WANTED,
-                "topic": TOPIC,
-                "allowed_subject_types": ["gts.x.eb.t1.subject.v1~"],
-            },
-            {
-                "id": UNWANTED,
-                "topic": TOPIC,
-                "allowed_subject_types": ["gts.x.eb.t1.subject.v1~"],
-            },
-        ])))
+        .with_type_registry(
+            StaticTypesRegistry::of(json!([
+                { "id": TOPIC, "partitions": 1 },
+            ]))
+            .event_type::<FooV1>()
+            .event_type::<BarV1>(),
+        )
         .build()
         .await;
     let group = harness.api_v1().post_consumer_groups().send().await.json()["id"]

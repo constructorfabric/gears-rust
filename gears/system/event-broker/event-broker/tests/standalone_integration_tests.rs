@@ -15,8 +15,55 @@ mod common;
 
 use std::time::Duration;
 
+use event_broker_sdk::gts::EventV1;
 use serde_json::json;
+use toolkit_gts::{GtsSchema, gts_type_schema};
 use uuid::Uuid;
+
+/// Any object payload: an open type with no declared members.
+#[gts_type_schema(
+    dir_path = "schemas",
+    base = EventV1,
+    type_id = gts_id!("cf.core.events.event.v1~x.eb.t10.foo.v1~"),
+    description = "An event type admitting any object payload.",
+    properties = "",
+    traits = json!({
+        "topic": "gts.cf.core.events.topic.v1~x.eb.t10.topic.v1",
+        "allowed_subject_types": ["gts.x.eb.t10.subject.v1~"],
+    }),
+)]
+#[schemars(extend("additionalProperties" = true))]
+struct FooT10V1;
+
+/// Any object payload: an open type with no declared members.
+#[gts_type_schema(
+    dir_path = "schemas",
+    base = EventV1,
+    type_id = gts_id!("cf.core.events.event.v1~x.eb.t10r.foo.v1~"),
+    description = "An event type admitting any object payload.",
+    properties = "",
+    traits = json!({
+        "topic": "gts.cf.core.events.topic.v1~x.eb.t10r.topic.v1",
+        "allowed_subject_types": ["gts.x.eb.t10r.subject.v1~"],
+    }),
+)]
+#[schemars(extend("additionalProperties" = true))]
+struct FooT10rV1;
+
+/// Any object payload: an open type with no declared members.
+#[gts_type_schema(
+    dir_path = "schemas",
+    base = EventV1,
+    type_id = gts_id!("cf.core.events.event.v1~x.eb.t10p.foo.v1~"),
+    description = "An event type admitting any object payload.",
+    properties = "",
+    traits = json!({
+        "topic": "gts.cf.core.events.topic.v1~x.eb.t10p.topic.v1",
+        "allowed_subject_types": ["gts.x.eb.t10p.subject.v1~"],
+    }),
+)]
+#[schemars(extend("additionalProperties" = true))]
+struct FooT10pV1;
 
 use common::{EventLog, SseFrameReader, TestServer};
 
@@ -27,12 +74,7 @@ async fn publish_then_consume_happy_path() {
     let subject_type = "gts.x.eb.t10.subject.v1~";
     let server = TestServer::start(vec![
         json!({ "id": topic, "partitions": 1, }),
-        json!({
-            "id": event_type,
-            "topic_id": topic,
-            "allowed_subject_types": [subject_type],
-            "data_schema": {},
-        }),
+        FooT10V1::gts_schema_with_refs(),
     ])
     .await;
     let client = reqwest::Client::new();
@@ -172,12 +214,7 @@ async fn restart_preserves_events_and_consumer_groups_but_not_subscriptions() {
     let mut server = TestServer::start_with_event_log(
         vec![
             json!({ "id": topic, "partitions": 1, }),
-            json!({
-                "id": event_type,
-                "topic_id": topic,
-                "allowed_subject_types": [subject_type],
-                "data_schema": {},
-            }),
+            FooT10rV1::gts_schema_with_refs(),
         ],
         EventLog::Sqlite,
     )
@@ -359,12 +396,7 @@ async fn producer_chain_sequence_resubmission_is_deduped_not_double_persisted() 
     let subject_type = "gts.x.eb.t10p.subject.v1~";
     let server = TestServer::start(vec![
         json!({ "id": topic, "partitions": 1, }),
-        json!({
-            "id": event_type,
-            "topic_id": topic,
-            "allowed_subject_types": [subject_type],
-            "data_schema": {},
-        }),
+        FooT10pV1::gts_schema_with_refs(),
     ])
     .await;
     let client = reqwest::Client::new();

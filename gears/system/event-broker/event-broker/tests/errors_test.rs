@@ -11,24 +11,37 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use authz_resolver_sdk::{AuthZResolverApi, EvaluationRequest, EvaluationResponse, PolicyEnforcer};
 use event_broker::test_support::{DenyingAuthZ, EventBrokerHarness, Json, StaticTypesRegistry};
+use event_broker_sdk::gts::EventV1;
 use http::HeaderValue;
 use serde_json::json;
 use toolkit_canonical_errors::CanonicalError;
+use toolkit_gts::gts_type_schema;
 use toolkit_security::PlatformSecurityContext;
 
 const TOPIC: &str = "gts.cf.core.events.topic.v1~x.eb.errors.stream.v1";
 const EVENT_TYPE: &str = "gts.cf.core.events.event.v1~x.eb.errors.happy.v1~";
 const SUBJECT_TYPE: &str = "gts.x.eb.errors.subject.v1~";
 
+/// Any object payload: an open type with no declared members.
+#[gts_type_schema(
+    dir_path = "schemas",
+    base = EventV1,
+    type_id = gts_id!("cf.core.events.event.v1~x.eb.errors.happy.v1~"),
+    description = "An event type admitting any object payload.",
+    properties = "",
+    traits = json!({
+        "topic": TOPIC,
+        "allowed_subject_types": [SUBJECT_TYPE],
+    }),
+)]
+#[schemars(extend("additionalProperties" = true))]
+struct HappyEventV1;
+
 fn registry() -> StaticTypesRegistry {
     StaticTypesRegistry::of(json!([
-        { "id": TOPIC, "partitions": 1 },
-        {
-            "id": EVENT_TYPE,
-            "topic": TOPIC,
-            "allowed_subject_types": [SUBJECT_TYPE],
-        },
-    ]))
+    { "id": TOPIC, "partitions": 1 },
+     ]))
+    .event_type::<HappyEventV1>()
 }
 
 /// A policy decision point that cannot be reached: every evaluation fails as

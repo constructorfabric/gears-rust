@@ -17,12 +17,23 @@ use sea_orm::{ConnectionTrait, Database, EntityTrait, PaginatorTrait, Set, State
 use toolkit_db::secure::{AccessScope, SecureInsertExt};
 use uuid::Uuid;
 
-use super::common::{publish_json, topic, topic_fixture, wait_until};
+use super::common::{publish_json, showcase_event_type, topic, topic_fixture, wait_until};
+use event_broker_sdk::gts::EventV1;
 
 const TX_SINGLE_TOPIC: &str = gts_id!("cf.core.events.topic.v1~example.mock.showcase.txsingle.v1");
-const TX_SINGLE_EVENT: &str = gts_id!("cf.core.events.event.v1~example.mock.showcase.txsingle.v1~");
+showcase_event_type!(
+    TX_SINGLE_EVENT,
+    TxSingleEventV1,
+    "cf.core.events.event.v1~example.mock.showcase.txsingle.v1~",
+    TX_SINGLE_TOPIC
+);
 const TX_BATCH_TOPIC: &str = gts_id!("cf.core.events.topic.v1~example.mock.showcase.txbatch.v1");
-const TX_BATCH_EVENT: &str = gts_id!("cf.core.events.event.v1~example.mock.showcase.txbatch.v1~");
+showcase_event_type!(
+    TX_BATCH_EVENT,
+    TxBatchEventV1,
+    "cf.core.events.event.v1~example.mock.showcase.txbatch.v1~",
+    TX_BATCH_TOPIC
+);
 
 mod dlq_row {
     use sea_orm::entity::prelude::*;
@@ -248,7 +259,7 @@ async fn dead_letter_count(conn: &sea_orm::DatabaseConnection) -> u64 {
 
 #[tokio::test]
 async fn if_i_want_transactional_single_event_handling_i_commit_the_delivered_offset_in_my_tx() {
-    let fixture = topic_fixture(TX_SINGLE_TOPIC, TX_SINGLE_EVENT, 1).await;
+    let fixture = topic_fixture::<TxSingleEventV1>(TX_SINGLE_TOPIC, 1).await;
     let (_raw, db) = db_with_showcase_tables().await;
     let group = fixture
         .broker
@@ -303,7 +314,7 @@ async fn if_i_want_transactional_single_event_handling_i_commit_the_delivered_of
 
 #[tokio::test]
 async fn if_i_want_transactional_batch_handling_i_commit_the_last_handled_offset_in_my_tx() {
-    let fixture = topic_fixture(TX_BATCH_TOPIC, TX_BATCH_EVENT, 1).await;
+    let fixture = topic_fixture::<TxBatchEventV1>(TX_BATCH_TOPIC, 1).await;
     let (_raw, db) = db_with_showcase_tables().await;
     let group = fixture
         .broker

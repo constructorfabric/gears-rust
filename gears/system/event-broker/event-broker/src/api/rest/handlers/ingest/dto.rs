@@ -21,7 +21,7 @@ use crate::domain::model::{Meta, Sequence, Topic, TopicSegmentManifest};
 // events.rs: POST /v1/events, POST /v1/events:batch
 // ---------------------------------------------------------------------------
 
-/// Publish-time transport-metadata block (`gts.cf.core.events.event.v1~.schema.json`'s `meta`) -
+/// Publish-time transport-metadata block (`event_broker_sdk::gts::EventV1`'s `meta`) -
 /// producer-protocol fields for chained/monotonic modes. Omit entirely for
 /// stateless publish.
 #[derive(Debug)]
@@ -37,7 +37,7 @@ pub struct MetaDto {
 /// `POST /v1/events` request body. Deliberately omits `partition`/
 /// `sequence`/`sequence_time` (the schema's `readOnly` fields) - a client
 /// that supplies them is rejected via `#[serde(deny_unknown_fields)]`
-/// (`gts.cf.core.events.event.v1~.schema.json`: "Producers MUST NOT supply this field on
+/// (`event_broker_sdk::gts::EventV1`: "Producers MUST NOT supply this field on
 /// publish"). It carries no `topic` either: the stream an event belongs to is
 /// the `topic` trait on its event type, so `type` alone names it.
 #[derive(Debug)]

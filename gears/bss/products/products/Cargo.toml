@@ -183,3 +183,6 @@ tempfile = { workspace = true }
 # own harness (`test_support::EventBrokerHarness`), as pricing's bound-producer suite does. A mock
 # accepted subject types the real ingest refuses (the sync of 2026-09-29).
 cf-gears-event-broker = { path = "../../../system/event-broker/event-broker", features = ["test-utils"] }
+# `#[gts_type_schema]` expands to code naming `schemars`: the delivery suite declares its fixture
+# event types with it.
+schemars = { workspace = true }

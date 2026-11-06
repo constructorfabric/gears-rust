@@ -10,10 +10,16 @@ use event_broker_sdk::{
     RawEvent, SingleEventHandler, TopicId,
 };
 
-use super::common::{publish_json, topic, topic_fixture, wait_until};
+use super::common::{publish_json, showcase_event_type, topic, topic_fixture, wait_until};
+use event_broker_sdk::gts::EventV1;
 
 const TOPIC: &str = gts_id!("cf.core.events.topic.v1~example.mock.showcase.customoffset.v1");
-const EVENT_TYPE: &str = gts_id!("cf.core.events.event.v1~example.mock.showcase.customoffset.v1~");
+showcase_event_type!(
+    EVENT_TYPE,
+    EventTypeV1,
+    "cf.core.events.event.v1~example.mock.showcase.customoffset.v1~",
+    TOPIC
+);
 
 type LoadCall = (ConsumerGroupId, TopicId, u32);
 type CommitCall = (ConsumerGroupId, TopicId, u32, i64);
@@ -71,7 +77,7 @@ impl SingleEventHandler for AckingHandler {
 
 #[tokio::test]
 async fn if_i_want_my_own_offset_store_i_implement_the_minimal_traits() {
-    let fixture = topic_fixture(TOPIC, EVENT_TYPE, 1).await;
+    let fixture = topic_fixture::<EventTypeV1>(TOPIC, 1).await;
     let store = RecordingOffsetStore {
         loads: Arc::new(Mutex::new(Vec::new())),
         commits: Arc::new(Mutex::new(Vec::new())),

@@ -26,6 +26,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use event_broker::test_support::{EventBrokerHarness, StaticTypesRegistry};
 use event_broker_sdk::backend::{Partition, TopicPartition, Wait};
+use event_broker_sdk::gts::EventV1;
 use event_broker_sdk::{
     ConsumerBuilder, ConsumerError, ConsumerGroupRef, DirectDeduplication, Fallback, GtsIdPattern,
     GtsInstanceId, HandlerOutcome, InMemoryOffsetManager, IngestOutcome, Producer,
@@ -34,9 +35,11 @@ use event_broker_sdk::{
 };
 #[cfg(all(feature = "db", feature = "outbox"))]
 use event_broker_sdk::{DbDeduplication, DbProducer, EventBrokerError};
+use gts::GtsSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::time::{Instant, sleep};
+use toolkit_gts::gts_type_schema;
 use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
@@ -56,6 +59,57 @@ const ORDER_SUBJECT: &str = gts_id!("cf.core.events.subject.v1~example.sdk.usage
 const BILLING_SUBJECT: &str = gts_id!("cf.core.events.subject.v1~example.sdk.usage.charge.v1~");
 #[cfg(all(feature = "db", feature = "outbox"))]
 const PRODUCER_QUEUE: &str = "event-broker-producer";
+
+/// The registered event types: declarations deriving from `EventV1`, each
+/// carrying the payload its `TypedEvent` below publishes.
+#[gts_type_schema(
+    dir_path = "schemas",
+    base = EventV1,
+    type_id = gts_id!("cf.core.events.event.v1~example.sdk.usage.created.v1~"),
+    description = "An order was created.",
+    properties = "order_id,total_cents",
+    traits = json!({
+        "topic": ORDERS_TOPIC,
+        "allowed_subject_types": [ORDER_SUBJECT],
+    }),
+)]
+struct OrderCreatedV1 {
+    order_id: Uuid,
+    total_cents: i64,
+}
+
+#[gts_type_schema(
+    dir_path = "schemas",
+    base = EventV1,
+    type_id = gts_id!("cf.core.events.event.v1~example.sdk.usage.updated.v1~"),
+    description = "An order changed status.",
+    properties = "order_id,status",
+    traits = json!({
+        "topic": ORDERS_TOPIC,
+        "allowed_subject_types": [ORDER_SUBJECT],
+    }),
+)]
+struct OrderUpdatedV1 {
+    order_id: Uuid,
+    status: String,
+}
+
+#[cfg(all(feature = "db", feature = "outbox"))]
+#[gts_type_schema(
+    dir_path = "schemas",
+    base = EventV1,
+    type_id = gts_id!("cf.core.events.event.v1~example.sdk.usage.charged.v1~"),
+    description = "A charge was made.",
+    properties = "charge_id,total_cents",
+    traits = json!({
+        "topic": BILLING_TOPIC,
+        "allowed_subject_types": [BILLING_SUBJECT],
+    }),
+)]
+struct BillingChargedV1 {
+    charge_id: Uuid,
+    total_cents: i64,
+}
 
 #[cfg(all(feature = "db", feature = "outbox"))]
 static USAGE_DB_SEQ: AtomicU64 = AtomicU64::new(1);
@@ -161,6 +215,19 @@ impl SingleEventHandler for NamedHandler {
     }
 }
 
+/// The base event's `data` member as the SDK generates it: the first branch of
+/// every composed payload contract.
+fn base_data_member() -> serde_json::Value {
+    <EventV1<()> as GtsSchema>::gts_schema_with_refs()["properties"]["data"].clone()
+}
+
+/// The `data` member a type declaration narrows the base event to: the payload
+/// contract its own fields generate, found on the declaration's branch after the
+/// reference to the base.
+fn declared_data_member<T: GtsSchema>() -> serde_json::Value {
+    T::gts_schema_with_refs()["allOf"][1]["properties"]["data"].clone()
+}
+
 /// A service can set up the broker's catalog before wiring producers or consumers.
 ///
 /// Preconditions: the harness is seeded with the orders topic and its created type.
@@ -187,7 +254,10 @@ async fn broker_exposes_registered_order_topic_and_event_type() -> TestResult {
     assert_eq!(event_type.id.as_ref(), ORDER_CREATED);
     assert_eq!(event_type.topic.as_ref(), ORDERS_TOPIC);
     assert_eq!(event_type.partition_key, "/tenant_id");
-    assert_eq!(event_type.description, None);
+    assert_eq!(
+        event_type.description.as_deref(),
+        OrderCreatedV1::gts_schema_with_refs()["description"].as_str()
+    );
     assert_eq!(
         event_type
             .allowed_subject_types
@@ -203,13 +273,8 @@ async fn broker_exposes_registered_order_topic_and_event_type() -> TestResult {
         event_type.data_schema,
         json!({
             "allOf": [
-                {
-                    "additionalProperties": true,
-                    "default": null,
-                    "description": "Event payload, validated at ingest against the resolved schema of the event's type. The only field where UTF-8 (or any non-ASCII bytes) is permitted; all other event fields are ASCII per platform convention. May be absent for body-less events (e.g., notification-only events whose semantics are fully carried by `type` + `subject`).",
-                    "type": ["object", "null"],
-                },
-                order_created_schema(),
+                base_data_member(),
+                declared_data_member::<OrderCreatedV1>(),
             ],
         })
     );
@@ -649,53 +714,22 @@ async fn harness_with(catalog: StaticTypesRegistry) -> EventBrokerHarness {
 }
 
 fn orders_catalog() -> StaticTypesRegistry {
-    StaticTypesRegistry::of(json!([
-        { "id": ORDERS_TOPIC, "partitions": ORDERS_PARTITIONS },
-        {
-            "id": ORDER_CREATED,
-            "topic": ORDERS_TOPIC,
-            "data_schema": order_created_schema(),
-            "allowed_subject_types": [ORDER_SUBJECT],
-        },
-    ]))
+    StaticTypesRegistry::of(json!([{ "id": ORDERS_TOPIC, "partitions": ORDERS_PARTITIONS }]))
+        .event_type::<OrderCreatedV1>()
 }
 
 fn orders_with_updated_catalog() -> StaticTypesRegistry {
-    StaticTypesRegistry::of(json!([
-        { "id": ORDERS_TOPIC, "partitions": ORDERS_PARTITIONS },
-        {
-            "id": ORDER_CREATED,
-            "topic": ORDERS_TOPIC,
-            "data_schema": order_created_schema(),
-            "allowed_subject_types": [ORDER_SUBJECT],
-        },
-        {
-            "id": ORDER_UPDATED,
-            "topic": ORDERS_TOPIC,
-            "data_schema": order_updated_schema(),
-            "allowed_subject_types": [ORDER_SUBJECT],
-        },
-    ]))
+    orders_catalog().event_type::<OrderUpdatedV1>()
 }
 
 #[cfg(all(feature = "db", feature = "outbox"))]
 fn orders_and_billing_catalog() -> StaticTypesRegistry {
     StaticTypesRegistry::of(json!([
         { "id": ORDERS_TOPIC, "partitions": ORDERS_PARTITIONS },
-        {
-            "id": ORDER_CREATED,
-            "topic": ORDERS_TOPIC,
-            "data_schema": order_created_schema(),
-            "allowed_subject_types": [ORDER_SUBJECT],
-        },
         { "id": BILLING_TOPIC, "partitions": ORDERS_PARTITIONS },
-        {
-            "id": BILLING_CHARGED,
-            "topic": BILLING_TOPIC,
-            "data_schema": billing_charged_schema(),
-            "allowed_subject_types": [BILLING_SUBJECT],
-        },
     ]))
+    .event_type::<OrderCreatedV1>()
+    .event_type::<BillingChargedV1>()
 }
 
 /// Events published by these tests partition by `/tenant_id` and so all land on
@@ -731,40 +765,6 @@ async fn wait_for_stored(harness: &EventBrokerHarness, topic: &str, count: usize
         );
         sleep(Duration::from_millis(10)).await;
     }
-}
-
-fn order_created_schema() -> serde_json::Value {
-    json!({
-        "type": "object",
-        "required": ["order_id", "total_cents"],
-        "properties": {
-            "order_id": { "type": "string" },
-            "total_cents": { "type": "integer" }
-        }
-    })
-}
-
-fn order_updated_schema() -> serde_json::Value {
-    json!({
-        "type": "object",
-        "required": ["order_id", "status"],
-        "properties": {
-            "order_id": { "type": "string" },
-            "status": { "type": "string" }
-        }
-    })
-}
-
-#[cfg(all(feature = "db", feature = "outbox"))]
-fn billing_charged_schema() -> serde_json::Value {
-    json!({
-        "type": "object",
-        "required": ["charge_id", "total_cents"],
-        "properties": {
-            "charge_id": { "type": "string" },
-            "total_cents": { "type": "integer" }
-        }
-    })
 }
 
 fn order_created() -> OrderCreated {

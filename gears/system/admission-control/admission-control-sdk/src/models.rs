@@ -443,9 +443,10 @@ impl From<&RefusalCause> for RefusalEventCause {
 /// resource tenant travel in the broker envelope (`subject`, `occurred_at`,
 /// `tenant_id`), so they are not repeated here.
 ///
-/// The event type's `data` schema is generated from this type. Optional
-/// fields are omitted rather than `null`, so their schemas name the inner
-/// type and never admit `null`.
+/// The event type's `data` schema is declared by
+/// [`RefusalEventV1`](crate::gts::RefusalEventV1), which must name the same
+/// fields (tested). Optional fields are omitted rather than `null`, so their
+/// schemas name the inner type and never admit `null`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct RefusalEvent {
     /// Calling enforcing gear.
