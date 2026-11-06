@@ -1,8 +1,9 @@
 //! Per-session LLM configuration primitives consumed by the first-party
 //! `LlmGatewayPlugin` (Phase 13).
 //!
-//! The types declared here are the **public schema surface** of the
-//! `gtx.cf.chat_engine.llm_gateway.*` namespace per ADR-0023:
+//! The types declared here are the **public schema surface** of the LLM
+//! Gateway plugin per ADR-0023 (the Rust structs are the source of truth;
+//! there are no separate JSON schema files):
 //!
 //! - [`LlmPluginConfig`] — the opaque blob mounted under
 //!   `PluginCallContext.plugin_config` for the LLM Gateway plugin instance.
@@ -21,9 +22,6 @@
 //! ADR-0023 rule: "all errors crossing the plugin boundary MUST use the
 //! `PluginError::*_with(msg, source)` constructors".
 //!
-//! Schema IDs live in the [`schema_ids`] module so the plugin registrar
-//! (Phase 15) has a single source of truth.
-//!
 //! Per the Phase 13 debug-redaction rule, none of the structs derive
 //! `Debug` automatically when they could carry secrets — but `LlmPluginConfig`
 //! deliberately contains only operational settings (no API keys, no auth
@@ -37,34 +35,6 @@ use std::time::Duration;
 use chat_engine_sdk::error::PluginError;
 use serde::{Deserialize, Serialize};
 use toolkit_macros::domain_model;
-
-/// GTS schema IDs for every type registered by the LLM Gateway plugin.
-///
-/// These are the load-bearing namespaces from ADR-0023; renaming any of
-/// them is a breaking change.
-pub mod schema_ids {
-    pub const LLM_PLUGIN_CONFIG_SCHEMA_ID: &str =
-        "gtx.cf.chat_engine.llm_gateway_plugin_config.v1~";
-    pub const LLM_SUMMARIZATION_SETTINGS_SCHEMA_ID: &str =
-        "gtx.cf.chat_engine.llm_gateway.summarization_settings.v1~";
-    pub const LLM_MESSAGE_METADATA_SCHEMA_ID: &str =
-        "gtx.cf.chat_engine.llm_gateway.message_metadata.v1~";
-    pub const LLM_USAGE_SCHEMA_ID: &str = "gtx.cf.chat_engine.llm_gateway.usage.v1~";
-
-    pub const LLM_MESSAGE_SCHEMA_ID: &str = "gtx.cf.chat_engine.llm_gateway.message.v1~";
-    pub const LLM_MESSAGE_GET_RESPONSE_SCHEMA_ID: &str =
-        "gtx.cf.chat_engine.llm_gateway.message_get_response.v1~";
-    pub const LLM_MESSAGE_NEW_RESPONSE_SCHEMA_ID: &str =
-        "gtx.cf.chat_engine.llm_gateway.message_new_response.v1~";
-    pub const LLM_MESSAGE_RECREATE_RESPONSE_SCHEMA_ID: &str =
-        "gtx.cf.chat_engine.llm_gateway.message_recreate_response.v1~";
-    pub const LLM_STREAMING_COMPLETE_EVENT_SCHEMA_ID: &str =
-        "gtx.cf.chat_engine.llm_gateway.streaming_complete_event.v1~";
-    pub const LLM_MESSAGE_NEW_EVENT_SCHEMA_ID: &str =
-        "gtx.cf.chat_engine.llm_gateway.message_new_event.v1~";
-    pub const LLM_SESSION_SUMMARY_EVENT_SCHEMA_ID: &str =
-        "gtx.cf.chat_engine.llm_gateway.session_summary_event.v1~";
-}
 
 /// Lower bound for `recent_messages_to_keep` per ADR-0023.
 pub const RECENT_MESSAGES_TO_KEEP_MIN: u32 = 2;
@@ -85,8 +55,6 @@ pub const DEFAULT_CIRCUIT_BREAKER_COOLDOWN_MS: u32 = 60_000;
 
 /// Configuration blob mounted under `PluginCallContext.plugin_config` for
 /// the LLM Gateway plugin instance.
-///
-/// Schema ID: `gtx.cf.chat_engine.llm_gateway_plugin_config.v1~`.
 #[domain_model]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LlmPluginConfig {
@@ -143,8 +111,6 @@ impl LlmPluginConfig {
 }
 
 /// Settings controlling the context-overflow summarization split.
-///
-/// Schema ID: `gtx.cf.chat_engine.llm_gateway.summarization_settings.v1~`.
 #[domain_model]
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LlmSummarizationSettings {
@@ -206,8 +172,6 @@ impl FinishReason {
 }
 
 /// Token-usage block carried inside [`LlmMessageMetadata`].
-///
-/// Schema ID: `gtx.cf.chat_engine.llm_gateway.usage.v1~`.
 #[domain_model]
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LlmUsage {
@@ -220,8 +184,6 @@ pub struct LlmUsage {
 
 /// Trailing metadata emitted at the end of every assistant message,
 /// written as the `metadata` field of a `StreamingCompleteEvent`.
-///
-/// Schema ID: `gtx.cf.chat_engine.llm_gateway.message_metadata.v1~`.
 ///
 /// `Eq` is intentionally **not** derived because `temperature_used: Option<f32>`
 /// is a floating-point value and total equality on floats is unsound.
