@@ -69,7 +69,7 @@ struct ClusterGear {
     /// The profile index: created **empty** in `init` and populated by `start`
     /// (DESIGN §5.2).
     ///
-    /// The split matters. Services and the healthcheck are collected before
+    /// The split matters. gRPC services are collected before
     /// `start` runs, so they must capture this registry rather than a backend
     /// (§4.2's lifecycle constraint) — and a request arriving in the window
     /// between the two resolves to `ProfileNotBound`, which is the correct answer
@@ -216,7 +216,7 @@ impl Gear for ClusterGear {
         self.config
             .set(config)
             .map_err(|_| anyhow!("{} already initialized", Self::MODULE_NAME))?;
-        // Created here, empty, because the gear's services and healthcheck are
+        // Created here, empty, because the gear's gRPC services are
         // collected before `start` populates it (DESIGN §4.2, §5.2).
         self.profiles
             .set(Arc::new(ProfileRegistry::new()))
@@ -257,17 +257,14 @@ impl Gear for ClusterGear {
     }
 }
 
-/// Platform tier, so cluster initialises in the system phase ahead of application
-/// gears (§4.2).
+/// Platform tier, so cluster initialises and starts in the system group ahead of
+/// application preparation (§4.2).
 ///
-/// Empty on purpose, and the emptiness is the whole implementation: every
-/// `SystemCapability` method is defaulted, so the capability is the ordering flag
-/// §4.2 describes and nothing more. Cluster wants neither hook — `pre_init` runs
-/// before *any* gear's `init`, and `post_init` before the REST and gRPC phases, so
-/// neither is a place backends could exist. The same shape as `authn-resolver`,
-/// `tenant-resolver`, `authz-resolver` and `credstore`.
+/// Empty on purpose: every `SystemCapability` method is defaulted. Cluster needs
+/// no runtime-internal wiring — `init` creates the profile registry and `start`
+/// binds its backends, before any application `init`.
 ///
-/// It is still a trait that must be implemented, which §4.2's table does not say:
+/// It is still a trait that must be implemented:
 /// the `#[toolkit::gear]` macro emits no *assertion* for `system` but its
 /// registration casts to `Arc<dyn SystemCapability>`, so omitting this is a
 /// build error from the macro rather than the documented no-op.

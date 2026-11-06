@@ -5,8 +5,6 @@
 
 mod common;
 
-use std::sync::Arc;
-
 use admission_control_sdk::{AdmissionEnginePluginClientV1, EngineRequest, EngineResult};
 use common::{TENANT, WIDGET, gear_ctx, tenant_user};
 use policy_engine::PolicyEngine;
@@ -16,8 +14,6 @@ use policy_engine_sdk::{PolicyManagementClientV1, reason};
 use serde_json::json;
 use toolkit::Gear;
 use toolkit::client_hub::ClientScope;
-use toolkit::contracts::SystemCapability;
-use toolkit::runtime::{GearManager, GrpcInstallerStore, SystemContext};
 use uuid::Uuid;
 
 fn request(tenant: Uuid) -> EngineRequest {
@@ -142,11 +138,7 @@ async fn invalid_builtins_fail_startup() {
         .await
         .expect("init defers the registry check");
     let err = gear
-        .post_init(&SystemContext::new(
-            Uuid::new_v4(),
-            Arc::new(GearManager::new()),
-            Arc::new(GrpcInstallerStore::new()),
-        ))
+        .post_init(&ctx)
         .await
         .expect_err("unknown concrete type");
     let message = format!("{err:#}");

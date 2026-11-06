@@ -73,19 +73,17 @@ static START_COMPLETED: AtomicBool = AtomicBool::new(false);
 ///
 /// That omission is not a shortcut, and it is the correction §4.9.2 needs. `deps`
 /// is a *hard* topo-sort edge: `RegistryBuilder` fails the whole registry build with
-/// `RegistryError::UnknownDependency` when a named gear is not linked
-/// (`registry.rs:565-568`), and a Profile 3 consumer by definition does not link the
-/// cluster gear. So `deps = [cluster]` is not merely unnecessary here — it makes the
+/// `RegistryError::UnknownDependency` when a named gear is not linked, and a
+/// Profile 3 consumer by definition does not link the cluster gear. So
+/// `deps = [cluster]` is not merely unnecessary here — it makes the
 /// process refuse to start, which is how this was found.
 ///
 /// Nothing is lost by omitting it, because neither thing `deps` would buy depends on
 /// it:
 ///
-/// - **Ordering.** `run_start_phase` iterates `gears_by_system_priority()`
-///   (`host_runtime.rs:838`), which runs every `system`-capability gear before every
-///   other one (`registry.rs:290-304`). Cluster declares `system`, so its `start`
-///   precedes any application consumer's `start` in Profile 1 without any `deps`
-///   edge at all.
+/// - **Ordering.** The runtime completes the system group before application
+///   preparation. Cluster declares `system`, so its `start` precedes any
+///   application consumer's `init` in Profile 1 without any `deps` edge at all.
 /// - **Readiness gating.** The `/readyz` dependency on `cluster` comes from
 ///   cluster-sdk's `ConsumerRegistration::dep_gear`, which the wiring phase feeds to
 ///   the `DependencyChecker` — so a consumer gets the gate in *both* profiles, and
@@ -99,9 +97,8 @@ struct Reservations {
 #[async_trait]
 impl toolkit::Gear for Reservations {
     async fn init(&self, ctx: &GearCtx) -> anyhow::Result<()> {
-        // Captured, not resolved. §4.9.1 forbids resolving here: the framework's
-        // phases are global, so no provider's `start` has run yet in either
-        // deployment profile.
+        // Captured, not resolved: consumer wiring runs after application `init`,
+        // so the remote client is not available yet in Profile 3.
         drop(self.hub.set(ctx.client_hub()));
         Ok(())
     }
@@ -120,8 +117,10 @@ impl toolkit::contracts::RunnableCapability for Reservations {
             Ordering::SeqCst,
         );
         // 2. And it is the *remote* one, because this process hosts no cluster gear.
+        //    cluster-sdk wires it process-wide, so this gear's view reaches it
+        //    through `try_get` and holds no proxy of its own.
         RESOLVE_WAS_A_PROXY.store(
-            hub.has_remote_proxy::<dyn ClusterClient>(),
+            hub.try_get_local::<dyn ClusterClient>().is_none(),
             Ordering::SeqCst,
         );
 

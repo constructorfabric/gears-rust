@@ -6,7 +6,6 @@ use async_trait::async_trait;
 use authz_resolver_sdk::AuthZResolverApi;
 use toolkit::api::OpenApiRegistry;
 use toolkit::context::GearCtx;
-use toolkit::contracts::SystemCapability;
 use toolkit::{Gear, RestApiCapability};
 use toolkit_contract::policy::PolicyStack;
 use tracing::info;
@@ -33,7 +32,7 @@ use crate::domain::{AuthZResolverLocalClient, Service};
 #[toolkit::gear(
     name = "authz-resolver",
     deps = [types_registry],
-    capabilities = [system, rest]
+    capabilities = [rest]
 )]
 #[toolkit::provides(
     contract = authz_resolver_sdk::AuthZResolverApi,
@@ -59,11 +58,6 @@ impl AuthZResolver {
         Ok(Arc::new(AuthZResolverLocalClient::new(svc)))
     }
 }
-
-// Marked as `system` so that init() runs in the system-gear phase.
-// This ensures the AuthZResolver client is available in ClientHub before
-// other system gears that depend on it.
-impl SystemCapability for AuthZResolver {}
 
 #[async_trait]
 impl Gear for AuthZResolver {

@@ -147,7 +147,12 @@ async fn list_event_types_of_a_topic_returns_a_paged_list() {
                 "partition_key": "/tenant_id",
                 "data_schema": {
                     "allOf": [
-                        { "type": ["object", "null"] },
+                        {
+                            "additionalProperties": true,
+                            "default": null,
+                            "description": "Event payload, validated at ingest against the resolved schema of the event's type. The only field where UTF-8 (or any non-ASCII bytes) is permitted; all other event fields are ASCII per platform convention. May be absent for body-less events (e.g., notification-only events whose semantics are fully carried by `type` + `subject`).",
+                            "type": ["object", "null"],
+                        },
                         { "type": ["object", "null"] },
                     ],
                 },

@@ -7,16 +7,16 @@ e2e-local` suite never boots a second server for routes it doesn't serve.
 
 Run it with: make e2e-event-broker
 
-`types-registry`'s config-seeded `entities:` are committed to queryable
-storage once, at boot (`post_init`), with no live-refresh path (see
-`config/event-broker-standalone.yaml`'s own header comment) - registering a
-NEW topic at runtime via `POST /types-registry/v1/entities` would NOT become
-visible to event-broker's own specification cache without a full restart.
-So every test that shares the session-scoped `test_env` server gets its own
-PRE-PROVISIONED topic baked into the config at session-setup time (below),
-rather than registering one for itself at test time - there is no other way
-to get per-test topic isolation against a server that boots once for the
-whole session.
+`types-registry` seeds the config's `entities:` into its database catalogue
+at boot, and the broker reads that catalogue at start and then once per
+`workers.specification_refresh_interval_secs` (see
+`config/event-broker-standalone.yaml`'s header comment). A topic admitted at
+runtime through `POST /types-registry/v2/platform/entities` (internal token)
+resolves at the first refresh after its admission, while
+`POST /types-registry/v1/entities` writes only the legacy catalogue, which
+the broker does not read. So every test that shares the session-scoped
+`test_env` server gets its own PRE-PROVISIONED topic baked into the config at
+session-setup time (below), rather than waiting out a refresh per test.
 """
 
 from __future__ import annotations
@@ -437,7 +437,7 @@ def pytest_configure(config):
 def _require_dedicated_binary():
     if not os.environ.get("E2E_BINARY"):
         pytest.skip(
-            "E2E_BINARY not set — run these tests via: make e2e-event-broker",
+            "E2E_BINARY not set - run these tests via: make e2e-event-broker",
             allow_module_level=True,
         )
 

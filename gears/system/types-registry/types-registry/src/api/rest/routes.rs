@@ -41,8 +41,19 @@ impl AsRef<str> for License {
 
 impl LicenseFeature for License {}
 
+/// The legacy v1 routes only, for `mode: legacy_only`: no new-API route, not even one
+/// answering 503, so nothing here serves either new contract.
+pub fn register_legacy_routes(
+    host: Router,
+    openapi: &dyn OpenApiRegistry,
+    service: Arc<TypesRegistryService>,
+) -> Router {
+    let router = register_v1(Router::new(), openapi);
+    host.merge(router.route_layer(from_fn(require_caller)))
+        .layer(Extension(service))
+}
+
 /// Registers all REST routes for the Types Registry gear.
-#[allow(clippy::needless_pass_by_value)]
 pub fn register_routes(
     host: Router,
     openapi: &dyn OpenApiRegistry,

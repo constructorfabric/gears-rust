@@ -25,6 +25,7 @@ use event_broker::EventBrokerConfig;
 use event_broker::domain::specification::{ProvisioningLimits, SpecificationManager, TopicState};
 use event_broker::infra::specification::{TypesRegistrySpecificationManager, bulk_load};
 use event_broker::test_support::module_boot::migrated_gear_db;
+use event_broker::test_support::type_registry::registry_holding;
 use event_broker::test_support::{EventBrokerHarness, SingleBackendResolver, StaticTypesRegistry};
 use event_broker_sdk::backend::{
     AppendRequest, Appended, Backend, BackendError, Dedup, LogClaim, Provisioning, Replacing,
@@ -36,8 +37,7 @@ use tokio::sync::Notify;
 use tokio::time::timeout;
 use toolkit_db::{DBProvider, DbError};
 use toolkit_gts::GtsInstanceId;
-use types_registry_sdk::TypesRegistryClient;
-use types_registry_sdk::testing::{MockTypesRegistryClient, make_test_instance};
+use types_registry_sdk::PlatformTypesRegistryApi;
 
 use support::matrix::{Engine, Matrix};
 
@@ -293,11 +293,9 @@ async fn load(db: &Arc<DBProvider<DbError>>, settings: serde_json::Value) {
         "topics": { "gts.cf.core.events.topic.v1~": settings },
     }))
     .expect("the test configuration deserializes");
-    let client: Arc<dyn TypesRegistryClient> = Arc::new(
-        MockTypesRegistryClient::new().with_instances([make_test_instance(
-            TOPIC,
-            json!({ "id": TOPIC, "description": "a topic to provision" }),
-        )]),
+    let client: Arc<dyn PlatformTypesRegistryApi> = registry_holding(
+        &[json!({ "id": TOPIC, "description": "a topic to provision" })],
+        &[],
     );
     bulk_load(&client, db, &config).await.expect("bulk_load");
 }

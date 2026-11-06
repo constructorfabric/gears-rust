@@ -6,7 +6,6 @@ use async_trait::async_trait;
 use tenant_resolver_sdk::TenantResolverClient;
 use toolkit::Gear;
 use toolkit::context::GearCtx;
-use toolkit::contracts::SystemCapability;
 use tracing::info;
 
 use crate::config::TenantResolverConfig;
@@ -25,7 +24,6 @@ use crate::domain::{Service, TenantResolverLocalClient};
 #[toolkit::gear(
     name = "tenant-resolver",
     deps = [types_registry],
-    capabilities = [system]
 )]
 pub(crate) struct TenantResolver {
     service: OnceLock<Arc<Service>>,
@@ -38,11 +36,6 @@ impl Default for TenantResolver {
         }
     }
 }
-
-// Marked as `system` so that init() runs in the system-gear phase.
-// This ensures the TenantResolver client is available in ClientHub before
-// other system gears that depend on it.
-impl SystemCapability for TenantResolver {}
 
 #[async_trait]
 impl Gear for TenantResolver {

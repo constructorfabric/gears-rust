@@ -1445,7 +1445,7 @@ The interfaces each slice owns are defined here and specified normatively in [§
 | `authz-resolver-sdk` | Shared `PolicyEnforcer` adapter | PDP decisions and compiled AccessScopes for reads, transitions and service-owned operations |
 | `event-broker-sdk` | `EventBrokerApi`, `DbProducer`, `ProducerOutboxQueue` (`outbox` feature) | Typed event validation, managed chained producer registration, broker partitioning and asynchronous publication |
 | `toolkit-db` advisory locks | `Db::lock` / `Db::try_lock`, `DbLockGuard` | Session-bound coordination for the authoritative worker roster in [Foundation contract §3.8](DESIGN.md#contract-01-3-8); toolkit owns outbox coordination |
-| `types-registry` | SDK client | Register and resolve event, subject, refusal-reason and category types before readiness; registration failure prevents startup |
+| `types-registry` | SDK client | Register subject, refusal-reason and category types before readiness and resolve the event types, whose contract the registry seeds from the GTS inventory; registration failure prevents startup |
 | `orders-workflow` | SDK client and published events | Bidirectional seam: Workflow calls transition operations and consumes state notifications. This gear makes no call to Workflow |
 
 **Dependency Rules** (per project conventions):
@@ -3179,7 +3179,7 @@ refused by `04`'s `administrative-edit-unchanged` (D-149), not by this reason.
 |-------------------|----------------|----------|
 | `toolkit-db` | Runtime-scoped database access plus `outbox` | The one transaction per transition, append-only stores, toolkit outbox migrations and the managed producer queue |
 | `event-broker-sdk` | `EventBrokerApi`, `DbProducer`, `ProducerOutboxQueue` (`outbox` feature) | Typed validation, managed chained producer registration, broker partitioning and asynchronous publication |
-| `types-registry` | SDK client | Resolving and registering the GTS event, subject, error and category types of §4.7; a type that fails to register fails the boot |
+| `types-registry` | SDK client | Resolving the GTS event types of §4.7, which the registry seeds from the GTS inventory, and registering the subject, error and category types; a type that fails to register fails the boot |
 | `toolkit-db` advisory locks | `Db::lock` / `Db::try_lock`, `DbLockGuard` | Session-bound coordination for the Orders worker roster in §3.8; toolkit manages its own outbox workers |
 
 **Dependency Rules** (per project conventions):
@@ -4911,10 +4911,11 @@ serializes the standard producer envelope into toolkit-db's opaque payload. Orde
 index or query event payloads in its database; Event Broker is the event query and replay surface.
 
 **Subject type.** Orders owns and registers `gts.cf.bss.orders.order.v1~` as the GTS entity type
-of an order before registering its event schemas. This is a type identifier, not an event type
-or an instance ID; it does not publish order state as a separate event or change the REST model.
-All eleven event types use it as `SUBJECT_TYPE` and in `allowed_subject_types`. This registration
-is required implementation work, not a claim that the type already exists in the registry.
+of an order at init. This is a type identifier, not an event type or an instance ID; it does not
+publish order state as a separate event or change the REST model.
+All eleven event types use it as `SUBJECT_TYPE` and in `allowed_subject_types`. The event contract
+itself (topic, abstract base, eleven final types) is a set of GTS inventory entries that
+`types-registry` seeds at its own init, before the `init` of any gear that depends on it.
 
 **Event tenancy and routing (D-95).** All eleven internal lifecycle event types **MUST** explicitly
 return the canonical platform-root tenant UUID from `TypedEvent::tenant_id()`. The Event Broker
@@ -5182,8 +5183,10 @@ precedence; `request-invalid` is the fallback, never a second name for them. An 
 optional here and compared only at §3.6 *Attempt Transition* step 12 (D-147).
 
 The **registry** is the platform `types-registry`, reached as an SDK client (`§3.4`). Consumers
-resolve event schemas and reason types there; this gear registers its types at startup, and a
-type that fails to register fails the boot rather than a request.
+resolve event schemas and reason types there; this gear registers its resource and reason types
+at startup, and one that fails to register fails the boot rather than a request; its event
+contract is a set of GTS inventory entries, so a bad event-contract document fails the registry's
+startup in every host that links `cf-gears-bss-orders`.
 
 <a id="contract-01-traits-and-versioning"></a>
 
@@ -5221,8 +5224,9 @@ know. A **major** bump is a breaking change and follows `§4.6`'s dual-publicati
 adds is that compatibility is *checked* at registration by the registry rather than asserted in
 prose.
 
-**Required implementation verification (not yet implemented).** Register the topic, subject
-type, abstract event and all eleven concrete schemas against the deployed registry/broker.
+**Required implementation verification (not yet implemented).** Verify against the deployed
+registry/broker that the topic, abstract event and all eleven concrete schemas are present (GTS
+inventory entries the registry seeds) and that the subject type Orders registers at init is present.
 Verify the resolved common and concrete `data` constraints, required members, supported traits
 and `/subject` pointer; reject unknown traits and invalid/missing business fields. Serialize
 each type through the SDK producer and verify the seven publish-required fields in §4.4,

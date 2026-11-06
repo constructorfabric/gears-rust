@@ -1,0 +1,189 @@
+#!/bin/sh
+# pre-push hook, auto-installed by any `make` run (see install.sh). Checks what the push adds vs main.
+set -eu
+# The symlink may live in a hooks dir shared by many repos (global core.hooksPath):
+# no-op outside gears-rust, and always run the current repo's own copy (stdin is kept).
+root=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0
+[ -f "$root/.githooks/lib.sh" ] || exit 0
+# Local git config is installation state that the repo's tracked files cannot provide.
+[ "$(git config --local --bool --get gears.hooks 2>/dev/null)" = true ] || exit 0
+# Re-exec this clone's own copy once (`test -ef` is not POSIX, so an env flag stops the recursion).
+[ -n "${GEARS_HOOK_SELF:-}" ] || { GEARS_HOOK_SELF=1; export GEARS_HOOK_SELF; exec "$root/.githooks/pre-push" "$@"; }
+cd "$root"
+. "$root/.githooks/lib.sh"
+HOOK_CMD=push
+
+zeros=0000000000000000000000000000000000000000
+IFS='
+'
+set -f
+
+# SELECT_JQ: from `cargo metadata` and $names (changed packages) print "D <name>" for names that are not
+# workspace members, "C <name>" for kept ones and "R <name>" for their transitive workspace dependents
+# (all dependency kinds: clippy runs with --all-targets).
+# shellcheck disable=SC2016 # jq variables, not shell
+SELECT_JQ='
+  .workspace_members as $ws
+  | [.packages[] | select(.id as $i | $ws | index($i))] as $mem
+  | ($mem | map({key: .id, value: .name}) | from_entries) as $nm
+  | [.resolve.nodes[] | select(.id as $i | $ws | index($i))
+     | {id, d: [.deps[].pkg | select(. as $p | $ws | index($p))]}] as $nodes
+  | ($names | split("\n") | map(select(. != ""))) as $chg
+  | ($mem | map(.name)) as $mn
+  | ($chg | map(select(. as $n | $mn | index($n)))) as $keep
+  | ([$mem[] | select(.name as $n | $keep | index($n)) | .id] | unique) as $start
+  | def grow: . as $s | ($s + [$nodes[] | select(.id as $i | $s | index($i) | not)
+      | select(.d | any(. as $d | $s | index($d))) | .id]) | unique;
+    def fix: grow as $g | if ($g | length) == length then . else $g | fix end;
+  ($chg - $keep | sort | .[] | "D " + .),
+  ($start | map("C " + $nm[.]) | sort | .[]),
+  (($start | fix) - $start | map("R " + $nm[.]) | sort | .[])
+'
+
+# pkg_of <file>: name of the nearest enclosing non-root Cargo package, if any.
+pkg_of() {
+    d=$(dirname "$1")
+    while [ "$d" != "." ] && [ "$d" != "/" ]; do
+        if [ -f "$d/Cargo.toml" ] && grep -q '^\[package\]' "$d/Cargo.toml"; then
+            sed -n '/^\[package\]/,/^\[/s/^name *= *"\(.*\)".*/\1/p' "$d/Cargo.toml" | head -n 1
+            return
+        fi
+        d=$(dirname "$d")
+    done
+}
+
+# check_ref <sha>: run the pre-push checks on the files changed since the merge-base with main.
+check_ref() {
+    sha=$1
+    # base: $GEARS_HOOKS_BASE, git config gears.hooksBase, else the first of upstream/main, origin/main, main
+    # (forks: origin is the fork, upstream/main is preferred when present). Never fetched.
+    base_ref=${GEARS_HOOKS_BASE:-}
+    [ -n "$base_ref" ] || base_ref=$(git config --get gears.hooksBase 2>/dev/null) || base_ref=""
+    if [ -n "$base_ref" ]; then
+        git rev-parse --verify -q "$base_ref" >/dev/null || { echo "hook: skipping all checks: base $base_ref not found"; return 0; }
+    else
+        for c in upstream/main origin/main main; do
+            ! git rev-parse --verify -q "$c" >/dev/null || { base_ref=$c; break; }
+        done
+        [ -n "$base_ref" ] || { echo "hook: skipping all checks: none of upstream/main, origin/main, main found"; return 0; }
+    fi
+    base=$(git merge-base "$sha" "$base_ref") || { echo "hook: skipping all checks: no merge-base with $base_ref"; return 0; }
+    echo "hook: base $base_ref (merge-base $(git rev-parse --short "$base"))"
+    # paths containing newlines are not supported
+    changed=$(git -c core.quotePath=false diff --name-only "$base" "$sha")
+    [ -n "$changed" ] || return 0
+
+    pkgs=""
+    for f in $changed; do
+        p=$(pkg_of "$f")
+        [ -z "$p" ] || pkgs="$pkgs
+$p"
+    done
+    pkgs=$(printf '%s\n' "$pkgs" | sed '/^$/d' | sort -u)
+
+    # Root files that change what every package compiles with: clippy the whole workspace
+    ws_re='^(Cargo\.toml|Cargo\.lock|clippy\.toml|rust-toolchain\.toml|\.cargo/config(\.toml)?)$'
+    ws=""
+    ! printf '%s\n' "$changed" | grep -Eq "$ws_re" || ws=1
+
+    # by design these check the working tree (a snapshot worktree would rebuild the workspace
+    # on every push); CI is the gate
+    tree_ok=1
+    if [ "$sha" != "$(git rev-parse HEAD)" ]; then
+        echo "hook: skipping clippy and dylint: pushed $(git rev-parse --short "$sha") is not the checked-out HEAD (they check the working tree)"
+        tree_ok=""
+    elif [ -n "$(git status --porcelain --untracked-files=no -- '*.rs' '*Cargo.toml' Cargo.lock)" ]; then
+        echo "hook: note: uncommitted Rust/Cargo changes; clippy and dylint check the working tree, not exactly the pushed commit"
+    fi
+
+    # Changed packages plus their workspace dependents, from one `cargo metadata` call. --all-features, as
+    # clippy below: without it the graph lacks optional dependencies (example-server -> oagw via feature
+    # `oagw`). Packages outside the workspace (e.g. tools/fuzz) are dropped. Without jq or metadata: whole
+    # workspace (slower, correct).
+    sel=""
+    nsel=0
+    nchg=0
+    unknown=""
+    if [ -n "$tree_ok" ] && [ -z "$ws" ] && [ -n "$pkgs" ]; then
+        reason=""
+        if ! have jq; then
+            reason="jq not found (install: brew install jq / apt install jq)"
+        elif ! meta=$(cargo metadata --format-version 1 --locked --offline --all-features 2>/dev/null) ||
+            ! out=$(printf '%s\n' "$meta" | jq -r --arg names "$pkgs" "$SELECT_JQ"); then
+            reason="cargo metadata failed"
+        fi
+        if [ -n "$reason" ]; then
+            echo "hook: note: $reason; running clippy on the whole workspace"
+            unknown=1
+        else
+            for l in $out; do
+                case $l in
+                    "D "*) echo "hook: clippy: skipping ${l#* } (not a workspace member)" ;;
+                    "C "*) sel="$sel
+${l#* }"; nchg=$((nchg + 1)); nsel=$((nsel + 1)) ;;
+                    "R "*) sel="$sel
+${l#* }"; nsel=$((nsel + 1)) ;;
+                esac
+            done
+            sel=$(printf '%s\n' "$sel" | sed '/^$/d')
+        fi
+    fi
+
+    # clippy also surfaces compile errors; flags mirror CI (CLIPPY_FLAGS in .gears-dna/gears.mk)
+    if [ -n "$tree_ok" ] && { [ -n "$sel" ] || [ -n "$ws" ] || [ -n "$unknown" ]; } \
+        && need clippy clippy "rustup component add clippy"; then
+        if [ -n "$ws" ] || [ -n "$unknown" ]; then
+            step clippy
+            cargo clippy --workspace --all-targets --all-features -- -D warnings -D clippy::perf ||
+                fail clippy "run: cargo clippy --workspace --all-targets --all-features"
+        else
+            # IFS is newline-only here, so build the -p list as positional args
+            set --
+            pflags=""
+            for p in $sel; do set -- "$@" -p "$p"; pflags="$pflags-p $p "; done
+            echo "hook: clippy: $nsel package(s): $nchg changed + $((nsel - nchg)) dependent(s)"
+            step clippy
+            cargo clippy "$@" --all-targets --all-features -- -D warnings -D clippy::perf ||
+                fail clippy "run: cargo clippy ${pflags}--all-targets --all-features"
+        fi
+    fi
+
+    # Workspace-wide, as `make dylint` (cargo-gears has no CI-equivalent package filter). `make dylint`
+    # also lints OAGW with -F cluster: do that when OAGW is affected (or unknown, from its changed files).
+    if [ -n "$tree_ok" ] \
+        && printf '%s\n' "$changed" | grep -Eq '(\.rs|(^|/)Cargo\.toml)$|^(Cargo\.lock|clippy\.toml|rust-toolchain\.toml|\.cargo/config(\.toml)?)$' \
+        && need dylint cargo-gears "cargo install --locked cargo-gears"; then
+        step dylint
+        cargo gears lint --dylint || fail dylint "run: cargo gears lint --dylint (everything: make dylint)"
+        oagw=""
+        if [ -n "$ws" ] || printf '%s\n' "$sel" | grep -qx 'cf-gears-oagw'; then
+            oagw=1
+        elif [ -n "$unknown" ]; then
+            oagw_dir=$(dirname "$(git grep -l 'name = "cf-gears-oagw"' -- '*Cargo.toml' | head -n 1)")
+            for f in $changed; do
+                case $f in "$oagw_dir"/*) oagw=1 ;; esac
+            done
+        fi
+        if [ -n "$oagw" ]; then
+            step dylint-oagw-cluster
+            cargo gears lint --dylint -P cf-gears-oagw -F cluster ||
+                fail dylint "run: cargo gears lint --dylint -P cf-gears-oagw -F cluster (everything: make dylint)"
+        fi
+    fi
+
+    # the script needs jq, bash >= 4 (mapfile) and grep -P; macOS ships bash 3.2 and BSD grep
+    if need forbidden-words jq "brew install jq / apt install jq" \
+        && need forbidden-words "bash>=4" "brew install bash" \
+        && need forbidden-words "grep -P" "brew install grep"; then
+        step forbidden-words
+        .github/scripts/check-forbidden-words.sh "$base" "$sha" ||
+            fail forbidden-words "remove the forbidden words reported above"
+    fi
+}
+
+while IFS=' ' read -r _lref lsha _rref _rsha; do
+    [ "$lsha" != "$zeros" ] || continue
+    check_ref "$lsha" </dev/null
+done
+
+finish

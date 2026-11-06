@@ -478,7 +478,7 @@ async def test_chained_producer_desync_recovery(api):
             )
             assert r.status_code == 202
 
-        # Step 1 — Publish with a stale sequence (simulating a crash/restore).
+        # Step 1 - Publish with a stale sequence (simulating a crash/restore).
         # Broker last accepted sequence=2; producer thinks it's 0.
         stale_resp = await client.post(
             "/events",
@@ -514,7 +514,7 @@ async def test_chained_producer_desync_recovery(api):
             },
         }
 
-        # Step 2 — Read the broker's cursor to learn the authoritative sequence.
+        # Step 2 - Read the broker's cursor to learn the authoritative sequence.
         cursors_resp = await client.get(f"/producers/{producer_id}/cursors")
         assert cursors_resp.status_code == 200
         cursor_body = cursors_resp.json()
@@ -522,7 +522,7 @@ async def test_chained_producer_desync_recovery(api):
         assert cursor_body["topics"] == [{"topic": TOPIC_STREAM, "last_sequence": 2}]
         last_seq = 2
 
-        # Step 3 — Republish with the correct sequence (previous=2, sequence=3).
+        # Step 3 - Republish with the correct sequence (previous=2, sequence=3).
         recovered_resp = await client.post(
             "/events",
             json={

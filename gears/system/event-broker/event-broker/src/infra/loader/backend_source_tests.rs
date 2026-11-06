@@ -5,7 +5,6 @@ use std::sync::Arc;
 use memory_event_broker_plugin::MemoryBackend;
 use toolkit_db::DBProvider;
 use toolkit_gts::GtsInstanceId;
-use types_registry_sdk::testing::{MockTypesRegistryClient, make_test_instance};
 use uuid::Uuid;
 
 use super::backend_source::BackendEventSource;
@@ -15,6 +14,7 @@ use crate::infra::loader::heads::HeadSource;
 use crate::infra::loader::source::{EventSource, SourceError};
 use crate::infra::specification::TypesRegistrySpecificationManager;
 use crate::infra::storage::migrations::Migrator;
+use crate::test_support::type_registry::registry_holding;
 use crate::test_support::{SingleBackendResolver, StaticTypesRegistry};
 
 const TOPIC_ID: &str =
@@ -50,11 +50,9 @@ async fn source() -> (BackendEventSource, String) {
     .await
     .expect("migrations");
     let db = Arc::new(DBProvider::new(db));
-    let client: Arc<dyn types_registry_sdk::TypesRegistryClient> = Arc::new(
-        MockTypesRegistryClient::new().with_instances(vec![make_test_instance(
-            TOPIC_ID,
-            serde_json::json!({ "id": TOPIC_ID, "description": "a topic the loader reads" }),
-        )]),
+    let client: Arc<dyn types_registry_sdk::PlatformTypesRegistryApi> = registry_holding(
+        &[serde_json::json!({ "id": TOPIC_ID, "description": "a topic the loader reads" })],
+        &[],
     );
     crate::infra::specification::bulk_load(&client, &db, &StaticTypesRegistry::empty_config())
         .await

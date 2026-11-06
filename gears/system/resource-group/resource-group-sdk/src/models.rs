@@ -126,8 +126,9 @@ pub struct CreateTypeRequest {
     /// GTS type path. Must have prefix `gts.cf.core.rg.type.v1~`.
     ///
     /// Whether this creates a new tenant scope is derived from the code: any
-    /// type whose path starts with [`TENANT_RG_TYPE_PATH`](crate::TENANT_RG_TYPE_PATH)
-    /// is a tenant type (`tenant_id = group.id` for its instances).
+    /// type whose path starts with a configured tenant-type prefix (default:
+    /// [`TENANT_RG_TYPE_PATH`](crate::TENANT_RG_TYPE_PATH)) is a tenant type
+    /// (`tenant_id = group.id` for its instances).
     pub code: String,
     /// Whether groups of this type can be root nodes.
     pub can_be_root: bool,
@@ -258,8 +259,9 @@ pub struct CreateGroupRequest {
     /// target tenant (platform-admin / onboarding use case); otherwise the
     /// request is rejected.
     ///
-    /// Rejected for tenant-typed groups (`code` starting with
-    /// `TENANT_RG_TYPE_PATH`): their effective tenant is always `group.id`.
+    /// Rejected for tenant-typed groups (`code` starting with a configured
+    /// tenant-type prefix, default `TENANT_RG_TYPE_PATH`): their effective
+    /// tenant is always `group.id`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tenant_id: Option<Uuid>,
     /// Type-specific metadata.

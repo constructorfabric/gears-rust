@@ -55,6 +55,41 @@ async fn stays_starting_until_ready_signal() {
     assert_eq!(m.status(), Status::Stopped);
 }
 
+struct SlowReady;
+
+#[lifecycle_attr(method = "run_slow", await_ready = true, ready_warn_after = "30ms")]
+impl SlowReady {
+    pub async fn run_slow(&self, cancel: CancellationToken, ready: ReadySignal) -> Result<()> {
+        let _held = ready; // hold without notifying so the deadline is what trips
+        cancel.cancelled().await;
+        Ok(())
+    }
+}
+
+#[tokio::test(start_paused = true)]
+#[tracing_test::traced_test]
+async fn macro_ready_warn_after_bounds_the_ready_signal() {
+    let m = SlowReady.into_gear();
+    let parent = CancellationToken::new();
+    m.start(parent.clone()).await.unwrap();
+    assert_eq!(m.status(), Status::Starting);
+
+    // The configured 30ms deadline (under the 60s default) must fire, proving
+    // the macro threaded `ready_warn_after` through.
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !logs_contain("did not signal readiness within the deadline") {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("configured ready_warn_after should have logged within the bound");
+    assert_eq!(m.status(), Status::Starting); // non-fatal: stays Starting
+
+    parent.cancel();
+    m.stop(CancellationToken::new()).await.unwrap();
+    assert_eq!(m.status(), Status::Stopped);
+}
+
 #[tokio::test]
 async fn auto_notify_when_no_ready_param() {
     let m = AutoNotify.into_gear();
@@ -222,4 +257,78 @@ async fn gear_macro_uses_computed_timeout_in_wrapper_and_registered_capability()
         assert_eq!(began.elapsed(), Duration::from_secs(40));
         assert!(GEAR_CLEANED.load(std::sync::atomic::Ordering::SeqCst));
     }
+}
+
+/// A gear that never signals readiness, so the configured warning period trips.
+#[toolkit::gear(
+    name = "ready-warn-gear",
+    capabilities = [stateful],
+    lifecycle(entry = "serve", await_ready = true, ready_warn_after = "30ms")
+)]
+#[derive(Default)]
+struct ReadyWarnGear;
+
+impl ReadyWarnGear {
+    async fn serve(&self, cancel: CancellationToken, ready: ReadySignal) -> Result<()> {
+        let _held = ready; // hold without notifying so the deadline is what trips
+        cancel.cancelled().await;
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl toolkit::Gear for ReadyWarnGear {
+    async fn init(&self, _: &toolkit::GearCtx) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// The `into_gear()` wrapper must thread `ready_warn_after` into the lifecycle.
+#[tokio::test(start_paused = true)]
+#[tracing_test::traced_test]
+async fn gear_macro_into_gear_threads_ready_warn_after() {
+    let wrapped: std::sync::Arc<dyn RunnableCapability> =
+        std::sync::Arc::new(ReadyWarnGear.into_gear());
+
+    let parent = CancellationToken::new();
+    wrapped.start(parent.clone()).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !logs_contain("did not signal readiness within the deadline") {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("configured ready_warn_after should have logged within the bound");
+    parent.cancel();
+    wrapped.stop(CancellationToken::new()).await.unwrap();
+}
+
+/// The registered capability (what the runtime starts) must also thread it
+/// through — the `register_stateful_with_meta` path, not just `into_gear()`.
+#[tokio::test(start_paused = true)]
+#[tracing_test::traced_test]
+async fn gear_macro_registered_capability_threads_ready_warn_after() {
+    let mut builder = toolkit::registry::RegistryBuilder::default();
+    __ready_warn_gear_registrator(&mut builder);
+    let registry = builder.build_topo_sorted().unwrap();
+    let registered = registry
+        .gears()
+        .iter()
+        .find(|entry| entry.name() == "ready-warn-gear")
+        .unwrap()
+        .caps()
+        .query::<toolkit::registry::RunnableCap>()
+        .unwrap();
+
+    let parent = CancellationToken::new();
+    registered.start(parent.clone()).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !logs_contain("did not signal readiness within the deadline") {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("configured ready_warn_after should have logged within the bound");
+    parent.cancel();
+    registered.stop(CancellationToken::new()).await.unwrap();
 }
