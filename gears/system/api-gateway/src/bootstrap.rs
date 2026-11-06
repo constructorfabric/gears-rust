@@ -37,7 +37,7 @@ impl BootstrapServer {
         &self,
         listener: TcpListener,
         health_bound: Option<(TcpListener, Router)>,
-        cancel: CancellationToken,
+        cancel: &CancellationToken,
     ) -> anyhow::Result<()> {
         let live = Arc::clone(&self.routes);
         let outer = Router::new().fallback_service(tower::service_fn(move |request| {

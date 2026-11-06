@@ -45,10 +45,10 @@ The `system` capability means:
 6. **Shutdown ordering.** Gears in this group stop after the application gear group, in reverse
    dependency order within their group. Only gears whose `start` was called are stopped.
 
-System gRPC services can serve during application preparation. In OoP HTTP serving,
-early system routes allow platform and anonymous operations; tenant operations return
-`503` until the application routes and tenant auth are installed. The in-process
-API Gateway starts later with the complete REST router.
+System gRPC services can serve during application preparation. Both embedded and OoP
+hosts bind framework probes before gear startup, then serve system platform and
+anonymous routes during application preparation. Tenant operations become available
+once application routes and tenant authentication are installed.
 
 The legacy registry also uses the temporary
 `legacy_finalize_after_application_init` hook, after application `init` and client
@@ -77,13 +77,13 @@ application gear group: pre_init → DB migration → GTS publication (admission
   keep handles for lazy use (or resolve them in `post_init`) rather than calling another gear.
 - **`post_init`** — optional hook of any gear; a **barrier** within its group: it begins only
   after every `init` of the group completed and its consumed clients are wired.
-- **REST / gRPC wiring** — routes and gRPC services are registered.
+- **REST / gRPC wiring** — routes and gRPC services are registered. The API Gateway
+  serves probes and system platform routes during preparation, then the full
+  authenticated API on the same listener after application initialization.
 - **`start`** — background work starts for stateful gears.
 - **`OoP spawn`** — out-of-process gears are spawned after the parent has completed
   application startup and advertised its REST endpoints. Parent GTS publication must use
   a local or already available external registry and must not depend on its children.
-  The API Gateway serves probes and system platform routes during preparation, then
-  the full authenticated API on the same listener after application initialization.
 - **Wait for cancellation** — the runtime blocks until a cancellation signal is received
   (Ctrl-C, SIGTERM, or programmatic).
 - **`stop`** — shutdown runs in **reverse dependency order** with a platform deadline.

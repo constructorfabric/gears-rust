@@ -2039,8 +2039,8 @@ async fn a_bearer_on_an_anonymous_route_is_ignored_at_the_gateway() {
     }
 }
 
-/// A raw HTTP/1.1 GET with `headers`, returning the status code.
-async fn listener_status(endpoint: &str, path: &str, headers: &[(&str, &str)]) -> u16 {
+/// A raw HTTP/1.1 GET with `headers`, returning the complete response.
+async fn listener_response(endpoint: &str, path: &str, headers: &[(&str, &str)]) -> String {
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
     let uri: http::Uri = endpoint.parse().expect("advertised endpoint URI");
     let addr = uri.authority().expect("endpoint authority").as_str();
@@ -2058,8 +2058,13 @@ async fn listener_status(endpoint: &str, path: &str, headers: &[(&str, &str)]) -
     stream.write_all(request.as_bytes()).await.unwrap();
     let mut response = Vec::new();
     stream.read_to_end(&mut response).await.unwrap();
-    let response = String::from_utf8_lossy(&response);
-    response
+    String::from_utf8(response).expect("an HTTP response")
+}
+
+/// A raw HTTP/1.1 GET with `headers`, returning the status code.
+async fn listener_status(endpoint: &str, path: &str, headers: &[(&str, &str)]) -> u16 {
+    listener_response(endpoint, path, headers)
+        .await
         .lines()
         .next()
         .and_then(|line| line.split_whitespace().nth(1))
@@ -2196,10 +2201,29 @@ async fn bootstrap_listener_serves_probes_and_platform_then_switches_to_tenant_r
     let routes = TestAxisGear
         .register_rest(&create_test_gear_ctx(), base, &gateway)
         .unwrap();
+    let routes = OperationBuilder::get("/missing-system-object")
+        .anonymous()
+        .summary("A system handler returning not found")
+        .handler(|| async { StatusCode::NOT_FOUND })
+        .no_content_response(StatusCode::NOT_FOUND, "System object not found")
+        .register(routes, &gateway);
     gateway
         .rest_finalize_bootstrap(&ctx, routes.clone(), Arc::clone(&health))
         .unwrap();
     let platform = [(AXIS_INTERNAL_HEADER, AXIS_INTERNAL_SECRET)];
+    let pending = listener_response(&endpoint, "/cf/pending-application", &[]).await;
+    assert!(pending.starts_with("HTTP/1.1 503"), "{pending}");
+    assert!(
+        pending
+            .to_ascii_lowercase()
+            .contains("\r\nretry-after: 1\r\n"),
+        "{pending}"
+    );
+    assert!(pending.contains("application preparation has not completed"));
+    assert_eq!(
+        listener_status(&endpoint, "/cf/missing-system-object", &[]).await,
+        404
+    );
     assert_eq!(
         listener_status(&endpoint, &format!("/cf{AXIS_PLATFORM_PATH}"), &platform).await,
         200
@@ -2219,11 +2243,25 @@ async fn bootstrap_listener_serves_probes_and_platform_then_switches_to_tenant_r
         Uuid::new_v4(),
     )));
     gateway.init(&ctx).await.unwrap();
+    let routes = OperationBuilder::get("/pending-application")
+        .anonymous()
+        .summary("An application route attached after preparation")
+        .handler(public_handler)
+        .json_response_with_schema::<TestResponse>(&gateway, StatusCode::OK, "Application ready")
+        .register(routes, &gateway);
     drop(gateway.rest_finalize(&ctx, routes, health).unwrap());
     let gear = gateway.into_gear();
     gear.start(cancel.clone()).await.unwrap();
     checker.mark_resolved(toolkit::runtime::PREPARATION_GATE);
     let bearer = format!("Bearer {AXIS_BEARER}");
+    assert_eq!(
+        listener_status(&endpoint, "/cf/pending-application", &[]).await,
+        200
+    );
+    assert_eq!(
+        listener_status(&endpoint, "/cf/not-a-route", &[("authorization", &bearer)]).await,
+        404
+    );
     assert_eq!(
         listener_status(
             &endpoint,
@@ -2250,6 +2288,42 @@ async fn bootstrap_listener_serves_probes_and_platform_then_switches_to_tenant_r
     gear.stop(tokio_util::sync::CancellationToken::new())
         .await
         .unwrap();
+}
+
+/// A system-provided fallback takes precedence over the bootstrap starting response.
+#[tokio::test]
+async fn bootstrap_listener_preserves_a_custom_system_fallback() {
+    let mut config = axis_config(true);
+    config["bind_addr"] = json!("127.0.0.1:0");
+    config["prefix_path"] = json!("/cf");
+    config["require_auth_by_default"] = json!(false);
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let ctx = GearCtx::new(
+        "api-gateway",
+        Uuid::new_v4(),
+        Arc::new(TestConfigProvider {
+            config: json!({"api-gateway": {"config": config}}),
+        }),
+        Arc::new(ClientHub::new()),
+        cancel.clone(),
+    );
+    let health = Arc::new(toolkit::RestHealthcheckRegistry::new());
+    let gateway = api_gateway::ApiGateway::default();
+    let base = gateway
+        .rest_bootstrap(&ctx, Arc::clone(&health), cancel)
+        .await
+        .unwrap()
+        .unwrap();
+    let routes = base.fallback(|| async { StatusCode::IM_A_TEAPOT });
+    gateway
+        .rest_finalize_bootstrap(&ctx, routes, health)
+        .unwrap();
+    let endpoint = gateway.bound_endpoint().unwrap();
+    assert_eq!(
+        listener_status(&endpoint, "/cf/system-fallback", &[]).await,
+        418
+    );
+    gateway.rest_shutdown_bootstrap().await.unwrap();
 }
 
 /// Counts how often its layer is applied to a route.

@@ -1329,6 +1329,10 @@ impl ApiGateway {
 
         let prefix = Self::normalize_prefix_path(&config.prefix_path)?;
         router = Self::apply_prefix(router, &prefix);
+        if bootstrap && !prefix.is_empty() {
+            // nest() inherits explicit system fallbacks, but not the inner default fallback.
+            router = router.fallback(|| async { bootstrap::starting_response() });
+        }
 
         self.publish_serving_router(&router, bootstrap);
 
@@ -1389,7 +1393,7 @@ impl toolkit::contracts::ApiGatewayCapability for ApiGateway {
         let listener = tokio::net::TcpListener::bind(addr).await?;
         let bound = listener.local_addr()?;
         let health_bound = self.bind_health_listener(&cfg).await?;
-        self.bootstrap.start(listener, health_bound, cancel)?;
+        self.bootstrap.start(listener, health_bound, &cancel)?;
         self.publish_bound_endpoint(&cfg, bound);
         Ok(Some(base))
     }
