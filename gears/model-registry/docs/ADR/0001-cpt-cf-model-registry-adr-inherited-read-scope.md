@@ -72,13 +72,13 @@ Chosen option: "Gear-built upward scope, tenant constraint as a gate, subtree co
 
 ### The read scope is built by the gear from the ancestor chain
 
-Reads run through `SecureConn` under `AccessScope::for_tenants(chain)`, where `chain` is the acting tenant T0 followed by its ancestors. The scope is an upper bound only: it admits rows of the chain's tenants and nothing else, so a defect in a predicate cannot reach a sibling or a descendant row. The catalog visibility predicates are ANDed onto it: ancestor providers only when `sharing_mode = shared`; models only when their provider wins its slug and the model is own or `shared`. Writes use `AccessScope::for_tenant(T0)`.
+Reads run through `SecureConn` under `AccessScope::for_tenants(chain)`, where `chain` is the acting tenant T0 followed by its ancestors. The scope is an upper bound only: it admits rows of the chain's tenants and nothing else, so a defect in a predicate cannot reach a sibling or a descendant row. The catalog visibility predicates are ANDed onto it: ancestor providers only when `sharing_mode = shared`; models only when they are own or `shared`. Resolution and the available list further require the model's provider to win its slug; management reads keep the candidates of shadowed providers and mark them `shadowed`. Writes use `AccessScope::for_tenant(T0)`.
 
 This is a documented deviation from the Secure ORM rule against building `AccessScope` manually in production code. The manual scope is narrower than any clamp the PDP could return for the same rows.
 
 ### The PDP tenant constraint is a gate on the acting tenant
 
-Every decision is asked with `owner_tenant_id = T0`, also when the returned row is owned by an ancestor. A constraint alternative is kept when its `owner_tenant_id` filter is `Eq` or `In` and admits T0. When no alternative remains, the result is `NOT_PERMITTED`. The tenant constraint never becomes a SQL clamp. Which ancestor rows T0 sees is decided by the catalog's sharing and shadowing rules, not by the PDP.
+Every decision is asked with `owner_tenant_id = T0`, also when the returned row is owned by an ancestor. A constraint alternative with no `owner_tenant_id` filter is kept, and its row constraints apply. An alternative with an `owner_tenant_id` filter is kept when the filter is `Eq` or `In` and admits T0. When no alternative remains, the result is `NOT_PERMITTED`. The tenant constraint never becomes a SQL clamp. Which ancestor rows T0 sees is decided by the catalog's sharing and shadowing rules, not by the PDP.
 
 Row constraints on `id`, `provider_id`, `canonical_id`, and `gts_type` apply as returned: in SQL on lists, in memory on point operations. The PDP never sees an inherited row's real owner; this is accepted.
 
@@ -102,13 +102,13 @@ One storage function produces the scope and the visibility predicates for every 
 * Hierarchy changes, including a change of a tenant's `self_managed` flag, apply within the chain-cache TTL.
 * A self-managed tenant does not receive the root tenant's platform-wide shared catalog. Its administrator owns the catalog for its subtree.
 * The chain cache holds one chain per entry and makes one Tenant Resolver call per miss; the gate adds no call (D6).
-* Security: the scope bounds every read to the chain; no downward read exists, and no read crosses an isolation barrier. Performance: unchanged beyond the cached chain. Reliability: a Tenant Resolver failure on a miss fails closed. Data, integration, operations, compliance, UX, business: not affected.
+* Security: the scope bounds every read to the chain; no downward read exists, and no read crosses an isolation barrier once the chain cache reflects it. After a `self_managed` conversion a cached chain can cross the new barrier until it expires (ADR-0003); deployments that need immediate isolation set the TTL to 0. Performance: unchanged beyond the cached chain. Reliability: a Tenant Resolver failure on a miss fails closed. Data, integration, operations, compliance, UX, business: not affected.
 
 ### Confirmation
 
 * Integration (SQLite and PostgreSQL): a self-managed tenant sees none of its ancestors' entries, `shared` or not; a descendant of a self-managed tenant sees that tenant's `shared` entries and nothing from above it; ancestors see nothing of the self-managed subtree.
 * Integration: `InTenantSubtree` denies with `respect_barriers` true or false, with or without `descendant_status`; an unknown `ScopeFilter` variant denies.
-* Integration: `Eq` or `In` admitting T0 passes; not admitting T0 returns `NOT_PERMITTED`.
+* Integration: `Eq` or `In` admitting T0 passes; not admitting T0 returns `NOT_PERMITTED`; an alternative with no `owner_tenant_id` filter passes and its row constraints apply.
 * Integration: a caller `$filter` never widens a list; a PDP row constraint narrows lists in SQL and point reads in memory.
 * Unit: a read-method enumeration test fails when a repository read method does not build its scope through the shared function.
 * Review: no `BarrierMode::Ignore` call exists in the gear; the chain call uses `GetAncestorsOptions::default()`.

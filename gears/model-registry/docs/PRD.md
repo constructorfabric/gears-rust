@@ -213,7 +213,7 @@ The system **MUST** make every model of a disabled provider unavailable for eval
 
 - [ ] `p1` - **ID**: `cpt-cf-model-registry-fr-provider-sharing`
 
-The system **MUST** support two provider sharing modes. With `Tenant`, the provider and its models are visible only to the owning tenant. With `Shared`, the provider is visible to all descendant tenants. A change of mode **MUST** take effect for later resolutions.
+The system **MUST** support two provider sharing modes. With `Tenant`, the provider and its models are visible only to the owning tenant. With `Shared`, the provider is visible to every descendant tenant whose ancestor chain reaches the owner, that is, up to an isolation barrier (`cpt-cf-model-registry-contract-tenant-hierarchy`). A change of mode **MUST** take effect for later resolutions.
 
 - **Rationale**: Parents configure a provider once and choose whether descendants receive it.
 - **Actors**: `cpt-cf-model-registry-actor-tenant-admin`
@@ -571,7 +571,7 @@ An acknowledged change to a provider or model **MUST** survive restarts of the g
 ## 9. Acceptance Criteria
 
 - [ ] A model from a disabled provider never resolves and is absent from the available list.
-- [ ] A descendant tenant sees the shared providers and models of its ancestors and none of their `Tenant`-mode entries.
+- [ ] A descendant tenant sees the shared providers and models of the ancestors in its chain, up to an isolation barrier, and none of their `Tenant`-mode entries.
 - [ ] Defining a `Shared` provider with an inherited slug replaces all inherited models of that slug for the tenant and its descendants.
 - [ ] Defining a `Tenant`-mode provider with an inherited slug replaces the inherited models for the owning tenant only; its descendants keep the inherited models.
 - [ ] A `Shared`, disabled shadowing provider removes the inherited models from the whole subtree.

@@ -69,7 +69,7 @@ Chosen option: "Write-time ownership check by metadata read, residual fallback a
 
 ### The check is a metadata read of the record under the caller's context
 
-On model create, and on an update that sets `secret_ref`, the catalog service calls `CredStoreClientV2::get_record(ctx, &secret_ref)` with the caller's `SecurityContext`, bounded by `credstore_deadline_ms`. The call needs the CredStore `read` action on the reference, not `read_secret`; no value is returned, so none is handled, logged, or dropped. Clearing `secret_ref` (`null`) makes no CredStore call.
+On model create with `secret_ref`, and on an update whose `secret_ref` is a non-null value different from the stored one, the catalog service calls `CredStoreClientV2::get_record(ctx, &secret_ref)` with the caller's `SecurityContext`, bounded by `credstore_deadline_ms`. The call needs the CredStore `read` action on the reference, not `read_secret`; no value is returned, so none is handled, logged, or dropped. Clearing `secret_ref` (`null`) or resending the stored value makes no CredStore call.
 
 A caller without the `read` grant is refused with `NOT_PERMITTED` and an operator-visible log diagnostic naming the missing grant. CredStore unavailable, an expired deadline, or an internal failure is dependency unavailable (`service_unavailable`), and the write is not performed.
 
@@ -84,11 +84,11 @@ The reference is accepted when the response is `Ok(Some(credential))` and the ca
 | `PermissionDenied` | `NOT_PERMITTED` (not a field violation) |
 | any other error | dependency unavailable |
 
-An `expired` own secret is accepted: the binding is about ownership, and rotation keeps the reference. Sharing mode of the secret is not checked: a `private` secret resolves at evaluation only for its creating subject and a `tenant` secret never for a descendant, which LLM Gateway reports as `credentials_unavailable`. The registry does not predict that outcome.
+An `expired` own secret is accepted: the binding is about ownership, and rotation keeps the reference. Sharing mode of the secret is not checked: a `private` secret resolves at evaluation only for its creating subject, and a `tenant` secret is invisible to a descendant, whose resolution walks past it to a same-named `shared` secret of a tenant above the owner when one exists and otherwise fails with `credentials_unavailable` in LLM Gateway. That fallback while the owner's secret still exists is accepted on the same grounds as the stale-binding residual below: the ancestor's `shared` secret is one the descendant can already read under CredStore's rules. Configuring CredStore inheritance, or choosing a unique reference to stay out of it, is the tenant administrator's responsibility. The registry does not predict the outcome.
 
 ### The check runs once, at write time
 
-The check runs before the write transaction and holds no database connection. It is not repeated on `resolve_model`, `list_available_models`, or any read, and not on an update that leaves `secret_ref` untouched. A provider type migration (`update_provider` with a new `gts_type`) does not re-check model secret references.
+The check runs before the write transaction and holds no database connection. It is not repeated on `resolve_model`, `list_available_models`, or any read, and not on an update that omits `secret_ref` or resends the stored value. A provider type migration (`update_provider` with a new `gts_type`) does not re-check model secret references.
 
 ### Evaluation does not verify the owner
 
@@ -97,22 +97,22 @@ The stored binding goes stale when the owner removes its own secret and leaves `
 1. It cannot be closed there under the CredStore contract. `get_secret` names no owner (ADR-0009), and under the evaluating caller's context an inherited model legitimately resolves to a secret the caller does not own, so no owner comparison distinguishes the stale case from the intended one.
 2. It is not a wider route to a value. The fallback reaches only an ancestor secret that is `shared` to the owner's tenant, one its administrators may already read and use under CredStore's rules; the model is a second route to a value CredStore already exposes to that tenant. The writing tenant can also reach the stale state itself: bind its own secret, then remove it with `fallback: inherit`. This is why the rule is defense in depth, not a boundary. The ancestor's control is CredStore sharing (stop sharing the secret) and the `read_secret` grant.
 
-The owner closes the residual on the CredStore side when it wants to: removing the secret as `PATCH {"secret": null, "fallback": "none"}` suppresses the reference ([CredStore ADR-0008](../../../credstore/docs/ADR/0008-cpt-cf-credstore-adr-suppression-fallback.md), `cpt-cf-credstore-fr-suppression`). With `sharing: shared` on the suppressing record, the owner and its descendants are covered; with `sharing: tenant`, the owner tenant only. `resolve_model` keeps returning the model, whose evaluation fails with `credentials_unavailable`.
+The owner closes the residual on the CredStore side when it wants to, by suppressing the reference ([CredStore ADR-0008](../../../credstore/docs/ADR/0008-cpt-cf-credstore-adr-suppression-fallback.md), `cpt-cf-credstore-fr-suppression`): while its record is `active`, by removing the secret as `PATCH {"secret": null, "fallback": "none"}`; after deleting the record, by `PUT {"type": …, "sharing": …, "fallback": "none", "secret": null}` with `If-None-Match: *`, since `PATCH` never creates a record. With `sharing: shared` on the suppressing record, the owner and its descendants are covered; with `sharing: tenant`, the owner tenant only. Suppression blocks the ancestor fallback only: a descendant whose own active secret has the same reference keeps evaluating with that secret. `resolve_model` keeps returning the model; where the suppression applies, evaluation fails with `credentials_unavailable`.
 
 ### Consequences
 
-* Model writes that set `secret_ref` take one CredStore round trip and depend on CredStore availability; other writes and all reads do not.
+* Model writes that set a new `secret_ref` take one CredStore round trip and depend on CredStore availability; other writes and all reads do not.
 * The writing administrator needs the CredStore `read` grant on the reference. No new PDP action is added to this gear.
 * The registry holds the invariant "a model's credential belongs to the model's owner" for the catalog it manages; it cannot hold it against later CredStore changes.
 * A `shared` model whose secret is not `shared` in CredStore is accepted and fails at evaluation for descendants. The two sharing settings are independent and owned by their gears.
 * The open question "CredStore metadata-only read" is resolved: `get_record` is that read. The SDK that ships today (`CredStoreClientV1::get`, which returns the value with `owner_tenant_id` and `is_inherited`) is not the published contract; implementing against it would put the value in this gear's memory and rely on fields ADR-0009 withdraws.
 * The LLM Gateway DESIGN follow-up (DESIGN §3.3 Contract Migration) carries no owner check; the Credential Broker's existing behavior on a missing or failed secret is sufficient.
-* Security: the check prevents an accidental or copy-paste binding to an inherited reference, including a `tenant`-mode ancestor credential or a `shared` one the writer could not read. A deliberate fallback by the owner's tenant is not prevented and is governed by CredStore sharing and `read_secret`; the value boundary stays with CredStore (D6). Performance: unchanged on reads. Reliability: a CredStore outage blocks writes that set `secret_ref` only. Data: none; the `secret_ref` column is unchanged. Integration: the gear depends on `CredStoreClientV2`. Operations: a rejected reference is visible as a `secret_ref` field violation and in the rejection metric by reason. Compliance, UX, business: not affected.
+* Security: the check prevents an accidental or copy-paste binding to an inherited reference, including a `tenant`-mode ancestor credential or a `shared` one the writer could not read. A deliberate fallback by the owner's tenant is not prevented and is governed by CredStore sharing and `read_secret`; the value boundary stays with CredStore (D6). Performance: unchanged on reads. Reliability: a CredStore outage blocks writes that set a new `secret_ref` only. Data: none; the `secret_ref` column is unchanged. Integration: the gear depends on `CredStoreClientV2`. Operations: a rejected reference is visible as a `secret_ref` field violation and in the rejection metric by reason. Compliance, UX, business: not affected.
 
 ### Confirmation
 
 * Integration: a reference the tenant owns (`own.status` `active`) is accepted; `expired` is accepted; an own row with `status` `declared` and an entry with no own row are rejected with `SECRET_REF_NOT_OWNED`; `Ok(None)` is rejected with `SECRET_REF_NOT_FOUND`; `PermissionDenied` yields `NOT_PERMITTED`; an error or a delay past `credstore_deadline_ms` yields `service_unavailable`. No row is written in any rejected case.
-* Integration: the mock CredStore records that only `get_record` is called, under the caller's context, once per write that sets `secret_ref`, and never on resolution, on lists, on an update that leaves `secret_ref` untouched, or on a `null`.
+* Integration: the mock CredStore records that only `get_record` is called, under the caller's context, once per create with `secret_ref` and per update that changes it to a non-null value, and never on resolution, on lists, on an update that omits `secret_ref` or resends the stored value, or on a `null`.
 * Unit: no CredStore type carrying a secret value is reachable from the catalog service; `get_secret` is not called anywhere in the gear.
 * Review: the registry's dependency declaration names CredStore for writes only.
 
