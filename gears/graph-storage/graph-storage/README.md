@@ -79,6 +79,14 @@ on server-wide state — so it runs at a bounded concurrency
 in-process runner). More than that on an ordinary machine and the connection
 pools start timing out, which reads as a flaky gear and is a busy host.
 
+The latency benchmark is a third, opt-in lane (`GEARS_GRAPH_PERF=1`, `tests/perf.rs`):
+it seeds the PRD's reference graph (100k nodes / 500k edges) and times search,
+projection and traversal, optionally behind an added round-trip time.
+[docs/PERF.md](../docs/PERF.md) has the method, the command and where results
+are posted. A deployment whose database is not on the same host should set
+`test_before_acquire: false` in its pool configuration: the default pings
+before every acquire, which doubles the round trips of every read.
+
 A case that panics can leave its container behind — the removal is
 asynchronous, and nothing awaits it — so after a failed run
 `docker ps --filter ancestor=pgvector/pgvector:0.8.7-pg18` is worth a glance; a

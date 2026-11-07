@@ -133,6 +133,20 @@ pub const REDIS_TAG: &str = "8-alpine";
 /// on.
 pub const KAFKA_TAG: &str = "4.3.1";
 
+/// Repository of the `netshoot` image: `tc` for the benchmarks that add
+/// round-trip time to a database container (`netem`, run with `NET_ADMIN`
+/// in that container's network namespace).
+pub const NETSHOOT_IMAGE: &str = "nicolaka/netshoot";
+
+/// Tag of the `netshoot` image, with its digest.
+///
+/// A third-party image run with `NET_ADMIN`, so it is pinned to the content
+/// and not only the name: `latest` would change both the code given network
+/// rights and the `tc` build two compared runs were shaped with. `v0.16` is
+/// the image the graph-storage runs on gears-rust #5517 used.
+pub const NETSHOOT_TAG: &str =
+    "v0.16@sha256:b09d9b21381f47a79b3cbcb30da25266dc17186ea00ae65e99fdc51396f48e70";
+
 /// Environment variable overriding [`POSTGRES_TAG`].
 pub const ENV_POSTGRES_TAG: &str = "GEARS_TEST_PG_TAG";
 /// Environment variable overriding [`POSTGRES_GRAPH_TAG`].
@@ -149,6 +163,8 @@ pub const ENV_CLICKHOUSE_TAG: &str = "GEARS_TEST_CLICKHOUSE_TAG";
 pub const ENV_REDIS_TAG: &str = "GEARS_TEST_REDIS_TAG";
 /// Environment variable overriding [`KAFKA_TAG`].
 pub const ENV_KAFKA_TAG: &str = "GEARS_TEST_KAFKA_TAG";
+/// Environment variable overriding [`NETSHOOT_TAG`].
+pub const ENV_NETSHOOT_TAG: &str = "GEARS_TEST_NETSHOOT_TAG";
 
 /// Environment variable turning an unavailable `PostgreSQL` 19 image into a
 /// failure instead of a skip. See [`graph_lane_required()`].
@@ -229,6 +245,17 @@ pub fn redis_tag() -> String {
 #[must_use]
 pub fn kafka_tag() -> String {
     tag_from(env_override(ENV_KAFKA_TAG), KAFKA_TAG)
+}
+
+/// `netshoot` image reference in effect (`repository:tag`), honoring
+/// `GEARS_TEST_NETSHOOT_TAG`. A reference rather than a request: the image is
+/// run by `docker run` beside a container, not started by `testcontainers`.
+#[must_use]
+pub fn netshoot_image() -> String {
+    format!(
+        "{NETSHOOT_IMAGE}:{}",
+        tag_from(env_override(ENV_NETSHOOT_TAG), NETSHOOT_TAG)
+    )
 }
 
 /// A `PostgreSQL` container request on the pinned tag.
@@ -426,6 +453,11 @@ mod tests {
         assert_eq!(CLICKHOUSE_TAG, "25.6");
         assert_eq!(REDIS_TAG, "8-alpine");
         assert_eq!(KAFKA_TAG, "4.3.1");
+        assert_eq!(NETSHOOT_IMAGE, "nicolaka/netshoot");
+        assert_eq!(
+            NETSHOOT_TAG,
+            "v0.16@sha256:b09d9b21381f47a79b3cbcb30da25266dc17186ea00ae65e99fdc51396f48e70"
+        );
     }
 
     /// Known floating-alias words. Checked per component (split on `-`/`_`),
@@ -451,6 +483,7 @@ mod tests {
             CLICKHOUSE_TAG,
             REDIS_TAG,
             KAFKA_TAG,
+            NETSHOOT_TAG,
         ] {
             assert!(
                 !is_floating_alias(tag),
@@ -580,6 +613,20 @@ mod tests {
         });
         temp_env::with_var(ENV_KAFKA_TAG, Some("tag-under-test"), || {
             assert_eq!(kafka().descriptor(), "apache/kafka:tag-under-test");
+        });
+    }
+
+    /// The pin is by digest, not only by tag, and an override replaces both.
+    #[test]
+    #[serial]
+    fn netshoot_is_pinned_by_digest_and_overridable() {
+        temp_env::with_var(ENV_NETSHOOT_TAG, None::<&str>, || {
+            let image = netshoot_image();
+            assert!(image.starts_with("nicolaka/netshoot:v"), "{image}");
+            assert!(image.contains("@sha256:"), "{image}");
+        });
+        temp_env::with_var(ENV_NETSHOOT_TAG, Some("tag-under-test"), || {
+            assert_eq!(netshoot_image(), "nicolaka/netshoot:tag-under-test");
         });
     }
 
