@@ -269,6 +269,21 @@ async fn expire_lease_for_tables(db: &Db, tables: &OutboxTables, partition_id: i
     .expect("expire_lease");
 }
 
+/// Put the processor's `attempts` counter where a long run of retries would.
+async fn set_attempts(db: &Db, partition_id: i64, attempts: i16) {
+    let conn = db.sea_internal();
+    conn.execute_raw(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        format!(
+            "UPDATE {} SET attempts = $1 WHERE partition_id = $2",
+            OutboxTables::default().processor()
+        ),
+        [attempts.into(), partition_id.into()],
+    ))
+    .await
+    .expect("set_attempts");
+}
+
 // ======================================================================
 // Layer C — Observations (read state only)
 // ======================================================================
@@ -2793,6 +2808,41 @@ async fn transactional_retry_increments_attempts() {
 }
 
 #[tokio::test]
+async fn transactional_attempts_saturate_instead_of_overflowing() {
+    let db = setup_db("ch4_tx_attempts_saturate").await;
+    let t = make_default_test_outbox().await;
+    t.outbox.register_queue(&db, "q", 1).await.unwrap();
+    let pid = t.outbox.all_partition_ids()[0];
+
+    enqueue_and_sequence(&t, &db, "q", 0, &["msg"]).await;
+
+    // A long outage has already retried the partition up to the limit.
+    set_attempts(&db, pid, i16::MAX).await;
+
+    // One more retry is recorded, and the counter stays at the limit.
+    run_transactional(&db, pid, AlwaysRetryTxHandler, 10).await;
+    let snap = read_processor_state(&db, pid).await;
+    assert_eq!(snap.attempts, i16::MAX, "attempts saturates at the limit");
+    assert_eq!(snap.last_error.as_deref(), Some("transient tx failure"));
+
+    // The downstream recovers: the message is delivered and the counter resets.
+    let count = Arc::new(AtomicU32::new(0));
+    run_transactional(
+        &db,
+        pid,
+        CountingTxHandler {
+            count: count.clone(),
+        },
+        10,
+    )
+    .await;
+    assert_eq!(count.load(Ordering::Relaxed), 1);
+    let snap = read_processor_state(&db, pid).await;
+    assert_eq!(snap.processed_seq, 1);
+    assert_eq!(snap.attempts, 0);
+}
+
+#[tokio::test]
 async fn transactional_reject_creates_dead_letter_and_advances() {
     let db = setup_db("ch4_tx_reject").await;
     let t = make_default_test_outbox().await;
@@ -3465,6 +3515,46 @@ async fn success_after_crash_resets_attempts() {
     let snap = read_processor_state(&db, pid).await;
     assert_eq!(snap.attempts, 0, "success resets attempts to 0");
     assert_eq!(snap.processed_seq, 1);
+}
+
+#[tokio::test]
+async fn leased_attempts_saturate_instead_of_overflowing() {
+    let db = setup_db("ch6_attempts_saturate").await;
+    let t = make_default_test_outbox().await;
+    t.outbox.register_queue(&db, "q", 1).await.unwrap();
+    let pid = t.outbox.all_partition_ids()[0];
+
+    enqueue_and_sequence(&t, &db, "q", 0, &["msg"]).await;
+
+    // A long outage has already retried the partition up to the limit.
+    set_attempts(&db, pid, i16::MAX).await;
+
+    // One more retry takes the lease, and the counter stays at the limit.
+    run_leased(&db, pid, AlwaysRetryHandler, Duration::from_secs(30), 10).await;
+    let snap = read_processor_state(&db, pid).await;
+    assert_eq!(snap.attempts, i16::MAX, "attempts saturates at the limit");
+    assert_eq!(snap.processed_seq, 0);
+
+    // The downstream recovers: the message is delivered and the counter resets.
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    run_leased(
+        &db,
+        pid,
+        AttemptsRecorder {
+            seen_attempts: seen.clone(),
+        },
+        Duration::from_secs(30),
+        10,
+    )
+    .await;
+    assert_eq!(
+        *seen.lock().unwrap(),
+        vec![i16::MAX - 1],
+        "the handler sees the saturated count, not a reset one"
+    );
+    let snap = read_processor_state(&db, pid).await;
+    assert_eq!(snap.processed_seq, 1);
+    assert_eq!(snap.attempts, 0);
 }
 
 // ======================================================================
