@@ -511,46 +511,11 @@ impl PlanRevisionSubject {
         )
         .await
         .map_err(storage)?;
-        let policies = crate::infra::storage::repo::usage_policy_repo::for_entries(
-            tx,
-            self.tenant_id,
-            &entries,
-        )
-        .await
-        .map_err(storage)?;
-        let entry_ids: Vec<Uuid> = entries.iter().map(|e| e.id).collect();
-        let prices = crate::infra::storage::repo::price_repo::by_entry(
-            crate::infra::storage::repo::price_repo::for_entries(
-                tx,
-                &AccessScope::for_tenant(self.tenant_id),
-                self.tenant_id,
-                &entry_ids,
-            )
-            .await
-            .map_err(storage)?,
-        );
         for entry in entries {
             self.meter_observations.check(&entry).map_err(|error| {
                 self.refuse(error);
                 invalid("METER_POLICY_REFUSED", format!("entry {}", entry.id))
             })?;
-            let refuses = policies.get(&entry.id).is_some_and(|p| {
-                crate::domain::usage_policy::refuses_minimum_fee(&(&p.content).into())
-            });
-            if refuses
-                && prices.get(&entry.id).is_some_and(|rows| {
-                    rows.iter().any(|p| {
-                        p.state == "approved"
-                            && crate::infra::storage::repo::price_repo::is_price(p)
-                            && p.min_fee.is_some()
-                    })
-                })
-            {
-                return Err(invalid(
-                    "UNSUPPORTED_TERMS",
-                    "minimum fee on CalendarHour or a resource-scoped policy",
-                ));
-            }
         }
         context.skus = self.skus(context.items.iter().map(|i| i.sku_id))?;
         Ok(plan::checks(&context, today))
