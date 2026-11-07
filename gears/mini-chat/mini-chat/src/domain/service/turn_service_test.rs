@@ -1247,6 +1247,294 @@ async fn retry_via_preview_asks_the_pdp_once() {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
+// preview_mutation racing a concurrent mutation
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Message repo that plays the winner of a concurrent retry at the moment the
+/// loser looks up the user message: after the loser has validated the turn, it
+/// soft-deletes the turn's messages (and, with `supersede`, makes a newer turn
+/// the latest one), then delegates to the real repo.
+struct RacedMessageRepo {
+    inner: Arc<repo::message_repo::MessageRepository>,
+    tenant_id: Uuid,
+    user_id: Uuid,
+    supersede: bool,
+}
+
+#[async_trait::async_trait]
+impl MessageRepository for RacedMessageRepo {
+    async fn find_user_message_by_request_id<C: toolkit_db::secure::DBRunner>(
+        &self,
+        runner: &C,
+        scope: &AccessScope,
+        chat_id: Uuid,
+        request_id: Uuid,
+    ) -> Result<Option<crate::infra::db::entity::message::Model>, crate::domain::error::DomainError>
+    {
+        self.inner
+            .soft_delete_by_request_id(runner, scope, chat_id, request_id)
+            .await?;
+        if self.supersede {
+            repo::turn_repo::TurnRepository
+                .create_turn(
+                    runner,
+                    scope,
+                    crate::domain::repos::CreateTurnParams {
+                        id: Uuid::new_v4(),
+                        tenant_id: self.tenant_id,
+                        chat_id,
+                        request_id: Uuid::new_v4(),
+                        requester_type: "user".to_owned(),
+                        requester_user_id: Some(self.user_id),
+                        reserve_tokens: None,
+                        max_output_tokens_applied: None,
+                        reserved_credits_micro: None,
+                        policy_version_applied: None,
+                        effective_model: None,
+                        minimal_generation_floor_applied: None,
+                        web_search_enabled: false,
+                    },
+                )
+                .await?;
+        }
+        self.inner
+            .find_user_message_by_request_id(runner, scope, chat_id, request_id)
+            .await
+    }
+
+    async fn insert_user_message<C: toolkit_db::secure::DBRunner>(
+        &self,
+        r: &C,
+        s: &AccessScope,
+        p: crate::domain::repos::InsertUserMessageParams,
+    ) -> Result<crate::infra::db::entity::message::Model, crate::domain::error::DomainError> {
+        self.inner.insert_user_message(r, s, p).await
+    }
+
+    async fn insert_assistant_message<C: toolkit_db::secure::DBRunner>(
+        &self,
+        r: &C,
+        s: &AccessScope,
+        p: crate::domain::repos::InsertAssistantMessageParams,
+    ) -> Result<crate::infra::db::entity::message::Model, crate::domain::error::DomainError> {
+        self.inner.insert_assistant_message(r, s, p).await
+    }
+
+    async fn find_by_chat_and_request_id<C: toolkit_db::secure::DBRunner>(
+        &self,
+        r: &C,
+        s: &AccessScope,
+        chat_id: Uuid,
+        request_id: Uuid,
+    ) -> Result<Vec<crate::infra::db::entity::message::Model>, crate::domain::error::DomainError>
+    {
+        self.inner
+            .find_by_chat_and_request_id(r, s, chat_id, request_id)
+            .await
+    }
+
+    async fn get_by_chat<C: toolkit_db::secure::DBRunner>(
+        &self,
+        r: &C,
+        s: &AccessScope,
+        msg_id: Uuid,
+        chat_id: Uuid,
+    ) -> Result<Option<crate::infra::db::entity::message::Model>, crate::domain::error::DomainError>
+    {
+        self.inner.get_by_chat(r, s, msg_id, chat_id).await
+    }
+
+    async fn list_by_chat<C: toolkit_db::secure::DBRunner>(
+        &self,
+        r: &C,
+        s: &AccessScope,
+        chat_id: Uuid,
+        query: &toolkit_odata::ODataQuery,
+    ) -> Result<
+        toolkit_odata::Page<crate::infra::db::entity::message::Model>,
+        crate::domain::error::DomainError,
+    > {
+        self.inner.list_by_chat(r, s, chat_id, query).await
+    }
+
+    async fn batch_attachment_summaries<C: toolkit_db::secure::DBRunner>(
+        &self,
+        r: &C,
+        s: &AccessScope,
+        chat_id: Uuid,
+        message_ids: &[Uuid],
+    ) -> Result<
+        std::collections::HashMap<Uuid, Vec<crate::domain::models::AttachmentSummary>>,
+        crate::domain::error::DomainError,
+    > {
+        self.inner
+            .batch_attachment_summaries(r, s, chat_id, message_ids)
+            .await
+    }
+
+    async fn snapshot_boundary<C: toolkit_db::secure::DBRunner>(
+        &self,
+        r: &C,
+        s: &AccessScope,
+        chat_id: Uuid,
+    ) -> Result<Option<crate::domain::repos::SnapshotBoundary>, crate::domain::error::DomainError>
+    {
+        self.inner.snapshot_boundary(r, s, chat_id).await
+    }
+
+    async fn recent_for_context<C: toolkit_db::secure::DBRunner>(
+        &self,
+        r: &C,
+        s: &AccessScope,
+        chat_id: Uuid,
+        limit: u32,
+        boundary: Option<crate::domain::repos::SnapshotBoundary>,
+    ) -> Result<Vec<crate::infra::db::entity::message::Model>, crate::domain::error::DomainError>
+    {
+        self.inner
+            .recent_for_context(r, s, chat_id, limit, boundary)
+            .await
+    }
+
+    async fn soft_delete_by_request_id<C: toolkit_db::secure::DBRunner>(
+        &self,
+        r: &C,
+        s: &AccessScope,
+        chat_id: Uuid,
+        request_id: Uuid,
+    ) -> Result<u64, crate::domain::error::DomainError> {
+        self.inner
+            .soft_delete_by_request_id(r, s, chat_id, request_id)
+            .await
+    }
+
+    async fn last_assistant_token_counts<C: toolkit_db::secure::DBRunner>(
+        &self,
+        r: &C,
+        s: &AccessScope,
+        chat_id: Uuid,
+    ) -> Result<Option<(i64, i64)>, crate::domain::error::DomainError> {
+        self.inner.last_assistant_token_counts(r, s, chat_id).await
+    }
+
+    async fn find_latest_message_before_turn<C: toolkit_db::secure::DBRunner>(
+        &self,
+        r: &C,
+        s: &AccessScope,
+        chat_id: Uuid,
+        exclude_request_id: Uuid,
+    ) -> Result<Option<crate::domain::repos::SummaryFrontier>, crate::domain::error::DomainError>
+    {
+        self.inner
+            .find_latest_message_before_turn(r, s, chat_id, exclude_request_id)
+            .await
+    }
+
+    async fn fetch_messages_in_range<C: toolkit_db::secure::DBRunner>(
+        &self,
+        r: &C,
+        s: &AccessScope,
+        chat_id: Uuid,
+        base: Option<&crate::domain::repos::SummaryFrontier>,
+        target: &crate::domain::repos::SummaryFrontier,
+    ) -> Result<Vec<crate::infra::db::entity::message::Model>, crate::domain::error::DomainError>
+    {
+        self.inner
+            .fetch_messages_in_range(r, s, chat_id, base, target)
+            .await
+    }
+
+    async fn mark_messages_compressed<C: toolkit_db::secure::DBRunner>(
+        &self,
+        r: &C,
+        s: &AccessScope,
+        chat_id: Uuid,
+        base: Option<&crate::domain::repos::SummaryFrontier>,
+        target: &crate::domain::repos::SummaryFrontier,
+    ) -> Result<u64, crate::domain::error::DomainError> {
+        self.inner
+            .mark_messages_compressed(r, s, chat_id, base, target)
+            .await
+    }
+
+    async fn recent_after_boundary<C: toolkit_db::secure::DBRunner>(
+        &self,
+        r: &C,
+        s: &AccessScope,
+        chat_id: Uuid,
+        lower_created_at: time::OffsetDateTime,
+        lower_id: Uuid,
+        limit: u32,
+        boundary: Option<crate::domain::repos::SnapshotBoundary>,
+    ) -> Result<Vec<crate::infra::db::entity::message::Model>, crate::domain::error::DomainError>
+    {
+        self.inner
+            .recent_after_boundary(r, s, chat_id, lower_created_at, lower_id, limit, boundary)
+            .await
+    }
+}
+
+/// Runs `preview_mutation` of a completed turn whose messages vanish between
+/// the validation and the user-message lookup.
+async fn preview_racing_mutation(supersede: bool) -> Result<(), MutationError> {
+    let (svc, ctx, chat_id, tenant_id) = setup().await;
+    let request_id = create_completed_turn(
+        &svc.db,
+        &*svc.turn_repo,
+        &*svc.message_repo,
+        tenant_id,
+        chat_id,
+        ctx.subject_id(),
+    )
+    .await;
+    let racing = TurnService::new(
+        Arc::clone(&svc.db),
+        Arc::clone(&svc.turn_repo),
+        Arc::new(RacedMessageRepo {
+            inner: Arc::clone(&svc.message_repo),
+            tenant_id,
+            user_id: ctx.subject_id(),
+            supersede,
+        }),
+        Arc::new(repo::chat_repo::ChatRepository::new(
+            toolkit_db::odata::LimitCfg {
+                default: 20,
+                max: 100,
+            },
+        )),
+        Arc::new(crate::infra::db::repo::message_attachment_repo::MessageAttachmentRepository),
+        mock_enforcer(),
+        Arc::new(RecordingOutboxEnqueuer::new()),
+        Arc::new(crate::domain::ports::metrics::NoopMetrics),
+    );
+    racing
+        .preview_mutation(&ctx, chat_id, request_id, None)
+        .await
+        .map(|_| ())
+}
+
+// A concurrent retry commits between the validation and the user-message
+// lookup: the loser must see the real cause (409), not an internal error.
+#[tokio::test]
+async fn preview_after_concurrent_retry_is_not_latest_turn() {
+    let err = preview_racing_mutation(true).await.unwrap_err();
+    assert!(
+        matches!(err, MutationError::NotLatestTurn),
+        "expected NotLatestTurn, got: {err:?}"
+    );
+}
+
+// A turn that still validates but has no user message is a real inconsistency.
+#[tokio::test]
+async fn preview_without_user_message_on_valid_turn_is_internal() {
+    let err = preview_racing_mutation(false).await.unwrap_err();
+    assert!(
+        matches!(err, MutationError::Internal { .. }),
+        "expected Internal, got: {err:?}"
+    );
+}
+
+// ════════════════════════════════════════════════════════════════════════════
 // Thread summary covering the mutated turn
 // ════════════════════════════════════════════════════════════════════════════
 
