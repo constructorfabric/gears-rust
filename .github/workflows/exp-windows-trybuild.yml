@@ -1,0 +1,154 @@
+name: exp windows trybuild
+
+# One-off experiment, never merged: why are the trybuild compile-fail tests
+# about 3.8x slower on windows-latest than on the self-hosted Linux runner?
+# Runs on pushes to lobster40/exp/** only. Each matrix leg is its own fresh
+# runner, so the legs do not disturb each other.
+on:
+  push:
+    branches: ['lobster40/exp/**']
+  workflow_dispatch:
+
+concurrency:
+  group: exp-windows-trybuild-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  PKG: cf-gears-toolkit-contract-macros-tests
+
+jobs:
+  probe:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Same flags as test-suite.yml uses on Windows.
+          - { name: win-baseline,   os: windows-latest, rustflags: '-C debuginfo=0 -C linker=lld-link', defender: false, jobs: '' }
+          # Defender real-time scanning off and the work folders excluded.
+          - { name: win-no-defender, os: windows-latest, rustflags: '-C debuginfo=0 -C linker=lld-link', defender: true,  jobs: '' }
+          # Fewer rustc processes inside each trybuild cargo.
+          - { name: win-jobs2,      os: windows-latest, rustflags: '-C debuginfo=0 -C linker=lld-link', defender: false, jobs: '2' }
+          # RUSTFLAGS unset: link.exe and debuginfo as the toolchain default.
+          - { name: win-noflags,    os: windows-latest, rustflags: '',                                  defender: false, jobs: '' }
+          # Control: GitHub-hosted Linux, same vCPU class as windows-latest.
+          - { name: ubuntu-control, os: ubuntu-latest,  rustflags: '-C debuginfo=0',                    defender: false, jobs: '' }
+    steps:
+      - name: Machine
+        shell: bash
+        run: |
+          {
+            echo "## ${{ matrix.name }}"
+            echo '```'
+            if [ "$RUNNER_OS" = Windows ]; then
+              echo "NUMBER_OF_PROCESSORS=$NUMBER_OF_PROCESSORS"
+              powershell -NoProfile -Command "Get-CimInstance Win32_Processor | Select-Object Name,NumberOfCores,NumberOfLogicalProcessors | Format-List | Out-String"
+              powershell -NoProfile -Command "'RAM GB: ' + [math]::Round((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory/1GB,1)"
+              powershell -NoProfile -Command "Get-MpComputerStatus | Select-Object RealTimeProtectionEnabled,AntivirusEnabled | Format-List | Out-String"
+            else
+              echo "nproc=$(nproc)"; lscpu | grep -E 'Model name|^CPU\(s\)'; free -g | head -2
+            fi
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Defender off
+        if: matrix.defender
+        shell: pwsh
+        run: |
+          Add-MpPreference -ExclusionPath $env:GITHUB_WORKSPACE, "$env:USERPROFILE\.cargo", "$env:USERPROFILE\.rustup", $env:RUNNER_TEMP, "D:\a"
+          Set-MpPreference -DisableRealtimeMonitoring $true
+          Get-MpComputerStatus | Select-Object RealTimeProtectionEnabled | Format-List
+
+      - name: Env for this leg
+        shell: bash
+        run: |
+          if [ -n "${{ matrix.rustflags }}" ]; then echo "RUSTFLAGS=${{ matrix.rustflags }}" >> "$GITHUB_ENV"; fi
+          if [ -n "${{ matrix.jobs }}" ]; then echo "CARGO_BUILD_JOBS=${{ matrix.jobs }}" >> "$GITHUB_ENV"; fi
+
+      - name: Force LF in working tree (w/a for Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          git config --global core.autocrlf false
+          git config --global core.eol lf
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Filesystem micro-benchmark (20000 small files)
+        shell: bash
+        run: |
+          PY=$(command -v python3 || command -v python)
+          cat > "$RUNNER_TEMP/fsbench.py" <<'PYEOF'
+          import os, sys, time, shutil
+          d = os.path.join(sys.argv[1], "fsbench"); shutil.rmtree(d, ignore_errors=True); os.makedirs(d)
+          n = 20000
+          t = time.time()
+          for i in range(n):
+              with open(os.path.join(d, f"f{i}.rs"), "w") as f: f.write("fn x() {}\n" * 10)
+          w = time.time() - t; t = time.time()
+          for i in range(n):
+              with open(os.path.join(d, f"f{i}.rs")) as f: f.read()
+          r = time.time() - t; t = time.time()
+          shutil.rmtree(d)
+          print(f"write {w:.1f}s read {r:.1f}s delete {time.time()-t:.1f}s for {n} files")
+          PYEOF
+          "$PY" "$RUNNER_TEMP/fsbench.py" "$RUNNER_TEMP" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Install protoc
+        uses: taiki-e/install-action@68a389c788b2cd04016ce8c80ee23b80d2ab3d68 # v2.88.1
+        with:
+          tool: protoc@3.34.1,nextest
+
+      - name: Install Go (as test-suite.yml)
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: '1.21.x'
+          cache: false
+
+      - name: Install Rust toolchain from rust-toolchain.toml
+        shell: bash
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          rustup show
+
+      - name: Build the test binaries (cold)
+        id: build
+        shell: bash
+        run: |
+          s=$(date +%s)
+          cargo nextest run -p "$PKG" --no-run 2>&1 | tail -n 5
+          echo "build=$(( $(date +%s) - s ))" >> "$GITHUB_OUTPUT"
+
+      - name: Run 1 (cold trybuild)
+        id: run1
+        shell: bash
+        run: |
+          s=$(date +%s)
+          cargo nextest run -p "$PKG" --no-fail-fast 2>&1 | tail -n 12 || true
+          echo "secs=$(( $(date +%s) - s ))" >> "$GITHUB_OUTPUT"
+
+      - name: Run 2 (trybuild artifacts warm)
+        id: run2
+        shell: bash
+        run: |
+          s=$(date +%s)
+          cargo nextest run -p "$PKG" --no-fail-fast 2>&1 | tail -n 12 || true
+          echo "secs=$(( $(date +%s) - s ))" >> "$GITHUB_OUTPUT"
+
+      - name: Result
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "### ${{ matrix.name }} result (seconds)"
+            echo "| build | run 1 | run 2 |"
+            echo "|---|---|---|"
+            echo "| ${{ steps.build.outputs.build }} | ${{ steps.run1.outputs.secs }} | ${{ steps.run2.outputs.secs }} |"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
