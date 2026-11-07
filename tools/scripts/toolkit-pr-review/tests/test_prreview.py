@@ -18,6 +18,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -32,7 +33,7 @@ import ghsource      # noqa: E402
 import budget        # noqa: E402
 import lint          # noqa: E402
 
-FIXTURE_PRS = sorted(p.name for p in FIXTURES.iterdir() if p.is_dir()) if FIXTURES.exists() else []
+FIXTURE_PRS = sorted(p.name for p in FIXTURES.iterdir() if p.is_dir() and (p / "diff.patch").is_file()) if FIXTURES.exists() else []
 
 
 def load(pr: str) -> str:
@@ -158,6 +159,9 @@ class TestLocalBase(unittest.TestCase):
     """
 
     def setUp(self):
+        isolated_env = patch.dict(os.environ, ghsource.git_environment(), clear=True)
+        isolated_env.start()
+        self.addCleanup(isolated_env.stop)
         self.repo = Path(tempfile.mkdtemp(prefix="prreview-base."))
         self.addCleanup(shutil.rmtree, self.repo, True)
         cwd = os.getcwd()
@@ -234,14 +238,15 @@ class TestSeverityMarker(unittest.TestCase):
                     self.assertIn(bad.group(1), lint.SEVERITIES,
                                   f"{path.name}:{n} has a non-severity bracket marker")
 
-    def test_conventions_and_the_agent_prompt_both_document_the_override(self):
+    def test_conventions_and_agent_calibrate_from_consequences(self):
         """An undocumented marker is inert: the agent reads the rule's level and moves on."""
         conv = (ROOT / "docs/toolkit-pr-review/review-conventions.md").read_text(encoding="utf-8")
         subj = (ROOT / "docs/toolkit-pr-review/agents/subject.md").read_text(encoding="utf-8")
         self.assertIn("[MEDIUM]", conv)
         self.assertIn("override", conv.lower())
         self.assertIn("[MEDIUM]", subj)
-        self.assertIn("wins over the rule", subj)
+        self.assertIn("historical guides", subj)
+        self.assertIn("consequences", subj)
 
 
 class TestBudget(unittest.TestCase):

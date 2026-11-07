@@ -1,7 +1,3 @@
-# /toolkit-pr-review
-
-Review a GitHub PR for Rust + ToolKit compliance and post inline comments.
-
-ALWAYS open and follow `.claude/skills/toolkit-pr-review/SKILL.md`.
-
-Usage: `/toolkit-pr-review <PR_NUMBER> [--repo <owner/repo>]`
+Open and follow `.claude/skills/toolkit-pr-review/SKILL.md` before reviewing.
+Use its pinned prepare → draft/closure → collect → matching → format → publish gates.
+Model inherits from the caller. Do not implement an independent review workflow here.

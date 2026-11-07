@@ -11,8 +11,8 @@ Apply every rule in this module to every changed file in the PR.
 
 ## Check IDs to Apply
 
-Apply **only** these specific check IDs. Each rule's `**Severity**` is the value to put in the
-finding; do not infer it from the example in the Output Contract.
+Apply **only** these specific check IDs. Rule `**Severity**` lines and criterion levels
+are historical guides, not assigned grades; apply policies/severity.md to actual consequences.
 
 ### 1. RUST-ERR-001 — Error Handling Is Explicit and Useful
 **Severity**: CRITICAL

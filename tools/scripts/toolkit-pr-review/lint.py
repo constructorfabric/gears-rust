@@ -33,6 +33,10 @@ STUB_DIR = ROOT / ".claude/agents"
 ARCH_AGENT = AGENT_DIR / "architecture.md"
 SKILL = ROOT / ".claude/skills/toolkit-pr-review/SKILL.md"
 DEVIN = ROOT / ".devin/workflows/toolkit-pr-review.md"
+ALIASES = [ROOT / p for p in (
+    ".agents/skills/toolkit-pr-review/SKILL.md", ".cursor/commands/toolkit-pr-review.md",
+    ".codex/prompts/toolkit-pr-review.md", ".devin/workflows/toolkit-pr-review.md",
+    ".windsurf/workflows/toolkit-pr-review.md")]
 CONVENTIONS = ROOT / "docs/toolkit-pr-review/review-conventions.md"
 STYLE = ROOT / "docs/toolkit-pr-review/comment-style.md"
 CARGO = ROOT / "Cargo.toml"
@@ -408,7 +412,7 @@ def report_severity_spread() -> None:
             elif current in spread:
                 spread[current] += 1
     shown = ", ".join(f"{s.lower()}={spread[s]}" for s in SEVERITIES)
-    note(f"criterion severity: {shown} ({overrides} overridden at criterion level)")
+    note(f"historical criterion labels (not assigned severity): {shown} ({overrides} explicit criterion markers)")
 
 
 # Markers of a harness that has gone back to doing prepare's work in prose. Each one names
@@ -429,7 +433,7 @@ def check_harnesses_call_prepare() -> None:
     drifted on five behaviours, two of them defects that silently posted comments on the
     wrong lines. A script nothing calls is not a safeguard.
     """
-    for f in (SKILL, DEVIN):
+    for f in (SKILL,):
         if not f.exists():
             fail("harness", f"{f.relative_to(ROOT)} is missing")
             continue
@@ -440,7 +444,7 @@ def check_harnesses_call_prepare() -> None:
 
     # The agent prompts and rule modules name context.json fields too, and an agent told to
     # read a field prepare does not emit simply finds nothing and reports nothing.
-    docs = [SKILL, DEVIN, SUBJECT_AGENT, ARCH_AGENT]
+    docs = [SKILL, SUBJECT_AGENT, ARCH_AGENT, CONVENTIONS]
     docs += sorted(RULES_DIR.glob("*.md"))
     for f in docs:
         if not f.exists():
@@ -449,16 +453,34 @@ def check_harnesses_call_prepare() -> None:
         for marker, why in REDRIFT.items():
             if marker in text:
                 fail("harness", f"{f.relative_to(ROOT)} still refers to `{marker}`: {why}")
+        for marker in ("wins over the rule", "second and third are expected", "treat it as []", "max 2 comments", "is the value to put in the", "emit it without `line`", "with **no** `line` field"):
+            if marker in text:
+                fail("harness", f"contradicting legacy instruction in {f.relative_to(ROOT)}: {marker}")
+    for f in ALIASES:
+        if not f.exists():
+            fail("entrypoint", f"missing {f.relative_to(ROOT)}")
+            continue
+        text = f.read_text(encoding="utf-8")
+        if ".claude/skills/toolkit-pr-review/SKILL.md" not in text or len(text.splitlines()) > 15:
+            fail("entrypoint", f"{f.relative_to(ROOT)} must be a thin canonical reference")
+    for module in [p.stem for p in RULES_DIR.glob("*.md")] + ["architecture"]:
+        for directory, ext in ((".claude/agents", "md"), (".codex/agents", "toml")):
+            f = ROOT / directory / f"toolkit-pr-review-{module}.{ext}"
+            if not f.exists() or "JSON array" in f.read_text(encoding="utf-8"):
+                fail("entrypoint", f"missing or obsolete agent registration {f.relative_to(ROOT)}")
+    text = SKILL.read_text(encoding="utf-8")
+    for command in ("validate-pass", "collect-input", "validate-collect", "match-input", "validate-match", "format-input", "finalize", "publish"):
+        if command not in text:
+            fail("harness", f"canonical workflow does not invoke {command}")
 
 
 def check_shared_files() -> None:
     for f in (CONVENTIONS, STYLE):
         if not f.exists():
             fail("shared", f"{f.relative_to(ROOT)} is missing")
-    if DEVIN.exists():
-        t = DEVIN.read_text(encoding="utf-8")
-        if "review-conventions.md" not in t:
-            fail("harness", "the Devin workflow does not mention review-conventions.md")
+    if len(parse_rules()) != 52:
+        fail("rules", "the workflow must preserve all 52 rules")
+
 
 
 def write_index(rules: dict[str, dict]) -> None:

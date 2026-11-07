@@ -15,8 +15,8 @@ entire diff, and it belongs to the architecture agent. Do not attempt it here.
 
 ## Check IDs to Apply
 
-Apply **only** these specific check IDs. Each rule's `**Severity**` is the value to put in the
-finding; do not infer it from the example in the Output Contract.
+Apply **only** these specific check IDs. Rule `**Severity**` lines and criterion levels
+are historical guides, not assigned grades; apply policies/severity.md to actual consequences.
 
 ### 1. RUST-API-001 — Idiomatic Public API Design
 **Severity**: HIGH
