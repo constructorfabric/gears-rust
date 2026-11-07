@@ -70,7 +70,7 @@ async fn consumer_tuning_concurrency_cap_sheds_second_request() {
     let (base_url, state) = start_hold_server().await;
     let url = format!("{base_url}/hold");
 
-    // The knob a deployment would put under `consumer_wiring.<dep>`.
+    // The knob a deployment would put under `clients.consumes.<dep>`.
     let tuning = ClientTuning {
         max_concurrent_requests: Some(1),
         ..ClientTuning::default()

@@ -13,7 +13,9 @@ publish = false
 name = "cf_api_contracts"
 
 [features]
-default = []
+# `grpc-client` is on so `cargo test --workspace` (what CI runs) covers the
+# gRPC client, resolving and runtime tests of this example.
+default = ["grpc-client"]
 # OpenTelemetry in generated clients: W3C traceparent propagation + RED metrics.
 otel = ["toolkit/otel", "api-contracts-sdk/otel"]
 grpc-client = [
@@ -77,6 +79,7 @@ types-registry = { package = "cf-gears-types-registry", path = "../../../../gear
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full"] }
+toolkit-resilience = { workspace = true }
 tokio-stream = { workspace = true }
 tokio-util = { workspace = true }
 toolkit-canonical-errors.workspace = true

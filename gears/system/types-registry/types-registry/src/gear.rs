@@ -38,8 +38,8 @@ use crate::infra::storage::Repos;
 /// Both contracts are provided locally and over REST (SPEC §8.4), except under
 /// `mode: legacy_only` ([`RegistryMode::LegacyOnly`]), which keeps only the legacy client
 /// and v1 routes and stays out of the service directory. The registry's own host
-/// always wires them `Local` — its configuration admits no `client_wiring` — and only past
-/// the seed barrier; a consumer elsewhere reaches them through the SDK's resolving clients.
+/// always wires them `Local` — a remote `clients.provides` entry for either is a boot
+/// error ([`refuse_remote_wiring`]) — and only past the seed barrier; a consumer elsewhere reaches them through the SDK's resolving clients.
 #[toolkit::provides(
     contract = types_registry_sdk::PlatformTypesRegistryApi,
     local = Self::seeded_platform_api,
@@ -145,6 +145,7 @@ impl TypesRegistryGear {
         ctx: &GearCtx,
         registry: &Arc<RegistryService>,
     ) -> anyhow::Result<()> {
+        refuse_remote_wiring(ctx.config_provider(), ctx.gear_name())?;
         let seeded = SeededClient(Arc::new(LocalClient::new(Arc::clone(registry))));
         held_while(&ctx.client_hub(), Arc::new(seeded), async {
             self.wire_platform_types_registry_api(ctx).await?;
@@ -492,6 +493,29 @@ impl RestApiCapability for TypesRegistryGear {
         info!("Types registry REST routes registered successfully");
         Ok(router)
     }
+}
+
+/// The contracts this gear provides, as `clients.provides` keys.
+const PROVIDED_CONTRACTS: [&str; 2] = ["platform_types_registry_api", "types_registry_api"];
+
+/// Refuse a `clients.provides` entry that binds either contract remotely: the
+/// registry serves both itself, and a remote binding would point it at itself.
+fn refuse_remote_wiring(
+    cfg: &dyn toolkit::config::ConfigProvider,
+    gear: &str,
+) -> anyhow::Result<()> {
+    for key in PROVIDED_CONTRACTS {
+        if !matches!(
+            toolkit::clients_config::provided_wiring(cfg, gear, key)?,
+            toolkit::clients_config::ClientWiring::Local
+        ) {
+            anyhow::bail!(
+                "gears.{gear}.clients.provides.{key}: the registry serves this contract itself; \
+                 remove the entry or set transport `local`"
+            );
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

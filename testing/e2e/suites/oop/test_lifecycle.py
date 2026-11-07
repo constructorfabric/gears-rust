@@ -78,6 +78,21 @@ def _readyz_status(url: str) -> int:
         return 0
 
 
+def _waits_on_provider(url: str) -> bool:
+    """`/readyz` is 503 and lists the provider as unresolved.
+
+    A starting gear answers 503 before its consumer wiring has registered the
+    dep (only the startup preparation gate is listed then), so 503 alone does
+    not mean the dep is being waited on.
+    """
+    try:
+        r = httpx.get(f"{url}/readyz", timeout=REQUEST_TIMEOUT)
+        unresolved = r.json().get("unresolved_deps", [])
+    except (httpx.HTTPError, ValueError):
+        return False
+    return r.status_code == 503 and PROVIDER_DEP in unresolved
+
+
 @pytest.fixture
 def provider_consumer_restored(cluster):
     """Restore provider + consumer (up and ready) after the readiness test."""
@@ -118,7 +133,7 @@ def test_consumer_readiness_gates_on_provider_dependency(cluster, provider_consu
 
     cluster.wait(
         "consumer reports not-ready while its provider dependency is unresolved",
-        lambda: _readyz_status(consumer_url) == 503,
+        lambda: _waits_on_provider(consumer_url),
     )
     r = httpx.get(f"{consumer_url}/readyz", timeout=REQUEST_TIMEOUT)
     assert r.status_code == 503, r.text

@@ -8,26 +8,32 @@
 //! `resolving_client` names one contract, so with several it goes on the entry.
 //! The list expands exactly like one attribute per contract.
 //!
+//! `transport = grpc` (top level, or on an entry) wires the contract's
+//! `<Contract>GrpcResolvingClient` from `#[toolkit::grpc_contract]` instead:
+//! it resolves the gRPC service name from the directory and calls it over a
+//! lazily connecting channel. `transport = rest` is the default.
+//!
 //! Applied on the **gear struct** (alongside `#[toolkit::gear]`). Emits a
 //! non-capturing `fn` plus an `inventory::submit!` of a
 //! [`toolkit::discovery::ConsumerRegistration`] that the runtime's proxy-wiring
 //! phase replays at startup. The wiring closure:
 //!   1. short-circuits if a compile-time (local) impl is already in the
 //!      `ClientHub` — a co-located provider wins;
-//!   2. otherwise registers a directory-resolving REST client under the
+//!   2. otherwise registers a directory-resolving REST or gRPC client under the
 //!      contract trait, which lazily resolves the provider endpoint per call.
 //!
 //! The runtime passes the consuming gear's view of the hub
 //! (`ClientHub::for_gear`), so the proxy belongs to that gear and is built from
-//! its own `consumer_wiring.<dep>` settings. Two gears consuming one contract
+//! its own `clients.consumes.<dep>` settings. Two gears consuming one contract
 //! get two proxies. One gear declaring the same contract twice would get one
 //! proxy for both: on one struct that is a compile error, and the wire fn also
 //! refuses it at boot for spellings the macro cannot compare.
 //!
 //! **Requirements on the consuming crate.** The emission is unconditional, so
 //! the crate needs a `toolkit` dependency (for `ClientHub`, `discovery` and the
-//! `inventory` re-export) and its contract SDK built with `rest-client`, which
-//! is what makes `<Contract>RestResolvingClient` exist. A missing SDK feature is
+//! `inventory` re-export) and its contract SDK built with `rest-client` (or
+//! `grpc-client` for `transport = grpc`), which is what makes the resolving
+//! client exist. A missing SDK feature is
 //! a hard `cannot find type` error rather than silently-dropped wiring; this
 //! attribute used to sit behind a `directory-rest-client` feature evaluated in
 //! the consuming crate, which turned a forgotten feature into a gear that
@@ -35,7 +41,7 @@
 //!
 //! **Gear name.** The emitted `owner_gear` is the gear's name, because the
 //! runtime uses it as a config key for the ADR-0004 static-endpoint override and
-//! the criticality flag (`gears.<owner_gear>.config.consumer_wiring.<dep>`), as
+//! the criticality flag (`gears.<owner_gear>.clients.consumes.<dep>`), as
 //! the owner of the hub view the proxy is wired into, and in log/error fields.
 //! When this attribute sits **above** `#[toolkit::gear]`, the gear attribute is
 //! still on the item and its `name = "..."` is used, so a
@@ -76,12 +82,43 @@ pub struct ConsumedContract {
     pub from: String,
     /// Optional override for the resolving-client path.
     ///
-    /// The default (`<parent>::<Contract>RestResolvingClient`) assumes the SDK
-    /// re-exports the resolving client at the **same module level** as the base
-    /// contract trait (as `#[toolkit::rest_contract]` SDKs do). Set this
-    /// explicitly when the base trait and its REST projection live in different
-    /// submodules.
+    /// The default (`<parent>::<Contract>RestResolvingClient`, or
+    /// `<parent>::<Contract>GrpcResolvingClient` for `transport = grpc`)
+    /// assumes the SDK re-exports the resolving client at the **same module
+    /// level** as the base contract trait. Set this explicitly when the base
+    /// trait and its projection live in different submodules.
     pub resolving_client: Option<Path>,
+    /// Transport the client talks to the provider over.
+    pub transport: Transport,
+}
+
+/// The transport of a consumed contract's client.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Transport {
+    /// `<Contract>RestResolvingClient`, resolved by gear name. The default.
+    #[default]
+    Rest,
+    /// `<Contract>GrpcResolvingClient`, resolved by gRPC service name.
+    Grpc,
+}
+
+fn expr_into_transport(value: &syn::Expr, key: &syn::Ident) -> SynResult<Transport> {
+    let name = match value {
+        syn::Expr::Path(p) if p.qself.is_none() => p.path.get_ident().map(ToString::to_string),
+        syn::Expr::Lit(syn::ExprLit {
+            lit: syn::Lit::Str(s),
+            ..
+        }) => Some(s.value()),
+        _ => None,
+    };
+    match name.as_deref() {
+        Some("rest") => Ok(Transport::Rest),
+        Some("grpc") => Ok(Transport::Grpc),
+        _ => Err(syn::Error::new_spanned(
+            value,
+            format!("`{key}` is `rest` or `grpc`"),
+        )),
+    }
 }
 
 impl Parse for ConsumesAttr {
@@ -90,9 +127,11 @@ impl Parse for ConsumesAttr {
 
         let mut from: Option<String> = None;
         let mut resolving_client: Option<Path> = None;
+        let mut transport = Transport::default();
         for kv in &args.rest {
             match kv.key.to_string().as_str() {
                 "from" => from = Some(expr_into_string(kv.value.clone(), &kv.key)?),
+                "transport" => transport = expr_into_transport(&kv.value, &kv.key)?,
                 "resolving_client" => {
                     args.check_per_contract_key(&kv.key)?;
                     resolving_client = Some(expr_into_path(kv.value.clone(), &kv.key)?);
@@ -111,9 +150,11 @@ impl Parse for ConsumesAttr {
         for entry in &args.contracts {
             let mut entry_from = from.clone();
             let mut entry_resolving_client = resolving_client.clone();
+            let mut entry_transport = transport;
             for kv in &entry.opts {
                 match kv.key.to_string().as_str() {
                     "from" => entry_from = Some(expr_into_string(kv.value.clone(), &kv.key)?),
+                    "transport" => entry_transport = expr_into_transport(&kv.value, &kv.key)?,
                     "resolving_client" => {
                         entry_resolving_client = Some(expr_into_path(kv.value.clone(), &kv.key)?);
                     }
@@ -135,6 +176,7 @@ impl Parse for ConsumesAttr {
                 contract: entry.path.clone(),
                 from,
                 resolving_client: entry_resolving_client,
+                transport: entry_transport,
             });
         }
         Ok(Self { contracts })
@@ -211,7 +253,7 @@ fn declared_gear_name(item: &ItemStruct) -> Option<String> {
 /// Top-level entry point invoked by the proc-macro shim in `lib.rs`.
 pub fn generate(attr: &ConsumesAttr, item: &ItemStruct) -> SynResult<TokenStream> {
     // `owner_gear` is the *gear name*, not the Rust type name: the runtime uses
-    // it as a config key (`gears.<owner_gear>.config.consumer_wiring.<dep>`) for
+    // it as a config key (`gears.<owner_gear>.clients.consumes.<dep>`) for
     // the ADR-0004 static-endpoint override, and as a log/error field. Gear
     // names are kebab-case, so derive it from the struct ident rather than
     // emitting `stringify!` — `stringify!(ApiContractsConsumer)` would look up
@@ -241,19 +283,30 @@ fn generate_one(attr: &ConsumedContract, owner_gear: &str) -> SynResult<TokenStr
         .ok_or_else(|| syn::Error::new_spanned(contract_path, "`contract` path is empty"))?;
     let from = &attr.from;
 
-    // Default resolving-client path: `<parent>::<Contract>RestResolvingClient`,
-    // mirroring how `#[toolkit::rest_contract]` names it (the REST projection of
-    // `PaymentApi` is `PaymentApiRest`, whose resolving client is
-    // `PaymentApiRestResolvingClient`). The SDK re-exports it at the same level
-    // as the base contract trait.
+    // Default resolving-client path: `<parent>::<Contract>RestResolvingClient`
+    // (or `GrpcResolvingClient`), mirroring how `#[toolkit::rest_contract]` and
+    // `#[toolkit::grpc_contract]` name it: the REST projection of `PaymentApi` is
+    // `PaymentApiRest`, whose resolving client is `PaymentApiRestResolvingClient`.
+    // The SDK re-exports it at the same level as the base contract trait.
+    let suffix = match attr.transport {
+        Transport::Rest => "RestResolvingClient",
+        Transport::Grpc => "GrpcResolvingClient",
+    };
     let resolving_client_path = if let Some(p) = &attr.resolving_client {
         p.clone()
     } else {
         let parent = parent_module(contract_path)?;
-        append_segment(
-            &parent,
-            &format_ident!("{}RestResolvingClient", contract_ident),
-        )
+        append_segment(&parent, &format_ident!("{contract_ident}{suffix}"))
+    };
+    // What the runtime probes for readiness: the provider's REST endpoint, or
+    // the gRPC service the client resolves.
+    let remote = match attr.transport {
+        Transport::Rest => quote! { ::toolkit::discovery::WireOutcome::Remote },
+        Transport::Grpc => quote! {
+            ::toolkit::discovery::WireOutcome::RemoteGrpc {
+                service: #resolving_client_path::GRPC_SERVICE,
+            }
+        },
     };
 
     let wire_fn = format_ident!(
@@ -294,11 +347,11 @@ fn generate_one(attr: &ConsumedContract, owner_gear: &str) -> SynResult<TokenStr
                         #from,
                     ));
                 }
-                return ::std::result::Result::Ok(::toolkit::discovery::WireOutcome::Remote);
+                return ::std::result::Result::Ok(#remote);
             }
-            // Otherwise register the directory-resolving REST client. The tuning
+            // Otherwise register the directory-resolving client. The tuning
             // is prepared by the runtime's proxy-wiring phase from the consumer's
-            // `consumer_wiring.<dep>` config and carries the process's platform-plane
+            // `clients.consumes.<dep>` config and carries the process's platform-plane
             // credential source, so platform-plane methods attach
             // `X-ToolKit-Internal-Token` (`cpt-cf-adr-two-plane-auth`).
             let __client = #resolving_client_path::new(
@@ -307,7 +360,7 @@ fn generate_one(attr: &ConsumedContract, owner_gear: &str) -> SynResult<TokenStr
                 __tuning,
             );
             __hub.register_remote_proxy::<dyn #contract_path>(::std::sync::Arc::new(__client));
-            ::std::result::Result::Ok(::toolkit::discovery::WireOutcome::Remote)
+            ::std::result::Result::Ok(#remote)
         }
 
         ::toolkit::inventory::submit! {
@@ -333,7 +386,7 @@ mod tests {
         generate(&attr, item).unwrap().to_string()
     }
 
-    /// `owner_gear` is a config key (`gears.<owner_gear>.config.consumer_wiring.<dep>`),
+    /// `owner_gear` is a config key (`gears.<owner_gear>.clients.consumes.<dep>`),
     /// so it must be the kebab gear name — not the Rust type name. Emitting
     /// `stringify!(ApiContractsConsumer)` made the static override unresolvable.
     #[test]
@@ -455,6 +508,48 @@ mod tests {
             "{out}"
         );
         assert!(out.contains("sdk :: TenantApiRestResolvingClient"), "{out}");
+    }
+
+    #[test]
+    fn transport_grpc_wires_the_grpc_resolving_client() {
+        let out =
+            expand_with(r#"contract = sdk::Api, from = "billing", transport = grpc"#).unwrap();
+        assert!(
+            out.contains("sdk :: ApiGrpcResolvingClient :: new"),
+            "{out}"
+        );
+        assert!(
+            out.contains("WireOutcome :: RemoteGrpc { service : sdk :: ApiGrpcResolvingClient :: GRPC_SERVICE"),
+            "{out}"
+        );
+        assert!(!out.contains("RestResolvingClient"), "{out}");
+    }
+
+    #[test]
+    fn rest_is_the_default_transport() {
+        let implicit = expand_with(r#"contract = sdk::Api, from = "billing""#).unwrap();
+        let explicit =
+            expand_with(r#"contract = sdk::Api, from = "billing", transport = rest"#).unwrap();
+        assert_eq!(implicit, explicit);
+        assert!(!implicit.contains("RemoteGrpc"), "{implicit}");
+    }
+
+    #[test]
+    fn an_entry_sets_its_own_transport() {
+        let out = expand_with(
+            r#"from = "b", transport = grpc, contract = [sdk::Fast, sdk::Plain(transport = rest)]"#,
+        )
+        .unwrap();
+        assert!(out.contains("sdk :: FastGrpcResolvingClient"), "{out}");
+        assert!(out.contains("sdk :: PlainRestResolvingClient"), "{out}");
+    }
+
+    #[test]
+    fn an_unknown_transport_is_an_error() {
+        let err = expand_with(r#"contract = sdk::Api, from = "b", transport = soap"#)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("`transport` is `rest` or `grpc`"), "{err}");
     }
 
     #[test]

@@ -97,6 +97,9 @@ pub fn render_effective_gears_config(app: &AppConfig) -> Result<serde_json::Valu
         if !parsed_config.config.is_null() {
             gear_entry.insert("config".to_owned(), parsed_config.config);
         }
+        if !parsed_config.clients.is_null() {
+            gear_entry.insert("clients".to_owned(), parsed_config.clients);
+        }
 
         // Get database configuration (resolved DSN + pool) - use dry_run=true
         match build_final_db_for_gear(app, gear_name, &home_dir, true) {

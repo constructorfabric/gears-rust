@@ -8,13 +8,15 @@
 //!
 //! # Why it is hand-written
 //!
-//! `#[toolkit::consumes]` generates a `<Contract>RestResolvingClient` and there is
-//! no gRPC counterpart planned. Cluster's data plane is gRPC (§2.2.1), so the
-//! macro cannot generate cluster's client — but `ConsumerRegistration` is a plain
-//! transport-agnostic struct, so cluster reuses the *mechanism* and writes only
-//! the one thing the macro cannot: the closure. That is a smaller deviation than
-//! it sounds, and its owner has confirmed the registration needs no rework when a
-//! generated gRPC client eventually lands (§4.9.2).
+//! `#[toolkit::consumes(.., transport = grpc)]` now generates a gRPC consumer: a
+//! `<Contract>GrpcResolvingClient` that finds its provider in the directory by
+//! service name. Cluster still writes its registration by hand because that
+//! client does not fit cluster's data plane (§2.2.1): cluster resolves by DNS
+//! convention without the directory (see below), shares one channel across its
+//! four services, and needs RPCs without a deadline (`Lock` waits server-side,
+//! watches are long-lived), while the generated client applies a per-call
+//! timeout to every RPC. `ConsumerRegistration` is a plain transport-agnostic
+//! struct, so cluster reuses the *mechanism* and writes only the closure (§4.9.2).
 //!
 //! # The endpoint is derived, not resolved
 //!
@@ -22,11 +24,12 @@
 //! the framework's `EndpointResolver` is ignored. Three reasons, in descending
 //! order of how load-bearing they are:
 //!
-//! - **It resolves the wrong plane.** `DirectoryEndpointResolver` calls
-//!   `resolve_rest_service`, which answers with a REST base URI. Cluster's
-//!   coordination plane is gRPC on a different port; handing that URI to
+//! - **It resolves the wrong plane.** `EndpointResolver::resolve_endpoint`
+//!   answers with the gear's REST base URI. Cluster's coordination plane is
+//!   gRPC on a different port; handing that URI to
 //!   `RemoteClusterClient::connect_lazy` would build a channel to the wrong
-//!   listener.
+//!   listener. (`resolve_grpc_endpoint` looks one service up in the directory,
+//!   and cluster resolves without a directory.)
 //! - **It cannot be consulted here.** `EndpointResolver::resolve_endpoint` is
 //!   `async` and `ConsumerRegistration::wire` is a sync `fn`. Blocking on the
 //!   future would block a runtime worker inside the wiring phase.
@@ -35,7 +38,7 @@
 //!   that does not exist yet — decision 21, and a platform-PRD question.
 //!
 //! **The cost, stated rather than buried**: the ADR-0004 static override
-//! (`gears.<owner>.config.consumer_wiring.<dep>`) therefore does not reach
+//! (`gears.<owner>.clients.consumes.<dep>`) therefore does not reach
 //! cluster, and §4.5 names that override as the current mechanism for a
 //! directory-less Kubernetes deployment. For cluster, DNS convention *is* that
 //! mechanism — which is the intended end state and needs no directory, so nothing
@@ -44,11 +47,11 @@
 //! there is no cluster-side endpoint key, in any form.
 //!
 //! **Only the *endpoint* half is inert, though — the key is still read, and it
-//! silently drops a readiness gate.** The phase's `consumer_wiring` read
+//! silently drops a readiness gate.** The phase's `clients.consumes` read
 //! (`host_runtime.rs`) does not consult `known_gears`, so a
-//! `gears.cluster-sdk.config.consumer_wiring.cluster` value is picked up even
+//! `gears.cluster-sdk.clients.consumes.cluster` value is picked up even
 //! though `owner_gear: "cluster-sdk"` names no registered gear. The phase then
-//! takes its `is_static` branch and calls `dep_checker.mark_resolved("cluster")`
+//! takes its static-override branch and calls `dep_checker.mark_resolved("cluster")`
 //! **with no probe**, while `wire` below still builds its own DNS-derived
 //! channel. Measured: with the key set, a consumer's `unresolved_deps()` at
 //! `start` is `[]`; without it, `["cluster"]`. So the override cannot redirect
@@ -278,7 +281,7 @@ fn wire(
     // and reads none of the tuning knobs — `connect_lazy` builds the channel from
     // SDK constants — so we take ownership of just the platform-plane credential
     // source and forward it to `RemoteClusterClient::connect_lazy`. Anything else
-    // set under `consumer_wiring.cluster` has no effect (see the module docs and
+    // set under `clients.consumes.cluster` has no effect (see the module docs and
     // the `ConsumerWiring` docs). `None` attaches nothing.
     let internal_token_provider = tuning.internal_token_provider;
     // 1. Local wins, and `try_get_local` is the right probe: it ignores anything
@@ -310,7 +313,7 @@ toolkit::inventory::submit! {
     ConsumerRegistration {
         // Neither name is a free choice, and the first one is a known mismatch
         // with the framework's model. `owner_gear` is meant to be the consuming
-        // gear's registry name, so that `gears.<owner>.config.consumer_wiring.*`
+        // gear's registry name, so that `gears.<owner>.clients.consumes.*`
         // resolves - but this registration is submitted by an *SDK*, once per
         // process, on behalf of however many consumer gears link it. There is no
         // single owner to name. The framework logs a `warn!` when `owner_gear` is

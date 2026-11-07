@@ -53,6 +53,11 @@ pub struct GearConfig {
     pub runtime: Option<GearRuntime>,
     #[serde(default)] // Used by the CLI
     pub metadata: serde_json::Value,
+    /// Settings for the clients the gear builds through wiring
+    /// (`defaults`, `consumes.<dep>`, `provides.<contract>`); read by
+    /// [`crate::clients_config`].
+    #[serde(default)]
+    pub clients: serde_json::Value,
 }
 
 /// Runtime configuration for a gear (local vs out-of-process).
@@ -1319,6 +1324,9 @@ pub struct RenderedGearConfig {
     /// Gear-specific config section (passed as-is)
     #[serde(default)]
     pub config: serde_json::Value,
+    /// The gear's `clients` section (passed as-is).
+    #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
+    pub clients: serde_json::Value,
     /// Logging configuration from master host.
     /// `OoP` gear will merge this with local --config (local keys override master keys).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1380,9 +1388,9 @@ pub fn render_gear_config_for_oop(
         None
     };
 
-    // Get the gear's config section (excluding database and runtime)
-    let config = parse_gear_config(app, gear_name)
-        .map(|entry| entry.config)
+    // Get the gear's config and clients sections (excluding database and runtime)
+    let (config, clients) = parse_gear_config(app, gear_name)
+        .map(|entry| (entry.config, entry.clients))
         .unwrap_or_default();
 
     // Pass logging config from master host so OoP gears can merge with their local config
@@ -1398,6 +1406,7 @@ pub fn render_gear_config_for_oop(
     Ok(RenderedGearConfig {
         database,
         config,
+        clients,
         logging: Some(logging),
         opentelemetry,
     })
@@ -1541,6 +1550,24 @@ mod tests {
     /// Helper: platform default subdirectory name.
     fn default_subdir() -> &'static str {
         ".cf-gears"
+    }
+
+    #[test]
+    fn the_clients_section_is_rendered_for_an_oop_gear() {
+        let mut app = AppConfig::default();
+        app.gears.insert(
+            "orders".to_owned(),
+            serde_json::json!({
+                "config": { "k": 1 },
+                "clients": { "consumes": { "billing": { "timeout": "2s" } } },
+            }),
+        );
+        let rendered = render_gear_config_for_oop(&app, "orders", Path::new(".")).unwrap();
+        assert_eq!(rendered.clients["consumes"]["billing"]["timeout"], "2s");
+
+        let json = serde_json::to_string(&rendered).unwrap();
+        let back = RenderedGearConfig::from_json(&json).unwrap();
+        assert_eq!(back.clients, rendered.clients);
     }
 
     #[test]

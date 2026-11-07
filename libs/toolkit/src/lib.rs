@@ -137,6 +137,7 @@ pub use http::sse::SseBroadcaster;
 pub mod telemetry;
 
 pub mod backends;
+pub mod clients_config;
 pub mod gts_publication;
 pub mod lifecycle;
 pub mod plugins;

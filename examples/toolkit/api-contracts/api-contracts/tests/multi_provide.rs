@@ -130,7 +130,7 @@ async fn both_wire_methods_register_independently() {
 
 #[tokio::test]
 async fn missing_wiring_falls_back_to_local() {
-    // No `client_wiring` in config → both contracts default to Local.
+    // No `clients.provides` entry → both contracts default to Local.
     let ctx = empty_ctx("multi-provide-smoke");
     let m = MultiProvider;
 

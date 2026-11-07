@@ -846,7 +846,7 @@ from = "types-registry")]`, likewise for `TypesRegistryApi`. The SDK's `rest-cli
 exports both `*RestResolvingClient` types; `rest-server` supplies bindings validated
 against each contract's IR.
 
-The registry always wires `Local` after seeding (`client_wiring` is disallowed),
+The registry always wires `Local` after seeding (a remote `clients.provides` entry is a boot error),
 holding its seeded client in `ClientHub` only during factory wiring. Local wins in
 Profile 1; otherwise `DirectoryResolvingClient` returns `service_unavailable` until
 reachable and rebuilds on endpoint changes (`toolkit-contract/src/runtime/resolving.rs`).
@@ -889,7 +889,7 @@ the AuthN SDK's `toolkit-gts` inventory. Hosts linking plugins need a registry
 database; resolver-only `auth_disabled` hosts (`config/no-db.yaml`) are unaffected.
 
 T41/T42 retain remote publication without a local registry, readiness during
-outages, remote schema publication and `consumer_wiring` overrides, which plugin
+outages, remote schema publication and `clients.consumes` overrides, which plugin
 `deny_unknown_fields` configs currently reject.
 
 **AuthZ, tenant resolution and AM: local-only startup.** **Pending in the consumer-migration follow-up:** this is the intended local startup contract; the existing consumers still use the legacy catalogue in this foundation. After migration, authz-resolver and
@@ -1525,7 +1525,7 @@ covering both kinds. The four old keys are accepted-and-ignored for one release 
 warning naming their replacements, so an existing deployment neither fails to start nor
 silently keeps a setting that no longer applies.
 
-The cache is an SDK decorator (§8.3), so these two settings configure it wherever a client is built. In the registry's process they come from this config. A remote consumer's resolving client is built by `#[consumes]` wiring, and T36 decides where its cache settings are read from without adding a per-consumer key to this gear. Transport wiring itself — local versus REST, and static endpoint overrides — is toolkit configuration (`gears.<gear>.config.client_wiring` / `consumer_wiring`), not a types-registry key.
+The cache is an SDK decorator (§8.3), so these two settings configure it wherever a client is built. In the registry's process they come from this config. A remote consumer's resolving client is built by `#[consumes]` wiring, and T36 decides where its cache settings are read from without adding a per-consumer key to this gear. Transport wiring itself — local versus REST, and static endpoint overrides — is toolkit configuration (`gears.<gear>.clients.provides` / `clients.consumes`), not a types-registry key.
 
 `ctx.config_or_default()` makes absent config and `config: {}` equivalent to these
 defaults. Existing keys (`entity_id_fields`, `schema_id_fields`, `entities`) are retained.

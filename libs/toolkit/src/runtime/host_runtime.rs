@@ -227,6 +227,9 @@ pub struct HostRuntime {
     /// Consumer registrations already wired, by address: the registry
     /// clients are wired early, the rest after application `init`, each once.
     wired: parking_lot::Mutex<HashSet<usize>>,
+    /// Directory targets each consumed dep still waits for, across all wiring
+    /// batches and their probes. A dep is resolved only when its entry is gone.
+    pending_targets: PendingTargets,
     /// Replaces the link-time `inventory` registrations in a test: a test
     /// binary links none, and submitting one would wire it in every test.
     #[cfg(test)]
@@ -304,6 +307,7 @@ impl HostRuntime {
             advertiser: Arc::new(RestAdvertiser::new(instance_id, &owned)),
             start_called: parking_lot::Mutex::new(HashSet::new()),
             wired: parking_lot::Mutex::new(HashSet::new()),
+            pending_targets: PendingTargets::default(),
             #[cfg(test)]
             consumer_registrations: None,
             owned,
@@ -774,7 +778,7 @@ impl HostRuntime {
         // `owner_gear` is set by `#[toolkit::consumes]` to the gear's declared
         // `#[toolkit::gear(name = ...)]`, falling back to the kebab-case of the
         // struct ident when that attribute is absent. It is used as the config key
-        // `gears.<owner_gear>.config.consumer_wiring.<dep>` and as the owner of the
+        // `gears.<owner_gear>.clients.consumes.<dep>` and as the owner of the
         // hub view the proxy is wired into. If it does not match any registered
         // gear name, the proxy is wired process-wide and that config key silently
         // resolves to nothing, so warn.
@@ -797,7 +801,7 @@ impl HostRuntime {
                     owner = reg.owner_gear,
                     dep = reg.dep_gear,
                     "proxy-wiring: consumer's owner gear name does not match any registered gear; \
-                     the `gears.{}.config.consumer_wiring.{}` static override will never resolve. \
+                     the `gears.{}.clients.consumes.{}` static override will never resolve. \
                      Ensure the consumer's `#[toolkit::gear(name = ...)]` matches its registered name.",
                     reg.owner_gear,
                     reg.dep_gear,
@@ -806,24 +810,52 @@ impl HostRuntime {
         }
 
         let mut outcomes = Vec::with_capacity(regs.len());
+        // In-process gears that serve no gRPC: a `RemoteGrpc` outcome for one of
+        // these can never resolve.
+        let grpc_providers: std::collections::HashSet<&str> = self
+            .registry
+            .grpc_services
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect();
+        let no_grpc_in_process: std::collections::HashSet<&str> = known_gears
+            .iter()
+            .copied()
+            .filter(|g| !grpc_providers.contains(g))
+            .collect();
+
         // A dep is resolved at wiring time only if no consumer of it needs the
         // directory: with one consumer on a static endpoint and another on
-        // discovery, the dep waits for the probe.
+        // discovery, the dep waits for the probe. One dep can be probed for
+        // several targets (a REST consumer and a gRPC consumer); it is
+        // resolved when all of them are.
         let mut resolved_now: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
-        let mut remote_deps: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+        let mut probes: std::collections::BTreeMap<&str, std::collections::BTreeSet<Probe>> =
+            std::collections::BTreeMap::new();
+        let mut transports_by_pair: std::collections::HashMap<(&str, &str), PairTransports> =
+            std::collections::HashMap::new();
         for reg in regs {
-            // Read the consumer's `consumer_wiring.<dep>` entry (if any) and
-            // split it into an optional static-endpoint override and the
-            // per-deployment `ClientTuning` (timeout/retry/pool/concurrency).
-            let (endpoint_override, mut tuning) =
+            // Read the consumer's `clients.consumes.<dep>` entry (if any) and
+            // split it into the optional static-endpoint overrides and the
+            // per-deployment `ClientTuning` (timeout/retry/pool/breaker).
+            let (rest_override, grpc_override, mut tuning) =
                 match read_consumer_wiring(self.gears_cfg.as_ref(), reg.owner_gear, reg.dep_gear)
                     .map_err(|source| RegistryError::ProxyWiring {
                         gear: reg.owner_gear,
                         source,
                     })? {
-                    Some(wiring) => wiring.into_parts(),
-                    None => (None, toolkit_contract::wiring::ClientTuning::default()),
+                    Some(wiring) => {
+                        let grpc = wiring.grpc_endpoint.clone();
+                        let (endpoint, tuning) = wiring.into_parts();
+                        (endpoint, grpc, tuning)
+                    }
+                    None => (
+                        None,
+                        None,
+                        toolkit_contract::wiring::ClientTuning::default(),
+                    ),
                 };
+            let grpc_ignored_knobs = tuning.grpc_ignored_knobs();
 
             // Thread the process's platform-plane credential onto the tuning so
             // the wired (directory-resolving) client's platform-plane methods
@@ -833,29 +865,29 @@ impl HostRuntime {
             tuning = tuning
                 .with_internal_token_provider(self.ctx_builder.internal_token_provider().cloned());
 
-            // ADR-0004 static-endpoint override (dev/test escape hatch): a
-            // configured `endpoint` wires the dep directly via a
-            // `StaticEndpointResolver`, bypassing discovery. It was validated as an
-            // absolute URI at parse time (invalid ones aborted above) and is
-            // resolvable by construction, so no probe loop is needed. Warned — must
-            // not be used in production.
-            let is_static = endpoint_override.is_some();
-            let reg_resolver: Arc<dyn EndpointResolver> = if let Some(endpoint) = &endpoint_override
-            {
-                tracing::warn!(
-                    owner = reg.owner_gear,
-                    dep = reg.dep_gear,
-                    endpoint = %endpoint,
-                    "proxy-wiring: STATIC endpoint override in use (ADR-0004 dev/test \
-                     escape hatch) - bypasses service discovery; MUST NOT be used in \
-                     production"
-                );
-                Arc::new(crate::discovery::StaticEndpointResolver::new(
-                    endpoint.clone(),
-                ))
-            } else {
-                Arc::clone(&resolver)
-            };
+            // ADR-0004 static-endpoint override: a configured `endpoint` (and,
+            // for gRPC clients, `grpc_endpoint`) wires the dep directly,
+            // bypassing discovery for that transport. Validated as absolute URIs
+            // at parse time, so no probe loop is needed for it.
+            let grpc_static = grpc_override.clone().or_else(|| rest_override.clone());
+            let reg_resolver: Arc<dyn EndpointResolver> =
+                if rest_override.is_some() || grpc_override.is_some() {
+                    tracing::warn!(
+                        owner = reg.owner_gear,
+                        dep = reg.dep_gear,
+                        endpoint = ?rest_override,
+                        grpc_endpoint = ?grpc_override,
+                        "proxy-wiring: STATIC endpoint override in use (ADR-0004) - bypasses \
+                         service discovery"
+                    );
+                    Arc::new(crate::discovery::OverrideResolver {
+                        rest: rest_override.clone(),
+                        grpc: grpc_static.clone(),
+                        fallback: Arc::clone(&resolver),
+                    })
+                } else {
+                    Arc::clone(&resolver)
+                };
 
             // Each registered consumer wires into its own view, so its proxy carries
             // its own settings. An owner that is not a gear here (an SDK-level
@@ -873,99 +905,103 @@ impl HostRuntime {
                 }
             })?;
             self.dep_checker.register_dep(reg.dep_gear.to_owned());
+            let in_process_owner = known_gears.contains(reg.owner_gear);
             match outcome {
                 // Local impl won the hub short-circuit — resolved.
                 crate::discovery::WireOutcome::Local => {
                     resolved_now.insert(reg.dep_gear);
                 }
                 // Static override → fixed endpoint, always resolvable — no probe.
-                crate::discovery::WireOutcome::Remote if is_static => {
+                crate::discovery::WireOutcome::Remote if rest_override.is_some() => {
+                    resolved_now.insert(reg.dep_gear);
+                }
+                crate::discovery::WireOutcome::RemoteGrpc { .. } if grpc_static.is_some() => {
                     resolved_now.insert(reg.dep_gear);
                 }
                 // A registered consumer depends on an in-process dep with no local
-                // impl and no REST API: wiring fell to a self-pointing proxy that
-                // would gate `/readyz` forever. Gated on the owner being registered
-                // too, so a stray/unused consumer (owner not in this process) falls
-                // through to the normal remote path below instead of aborting.
+                // impl and no API on the transport the client uses: wiring fell to
+                // a self-pointing proxy that would gate `/readyz` forever. Gated on
+                // the owner being registered too, so a stray/unused consumer
+                // (owner not in this process) falls through to the normal remote
+                // path below instead of aborting.
                 crate::discovery::WireOutcome::Remote
-                    if known_gears.contains(reg.owner_gear)
-                        && unreachable_in_process.contains(reg.dep_gear) =>
+                    if in_process_owner && unreachable_in_process.contains(reg.dep_gear) =>
                 {
-                    return Err(RegistryError::ProxyWiring {
-                        gear: reg.owner_gear,
-                        source: anyhow::anyhow!(
-                            "consumer '{}' depends on in-process gear '{}', which registered no \
-                             local impl and serves no REST API; the provider must register its \
-                             client in init() (#[toolkit::provides] wire_* or ClientHub::register) \
-                             or serve the contract over REST.",
-                            reg.owner_gear,
-                            reg.dep_gear,
-                        ),
-                    });
+                    return Err(unreachable_dep(reg, "serves no REST API"));
+                }
+                crate::discovery::WireOutcome::RemoteGrpc { .. }
+                    if in_process_owner && no_grpc_in_process.contains(reg.dep_gear) =>
+                {
+                    return Err(unreachable_dep(reg, "serves no gRPC service"));
                 }
                 // Directory-resolved remote → gate readiness + background probe.
                 crate::discovery::WireOutcome::Remote => {
-                    remote_deps.insert(reg.dep_gear);
+                    probes.entry(reg.dep_gear).or_default().insert(Probe::Rest);
+                }
+                crate::discovery::WireOutcome::RemoteGrpc { service } => {
+                    probes
+                        .entry(reg.dep_gear)
+                        .or_default()
+                        .insert(Probe::Grpc(service));
                 }
             }
+            warn_grpc_ignored_knobs(reg, outcome, &grpc_ignored_knobs);
+            let seen = transports_by_pair
+                .entry((reg.owner_gear, reg.dep_gear))
+                .or_default();
+            seen.record(outcome, rest_override.is_some() && grpc_override.is_none());
+            seen.check(reg)?;
             tracing::debug!(
                 owner = reg.owner_gear,
                 dep = reg.dep_gear,
                 outcome = ?outcome,
-                static_override = is_static,
                 "wired consumer contract"
             );
             outcomes.push(outcome);
         }
 
-        for dep in resolved_now.difference(&remote_deps) {
-            self.dep_checker.mark_resolved(dep);
+        // Wiring runs in batches (registry clients, system gears, the rest),
+        // and one dep can be consumed in several. Record this batch's targets
+        // first: a static or local outcome resolves a dep only when no batch
+        // still waits for a directory target of it, and a target added now
+        // reopens a dep an earlier batch resolved. Startup holds the
+        // preparation gate until the last batch, so a reopened dep is never
+        // seen as ready in between.
+        {
+            let mut pending = self.pending_targets.lock();
+            for (dep, targets) in &probes {
+                let entry = pending.entry((*dep).to_owned()).or_default();
+                let added = targets.iter().any(|t| !entry.contains(t));
+                entry.extend(targets.iter().cloned());
+                if added {
+                    self.dep_checker.mark_unresolved(dep);
+                }
+            }
+            for dep in &resolved_now {
+                if !pending.contains_key(*dep) {
+                    self.dep_checker.mark_resolved(dep);
+                }
+            }
         }
 
-        // Only remote deps need directory resolution; local wins are already
-        // resolved above. Without a directory the null resolver can never resolve
-        // them, so skip the probe entirely and leave those deps gating /readyz.
-        if !have_directory || remote_deps.is_empty() {
+        // Only directory-resolved deps need probing; local and static ones are
+        // already resolved above. Without a directory the null resolver can
+        // never resolve them, so skip the probe entirely and leave those deps
+        // gating /readyz.
+        if !have_directory || probes.is_empty() {
             return Ok(outcomes);
         }
-        let remote_deps: Vec<String> = remote_deps.into_iter().map(str::to_owned).collect();
+        let pending: std::collections::BTreeMap<String, std::collections::BTreeSet<Probe>> = probes
+            .into_iter()
+            .map(|(dep, targets)| (dep.to_owned(), targets))
+            .collect();
 
-        let readiness = Arc::clone(&self.dep_checker);
+        let readiness = Readiness {
+            deps: Arc::clone(&self.dep_checker),
+            pending: Arc::clone(&self.pending_targets),
+        };
         let cancel = self.owned.clone();
-        tokio::spawn(async move {
-            const BASE: std::time::Duration = std::time::Duration::from_millis(100);
-            const MAX: std::time::Duration = std::time::Duration::from_secs(30);
-            let mut pending = remote_deps;
-            let mut backoff = BASE;
-            while !pending.is_empty() {
-                let mut still_pending = Vec::new();
-                for dep in pending {
-                    match resolver.resolve_endpoint(&dep).await {
-                        Ok(Some(_)) => {
-                            readiness.mark_resolved(&dep);
-                            tracing::info!(dep = %dep, "readiness: dependency resolved");
-                        }
-                        // No live instance yet — expected during startup churn.
-                        Ok(None) => still_pending.push(dep),
-                        // Genuine directory-backend failure: surface it (a stuck
-                        // Starting / 503 pod otherwise has no diagnostic trail).
-                        Err(e) => {
-                            tracing::warn!(dep = %dep, error = %e, "readiness: directory lookup failed");
-                            still_pending.push(dep);
-                        }
-                    }
-                }
-                pending = still_pending;
-                if pending.is_empty() {
-                    break;
-                }
-                tokio::select! {
-                    () = cancel.cancelled() => break,
-                    () = tokio::time::sleep(backoff) => {}
-                }
-                backoff = (backoff * 2).min(MAX);
-            }
-        });
+        tokio::spawn(probe_until_resolved(resolver, readiness, cancel, pending));
 
         Ok(outcomes)
     }
@@ -2373,38 +2409,202 @@ impl HostRuntime {
     }
 }
 
-/// Read `gears.<owner>.config.consumer_wiring.<dep>` as a [`ConsumerWiring`].
+/// The transports one gear consumes one dep over, and whether its
+/// `clients.consumes.<dep>` sets only `endpoint`.
+#[derive(Default)]
+struct PairTransports {
+    rest: bool,
+    grpc: bool,
+    only_endpoint: bool,
+}
+
+impl PairTransports {
+    fn record(&mut self, outcome: crate::discovery::WireOutcome, only_endpoint: bool) {
+        match outcome {
+            crate::discovery::WireOutcome::Remote => self.rest = true,
+            crate::discovery::WireOutcome::RemoteGrpc { .. } => self.grpc = true,
+            crate::discovery::WireOutcome::Local => {}
+        }
+        self.only_endpoint = only_endpoint;
+    }
+
+    /// One `endpoint` cannot serve a gear's REST and gRPC clients of a dep.
+    fn check(&self, reg: &crate::discovery::ConsumerRegistration) -> Result<(), RegistryError> {
+        if self.rest && self.grpc && self.only_endpoint {
+            return Err(RegistryError::ProxyWiring {
+                gear: reg.owner_gear,
+                source: anyhow::anyhow!(
+                    "gear '{}' consumes '{}' over both REST and gRPC, and \
+                     `clients.consumes.{}` sets only `endpoint`; one address cannot serve \
+                     both. Add `grpc_endpoint` for the gRPC client.",
+                    reg.owner_gear,
+                    reg.dep_gear,
+                    reg.dep_gear,
+                ),
+            });
+        }
+        Ok(())
+    }
+}
+
+/// A gRPC client ignores the REST pool and concurrency knobs and
+/// `stream_reconnect`; say so.
+fn warn_grpc_ignored_knobs(
+    reg: &crate::discovery::ConsumerRegistration,
+    outcome: crate::discovery::WireOutcome,
+    knobs: &[&str],
+) {
+    if let crate::discovery::WireOutcome::RemoteGrpc { service } = outcome
+        && !knobs.is_empty()
+    {
+        tracing::warn!(
+            owner = reg.owner_gear,
+            dep = reg.dep_gear,
+            service,
+            knobs = ?knobs,
+            "proxy-wiring: clients.consumes sets knobs a gRPC client does not apply; \
+             they have no effect"
+        );
+    }
+}
+
+/// What the readiness probe resolves for one consumed dep.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum Probe {
+    /// The provider gear's REST endpoint.
+    Rest,
+    /// A gRPC service, by fully qualified name.
+    Grpc(&'static str),
+}
+
+/// Directory targets still unresolved, per consumed dep.
+type PendingTargets =
+    Arc<parking_lot::Mutex<std::collections::BTreeMap<String, std::collections::BTreeSet<Probe>>>>;
+
+/// Where a probe reports: the readiness gate and the targets shared by every
+/// wiring batch.
+struct Readiness {
+    deps: Arc<super::readiness::DependencyChecker>,
+    pending: PendingTargets,
+}
+
+impl Readiness {
+    /// `target` of `dep` resolved. The dep is resolved once no batch waits for
+    /// any other target of it.
+    fn resolved(&self, dep: &str, target: &Probe) {
+        let mut pending = self.pending.lock();
+        let done = match pending.get_mut(dep) {
+            Some(targets) => {
+                targets.remove(target);
+                targets.is_empty()
+            }
+            None => true,
+        };
+        if done {
+            pending.remove(dep);
+            if self.deps.mark_resolved(dep) {
+                tracing::info!(dep = %dep, "readiness: dependency resolved");
+            }
+        }
+    }
+}
+
+/// Probe rounds after which a gRPC service still missing from the directory
+/// gets a hint in the log: with backoff this is about a minute.
+const GRPC_HINT_ROUNDS: u32 = 10;
+
+fn unreachable_dep(reg: &crate::discovery::ConsumerRegistration, why: &str) -> RegistryError {
+    RegistryError::ProxyWiring {
+        gear: reg.owner_gear,
+        source: anyhow::anyhow!(
+            "consumer '{}' depends on in-process gear '{}', which registered no local impl \
+             and {why}; the provider must register its client in init() \
+             (#[toolkit::provides] wire_* or ClientHub::register) or serve the contract over \
+             the transport the consumer uses.",
+            reg.owner_gear,
+            reg.dep_gear,
+        ),
+    }
+}
+
+/// Resolve every pending target with backoff, marking a dep ready once all of
+/// its targets resolve. Stops on `cancel`.
+async fn probe_until_resolved(
+    resolver: Arc<dyn toolkit_contract::runtime::resolving::EndpointResolver>,
+    readiness: Readiness,
+    cancel: CancellationToken,
+    mut pending: std::collections::BTreeMap<String, std::collections::BTreeSet<Probe>>,
+) {
+    const BASE: std::time::Duration = std::time::Duration::from_millis(100);
+    const MAX: std::time::Duration = std::time::Duration::from_secs(30);
+    let mut backoff = BASE;
+    let mut rounds = 0u32;
+    while !pending.is_empty() {
+        let mut still_pending = std::collections::BTreeMap::new();
+        for (dep, targets) in pending {
+            let mut left = std::collections::BTreeSet::new();
+            for target in targets {
+                let lookup = match &target {
+                    Probe::Rest => resolver.resolve_endpoint(&dep).await,
+                    Probe::Grpc(service) => resolver.resolve_grpc_endpoint(service).await,
+                };
+                match lookup {
+                    Ok(Some(_)) => readiness.resolved(&dep, &target),
+                    // No live instance yet — expected during startup churn.
+                    Ok(None) => {
+                        left.insert(target);
+                    }
+                    // Genuine directory-backend failure: surface it (a stuck
+                    // Starting / 503 pod otherwise has no diagnostic trail).
+                    Err(e) => {
+                        tracing::warn!(dep = %dep, target = ?target, error = %e, "readiness: directory lookup failed");
+                        left.insert(target);
+                    }
+                }
+            }
+            if !left.is_empty() {
+                still_pending.insert(dep, left);
+            }
+        }
+        pending = still_pending;
+        if pending.is_empty() {
+            break;
+        }
+        rounds = rounds.saturating_add(1);
+        if rounds == GRPC_HINT_ROUNDS {
+            for (dep, targets) in &pending {
+                for target in targets {
+                    if let Probe::Grpc(service) = target {
+                        tracing::warn!(
+                            dep = %dep,
+                            service,
+                            "readiness: gRPC service still not in the directory; check that the \
+                             provider's process runs grpc-hub with a listen_addr and an \
+                             advertise_addr it can register"
+                        );
+                    }
+                }
+            }
+        }
+        tokio::select! {
+            () = cancel.cancelled() => break,
+            () = tokio::time::sleep(backoff) => {}
+        }
+        backoff = (backoff * 2).min(MAX);
+    }
+}
+
+/// Read the [`ConsumerWiring`] for `owner`'s client of `dep` from
+/// `gears.<owner>.clients` ([`crate::clients_config::consumer_wiring`]).
 ///
 /// `Ok(None)` when absent (the dep keeps discovery). A *present* entry that cannot
-/// be deserialized is an `Err` that aborts proxy-wiring — the same fail-at-boot
-/// contract the provider side uses for `client_wiring` ([`crate::wiring::read_wiring`]).
+/// be read is an `Err` that aborts proxy-wiring, as on the provider side.
 fn read_consumer_wiring(
     cfg: &dyn ConfigProvider,
     owner_gear: &str,
     dep_gear: &str,
 ) -> Result<Option<toolkit_contract::wiring::ConsumerWiring>, anyhow::Error> {
-    let Some(value) = cfg
-        .get_gear_config(owner_gear)
-        .and_then(|c| c.get("config"))
-        .and_then(|c| c.get("consumer_wiring"))
-        .and_then(|c| c.get(dep_gear))
-    else {
-        return Ok(None);
-    };
-    // A bare string is the legacy static-endpoint shape; the raw serde error
-    // ("invalid type: string") would not hint at the fix, so name the object form.
-    if let Some(s) = value.as_str() {
-        anyhow::bail!(
-            "gear `{owner_gear}`: `consumer_wiring.{dep_gear}` is a bare string; the \
-             static-endpoint override now lives on the object form — write it as \
-             `{{ \"endpoint\": \"{s}\" }}`"
-        );
-    }
-    serde_json::from_value::<toolkit_contract::wiring::ConsumerWiring>(value.clone())
-        .map(Some)
-        .map_err(|e| {
-            anyhow::anyhow!("gear `{owner_gear}`: invalid consumer_wiring.{dep_gear}: {e}")
-        })
+    crate::clients_config::consumer_wiring(cfg, owner_gear, dep_gear)
 }
 
 #[cfg(test)]
@@ -2615,27 +2815,27 @@ mod tests {
         }
     }
 
-    /// Extract just the static-endpoint override from a `consumer_wiring` entry.
+    /// Extract just the static-endpoint override from a `clients.consumes` entry.
     fn endpoint_override(cfg: &dyn ConfigProvider, owner: &str, dep: &str) -> Option<String> {
         super::read_consumer_wiring(cfg, owner, dep)
-            .expect("consumer_wiring must not error for a valid/absent endpoint")
+            .expect("clients.consumes must not error for a valid/absent endpoint")
             .and_then(|w| w.into_parts().0)
     }
 
     #[test]
-    fn static_endpoint_override_reads_nested_consumer_wiring_key() {
+    fn static_endpoint_override_reads_the_clients_consumes_entry() {
         let mut map = std::collections::HashMap::new();
         map.insert(
             "orders".to_owned(),
             serde_json::json!({
-                "config": {
-                    "consumer_wiring": { "billing": { "endpoint": "http://localhost:8081" } }
+                "clients": {
+                    "consumes": { "billing": { "endpoint": "http://localhost:8081" } }
                 }
             }),
         );
         let cfg = MapCfg(map);
 
-        // Present override is read from `config.consumer_wiring.<dep>.endpoint`.
+        // Present override is read from `clients.consumes.<dep>.endpoint`.
         assert_eq!(
             endpoint_override(&cfg, "orders", "billing").as_deref(),
             Some("http://localhost:8081")
@@ -2654,8 +2854,8 @@ mod tests {
     #[test]
     fn consumer_wiring_object_form_yields_endpoint_and_tuning() {
         let cfg = OrdersCfg(serde_json::json!({
-            "config": {
-                "consumer_wiring": {
+            "clients": {
+                "consumes": {
                     "billing": {
                         "endpoint": "http://billing:8080",
                         "timeout": "5s",
@@ -2680,8 +2880,8 @@ mod tests {
     #[test]
     fn consumer_wiring_object_without_endpoint_keeps_discovery() {
         let cfg = OrdersCfg(serde_json::json!({
-            "config": {
-                "consumer_wiring": { "billing": { "max_concurrent_requests": 1 } }
+            "clients": {
+                "consumes": { "billing": { "max_concurrent_requests": 1 } }
             }
         }));
 
@@ -2694,7 +2894,7 @@ mod tests {
     }
 
     /// A present-but-unparseable entry (wrong shape or wrong-typed tuning) is a
-    /// boot error, matching the provider side's `client_wiring` — not a silent
+    /// boot error, matching the provider side's `clients.provides` — not a silent
     /// downgrade to discovery.
     #[test]
     fn consumer_wiring_malformed_entry_is_an_error() {
@@ -2711,7 +2911,7 @@ mod tests {
         ];
         for entry in malformed {
             let cfg = OrdersCfg(serde_json::json!({
-                "config": { "consumer_wiring": { "billing": entry.clone() } }
+                "clients": { "consumes": { "billing": entry.clone() } }
             }));
             assert!(
                 super::read_consumer_wiring(&cfg, "orders", "billing").is_err(),
@@ -2720,29 +2920,13 @@ mod tests {
         }
     }
 
-    /// A legacy bare-string value is a hard error whose message names the object
-    /// form (a migration hint, not an opaque serde "invalid type" error).
-    #[test]
-    fn consumer_wiring_legacy_bare_string_is_an_error_naming_the_object_form() {
-        let cfg = OrdersCfg(serde_json::json!({
-            "config": { "consumer_wiring": { "billing": "http://localhost:8081" } }
-        }));
-        let err = super::read_consumer_wiring(&cfg, "orders", "billing")
-            .expect_err("a bare-string value is the legacy shape -> hard error")
-            .to_string();
-        assert!(
-            err.contains("endpoint"),
-            "the error must point the operator at the `{{ endpoint: ... }}` object form, got: {err}"
-        );
-    }
-
     /// A present-but-invalid `endpoint` is surfaced as an error, not downgraded to
     /// discovery — the operator asked for a specific endpoint that can't be honoured.
     #[test]
     fn consumer_wiring_invalid_endpoint_is_an_error() {
         for bad in ["", "billing", "/path/only"] {
             let cfg = OrdersCfg(serde_json::json!({
-                "config": { "consumer_wiring": { "billing": { "endpoint": bad } } }
+                "clients": { "consumes": { "billing": { "endpoint": bad } } }
             }));
             assert!(
                 super::read_consumer_wiring(&cfg, "orders", "billing").is_err(),
@@ -2795,6 +2979,32 @@ mod tests {
         }
     }
 
+    /// A gRPC client warns about the knobs it does not apply, among them
+    /// `stream_reconnect`; a REST client applies them all and stays quiet.
+    #[test]
+    #[tracing_test::traced_test]
+    fn a_grpc_consumer_warns_about_knobs_it_does_not_apply() {
+        let tuning: toolkit_contract::wiring::ClientTuning = serde_json::from_value(
+            serde_json::json!({ "stream_reconnect": { "max_attempts": 3 } }),
+        )
+        .unwrap();
+        let knobs = tuning.grpc_ignored_knobs();
+        let reg = test_registration();
+
+        warn_grpc_ignored_knobs(&reg, crate::discovery::WireOutcome::Remote, &knobs);
+        assert!(!logs_contain("does not apply"));
+
+        warn_grpc_ignored_knobs(
+            &reg,
+            crate::discovery::WireOutcome::RemoteGrpc {
+                service: "billing.v1.BillingApi",
+            },
+            &knobs,
+        );
+        assert!(logs_contain("does not apply"));
+        assert!(logs_contain("stream_reconnect"));
+    }
+
     /// Static-endpoint arm: an `endpoint` wires a `StaticEndpointResolver` pinned
     /// to it, threads the entry's tuning through, and marks the dep resolved
     /// immediately (no probe loop).
@@ -2804,8 +3014,8 @@ mod tests {
         map.insert(
             "orders".to_owned(),
             serde_json::json!({
-                "config": {
-                    "consumer_wiring": {
+                "clients": {
+                    "consumes": {
                         "billing": {
                             "endpoint": "http://localhost:8081",
                             "max_concurrent_requests": 7
@@ -2913,8 +3123,8 @@ mod tests {
         map.insert(
             "orders".to_owned(),
             serde_json::json!({
-                "config": {
-                    "consumer_wiring": { "billing": { "max_concurrent_requests": 4343 } }
+                "clients": {
+                    "consumes": { "billing": { "max_concurrent_requests": 4343 } }
                 }
             }),
         );
@@ -2966,8 +3176,8 @@ mod tests {
         map.insert(
             "orders".to_owned(),
             serde_json::json!({
-                "config": {
-                    "consumer_wiring": { "billing": { "max_concurrent_requests": 4242 } }
+                "clients": {
+                    "consumes": { "billing": { "max_concurrent_requests": 4242 } }
                 }
             }),
         );
@@ -3008,8 +3218,8 @@ mod tests {
         map.insert(
             "orders".to_owned(),
             serde_json::json!({
-                "config": {
-                    "consumer_wiring": {
+                "clients": {
+                    "consumes": {
                         "billing": { "endpoint": "", "max_concurrent_requests": 4444 }
                     }
                 }
@@ -3046,8 +3256,8 @@ mod tests {
         map.insert(
             "api-contracts-consumer".to_owned(),
             serde_json::json!({
-                "config": {
-                    "consumer_wiring": {
+                "clients": {
+                    "consumes": {
                         "api-contracts": { "endpoint": "http://localhost:9099" }
                     }
                 }
@@ -3136,17 +3346,17 @@ mod tests {
     }
 
     /// Issue #5686: two gears consuming one contract each get a proxy built
-    /// from their own `consumer_wiring`, whichever wires first.
+    /// from their own `clients.consumes` entry, whichever wires first.
     #[tokio::test]
     async fn each_consumer_gets_a_proxy_with_its_own_wiring() {
         let config = serde_json::json!({
-            "a": { "config": { "consumer_wiring": { "shipping": {
+            "a": { "clients": { "consumes": { "shipping": {
                 "endpoint": "http://shipping-for-a:8080",
                 "timeout": "1s",
                 "retry": { "max_attempts": 2 },
                 "require_tls": false
             } } } },
-            "b": { "config": { "consumer_wiring": { "shipping": {
+            "b": { "clients": { "consumes": { "shipping": {
                 "endpoint": "http://shipping-for-b:8080",
                 "timeout": "10s",
                 "retry": { "max_attempts": 5 },
@@ -3211,7 +3421,7 @@ mod tests {
     #[tokio::test]
     async fn a_static_consumer_does_not_resolve_a_dep_another_consumer_discovers() {
         let config = serde_json::json!({
-            "a": { "config": { "consumer_wiring": { "shipping": {
+            "a": { "clients": { "consumes": { "shipping": {
                 "endpoint": "http://shipping:8080"
             } } } }
         });
@@ -3236,7 +3446,7 @@ mod tests {
     #[tokio::test]
     async fn a_mixed_dep_resolves_once_the_provider_is_advertised() {
         let config = serde_json::json!({
-            "a": { "config": { "consumer_wiring": { "shipping": {
+            "a": { "clients": { "consumes": { "shipping": {
                 "endpoint": "http://shipping:8080"
             } } } }
         });
@@ -3285,7 +3495,7 @@ mod tests {
     /// Both consumers on static endpoints: resolved at wiring time.
     #[tokio::test]
     async fn static_consumers_resolve_the_dep() {
-        let entry = serde_json::json!({ "config": { "consumer_wiring": { "shipping": {
+        let entry = serde_json::json!({ "clients": { "consumes": { "shipping": {
             "endpoint": "http://shipping:8080"
         } } } });
         let runtime = shipping_runtime(serde_json::json!({ "a": entry, "b": entry }));
@@ -3310,6 +3520,295 @@ mod tests {
             matches!(err, RegistryError::ProxyWiring { gear, .. } if gear == "a"),
             "got {err:?}"
         );
+    }
+
+    const SHIPPING_GRPC: &str = "shipping.v1.ShippingApi";
+
+    /// `wire_shipping` for a gRPC client: same proxy, readiness on the service.
+    fn wire_shipping_grpc(
+        hub: &ClientHub,
+        resolver: Arc<dyn crate::discovery::EndpointResolver>,
+        tuning: toolkit_contract::wiring::ClientTuning,
+    ) -> anyhow::Result<crate::discovery::WireOutcome> {
+        match wire_shipping(hub, resolver, tuning)? {
+            crate::discovery::WireOutcome::Remote => {
+                Ok(crate::discovery::WireOutcome::RemoteGrpc {
+                    service: SHIPPING_GRPC,
+                })
+            }
+            other => Ok(other),
+        }
+    }
+
+    fn shipping_grpc_registration(
+        owner_gear: &'static str,
+    ) -> crate::discovery::ConsumerRegistration {
+        crate::discovery::ConsumerRegistration {
+            owner_gear,
+            dep_gear: "shipping",
+            wire: wire_shipping_grpc,
+        }
+    }
+
+    /// `shipping_runtime` with an in-process directory the test can publish to.
+    fn shipping_runtime_with_directory(
+        config: serde_json::Value,
+    ) -> (HostRuntime, Arc<crate::runtime::GearManager>) {
+        let runtime = shipping_runtime(config);
+        let gears = Arc::new(crate::runtime::GearManager::new());
+        runtime
+            .client_hub
+            .register::<dyn crate::DirectoryClient>(Arc::new(
+                crate::directory::LocalDirectoryClient::new(Arc::clone(&gears)),
+            ));
+        (runtime, gears)
+    }
+
+    fn publish(gears: &crate::runtime::GearManager, instance: crate::runtime::GearInstance) {
+        gears.register_instance(Arc::new(instance)).unwrap();
+    }
+
+    /// Every consumed dep resolved; only the startup preparation gate,
+    /// which these wiring-only tests never lift, is left.
+    fn deps_resolved(runtime: &HostRuntime) -> bool {
+        runtime.dep_checker.unresolved_deps() == [PREPARATION_GATE]
+    }
+
+    async fn wait_resolved(runtime: &HostRuntime) -> bool {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !deps_resolved(runtime) {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .is_ok()
+    }
+
+    /// A gRPC consumer's dep is probed by service name, not by the gear's
+    /// REST endpoint.
+    #[tokio::test]
+    async fn a_grpc_dep_resolves_when_its_service_is_published() {
+        let (runtime, gears) = shipping_runtime_with_directory(serde_json::json!({}));
+        let reg = shipping_grpc_registration("a");
+        runtime.wire_consumer_registrations(&[&reg]).unwrap();
+
+        // A REST endpoint for the gear does not satisfy a gRPC consumer.
+        publish(
+            &gears,
+            crate::runtime::GearInstance::new("shipping", Uuid::new_v4())
+                .with_rest_endpoint(crate::runtime::Endpoint::http("shipping", 8080)),
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(!deps_resolved(&runtime));
+
+        publish(
+            &gears,
+            crate::runtime::GearInstance::new("shipping", Uuid::new_v4()).with_grpc_service(
+                SHIPPING_GRPC,
+                crate::runtime::Endpoint::http("shipping", 50051),
+            ),
+        );
+        assert!(
+            wait_resolved(&runtime).await,
+            "the published service resolves the dep"
+        );
+        runtime.cancel.cancel();
+    }
+
+    /// A REST consumer and a gRPC consumer of one dep: ready only when both
+    /// targets resolve.
+    #[tokio::test]
+    async fn a_dep_consumed_over_both_transports_waits_for_both() {
+        let (runtime, gears) = shipping_runtime_with_directory(serde_json::json!({}));
+        let (rest, grpc) = (shipping_registration("a"), shipping_grpc_registration("b"));
+        runtime
+            .wire_consumer_registrations(&[&rest, &grpc])
+            .unwrap();
+
+        publish(
+            &gears,
+            crate::runtime::GearInstance::new("shipping", Uuid::new_v4()).with_grpc_service(
+                SHIPPING_GRPC,
+                crate::runtime::Endpoint::http("shipping", 50051),
+            ),
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(!deps_resolved(&runtime), "the REST consumer still waits");
+
+        publish(
+            &gears,
+            crate::runtime::GearInstance::new("shipping", Uuid::new_v4())
+                .with_rest_endpoint(crate::runtime::Endpoint::http("shipping", 8080)),
+        );
+        assert!(wait_resolved(&runtime).await);
+        runtime.cancel.cancel();
+    }
+
+    /// Wiring runs in batches (system gears, then the rest). A static consumer
+    /// wired in one batch must not resolve a dep that a consumer in another
+    /// batch discovers, in either order.
+    #[tokio::test]
+    async fn a_static_batch_does_not_resolve_a_dep_another_batch_discovers() {
+        let config = serde_json::json!({
+            "a": { "clients": { "consumes": { "shipping": {
+                "endpoint": "http://shipping:8080"
+            } } } }
+        });
+        let (reg_a, reg_b) = (shipping_registration("a"), shipping_registration("b"));
+
+        for (first, second) in [(&reg_a, &reg_b), (&reg_b, &reg_a)] {
+            let runtime = shipping_runtime(config.clone());
+            runtime.wire_consumer_registrations(&[first]).unwrap();
+            runtime.wire_consumer_registrations(&[second]).unwrap();
+
+            assert!(
+                runtime
+                    .dep_checker
+                    .unresolved_deps()
+                    .contains(&"shipping".to_owned()),
+                "the discovery consumer must keep the dep gating readiness"
+            );
+        }
+    }
+
+    /// Probes started by two batches for one dep: the dep resolves only when
+    /// the targets of both have.
+    #[tokio::test]
+    async fn probes_from_two_batches_resolve_the_dep_together() {
+        let (runtime, gears) = shipping_runtime_with_directory(serde_json::json!({}));
+        let (rest, grpc) = (shipping_registration("a"), shipping_grpc_registration("b"));
+        runtime.wire_consumer_registrations(&[&rest]).unwrap();
+        runtime.wire_consumer_registrations(&[&grpc]).unwrap();
+
+        publish(
+            &gears,
+            crate::runtime::GearInstance::new("shipping", Uuid::new_v4())
+                .with_rest_endpoint(crate::runtime::Endpoint::http("shipping", 8080)),
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(!deps_resolved(&runtime), "the gRPC consumer still waits");
+
+        publish(
+            &gears,
+            crate::runtime::GearInstance::new("shipping", Uuid::new_v4()).with_grpc_service(
+                SHIPPING_GRPC,
+                crate::runtime::Endpoint::http("shipping", 50051),
+            ),
+        );
+        assert!(wait_resolved(&runtime).await);
+        runtime.cancel.cancel();
+    }
+
+    /// `grpc_endpoint` is a static override for the gRPC client only.
+    #[tokio::test]
+    async fn grpc_endpoint_wires_the_grpc_client_statically() {
+        let config = serde_json::json!({
+            "a": { "clients": { "consumes": { "shipping": {
+                "grpc_endpoint": "http://shipping:50051"
+            } } } }
+        });
+        let runtime = shipping_runtime(config);
+        let reg = shipping_grpc_registration("a");
+        runtime.wire_consumer_registrations(&[&reg]).unwrap();
+
+        assert!(deps_resolved(&runtime));
+        let proxy = runtime
+            .client_hub
+            .for_gear("a")
+            .get::<dyn ShippingApi>()
+            .unwrap();
+        assert_eq!(
+            proxy
+                .wiring()
+                .resolver
+                .resolve_grpc_endpoint(SHIPPING_GRPC)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("http://shipping:50051")
+        );
+    }
+
+    /// `grpc_endpoint` alone leaves a REST consumer of the dep on discovery.
+    #[tokio::test]
+    async fn grpc_endpoint_does_not_pin_the_rest_client() {
+        let config = serde_json::json!({
+            "a": { "clients": { "consumes": { "shipping": {
+                "grpc_endpoint": "http://shipping:50051"
+            } } } }
+        });
+        let runtime = shipping_runtime(config);
+        let reg = shipping_registration("a");
+        runtime.wire_consumer_registrations(&[&reg]).unwrap();
+
+        assert!(!deps_resolved(&runtime), "REST still waits for discovery");
+    }
+
+    /// One `endpoint` cannot serve one gear's REST and gRPC clients.
+    #[tokio::test]
+    async fn one_endpoint_for_both_transports_of_a_gear_is_an_error() {
+        let runtime = shipping_runtime(serde_json::json!({
+            "a": { "clients": { "consumes": { "shipping": {
+                "endpoint": "http://shipping:8080"
+            } } } }
+        }));
+        let rest = shipping_registration("a");
+        // In real code the two clients are two contracts; the test proxy type
+        // is shared, so the gRPC one goes into another view to get past the
+        // duplicate check.
+        let grpc = crate::discovery::ConsumerRegistration {
+            owner_gear: "a",
+            dep_gear: "shipping",
+            wire: |hub, resolver, tuning| {
+                wire_shipping_grpc(&hub.for_gear("a-grpc"), resolver, tuning)
+            },
+        };
+        let err = runtime
+            .wire_consumer_registrations(&[&rest, &grpc])
+            .expect_err("a single endpoint for both transports must fail");
+        assert!(err.to_string().contains("grpc_endpoint"), "{err}");
+    }
+
+    struct DummyGrpc;
+
+    #[async_trait::async_trait]
+    impl crate::contracts::GrpcServiceCapability for DummyGrpc {
+        async fn get_grpc_services(
+            &self,
+            _ctx: &GearCtx,
+        ) -> anyhow::Result<Vec<crate::contracts::RegisterGrpcServiceFn>> {
+            Ok(Vec::new())
+        }
+    }
+
+    /// An in-process provider that serves gRPC is a valid gRPC dependency; one
+    /// that serves neither REST nor gRPC is not.
+    #[tokio::test]
+    async fn an_in_process_grpc_dep_must_serve_grpc() {
+        let build = |grpc: bool| {
+            let mut b = crate::registry::RegistryBuilder::default();
+            b.register_core_with_meta("a", &[], Arc::new(DummyCore));
+            b.register_core_with_meta("shipping", &[], Arc::new(DummyCore));
+            if grpc {
+                b.register_grpc_service_with_meta("shipping", Arc::new(DummyGrpc));
+            }
+            HostRuntime::new(
+                b.build_topo_sorted().unwrap(),
+                Arc::new(MapCfg(std::collections::HashMap::new())),
+                DbOptions::None,
+                Arc::new(ClientHub::new()),
+                CancellationToken::new(),
+                Uuid::new_v4(),
+                None,
+            )
+        };
+        let reg = shipping_grpc_registration("a");
+
+        build(true).wire_consumer_registrations(&[&reg]).unwrap();
+        let err = build(false)
+            .wire_consumer_registrations(&[&reg])
+            .expect_err("no gRPC service to call");
+        assert!(err.to_string().contains("serves no gRPC service"), "{err}");
     }
 
     #[tokio::test]

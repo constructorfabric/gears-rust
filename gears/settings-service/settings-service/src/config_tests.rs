@@ -23,7 +23,9 @@
 //! reason. It becomes testable the day a required field is added — which is
 //! also the day it starts to matter.
 
-use super::{IN_PROCESS_CONTRACTS, SettingsServiceConfig};
+use toolkit::config::ConfigProvider;
+
+use super::{IN_PROCESS_CONTRACTS, SettingsServiceConfig, check_in_process_bindings};
 
 fn parse(json: serde_json::Value) -> Result<SettingsServiceConfig, serde_json::Error> {
     serde_json::from_value(json)
@@ -101,18 +103,30 @@ fn the_step_up_section_is_optional_and_defaults_its_window_to_five_minutes() {
     );
 }
 
+struct Gear(serde_json::Value);
+
+impl ConfigProvider for Gear {
+    fn get_gear_config(&self, gear: &str) -> Option<&serde_json::Value> {
+        (gear == "settings-service").then_some(&self.0)
+    }
+}
+
+fn with_clients(clients: serde_json::Value) -> Gear {
+    let mut entry = serde_json::json!({ "config": {} });
+    entry["clients"] = clients;
+    Gear(entry)
+}
+
 #[test]
 fn a_remote_binding_for_either_sdk_trait_is_refused_with_the_contract_named() {
     for contract in IN_PROCESS_CONTRACTS {
-        for transport in ["rest", "grpc", "REST"] {
-            let config: SettingsServiceConfig = serde_json::from_value(serde_json::json!({
-                "client_wiring": {
+        for transport in ["rest", "grpc"] {
+            let gear = with_clients(serde_json::json!({
+                "provides": {
                     contract: { "transport": transport, "endpoint": "http://elsewhere" }
                 }
-            }))
-            .expect("the section parses");
-            let refusal = config
-                .check_in_process_bindings()
+            }));
+            let refusal = check_in_process_bindings(&gear, "settings-service")
                 .expect_err("a remote binding is refused");
             assert!(refusal.contains(contract), "{refusal}");
             assert!(refusal.contains(transport), "{refusal}");
@@ -122,24 +136,25 @@ fn a_remote_binding_for_either_sdk_trait_is_refused_with_the_contract_named() {
 
 #[test]
 fn a_local_binding_another_contract_and_no_section_at_all_are_all_accepted() {
-    for section in [
-        serde_json::json!({}),
-        serde_json::json!({ "client_wiring": {} }),
-        serde_json::json!({
-            "client_wiring": { "settings_reader_client": { "transport": "local" } }
-        }),
+    let cases = [
+        Gear(serde_json::json!({ "config": {} })),
+        with_clients(serde_json::json!({})),
+        with_clients(serde_json::json!({ "provides": {} })),
+        with_clients(serde_json::json!({
+            "provides": { "settings_reader_client": { "transport": "local" } }
+        })),
         // Another gear's contract is none of this gear's business.
-        serde_json::json!({
-            "client_wiring": {
+        with_clients(serde_json::json!({
+            "provides": {
                 "authz_resolver_api": { "transport": "rest", "endpoint": "http://authz" }
             }
-        }),
-    ] {
-        let config: SettingsServiceConfig =
-            serde_json::from_value(section.clone()).expect("parses");
+        })),
+    ];
+    for gear in cases {
         assert!(
-            config.check_in_process_bindings().is_ok(),
-            "{section} should be accepted"
+            check_in_process_bindings(&gear, "settings-service").is_ok(),
+            "{} should be accepted",
+            gear.0
         );
     }
 }

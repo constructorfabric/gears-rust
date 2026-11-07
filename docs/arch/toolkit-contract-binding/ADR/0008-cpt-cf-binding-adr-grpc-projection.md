@@ -29,7 +29,9 @@ This ADR is written **after the fact**: `#[toolkit::grpc_contract]` shipped on
 `toolkit-contract-protogen`, a committed `proto.lock.toml`, and an integration
 test), while PRD §4.2 and DESIGN §7 still described it as future work. Recording
 the decisions here closes that gap and gives the shipped behaviour — including
-two deliberate asymmetries with REST — a normative home.
+the deliberate asymmetries with REST — a normative home. It was later extended
+with the generated consumer path (resolving client, service-name constant,
+lazy channel), schema collection for protogen, and the circuit breaker.
 
 ## Decision Drivers
 
@@ -83,17 +85,48 @@ pub trait PaymentApiGrpc: PaymentApi {
 }
 ```
 
-The macro emits four artifacts, **all client-side**: the cleaned trait, a
-`<trait>_grpc_binding()` IR function, a `{Trait}Client` (gated on `grpc-client`),
-and `impl BaseTrait for {Trait}Client` so the consumer keeps seeing
-`Arc<dyn PaymentApi>`.
+The macro emits, **all client-side** (the server stays hand-written):
+
+* the cleaned trait and a `<trait>_grpc_binding()` IR function;
+* `pub const <BASE>_GRPC_SERVICE: &str = "package.Service"`
+  (`PAYMENT_API_GRPC_SERVICE = "api_contracts.payment.v1.PaymentApi"`), the
+  name the provider registers the service under and consumers discover it by.
+  protogen writes the same `package` and `service` into the `.proto`, so it
+  equals tonic's `NamedService::NAME` for the hand-written server;
+* `<base>_grpc_schemas<V>(&mut V)`, a visitor over every request and response
+  type on the wire, bounded by `V: toolkit_contract::ir::grpc::VisitType<T>`
+  per type, so an SDK that never calls it needs no `schemars` (see below);
+* a compile-time check,
+  `const _: () = toolkit_contract::contract::assert_grpc_package_major::<dyn Base>(package)`:
+  a package whose last segment is `v<digits>` must name the major of
+  `#[toolkit::contract(version)]`, read through the `ContractVersion` trait
+  that `#[toolkit::contract]` now implements; a package without a version
+  segment is not checked (`cpt-cf-binding-adr-contract-versioning`);
+* gated on `grpc-client`: `{Trait}Client` and `{Trait}ResolvingClient`, each
+  with `impl BaseTrait`, so the consumer keeps seeing `Arc<dyn PaymentApi>`.
 
 ### `.proto` generation and the lock file
 
 `toolkit-contract-protogen` renders a `.proto` from the contract IR. The result
 is **committed**, and `proto.lock.toml` pins it so an unintended schema change
 shows up as a lock-file diff rather than silently re-rendering during a build.
-Regeneration is an explicit step (the SDK's `gen_grpc_proto` example).
+
+The wire-type schemas come from the generated `<base>_grpc_schemas` visitor:
+`toolkit_contract_protogen::SchemaCollector` implements `VisitType` for every
+`JsonSchema` type and flattens each schema's `$defs`, so nested types are picked
+up and an SDK no longer lists its model types by hand. A `ProtoSpec` (contract
+IR, binding, schemas, `.proto` path, lockfile path) drives two functions:
+
+* `check_proto(&spec)` — for a test in the SDK (`tests/proto_up_to_date.rs` in
+  the `api-contracts` SDK). It fails when the committed `.proto` or lockfile is
+  not what the contract generates now, naming the first differing line; with
+  `TOOLKIT_PROTO_UPDATE=1` it rewrites both instead.
+* `write_proto(&spec)` — what the SDK's `gen_grpc_proto` example calls; `cargo
+  xtask proto-regen` runs that example for every SDK that has one.
+
+Regeneration stays an explicit step, and a forgotten one is now a test failure.
+There is deliberately no `build.rs` helper: generating at build time would make
+the `.proto` an output of the build rather than a reviewed artifact.
 
 ### DTO ↔ proto bridging, and the panic rule
 
@@ -136,12 +169,49 @@ supported; there is no `Stream`-typed *parameter* form in the projection
 vocabulary. A method needing them writes a `tonic` client by hand against the
 same base trait.
 
+### Client construction, timeouts and status mapping
+
+`{Trait}Client` has three constructors. `new(channel, config)` wraps a given
+channel; `connect(config)` connects eagerly; `connect_lazy(config)` is sync,
+touches no network, and returns a client whose channel connects on first use
+and reconnects by itself. `connect` and `connect_lazy` configure the endpoint
+the same way: a 10 s connect timeout, HTTP/2 keepalive (30 s interval, 10 s
+timeout, also while idle), and `config.timeout` as the per-call deadline, sent
+as `grpc-timeout` and enforced in the channel. A deadline that fires in the
+channel (tonic's `TimeoutExpired`, otherwise `CANCELLED "Timeout expired"`)
+maps to `TransportError::Timeout(config.timeout)`, as on the REST path.
+`require_tls` refuses a non-`https` endpoint.
+
+Every constructor puts the channel behind the config's circuit breaker
+(`toolkit_contract::grpc::GrpcChannel`, built by `guard_channel`); see
+`cpt-cf-binding-adr-client-circuit-breaker`. `#[circuit_breaker(skip)]` on a
+method lets its requests bypass the breaker.
+
+gRPC `UNIMPLEMENTED` without a Problem trailer maps to canonical
+`Unimplemented` ("provider does not implement this RPC; it may run an older
+minor version of the contract"), not to an internal error: within one major
+version that is what a missing RPC means
+(`cpt-cf-binding-adr-contract-versioning`).
+
+### Discovery and generated consumers
+
+`{Trait}ResolvingClient` (`PaymentApiGrpcResolvingClient`) wraps a
+`DirectoryResolvingClient`: it carries `const GRPC_SERVICE`, is built with
+`new(resolver, from_gear, tuning)`, resolves `GRPC_SERVICE` through the
+`EndpointResolver` on every call, and builds a `connect_lazy` client per
+endpoint. `#[toolkit::consumes(.., transport = grpc)]` registers it
+(`cpt-cf-binding-adr-consumer-wiring`). The provider registers its
+hand-written server under `<BASE>_GRPC_SERVICE`
+(`RegisterGrpcServiceFn::service_name`), and grpc-hub publishes it in the
+directory. The directory resolves by service name across gears; the consumer's
+`from` does not filter the lookup (`cpt-cf-adr-instance-addressable-discovery`).
+
 ### Coexistence with REST
 
 A base trait may carry both projections. They generate independent clients
 (`PaymentApiRestClient`, `PaymentApiGrpcClient`), both implement the base trait,
 and `#[toolkit::provides(transports = [local, rest, grpc])]` selects one at
-runtime from `client_wiring`. The `api-contracts` example ships all three.
+runtime from `clients.provides`. The `api-contracts` example ships all three.
 
 ### Known asymmetries with the REST projection
 
@@ -156,6 +226,13 @@ Recorded deliberately rather than left to be rediscovered:
 * **The policy stack does not run.** As with REST, `policies = [...]` on
   `#[toolkit::provides]` applies to the local transport only; the wiring logs a
   `warn!` when a non-local transport is selected with policies declared.
+* **No TLS configuration on the channel.** `require_tls` refuses a non-`https`
+  endpoint, but the generated client sets no `ClientTlsConfig`; the REST client
+  configures TLS through `toolkit-http`.
+* **Errors in trailers after headers are not seen by the circuit breaker.** The
+  classifier reads trailers-only responses, which is how tonic servers send
+  unary errors; a status that arrives after the response headers (a
+  server-streaming error) is not counted.
 
 ### Consequences
 
@@ -177,6 +254,13 @@ Recorded deliberately rather than left to be rediscovered:
 * Negative compile test: `#[retryable]` on `NotIdempotent`
   (`grpc_retryable_non_idempotent` trybuild fixture).
 * `ClientHub` test: a `PaymentApiGrpcClient` resolves as `Arc<dyn PaymentApi>`.
+* Drift test: `tests/proto_up_to_date.rs` in the `api-contracts` SDK (`check_proto`).
+* Resolving client (`grpc_resolving.rs`): waits for the provider, follows a
+  provider that moved, opens and closes its breaker, routes each major to its
+  own provider by service name, reports a missing RPC as `Unimplemented`, and
+  `PAYMENT_API_GRPC_SERVICE` equals tonic's `NamedService::NAME`.
+* Compile-time major check: `assert_grpc_package_major` unit tests in
+  `libs/toolkit-contract/src/contract.rs` (`v1` does not match `v10`).
 
 ## Pros and Cons of the Options
 
@@ -194,8 +278,9 @@ Recorded deliberately rather than left to be rediscovered:
   something to generate from.
 * Good, because the lock file turns an accidental schema change into a visible
   diff.
-* Neutral, because regeneration is a manual step authors must remember; CI
-  checking the lock file is what makes that safe.
+* Neutral, because regeneration is a manual step; the SDK's `check_proto` test
+  turns a forgotten one into a test failure, and `cargo xtask proto-regen
+  --check` checks every SDK at once.
 
 ### Option C: Code-First with No `.proto`
 
@@ -215,8 +300,15 @@ Recorded deliberately rather than left to be rediscovered:
   [`0007-cpt-cf-binding-adr-contract-versioning.md`](./0007-cpt-cf-binding-adr-contract-versioning.md)
   — a `V<N>` marker is stripped before the projection-suffix check, so
   `PaymentApiV2Grpc` classifies like `PaymentApiGrpc`.
+* `cpt-cf-binding-adr-consumer-wiring` (ADR-0004) — `#[toolkit::consumes(..,
+  transport = grpc)]` and readiness by gRPC service name.
+* `cpt-cf-binding-adr-client-circuit-breaker` (ADR-0009 in this folder) — the
+  breaker around the generated channel.
 * Codegen: `libs/toolkit-contract-macros/src/grpc_contract.rs`,
-  `proto_bridge.rs`; proto rendering: `libs/toolkit-contract-protogen`.
-* Runtime helpers: `libs/toolkit-contract/src/grpc.rs` (status mapping, bearer
-  metadata), `libs/toolkit-transport-grpc` (problem trailers, retry).
+  `proto_bridge.rs`; proto rendering: `libs/toolkit-contract-protogen`
+  (`sync.rs`: `SchemaCollector`, `ProtoSpec`, `check_proto`, `write_proto`).
+* Runtime helpers: `libs/toolkit-contract/src/grpc/mod.rs` (status mapping,
+  bearer metadata, `GrpcChannel`, `lazy_channel`),
+  `libs/toolkit-contract/src/runtime/resolving.rs`,
+  `libs/toolkit-transport-grpc` (problem trailers, retry).
 * Reference implementation: `examples/toolkit/api-contracts`.

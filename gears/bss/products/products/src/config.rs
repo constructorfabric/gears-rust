@@ -54,12 +54,12 @@ pub enum UsageTypeCatalogSource {
 /// working one; `deny_unknown_fields` is what turns a typo in the operator's
 /// file into a boot failure rather than a silently ignored setting.
 ///
-/// # `client_wiring.product_catalog_client_v1`
+/// # `clients.provides.product_catalog_client_v1`
 ///
 /// Products provides pricing's `ProductCatalogClientV1` through
 /// `#[toolkit::provides]`. `toolkit::wiring::read_wiring` reads
-/// `gears.bss-products.config.client_wiring.product_catalog_client_v1`.
-/// **An absent `client_wiring` section, or an absent key, is
+/// `gears.bss-products.clients.provides.product_catalog_client_v1`, a
+/// section next to this gear's `config`, not inside it. **An absent entry is
 /// `ClientWiring::Local`** — a same-process `core-server` needs no config
 /// and gets the in-process catalog provider. Only a split deployment
 /// declares the REST arm:
@@ -67,8 +67,8 @@ pub enum UsageTypeCatalogSource {
 /// ```yaml
 /// gears:
 ///   bss-products:
-///     config:
-///       client_wiring:
+///     clients:
+///       provides:
 ///         product_catalog_client_v1:
 ///           transport: rest
 ///           endpoint: "http://bss-products.virtuozzo.svc:8080"
@@ -77,8 +77,7 @@ pub enum UsageTypeCatalogSource {
 /// `ClientWiring` is `#[serde(tag = "transport")]`. The tagged object
 /// above is what `toolkit::wiring::read_wiring` accepts. The plan's
 /// nested spelling (`rest: { endpoint: ... }`) **will not parse** — it
-/// is not a `transport` tag. The key still lives in this typed config so
-/// `deny_unknown_fields` does not refuse a split deployment.
+/// is not a `transport` tag.
 ///
 /// A typo in a *value* has no such spelling, which is why
 /// [`Self::resolved_idempotency_retention_hours`] exists: `deny_unknown_fields`
@@ -132,15 +131,6 @@ pub struct ProductsConfig {
     /// wins over this: the value is the last step of `gear.rs`'s four, not the
     /// first. Default [`UsageTypeCatalogSource::Unconfigured`].
     pub usage_type_catalog_mode: UsageTypeCatalogSource,
-
-    /// `#[toolkit::provides]` wiring for `product_catalog_client_v1`.
-    ///
-    /// Absent (the default) is in-process `ClientWiring::Local`. Present so
-    /// a split-deployment `client_wiring` key is not refused by
-    /// `deny_unknown_fields`; `toolkit::wiring::read_wiring` is what
-    /// interprets the value.
-    #[serde(default)]
-    pub client_wiring: serde_json::Value,
 }
 
 impl Default for ProductsConfig {
@@ -152,7 +142,6 @@ impl Default for ProductsConfig {
             require_broker: false,
             usage_type_resolver_timeout_ms: USAGE_TYPE_RESOLVER_TIMEOUT_MS_DEFAULT,
             usage_type_catalog_mode: UsageTypeCatalogSource::Unconfigured,
-            client_wiring: serde_json::Value::Null,
         }
     }
 }

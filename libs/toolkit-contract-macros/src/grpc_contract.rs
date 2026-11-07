@@ -14,7 +14,7 @@
 //!
 //! See `rest_contract.rs` for the parallel REST pipeline.
 
-use heck::{ToSnakeCase as _, ToUpperCamelCase as _};
+use heck::{ToShoutySnakeCase as _, ToSnakeCase as _, ToUpperCamelCase as _};
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 use syn::{TraitItem, Type};
@@ -34,6 +34,7 @@ const GRPC_ATTRS: &[&str] = &[
     "streaming",
     "retryable",
     "optional",
+    "circuit_breaker",
 ];
 
 /// Expands a parsed `#[grpc_contract]` projection into the cleaned trait and gRPC binding function.
@@ -46,15 +47,112 @@ pub fn generate(model: &GrpcContractModel) -> TokenStream {
     let client_struct = generate_client_struct(model, &support);
     let client_impl = generate_client_impl(model, &support);
     let projection_impl = generate_projection_impl(model);
+    let service_const = generate_service_const(model);
+    let version_guard = generate_version_guard(model, &support);
+    let resolving_struct = generate_resolving_client_struct(model, &support);
+    let resolving_impl = generate_resolving_client_impl(model, &support);
+    let schema_visitor = generate_schema_visitor(model, &support);
 
     quote! {
         #cleaned_trait
         #binding_fn
+        #service_const
+        #version_guard
         #repr_guards
         #synthesized_request_bridges
         #client_struct
         #client_impl
         #projection_impl
+        #resolving_struct
+        #resolving_impl
+        #schema_visitor
+    }
+}
+
+/// `<base>_grpc_schemas(&mut V)`: visits every request and response type the
+/// projection puts on the wire, for `toolkit-contract-protogen` to build the
+/// `.proto` from. The `VisitType` bounds sit on the function, so nothing here
+/// needs `schemars` until a caller (a protogen test) instantiates it.
+fn generate_schema_visitor(model: &GrpcContractModel, support: &TokenStream) -> TokenStream {
+    let fn_ident = format_ident!("{}_grpc_schemas", base_trait_ident(model).to_snake_case());
+    let mut seen = std::collections::BTreeSet::new();
+    let mut types: Vec<&Type> = Vec::new();
+    for method in &model.methods {
+        let wire = method
+            .params
+            .iter()
+            .filter(|p| p.ident != "self" && !is_security_context_type(&p.ty))
+            .map(|p| &p.ty);
+        for ty in wire.chain(std::iter::once(&method.result_types.0)) {
+            let ty = match ty {
+                Type::Reference(r) => &*r.elem,
+                other => other,
+            };
+            if seen.insert(quote!(#ty).to_string()) {
+                types.push(ty);
+            }
+        }
+    }
+    let doc = format!(
+        "Visits the wire types of [`{}`]; see `toolkit_contract::ir::grpc::VisitType`.",
+        model.trait_ident
+    );
+    quote! {
+        #[doc = #doc]
+        pub fn #fn_ident<V>(visitor: &mut V)
+        where
+            #(V: #support::ir::grpc::VisitType<#types>,)*
+        {
+            #(<V as #support::ir::grpc::VisitType<#types>>::visit(visitor);)*
+        }
+    }
+}
+
+/// The fully qualified gRPC service name: `package.Service`, or `Service` with
+/// no package. This is tonic's `NamedService::NAME` for the generated server,
+/// since protogen writes the same `package` and `service` into the `.proto`,
+/// and the name the service is registered and discovered under.
+fn grpc_service_name(model: &GrpcContractModel) -> String {
+    if model.package.is_empty() {
+        model.service.clone()
+    } else {
+        format!("{}.{}", model.package, model.service)
+    }
+}
+
+fn base_trait_ident(model: &GrpcContractModel) -> String {
+    model
+        .base_trait
+        .segments
+        .last()
+        .map(|s| s.ident.to_string())
+        .unwrap_or_default()
+}
+
+/// `pub const <BASE>_GRPC_SERVICE: &str = "package.Service";`
+fn generate_service_const(model: &GrpcContractModel) -> TokenStream {
+    let const_ident = format_ident!(
+        "{}_GRPC_SERVICE",
+        base_trait_ident(model).to_shouty_snake_case()
+    );
+    let name = grpc_service_name(model);
+    let doc = format!(
+        "Fully qualified gRPC service name of [`{}`]: what the provider registers in the \
+         directory and what a consumer resolves.",
+        model.trait_ident
+    );
+    quote! {
+        #[doc = #doc]
+        pub const #const_ident: &str = #name;
+    }
+}
+
+/// A `vN` package must name the base contract's major version.
+fn generate_version_guard(model: &GrpcContractModel, support: &TokenStream) -> TokenStream {
+    let base = &model.base_trait;
+    let package = &model.package;
+    quote! {
+        const _: () = #support::contract::assert_grpc_package_major::<dyn #base>(#package);
     }
 }
 
@@ -325,22 +423,42 @@ fn generate_client_struct(model: &GrpcContractModel, support: &TokenStream) -> T
         #[cfg(feature = "grpc-client")]
         #[doc = #doc]
         pub struct #client_ident {
-            inner: #stubs::#client_module::#client_type_ident<::tonic::transport::Channel>,
+            inner: #stubs::#client_module::#client_type_ident<#support::grpc::GrpcChannel>,
             config: #support::runtime::config::ClientConfig,
         }
 
         #[cfg(feature = "grpc-client")]
         impl #client_ident {
-            /// Build a new client wrapping the supplied tonic Channel.
+            /// Build a new client wrapping the supplied tonic Channel, behind
+            /// `config`'s circuit breaker if it has one.
             #[must_use]
             pub fn new(
                 channel: ::tonic::transport::Channel,
                 config: #support::runtime::config::ClientConfig,
             ) -> Self {
                 Self {
-                    inner: #stubs::#client_module::#client_type_ident::new(channel),
+                    inner: #stubs::#client_module::#client_type_ident::new(
+                        #support::grpc::guard_channel(channel, &config),
+                    ),
                     config,
                 }
+            }
+
+            /// Build a client whose channel connects on first use and
+            /// reconnects by itself. Touches no network.
+            ///
+            /// # Errors
+            ///
+            /// Returns a `TransportError` for an invalid endpoint, a plaintext
+            /// endpoint under `require_tls`, or a call outside a Tokio runtime.
+            pub fn connect_lazy(
+                config: #support::runtime::config::ClientConfig,
+            ) -> ::std::result::Result<
+                Self,
+                #support::runtime::transport_error::TransportError,
+            > {
+                let channel = #support::grpc::lazy_channel(&config)?;
+                ::std::result::Result::Ok(Self::new(channel, config))
             }
 
             /// Connect to a base URL and build a client.
@@ -355,27 +473,11 @@ fn generate_client_struct(model: &GrpcContractModel, support: &TokenStream) -> T
                 Self,
                 #support::runtime::transport_error::TransportError,
             > {
-                // Honor `require_tls`: refuse to build the channel over a
-                // plaintext (`http://`) scheme so the long-lived, process-scoped
-                // platform-plane credential is never sent over cleartext h2c
-                // (`cpt-cf-adr-two-plane-auth`). When it is unset, the platform's
-                // deliberate in-mesh plaintext service-to-service convention
-                // is preserved (see `ClientConfig::require_tls`).
-                if config.require_tls
-                    && !config.base_url.trim_start().starts_with("https://")
-                {
-                    return ::std::result::Result::Err(
-                        #support::runtime::transport_error::TransportError::network(
-                            ::std::format!(
-                                "require_tls is set but the gRPC endpoint scheme is not https: {}",
-                                config.base_url,
-                            ),
-                        ),
-                    );
-                }
-                let endpoint = ::tonic::transport::Endpoint::from_shared(config.base_url.clone())
-                    .map_err(|e| #support::runtime::transport_error::TransportError::network(e))?;
-                let endpoint = endpoint.timeout(config.timeout);
+                // `require_tls` refuses a plaintext (`http://`) scheme so the
+                // process-scoped platform credential never goes over cleartext
+                // h2c (`cpt-cf-adr-two-plane-auth`).
+                #support::grpc::check_tls(&config)?;
+                let endpoint = #support::grpc::configured_endpoint(&config)?;
                 let channel = endpoint.connect().await
                     .map_err(|e| #support::runtime::transport_error::TransportError::network(e))?;
                 Ok(Self::new(channel, config))
@@ -585,6 +687,7 @@ fn generate_one_shot_unary_method(
     support: &TokenStream,
     err_convert: &TokenStream,
 ) -> TokenStream {
+    let skip_marker = skip_marker(method, support);
     let method_ident = &method.ident;
     let rpc_name = method.ident.to_string();
     let attach_metadata = match plane {
@@ -616,12 +719,13 @@ fn generate_one_shot_unary_method(
                 let __proto: #proto_request_ty = ::std::convert::From::from(#body_ident);
                 #[allow(unused_mut)]
                 let mut __request = ::tonic::Request::new(__proto);
+                #skip_marker
                 #attach_metadata
                 let mut __client = self.inner.clone();
                 let __response = __client
                     .#rpc_method_ident(__request)
                     .await
-                    .map_err(|__s| #support::grpc::map_tonic_status(&__s))?;
+                    .map_err(|__s| #support::grpc::map_call_status(&__s, self.config.timeout))?;
                 // Fallible conversion: a `via_string`-bearing response type has no
                 // infallible `From<Proto>` (a malformed field would otherwise let a
                 // peer take this process down with one bad response), so decode
@@ -657,6 +761,7 @@ fn generate_retryable_unary_method(
     support: &TokenStream,
     err_convert: &TokenStream,
 ) -> TokenStream {
+    let skip_marker = skip_marker(method, support);
     let method_ident = &method.ident;
     let rpc_name = method.ident.to_string();
     // Inside the per-attempt async block we hold a CLONE of the context
@@ -705,11 +810,12 @@ fn generate_retryable_unary_method(
                     let mut __client = self.inner.clone();
                     #[allow(unused_mut)]
                     let mut __request = ::tonic::Request::new((*__proto).clone());
+                    #skip_marker
                     #attach_metadata
                     let __response = __client
                         .#rpc_method_ident(__request)
                         .await
-                        .map_err(|__s| #support::grpc::map_tonic_status(&__s))?;
+                        .map_err(|__s| #support::grpc::map_call_status(&__s, self.config.timeout))?;
                     // See the one-shot arm: a panicking decode here would blow
                     // up inside the retry loop rather than returning an error.
                     let __decoded = <#ok_ty as #support::grpc_repr::TryFromProto<_>>::try_from_proto_wire(
@@ -726,6 +832,20 @@ fn generate_retryable_unary_method(
                 #support::runtime::retry::retry_with_backoff(&self.config.retry, __attempt).await;
             __result.map_err(#err_convert)
         }
+    }
+}
+
+/// Marks the request of a `#[circuit_breaker(skip)]` method so the client's
+/// circuit breaker lets it through uncounted.
+fn skip_marker(method: &GrpcMethodModel, support: &TokenStream) -> TokenStream {
+    if method.breaker_skip {
+        quote! {
+            __request
+                .extensions_mut()
+                .insert(#support::runtime::breaker::SkipCircuitBreaker);
+        }
+    } else {
+        quote! {}
     }
 }
 
@@ -768,6 +888,7 @@ fn generate_streaming_client_method(
     ok_ty: &Type,
     err_ty: &Type,
 ) -> TokenStream {
+    let skip_marker = skip_marker(method, support);
     let method_ident = &method.ident;
     let rpc_name = method.ident.to_string();
 
@@ -810,17 +931,20 @@ fn generate_streaming_client_method(
     // attach credentials, then await the response *headers*. That await is the
     // open — tonic's client call is `async fn(..) -> Result<Response<Streaming<T>>,
     // Status>`, so a server that returns a `Status` before its first message
-    // fails exactly here.
+    // fails exactly here, and so does the channel's per-call timeout.
     let open_call = quote! {
         let __proto: _ = ::std::convert::From::from(__body_owned);
         #[allow(unused_mut)]
         let mut __request = ::tonic::Request::new(__proto);
+        #skip_marker
         #attach_metadata
         let __response = __client
             .#rpc_method_ident(__request)
             .await
             .map_err(|__s| -> #err_ty {
-                ::std::convert::From::from(#support::grpc::map_tonic_status(&__s))
+                ::std::convert::From::from(
+                    #support::grpc::map_call_status(&__s, __call_timeout),
+                )
             })?;
         let mut __stream = __response.into_inner();
     };
@@ -859,6 +983,7 @@ fn generate_streaming_client_method(
                 use ::futures_util::StreamExt as _;
                 let __body_owned = #body_ident;
                 let __client_arc = self.inner.clone();
+                let __call_timeout = self.config.timeout;
                 #ctx_clone
 
                 ::std::boxed::Box::pin(::async_stream::try_stream! {
@@ -879,6 +1004,7 @@ fn generate_streaming_client_method(
                 use ::futures_util::StreamExt as _;
                 let __body_owned = #body_ident;
                 let mut __client = self.inner.clone();
+                let __call_timeout = self.config.timeout;
                 #ctx_clone
 
                 #open_call
@@ -892,6 +1018,151 @@ fn generate_streaming_client_method(
                 ))
             }
         },
+    }
+}
+
+/// The directory-resolving gRPC client: resolves `GRPC_SERVICE` on every call
+/// and delegates to a [`connect_lazy`] client per endpoint, so a consumer
+/// tolerates eventual readiness and provider churn. `#[toolkit::consumes(..,
+/// transport = grpc)]` registers it.
+fn generate_resolving_client_struct(
+    model: &GrpcContractModel,
+    support: &TokenStream,
+) -> TokenStream {
+    let resolving_ident = format_ident!("{}ResolvingClient", model.trait_ident);
+    let client_ident = client_struct_ident(&model.trait_ident);
+    let service = grpc_service_name(model);
+    let doc = format!(
+        "Directory-resolving gRPC client for [`{}`].\n\nProduced by \
+         `#[toolkit::grpc_contract]`. Resolves the `{service}` service from the service \
+         directory on every call and keeps a lazily connecting [`{client_ident}`] per \
+         endpoint, behind a circuit breaker of its own.",
+        model.trait_ident
+    );
+    quote! {
+        #[cfg(feature = "grpc-client")]
+        #[doc = #doc]
+        pub struct #resolving_ident {
+            __inner: ::std::sync::Arc<
+                #support::runtime::resolving::DirectoryResolvingClient<#client_ident>,
+            >,
+        }
+
+        #[cfg(feature = "grpc-client")]
+        impl #resolving_ident {
+            /// The gRPC service this client resolves and calls.
+            pub const GRPC_SERVICE: &'static str = #service;
+
+            /// Build a client that discovers `GRPC_SERVICE`, provided by
+            /// `from_gear`, through `resolver`. `tuning` applies the per-call
+            /// timeout, retry and circuit-breaker settings.
+            #[must_use]
+            pub fn new(
+                resolver: ::std::sync::Arc<dyn #support::runtime::resolving::EndpointResolver>,
+                from_gear: impl ::std::convert::Into<::std::string::String>,
+                tuning: #support::wiring::ClientTuning,
+            ) -> Self {
+                let __inner = #support::runtime::resolving::DirectoryResolvingClient::for_target(
+                    resolver,
+                    #support::runtime::resolving::ResolveTarget::grpc(from_gear, Self::GRPC_SERVICE),
+                    tuning,
+                    <#client_ident>::connect_lazy,
+                );
+                Self { __inner: ::std::sync::Arc::new(__inner) }
+            }
+        }
+    }
+}
+
+fn generate_resolving_client_impl(model: &GrpcContractModel, support: &TokenStream) -> TokenStream {
+    let resolving_ident = format_ident!("{}ResolvingClient", model.trait_ident);
+    let client_ident = client_struct_ident(&model.trait_ident);
+    let trait_path = &model.base_trait;
+    let methods = model
+        .methods
+        .iter()
+        .map(|m| generate_resolving_method(m, &client_ident, trait_path, support));
+    quote! {
+        #[cfg(feature = "grpc-client")]
+        #[::async_trait::async_trait]
+        impl #trait_path for #resolving_ident {
+            #(#methods)*
+        }
+    }
+}
+
+/// One delegating method of the resolving client.
+fn generate_resolving_method(
+    method: &GrpcMethodModel,
+    client_ident: &syn::Ident,
+    trait_path: &syn::Path,
+    support: &TokenStream,
+) -> TokenStream {
+    let method_ident = &method.ident;
+    let sig_inputs = render_method_inputs(method.params.iter().map(|p| (&p.ident, &p.ty)));
+    let (ok_ty, err_ty) = &method.result_types;
+    let return_ty = render_method_return_ty(ok_ty, err_ty, method.shape);
+    let wire_params: Vec<&GrpcParam> = method.params.iter().filter(|p| p.ident != "self").collect();
+
+    if method.shape.stream_open() == Some(StreamOpen::Immediate) {
+        // The stream is `'static` and resolving happens inside it, so every
+        // argument moves in. A borrowed one (`&PlatformSecurityContext`) is
+        // cloned first and lent to the call; the inner client's stream is
+        // `'static` too, so the loan ends with the call.
+        let owned = wire_params.iter().map(|p| {
+            let ident = &p.ident;
+            if matches!(&p.ty, Type::Reference(r) if r.mutability.is_none()) {
+                quote! { let #ident = ::std::borrow::ToOwned::to_owned(#ident); }
+            } else {
+                quote! {}
+            }
+        });
+        let call_args = wire_params.iter().map(|p| {
+            let ident = &p.ident;
+            if matches!(&p.ty, Type::Reference(r) if r.mutability.is_none()) {
+                quote! { &#ident }
+            } else {
+                quote! { #ident }
+            }
+        });
+        return quote! {
+            fn #method_ident #sig_inputs #return_ty {
+                use ::futures_util::StreamExt as _;
+                let __inner = ::std::sync::Arc::clone(&self.__inner);
+                #(#owned)*
+                let __fut = async move {
+                    let __stream: ::std::pin::Pin<::std::boxed::Box<
+                        dyn ::futures_core::Stream<Item = ::std::result::Result<#ok_ty, #err_ty>>
+                            + ::std::marker::Send + 'static,
+                    >> = match __inner.resolved().await {
+                        ::std::result::Result::Ok(__c) => {
+                            <#client_ident as #trait_path>::#method_ident(&*__c, #(#call_args),*)
+                        }
+                        ::std::result::Result::Err(__e) => ::std::boxed::Box::pin(
+                            ::futures_util::stream::once(async move {
+                                ::std::result::Result::Err(
+                                    <#err_ty as ::std::convert::From<
+                                        #support::runtime::transport_error::TransportError,
+                                    >>::from(__e),
+                                )
+                            }),
+                        ),
+                    };
+                    __stream
+                };
+                ::std::boxed::Box::pin(::futures_util::stream::once(__fut).flatten())
+            }
+        };
+    }
+
+    let args = wire_params.iter().map(|p| &p.ident);
+    quote! {
+        async fn #method_ident #sig_inputs #return_ty {
+            let __c = self.__inner.resolved().await.map_err(|__e| {
+                <#err_ty as ::std::convert::From<#support::runtime::transport_error::TransportError>>::from(__e)
+            })?;
+            <#client_ident as #trait_path>::#method_ident(&*__c, #(#args),*).await
+        }
     }
 }
 
@@ -947,6 +1218,139 @@ mod tests {
         }
         assert!(!out.is_empty(), "no fn `{method}` found in expansion");
         out
+    }
+
+    #[test]
+    fn the_service_name_constant_is_package_dot_service() {
+        let out = expand(quote! {
+            pub trait FooApiGrpc: FooApi {
+                async fn get_thing(&self, id: String) -> Result<Resp, Err>;
+            }
+        });
+        assert!(
+            out.contains(r#"pub const FOO_API_GRPC_SERVICE : & str = "test.v1.FooApi""#),
+            "{out}"
+        );
+        assert!(
+            out.contains(r#"pub const GRPC_SERVICE : & 'static str = "test.v1.FooApi""#),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn the_package_major_is_checked_against_the_contract() {
+        let out = expand(quote! {
+            pub trait FooApiGrpc: FooApi {
+                async fn get_thing(&self, id: String) -> Result<Resp, Err>;
+            }
+        });
+        assert!(
+            out.contains("assert_grpc_package_major :: < dyn FooApi > (\"test.v1\")"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn the_client_builds_lazily_behind_the_breaker() {
+        let out = expand(quote! {
+            pub trait FooApiGrpc: FooApi {
+                async fn get_thing(&self, id: String) -> Result<Resp, Err>;
+            }
+        });
+        assert!(out.contains("pub fn connect_lazy"), "{out}");
+        assert!(
+            out.contains("grpc :: guard_channel (channel , & config)"),
+            "{out}"
+        );
+        assert!(
+            out.contains("pub struct FooApiGrpcResolvingClient"),
+            "{out}"
+        );
+        assert!(out.contains("ResolveTarget :: grpc"), "{out}");
+    }
+
+    #[test]
+    fn unary_status_mapping_knows_the_configured_timeout() {
+        let body = method_bodies(
+            quote! {
+                pub trait FooApiGrpc: FooApi {
+                    async fn get_thing(&self, id: String) -> Result<Resp, Err>;
+                }
+            },
+            "get_thing",
+        );
+        assert!(body.contains("map_call_status"), "{body}");
+    }
+
+    #[test]
+    fn stream_open_status_mapping_knows_the_configured_timeout() {
+        for method in [
+            quote! { #[streaming] fn items(&self, id: String) -> Result<Resp, Err>; },
+            quote! { #[streaming(open = fallible)] async fn items(&self, id: String) -> Result<Resp, Err>; },
+        ] {
+            let body = method_bodies(
+                quote! {
+                    pub trait FooApiGrpc: FooApi {
+                        #method
+                    }
+                },
+                "items",
+            );
+            assert!(
+                body.contains("map_call_status (& __s , __call_timeout)"),
+                "{body}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_skipped_method_marks_its_request() {
+        let tokens = quote! {
+            pub trait FooApiGrpc: FooApi {
+                #[circuit_breaker(skip)]
+                async fn wait(&self, id: String) -> Result<Resp, Err>;
+                async fn get(&self, id: String) -> Result<Resp, Err>;
+            }
+        };
+        assert!(method_bodies(tokens.clone(), "wait").contains("SkipCircuitBreaker"));
+        assert!(!method_bodies(tokens.clone(), "get").contains("SkipCircuitBreaker"));
+        assert!(
+            !expand(tokens).contains("# [circuit_breaker"),
+            "the marker is stripped from the emitted trait"
+        );
+    }
+
+    #[test]
+    fn circuit_breaker_takes_only_skip() {
+        let attr: GrpcContractAttr =
+            syn::parse2(quote! { package = "test.v1", stubs_module = "crate::stubs" }).unwrap();
+        let item: syn::ItemTrait = syn::parse2(quote! {
+            pub trait FooApiGrpc: FooApi {
+                #[circuit_breaker(failure_ratio = 0.5)]
+                async fn get(&self, id: String) -> Result<Resp, Err>;
+            }
+        })
+        .unwrap();
+        let err = grpc_contract_parse::parse(attr, item)
+            .err()
+            .expect("rejected");
+        assert!(err.to_string().contains("circuit_breaker(skip)"), "{err}");
+    }
+
+    /// A streamed `&PlatformSecurityContext` is cloned into the resolving
+    /// client's `'static` stream instead of borrowed.
+    #[test]
+    fn the_resolving_client_owns_borrowed_stream_arguments() {
+        let out = expand(quote! {
+            pub trait FooApiGrpc: FooApi {
+                #[streaming]
+                fn watch(&self, ctx: &PlatformSecurityContext, key: String) -> Result<Event, Err>;
+            }
+        });
+        assert!(
+            out.contains("let ctx = :: std :: borrow :: ToOwned :: to_owned (ctx)"),
+            "{out}"
+        );
     }
 
     #[test]

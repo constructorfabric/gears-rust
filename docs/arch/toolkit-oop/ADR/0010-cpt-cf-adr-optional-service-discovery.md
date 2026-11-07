@@ -30,7 +30,7 @@ that declare remote `#[toolkit::consumes]` dependencies.
 
 This is a direct requirement, not only a convenience. `cpt-cf-fr-k8s-native` states that `DirectoryService` MAY be
 used alongside k8s DNS but MUST NOT be *required* for basic service resolution in k8s. The current OoP bootstrap
-violates this by always requiring a directory. A static `consumer_wiring.<dep>.endpoint` pointing at a
+violates this by always requiring a directory. A static `clients.consumes.<dep>.endpoint` pointing at a
 `http://<gear>.<ns>.svc.cluster.local:<port>` Service URL *is* k8s DNS discovery; this ADR makes it a supported mode.
 
 ## Runtime Scope
@@ -58,7 +58,7 @@ endpoint is available, so no host-side change is required.
 * **Readiness correctness**: A gear with remote dependencies must not report `ready` when it has no way to resolve them.
   Missing discovery must be a visible misconfiguration, not a silent runtime failure.
 * **Reuse existing wiring**: The framework already has a static-endpoint override for consumer wiring
-  (`consumer_wiring.<dep>.endpoint`, implemented in `libs/toolkit-contract/src/wiring.rs` and consumed by the
+  (`clients.consumes.<dep>.endpoint`, implemented in `libs/toolkit-contract/src/wiring.rs` and consumed by the
   proxy-wiring phase in `libs/toolkit/src/runtime/host_runtime.rs`). That mechanism should become the supported
   fallback when discovery is disabled, rather than introducing a parallel abstraction.
 * **Gear code agnosticism**: Gear source code must not change. The decision is implemented in bootstrap and runtime
@@ -80,7 +80,7 @@ endpoint is available, so no host-side change is required.
 * **Option D**: Introduce a pluggable `DiscoveryBackend` trait from the start. Rejected as overkill - the current need
   is satisfied by "directory" vs. "static endpoint" and can be folded into a trait later without breaking Option C.
 * **Option E**: Static resolution via an endpoint *template* (e.g. `http://{gear}.{namespace}.svc.cluster.local:8080`)
-  configured once per process, rather than one `consumer_wiring.<dep>.endpoint` entry per `(consumer, dep)` pair.
+  configured once per process, rather than one `clients.consumes.<dep>.endpoint` entry per `(consumer, dep)` pair.
   This directly targets the k8s-native case: in a cluster the Service URL of every provider follows one DNS pattern,
   so a single template resolves all dependencies - including the platform gears every gear consumes (e.g.
   `settings-service` → `authz-resolver`), which otherwise require a static entry per consumer per platform dependency.
@@ -96,7 +96,7 @@ supported fallback.
 An `OoP` gear starts without directory interaction when directory-less mode is selected. It still runs
 its HTTP server, framework probes (`/healthz`, `/readyz`, `/health`, `/.well-known/openapi.json`), and the normal
 gear lifecycle. Remote dependencies are resolved either through the directory (when configured) or through explicit
-static endpoint overrides in `consumer_wiring`. If neither is available, remote dependencies gate `/readyz` as
+static endpoint overrides in `clients.consumes`. If neither is available, remote dependencies gate `/readyz` as
 unresolved, which is the safe default.
 
 ### Discovery mode
@@ -107,7 +107,7 @@ The mode is selected explicitly so that a missing endpoint is never silently int
   heartbeats, and resolves remote deps through `DirectoryService`. If this mode is selected but **no** endpoint is
   configured, the bootstrap **fails fast with a startup error** rather than degrading to directory-less.
 * **`discovery: none`** - directory-less by intent. No registration, no heartbeat, no deregistration. Remote deps are
-  resolved only through static `consumer_wiring.<dep>.endpoint` overrides; otherwise they stay unresolved and gate
+  resolved only through static `clients.consumes.<dep>.endpoint` overrides; otherwise they stay unresolved and gate
   `/readyz`.
 
 When neither `discovery` nor `TOOLKIT_DIRECTORY_ENDPOINT` is set, the mode defaults to `none`. Deployments (e.g. Helm
@@ -126,7 +126,7 @@ the mechanical changes are listed under [Bootstrap changes](#bootstrap-changes).
   (`cpt-cf-adr-two-plane-auth`). Skipping `build_directory_client` in directory-less mode would leave the process with
   no credential, so static-endpoint platform-plane calls would 401. Credential construction therefore runs in **both**
   modes; only the directory client and presence loop are gated on the endpoint.
-* The `consumer_wiring.<dep>.endpoint` static override - defined by `cpt-cf-binding-adr-consumer-wiring` as a dev/test
+* The `clients.consumes.<dep>.endpoint` static override - defined by `cpt-cf-binding-adr-consumer-wiring` as a dev/test
   escape hatch that "MUST NOT be used in production" - is promoted to a supported static-discovery mode under
   `discovery: none`. This ADR **amends** that binding ADR (see [Traceability](#traceability)): its "No static endpoint
   configuration" driver and deferred production guard are superseded for this mode, and the implementation must align
@@ -140,7 +140,7 @@ the mechanical changes are listed under [Bootstrap changes](#bootstrap-changes).
   the directory, so a gear declaring a label-based dependency must **fail fast at startup** (or keep `/readyz` at
   `503`) rather than appearing ready and failing only at call time.
 * A gear with remote `#[toolkit::consumes]` declarations becomes ready only if a directory resolves the provider or a
-  static `consumer_wiring.<dep>.endpoint` is configured for it. No gear source code changes are required.
+  static `clients.consumes.<dep>.endpoint` is configured for it. No gear source code changes are required.
 
 ### Static endpoint override as static discovery
 
@@ -149,8 +149,8 @@ The existing `ConsumerWiring` schema already supports an absolute `endpoint` per
 ```yaml
 gears:
   my-consumer:
-    config:
-      consumer_wiring:
+    clients:
+      consumes:
         api-contracts:
           endpoint: "https://api-contracts.my-ns.svc.cluster.local:8443"
           require_tls: true
@@ -211,7 +211,7 @@ The code changes are localized to `libs/toolkit/src/bootstrap/oop.rs` and
 * **Fail-fast test**: launch an `OoP` worker with `discovery: directory` and no endpoint configured; assert the
   bootstrap exits with a startup error rather than proceeding directory-less.
 * **Readiness test**: launch an `OoP` consumer with a remote `#[toolkit::consumes]` dep under `discovery: none`;
-  assert that `/readyz` returns `503` with the dep in `unresolved_deps`; add a static `consumer_wiring.<dep>.endpoint`
+  assert that `/readyz` returns `503` with the dep in `unresolved_deps`; add a static `clients.consumes.<dep>.endpoint`
   and assert that `/readyz` returns `200`.
 * **Platform-plane credential test**: launch a directory-less consumer that calls a platform-plane method through a
   static endpoint; assert the request carries `X-ToolKit-Internal-Token` (i.e. the credential survives the removal of
@@ -247,7 +247,7 @@ The code changes are localized to `libs/toolkit/src/bootstrap/oop.rs` and
 ### Option C: Runtime Optional Directory + Static Override (chosen)
 
 * Good, because the same binary works in both modes.
-* Good, because it reuses the existing `consumer_wiring.<dep>.endpoint` mechanism instead of introducing a new
+* Good, because it reuses the existing `clients.consumes.<dep>.endpoint` mechanism instead of introducing a new
   abstraction.
 * Good, because readiness semantics stay correct: missing discovery is visible as unresolved deps unless explicitly
   resolved by static configuration.
@@ -333,7 +333,7 @@ forward-compatible subset of that future set.
   variant of Profile 2/3 with external routing.
 - **Amends**: [`cpt-cf-binding-adr-consumer-wiring`](../../toolkit-contract-binding/ADR/0004-cpt-cf-binding-adr-consumer-wiring.md)
   - under `discovery: none`, supersedes its "No static endpoint configuration" driver and deferred production guard
-  (`consumer_wiring.<dep>.endpoint` becomes a supported static-discovery mechanism).
+  (`clients.consumes.<dep>.endpoint` becomes a supported static-discovery mechanism).
 
 This decision directly addresses the following requirements or design elements:
 

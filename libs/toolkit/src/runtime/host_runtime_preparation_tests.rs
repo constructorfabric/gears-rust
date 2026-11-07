@@ -2279,7 +2279,7 @@ async fn an_external_registry_endpoint_does_not_depend_on_a_same_name_child() {
     let runtime = HostRuntime::new(
         builder.build_topo_sorted().unwrap(),
         Arc::new(ExternalConfig(serde_json::json!({
-            "a": {"config": {"consumer_wiring": {
+            "a": {"clients": {"consumes": {
                 "fake-registry": {"endpoint": "https://external-registry.example:8443"}
             }}}
         }))),

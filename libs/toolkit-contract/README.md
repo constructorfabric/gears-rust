@@ -12,12 +12,13 @@ The `cf-gears-toolkit-contract` crate provides:
 - REST query-parameter types and the `QueryParams` derive, shared by generated clients, server routes, and OpenAPI specifications
 - A per-call policy stack for cross-cutting behavior such as tracing, metrics, and authorization
 - Client wiring and transport tuning for local, REST, and gRPC contract implementations
+- Directory-resolving clients for REST and gRPC, and a per-endpoint circuit breaker (from `toolkit-resilience`) in every client built through wiring
 - gRPC representation traits and protobuf conversion helpers
 
 ## Features
 
-- `runtime-client`: enables runtime helpers shared by generated REST clients
-- `rest-client`: enables generated REST clients and directory-resolving client wrappers
+- `runtime-client`: enables runtime helpers shared by generated REST and gRPC clients, including the directory-resolving runtime and the circuit breaker
+- `rest-client`: enables generated REST clients and their `<Trait>RestResolvingClient` wrappers
 - `rest-server`: enables generated REST route integration and query extraction
 - `grpc-client`: enables runtime helpers for generated gRPC clients
 - `canonical-errors`: re-exports the RFC 9457 `Problem` envelope and enables transport-error conversion

@@ -120,7 +120,7 @@ clients. An instance becomes selectable only after its plugin binds its client.
 
 Listed crates call `declare_gts_inventory!()` and use `toolkit_gts::local::*`; remaining root
 macros cause a manifest error. Deployment publication shares startup validation and per-publisher
-`consumer_wiring` settings; `--registry` overrides only the endpoint.
+`clients.consumes` settings; `--registry` overrides only the endpoint.
 
 See the [SDK publication guide](../../gears/system/types-registry/types-registry-sdk/README.md#publishing-from-a-gear)
 for collectors, publisher setup, manifest binding, retry/timeout/batch configuration and registry-client wiring.

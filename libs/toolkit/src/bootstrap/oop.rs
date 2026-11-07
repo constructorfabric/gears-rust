@@ -228,6 +228,12 @@ fn effective_oop_config(
                 obj.insert("config".to_owned(), rendered.config.clone());
             }
             // If local has "config", it already overrides - no action needed
+            // `clients` follows the same rule.
+            if !rendered.clients.is_null()
+                && (!obj.contains_key("clients") || obj["clients"].is_null())
+            {
+                obj.insert("clients".to_owned(), rendered.clients.clone());
+            }
         }
 
         debug!(

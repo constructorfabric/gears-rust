@@ -102,7 +102,7 @@ The four contract types encode fundamentally different operational semantics tha
 Transaction scope     can participate in caller's   cannot participate (ACID)
 Failure domain        same as caller               independent
 Timeout / retry       not applicable               required
-Circuit breaker       not applicable               recommended
+Circuit breaker       not applicable               on by default (ADR-0009)
 Error mapping         Rust errors directly          Problem Details over wire
 Serialization         none (zero-copy)             JSON / protobuf
 Lifecycle             shared with host             independent process
@@ -138,8 +138,7 @@ Collapsing to fewer contract types would force callers into unnecessary defensiv
 - Service directory implementation -- delivered by cluster service discovery workstream
 - Transaction guard (TxGuard) compile-time mechanism -- open design question, separate ADR
 - Transaction context propagation for Embedded/Extension contracts -- separate ADR
-- Circuit breaker implementation -- future work
-- Remote backend unavailability / degraded-mode behavior -- future work
+- Fallback methods and degraded-mode behavior for remote backend unavailability -- future work (the client-side circuit breaker shipped: ADR-0009, `cpt-cf-binding-adr-client-circuit-breaker`)
 - Compile-only and REST-only enforcement at build/boot time -- future work
 
 ## 5. Functional Requirements
@@ -664,7 +663,7 @@ SDK crates with the `rest-client` feature disabled MUST NOT incur additional com
 ### 7.3 Open Design Questions
 
 - **Transaction guard (TxGuard)**: A compile-time mechanism that restricts which contracts can be called inside a transaction scope. Within a `TxGuard<'tx>`, only Embedded/Extension contracts would be callable -- the compiler would reject calls to Api/Backend traits. This would enforce the operational semantics table at the type level, not just by naming convention. Needs its own ADR to design the type-state mechanism and interaction with database transactions (SeaORM/SQLx). Not a requirement for this change.
-- **Remote backend unavailability**: Circuit breakers, fallback methods, degraded-mode behavior when remote plugins are temporarily down.
+- **Remote backend unavailability**: Fallback methods and degraded-mode behavior when remote plugins are temporarily down. Circuit breaking is resolved by ADR-0009 (`cpt-cf-binding-adr-client-circuit-breaker`): every generated client built through wiring has a per-endpoint breaker, on by default.
 - **Transaction context propagation**: How Embedded/Extension contracts receive and participate in the caller's transaction scope.
 
 ## 8. Prior Art
@@ -684,4 +683,5 @@ SDK crates with the `rest-client` feature disabled MUST NOT incur additional com
 - **ADR-0001** — contract source of truth: [`./ADR/0001-cpt-cf-binding-adr-contract-source-of-truth.md`](./ADR/0001-cpt-cf-binding-adr-contract-source-of-truth.md)
 - **ADR-0002** — OpenAPI spec limits: [`./ADR/0002-cpt-cf-binding-adr-openapi-spec-limits.md`](./ADR/0002-cpt-cf-binding-adr-openapi-spec-limits.md)
 - **ADR-0006** — client observability (tracing/OTEL): [`./ADR/0006-cpt-cf-binding-adr-client-observability.md`](./ADR/0006-cpt-cf-binding-adr-client-observability.md)
+- **ADR-0009** — client-side circuit breaker: [`./ADR/0009-cpt-cf-binding-adr-client-circuit-breaker.md`](./ADR/0009-cpt-cf-binding-adr-client-circuit-breaker.md)
 - **PoC**: [striped-zebra-dev/toolkit-binding-poc](https://github.com/striped-zebra-dev/toolkit-binding-poc)

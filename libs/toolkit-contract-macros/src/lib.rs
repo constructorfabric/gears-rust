@@ -44,6 +44,17 @@ pub fn rest_contract(attr: TokenStream, item: TokenStream) -> TokenStream {
     }
 }
 
+/// `#[toolkit::grpc_contract(package = "...", service = "...", stubs_module = "...")]`
+/// — the gRPC projection of a base contract trait.
+///
+/// Generates client-side code only (servers are hand-written): the binding IR
+/// (`<trait>_grpc_binding()`), `<BASE>_GRPC_SERVICE` (the `package.Service`
+/// name), the `<base>_grpc_schemas` visitor for protogen, a compile-time check
+/// that a `vN` package matches the contract's major version, and, under
+/// `grpc-client`, `<Trait>Client` (`new`, `connect`, `connect_lazy`) and
+/// `<Trait>ResolvingClient`, both implementing the base trait. Methods take
+/// `#[rpc(name = "...")]`, `#[idempotency_level(...)]`, and optionally
+/// `#[streaming]`, `#[retryable]` and `#[circuit_breaker(skip)]`.
 #[proc_macro_attribute]
 pub fn grpc_contract(attr: TokenStream, item: TokenStream) -> TokenStream {
     let attr = parse_macro_input!(attr as grpc_contract_parse::GrpcContractAttr);
@@ -80,7 +91,9 @@ pub fn provides(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// Applied on the gear struct (alongside `#[toolkit::gear]`). Emits a
 /// `ConsumerRegistration` that the runtime's
 /// proxy-wiring phase replays: a compile-time local impl wins, otherwise a
-/// directory-resolving REST client is registered.
+/// directory-resolving client is registered — `<Contract>RestResolvingClient`
+/// by default, `<Contract>GrpcResolvingClient` with `transport = grpc` (top
+/// level or per entry).
 /// `contract = [sdk::Api, sdk::OtherApi(from = "other")]` consumes several
 /// contracts from one attribute. Does NOT inject a topo-sort dependency — see
 /// `toolkit_contract_macros::consumes` docs.

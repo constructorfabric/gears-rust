@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use toolkit::ClientHub;
 
-use super::held_while;
+use super::{held_while, refuse_remote_wiring};
 
 /// Stands in for the seeded client: what is held is irrelevant to the handoff.
 struct Held;
@@ -63,4 +63,40 @@ async fn a_panicking_wiring_removes_the_entry() {
     });
     assert!(task.await.expect_err("the wiring panicked").is_panic());
     assert!(hub.try_get::<Held>().is_none(), "removed after the panic");
+}
+
+struct Gear(serde_json::Value);
+
+impl toolkit::config::ConfigProvider for Gear {
+    fn get_gear_config(&self, gear: &str) -> Option<&serde_json::Value> {
+        (gear == "types-registry").then_some(&self.0)
+    }
+}
+
+#[test]
+fn a_remote_binding_for_a_provided_contract_is_refused() {
+    for key in ["platform_types_registry_api", "types_registry_api"] {
+        let gear = Gear(serde_json::json!({
+            "clients": { "provides": { key: { "transport": "rest", "endpoint": "http://r:1" } } }
+        }));
+        let err = refuse_remote_wiring(&gear, "types-registry")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains(&format!("clients.provides.{key}")),
+            "names the entry: {err}"
+        );
+    }
+}
+
+#[test]
+fn local_or_absent_wiring_is_accepted() {
+    for gear in [
+        Gear(serde_json::json!({ "config": {} })),
+        Gear(serde_json::json!({
+            "clients": { "provides": { "types_registry_api": { "transport": "local" } } }
+        })),
+    ] {
+        refuse_remote_wiring(&gear, "types-registry").unwrap();
+    }
 }

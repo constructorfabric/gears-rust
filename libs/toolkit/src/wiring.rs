@@ -12,34 +12,21 @@ use toolkit_contract::wiring::ClientWiring;
 
 use crate::context::GearCtx;
 
-/// Read the [`ClientWiring`] for a single provided contract from the
-/// module's config section.
+/// Read the [`ClientWiring`] for a single provided contract.
 ///
-/// Path: `gears.<gear>.config.client_wiring.<key>`. If `client_wiring`
-/// or the contract `key` is absent, returns [`ClientWiring::Local`] —
-/// gears whose only provided contract has a local-only deployment can
-/// run with no config at all.
+/// Path: `gears.<gear>.clients.provides.<key>`, with `clients.defaults`
+/// merged under it ([`crate::clients_config::provided_wiring`]). If the entry
+/// is absent, returns [`ClientWiring::Local`] — gears whose only provided
+/// contract has a local-only deployment can run with no config at all.
 ///
 /// `key` is the `snake_case` form of the contract trait identifier (e.g.
 /// `payment_api` for `PaymentApi`); the macro takes care of casing.
 ///
 /// # Errors
-/// Returns a context-bearing `anyhow::Error` if `client_wiring.<key>` is
-/// present but cannot be deserialized into a [`ClientWiring`].
+/// Returns an `anyhow::Error` naming the config path if the entry is present
+/// but malformed.
 pub fn read_wiring(ctx: &GearCtx, key: &str) -> anyhow::Result<ClientWiring> {
-    let raw = ctx.raw_config();
-    let Some(section) = raw.get("client_wiring") else {
-        return Ok(ClientWiring::Local);
-    };
-    let Some(per_contract) = section.get(key) else {
-        return Ok(ClientWiring::Local);
-    };
-    serde_json::from_value::<ClientWiring>(per_contract.clone()).map_err(|e| {
-        anyhow::anyhow!(
-            "gear `{gear}`: invalid client_wiring.{key}: {e}",
-            gear = ctx.gear_name()
-        )
-    })
+    crate::clients_config::provided_wiring(ctx.config_provider(), ctx.gear_name(), key)
 }
 
 /// Default [`PolicyStack`] applied to in-process local clients built by

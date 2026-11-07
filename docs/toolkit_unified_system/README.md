@@ -29,6 +29,7 @@ This folder contains the ToolKit developer documentation, split by topic for foc
 | E2E testing (philosophy, patterns, infrastructure) | `13_e2e_testing.md` | |
 | DB behavior testing & audit (rules with no exceptions, audit method; choices with a price in TRADEOFFS) | `14_db_behavior_testing.md` | `docs/arch/database/TRADEOFFS.md` |
 | HTTP client (TLS, retries, timeouts, concurrency, OTel tracing, auth hook) | | `docs/adrs/toolkit/0001-toolkit-hyper-tower-http-client.md` |
+| Client circuit breaker (`toolkit-resilience`, generated contract clients) | | `docs/adrs/toolkit/0005-toolkit-client-circuit-breaker.md` |
 | AuthN/AuthZ, PolicyEnforcer, PEP enforcement | `06_authn_authz_secure_orm.md` | `docs/arch/authorization/DESIGN.md` |
 | Authentication (inbound JWT/OIDC policies, outbound OAuth2 client-credentials) | | `docs/adrs/toolkit/0002-toolkit-auth-oauth2-client.md` |
 | Which control catches which class of defect (inverse lookup, before merge) | `16_defect_class_to_control_map.md` | |
@@ -70,3 +71,4 @@ This folder contains the ToolKit developer documentation, split by topic for foc
 
 - `docs/adrs/toolkit/0001-toolkit-hyper-tower-http-client.md` – **toolkit-http**: Hyper+Tower HTTP client with TLS, retries, timeouts, concurrency limiting, decompression, OTel tracing, and extensible auth layer hook.
 - `docs/adrs/toolkit/0002-toolkit-auth-oauth2-client.md` – **toolkit-auth**: Inbound JWT/OIDC route-level policies and outbound OAuth2 client-credentials flow with automatic token refresh and `Authorization: Bearer` injection.
+- `docs/adrs/toolkit/0005-toolkit-client-circuit-breaker.md` – **toolkit-resilience**: client-side circuit breaker as a tower layer, counted per attempt below retry; on by default in generated contract clients (`cpt-cf-binding-adr-client-circuit-breaker`).

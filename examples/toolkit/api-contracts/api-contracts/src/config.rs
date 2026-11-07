@@ -1,7 +1,7 @@
 //! Configuration for the api-contracts gear.
 //!
 //! Transport wiring is no longer carried here — it lives under
-//! `gears.api-contracts.config.client_wiring.payment_api` and is parsed
+//! `gears.api-contracts.clients.provides.payment_api` and is parsed
 //! by `#[toolkit::provides]` into a typed
 //! [`ClientWiring`](toolkit_contract::wiring::ClientWiring).
 

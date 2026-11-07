@@ -118,6 +118,8 @@ pub struct RequestBuilder {
     transport_security: TransportSecurity,
     /// Optional per-request metrics label (read by the metrics layer)
     request_type: Option<RequestType>,
+    /// Typed values for the client's layers (never sent on the wire)
+    extensions: http::Extensions,
 }
 
 impl RequestBuilder {
@@ -139,6 +141,7 @@ impl RequestBuilder {
             error: None,
             transport_security,
             request_type: None,
+            extensions: http::Extensions::new(),
         }
     }
 
@@ -293,6 +296,14 @@ impl RequestBuilder {
     /// ```
     pub fn with_request_type(mut self, t: impl Into<std::borrow::Cow<'static, str>>) -> Self {
         self.request_type = Some(RequestType::new(t));
+        self
+    }
+
+    /// Attach a typed value for the client's layers to read, such as a marker
+    /// that tells a circuit breaker to let this request through. Extensions
+    /// are never sent on the wire.
+    pub fn extension<T: Clone + Send + Sync + 'static>(mut self, value: T) -> Self {
+        self.extensions.insert(value);
         self
     }
 
@@ -509,6 +520,7 @@ impl RequestBuilder {
         };
 
         let mut request = builder.body(Full::new(body_bytes))?;
+        request.extensions_mut().extend(self.extensions);
 
         // Forward the chain-scoped `x-request-id` of the request being served,
         // if any. Runs here (not as a layer) because `Buffer` dispatches on a

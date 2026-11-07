@@ -230,6 +230,7 @@ fn generate_contract_impl(model: &ContractModel, support: &TokenStream) -> Token
     let trait_name_str = trait_name.to_string();
     let descriptor_name = format_ident!("{}_DESCRIPTOR", trait_name_str.to_shouty_snake_case());
     let fn_name = format_ident!("{}_ir", trait_name_str.to_snake_case());
+    let version = &model.version;
 
     quote! {
         impl #support::contract::Contract for dyn #trait_name {
@@ -240,6 +241,10 @@ fn generate_contract_impl(model: &ContractModel, support: &TokenStream) -> Token
             fn contract_ir() -> #support::ir::contract::ContractIr {
                 #fn_name()
             }
+        }
+
+        impl #support::contract::ContractVersion for dyn #trait_name {
+            const VERSION: &'static str = #version;
         }
     }
 }

@@ -70,8 +70,9 @@ impl TryFromProto<stubs::RegisterResponse> for RegResult {
 
 /// Hand-written stand-in for the tonic-generated stubs the macro references via
 /// `stubs_module = "crate::stubs"`. Shaped to match tonic-prost-build output:
-/// `<service_snake>_client::<Service>Client<Channel>` with `new` + the RPC
-/// method, plus `<Method>Request` / response messages.
+/// `<service_snake>_client::<Service>Client<T>`, generic over the transport like
+/// tonic's, with `new` + the RPC method, plus `<Method>Request` / response
+/// messages.
 pub mod stubs {
     #[derive(Clone, Debug, PartialEq, Eq)]
     pub struct RegisterRequest {
@@ -87,15 +88,13 @@ pub mod stubs {
     }
 
     pub mod reg_client {
-        use tonic::transport::Channel;
-
         #[derive(Clone)]
         pub struct RegClient<C> {
             _channel: C,
         }
 
-        impl RegClient<Channel> {
-            pub fn new(channel: Channel) -> Self {
+        impl<C> RegClient<C> {
+            pub fn new(channel: C) -> Self {
                 Self { _channel: channel }
             }
 

@@ -974,7 +974,7 @@ async fn each_declared_provider_is_served_by_the_gears_own_installers() {
         "cluster",
         uuid::Uuid::new_v4(),
         Arc::new(MockConfig(serde_json::json!({
-            "config": { "client_wiring": {
+            "clients": { "provides": {
                 "cluster_cache_api": grpc,
                 "distributed_lock_api": grpc,
                 "leader_election_api": grpc,
