@@ -22,6 +22,7 @@ pub mod repo;
 pub mod resolution;
 pub mod specification;
 pub mod streaming;
+pub mod sync_wait;
 
 #[cfg(test)]
 mod local_broker_tests;

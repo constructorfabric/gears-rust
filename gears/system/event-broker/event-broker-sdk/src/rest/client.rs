@@ -4,7 +4,7 @@ use secrecy::ExposeSecret;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use toolkit_canonical_errors::{CanonicalError, Problem};
-use toolkit_http::{HttpClient, HttpResponse, RequestBuilder};
+use toolkit_http::{HttpClient, HttpClientBuilder, HttpResponse, RequestBuilder};
 use toolkit_security::SecurityContext;
 
 use crate::api::{
@@ -22,6 +22,13 @@ use crate::rest::wire;
 use crate::sequence::Sequence;
 
 const V1: &str = "/event-broker/v1";
+
+/// The HTTP client's per-request timeout. It bounds the time to the *response
+/// head*, not the streamed body, so it is safe for the long-lived delivery
+/// streams; and it sits well above any synchronous-publish hold (which the
+/// broker caps at tens of seconds), so a held `201`/`202` is never cut off
+/// client-side regardless of the `Prefer: wait` a caller chooses.
+const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// Wire framing for the delivery stream.
 ///
@@ -47,6 +54,11 @@ pub struct RestBroker {
     base_url: String,
     framing: StreamTransport,
     debug: bool,
+    /// How long [`publish_sync`](EventBrokerApi::publish_sync) asks the broker
+    /// to hold the response (the `N` of `Prefer: wait=N`). The broker clamps it
+    /// to its own configured ceiling, so a client asking for more than the
+    /// broker allows simply gets the broker's maximum.
+    sync_wait: std::time::Duration,
 }
 
 impl RestBroker {
@@ -57,13 +69,30 @@ impl RestBroker {
     /// [`EventBrokerError::Transport`] if the underlying HTTP client cannot be
     /// constructed.
     pub fn new(base_url: impl Into<String>) -> Result<Self, EventBrokerError> {
-        let http = HttpClient::new().map_err(|err| EventBrokerError::Transport(err.to_string()))?;
+        let http = HttpClientBuilder::new()
+            .timeout(REQUEST_TIMEOUT)
+            .build()
+            .map_err(|err| EventBrokerError::Transport(err.to_string()))?;
         Ok(Self {
             http,
             base_url: base_url.into(),
             framing: StreamTransport::default(),
             debug: false,
+            // A 30s default `Prefer: wait=N`; the broker caps it to its own
+            // `publish.max_wait_secs`, so this is an upper bound, not a demand.
+            sync_wait: std::time::Duration::from_secs(30),
         })
+    }
+
+    /// Sets how long [`publish_sync`](EventBrokerApi::publish_sync) asks the
+    /// broker to hold the response (`Prefer: wait=N`); clamped by the broker to
+    /// its configured ceiling. This sets only the header value - the client's
+    /// request timeout ([`REQUEST_TIMEOUT`]) already covers any hold the broker
+    /// will honour, so the client need not be rebuilt.
+    #[must_use]
+    pub fn with_sync_wait(mut self, wait: std::time::Duration) -> Self {
+        self.sync_wait = wait;
+        self
     }
 
     /// Selects the delivery stream framing this client opens streams with.
@@ -187,6 +216,19 @@ impl RestBroker {
         url: &str,
         body: Option<serde_json::Value>,
     ) -> Result<(u16, Bytes), EventBrokerError> {
+        self.call_with_headers(ctx, method, url, body, &[]).await
+    }
+
+    /// [`call`](Self::call) with additional request headers - the publish
+    /// path's `Prefer: wait=N` (RFC 7240) rides through here.
+    async fn call_with_headers(
+        &self,
+        ctx: &SecurityContext,
+        method: Method,
+        url: &str,
+        body: Option<serde_json::Value>,
+        headers: &[(&str, &str)],
+    ) -> Result<(u16, Bytes), EventBrokerError> {
         let mut rb = match method {
             Method::Get => self.http().get(url),
             Method::Post => self.http().post(url),
@@ -194,6 +236,9 @@ impl RestBroker {
         };
         if let Some(body) = &body {
             rb = rb.json(body).map_err(to_transport)?;
+        }
+        for (name, value) in headers {
+            rb = rb.header(name, value);
         }
         rb = self.authed(rb, ctx);
         if self.debug {
@@ -513,6 +558,43 @@ impl EventBrokerApi for RestBroker {
             .call_status(ctx, Method::Post, &url, Some(to_value(&body)?))
             .await?;
         Ok(outcome_from_status(status))
+    }
+
+    /// Publishes with `Prefer: wait=N` (RFC 7240) so the broker holds the
+    /// response until the event is stored: `201` -> `Persisted`, `202` ->
+    /// `Accepted` (the wait elapsed; the event is still enqueued), `200` ->
+    /// `Duplicate`.
+    async fn publish_sync(
+        &self,
+        ctx: &SecurityContext,
+        event: &Event,
+    ) -> Result<IngestOutcome, EventBrokerError> {
+        let body = wire::PublishEventWire::from_event(event);
+        let url = self.url(&format!("{V1}/events"));
+        // `Prefer: wait` is whole seconds (RFC 7240). Round a sub-second wait up
+        // to 1 rather than down to 0 (which asks for no wait at all), and
+        // saturate a wait beyond `u32` to the max the server accepts.
+        let secs = u32::try_from(
+            self.sync_wait
+                .as_secs()
+                .saturating_add(u64::from(self.sync_wait.subsec_nanos() > 0)),
+        )
+        .unwrap_or(u32::MAX);
+        let prefer = format!("wait={secs}");
+        let (status, bytes) = self
+            .call_with_headers(
+                ctx,
+                Method::Post,
+                &url,
+                Some(to_value(&body)?),
+                &[("Prefer", &prefer)],
+            )
+            .await?;
+        if (200..300).contains(&status) {
+            Ok(outcome_from_status(status))
+        } else {
+            Err(error_from_bytes(status, &bytes))
+        }
     }
 
     async fn publish_batch(

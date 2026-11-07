@@ -101,6 +101,56 @@ fn ingest_and_delivery_are_checked_too() {
     }
 }
 
+/// A valid single-backend deployment in `mode`, with the synchronous-publish
+/// cap set to `max_wait_secs`.
+fn config_with_publish_wait(mode: &str, max_wait_secs: u32) -> EventBrokerConfig {
+    serde_json::from_value(json!({
+        "mode": mode,
+        "publish": { "max_wait_secs": max_wait_secs },
+        "backends": { "main": { "type": MEMORY_BACKEND } },
+        "backend_routing": { TOPIC_TYPE: "main" },
+    }))
+    .expect("test configuration deserializes")
+}
+
+/// B2: a shared ingest tier refuses a synchronous-publish hold above the cap,
+/// so one slow backend cannot be made to pin every connection open.
+#[test]
+fn cluster_ingest_refuses_a_publish_wait_above_the_cap() {
+    let cfg = config_with_publish_wait("cluster_ingest", super::MAX_CLUSTER_INGEST_WAIT_SECS + 1);
+
+    assert_eq!(
+        check(&cfg, DeploymentMode::ClusterIngest).err(),
+        Some(Error::PublishMaxWaitTooLarge {
+            secs: super::MAX_CLUSTER_INGEST_WAIT_SECS + 1,
+            max: super::MAX_CLUSTER_INGEST_WAIT_SECS,
+        })
+    );
+}
+
+/// The cap itself is accepted.
+#[test]
+fn cluster_ingest_accepts_the_publish_wait_cap() {
+    let cfg = config_with_publish_wait("cluster_ingest", super::MAX_CLUSTER_INGEST_WAIT_SECS);
+
+    assert!(
+        check(&cfg, DeploymentMode::ClusterIngest).is_ok(),
+        "the cap itself is within bounds"
+    );
+}
+
+/// The cap is `cluster_ingest`-only: standalone (a single dev/test process) may
+/// hold a synchronous publish as long as it likes.
+#[test]
+fn standalone_is_not_subject_to_the_publish_wait_cap() {
+    let cfg = config_with_publish_wait("standalone", super::MAX_CLUSTER_INGEST_WAIT_SECS * 100);
+
+    assert!(
+        check(&cfg, DeploymentMode::Standalone).is_ok(),
+        "standalone is unrestricted"
+    );
+}
+
 /// A dispatcher holds no registry: it carries the sections without being
 /// subject to their rules.
 #[test]

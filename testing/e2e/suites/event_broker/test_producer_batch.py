@@ -10,12 +10,15 @@
 - 1.07: chained run that does not link → 400
 - 1.08: run behind the committed chain head → 412
 - 1.09: resent batch of only duplicates → 200
+- 1.10: sync batch (Prefer: wait=N) → 201 once every admitted event is stored
 """
 
 from __future__ import annotations
 
 import uuid
 from datetime import datetime, timezone
+
+import pytest
 
 from .conftest import (
     API_BASE,
@@ -57,6 +60,31 @@ async def test_batch_publish_returns_202(api):
         )
     assert resp.status_code == 202
     assert resp.text == "", "202 Accepted must carry no body"
+
+
+@pytest.mark.backend_sensitive
+async def test_batch_prefer_wait_returns_201_once_stored(api):
+    """scenario: producer/batch/1.10-positive-batch-sync-wait.md
+
+    ``Prefer: wait=N`` applies to the batch as a whole: once every admitted
+    event is stored the broker answers ``201``, and ``Preference-Applied``
+    reports the applied wait (RFC 7240 §3).
+    """
+    tenant_id = str(uuid.uuid4())
+    async with api() as client:
+        resp = await client.post(
+            "/events:batch",
+            headers={"Prefer": "wait=10"},
+            json={
+                "events": [
+                    _event(EVENT_TYPE_STREAM, tenant_id, "s1"),
+                    _event(EVENT_TYPE_STREAM, tenant_id, "s2"),
+                ]
+            },
+        )
+    assert resp.status_code == 201
+    assert resp.text == "", "201 Created must carry no body"
+    assert resp.headers.get("preference-applied") == "wait=10"
 
 
 async def test_batch_mixing_topics_rejected_400(api):

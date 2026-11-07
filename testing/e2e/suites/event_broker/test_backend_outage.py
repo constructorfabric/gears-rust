@@ -217,3 +217,93 @@ async def test_a_server_started_with_its_backend_down_serves_once_it_is_up(test_
                 proc.kill()
                 proc.wait(timeout=5)
         sidecar.stop()
+
+
+@pytest.mark.skipif(
+    BACKEND not in _SIDECARS,
+    reason="needs a backend server in a sidecar container the test can stop; "
+    "runs with EB_E2E_BACKEND=postgres, mysql, mariadb or kafka",
+)
+@pytest.mark.backend_sensitive
+@pytest.mark.timeout(150, func_only=True)
+async def test_sync_publish_times_out_to_202_when_the_backend_is_down(test_env):
+    """A synchronous publish (`Prefer: wait=N`) to a provisioned topic whose
+    backend is then unreachable is admitted and durably enqueued (the producer
+    chain lives in the gear database, not the event backend), but the outbox
+    append never succeeds, so the broker answers a deterministic `202 Accepted`
+    once N elapses.
+
+    This is the deterministic companion to the `wait=0` single-publish test: on
+    a live backend that test races the drain, whereas a stopped backend makes a
+    timed-out wait certain.
+    """
+    sidecar_type = _SIDECARS[BACKEND]
+    sidecar = type(
+        f"Outage{sidecar_type.__name__}",
+        (sidecar_type,),
+        {
+            "NAME_PREFIX": f"eb-e2e-outage-{BACKEND}",
+            "LABEL": f"{LABEL_KEY}=eb-e2e-outage-{BACKEND}",
+            "FIXED_HOST_PORT": True,
+        },
+    )()
+    sidecar.start()
+    proc = None
+    try:
+        # Unlike the companion test, the backend is UP at boot so the topic
+        # provisions; it is stopped only after provisioning, so a later publish
+        # is admitted (provisioning is recorded in the gear DB) yet never stored.
+        home_dir = tempfile.mkdtemp(prefix="cf-gears-e2e-event-broker-outage-sync-")
+        env = GearTestEnv(
+            config_path=CONFIG,
+            config_patch=lambda text, _env: _patch(text, home_dir, [sidecar]),
+            port=OUTAGE_PORT,
+            health_path="/healthz",
+            health_timeout=60,
+            log_suffix="event-broker-outage-sync",
+        )
+        config_path = _prepare_config(env)
+        proc = subprocess.Popen(
+            [os.environ["E2E_BINARY"], "--config", str(config_path), "run"],
+            cwd=str(PROJECT_ROOT),
+            stdout=open(_log_path(env), "a"),
+            stderr=subprocess.STDOUT,
+            env={**os.environ},
+        )
+        _wait_healthy(env)
+
+        origin = f"http://localhost:{OUTAGE_PORT}"
+        deadline = time.monotonic() + 90
+        while httpx.get(f"{origin}/readyz", timeout=5).status_code != 200:
+            assert time.monotonic() < deadline, "the server never turned ready"
+            time.sleep(0.5)
+        wait_provisioned(BASE_URL, {TOPIC: EVENT_TYPE})
+
+        # Take the backend down now that the topic is provisioned.
+        _docker("stop", sidecar.container_id)
+
+        tenant_id = str(uuid.uuid4())
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.post(
+                f"{BASE_URL}/events",
+                headers={"Prefer": "wait=2"},
+                json=_event(tenant_id),
+            )
+        # Admitted and enqueued, but the backend append cannot complete while the
+        # backend is down, so the wait elapses to 202.
+        assert resp.status_code == 202
+        assert resp.text == "", "202 Accepted must carry no body"
+        assert resp.headers.get("preference-applied") == "wait=2"
+
+        # Bring the backend back so the container stops cleanly in teardown.
+        _docker("start", sidecar.container_id)
+        sidecar._wait_ready()
+    finally:
+        if proc is not None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=15)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=5)
+        sidecar.stop()

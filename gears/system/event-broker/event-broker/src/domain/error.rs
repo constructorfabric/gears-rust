@@ -224,6 +224,7 @@ pub enum ErrorCode {
     // -- Validation (400) --
     BadTypePattern,
     InvalidBody,
+    InvalidHeader,
     InvalidPartition,
     InvalidPath,
     InvalidQuery,
@@ -266,6 +267,7 @@ impl ErrorCode {
             Self::TopologyVersionMismatch => "TopologyVersionMismatch",
             Self::BadTypePattern => "BadTypePattern",
             Self::InvalidBody => "InvalidBody",
+            Self::InvalidHeader => "InvalidHeader",
             Self::InvalidPartition => "InvalidPartition",
             Self::InvalidPath => "InvalidPath",
             Self::InvalidQuery => "InvalidQuery",

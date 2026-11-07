@@ -111,7 +111,8 @@ let producer = Producer::builder()
     .await?;
 
 producer.publish(OrderCreated { order_id, total_cents: 4299 }).await?;
-// Reports `Accepted` or `Duplicate`, never `Persisted`, until #5655 serves synchronous publish.
+// Holds until the backend stores the event (`Prefer: wait=N`): `Persisted` once
+// stored, `Accepted` if the wait elapses first, `Duplicate` for a resend.
 producer.publish_persisted(OrderCreated { order_id, total_cents: 4299 }).await?;
 ```
 

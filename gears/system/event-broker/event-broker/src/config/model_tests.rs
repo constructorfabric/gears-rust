@@ -240,7 +240,7 @@ fn the_removed_default_storage_backend_key_is_refused() {
     .expect_err("the key no longer exists");
     assert_eq!(
         err.to_string(),
-        "unknown field `default_storage_backend`, expected one of `mode`, `batch`, `polling`, `subscription`, `streaming`, `loader`, `workers`, `registration`, `provisioning`, `topics`, `backends`, `backend_routing`, `outbox_groups`"
+        "unknown field `default_storage_backend`, expected one of `mode`, `batch`, `publish`, `polling`, `subscription`, `streaming`, `loader`, `workers`, `registration`, `provisioning`, `topics`, `backends`, `backend_routing`, `outbox_groups`"
     );
 }
 
@@ -256,7 +256,7 @@ fn the_removed_producer_key_is_refused() {
     .expect_err("the key no longer exists");
     assert_eq!(
         err.to_string(),
-        "unknown field `producer`, expected one of `mode`, `batch`, `polling`, `subscription`, `streaming`, `loader`, `workers`, `registration`, `provisioning`, `topics`, `backends`, `backend_routing`, `outbox_groups`"
+        "unknown field `producer`, expected one of `mode`, `batch`, `publish`, `polling`, `subscription`, `streaming`, `loader`, `workers`, `registration`, `provisioning`, `topics`, `backends`, `backend_routing`, `outbox_groups`"
     );
 }
 
