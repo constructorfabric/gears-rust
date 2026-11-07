@@ -14,25 +14,25 @@ const GRAPH_STORAGE_SCHEMAS: [(&str, &str); 4] = [
     (
         NODE_BASE_TYPE,
         include_str!(
-            "../../../graph-storage/graph-storage/schemas/gts.cf.core.graph.node.v1~.schema.json"
+            "../../../graph-storage/graph-storage-sdk/schemas/gts.cf.core.graph.node.v1~.schema.json"
         ),
     ),
     (
         OWNED_NODE_TYPE,
         include_str!(
-            "../../../graph-storage/graph-storage/schemas/gts.cf.core.graph.node.v1~cf.core.graph.owned_node.v1~.schema.json"
+            "../../../graph-storage/graph-storage-sdk/schemas/gts.cf.core.graph.node.v1~cf.core.graph.owned_node.v1~.schema.json"
         ),
     ),
     (
         ATTRIBUTE_BASE_TYPE,
         include_str!(
-            "../../../graph-storage/graph-storage/schemas/gts.cf.core.graph.attribute.v1~.schema.json"
+            "../../../graph-storage/graph-storage-sdk/schemas/gts.cf.core.graph.attribute.v1~.schema.json"
         ),
     ),
     (
         PROVENANCE_ATTRIBUTE_TYPE,
         include_str!(
-            "../../../graph-storage/graph-storage/schemas/gts.cf.core.graph.attribute.v1~cf.core.graph.provenance.v1~.schema.json"
+            "../../../graph-storage/graph-storage-sdk/schemas/gts.cf.core.graph.attribute.v1~cf.core.graph.provenance.v1~.schema.json"
         ),
     ),
 ];

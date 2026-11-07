@@ -160,7 +160,7 @@ Several platform initiatives need to persist and query relationships between het
 
 **ID**: `cpt-cf-graph-storage-actor-types-registry`
 
-- **Role**: The platform GTS registry that validates and serves compile-time-known GTS schemas and instances; the graph ontology's base types are published through it.
+- **Role**: The platform GTS registry that validates and serves compile-time-known GTS schemas and instances. The graph ontology's base types and the gear's permissions are seeded into it from the `toolkit-gts` inventory at its startup; producer types are registered with the gear only until the registry holds tenant-owned types (ADR-0007, stage 2).
 
 #### AuthZ Resolver Gear
 
@@ -1049,7 +1049,7 @@ The gear **MUST** maintain at least 85% line coverage across its library crates.
 | Platform tenant-deletion ledger | Authoritative, restore-independent tenant deletion generations for offboarding reconciliation (`cpt-cf-graph-storage-fr-tenant-offboarding`) | p2 |
 | ToolKit framework | Gear lifecycle, REST OperationBuilder, SecureORM, ClientHub, canonical errors | p1 |
 | AuthZ Resolver gear | Policy decisions and access scopes for every operation | p1 |
-| Types Registry gear | Platform registration of the gear's GTS base types and permission instances | p1 |
+| Types Registry gear | Seeds the gear's GTS base types and permission instances from the inventory (no runtime dependency); producer types move to it after its tenancy release (ADR-0007) | p1 |
 | Embedding provider | In-process ONNX runtime or remote inference endpoint producing fixed-dimension vectors | p1 |
 | File Storage gear | Blob storage for heavy content referenced from node payloads | p2 |
 | ToolKit `toolkit-db` safe-CTE API | Not a dependency of the shipped gear: every hop is the two-query hop, two scoped statements through the secure ORM. A scoped single-statement hop (`toolkit-db` PR #4584) is a later option for tail latency at a database round trip of 2 ms or more, measured on the development stand | — |

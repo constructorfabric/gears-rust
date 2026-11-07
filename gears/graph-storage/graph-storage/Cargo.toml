@@ -92,7 +92,11 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 # --workspace` in the repository, including the macOS lane, which has no
 # Docker and fails on them. Nothing in this gear's tests needs it:
 # `run_migrations_for_testing` is not behind it.
-toolkit-db = { workspace = true, features = ["pg"] }
+toolkit-db = { workspace = true, features = ["pg", "sqlite"] }
+# The real registry, seeded from this crate's inventory: one bad entry would stop
+# its startup, and the platform with it (`tests/types_registry.rs`).
+types-registry = { workspace = true }
+types-registry-sdk = { workspace = true }
 # Drives the gear's own axum router in-process: the REST cases send real
 # requests through it rather than calling the handlers as functions.
 tower = { workspace = true }
