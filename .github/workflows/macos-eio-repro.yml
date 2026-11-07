@@ -1,0 +1,136 @@
+name: macOS EIO repro (tmp)
+
+# Temporary experiment: tries to reproduce EIO on GitHub-hosted macos-latest
+# with generic I/O and public-crate builds only (no gears-rust code).
+# RED job = reproduced, GREEN = not reproduced.
+
+on:
+  push:
+    branches: ['lobster40/tmp/macos-repro-**']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  repro:
+    name: repro (replica ${{ matrix.replica }})
+    runs-on: macos-latest
+    timeout-minutes: 100
+    strategy:
+      fail-fast: false
+      matrix:
+        replica: [1, 2, 3, 4]
+    steps:
+      - name: Checkout (repro scripts only)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: .github/macos-eio-repro
+          sparse-checkout-cone-mode: false
+
+      - name: Env
+        run: |
+          mkdir -p "$RUNNER_TEMP/eio"
+          {
+            sw_vers; uname -a
+            df -h /; df -h "$GITHUB_WORKSPACE"
+            sysctl hw.memsize hw.ncpu
+            mount | grep -E 'disk|apfs' || true
+          } > "$RUNNER_TEMP/eio/env.txt" 2>&1
+          cat "$RUNNER_TEMP/eio/env.txt"
+          printf 'phase\tstart_epoch\tend_epoch\n' > "$RUNNER_TEMP/eio/phases.tsv"
+          printf 'T0\t%s\t%s\n' "$(date -u +%s)" "$(date -u +%s)" >> "$RUNNER_TEMP/eio/phases.tsv"
+
+      - name: "Phase 1: pure I/O"
+        continue-on-error: true
+        run: |
+          start=$(date -u +%s)
+          rc=0
+          python3 .github/macos-eio-repro/io_stress.py --dir "$GITHUB_WORKSPACE/_io" --minutes 20 --threads 8 --report "$RUNNER_TEMP/eio/phase1.json" || rc=$?
+          printf 'phase1\t%s\t%s\n' "$start" "$(date -u +%s)" >> "$RUNNER_TEMP/eio/phases.tsv"
+          exit "$rc"
+
+      - name: "Phase 2: cargo, no project code"
+        continue-on-error: true
+        run: |
+          start=$(date -u +%s)
+          rc=0
+          bash .github/macos-eio-repro/cargo_load.sh "$GITHUB_WORKSPACE/_cargo" 30 "$RUNNER_TEMP/eio/phase2.json" || rc=$?
+          printf 'phase2\t%s\t%s\n' "$start" "$(date -u +%s)" >> "$RUNNER_TEMP/eio/phases.tsv"
+          exit "$rc"
+
+      - name: Collect kernel log and summarize
+        if: ${{ always() }}
+        env:
+          REPLICA: ${{ matrix.replica }}
+        run: |
+          cd "$RUNNER_TEMP/eio"
+          t0=$(awk -F'\t' '$1=="T0"{print $2}' phases.tsv)
+          # log show takes runner-local time; format T0 in local time (minus 60 s margin)
+          start_local=$(date -r $((t0 - 60)) '+%Y-%m-%d %H:%M:%S')
+          sudo log show --start "$start_local" --style compact --predicate 'process == "kernel"' 2>&1 | tee kernel.log > /dev/null || true
+          grep -iE 'apfs|nvme|disk[0-9]|I/O error|checksum|corrupt' kernel.log > kernel-storage.log || true
+          gzip -f kernel.log || true
+
+          # EIO lines: "YYYY-MM-DD HH:MM:SS.ffffff ..." in runner-local time
+          grep -E 'disk[0-9]+s[0-9]+: I/O error' kernel-storage.log > kernel-eio.log || true
+          eio_total=$(wc -l < kernel-eio.log | tr -d ' ')
+          to_epoch() { date -j -f '%Y-%m-%d %H:%M:%S' "$1 $2" +%s 2>/dev/null || echo 0; }
+          eio_first=""; eio_last=""
+          if [ "$eio_total" -gt 0 ]; then
+            eio_first=$(head -n1 kernel-eio.log | awk '{print $1" "substr($2,1,8)}')
+            eio_last=$(tail -n1 kernel-eio.log | awk '{print $1" "substr($2,1,8)}')
+          fi
+          eio_p1=0; eio_p2=0
+          if [ "$eio_total" -gt 0 ]; then
+            while read -r d t _; do
+              e=$(to_epoch "$d" "${t%%.*}")
+              for ph in phase1 phase2; do
+                s=$(awk -F'\t' -v p="$ph" '$1==p{print $2}' phases.tsv)
+                f=$(awk -F'\t' -v p="$ph" '$1==p{print $3}' phases.tsv)
+                if [ -n "$s" ] && [ "$e" -ge "$s" ] && [ "$e" -le "$f" ]; then
+                  if [ "$ph" = phase1 ]; then eio_p1=$((eio_p1 + 1)); else eio_p2=$((eio_p2 + 1)); fi
+                fi
+              done
+            done < kernel-eio.log
+          fi
+
+          jq_num() { jq -r --arg k "$2" '.[$k] // "n/a"' "$1" 2>/dev/null || echo n/a; }
+          p1_mis=$(jq_num phase1.json verify_mismatches)
+          p1_err=$(jq_num phase1.json os_errors)
+          p2_fb=$(jq_num phase2.json failed_builds)
+          p2_ex=$(jq_num phase2.json exec_failures)
+          p2_sig=$(jq_num phase2.json signature_hits)
+          df_end=$(df -h "$GITHUB_WORKSPACE" | tail -n1 | awk '{print $4" free ("$5" used)"}')
+
+          {
+            echo "### EIO repro, replica $REPLICA"
+            echo
+            echo "| replica | phase1 verify mismatches | phase1 errors | phase2 failed builds | phase2 exec failures | phase2 signature hits | EIO total (p1 / p2) | first EIO | last EIO | df at end |"
+            echo "|---|---|---|---|---|---|---|---|---|---|"
+            echo "| $REPLICA | $p1_mis | $p1_err | $p2_fb | $p2_ex | $p2_sig | $eio_total ($eio_p1 / $eio_p2) | ${eio_first:--} | ${eio_last:--} | $df_end |"
+            echo
+            echo "EIO times are runner-local; phase attribution uses phases.tsv epochs."
+          } >> "$GITHUB_STEP_SUMMARY"
+          cat "$GITHUB_STEP_SUMMARY" | tail -n 8
+
+          bad=0
+          [ "$eio_total" -gt 0 ] && bad=1
+          case "$p1_mis" in ''|n/a|0) ;; *) bad=1 ;; esac
+          case "$p2_ex" in ''|n/a|0) ;; *) bad=1 ;; esac
+          # Exact fault strings (Illegal byte sequence, Bus error, disk I/O error,
+          # os error 5/92) in cargo output: the same fault seen from user space.
+          case "$p2_sig" in ''|n/a|0) ;; *) bad=1 ;; esac
+          if [ "$bad" -eq 1 ]; then
+            echo "::error::EIO reproduced on replica $REPLICA"
+            exit 1
+          fi
+
+      - name: Upload artifacts
+        if: ${{ always() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: eio-repro-${{ matrix.replica }}
+          path: ${{ runner.temp }}/eio
+          if-no-files-found: warn
