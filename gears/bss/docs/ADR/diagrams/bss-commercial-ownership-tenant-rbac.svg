@@ -1,0 +1,65 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="790" viewBox="0 0 1200 790">
+<defs><marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="#64748b"/></marker></defs>
+<rect width="1200" height="790" fill="#ffffff"/>
+<text x="32" y="56.0" font-family="Arial, Helvetica, sans-serif" font-size="32" font-weight="700" fill="#172b4d" text-anchor="start">Who owns what — and who can access it</text>
+<text x="32" y="93.0" font-family="Arial, Helvetica, sans-serif" font-size="21" font-weight="400" fill="#52627a" text-anchor="start">BSS commercial ownership · Tenant-scoped RBAC</text>
+<rect x="32" y="144" width="248" height="484" rx="12" fill="#f3f7ff" stroke="#c1d3ed" stroke-width="1.4"/>
+<rect x="340" y="144" width="470" height="484" rx="12" fill="#f2f9f6" stroke="#b5d6c8" stroke-width="1.4"/>
+<rect x="870" y="144" width="298" height="484" rx="12" fill="#f7f5fc" stroke="#d0c7e6" stroke-width="1.4"/>
+<text x="52" y="181.0" font-family="Arial, Helvetica, sans-serif" font-size="17" font-weight="700" fill="#315a8b" text-anchor="start">ACCOUNT MANAGEMENT</text>
+<text x="360" y="183.0" font-family="Arial, Helvetica, sans-serif" font-size="19" font-weight="700" fill="#24624f" text-anchor="start">BSS</text>
+<text x="890" y="183.0" font-family="Arial, Helvetica, sans-serif" font-size="19" font-weight="700" fill="#654a91" text-anchor="start">AUTHORIZATION</text>
+<text x="360" y="211.0" font-family="Arial, Helvetica, sans-serif" font-size="17" font-weight="400" fill="#52627a" text-anchor="start">Commercial responsibility</text>
+<text x="890" y="211.0" font-family="Arial, Helvetica, sans-serif" font-size="17" font-weight="400" fill="#52627a" text-anchor="start">Tenant-scoped RBAC</text>
+<rect x="52" y="242" width="208" height="112" rx="12" fill="#ffffff" stroke="#c1d3ed" stroke-width="1.4"/>
+<text x="68" y="281.0" font-family="Arial, Helvetica, sans-serif" font-size="23" font-weight="700" fill="#172b4d" text-anchor="start">Tenants</text>
+<text x="68" y="313.0" font-family="Arial, Helvetica, sans-serif" font-size="18" font-weight="400" fill="#172b4d" text-anchor="start">Identity, status</text>
+<text x="68" y="337.3" font-family="Arial, Helvetica, sans-serif" font-size="18" font-weight="400" fill="#172b4d" text-anchor="start">and hierarchy</text>
+<text x="52" y="432.0" font-family="Arial, Helvetica, sans-serif" font-size="20" font-weight="700" fill="#315a8b" text-anchor="start">Works independently</text>
+<text x="52" y="459.0" font-family="Arial, Helvetica, sans-serif" font-size="20" font-weight="700" fill="#315a8b" text-anchor="start">of BSS.</text>
+<text x="52" y="501.0" font-family="Arial, Helvetica, sans-serif" font-size="18" font-weight="400" fill="#52627a" text-anchor="start">Commercial agreements</text>
+<text x="52" y="525.3" font-family="Arial, Helvetica, sans-serif" font-size="18" font-weight="400" fill="#52627a" text-anchor="start">are owned by BSS.</text>
+<rect x="360" y="242" width="205" height="112" rx="12" fill="#ffffff" stroke="#b5d6c8" stroke-width="1.4"/>
+<text x="376" y="278.0" font-family="Arial, Helvetica, sans-serif" font-size="21" font-weight="700" fill="#172b4d" text-anchor="start">Commercial</text>
+<text x="376" y="306.35" font-family="Arial, Helvetica, sans-serif" font-size="21" font-weight="700" fill="#172b4d" text-anchor="start">relationships</text>
+<text x="376" y="337.0" font-family="Arial, Helvetica, sans-serif" font-size="16" font-weight="400" fill="#52627a" text-anchor="start">Who may pay for whom</text>
+<rect x="585" y="242" width="205" height="112" rx="12" fill="#ffffff" stroke="#b5d6c8" stroke-width="1.4"/>
+<text x="601" y="278.0" font-family="Arial, Helvetica, sans-serif" font-size="21" font-weight="700" fill="#172b4d" text-anchor="start">Billing accounts</text>
+<text x="601" y="312.0" font-family="Arial, Helvetica, sans-serif" font-size="18" font-weight="400" fill="#52627a" text-anchor="start">Each belongs to</text>
+<text x="601" y="336.3" font-family="Arial, Helvetica, sans-serif" font-size="18" font-weight="400" fill="#52627a" text-anchor="start">one payer tenant</text>
+<rect x="360" y="410" width="430" height="86" rx="12" fill="#ffffff" stroke="#86bba5" stroke-width="1.4"/>
+<text x="378" y="445.0" font-family="Arial, Helvetica, sans-serif" font-size="23" font-weight="700" fill="#172b4d" text-anchor="start">Orders &amp; subscriptions</text>
+<text x="378" y="476.0" font-family="Arial, Helvetica, sans-serif" font-size="18" font-weight="400" fill="#172b4d" text-anchor="start">Resource tenant · Seller · Payer / account</text>
+<rect x="360" y="548" width="430" height="58" rx="12" fill="#ffffff" stroke="#b5d6c8" stroke-width="1.4"/>
+<text x="378" y="576.0" font-family="Arial, Helvetica, sans-serif" font-size="21" font-weight="700" fill="#172b4d" text-anchor="start">Charges &amp; invoices</text>
+<text x="378" y="598.0" font-family="Arial, Helvetica, sans-serif" font-size="16" font-weight="400" fill="#52627a" text-anchor="start">Retain the original financial assignment</text>
+<rect x="890" y="242" width="258" height="112" rx="12" fill="#ffffff" stroke="#d0c7e6" stroke-width="1.4"/>
+<text x="906" y="280.0" font-family="Arial, Helvetica, sans-serif" font-size="22" font-weight="700" fill="#172b4d" text-anchor="start">User permissions</text>
+<text x="906" y="314.0" font-family="Arial, Helvetica, sans-serif" font-size="18" font-weight="400" fill="#172b4d" text-anchor="start">Role + tenant scope</text>
+<text x="906" y="338.3" font-family="Arial, Helvetica, sans-serif" font-size="18" font-weight="400" fill="#172b4d" text-anchor="start">+ allowed action</text>
+<rect x="890" y="410" width="258" height="86" rx="12" fill="#ffffff" stroke="#b1a0ce" stroke-width="1.4"/>
+<text x="906" y="445.0" font-family="Arial, Helvetica, sans-serif" font-size="23" font-weight="700" fill="#172b4d" text-anchor="start">PDP decision</text>
+<text x="906" y="474.0" font-family="Arial, Helvetica, sans-serif" font-size="16" font-weight="400" fill="#172b4d" text-anchor="start">Permission AND tenant match</text>
+<rect x="890" y="548" width="258" height="58" rx="12" fill="#ffffff" stroke="#d0c7e6" stroke-width="1.4"/>
+<text x="906" y="576.0" font-family="Arial, Helvetica, sans-serif" font-size="21" font-weight="700" fill="#172b4d" text-anchor="start">PEP / SecureORM</text>
+<text x="906" y="598.0" font-family="Arial, Helvetica, sans-serif" font-size="16" font-weight="400" fill="#52627a" text-anchor="start">Enforce decision &amp; constraints</text>
+<path d="M260,292 L360,292" fill="none" stroke="#64748b" stroke-width="1.7" marker-end="url(#arrow)"/>
+<text x="310.0" y="281.0" font-family="Arial, Helvetica, sans-serif" font-size="16" font-weight="400" fill="#475569" text-anchor="middle">tenant IDs</text>
+<path d="M462,354 L462,410" fill="none" stroke="#64748b" stroke-width="1.7" marker-end="url(#arrow)"/>
+<text x="511.5" y="386.0" font-family="Arial, Helvetica, sans-serif" font-size="16" font-weight="400" fill="#475569" text-anchor="middle">validate</text>
+<path d="M687,354 L687,410" fill="none" stroke="#64748b" stroke-width="1.7" marker-end="url(#arrow)"/>
+<text x="736.0" y="386.0" font-family="Arial, Helvetica, sans-serif" font-size="16" font-weight="400" fill="#475569" text-anchor="middle">assign</text>
+<path d="M575,496 L575,548" fill="none" stroke="#64748b" stroke-width="1.7" marker-end="url(#arrow)"/>
+<text x="631.0" y="526.0" font-family="Arial, Helvetica, sans-serif" font-size="16" font-weight="400" fill="#475569" text-anchor="middle">record</text>
+<path d="M1019,354 L1019,410" fill="none" stroke="#64748b" stroke-width="1.7" marker-end="url(#arrow)"/>
+<path d="M790,453 L890,453" fill="none" stroke="#64748b" stroke-width="1.7" marker-end="url(#arrow)"/>
+<text x="840.0" y="441.0" font-family="Arial, Helvetica, sans-serif" font-size="16" font-weight="400" fill="#475569" text-anchor="middle">object facts</text>
+<path d="M1019,496 L1019,548" fill="none" stroke="#64748b" stroke-width="1.7" marker-end="url(#arrow)"/>
+<text x="340" y="661.0" font-family="Arial, Helvetica, sans-serif" font-size="17" font-weight="400" fill="#52627a" text-anchor="start">Object facts identify the resource, seller or payer tenant of the requested object.</text>
+<rect x="32" y="690" width="544" height="72" rx="12" fill="#f8fafc" stroke="#e2e8f0" stroke-width="1.4"/>
+<text x="50" y="719.0" font-family="Arial, Helvetica, sans-serif" font-size="18" font-weight="400" fill="#172b4d" text-anchor="start">One effective payer per subscription.</text>
+<text x="50" y="743.3" font-family="Arial, Helvetica, sans-serif" font-size="18" font-weight="400" fill="#172b4d" text-anchor="start">Different subscriptions may have different payers.</text>
+<rect x="600" y="690" width="568" height="72" rx="12" fill="#f8fafc" stroke="#e2e8f0" stroke-width="1.4"/>
+<text x="618" y="719.0" font-family="Arial, Helvetica, sans-serif" font-size="18" font-weight="400" fill="#172b4d" text-anchor="start">Billing accounts are not separate RBAC scopes.</text>
+<text x="618" y="743.3" font-family="Arial, Helvetica, sans-serif" font-size="18" font-weight="400" fill="#172b4d" text-anchor="start">Commercial eligibility alone never grants access.</text>
+</svg>
