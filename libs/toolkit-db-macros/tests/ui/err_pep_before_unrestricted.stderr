@@ -1,0 +1,11 @@
+error: secure: 'pep_prop' cannot be used with 'unrestricted'
+  --> tests/ui/err_pep_before_unrestricted.rs:11:19
+   |
+11 | #[secure(pep_prop(custom = "custom_col"), unrestricted)]
+   |                   ^^^^^^
+
+error[E0601]: `main` function not found in crate `$CRATE`
+  --> tests/ui/err_pep_before_unrestricted.rs:12:14
+   |
+12 | struct Model;
+   |              ^ consider adding a `main` function to `$DIR/tests/ui/err_pep_before_unrestricted.rs`

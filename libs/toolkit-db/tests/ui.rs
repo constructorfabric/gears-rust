@@ -21,3 +21,15 @@ fn compile_fail_tests() {
     #[cfg(feature = "pgq")]
     t.compile_fail("tests/ui/fail_pgq/*.rs");
 }
+
+/// The checks `ScopeProperties` makes of an entity's table are evaluated at
+/// monomorphization, which `cargo check` never reaches. A case set with a
+/// `pass` case makes trybuild run `cargo build` instead, so these live in a
+/// set of their own rather than beside the fixtures above, which a build would
+/// make slower and no stricter.
+#[test]
+fn post_monomorphization_guards() {
+    let t = trybuild::TestCases::new();
+    t.pass("tests/ui/mono/pass/*.rs");
+    t.compile_fail("tests/ui/mono/fail/*.rs");
+}

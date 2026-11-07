@@ -70,29 +70,19 @@ mod node {
     impl ActiveModelBehavior for ActiveModel {}
 
     impl toolkit_db::secure::ScopableEntity for Entity {
-        fn tenant_col() -> Option<Column> {
-            Some(Column::TenantId)
-        }
-        fn resource_col() -> Option<Column> {
-            Some(Column::Id)
-        }
-        fn owner_col() -> Option<Column> {
-            None
-        }
+        const SCOPE_PROPERTIES: &'static [(&'static str, Self::Column)] = &[
+            (
+                toolkit_security::pep_properties::OWNER_TENANT_ID,
+                Column::TenantId,
+            ),
+            (toolkit_security::pep_properties::RESOURCE_ID, Column::Id),
+        ];
+
+        const UNSCOPED_DIMENSIONS: &'static [&'static str] =
+            &[toolkit_security::pep_properties::OWNER_ID];
+
         fn type_col() -> Option<Column> {
             None
-        }
-        fn resolve_property(property: &str) -> Option<Column> {
-            match property {
-                p if p == toolkit_security::pep_properties::OWNER_TENANT_ID => {
-                    Some(Column::TenantId)
-                }
-                p if p == toolkit_security::pep_properties::RESOURCE_ID => Some(Column::Id),
-                _ => None,
-            }
-        }
-        fn scope_columns() -> Vec<Column> {
-            vec![Column::TenantId, Column::Id]
         }
     }
 }
@@ -117,29 +107,19 @@ mod edge {
     impl ActiveModelBehavior for ActiveModel {}
 
     impl toolkit_db::secure::ScopableEntity for Entity {
-        fn tenant_col() -> Option<Column> {
-            Some(Column::TenantId)
-        }
-        fn resource_col() -> Option<Column> {
-            Some(Column::Id)
-        }
-        fn owner_col() -> Option<Column> {
-            None
-        }
+        const SCOPE_PROPERTIES: &'static [(&'static str, Self::Column)] = &[
+            (
+                toolkit_security::pep_properties::OWNER_TENANT_ID,
+                Column::TenantId,
+            ),
+            (toolkit_security::pep_properties::RESOURCE_ID, Column::Id),
+        ];
+
+        const UNSCOPED_DIMENSIONS: &'static [&'static str] =
+            &[toolkit_security::pep_properties::OWNER_ID];
+
         fn type_col() -> Option<Column> {
             None
-        }
-        fn resolve_property(property: &str) -> Option<Column> {
-            match property {
-                p if p == toolkit_security::pep_properties::OWNER_TENANT_ID => {
-                    Some(Column::TenantId)
-                }
-                p if p == toolkit_security::pep_properties::RESOURCE_ID => Some(Column::Id),
-                _ => None,
-            }
-        }
-        fn scope_columns() -> Vec<Column> {
-            vec![Column::TenantId, Column::Id]
         }
     }
 }
@@ -198,29 +178,19 @@ mod open_node {
     impl ActiveModelBehavior for ActiveModel {}
 
     impl toolkit_db::secure::ScopableEntity for Entity {
-        fn tenant_col() -> Option<Column> {
-            Some(Column::TenantId)
-        }
-        fn resource_col() -> Option<Column> {
-            Some(Column::Id)
-        }
-        fn owner_col() -> Option<Column> {
-            None
-        }
+        const SCOPE_PROPERTIES: &'static [(&'static str, Self::Column)] = &[
+            (
+                toolkit_security::pep_properties::OWNER_TENANT_ID,
+                Column::TenantId,
+            ),
+            (toolkit_security::pep_properties::RESOURCE_ID, Column::Id),
+        ];
+
+        const UNSCOPED_DIMENSIONS: &'static [&'static str] =
+            &[toolkit_security::pep_properties::OWNER_ID];
+
         fn type_col() -> Option<Column> {
             None
-        }
-        fn resolve_property(property: &str) -> Option<Column> {
-            match property {
-                p if p == toolkit_security::pep_properties::OWNER_TENANT_ID => {
-                    Some(Column::TenantId)
-                }
-                p if p == toolkit_security::pep_properties::RESOURCE_ID => Some(Column::Id),
-                _ => None,
-            }
-        }
-        fn scope_columns() -> Vec<Column> {
-            vec![Column::TenantId, Column::Id]
         }
     }
 }
@@ -244,29 +214,19 @@ mod open_edge {
     impl ActiveModelBehavior for ActiveModel {}
 
     impl toolkit_db::secure::ScopableEntity for Entity {
-        fn tenant_col() -> Option<Column> {
-            Some(Column::TenantId)
-        }
-        fn resource_col() -> Option<Column> {
-            Some(Column::Id)
-        }
-        fn owner_col() -> Option<Column> {
-            None
-        }
+        const SCOPE_PROPERTIES: &'static [(&'static str, Self::Column)] = &[
+            (
+                toolkit_security::pep_properties::OWNER_TENANT_ID,
+                Column::TenantId,
+            ),
+            (toolkit_security::pep_properties::RESOURCE_ID, Column::Id),
+        ];
+
+        const UNSCOPED_DIMENSIONS: &'static [&'static str] =
+            &[toolkit_security::pep_properties::OWNER_ID];
+
         fn type_col() -> Option<Column> {
             None
-        }
-        fn resolve_property(property: &str) -> Option<Column> {
-            match property {
-                p if p == toolkit_security::pep_properties::OWNER_TENANT_ID => {
-                    Some(Column::TenantId)
-                }
-                p if p == toolkit_security::pep_properties::RESOURCE_ID => Some(Column::Id),
-                _ => None,
-            }
-        }
-        fn scope_columns() -> Vec<Column> {
-            vec![Column::TenantId, Column::Id]
         }
     }
 }

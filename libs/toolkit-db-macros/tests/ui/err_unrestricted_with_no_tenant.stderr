@@ -1,18 +1,5 @@
-error: Cannot use 'unrestricted' with 'no_tenant'
- --> tests/ui/err_unrestricted_with_no_tenant.rs:6:9
-  |
-6 | #[secure(unrestricted, no_tenant)]
-  |         ^^^^^^^^^^^^
-  |
-note: no_tenant defined here
+error: secure: 'no_tenant' cannot be used with 'unrestricted'
  --> tests/ui/err_unrestricted_with_no_tenant.rs:6:24
   |
 6 | #[secure(unrestricted, no_tenant)]
   |                        ^^^^^^^^^
-
-error: When using 'unrestricted', no other column attributes are allowed
- --> tests/ui/err_unrestricted_with_no_tenant.rs:6:9
-  |
-6 | #[secure(unrestricted, no_tenant)]
-  |         ^^^^^^^^^^^^
-

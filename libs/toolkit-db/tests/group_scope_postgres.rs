@@ -260,32 +260,15 @@ mod closure {
 }
 
 impl ScopableEntity for resource::Entity {
-    fn tenant_col() -> Option<resource::Column> {
-        Some(resource::Column::TenantId)
-    }
+    const SCOPE_PROPERTIES: &'static [(&'static str, Self::Column)] = &[
+        (pep_properties::OWNER_TENANT_ID, resource::Column::TenantId),
+        (pep_properties::RESOURCE_ID, resource::Column::Id),
+    ];
 
-    fn resource_col() -> Option<resource::Column> {
-        Some(resource::Column::Id)
-    }
-
-    fn owner_col() -> Option<resource::Column> {
-        None
-    }
+    const UNSCOPED_DIMENSIONS: &'static [&'static str] = &[pep_properties::OWNER_ID];
 
     fn type_col() -> Option<resource::Column> {
         None
-    }
-
-    fn resolve_property(property: &str) -> Option<resource::Column> {
-        match property {
-            p if p == pep_properties::OWNER_TENANT_ID => Self::tenant_col(),
-            p if p == pep_properties::RESOURCE_ID => Self::resource_col(),
-            _ => None,
-        }
-    }
-
-    fn scope_columns() -> Vec<resource::Column> {
-        vec![resource::Column::TenantId, resource::Column::Id]
     }
 }
 
@@ -294,27 +277,11 @@ macro_rules! unrestricted_entity {
         impl ScopableEntity for $entity {
             const IS_UNRESTRICTED: bool = true;
 
-            fn tenant_col() -> Option<$column> {
-                None
-            }
+            const SCOPE_PROPERTIES: &'static [(&'static str, Self::Column)] = &[];
 
-            fn resource_col() -> Option<$column> {
-                None
-            }
-
-            fn owner_col() -> Option<$column> {
-                None
-            }
+            const UNSCOPED_DIMENSIONS: &'static [&'static str] = &[];
 
             fn type_col() -> Option<$column> {
-                None
-            }
-
-            fn scope_columns() -> Vec<$column> {
-                Vec::new()
-            }
-
-            fn resolve_property(_property: &str) -> Option<$column> {
                 None
             }
         }

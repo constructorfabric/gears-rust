@@ -1,0 +1,11 @@
+error: tenant_col: column name '' does not form a valid column variant (''); use a snake_case identifier
+ --> tests/ui/err_dimension_column_empty.rs:7:10
+  |
+7 | #[secure(tenant_col = "", resource_col = "id", no_owner, no_type)]
+  |          ^^^^^^^^^^
+
+error[E0601]: `main` function not found in crate `$CRATE`
+ --> tests/ui/err_dimension_column_empty.rs:8:14
+  |
+8 | struct Model;
+  |              ^ consider adding a `main` function to `$DIR/tests/ui/err_dimension_column_empty.rs`

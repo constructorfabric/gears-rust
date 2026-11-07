@@ -61,7 +61,9 @@ use toolkit_security::AccessScope;
 
 use crate::secure::tx_config::TxConfig;
 
-use crate::secure::{ScopableEntity, ScopeError, Scoped, SecureEntityExt, SecureSelect};
+use crate::secure::{
+    ScopableEntity, ScopeError, ScopeProperties, Scoped, SecureEntityExt, SecureSelect,
+};
 
 use crate::secure::db_ops::{SecureDeleteExt, SecureDeleteMany, SecureUpdateExt, SecureUpdateMany};
 
