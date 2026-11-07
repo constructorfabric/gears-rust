@@ -14,6 +14,6 @@ gear(
     implementation = "design",
     id = "bss-subscriptions",
     name = "Subscriptions",
-    description = "Subscription lifecycle state machine with versioned composition and entitlement management.",
+    description = "Subscription lifecycle state machine with versioned composition, commercial posture and billable facts; entitlement application belongs to Entitlements.",
     category = "bss",
 )
