@@ -4753,7 +4753,9 @@ dependencies = [
  "cf-gears-toolkit-contract-macros",
  "cf-gears-toolkit-http",
  "cf-gears-toolkit-http-middleware",
+ "cf-gears-toolkit-http-proxy",
  "cf-gears-toolkit-security",
+ "cf-gears-toolkit-trace-context",
  "cf-gears-toolkit-transport-grpc",
  "cf-gears-toolkit-utils",
  "futures-core",
@@ -4802,6 +4804,31 @@ dependencies = [
  "secrecy",
  "serde",
  "thiserror 2.0.21",
+ "trybuild",
+ "uuid",
+]
+
+[[package]]
+name = "cf-gears-toolkit-contract-manual-fixture"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "bytes",
+ "cf-gears-toolkit",
+ "cf-gears-toolkit-canonical-errors",
+ "cf-gears-toolkit-contract",
+ "cf-gears-toolkit-http",
+ "cf-gears-toolkit-security",
+ "futures-core",
+ "futures-util",
+ "http",
+ "http-body",
+ "http-body-util",
+ "secrecy",
+ "serde",
+ "serde_json",
+ "tokio",
  "trybuild",
  "uuid",
 ]

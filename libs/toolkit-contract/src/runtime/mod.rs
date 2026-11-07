@@ -33,4 +33,8 @@ pub mod retry;
 pub mod sse;
 
 #[cfg(feature = "rest-client")]
+pub mod manual;
+#[cfg(feature = "raw-http")]
+pub mod raw;
+#[cfg(feature = "rest-client")]
 pub mod resolving;

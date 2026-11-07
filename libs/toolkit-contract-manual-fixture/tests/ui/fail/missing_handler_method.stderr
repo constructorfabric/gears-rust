@@ -1,0 +1,8 @@
+error[E0046]: not all trait items implemented, missing: `two`
+  --> tests/ui/fail/missing_handler_method.rs:31:1
+   |
+13 | #[toolkit::rest_contract(base_path = "/local/v1")]
+   | -------------------------------------------------- `two` from trait
+...
+31 | impl LocalApiRestManual for Local {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ missing `two` in implementation

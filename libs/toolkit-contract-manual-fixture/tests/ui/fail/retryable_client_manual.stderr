@@ -1,0 +1,5 @@
+error: `#[retryable]` cannot mark a `#[client_manual]` method: the handler sends the request, so the generated retry loop never runs
+  --> tests/ui/fail/retryable_client_manual.rs:14:5
+   |
+14 |     #[retryable]
+   |     ^

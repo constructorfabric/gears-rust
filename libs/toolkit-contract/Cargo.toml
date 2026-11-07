@@ -38,6 +38,15 @@ runtime-client = [
 # same name. The wrapper is a thin layer over the plain client and needs no
 # dependencies of its own, so splitting it into its own feature bought nothing.
 rest-client = ["runtime-client"]
+# Raw HTTP passthrough for `#[client_manual]` methods bound with
+# `#[passthrough]` (`ManualCallContext::send_raw`, ADR-0009 §4). Separate from
+# `rest-client` because it pulls in the `toolkit-http-proxy` engine.
+raw-http = [
+    "rest-client",
+    "dep:toolkit-http-proxy",
+    "dep:toolkit-trace-context",
+    "dep:toolkit-security",
+]
 # OpenTelemetry in generated clients. Activates `toolkit-http/otel`, which makes
 # the transport actually inject W3C `traceparent` (real distributed-trace
 # propagation) AND enables RED client metrics (`http.client.request.duration`)
@@ -90,6 +99,8 @@ percent-encoding = "2"
 serde_html_form.workspace = true
 
 toolkit-http = { workspace = true, optional = true }
+toolkit-http-proxy = { workspace = true, optional = true }
+toolkit-trace-context = { workspace = true, optional = true }
 http-body = { workspace = true, optional = true }
 http-body-util = { workspace = true, optional = true }
 tokio = { workspace = true, features = ["time", "macros"], optional = true }

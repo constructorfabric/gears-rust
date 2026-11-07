@@ -42,6 +42,13 @@ pub struct ProxyClientConfig {
     /// How long a negotiated protocol is remembered per host. Zero disables
     /// the cache (every new TLS connection offers `h2` and `http/1.1`).
     pub protocol_cache_ttl: Duration,
+    /// Resend an idempotent replayable request after a failure that does not
+    /// prove the upstream skipped it: a stale HTTP/1.1 keep-alive connection
+    /// or an HTTP/2 graceful `GOAWAY` (RFC 9110 §9.2.2 allows it). `false`
+    /// keeps only resends of requests that provably never reached the
+    /// upstream (unsent, `REFUSED_STREAM`, `HTTP_1_1_REQUIRED`), for callers
+    /// that must not replay at all.
+    pub resend_idempotent: bool,
     /// Connection pool settings.
     pub pool: PoolConfig,
     /// HTTP/1.1 limits.
@@ -61,6 +68,7 @@ impl Default for ProxyClientConfig {
             response_merge_limit: 32 * 1024,
             preserve_header_case: false,
             protocol_cache_ttl: Duration::from_secs(3600),
+            resend_idempotent: true,
             pool: PoolConfig::default(),
             h1: H1Limits::default(),
             h2: H2Limits::default(),

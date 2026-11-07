@@ -104,6 +104,12 @@ pub enum TransportError {
     #[error("URL build error: {0}")]
     UrlBuild(String),
 
+    /// The client refused to send a request it cannot forward faithfully,
+    /// e.g. a protocol upgrade or a method outside a passthrough binding's set.
+    /// Raised before anything reaches the network.
+    #[error("invalid request: {0}")]
+    InvalidRequest(String),
+
     /// The providing gear could not be resolved to a live endpoint via the
     /// service directory: it has not registered yet, or every instance was
     /// evicted (e.g., the provider pod went away). Treated as transient — the
@@ -208,6 +214,7 @@ impl TransportError {
             // adds load to an already-saturated client, so it fails fast.
             TransportError::Serialization(_)
             | TransportError::UrlBuild(_)
+            | TransportError::InvalidRequest(_)
             | TransportError::Overloaded => false,
         }
     }
