@@ -20,7 +20,8 @@ use graph_storage_sdk::GraphStorageClientV1;
 
 use crate::api::rest::routes;
 use crate::api::rest::types::{
-    ConcreteIntake, ConcreteProfile, ConcreteReviewQueue, ConcreteSettings, ConcreteSubjectControl,
+    ConcreteAdminFacts, ConcreteIntake, ConcreteProfile, ConcreteReviewQueue, ConcreteSettings,
+    ConcreteSubjectControl,
 };
 use crate::config::ConstructConfig;
 use crate::domain::local_client::LocalClient;
@@ -51,6 +52,7 @@ pub struct ConstructGear {
     profile: OnceLock<Arc<ConcreteProfile>>,
     subject_control: OnceLock<Arc<ConcreteSubjectControl>>,
     review_queue: OnceLock<Arc<ConcreteReviewQueue>>,
+    admin_facts: OnceLock<Arc<ConcreteAdminFacts>>,
     /// The processing worker, until `start` takes it.
     worker: Mutex<Option<Worker>>,
     running: Mutex<Option<Running>>,
@@ -71,6 +73,7 @@ impl Default for ConstructGear {
             profile: OnceLock::new(),
             subject_control: OnceLock::new(),
             review_queue: OnceLock::new(),
+            admin_facts: OnceLock::new(),
             worker: Mutex::new(None),
             running: Mutex::new(None),
         }
@@ -155,6 +158,9 @@ impl Gear for ConstructGear {
         self.review_queue
             .set(pipeline.review_queue)
             .map_err(|_| anyhow::anyhow!("{} gear already initialized", Self::MODULE_NAME))?;
+        self.admin_facts
+            .set(pipeline.admin_facts)
+            .map_err(|_| anyhow::anyhow!("{} gear already initialized", Self::MODULE_NAME))?;
         *self.worker.lock() = pipeline.worker;
         let ports = IntakePorts {
             types,
@@ -225,9 +231,16 @@ impl toolkit::contracts::RestApiCapability for ConstructGear {
             .map(Arc::clone)
             .ok_or_else(|| anyhow::anyhow!("Review queue not initialized"))?;
 
+        let admin_facts = self
+            .admin_facts
+            .get()
+            .map(Arc::clone)
+            .ok_or_else(|| anyhow::anyhow!("Administrator fact management not initialized"))?;
+
         let router = routes::register_routes(router, openapi, intake, settings, profile);
         let router = routes::register_subject_control_routes(router, openapi, subject_control);
         let router = routes::register_review_queue_routes(router, openapi, review_queue);
+        let router = routes::register_admin_facts_routes(router, openapi, admin_facts);
         info!("Construct gear: REST routes registered");
         Ok(router)
         // @cpt-end:cpt-cf-construct-algo-gear-foundation-start-gear:p1:inst-start-rest

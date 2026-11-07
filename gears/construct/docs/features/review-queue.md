@@ -73,9 +73,9 @@ The PRD requires that the subject can mark any fact as incorrect, with an option
 
 - **Rejected**: the request closes with the reason. The fact is served again.
 - **Deleted**: the fact is soft-deleted as the subject's delete does it, and the request closes. A fact already gone closes it all the same.
-- **Corrected**: the new value goes through the one-step plan path: a plan with one replace step, the reviewer as origin, the sensitive-data checks and Admission like any plan, and the profile writer. The replace gives the fact a new id, `corrected_fact_id`. When the checks fail, a value is blocked, or Admission drops the plan (personalization off, a rule broken), nothing is stored, the request stays open, and the answer is `422` naming the reason. When the fact is gone before the correction is stored, nothing is stored and the request closes as deleted, which the answer shows. No sensitive-data check exists yet, so a correction, like record processing, runs only where the deployment opted in (`processing.run_without_sensitive_data_checks`); elsewhere it answers `501`. A rejection and a delete need no opt-in. Without a processing identity every resolution answers `501`, a rejection included: it reads the profile to see whether the fact is gone.
+- **Corrected**: the new value goes through the one-step plan path: a plan with one replace step, the reviewer as origin, the sensitive-data checks and Admission like any plan, and the profile writer. The replace gives the fact a new id, `corrected_fact_id`. When the checks fail, a value is blocked, or Admission drops the plan (personalization off, a rule broken), nothing is stored, the request stays open, and the answer is `422` naming the reason. When the fact is gone before the correction is stored, nothing is stored and the request closes as deleted, which the answer shows; without a reason from the resolver, its reason says the fact was gone before the correction and nothing was written. No sensitive-data check exists yet, so a correction, like record processing, runs only where the deployment opted in (`processing.run_without_sensitive_data_checks`); elsewhere it answers `501`. A rejection and a delete need no opt-in. Without a processing identity every resolution answers `501`, a rejection included: it reads the profile to see whether the fact is gone.
 
-A delete and a correction are written against the profile's version, and read and written again after a short pause on a conflict, as the subject's delete does (`processing.max_reruns`, within 20 seconds); past either they answer `503` and the request stays open. The 20 seconds bound the reads, checks and pauses before each write; the budget does not cut a write that started, which the writer bounds at 90 seconds. When the writer fails or runs out, the profile is read once more, a write found there counts as stored, and one not found is answered as possibly written (`409 WRITTEN_NOT_CLOSED`, with the claim kept), never as not written. A correction takes its sensitive-data checks and Admission from the same place record processing does, so a check added there guards both, and the start-up warning that values are stored unchecked covers both.
+A delete and a correction are written against the profile's version, and read and written again after a short pause on a conflict, as the subject's delete does (`processing.max_reruns`, within 20 seconds); past either they answer `503` and the request stays open. The 20 seconds bound the permission check, the request's lookup, and the reads, checks and pauses before each write; the budget does not cut a write that started, which the writer bounds at 90 seconds. When the writer fails or runs out, the profile is read once more, a write found there counts as stored, and one not found is answered as possibly written (`409 WRITTEN_NOT_CLOSED`, with the claim kept), never as not written. A correction takes its sensitive-data checks and Admission from the same place record processing does, so a check added there guards both, and the start-up warning that values are stored unchecked covers both.
 
 **Frozen while open.** The profile read leaves out a fact under an open request, as it does for a category the caller may not read. Processing drops every planned step that would replace or remove such a fact, or add a property to it, before the checks; the drop is logged without content, with the subject, and a plan left empty stores nothing. A manage-facts call left with nothing answers `under_review`. The planner itself still sees the fact, so the model does not add it again; `FactsUnderReview::under_review` tells it which facts are under review if it wants to leave them out of the model's choices. The subject's own view still shows the fact. A plan whose step was checked before the request opened can still land a few milliseconds after it; the request then points at a fact that is gone, and its resolution closes it as deleted.
 
@@ -196,12 +196,13 @@ A delete and a correction are written against the profile's version, and read an
 **Steps**:
 1. [x] - `p1` - Caller sends `POST /construct/v1/admin/review-requests/{request_id}/resolution` with `{outcome, reason, property, value}`, authenticated - `inst-resolve-send`
 2. [x] - `p1` - API: the extractors take the security context, the service, the request id and the body; a body that does not fit its outcome answers 400 - `inst-resolve-parse`
-3. [x] - `p1` - Run `cpt-cf-construct-algo-review-queue-reviewer-only`, and read the request in the caller's tenant. **IF** there is none, not found. **IF** it is closed, conflict. Claim it, and read in the same step what an earlier claim recorded; **IF** another claim holds it, conflict - `inst-resolve-read`
-4. [x] - `p1` - **IF** an earlier claim recorded a write that is in the profile, run `cpt-cf-construct-algo-review-queue-close` as that one - `inst-resolve-settle`
-5. [x] - `p1` - **IF** rejected, run `cpt-cf-construct-algo-review-queue-close` with the reason - `inst-resolve-reject`
-6. [x] - `p1` - **IF** deleted, record the delete on the claim, run `cpt-cf-construct-algo-review-queue-remove`, then `cpt-cf-construct-algo-review-queue-close` - `inst-resolve-delete`
-7. [x] - `p1` - **IF** corrected, run `cpt-cf-construct-algo-review-queue-correct`; on a stored correction, run `cpt-cf-construct-algo-review-queue-close` with the new fact's id; on a fact that is gone, close as deleted; on a refusal, record a refused event and give the claim back - `inst-resolve-correct`
-8. [x] - `p1` - Record a resolved event. **RETURN** 200 with the closed request. **IF** the close failed for a resolution that wrote nothing and has nothing recorded, give the claim back and answer the failure. **IF** the close failed otherwise, or found the request no longer held, read it again: closed as this resolution, **RETURN** it; closed otherwise, conflict `WRITTEN_BUT_CLOSED`; else conflict `WRITTEN_NOT_CLOSED`, with the claim kept - `inst-resolve-return`
+3. [x] - `p1` - Run `cpt-cf-construct-algo-review-queue-reviewer-only`, and read the request in the caller's tenant. **IF** there is none, not found. **IF** it is closed, conflict. **IF** it is on the reviewer's own fact, forbidden - `inst-resolve-read`
+4. [x] - `p1` - Claim the request for the reviewer, and read in the same step what an earlier claim recorded; **IF** it is closed, or another claim holds it, conflict. An administrator's edit or delete of a fact under review (`cpt-cf-construct-feature-admin-facts`) resolves its request from this step on, with the administrator as resolver and origin - `inst-resolve-claim`
+5. [x] - `p1` - **IF** an earlier claim recorded a write that is in the profile, run `cpt-cf-construct-algo-review-queue-close` as that one - `inst-resolve-settle`
+6. [x] - `p1` - **IF** rejected, run `cpt-cf-construct-algo-review-queue-close` with the reason - `inst-resolve-reject`
+7. [x] - `p1` - **IF** deleted, record the delete on the claim, run `cpt-cf-construct-algo-review-queue-remove`, then `cpt-cf-construct-algo-review-queue-close` - `inst-resolve-delete`
+8. [x] - `p1` - **IF** corrected, run `cpt-cf-construct-algo-review-queue-correct`; on a stored correction, run `cpt-cf-construct-algo-review-queue-close` with the new fact's id; on a fact that is gone, close as deleted; on a refusal, record a refused event and give the claim back - `inst-resolve-correct`
+9. [x] - `p1` - Record a resolved event. **RETURN** 200 with the closed request. **IF** the close failed for a resolution that wrote nothing and has nothing recorded, give the claim back and answer the failure. **IF** the close failed otherwise, or found the request no longer held, read it again: closed as this resolution, **RETURN** it; closed otherwise, conflict `WRITTEN_BUT_CLOSED`; else conflict `WRITTEN_NOT_CLOSED`, with the claim kept - `inst-resolve-return`
 
 ## 3. Processes / Business Logic (CDSL)
 
@@ -220,28 +221,28 @@ A delete and a correction are written against the profile's version, and read an
 
 - [x] `p1` - **ID**: `cpt-cf-construct-algo-review-queue-correct`
 
-**Input**: The reviewer, the open request and the new value.
+**Input**: Who writes, as origin: a reviewer, or an administrator; the open request and the new value, or for an administrator's add, the property and its value.
 
-**Output**: The new fact's id, the fact is gone, or why nothing was stored.
+**Output**: The new fact, the fact is gone, the value is held already, or why nothing was stored.
 
 **Steps**:
-1. [x] - `p1` - **IF** the deployment did not opt in to storing values without sensitive-data checks, not configured. Start the budget (20 seconds), and build Construct's context and scope for the tenant - `inst-correct-start`
-2. [x] - `p1` - Read the subject's facts, cut off when the budget runs out (unavailable). **IF** no live fact has the request's fact id, **RETURN** gone - `inst-correct-read`
-3. [x] - `p1` - Build a plan with one step that replaces the fact with a new entity under a new node key, holding the new value, with the reviewer as origin and the version just read - `inst-correct-plan`
+1. [x] - `p1` - **IF** the deployment did not opt in to storing values without sensitive-data checks, not configured. Check the value against its property's schema first, so a value it does not take answers invalid even for a fact that is gone; a stored property no person type has is an internal error. Start the budget (20 seconds), and build Construct's context and scope for the tenant - `inst-correct-start`
+2. [x] - `p1` - Read the subject's facts, cut off when the budget runs out (unavailable) - `inst-correct-read`
+3. [x] - `p1` - Build a plan under a new node key, with the version just read and the writer as origin. For a replace: **IF** no live fact has the fact id, **RETURN** gone; one step replaces the fact with a new entity holding the new value. For an add: **IF** the subject holds the value, or a value of a one-valued property, **RETURN** held with that fact; one step adds a new entity holding it - `inst-correct-plan`
 4. [x] - `p1` - Run the sensitive-data checks and Admission on it. **IF** a check fails, Admission drops the plan, or the value is blocked, **RETURN** nothing stored, with the reason - `inst-correct-admit`
-5. [x] - `p1` - Record the correction with the new key on the claim; **IF** the claim no longer holds the request, conflict. Write it through the profile writer, for at most 90 seconds; when the writer fails, read the facts once more and count the new key found there as stored. **IF** stored, **RETURN** the new key. On a conflict, pause briefly and go back to step 2, at most `processing.max_reruns` times and while the budget lasts; then unavailable - `inst-correct-write`
+5. [x] - `p1` - For a correction, record it with the new key on the claim; **IF** the claim no longer holds the request, conflict. Write it through the profile writer, for at most 90 seconds; when the writer fails, read the facts once more and count the new key found there as stored. **IF** stored, **RETURN** the new key. On a conflict, pause briefly and go back to step 2, at most `processing.max_reruns` times and while the budget lasts; then unavailable - `inst-correct-write`
 
 ### Remove a Fact Under Review
 
 - [x] `p1` - **ID**: `cpt-cf-construct-algo-review-queue-remove`
 
-**Input**: The reviewer and the open request.
+**Input**: The resolver and the open request.
 
 **Output**: Done, or an error.
 
 **Steps**:
 1. [x] - `p1` - Start the budget, build Construct's context, and read the subject's facts. **IF** the fact is gone, **RETURN** done - `inst-remove-read`
-2. [x] - `p1` - Write a plan with one removal, with the reviewer as origin, against the version just read; on a conflict, read and write again as in `cpt-cf-construct-algo-subject-control-delete` - `inst-remove-write`
+2. [x] - `p1` - Write a plan with one removal, with the resolver as origin, against the version just read; on a conflict, read and write again as in `cpt-cf-construct-algo-subject-control-delete` - `inst-remove-write`
 
 ### Close a Request
 
@@ -302,7 +303,7 @@ A delete and a correction are written against the profile's version, and read an
 **Initial State**: open
 
 **Transitions**:
-1. [x] - `p1` - **FROM** open **TO** closed **WHEN** a reviewer rejects it, deletes the fact, or stores a correction; or the subject deletes the fact; or a correction finds the fact gone - `inst-state-close`
+1. [x] - `p1` - **FROM** open **TO** closed **WHEN** a reviewer rejects it, deletes the fact, or stores a correction; or the subject deletes the fact; or an administrator edits or deletes it; or a correction finds the fact gone - `inst-state-close`
 
 A closed request never opens again; the subject flags the fact again for a new review.
 
@@ -371,7 +372,7 @@ The system **MUST** turn a corrected value into a plan with one replace step and
 - Graph storage: the fact's node (replaced), the root's version
 - Config: `processing.run_without_sensitive_data_checks`, `processing.max_reruns`
 
-**Verified by**: `a_correction_replaces_the_fact_under_a_new_key_as_the_reviewer`, `a_correction_rerun_after_a_conflict_keeps_the_key_it_stored`, `a_correction_admission_drops_stores_nothing_and_gives_the_request_back`, `a_correction_whose_value_is_blocked_stores_nothing_and_stays_open`, `a_correction_of_a_fact_already_gone_closes_the_request_as_deleted`, `a_correction_takes_only_the_facts_property_with_a_value_its_schema_takes`, `without_the_opt_in_a_correction_is_not_configured_and_the_rest_works` (service), `a_correction_needs_the_opt_in_to_store_values_unchecked` (pipeline), `a_correction_answers_the_closed_request_with_the_new_facts_id`, `a_correction_admission_refuses_is_422_and_the_request_stays_open` (routes), `a_correction_whose_check_fails_stores_nothing_and_gives_the_request_back`, `a_write_that_started_runs_past_the_budget_to_its_end`.
+**Verified by**: `a_correction_replaces_the_fact_under_a_new_key_as_the_reviewer`, `a_correction_rerun_after_a_conflict_keeps_the_key_it_stored`, `a_correction_admission_drops_stores_nothing_and_gives_the_request_back`, `a_correction_whose_value_is_blocked_stores_nothing_and_stays_open`, `a_correction_of_a_fact_already_gone_closes_the_request_as_deleted`, `a_correction_takes_only_the_facts_property_with_a_value_its_schema_takes`, `without_the_opt_in_a_correction_is_not_configured_and_the_rest_works` (service), `a_correction_needs_the_opt_in_to_store_values_unchecked` (pipeline), `a_correction_answers_the_closed_request_with_the_new_facts_id`, `a_correction_admission_refuses_is_422_and_the_request_stays_open` (routes), `a_correction_whose_check_fails_stores_nothing_and_gives_the_request_back`, `a_corrections_value_is_checked_before_its_fact_is_read`, `a_correction_of_a_stored_property_no_person_type_has_is_internal`, `a_write_that_started_runs_past_the_budget_to_its_end`.
 
 ### A Fact Under Review Is Frozen
 

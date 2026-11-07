@@ -13,6 +13,7 @@ use uuid::Uuid;
 
 use crate::domain::admission::{Admission, AdmissionPorts};
 use crate::domain::error::DomainError;
+use crate::domain::one_step::OneStepPath;
 use crate::domain::plan::Plan;
 use crate::domain::plan::{Change, NodeKey, Origin};
 use crate::domain::planner::catalog::PropertyCatalog;
@@ -22,8 +23,8 @@ use crate::domain::profile_writes::ProfileWrites;
 use crate::domain::profile_writes::{SubjectFacts, SubjectProfiles};
 use crate::domain::record_intake::DropReason;
 use crate::domain::review_queue::{
-    CLAIM_HOLD, Corrections, NotStored, Resolution, ReviewConflict, ReviewOutcome,
-    ReviewQueueEvent, ReviewQueueService, ReviewRequest, ReviewStatus, ReviewText, close_on_delete,
+    CLAIM_HOLD, NotStored, OutsideChange, Resolution, ReviewConflict, ReviewOutcome,
+    ReviewQueueEvent, ReviewQueueService, ReviewRequest, ReviewStatus, ReviewText, close_on_change,
 };
 use crate::domain::sensitive_data::{SensitiveDataCheck, SensitiveDataChecks, SensitiveDataKind};
 use crate::domain::subject_settings::{SubjectKey, SubjectSettings};
@@ -90,7 +91,7 @@ impl Fixture {
         .with_budget(std::time::Duration::from_secs(5));
         let corrections = settings.map(|settings| {
             let drops = Arc::new(RecordingEvents::default());
-            Corrections {
+            Arc::new(OneStepPath {
                 checks: SensitiveDataChecks::new(checks, Arc::clone(&drops) as _),
                 admission: Admission::new(AdmissionPorts {
                     settings: Arc::new(FixedSubjectSettings(Ok(settings))),
@@ -99,7 +100,7 @@ impl Fixture {
                     drops,
                 }),
                 catalog: Arc::new(PropertyCatalog::load().unwrap()),
-            }
+            })
         });
         ReviewQueueService::new(
             Arc::new(writes),
@@ -769,6 +770,74 @@ async fn a_correction_takes_only_the_facts_property_with_a_value_its_schema_take
 }
 
 #[tokio::test]
+async fn a_corrections_value_is_checked_before_its_fact_is_read() {
+    let fixture = Fixture::new(0);
+    let request = fixture.flagged().await;
+    fixture
+        .profile
+        .facts
+        .lock()
+        .unwrap()
+        .retain(|fact| fact.node_key != request.fact_id);
+
+    let bad_value = fixture
+        .service()
+        .resolve(
+            &fixture.reviewer(),
+            request.id,
+            Resolution::Corrected {
+                property: "skills".to_owned(),
+                value: json!({ "name": "" }),
+                reason: None,
+            },
+        )
+        .await;
+
+    assert!(
+        matches!(
+            bad_value,
+            Err(DomainError::InvalidValue { field: "value", .. })
+        ),
+        "{bad_value:?}"
+    );
+    assert!(
+        matches!(fixture.status(), ReviewStatus::Open { .. }),
+        "a value no schema takes does not close the request"
+    );
+}
+
+#[tokio::test]
+async fn a_correction_of_a_stored_property_no_person_type_has_is_internal() {
+    let fixture = Fixture::new(0);
+    let odd = stored_fact(Category::Skill, "retired_property", json!("x"), 30);
+    fixture.profile.facts.lock().unwrap().push(odd.clone());
+    let request = fixture
+        .service()
+        .flag(&fixture.owner(), fixture.subject, &odd.node_key, None)
+        .await
+        .unwrap();
+
+    let corrected = fixture
+        .service()
+        .resolve(
+            &fixture.reviewer(),
+            request.id,
+            Resolution::Corrected {
+                property: "retired_property".to_owned(),
+                value: json!("y"),
+                reason: None,
+            },
+        )
+        .await;
+
+    assert!(
+        matches!(&corrected, Err(DomainError::Internal(why)) if why.contains(&odd.node_key.0)),
+        "{corrected:?}"
+    );
+    assert!(fixture.writer.plans().is_empty());
+}
+
+#[tokio::test]
 async fn without_the_opt_in_a_correction_is_not_configured_and_the_rest_works() {
     let fixture = Fixture::new(0);
     let request = fixture.flagged().await;
@@ -1024,14 +1093,18 @@ async fn the_subjects_delete_after_a_landed_correction_closes_the_request_as_the
 
     // The subject deletes the corrected fact, which the correction already
     // replaced: it finds it gone.
-    let closed = close_on_delete(
+    let closed = close_on_change(
         fixture.reviews.as_ref(),
         fixture.events.as_ref(),
         &writes,
         &AccessScope::allow_all(),
         request.subject(),
         &request.fact_id,
-        false,
+        OutsideChange {
+            by: fixture.subject,
+            outcome: ReviewOutcome::Deleted,
+            changed: false,
+        },
     )
     .await
     .unwrap();
