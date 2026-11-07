@@ -180,3 +180,111 @@ async fn workflow_run_upsert_is_idempotent_by_id() {
     assert_eq!(items[0]["conclusion"], "failure");
     assert_eq!(items[0]["run_attempt"], 2);
 }
+
+fn run_of_workflow(
+    id: i64,
+    run_number: i64,
+    workflow_id: i64,
+    name: &str,
+    created_at: &str,
+) -> WorkflowRunRecord {
+    WorkflowRunRecord {
+        workflow_id,
+        name: Some(name.to_owned()),
+        ..workflow_run_record(id, run_number, created_at)
+    }
+}
+
+async fn service_with_two_workflows(ctx: &SecurityContext) -> Arc<ConcreteService> {
+    let service = common::service("https://api.github.com").await;
+    service
+        .upsert_repo(ctx, repo_record())
+        .await
+        .expect("repo seed must succeed");
+    for record in [
+        run_of_workflow(11, 200, 8, "CI", "2026-08-18T00:00:00Z"),
+        run_of_workflow(12, 201, 8, "Build", "2026-08-20T00:00:00Z"),
+        run_of_workflow(13, 300, 9, "Release", "2026-08-19T00:00:00Z"),
+    ] {
+        service
+            .upsert_workflow_run(ctx, "acme", "widget", record)
+            .await
+            .expect("run seed must succeed");
+    }
+    service
+}
+
+#[tokio::test]
+async fn workflows_are_built_from_stored_runs_under_their_latest_name() {
+    let ctx = common::caller_in(Uuid::new_v4());
+    let service = service_with_two_workflows(&ctx).await;
+
+    let response = get(
+        router_for(service, ctx),
+        "/repos/acme/widget/actions/workflows",
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let json = body_json(response).await;
+    assert_eq!(json["total_count"], 2);
+    let workflows = json["workflows"].as_array().expect("workflows");
+    assert_eq!(workflows[0]["id"], 8);
+    assert_eq!(
+        workflows[0]["name"], "Build",
+        "a renamed workflow shows its newest name"
+    );
+    assert_eq!(workflows[1]["id"], 9);
+    assert_eq!(workflows[1]["name"], "Release");
+}
+
+#[tokio::test]
+async fn runs_of_one_workflow_leave_the_others_out() {
+    let ctx = common::caller_in(Uuid::new_v4());
+    let service = service_with_two_workflows(&ctx).await;
+    let router = router_for(service, ctx);
+
+    let json = body_json(
+        get(
+            router.clone(),
+            "/repos/acme/widget/actions/workflows/8/runs",
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(json["total_count"], 2);
+    let runs = json["workflow_runs"].as_array().expect("workflow_runs");
+    assert_eq!(runs[0]["run_number"], 201);
+    assert_eq!(runs[1]["run_number"], 200);
+
+    let json = body_json(get(router, "/repos/acme/widget/actions/workflows/9/runs").await).await;
+    assert_eq!(json["total_count"], 1);
+    assert_eq!(json["workflow_runs"][0]["run_number"], 300);
+}
+
+#[tokio::test]
+async fn workflows_of_unknown_repository_return_404() {
+    let ctx = common::caller_in(Uuid::new_v4());
+    let service = common::service("https://api.github.com").await;
+    let router = router_for(service, ctx);
+
+    let workflows = get(router.clone(), "/repos/acme/nope/actions/workflows").await;
+    assert_eq!(workflows.status(), StatusCode::NOT_FOUND);
+    let runs = get(router, "/repos/acme/nope/actions/workflows/8/runs").await;
+    assert_eq!(runs.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn workflows_are_tenant_scoped() {
+    let owner = common::caller_in(Uuid::new_v4());
+    let service = service_with_two_workflows(&owner).await;
+
+    let stranger = common::caller_in(Uuid::new_v4());
+    let response = get(
+        router_for(service, stranger),
+        "/repos/acme/widget/actions/workflows",
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}

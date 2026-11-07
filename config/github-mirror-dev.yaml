@@ -186,6 +186,11 @@ gears:
           parent_id: "00000000-0000-0000-0000-000000000011"
           status: active
 
+        - id: "00000000-df51-5b42-9538-d2b56b7ee953"
+          name: "default"
+          parent_id: "00000000-0000-0000-0000-000000000001"
+          status: active
+
   credstore:
     database:
       server: "sqlite_users"

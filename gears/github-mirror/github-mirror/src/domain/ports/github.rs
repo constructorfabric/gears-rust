@@ -11,12 +11,12 @@ use toolkit_security::AccessScope;
 
 use crate::domain::error::DomainError;
 use crate::domain::repo::{
-    BranchRecord, CheckRunRecord, CommentRecord, CommitCommentRecord, CommitFileRecord,
-    CommitRecord, CommitStatusRecord, ContributorRecord, DeploymentRecord, IssueEventRecord,
-    IssueReactionRecord, IssueRecord, IssueTimelineEventRecord, LabelRecord, MilestoneRecord,
-    PullRequestCommitRecord, PullRequestFileRecord, PullRequestRecord, ReleaseRecord, RepoRecord,
-    ReviewCommentRecord, ReviewRecord, ReviewThreadRecord, TagRecord, WorkflowJobRecord,
-    WorkflowRunRecord,
+    ArtifactRecord, BranchRecord, CheckRunRecord, CommentRecord, CommitCommentRecord,
+    CommitFileRecord, CommitRecord, CommitStatusRecord, ContributorRecord, DeploymentRecord,
+    IssueEventRecord, IssueReactionRecord, IssueRecord, IssueTimelineEventRecord, LabelRecord,
+    MilestoneRecord, PullRequestCommitRecord, PullRequestFileRecord, PullRequestRecord,
+    ReleaseRecord, RepoRecord, ReviewCommentRecord, ReviewRecord, ReviewThreadRecord, TagRecord,
+    WorkflowJobRecord, WorkflowRunRecord,
 };
 use crate::domain::scope::ScopeConfig;
 use crate::domain::sync::telemetry::SessionTelemetry;
@@ -318,13 +318,15 @@ pub struct MetadataListing {
     pub tags: Vec<TagRecord>,
 }
 
-/// The GitHub Actions listings: workflow runs and deployments. Jobs are only
-/// reachable per run, so they come from [`GithubPort::refine_workflow_run`].
+/// The GitHub Actions listings: workflow runs, deployments and artifacts. Jobs
+/// are only reachable per run, so they come from
+/// [`GithubPort::refine_workflow_run`].
 #[domain_model]
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ActionsListing {
     pub workflow_runs: Vec<WorkflowRunRecord>,
     pub deployments: Vec<DeploymentRecord>,
+    pub artifacts: Vec<ArtifactRecord>,
 }
 
 /// Everything one full sync of a repository amounts to, in one value.

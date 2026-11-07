@@ -7,10 +7,10 @@
 //! shapes.
 
 use github_mirror_sdk::{
-    Actor, Branch, CheckRun, Comment, Commit, CommitComment, CommitFile, CommitStatus, Contributor,
-    Deployment, Issue, IssueEvent, IssueReaction, IssueTimelineEvent, Label, LabelRef, Milestone,
-    PullRequest, PullRequestCommit, PullRequestFile, Release, ReleaseAsset, Repo, Review,
-    ReviewComment, ReviewThread, Tag, WorkflowJob, WorkflowRun, WorkflowStep,
+    Actor, Artifact, Branch, CheckRun, Comment, Commit, CommitComment, CommitFile, CommitStatus,
+    Contributor, Deployment, Issue, IssueEvent, IssueReaction, IssueTimelineEvent, Label, LabelRef,
+    Milestone, PullRequest, PullRequestCommit, PullRequestFile, Release, ReleaseAsset, Repo,
+    Review, ReviewComment, ReviewThread, Tag, Workflow, WorkflowJob, WorkflowRun, WorkflowStep,
 };
 use github_mirror_sdk::{CountDrift, MirrorStatus, SyncSummary};
 
@@ -362,10 +362,16 @@ pub struct CommentDto {
     #[schema(format = DateTime)]
     pub updated_at: String,
     pub html_url: Option<String>,
+    pub issue_url: String,
 }
 
-impl From<Comment> for CommentDto {
-    fn from(c: Comment) -> Self {
+fn issue_api_url(owner: &str, name: &str, number: i64) -> String {
+    format!("https://api.github.com/repos/{owner}/{name}/issues/{number}")
+}
+
+impl CommentDto {
+    #[must_use]
+    pub fn new(c: Comment, owner: &str, name: &str) -> Self {
         Self {
             id: c.id,
             user: actor(c.author_login),
@@ -373,6 +379,7 @@ impl From<Comment> for CommentDto {
             created_at: c.created_at,
             updated_at: c.updated_at,
             html_url: c.html_url,
+            issue_url: issue_api_url(owner, name, c.issue_number),
         }
     }
 }
@@ -640,6 +647,7 @@ pub struct CommitStatsDto {
 #[toolkit_macros::api_dto(response)]
 pub struct CommitDto {
     pub sha: String,
+    pub html_url: String,
     pub commit: CommitDetailDto,
     pub author: Option<ActorDto>,
     pub committer: Option<ActorDto>,
@@ -649,10 +657,17 @@ pub struct CommitDto {
     pub files: Vec<PullRequestFileDto>,
 }
 
-impl From<Commit> for CommitDto {
-    fn from(c: Commit) -> Self {
+fn commit_html_url(owner: &str, name: &str, sha: &str) -> String {
+    format!("https://github.com/{owner}/{name}/commit/{sha}")
+}
+
+impl CommitDto {
+    #[must_use]
+    pub fn new(c: Commit, owner: &str, name: &str) -> Self {
+        let html_url = commit_html_url(owner, name, &c.sha);
         Self {
             sha: c.sha,
+            html_url,
             commit: CommitDetailDto {
                 message: c.message,
                 author: GitPersonDto {
@@ -863,6 +878,79 @@ pub struct WorkflowRunsPageDto {
     pub workflow_runs: Vec<WorkflowRunDto>,
 }
 
+#[derive(Debug)]
+#[toolkit_macros::api_dto(response)]
+pub struct WorkflowDto {
+    pub id: i64,
+    pub name: Option<String>,
+}
+
+impl From<Workflow> for WorkflowDto {
+    fn from(w: Workflow) -> Self {
+        Self {
+            id: w.id,
+            name: w.name,
+        }
+    }
+}
+
+#[derive(Debug)]
+#[toolkit_macros::api_dto(response)]
+pub struct WorkflowsPageDto {
+    pub total_count: i64,
+    pub workflows: Vec<WorkflowDto>,
+}
+
+#[derive(Debug)]
+#[toolkit_macros::api_dto(response)]
+pub struct ArtifactWorkflowRunDto {
+    pub id: i64,
+    pub head_branch: Option<String>,
+    pub head_sha: Option<String>,
+}
+
+#[derive(Debug)]
+#[toolkit_macros::api_dto(response)]
+pub struct ArtifactDto {
+    pub id: i64,
+    pub name: String,
+    pub size_in_bytes: i64,
+    pub expired: bool,
+    #[schema(format = DateTime)]
+    pub created_at: Option<String>,
+    #[schema(format = DateTime)]
+    pub updated_at: Option<String>,
+    #[schema(format = DateTime)]
+    pub expires_at: Option<String>,
+    pub workflow_run: Option<ArtifactWorkflowRunDto>,
+}
+
+impl From<Artifact> for ArtifactDto {
+    fn from(a: Artifact) -> Self {
+        Self {
+            id: a.id,
+            name: a.name,
+            size_in_bytes: a.size_in_bytes,
+            expired: a.expired,
+            created_at: a.created_at,
+            updated_at: a.updated_at,
+            expires_at: a.expires_at,
+            workflow_run: a.workflow_run_id.map(|id| ArtifactWorkflowRunDto {
+                id,
+                head_branch: a.head_branch,
+                head_sha: a.head_sha,
+            }),
+        }
+    }
+}
+
+#[derive(Debug)]
+#[toolkit_macros::api_dto(response)]
+pub struct ArtifactsPageDto {
+    pub total_count: i64,
+    pub artifacts: Vec<ArtifactDto>,
+}
+
 /// GitHub-shaped contributor.
 #[derive(Debug)]
 #[toolkit_macros::api_dto(response)]
@@ -924,6 +1012,7 @@ pub struct SyncSummaryDto {
     pub commit_comments_synced: u64,
     pub issue_events_synced: u64,
     pub deployments_synced: u64,
+    pub artifacts_synced: u64,
     pub pull_request_commits_synced: u64,
     pub commit_statuses_synced: u64,
     pub workflow_jobs_synced: u64,
@@ -983,6 +1072,7 @@ impl From<SyncSummary> for SyncSummaryDto {
             commit_comments_synced: s.commit_comments_synced,
             issue_events_synced: s.issue_events_synced,
             deployments_synced: s.deployments_synced,
+            artifacts_synced: s.artifacts_synced,
             pull_request_commits_synced: s.pull_request_commits_synced,
             commit_statuses_synced: s.commit_statuses_synced,
             workflow_jobs_synced: s.workflow_jobs_synced,
@@ -1275,6 +1365,7 @@ impl From<IssueReaction> for IssueReactionDto {
 /// GitHub-shaped deployment.
 #[derive(Debug)]
 #[toolkit_macros::api_dto(response)]
+#[schema(as = GithubMirrorDeploymentDto)]
 pub struct DeploymentDto {
     pub id: i64,
     #[serde(rename = "ref")]
@@ -1306,10 +1397,13 @@ impl From<Deployment> for DeploymentDto {
     }
 }
 
-impl From<PullRequestCommit> for CommitDto {
-    fn from(c: PullRequestCommit) -> Self {
+impl CommitDto {
+    #[must_use]
+    pub fn from_pull_request_commit(c: PullRequestCommit, owner: &str, name: &str) -> Self {
+        let html_url = commit_html_url(owner, name, &c.sha);
         Self {
             sha: c.sha,
+            html_url,
             commit: CommitDetailDto {
                 message: c.message,
                 author: GitPersonDto {

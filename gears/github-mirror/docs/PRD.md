@@ -192,7 +192,7 @@ A full local mirror that synchronizes incrementally with GitHub, serves a GitHub
 
 ### 4.1 In Scope
 
-- Full synchronization of all supported GitHub entity types: repository metadata, branches, tags, releases, milestones, labels, issues, issue comments, issue events, issue timeline, issue reactions, pull requests, PR reviews, PR review comments, PR issue comments, PR commits, PR files, PR diff/patch, PR merge status, commits, commit comments, commit statuses, check runs, check suites, workflow runs, workflow jobs, deployments, deployment statuses, project/card references (where API access allows), and security/dependabot/code-scanning alerts (when token scopes allow)
+- Full synchronization of all supported GitHub entity types: repository metadata, branches, tags, releases, milestones, labels, issues, issue comments, issue events, issue timeline, issue reactions, pull requests, PR reviews, PR review comments, PR issue comments, PR commits, PR files, PR diff/patch, PR merge status, commits, commit comments, commit statuses, check runs, check suites, workflow runs, workflow jobs, workflow artifacts, deployments, deployment statuses, project/card references (where API access allows), and security/dependabot/code-scanning alerts (when token scopes allow)
 - Derived contributors / people index from embedded user objects (no additional API calls)
 - Detection of `pull_request` field on issues and automatic PR-specific refinement
 - GitHub-compatible REST API surface mirroring GitHub's native REST API v3
@@ -561,6 +561,7 @@ The following endpoint families **MUST** be supported (reading from the local no
 - `/repos/{owner}/{repo}` — repository metadata
 - `/repos/{owner}/{repo}/issues` and `/repos/{owner}/{repo}/issues/{number}` — issues
 - `/repos/{owner}/{repo}/issues/{number}/comments` — issue comments
+- `/repos/{owner}/{repo}/issues/comments` — issue and PR comments of the whole repository
 - `/repos/{owner}/{repo}/issues/{number}/events` — issue events
 - `/repos/{owner}/{repo}/issues/{number}/timeline` — issue timeline
 - `/repos/{owner}/{repo}/issues/{number}/reactions` — issue reactions
@@ -580,6 +581,9 @@ The following endpoint families **MUST** be supported (reading from the local no
 - `/repos/{owner}/{repo}/labels` — labels
 - `/repos/{owner}/{repo}/actions/runs` — workflow runs
 - `/repos/{owner}/{repo}/actions/runs/{run_id}/jobs` — workflow jobs
+- `/repos/{owner}/{repo}/actions/workflows` — workflows that have mirrored runs
+- `/repos/{owner}/{repo}/actions/workflows/{workflow_id}/runs` — workflow runs of one workflow
+- `/repos/{owner}/{repo}/actions/artifacts` — workflow artifacts
 - `/repos/{owner}/{repo}/deployments` — deployments
 - `/repos/{owner}/{repo}/contributors` — derived contributors
 
