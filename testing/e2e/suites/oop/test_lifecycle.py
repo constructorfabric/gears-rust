@@ -78,6 +78,17 @@ def _readyz_status(url: str) -> int:
         return 0
 
 
+def _readyz_gated_on(url: str, dep: str) -> bool:
+    """True iff /readyz is 503 and lists `dep` among its unresolved dependencies."""
+    try:
+        r = httpx.get(f"{url}/readyz", timeout=REQUEST_TIMEOUT)
+        if r.status_code != 503:
+            return False
+        return dep in r.json().get("unresolved_deps", [])
+    except (httpx.HTTPError, ValueError, AttributeError):
+        return False
+
+
 @pytest.fixture
 def provider_consumer_restored(cluster):
     """Restore provider + consumer (up and ready) after the readiness test."""
@@ -117,8 +128,8 @@ def test_consumer_readiness_gates_on_provider_dependency(cluster, provider_consu
     cluster.start_gear(CONSUMER)
 
     cluster.wait(
-        "consumer reports not-ready while its provider dependency is unresolved",
-        lambda: _readyz_status(consumer_url) == 503,
+        "consumer reports not-ready, gated on its unresolved provider dependency",
+        lambda: _readyz_gated_on(consumer_url, PROVIDER_DEP),
     )
     r = httpx.get(f"{consumer_url}/readyz", timeout=REQUEST_TIMEOUT)
     assert r.status_code == 503, r.text
