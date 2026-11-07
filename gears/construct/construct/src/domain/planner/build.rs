@@ -12,7 +12,7 @@ impl PlanDraft<'_> {
     /// @cpt-dod:cpt-cf-construct-dod-planner-plan:p1
     #[must_use]
     pub fn finish(self, tenant_id: Uuid, subject_id: Uuid, origin: Origin) -> Plan {
-        let new_key = || NodeKey(format!("construct:{tenant_id}:{}", Uuid::new_v4()));
+        let new_key = || NodeKey::new_in(tenant_id);
         let steps = self
             .steps
             .into_iter()

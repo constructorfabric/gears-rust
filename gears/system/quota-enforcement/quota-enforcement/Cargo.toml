@@ -30,7 +30,7 @@ grpc-client = ["cluster-sdk/grpc-client"]
 quota-enforcement-engine-cel = { workspace = true }
 quota-enforcement-engine-most-restrictive = { workspace = true }
 parking_lot = { workspace = true }
-quota-enforcement-sdk = { workspace = true }
+quota-enforcement-sdk = { workspace = true, features = ["rest-client", "rest-server"] }
 authz-resolver-sdk = { workspace = true }
 authz-resolver = { workspace = true }
 types-registry-sdk = { workspace = true }
@@ -48,8 +48,10 @@ utoipa = { workspace = true }
 gts = { workspace = true }
 
 axum = { workspace = true }
-# Repeated list query parameters (`id=a&id=b`) and their OpenAPI declaration.
-toolkit-contract = { workspace = true, features = ["rest-server"] }
+# `$filter`, `$top` and `CursorV1` on the REST lists, and the `Page<T>` envelope.
+toolkit-odata = { workspace = true, features = ["with-utoipa"] }
+# The policy read and delete query parameters and their OpenAPI declaration.
+toolkit-contract = { workspace = true, features = ["runtime-client", "rest-server"] }
 anyhow = { workspace = true }
 # One server clock reading per read response and the gauge refresh timing.
 time = { workspace = true }
@@ -82,6 +84,8 @@ cluster = { package = "cf-gears-cluster", path = "../../cluster/cluster" }
 standalone-cluster-plugin = { package = "cf-gears-standalone-cluster-plugin", path = "../../cluster/plugins/standalone-cluster-plugin" }
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
 tokio = { workspace = true, features = ["rt", "macros", "time", "test-util"] }
+# A recording subscriber: the span tests and the traced bench variants.
+tracing-subscriber = { workspace = true }
 # Router round trips in the REST tests.
 tower = { workspace = true, features = ["util"] }
 # The published SQL storage plugin over SQLite, for the end-to-end delivery test.

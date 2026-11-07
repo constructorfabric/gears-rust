@@ -2,7 +2,10 @@ use toolkit_canonical_errors::CanonicalError;
 use toolkit_db::DbError;
 use toolkit_macros::domain_model;
 
+use super::pagination::{PageError, QueryError};
+use super::profile::FullProfile;
 use super::refusal::Refusal;
+use super::review_queue::{NotStored, ReviewConflict};
 use super::settings_scope::SettingsOutOfScope;
 
 #[domain_model]
@@ -20,11 +23,56 @@ pub enum DomainError {
     #[error("Access forbidden: {0}")]
     OutOfScope(SettingsOutOfScope),
 
+    /// The caller may not see the resource. Answered like a resource that
+    /// does not exist, so the answer tells nothing about what exists.
+    #[error("Not visible: {0}")]
+    NotVisible(String),
+
     #[error("Service unavailable: {0}")]
     Unavailable(String),
 
+    /// The deployment does not configure what the call needs, such as the
+    /// processing identity. Not cured by a retry, so it is not `Unavailable`.
+    #[error("Not configured: {0}")]
+    NotConfigured(String),
+
+    /// The subject has no live fact with the id asked for. Answered like a
+    /// subject that does not exist.
+    #[error("No such fact: {0}")]
+    NoSuchFact(String),
+
+    /// The tenant has no review request with the id asked for.
+    #[error("No such review request: {0}")]
+    NoSuchReviewRequest(String),
+
+    /// The fact already has an open review request, or the request asked to
+    /// resolve is closed.
+    #[error("Review conflict: {0}")]
+    ReviewConflict(ReviewConflict),
+
+    /// A reviewer's correction is for another property than the fact's
+    /// (`property`), or its property's schema does not take the value
+    /// (`value`). The rule never repeats the value.
+    #[error("Invalid {field}: {rule}")]
+    InvalidValue { field: &'static str, rule: String },
+
+    /// A correction the checks or Admission did not let through; nothing was
+    /// stored.
+    #[error("Not stored: {}", .0.name())]
+    NotStored(NotStored),
+
+    /// The caller's `$filter`, `$orderby` or cursor does not fit the list.
+    #[error("Invalid query: {0:?}")]
+    InvalidQuery(QueryError),
+
     #[error("Internal error: {0}")]
     Internal(String),
+
+    /// The subject's profile holds as many facts as one read takes: it takes
+    /// no new fact, and a profile past that cannot be read whole. Not a
+    /// defect, and not cured by a retry.
+    #[error("Profile full: {0}")]
+    ProfileFull(FullProfile),
 
     #[error("Database error: {0}")]
     Database(#[from] DbError),
@@ -96,5 +144,14 @@ impl From<authz_resolver_sdk::EnforcerError> for DomainError {
 impl From<Refusal> for DomainError {
     fn from(refusal: Refusal) -> Self {
         Self::Refused(refusal)
+    }
+}
+
+impl From<PageError> for DomainError {
+    fn from(err: PageError) -> Self {
+        match err {
+            PageError::Internal(detail) => Self::Internal(detail),
+            PageError::Query(query) => Self::InvalidQuery(query),
+        }
     }
 }

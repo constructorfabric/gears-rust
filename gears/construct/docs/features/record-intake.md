@@ -38,7 +38,7 @@
 
 ### 1.1 Overview
 
-Record Intake is the single entry for connectors (`cpt-cf-construct-component-results-api`). A connector sends one record per request for one tenant. Intake checks the record against its GTS type and the types it derives from, checks that the connector is on and, for a record about a subject, that personalization is on with no erasure under way. It then keeps the record's identity, so that a resend is a repeat, hands the record to background processing, and answers received, repeat or refused at once. Until the Planner delivers the processing, a stub drops every received record with a content-free drop event.
+Record Intake is the single entry for connectors (`cpt-cf-construct-component-results-api`). A connector sends one record per request for one tenant. Intake checks the record against its GTS type and the types it derives from, checks that the connector is on and, for a record about a subject, that personalization is on with no erasure under way. It then keeps the record's identity, so that a resend is a repeat, hands the record to background processing, and answers received, repeat or refused at once. Processing runs where the deployment configures a processing identity and a model and opts in to processing without sensitive-data checks (Profile Reader, `cpt-cf-construct-feature-profile-reader`); elsewhere a stub drops every received record with a content-free drop event.
 
 ### 1.2 Purpose
 
@@ -46,7 +46,7 @@ The PRD requires Construct to take records one at a time, check each against its
 
 **The record types.** The record base type `gts.cf.connectors.core.record.v1~` and the four derived types (chat message, enrichment fact candidate, mastery course catalog, mastery student mastery) are Rust structs in the SDK crate (`construct_sdk::gts`), which is their source of truth (`cpt-cf-construct-contract-gts-record`). `#[gts_type_schema]` generates each type's schema from its struct and submits it to the link-time schema inventory, which the types registry drains at boot. The connectors are not Rust and cannot register their types themselves, and the in-host types registry fills only at boot. The generated schemas are committed under `construct-sdk/schemas/`, and a test fails when the generated output differs, so a change to a registered type version shows in review. The enum values of a type are fixed for its version; a new value needs a new version of the type. The payload structs define the schemas, but `gts-macros` 0.12 reads every payload member as required, so a valid record that leaves an optional member out cannot be read into its payload struct; intake checks the JSON and never reads them. The envelope is the base: `type` (at most 1024 characters), `provenance`, `version`, `observed_at` and `payload` are required, `subject_id` is optional (absent only for source-scoped records), and the top level takes no other member. A pushed record **MUST NOT** carry `id`. The base declares it as optional, under the Rust name `store_id` (the generator takes a base with either a `GtsInstanceId` named `id` or a type member, and a record needs `type`), so a record kept in a GTS store with its `id` validates against the registered base; intake refuses an `id` in a pushed record before any schema runs. A type about a person requires `subject_id`. A derived schema cannot say so, so each type states it as the GTS trait `subject_required`, on unless the type turns it off (only the course catalog does), and inherited by a derived type; a type derived from a person type cannot turn it off. Another reader of the registered schemas sees the trait but not a schema rule. Other rules a generated schema cannot carry either: a derived schema refines only `payload`, and cannot tie one payload member to another. The SDK states them per type (`construct_sdk::gts::check_type_rules`), and intake checks them after the schema. For the fact candidate: `provenance` and `version` are `sha256:` plus 64 lower-case hex digits, derived as the SDK's `docs/fact-candidate-identity.md` specifies; `value` is a list for `research_areas` and `skills` and one string for every other field; and no value or list item is whitespace only, nor a list item unstripped, by the derivation's set, which is wider than `\S` in a validator that follows ECMA-262.
 
-**The tenant and the connector.** A connector serves many tenants with one login, so it names the tenant in the `tenant` query parameter, never in the record (`cpt-cf-construct-fr-access-control`, as amended with this feature). The AuthZ resolver must authorize the connector for that tenant: intake asks for the resource type `construct.record` with the action `send`, passes the named tenant as the context tenant (root only) and as the owner tenant, and every later step runs under the scope this one decision returns. The connector identity is the subject id of the connector's login. The subject's settings are read only in the named tenant, also when the scope covers more than one tenant.
+**The tenant and the connector.** A connector serves many tenants with one login, so it names the tenant in the `tenant` query parameter, never in the record (`cpt-cf-construct-fr-access-control`, as amended with this feature). The AuthZ resolver must authorize the connector for that tenant: intake asks for the resource type `gts.cf.connectors.core.record.v1~` with the action `send`, passes the named tenant as the context tenant (root only) and as the owner tenant, and every later step runs under the scope this one decision returns. The connector identity is the subject id of the connector's login. The subject's settings are read only in the named tenant, also when the scope covers more than one tenant.
 
 **The record identity.** One row per tenant and record identity in `construct__record_ids` (`cpt-cf-construct-dbtable-record-ids`). The identity is (tenant, connector, provenance, version), as the record base type states, and it is kept only as its record key: the SHA-256 of connector, provenance and version. A provenance can hold record content (a fact candidate's is the fact key and its value), so the table stores neither the provenance nor the version, and no log line names them. Inserting the key is the repeat check, so two copies sent at once cannot both be received. The table holds no record content.
 
@@ -58,11 +58,11 @@ The PRD requires Construct to take records one at a time, check each against its
 - `UNKNOWN_TYPE` and `CONNECTOR_OFF` can clear: once the type is registered, or the tenant turns the connector on.
 - `PERSONALIZATION_OFF` and `ERASURE_IN_PROGRESS` are final for the record, though the state behind them can change: a connector **MUST NOT** send such a record again, so data from a time the subject opted out, or data an erasure removed, never comes back. Construct does not remember refusals, so it cannot enforce this; it is the connector's rule.
 
-**Until the Planner exists.** The stub takes every record and drops it, with a drop event: intake answers `202` and keeps the identity, as the story asks. A record received while the stub is wired in is not processed, and a resend after the Planner ships is a repeat. Records the stub takes are development data: an environment that took records with the stub is reset when the stub is replaced.
+**Without processing.** Where no processing identity, no model or no opt-in to processing without sensitive-data checks is configured, the stub takes every record and drops it, with a drop event: intake answers `202` and keeps the identity. A record received while the stub is wired in is not processed, and a resend once processing is configured is a repeat. Records the stub takes are development data: an environment that took records with the stub is reset when processing is configured.
 
 **Out of scope**:
 
-- The Planner's entry point and background processing; a stub that drops every record with a drop event stands in.
+- The Planner's entry point and background processing, which the Planner and the Profile Reader's wiring deliver; this feature's stub, which drops every record with a drop event, stands in where processing is not configured.
 - Connectors on or off in the settings service. This feature reads the switch through a small interface whose first version takes the deployment config (every connector on unless configured off); declaring and reading it in the settings service waits until it is decided whether the settings service runs in Construct's host.
 - Writing drop events to the Audit gear, which does not exist yet; they go to the structured log.
 - Erasure and retention of record identities.
@@ -114,7 +114,7 @@ The PRD requires Construct to take records one at a time, check each against its
 **Steps**:
 1. [x] - `p1` - Connector sends `POST /construct/v1/records?tenant=<tenant id>` with one record as the JSON body. The route is authenticated - `inst-submit-send`
 2. [x] - `p1` - API: the security context, the `tenant` query parameter and the JSON body are extracted; a missing or malformed one is answered with a problem before the service runs - `inst-submit-parse`
-3. [x] - `p1` - Ask the AuthZ resolver for `construct.record` / `send`, with the named tenant as the context tenant (root only) and as the owner-tenant property. A denial is `403`. The connector identity is the subject id of the caller - `inst-submit-authorize`
+3. [x] - `p1` - Ask the AuthZ resolver for `gts.cf.connectors.core.record.v1~` / `send`, with the named tenant as the context tenant (root only) and as the owner-tenant property. A denial is `403`. The connector identity is the subject id of the caller - `inst-submit-authorize`
 4. [x] - `p1` - Run `cpt-cf-construct-algo-record-intake-check-record` on the record. **IF** it is refused, **RETURN** the refusal (`422`) - `inst-submit-refused`
 5. [x] - `p1` - **IF** the connector is off for the tenant, **RETURN** a refusal `CONNECTOR_OFF` - `inst-submit-connector`
 6. [x] - `p1` - **IF** the record names a subject, read the subject's settings in the named tenant under the scope of step 3 (`cpt-cf-construct-algo-subject-settings-read`). **IF** that scope does not cover the subject's settings, **RETURN** forbidden (`403`): a row the scope leaves out never becomes the tenant's default. **IF** an erasure is under way, **RETURN** a refusal `ERASURE_IN_PROGRESS`; **IF** personalization is off, **RETURN** a refusal `PERSONALIZATION_OFF`. A record without a subject skips this step - `inst-submit-subject`
@@ -154,7 +154,7 @@ The PRD requires Construct to take records one at a time, check each against its
 **Output**: Taken, or refused with an unavailable error. The hand-off returns at once; the Planner's implementation puts the record on a bounded queue and refuses when it is full.
 
 **Steps**:
-1. [x] - `p1` - Until the Planner's entry point exists, take every record and drop it: write a drop event (stage `planner`, reason `no_planner`, `cpt-cf-construct-algo-record-intake-drop-event`) and **RETURN** taken, so intake commits the identity and answers `202` - `inst-hand-off-drop`
+1. [x] - `p1` - Where processing is not configured (no processing identity, no model or no opt-in to processing without sensitive-data checks), take every record and drop it: write a drop event (stage `planner`, reason `no_planner`, `cpt-cf-construct-algo-record-intake-drop-event`) and **RETURN** taken, so intake commits the identity and answers `202` - `inst-hand-off-drop`
 
 ### Write a Drop Event
 
@@ -162,7 +162,7 @@ The PRD requires Construct to take records one at a time, check each against its
 
 **Input**: A received record that processing drops, the stage that drops it, and the reason.
 
-**Output**: One content-free event: tenant, subject, connector, record key (never the provenance or the version), record type, stage (`planner`, `checks`, `admission`, `writer`) and reason: `no_planner` and `processing_failed`, and, from the Sensitive-Data Checks and Admission, `check_failed`, `personalization_off`, `erasure_in_progress`, `untrusted_source`, `below_confidence_floor`, `entity_kind_not_allowed` and `write_cap_exceeded`. A plan with no record behind it (an agent's, a reviewer's or an administrator's) has no drop event; its caller gets the reason in the result.
+**Output**: One content-free event: tenant, subject, connector, record key (never the provenance or the version), record type, stage (`planner`, `checks`, `admission`, `writer`, `worker`) and reason: `no_planner` and `processing_failed`, and, from the Sensitive-Data Checks and Admission, `check_failed`, `personalization_off`, `erasure_in_progress`, `untrusted_source`, `below_confidence_floor`, `entity_kind_not_allowed` and `write_cap_exceeded`. A plan with no record behind it (an agent's, a reviewer's or an administrator's) has no drop event; its caller gets the reason in the result.
 
 **Steps**:
 1. [x] - `p1` - Write the event to the structured log at warn level under the target `construct::audit`, until the Audit gear ships. The subject is a plain id, only when the record names one; no record content is written. The Planner, the Sensitive-Data Checks, Admission and the Profile Writer emit it - `inst-drop-event-log`
@@ -231,7 +231,7 @@ Intake **MUST** read whether a connector is on through one interface. Its first 
 
 - [x] `p1` - **ID**: `cpt-cf-construct-dod-record-intake-hand-off`
 
-A received record **MUST** go to processing through one interface that returns at once and can refuse. It **MUST** carry the tenant, the connector identity and the record, and **MUST NOT** carry the caller's security context or scope; processing builds its own for the tenant. Until the Planner exists, the wired-in hand-off **MUST** take every record and emit the drop event, so intake answers `202` and keeps the identity. A hand-off that refuses **MUST** leave no identity behind.
+A received record **MUST** go to processing through one interface that returns at once and can refuse. It **MUST** carry the tenant, the connector identity and the record, and **MUST NOT** carry the caller's security context or scope; processing builds its own for the tenant. Where processing is not configured, the wired-in hand-off **MUST** take every record and emit the drop event, so intake answers `202` and keeps the identity; where it is configured, the hand-off **MUST** put the record on a bounded queue and refuse when the queue is full. A hand-off that refuses **MUST** leave no identity behind.
 
 **Implements**:
 - `cpt-cf-construct-algo-record-intake-hand-off`
@@ -247,7 +247,7 @@ The system **MUST** define one content-free drop event (tenant, subject, connect
 **Implements**:
 - `cpt-cf-construct-algo-record-intake-drop-event`
 
-**Verified by**: `a_drop_event_names_the_record_its_stage_and_its_reason`, `the_drop_event_is_logged_without_record_content` (captures the log). The stub, the Sensitive-Data Checks and Admission emit it today (`a_failed_check_drops_the_record_with_a_drop_event`, `an_admission_drop_is_logged_in_the_record_drop_shape_without_content`); the Planner and the writer will.
+**Verified by**: `a_drop_event_names_the_record_its_stage_and_its_reason`, `the_drop_event_is_logged_without_record_content` (captures the log). The stub, the Sensitive-Data Checks and Admission emit it today (`a_failed_check_drops_the_record_with_a_drop_event`, `an_admission_drop_is_logged_in_the_record_drop_shape_without_content`); processing emits it for the Planner, the writer and the worker (`a_conflict_on_every_rerun_drops_the_record_at_the_writer`).
 
 ### Intake Route
 
@@ -281,7 +281,7 @@ The system **MUST** register `POST /construct/v1/records` with OperationBuilder,
 - [ ] A connector without permission for the record's tenant is refused (`a_connector_without_permission_is_refused_before_the_record_is_checked`, `a_connector_authorized_only_for_its_own_tenant_cannot_write_into_another`, `a_connector_without_permission_gets_403`).
 - [ ] Records are refused while personalization is off or an erasure is under way, and when the connector is off (`personalization_off_for_the_subject_is_refused`, `an_erasure_under_way_is_refused_even_with_personalization_on`, `a_connector_that_is_off_is_refused`).
 - [ ] A record of a registered derived type is taken with no type-specific code: one schema check covers every type (`a_valid_record_of_every_derived_type_passes`, `a_record_without_a_subject_skips_the_subject_checks`).
-- [ ] Until the Planner exists, a record is answered `202` and dropped with a drop event, and its identity is kept (`until_the_planner_exists_a_record_is_received_and_dropped_with_an_event`, `until_the_planner_exists_a_record_gets_202_and_a_resend_200`).
+- [ ] Where processing is not configured, a record is answered `202` and dropped with a drop event, and its identity is kept (`until_the_planner_exists_a_record_is_received_and_dropped_with_an_event`, `until_the_planner_exists_a_record_gets_202_and_a_resend_200`).
 - [ ] The tests named in this document pass. They run on an in-memory SQLite database.
 
 ## 7. Non-Functional Considerations

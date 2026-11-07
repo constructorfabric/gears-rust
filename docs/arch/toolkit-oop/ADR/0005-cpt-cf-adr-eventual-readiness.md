@@ -3,7 +3,7 @@ status: accepted
 date: 2026-04-07
 ---
 
-# Dependency Readiness — Eventual Self-Registration, No Blocking Startup
+# Dependency Readiness — Eventual Registration and Bounded Application Preparation
 
 **ID**: `cpt-cf-adr-eventual-readiness`
 
@@ -38,14 +38,35 @@ dependencies at startup, and who is responsible for the retry/registration logic
 * **Option A**: Init containers wait for Flight Control; topo-sort equivalent via deployment ordering (Helm hooks / Argo
   sync-waves).
 * **Option B**: Central dependency checker in Flight Control that signals "you may start" to each gear.
-* **Option C**: Eventual readiness — gears start immediately, self-register with retry, readiness probe gates traffic
-  until critical deps are resolved. All retry/probe logic lives in ToolKit runtime.
+* **Option C**: Eventual readiness — infrastructure starts and self-registers with retry; readiness gates traffic
+  until prerequisites are resolved. The application GTS preparation exception below is bounded and owned by ToolKit.
 
 ## Decision Outcome
 
 Chosen option: "Eventual readiness with ToolKit runtime-managed self-registration and probes", because it is
 kubernetes-native, has no single point of failure, requires zero boilerplate from gear developers, and reuses the
 existing `deps` metadata for readiness gating.
+
+### Amendment, 2026-11-05: GTS admission before application initialization
+
+Declared GTS prerequisites now gate application `init`; directory registration and dependency resolution
+remain eventual. Embedded and OoP hosts serve probes and system platform/anonymous routes during
+preparation. Tenant routes return `503` until application initialization completes. Legacy-only registries
+opt out of discovery, including when they are the process root.
+
+After DB migrations and registry-client wiring, applications publish concurrently within a shared
+120-second budget. All manifests must be admitted before any application `init`. This simplifies plugin
+binding but lets one slow publisher delay every application in the process. Early registry serving lets
+peer publishers supply missing prerequisites without waiting for those applications.
+
+Refusal or expiry stops started gears and returns an error for supervisor restart. Configuration errors
+and permanent refusals require correction. Parent publication cannot depend on an unstarted child registry;
+a local provider or explicit external endpoint may satisfy it instead.
+
+Migrations and partial admission are not rolled back: preparation must be retryable and compatible with
+old pods. Deployment publication uses the same policies and transport settings. Business readiness stays
+separate. Configure `grpc_service_owners` to protect embedded application and remote service names before
+registration; unconfigured names retain first-registration ownership until their installers are collected.
 
 ### Consequences
 
@@ -84,19 +105,19 @@ existing `deps` metadata for readiness gating.
   concurrently, timeout-bounded, panic-isolated, cached to avoid storm; per-check timeout configurable via
   `oop_http.healthcheck_timeout_ms`). `Unhealthy` from the check forces `Starting`/`503`; `Degraded` stays `200`.
   The full per-component health report is returned by `/health`; `/readyz` only uses the aggregate status internally.
-* Gears with no `deps` and no healthcheck (e.g., Flight Control itself, types-registry) become ready immediately
-  after `start()`.
+* A process with no consumed dependencies, publication or healthcheck becomes ready after its application
+  preparation and startup complete. A system provider can serve platform requests earlier while the
+  process's application readiness remains blocked.
 * **`startupProbe` is an optional safety-net.** The framework serves `/healthz` as soon as the listener binds —
   *before* the gear's `start()` phase (see `cpt-cf-component-oop-bootstrap`) — so a slow bootstrap no longer trips the
   liveness budget and a `startupProbe` is **not** required. Gears with very long bootstraps MAY still declare one
   (pointing at `/readyz`) to defer liveness/readiness evaluation and suppress not-ready noise during a known startup
   window.
-* The Helm chart library (`toolkit-common`) configures `livenessProbe`, `readinessProbe`, and a conservative
-  `startupProbe` (failureThreshold=30, periodSeconds=5 → 150s bootstrap budget) by default; gears tune
-  `startupProbe.failureThreshold` per their `deps` count and external-resource expectations. No init containers are
-  generated.
-* In Profile 1, topo-sort remains the primary mechanism. The readiness probes still exist but are trivially satisfied (
-  all deps are in-process and already started).
+* The Helm chart library (`toolkit-common`) renders configurable `livenessProbe` and `readinessProbe`.
+  It currently does not render a `startupProbe`; deployments adding one must size it for their complete
+  preparation window. Early probes prevent a normal GTS wait from exhausting the HTTP liveness window.
+* In Profile 1, topo-sort orders each startup group. Readiness also waits for the process's GTS preparation;
+  it is not assumed to be satisfied merely because providers are in process.
 * In Profile 2 (Self-Hosted), Flight Control starts first (it has no deps), then spawns workers. Workers retry
   registration until Flight Control is reachable (typically immediate since it starts first). Deps resolve quickly
   because the host can start workers in topo order, but correctness does not depend on this ordering.
@@ -111,6 +132,10 @@ existing `deps` metadata for readiness gating.
   requests (liveness OK) and re-registers when Flight Control restarts.
 * Code review: verify that no gear source code contains retry loops for registration or dependency resolution — all
   such logic is in `toolkit::bootstrap::oop`.
+* During pending admission, verify probes and platform routes work, tenant calls are refused, and a peer
+  can publish the missing base. Refusal/expiry must clean up and return an error without SIGTERM.
+* Verify migrations survive failure and configured gRPC ownership rejects another gear's registration
+  before application `init`.
 
 ## Pros and Cons of the Options
 
@@ -144,11 +169,12 @@ Control signals "your deps are ready, proceed".
 
 ### Option C: Eventual Readiness (chosen)
 
-Gears start immediately and unconditionally. The ToolKit runtime manages self-registration (background retry) and
-readiness probes (dep resolution check). No blocking, no central coordinator.
+System infrastructure starts independently. The ToolKit runtime manages self-registration (background retry),
+readiness probes and bounded application GTS preparation as amended above. There is no central coordinator.
 
 * Good, because fully kubernetes-native — works with any k8s distribution, no special operators or ordering.
-* Good, because no SPOF — Flight Control restart does not block gears; they re-register when it's back.
+* Good, because a running gear survives a directory restart and re-registers when it returns. Application GTS
+  preparation can wait for discovery or the registry and uses the bounded restart policy above.
 * Good, because developer transparency — `deps` in the macro is all the developer writes; runtime does everything else.
 * Good, because works identically in Profile 2 and 3 — same runtime code, different transport.
 * Good, because naturally resilient to rolling updates, node failures, pod evictions.
@@ -157,6 +183,8 @@ readiness probes (dep resolution check). No blocking, no central coordinator.
   behavior.
 * Bad, because eventual consistency means first requests may see 503 if a dep is slow to start — acceptable for
   distributed systems, but different from Profile 1's instant availability.
+* Bad, because the application barrier couples all applications in one process to its slowest publication;
+  independent processes or deployment-time preparation can reduce that coupling.
 
 ## More Information
 
@@ -246,6 +274,8 @@ The `deps` field semantics expand per profile:
 | Profile 1 (Embedded)     | Topo-sort startup order                      | Yes (sequential, in-process)               |
 | Profile 2 (Self-Hosted) | Readiness gating + topo-hint for spawn order | No (eventual, spawn order is best-effort)  |
 | Profile 3 (K8s Native)   | Readiness gating only                        | No (eventual, k8s schedules independently) |
+
+The GTS admission barrier applies in every profile; publication failure exits after cleanup.
 
 ## Traceability
 

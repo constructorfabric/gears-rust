@@ -4,7 +4,10 @@
 //!
 //! What they measure: the canonical payload digest, the in-process replay
 //! cache, pinning a compiled artifact, the engine's selection, and the counter
-//! mutation itself against the in-memory storage double.
+//! and lease mutations against the in-memory storage double, each also under a
+//! subscriber that formats every span close as JSON into a sink. These cover the
+//! evaluation driver and the double only; `span_overhead_over_the_sql_plugin`
+//! times the whole gear.
 //!
 //! What they deliberately exclude: the PDP round trip, catalogue mapping, and
 //! HTTP. Those are network and policy costs that would swamp the arithmetic
@@ -33,7 +36,8 @@ use quota_enforcement_sdk::testing::{
 use quota_enforcement_sdk::{
     ApplicableQuotas, AttributionDigest, Decision, DecisionResult, EvaluatedMutation,
     IdempotencyScope, IdempotencySubjectKey, IdempotencyWrite, MetricId, OperationType,
-    PayloadHash, QuotaEnforcementStoragePluginV1, QuotaId, SubjectRef, TenantId,
+    PartialIdempotencyWrite, PayloadHash, QuotaEnforcementStoragePluginV1, QuotaId, SubjectRef,
+    TenantId,
 };
 use serde_json::json;
 use time::OffsetDateTime;
@@ -72,11 +76,15 @@ fn applicable(subjects: Vec<SubjectRef>) -> ApplicableQuotas {
 }
 
 fn write(key: &str) -> IdempotencyWrite {
+    write_as(key, OperationType::Debit)
+}
+
+fn write_as(key: &str, operation_type: OperationType) -> IdempotencyWrite {
     IdempotencyWrite {
         scope: IdempotencyScope {
             tenant_id: tenant(),
             subject_key: IdempotencySubjectKey::from_bytes([1; 32]),
-            operation_type: OperationType::Debit,
+            operation_type,
             key: key.to_owned(),
         },
         payload_hash: PayloadHash::from_bytes([2; 32]),
@@ -147,9 +155,15 @@ fn debit(c: &mut Criterion) {
     let access = AccessScope::allow_all();
 
     let mut group = c.benchmark_group("debit");
-    for (name, quota_count) in [("single_quota", 1_usize), ("ten_quota_cascade", 10)] {
+    for (name, quota_count, traced) in [
+        ("single_quota", 1_usize, false),
+        ("single_quota_traced", 1, true),
+        ("ten_quota_cascade", 10, false),
+        ("ten_quota_cascade_traced", 10, true),
+    ] {
         let applicable = applicable(subjects(quota_count));
         group.bench_function(name, |b| {
+            let _recording = traced.then(recording);
             // Each iteration debits into a freshly seeded store. The in-memory
             // double stages every mutation by cloning its whole state, so a
             // store that accumulated a record per iteration would make this
@@ -200,6 +214,90 @@ fn debit(c: &mut Criterion) {
     group.finish();
 }
 
+/// One lease acquired and committed through the storage double, with the
+/// same driver and engine as a debit.
+fn lease(c: &mut Criterion) {
+    let runtime = Runtime::new().expect("runtime");
+    let (engines, artifacts) = deployment();
+    let metrics: Arc<dyn quota_enforcement::domain::ports::metrics::QeMetrics> =
+        Arc::new(NoopMetrics);
+    let null = serde_json::Value::Null;
+    let security = ctx();
+    let access = AccessScope::allow_all();
+    let applicable = applicable(subjects(1));
+
+    let mut group = c.benchmark_group("lease");
+    for (name, traced) in [("acquire_commit", false), ("acquire_commit_traced", true)] {
+        group.bench_function(name, |b| {
+            let _recording = traced.then(recording);
+            b.iter_batched(
+                || seeded(&runtime, 1).0,
+                |storage| {
+                    let prepared = PreparedEvaluation::new(
+                        Arc::clone(&engines),
+                        Arc::clone(&artifacts),
+                        Arc::clone(&metrics),
+                        storage.as_ref(),
+                        std::num::NonZeroU32::new(3).expect("attempts"),
+                    );
+                    let idempotency = write_as("acquire", OperationType::Reserve);
+                    let mutation = EvaluatedMutation {
+                        applicable: &applicable,
+                        amount: 1,
+                        request: &null,
+                        resource: &null,
+                        user_projection: None,
+                        limits: limits(),
+                        idempotency: &idempotency,
+                        authorized: AttributionDigest::from_bytes([7; 32]),
+                        evaluate: prepared.evaluator(),
+                    };
+                    let acquired = runtime
+                        .block_on(prepared.run(|| {
+                            storage.acquire_lease(
+                                &security,
+                                &access,
+                                &mutation,
+                                Duration::from_secs(60),
+                            )
+                        }))
+                        .expect("acquire");
+                    let token = acquired.get().token.expect("a lease is held");
+                    let commit = PartialIdempotencyWrite {
+                        tenant_id: tenant(),
+                        key: "commit".to_owned(),
+                        payload_hash: PayloadHash::from_bytes([3; 32]),
+                    };
+                    let committed = runtime
+                        .block_on(storage.commit_lease(
+                            &security,
+                            &access,
+                            token,
+                            None,
+                            &commit,
+                            &[],
+                        ))
+                        .expect("commit");
+                    black_box(committed);
+                },
+                criterion::BatchSize::SmallInput,
+            );
+        });
+    }
+    group.finish();
+}
+
+/// Formats every span close as JSON into a sink: formatting cost, not exporter cost.
+fn recording() -> tracing::subscriber::DefaultGuard {
+    tracing::subscriber::set_default(
+        tracing_subscriber::fmt()
+            .json()
+            .with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE)
+            .with_writer(std::io::sink)
+            .finish(),
+    )
+}
+
 /// The digest a debit computes before it touches storage at all.
 fn payload_digest(c: &mut Criterion) {
     let payload = json!({
@@ -236,5 +334,5 @@ fn replay_cache_hit(c: &mut Criterion) {
     });
 }
 
-criterion_group!(benches, debit, payload_digest, replay_cache_hit);
+criterion_group!(benches, debit, lease, payload_digest, replay_cache_hit);
 criterion_main!(benches);

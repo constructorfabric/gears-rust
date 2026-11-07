@@ -1,16 +1,28 @@
-use crate::api::rest::types::{ConcreteIntake, ConcreteSettings};
+use crate::api::rest::types::{
+    ConcreteIntake, ConcreteProfile, ConcreteReviewQueue, ConcreteSettings, ConcreteSubjectControl,
+};
 use crate::api::rest::{dto, handlers};
 use crate::domain::planner::manage::ManageFacts;
-use axum::http::StatusCode;
+use axum::http::{StatusCode, header};
 use axum::{Extension, Router};
 use std::sync::Arc;
-use toolkit::api::operation_builder::{CORE_GLOBAL_BASE_LICENSE_FEATURE, LicenseFeature};
+use toolkit::api::operation_builder::{
+    CORE_GLOBAL_BASE_LICENSE_FEATURE, LicenseFeature, OperationBuilderODataExt as _,
+};
 use toolkit::api::{OpenApiRegistry, OperationBuilder};
 
 const SUBJECT_SETTINGS_PATH: &str = "/construct/v1/subjects/{subject_id}/settings";
 const SUBJECT_SETTINGS_TAG: &str = "Subject settings";
 const MANAGE_FACTS_PATH: &str = "/construct/v1/subjects/{subject_id}/facts/manage";
 const SUBJECT_FACTS_TAG: &str = "Subject facts";
+const PROFILE_PATH: &str = "/construct/v1/subjects/{subject_id}/profile";
+const SUBJECT_FACTS_PATH: &str = "/construct/v1/subjects/{subject_id}/facts";
+const SUBJECT_FACT_PATH: &str = "/construct/v1/subjects/{subject_id}/facts/{fact_id}";
+const SUBJECT_EXPORT_PATH: &str = "/construct/v1/subjects/{subject_id}/export";
+const SUBJECT_REVIEWS_PATH: &str = "/construct/v1/subjects/{subject_id}/review-requests";
+const OPEN_REVIEWS_PATH: &str = "/construct/v1/admin/review-requests";
+const RESOLUTION_PATH: &str = "/construct/v1/admin/review-requests/{request_id}/resolution";
+const REVIEW_TAG: &str = "Review requests";
 
 struct License;
 
@@ -24,13 +36,14 @@ impl LicenseFeature for License {}
 
 /// @cpt-dod:cpt-cf-construct-dod-record-intake-route:p1
 pub fn register_routes(
-    mut router: Router,
+    router: Router,
     openapi: &dyn OpenApiRegistry,
     intake: Arc<ConcreteIntake>,
     settings: Arc<ConcreteSettings>,
+    profile: Arc<ConcreteProfile>,
 ) -> Router {
     // @cpt-begin:cpt-cf-construct-flow-record-intake-submit:p1:inst-submit-send
-    router = OperationBuilder::post("/construct/v1/records")
+    let records = OperationBuilder::post("/construct/v1/records")
         .operation_id("construct.submit_record")
         .summary("Send one connector record")
         .description(
@@ -58,11 +71,15 @@ pub fn register_routes(
         .standard_errors(openapi)
         .error_422(openapi)
         .error_503(openapi)
-        .register(router, openapi);
+        .register(Router::new(), openapi);
     // @cpt-end:cpt-cf-construct-flow-record-intake-submit:p1:inst-submit-send
 
+    // Every route about one subject answers with `no-store` and the
+    // security headers, as the record route does.
+    let mut subject = Router::new();
+
     // @cpt-begin:cpt-cf-construct-flow-subject-settings-view:p1:inst-view-send
-    router = OperationBuilder::get(SUBJECT_SETTINGS_PATH)
+    subject = OperationBuilder::get(SUBJECT_SETTINGS_PATH)
         .operation_id("construct.get_subject_settings")
         .summary("Read the subject's settings")
         .description(
@@ -81,11 +98,11 @@ pub fn register_routes(
             "The subject's settings",
         )
         .standard_errors(openapi)
-        .register(router, openapi);
+        .register(subject, openapi);
     // @cpt-end:cpt-cf-construct-flow-subject-settings-view:p1:inst-view-send
 
     // @cpt-begin:cpt-cf-construct-flow-subject-settings-change:p1:inst-change-send
-    router = OperationBuilder::put(SUBJECT_SETTINGS_PATH)
+    subject = OperationBuilder::put(SUBJECT_SETTINGS_PATH)
         .operation_id("construct.put_subject_settings")
         .summary("Change the subject's settings")
         .description(
@@ -106,21 +123,332 @@ pub fn register_routes(
         )
         .standard_errors(openapi)
         .error_422(openapi)
-        .register(router, openapi);
+        .register(subject, openapi);
     // @cpt-end:cpt-cf-construct-flow-subject-settings-change:p1:inst-change-send
 
-    router.layer(Extension(intake)).layer(Extension(settings))
+    // @cpt-begin:cpt-cf-construct-flow-profile-reader-read:p1:inst-profile-send
+    subject = OperationBuilder::get(PROFILE_PATH)
+        .operation_id("construct.get_profile")
+        .summary("Read a subject's profile")
+        .description(
+            "Read the facts of a subject by category, for a caller the platform lets act for \
+             the subject: the subject itself, or an application or agent acting for it. The \
+             tenant is the caller's own, or the one named in `tenant`. A category the caller \
+             may not read is not listed, like one without facts; nothing is listed while \
+             personalization is off or an erasure is under way. A subject the caller may not \
+             act for is answered with 404, like one that does not exist.",
+        )
+        .tag("Profiles")
+        .authenticated()
+        .require_license_features::<License>([])
+        .path_param("subject_id", "The subject whose profile is read")
+        .query_param_typed(
+            "tenant",
+            false,
+            "Tenant of the subject, when not the caller's own",
+            "string",
+        )
+        .handler(handlers::get_profile)
+        .json_response_with_schema::<dto::ProfileDto>(
+            openapi,
+            StatusCode::OK,
+            "The subject's profile by category",
+        )
+        .standard_errors(openapi)
+        .error_503(openapi)
+        .problem_response(
+            openapi,
+            StatusCode::NOT_IMPLEMENTED,
+            "The deployment does not provide the profile read",
+        )
+        .register(subject, openapi);
+    // @cpt-end:cpt-cf-construct-flow-profile-reader-read:p1:inst-profile-send
+
+    router
+        .merge(not_stored(records))
+        .merge(not_stored(subject))
+        .layer(Extension(intake))
+        .layer(Extension(settings))
+        .layer(Extension(profile))
+}
+
+/// Subject Control's routes: the subject's own facts, one fact, its delete,
+/// and the export. Every answer is marked `no-store`.
+///
+/// @cpt-dod:cpt-cf-construct-dod-subject-control-view:p1
+pub fn register_subject_control_routes(
+    router: Router,
+    openapi: &dyn OpenApiRegistry,
+    svc: Arc<ConcreteSubjectControl>,
+) -> Router {
+    // @cpt-begin:cpt-cf-construct-flow-subject-control-view:p1:inst-view-send
+    let mut subject = OperationBuilder::get(SUBJECT_FACTS_PATH)
+        .operation_id("construct.list_subject_facts")
+        .summary("The subject's own facts")
+        .description(
+            "Every live fact of the caller, in every category, with who it came from. \
+             Owner only: another subject answers 404. Personalization off and an erasure \
+             under way do not hide anything here. Paged: `limit` (default 50, at most 200; \
+             a larger value is cut to 200) and an opaque `cursor`. `$filter` and \
+             `$orderby` over `fact_id`, `entity_kind`, `origin` and `stored_at`; the \
+             default order is `stored_at desc`, and `fact_id` breaks ties. `version` is \
+             the profile's version, to poll for changes.",
+        )
+        .tag(SUBJECT_FACTS_TAG)
+        .authenticated()
+        .require_license_features::<License>([])
+        .path_param("subject_id", "The caller's own subject id")
+        .query_param_typed("limit", false, "Page size, at most 200", "integer")
+        .query_param("cursor", false, "Cursor of the next page")
+        .with_odata_filter::<crate::domain::subject_control::SubjectFactField>()
+        .with_odata_orderby::<crate::domain::subject_control::SubjectFactField>()
+        .handler(handlers::list_subject_facts)
+        .json_response_with_schema::<dto::SubjectFactsPageDto>(
+            openapi,
+            StatusCode::OK,
+            "A page of the subject's facts",
+        )
+        .standard_errors(openapi)
+        .error_503(openapi)
+        .problem_response(
+            openapi,
+            StatusCode::NOT_IMPLEMENTED,
+            "The deployment does not provide subject control",
+        )
+        .register(Router::new(), openapi);
+    // @cpt-end:cpt-cf-construct-flow-subject-control-view:p1:inst-view-send
+
+    // @cpt-begin:cpt-cf-construct-flow-subject-control-fact:p1:inst-fact-send
+    subject = OperationBuilder::get(SUBJECT_FACT_PATH)
+        .operation_id("construct.get_subject_fact")
+        .summary("One of the subject's own facts")
+        .description(
+            "One live fact of the caller, by its id. Owner only. Another subject, or a \
+             fact the subject does not have, answers 404.",
+        )
+        .tag(SUBJECT_FACTS_TAG)
+        .authenticated()
+        .require_license_features::<License>([])
+        .path_param("subject_id", "The caller's own subject id")
+        .path_param("fact_id", "The fact's id, as the facts list gives it")
+        .handler(handlers::get_subject_fact)
+        .json_response_with_schema::<dto::SubjectFactDto>(openapi, StatusCode::OK, "The fact")
+        .standard_errors(openapi)
+        .error_503(openapi)
+        .problem_response(
+            openapi,
+            StatusCode::NOT_IMPLEMENTED,
+            "The deployment does not provide subject control",
+        )
+        .register(subject, openapi);
+    // @cpt-end:cpt-cf-construct-flow-subject-control-fact:p1:inst-fact-send
+
+    // @cpt-begin:cpt-cf-construct-flow-subject-control-delete:p1:inst-delete-send
+    subject = OperationBuilder::delete(SUBJECT_FACT_PATH)
+        .operation_id("construct.delete_subject_fact")
+        .summary("Delete one of the subject's own facts")
+        .description(
+            "Soft-deletes one live fact of the caller; it is not served from the next read, \
+             and an open review request on it closes as deleted. Owner only. Another subject, \
+             or a fact the subject does not have, answers 404. 503 when the profile kept \
+             changing while the delete was written, or when the fact was deleted but its \
+             review request could not be closed; sending the delete again then closes the \
+             request and answers 204.",
+        )
+        .tag(SUBJECT_FACTS_TAG)
+        .authenticated()
+        .require_license_features::<License>([])
+        .path_param("subject_id", "The caller's own subject id")
+        .path_param("fact_id", "The fact's id, as the facts list gives it")
+        .handler(handlers::delete_subject_fact)
+        .no_content_response(StatusCode::NO_CONTENT, "The fact is deleted")
+        .standard_errors(openapi)
+        .error_503(openapi)
+        .problem_response(
+            openapi,
+            StatusCode::NOT_IMPLEMENTED,
+            "The deployment does not provide subject control",
+        )
+        .register(subject, openapi);
+    // @cpt-end:cpt-cf-construct-flow-subject-control-delete:p1:inst-delete-send
+
+    // @cpt-begin:cpt-cf-construct-flow-subject-control-export:p1:inst-export-send
+    subject = OperationBuilder::get(SUBJECT_EXPORT_PATH)
+        .operation_id("construct.export_subject")
+        .summary("Export a subject's data")
+        .description(
+            "All of a subject's data in the caller's tenant, as a JSON file: the settings, \
+             every live fact with its origin, and every review request, open and closed. For the data protection officer, under \
+             the permission to export a subject's data; without it, 403. A subject \
+             without data in the tenant exports empty, like one with no profile.",
+        )
+        .tag(SUBJECT_FACTS_TAG)
+        .authenticated()
+        .require_license_features::<License>([])
+        .path_param("subject_id", "The subject whose data is exported")
+        .handler(handlers::export_subject)
+        .json_response_with_schema::<dto::SubjectExportDto>(
+            openapi,
+            StatusCode::OK,
+            "The subject's data, as an attachment",
+        )
+        .standard_errors(openapi)
+        .error_503(openapi)
+        .problem_response(
+            openapi,
+            StatusCode::NOT_IMPLEMENTED,
+            "The deployment does not provide subject control",
+        )
+        .register(subject, openapi);
+    // @cpt-end:cpt-cf-construct-flow-subject-control-export:p1:inst-export-send
+
+    router.merge(not_stored(subject)).layer(Extension(svc))
+}
+
+/// The Review Queue's routes: the subject's flag and list, and the
+/// reviewers' list and resolution.
+///
+/// @cpt-dod:cpt-cf-construct-dod-review-queue-subject:p1
+/// @cpt-dod:cpt-cf-construct-dod-review-queue-reviewer:p1
+pub fn register_review_queue_routes(
+    router: Router,
+    openapi: &dyn OpenApiRegistry,
+    svc: Arc<ConcreteReviewQueue>,
+) -> Router {
+    // @cpt-begin:cpt-cf-construct-flow-review-queue-flag:p1:inst-flag-send
+    let mut ops = OperationBuilder::post(SUBJECT_REVIEWS_PATH)
+        .operation_id("construct.flag_subject_fact")
+        .summary("Flag one of the subject's own facts as incorrect")
+        .description(
+            "Opens a review request on one live fact of the caller, with an optional comment \
+             of at most 1000 characters. While it is open the fact is not served to \
+             applications and agents, and no record or agent changes it; the subject still \
+             sees it. Owner only: another subject, or a fact the subject does not have, \
+             answers 404. A fact with an open request answers 409.",
+        )
+        .tag(REVIEW_TAG)
+        .authenticated()
+        .require_license_features::<License>([])
+        .path_param("subject_id", "The caller's own subject id")
+        .json_request::<dto::FlagFactRequest>(openapi, "The fact and the comment")
+        .handler(handlers::flag_fact)
+        .json_response_with_schema::<dto::ReviewRequestDto>(
+            openapi,
+            StatusCode::CREATED,
+            "The open review request",
+        )
+        .standard_errors(openapi)
+        .error_503(openapi)
+        .problem_response(
+            openapi,
+            StatusCode::NOT_IMPLEMENTED,
+            "The deployment does not provide subject control",
+        )
+        .register(Router::new(), openapi);
+    // @cpt-end:cpt-cf-construct-flow-review-queue-flag:p1:inst-flag-send
+
+    ops = OperationBuilder::get(SUBJECT_REVIEWS_PATH)
+        .operation_id("construct.list_subject_review_requests")
+        .summary("The subject's own review requests")
+        .description(
+            "Every review request of the caller, open and closed, with its state and \
+             outcome. Owner only: another subject answers 404. Paged: `limit` (default 50, \
+             at most 200) and an opaque `cursor`. `$filter` and `$orderby` over `id`, \
+             `fact_id`, `state`, `outcome` and `created_at`; the default order is \
+             `created_at desc`, and `id` breaks ties.",
+        )
+        .tag(REVIEW_TAG)
+        .authenticated()
+        .require_license_features::<License>([])
+        .path_param("subject_id", "The caller's own subject id")
+        .query_param_typed("limit", false, "Page size, at most 200", "integer")
+        .query_param("cursor", false, "Cursor of the next page")
+        .with_odata_filter::<crate::domain::review_queue::SubjectReviewField>()
+        .with_odata_orderby::<crate::domain::review_queue::SubjectReviewField>()
+        .handler(handlers::list_own_review_requests)
+        .json_response_with_schema::<dto::ReviewRequestsPageDto>(
+            openapi,
+            StatusCode::OK,
+            "A page of the subject's review requests",
+        )
+        .standard_errors(openapi)
+        .error_503(openapi)
+        .register(ops, openapi);
+
+    ops = OperationBuilder::get(OPEN_REVIEWS_PATH)
+        .operation_id("construct.list_open_review_requests")
+        .summary("The tenant's open review requests")
+        .description(
+            "The open review requests of the caller's tenant, each with the flagged value, \
+             for a caller with the permission to resolve review requests; without it, 403. \
+             Paged: `limit` (default 50, at most 200) and an opaque `cursor`. `$filter` and \
+             `$orderby` over `id`, `subject_id`, `fact_id`, `entity_kind` and `created_at`; \
+             the default order is `created_at asc`, oldest first, and `id` breaks ties.",
+        )
+        .tag(REVIEW_TAG)
+        .authenticated()
+        .require_license_features::<License>([])
+        .query_param_typed("limit", false, "Page size, at most 200", "integer")
+        .query_param("cursor", false, "Cursor of the next page")
+        .with_odata_filter::<crate::domain::review_queue::OpenReviewField>()
+        .with_odata_orderby::<crate::domain::review_queue::OpenReviewField>()
+        .handler(handlers::list_open_review_requests)
+        .json_response_with_schema::<dto::ReviewRequestsPageDto>(
+            openapi,
+            StatusCode::OK,
+            "A page of the tenant's open review requests",
+        )
+        .standard_errors(openapi)
+        .error_503(openapi)
+        .register(ops, openapi);
+
+    // @cpt-begin:cpt-cf-construct-flow-review-queue-resolve:p1:inst-resolve-send
+    ops = OperationBuilder::post(RESOLUTION_PATH)
+        .operation_id("construct.resolve_review_request")
+        .summary("Resolve an open review request")
+        .description(
+            "Close an open review request of the caller's tenant as `rejected` (with a \
+             `reason`), `deleted`, or `corrected` (with `property`, the fact's own property, \
+             and its new `value`). A correction passes the sensitive-data checks and Admission \
+             and gives the fact a new id; when they refuse it, 422 and the request stays \
+             open. A correction of a fact that is gone closes the request as deleted. Needs \
+             the permission to resolve review requests; without it, 403. An unknown \
+             request answers 404, a closed one 409.",
+        )
+        .tag(REVIEW_TAG)
+        .authenticated()
+        .require_license_features::<License>([])
+        .path_param("request_id", "The review request")
+        .json_request::<dto::ResolutionRequest>(openapi, "The outcome")
+        .handler(handlers::resolve_review_request)
+        .json_response_with_schema::<dto::ReviewRequestDto>(
+            openapi,
+            StatusCode::OK,
+            "The closed review request",
+        )
+        .standard_errors(openapi)
+        .error_422(openapi)
+        .error_503(openapi)
+        .problem_response(
+            openapi,
+            StatusCode::NOT_IMPLEMENTED,
+            "The deployment does not provide corrections",
+        )
+        .register(ops, openapi);
+    // @cpt-end:cpt-cf-construct-flow-review-queue-resolve:p1:inst-resolve-send
+
+    router.merge(not_stored(ops)).layer(Extension(svc))
 }
 
 /// The synchronous manage-facts route. The gear registers it together with the planner chain it runs on.
 ///
 /// @cpt-dod:cpt-cf-construct-dod-planner-manage-route:p1
 pub fn register_manage_route(
-    mut router: Router,
+    router: Router,
     openapi: &dyn OpenApiRegistry,
     manage: Arc<ManageFacts>,
 ) -> Router {
-    router = OperationBuilder::post(MANAGE_FACTS_PATH)
+    let facts = OperationBuilder::post(MANAGE_FACTS_PATH)
         .operation_id("construct.manage_facts")
         .summary("Store what the subject told an agent")
         .description(
@@ -141,6 +469,48 @@ pub fn register_manage_route(
         )
         .standard_errors(openapi)
         .error_503(openapi)
-        .register(router, openapi);
-    router.layer(Extension(manage))
+        .register(Router::new(), openapi);
+    router.merge(not_stored(facts)).layer(Extension(manage))
+}
+
+/// `routes` with every answer, errors included, marked
+/// `Cache-Control: no-store`, so no proxy or browser cache keeps one
+/// subject's data, and with the response headers OWASP names for a JSON API:
+/// no content sniffing, no framing, no content to run, no referrer, no
+/// browser features, no cross-origin embedding, no cross-domain policy files
+/// and no DNS prefetch. HSTS belongs to the TLS ingress. Every route
+/// Construct registers gets the layer, and only they do: the router they are
+/// merged into holds other gears' routes too.
+fn not_stored(routes: Router) -> Router {
+    routes.layer(axum::middleware::map_response(
+        |mut response: axum::response::Response| async move {
+            let headers = response.headers_mut();
+            for (name, value) in [
+                (header::CACHE_CONTROL, "no-store"),
+                (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+                (header::X_FRAME_OPTIONS, "DENY"),
+                (
+                    header::CONTENT_SECURITY_POLICY,
+                    "default-src 'none'; frame-ancestors 'none'",
+                ),
+                (header::REFERRER_POLICY, "no-referrer"),
+                (
+                    header::HeaderName::from_static("permissions-policy"),
+                    "camera=(), microphone=(), geolocation=(), interest-cohort=()",
+                ),
+                (
+                    header::HeaderName::from_static("cross-origin-resource-policy"),
+                    "same-origin",
+                ),
+                (
+                    header::HeaderName::from_static("x-permitted-cross-domain-policies"),
+                    "none",
+                ),
+                (header::X_DNS_PREFETCH_CONTROL, "off"),
+            ] {
+                headers.insert(name, header::HeaderValue::from_static(value));
+            }
+            response
+        },
+    ))
 }

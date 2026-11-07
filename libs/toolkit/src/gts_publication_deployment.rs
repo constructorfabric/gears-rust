@@ -8,12 +8,13 @@
 //! publications run concurrently under one deadline: a waiting derived-type
 //! publisher never delays a base-type one in the same job.
 
+use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
-use toolkit_contract::wiring::ClientTuning;
+use toolkit_contract::wiring::{ClientTuning, ConsumerWiring};
 
 use super::{
     GtsPublicationDescriptor, GtsPublicationError, PreparedGtsPublication, check_ownership,
@@ -34,8 +35,12 @@ pub enum GtsDeploymentOutcome {
     /// budget. `unconfirmed` lists the manifest's GTS ids: some of them may
     /// already be admitted.
     DeadlineExceeded { unconfirmed: Vec<String> },
+    /// Deadline expiry with the final error or last known pending details.
+    DeadlineExceededWithDetails(String),
     /// The caller cancelled the job first; `unconfirmed` as above.
     Cancelled { unconfirmed: Vec<String> },
+    /// Cancellation with the last known pending details.
+    CancelledWithDetails(String),
 }
 
 /// The result of a deployment publication, one entry per publisher.
@@ -69,15 +74,65 @@ impl fmt::Display for GtsDeploymentReport {
                     "{gear}: deadline exceeded; not confirmed (some may be admitted): {}",
                     unconfirmed.join(", ")
                 )?,
+                GtsDeploymentOutcome::DeadlineExceededWithDetails(detail) => {
+                    writeln!(
+                        f,
+                        "{gear}: deadline exceeded; last publication detail: {detail}"
+                    )?;
+                }
                 GtsDeploymentOutcome::Cancelled { unconfirmed } => writeln!(
                     f,
                     "{gear}: cancelled; not confirmed (some may be admitted): {}",
                     unconfirmed.join(", ")
                 )?,
+                GtsDeploymentOutcome::CancelledWithDetails(detail) => {
+                    writeln!(f, "{gear}: cancelled; last publication detail: {detail}")?;
+                }
             }
         }
         Ok(())
     }
+}
+
+/// Override the endpoint; retain each publisher's configured transport settings.
+fn publisher_tunings(
+    descriptors: &[&GtsPublicationDescriptor],
+    config: &dyn ConfigProvider,
+    defaults: &ClientTuning,
+    endpoint: &http::Uri,
+) -> anyhow::Result<Vec<ClientTuning>> {
+    descriptors
+        .iter()
+        .map(|descriptor| {
+            let value = config
+                .get_gear_config(descriptor.gear)
+                .and_then(|gear| gear.get("config"))
+                .and_then(|config| config.get("consumer_wiring"))
+                .and_then(|wiring| wiring.get(descriptor.provider));
+            let tuning = if let Some(value) = value {
+                let wiring: ConsumerWiring =
+                    serde_json::from_value(value.clone()).map_err(|error| {
+                        anyhow::anyhow!(
+                            "gear `{}`: invalid consumer_wiring.{}: {error}",
+                            descriptor.gear,
+                            descriptor.provider
+                        )
+                    })?;
+                wiring
+                    .tuning
+                    .with_internal_token_provider(defaults.internal_token_provider.clone())
+            } else {
+                defaults.clone()
+            };
+            anyhow::ensure!(
+                tuning.require_tls != Some(true) || endpoint.scheme_str() == Some("https"),
+                "gear `{}`: consumer_wiring.{} requires TLS, but registry endpoint is not https",
+                descriptor.gear,
+                descriptor.provider
+            );
+            Ok(tuning)
+        })
+        .collect()
 }
 
 /// Publish the manifests of `descriptors` for `config` to `registry_endpoint`,
@@ -110,25 +165,35 @@ pub async fn publish(
     let deadline_at = tokio::time::Instant::now()
         .checked_add(deadline)
         .ok_or_else(|| anyhow::anyhow!("the publication deadline cannot be represented"))?;
+    // Check all TLS policies before passing credentials to any adapter.
+    let tunings = publisher_tunings(descriptors, config, tuning, &endpoint)?;
     let hub = ClientHub::new();
     let resolver: Arc<dyn crate::discovery::EndpointResolver> =
         Arc::new(StaticEndpointResolver::new(registry_endpoint));
     let mut prepared = Vec::with_capacity(descriptors.len());
-    for descriptor in descriptors {
-        (descriptor.wire)(&hub, Arc::clone(&resolver), tuning.clone())
+    for (descriptor, tuning) in descriptors.iter().zip(tunings) {
+        let owner_hub = hub.for_gear(descriptor.gear);
+        (descriptor.wire)(&owner_hub, Arc::clone(&resolver), tuning)
             .map_err(|e| e.context(format!("{}: registry wiring", descriptor.gear)))?;
         prepared.push(
-            PreparedGtsPublication::prepare(descriptor, config, &hub)?.with_deadline(deadline_at),
+            PreparedGtsPublication::prepare(descriptor, config, &owner_hub)?
+                .with_deadline(deadline_at),
         );
     }
     check_ownership(prepared.iter().map(PreparedGtsPublication::gts_manifest))?;
 
     // Cancelled at the deadline or with the caller's token.
     let stop = cancel.child_token();
+    let progress = Arc::new(parking_lot::Mutex::new(
+        HashMap::<&'static str, String>::new(),
+    ));
+    let captured = Arc::clone(&progress);
     let all = super::publish_all(
         &prepared,
         &stop,
-        Arc::new(|_: &'static str, _: &str| {}),
+        Arc::new(move |gear: &'static str, detail: &str| {
+            captured.lock().insert(gear, detail.to_owned());
+        }),
         false,
     );
     tokio::pin!(all);
@@ -156,19 +221,37 @@ pub async fn publish(
                 Ok(()) => GtsDeploymentOutcome::Published {
                     documents: plan.gts_manifest().documents().len(),
                 },
-                Err(GtsPublicationError::Expired { .. }) => {
-                    GtsDeploymentOutcome::DeadlineExceeded {
-                        unconfirmed: unconfirmed(),
+                // An opaque error needs the manifest IDs as unconfirmed context.
+                Err(GtsPublicationError::Expired { source, .. }) => {
+                    let detail = format!("{source:#}");
+                    let unconfirmed: Vec<String> = unconfirmed();
+                    if unconfirmed.is_empty()
+                        || unconfirmed.iter().any(|id| detail.contains(id.as_str()))
+                    {
+                        GtsDeploymentOutcome::DeadlineExceededWithDetails(detail)
+                    } else {
+                        GtsDeploymentOutcome::DeadlineExceededWithDetails(format!(
+                            "{detail}; not confirmed (some may be admitted): {}",
+                            unconfirmed.join(", ")
+                        ))
                     }
                 }
                 Err(GtsPublicationError::Cancelled { .. }) if deadline_passed => {
-                    GtsDeploymentOutcome::DeadlineExceeded {
-                        unconfirmed: unconfirmed(),
-                    }
+                    progress.lock().remove(gear).map_or_else(
+                        || GtsDeploymentOutcome::DeadlineExceeded {
+                            unconfirmed: unconfirmed(),
+                        },
+                        GtsDeploymentOutcome::DeadlineExceededWithDetails,
+                    )
                 }
-                Err(GtsPublicationError::Cancelled { .. }) => GtsDeploymentOutcome::Cancelled {
-                    unconfirmed: unconfirmed(),
-                },
+                Err(GtsPublicationError::Cancelled { .. }) => {
+                    progress.lock().remove(gear).map_or_else(
+                        || GtsDeploymentOutcome::Cancelled {
+                            unconfirmed: unconfirmed(),
+                        },
+                        GtsDeploymentOutcome::CancelledWithDetails,
+                    )
+                }
                 Err(e) => GtsDeploymentOutcome::Refused(format!("{e:#}")),
             };
             (gear, outcome)

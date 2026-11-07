@@ -2039,8 +2039,8 @@ async fn a_bearer_on_an_anonymous_route_is_ignored_at_the_gateway() {
     }
 }
 
-/// A raw HTTP/1.1 GET with `headers`, returning the status code.
-async fn listener_status(endpoint: &str, path: &str, headers: &[(&str, &str)]) -> u16 {
+/// A raw HTTP/1.1 GET with `headers`, returning the complete response.
+async fn listener_response(endpoint: &str, path: &str, headers: &[(&str, &str)]) -> String {
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
     let uri: http::Uri = endpoint.parse().expect("advertised endpoint URI");
     let addr = uri.authority().expect("endpoint authority").as_str();
@@ -2058,8 +2058,13 @@ async fn listener_status(endpoint: &str, path: &str, headers: &[(&str, &str)]) -
     stream.write_all(request.as_bytes()).await.unwrap();
     let mut response = Vec::new();
     stream.read_to_end(&mut response).await.unwrap();
-    let response = String::from_utf8_lossy(&response);
-    response
+    String::from_utf8(response).expect("an HTTP response")
+}
+
+/// A raw HTTP/1.1 GET with `headers`, returning the status code.
+async fn listener_status(endpoint: &str, path: &str, headers: &[(&str, &str)]) -> u16 {
+    listener_response(endpoint, path, headers)
+        .await
         .lines()
         .next()
         .and_then(|line| line.split_whitespace().nth(1))
@@ -2152,6 +2157,267 @@ async fn the_gateway_starts_with_the_complete_prefixed_surface() {
     );
     assert_eq!(listener_status(&endpoint, "/readyz", &[]).await, 404);
 
+    gear.stop(tokio_util::sync::CancellationToken::new())
+        .await
+        .unwrap();
+}
+
+/// Platform calls work before `AuthN` init; tenant calls wait for the final router.
+#[tokio::test]
+async fn bootstrap_listener_serves_probes_and_platform_then_switches_to_tenant_routes() {
+    use toolkit::contracts::RunnableCapability as _;
+    let mut config = axis_config(true);
+    config["bind_addr"] = json!("127.0.0.1:0");
+    config["prefix_path"] = json!("/cf");
+    let hub = Arc::new(ClientHub::new());
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let ctx = GearCtx::new(
+        "api-gateway",
+        Uuid::new_v4(),
+        Arc::new(TestConfigProvider {
+            config: json!({"api-gateway": {"config": config}}),
+        }),
+        Arc::clone(&hub),
+        cancel.clone(),
+    );
+    let checker = Arc::new(toolkit::DependencyChecker::new());
+    checker.register_dep(toolkit::runtime::PREPARATION_GATE);
+    let health = Arc::new(toolkit::RestHealthcheckRegistry::new());
+    health.register(
+        "readiness",
+        Arc::new(toolkit::runtime::ReadinessHealthcheck::new(Arc::clone(
+            &checker,
+        ))),
+    );
+    let gateway = api_gateway::ApiGateway::default();
+    let base = gateway
+        .rest_bootstrap(&ctx, Arc::clone(&health), cancel.clone())
+        .await
+        .unwrap()
+        .expect("the gateway binds before application init");
+    let endpoint = gateway.bound_endpoint().expect("listener already bound");
+    assert_eq!(listener_status(&endpoint, "/cf/healthz", &[]).await, 200);
+    assert_eq!(listener_status(&endpoint, "/cf/readyz", &[]).await, 503);
+    let routes = TestAxisGear
+        .register_rest(&create_test_gear_ctx(), base, &gateway)
+        .unwrap();
+    let routes = OperationBuilder::get("/missing-system-object")
+        .anonymous()
+        .summary("A system handler returning not found")
+        .handler(|| async { StatusCode::NOT_FOUND })
+        .no_content_response(StatusCode::NOT_FOUND, "System object not found")
+        .register(routes, &gateway);
+    gateway
+        .rest_finalize_bootstrap(&ctx, routes.clone(), Arc::clone(&health))
+        .unwrap();
+    let platform = [(AXIS_INTERNAL_HEADER, AXIS_INTERNAL_SECRET)];
+    let pending = listener_response(&endpoint, "/cf/pending-application", &[]).await;
+    assert!(pending.starts_with("HTTP/1.1 503"), "{pending}");
+    assert!(
+        pending
+            .to_ascii_lowercase()
+            .contains("\r\nretry-after: 1\r\n"),
+        "{pending}"
+    );
+    assert!(pending.contains("application preparation has not completed"));
+    assert_eq!(
+        listener_status(&endpoint, "/cf/missing-system-object", &[]).await,
+        404
+    );
+    assert_eq!(
+        listener_status(&endpoint, &format!("/cf{AXIS_PLATFORM_PATH}"), &platform).await,
+        200
+    );
+    assert_eq!(
+        listener_status(&endpoint, &format!("/cf{AXIS_PLATFORM_PATH}"), &[]).await,
+        401
+    );
+    assert_eq!(
+        listener_status(&endpoint, &format!("/cf{AXIS_PATH}"), &[]).await,
+        503
+    );
+
+    hub.register::<dyn AuthNResolverClient>(Arc::new(mock_accepting_token(
+        AXIS_BEARER,
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+    )));
+    gateway.init(&ctx).await.unwrap();
+    let routes = OperationBuilder::get("/pending-application")
+        .anonymous()
+        .summary("An application route attached after preparation")
+        .handler(public_handler)
+        .json_response_with_schema::<TestResponse>(&gateway, StatusCode::OK, "Application ready")
+        .register(routes, &gateway);
+    drop(gateway.rest_finalize(&ctx, routes, health).unwrap());
+    let gear = gateway.into_gear();
+    gear.start(cancel.clone()).await.unwrap();
+    checker.mark_resolved(toolkit::runtime::PREPARATION_GATE);
+    let bearer = format!("Bearer {AXIS_BEARER}");
+    assert_eq!(
+        listener_status(&endpoint, "/cf/pending-application", &[]).await,
+        200
+    );
+    assert_eq!(
+        listener_status(&endpoint, "/cf/not-a-route", &[("authorization", &bearer)]).await,
+        404
+    );
+    assert_eq!(
+        listener_status(
+            &endpoint,
+            &format!("/cf{AXIS_PATH}"),
+            &[("authorization", &bearer)]
+        )
+        .await,
+        200
+    );
+    assert_eq!(
+        listener_status(&endpoint, &format!("/cf{AXIS_PATH}"), &[]).await,
+        401
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while listener_status(&endpoint, "/cf/readyz", &[]).await != 200 {
+            // The framework caches health reports for two seconds.
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("readiness converges after the cached report expires");
+    assert_eq!(gear.inner().bound_endpoint().as_ref(), Some(&endpoint));
+    cancel.cancel();
+    gear.stop(tokio_util::sync::CancellationToken::new())
+        .await
+        .unwrap();
+}
+
+/// A system-provided fallback takes precedence over the bootstrap starting response.
+#[tokio::test]
+async fn bootstrap_listener_preserves_a_custom_system_fallback() {
+    let mut config = axis_config(true);
+    config["bind_addr"] = json!("127.0.0.1:0");
+    config["prefix_path"] = json!("/cf");
+    config["require_auth_by_default"] = json!(false);
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let ctx = GearCtx::new(
+        "api-gateway",
+        Uuid::new_v4(),
+        Arc::new(TestConfigProvider {
+            config: json!({"api-gateway": {"config": config}}),
+        }),
+        Arc::new(ClientHub::new()),
+        cancel.clone(),
+    );
+    let health = Arc::new(toolkit::RestHealthcheckRegistry::new());
+    let gateway = api_gateway::ApiGateway::default();
+    let base = gateway
+        .rest_bootstrap(&ctx, Arc::clone(&health), cancel)
+        .await
+        .unwrap()
+        .unwrap();
+    let routes = base.fallback(|| async { StatusCode::IM_A_TEAPOT });
+    gateway
+        .rest_finalize_bootstrap(&ctx, routes, health)
+        .unwrap();
+    let endpoint = gateway.bound_endpoint().unwrap();
+    assert_eq!(
+        listener_status(&endpoint, "/cf/system-fallback", &[]).await,
+        418
+    );
+    gateway.rest_shutdown_bootstrap().await.unwrap();
+}
+
+/// Counts how often its layer is applied to a route.
+#[derive(Clone)]
+struct CountingLayer(Arc<std::sync::atomic::AtomicUsize>);
+
+impl CountingLayer {
+    fn applied(&self) -> usize {
+        self.0.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl<S> tower::Layer<S> for CountingLayer {
+    type Service = S;
+
+    fn layer(&self, inner: S) -> S {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        inner
+    }
+}
+
+/// Publishing builds route layers once, rather than on every request.
+#[tokio::test]
+async fn bootstrap_listener_builds_each_published_router_once() {
+    use toolkit::contracts::RunnableCapability as _;
+    let mut config = axis_config(true);
+    config["bind_addr"] = json!("127.0.0.1:0");
+    config["prefix_path"] = json!("/cf");
+    let hub = Arc::new(ClientHub::new());
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let ctx = GearCtx::new(
+        "api-gateway",
+        Uuid::new_v4(),
+        Arc::new(TestConfigProvider {
+            config: json!({"api-gateway": {"config": config}}),
+        }),
+        Arc::clone(&hub),
+        cancel.clone(),
+    );
+    let health = Arc::new(toolkit::RestHealthcheckRegistry::new());
+    let gateway = api_gateway::ApiGateway::default();
+    let base = gateway
+        .rest_bootstrap(&ctx, Arc::clone(&health), cancel.clone())
+        .await
+        .unwrap()
+        .expect("the gateway binds before application init");
+    let endpoint = gateway.bound_endpoint().expect("listener already bound");
+    let counter = CountingLayer(Arc::default());
+    let routes = TestAxisGear
+        .register_rest(&create_test_gear_ctx(), base, &gateway)
+        .unwrap()
+        .layer(counter.clone());
+
+    // System stage.
+    gateway
+        .rest_finalize_bootstrap(&ctx, routes.clone(), Arc::clone(&health))
+        .unwrap();
+    let platform = [(AXIS_INTERNAL_HEADER, AXIS_INTERNAL_SECRET)];
+    let platform_path = format!("/cf{AXIS_PLATFORM_PATH}");
+    assert_eq!(
+        listener_status(&endpoint, &platform_path, &platform).await,
+        200
+    );
+    let built = counter.applied();
+    assert!(built > 0, "the counting layer wraps the platform route");
+    for _ in 0..3 {
+        assert_eq!(
+            listener_status(&endpoint, &platform_path, &platform).await,
+            200
+        );
+    }
+    assert_eq!(counter.applied(), built, "system stage: built per request");
+
+    // Final stage.
+    hub.register::<dyn AuthNResolverClient>(Arc::new(mock_accepting_token(
+        AXIS_BEARER,
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+    )));
+    gateway.init(&ctx).await.unwrap();
+    drop(gateway.rest_finalize(&ctx, routes, health).unwrap());
+    let gear = gateway.into_gear();
+    gear.start(cancel.clone()).await.unwrap();
+    let bearer = format!("Bearer {AXIS_BEARER}");
+    let tenant = [("authorization", bearer.as_str())];
+    let tenant_path = format!("/cf{AXIS_PATH}");
+    assert_eq!(listener_status(&endpoint, &tenant_path, &tenant).await, 200);
+    let built = counter.applied();
+    for _ in 0..3 {
+        assert_eq!(listener_status(&endpoint, &tenant_path, &tenant).await, 200);
+    }
+    assert_eq!(counter.applied(), built, "final stage: built per request");
+
+    cancel.cancel();
     gear.stop(tokio_util::sync::CancellationToken::new())
         .await
         .unwrap();

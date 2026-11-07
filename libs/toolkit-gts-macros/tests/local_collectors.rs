@@ -12,11 +12,6 @@ gts_kit::local::gts_instance_raw!({
     "name": "test-crate",
 });
 
-gts_kit::gts_instance_raw!({
-    "id": gts_id!("test.cf.local_fixture.widget.v1~test.cf.local_fixture.test_global.v1"),
-    "name": "test-global",
-});
-
 fn ids(declarations: &[(String, String)]) -> Vec<&str> {
     declarations.iter().map(|(id, _)| id.as_str()).collect()
 }
@@ -29,7 +24,7 @@ fn a_crate_collects_only_its_own_local_declarations() {
     assert_eq!(
         ids(&fixture),
         FIXTURE_IDS,
-        "sorted; no cfg-off, global-only or foreign entry"
+        "sorted; no cfg-off or foreign entry"
     );
 
     let own = gts_declarations();
@@ -75,11 +70,9 @@ fn local_declarations_stay_in_the_process_wide_inventory() {
         )
         .collect();
 
-    for id in FIXTURE_IDS.iter().chain(&[
-        gts_id!("test.cf.local_fixture.widget.v1~test.cf.local_fixture.global_only.v1"),
-        gts_id!("test.cf.local_fixture.widget.v1~test.cf.local_fixture.test_crate.v1"),
-        gts_id!("test.cf.local_fixture.widget.v1~test.cf.local_fixture.test_global.v1"),
-    ]) {
+    for id in FIXTURE_IDS.iter().chain(&[gts_id!(
+        "test.cf.local_fixture.widget.v1~test.cf.local_fixture.test_crate.v1"
+    )]) {
         assert_eq!(
             global.iter().filter(|g| *g == id).count(),
             1,

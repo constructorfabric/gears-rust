@@ -263,6 +263,33 @@ impl GearEntry {
     pub fn is_system(&self) -> bool {
         self.caps.has::<SystemCap>()
     }
+
+    /// Validate publication capabilities/configuration for startup and deployment jobs.
+    pub(crate) fn validate_gts_publication_config(
+        &self,
+        config: &dyn crate::config::ConfigProvider,
+    ) -> anyhow::Result<()> {
+        if self.caps.has::<GtsPublicationCap>() {
+            anyhow::ensure!(
+                !self.is_system(),
+                "a system gear initializes before the GTS barrier, so it cannot \
+                 publish GTS documents with `gts_publication(...)`"
+            );
+        } else {
+            anyhow::ensure!(
+                config
+                    .get_gear_config(self.name)
+                    .and_then(|gear| gear.get("config"))
+                    .and_then(|config| config.get(crate::config::GTS_PUBLICATION_CONFIG_KEY))
+                    .is_none(),
+                "gears.{}.config.{} is set, but this gear publishes no GTS \
+                 documents: it declares no `gts_publication(...)`",
+                self.name,
+                crate::config::GTS_PUBLICATION_CONFIG_KEY
+            );
+        }
+        Ok(())
+    }
 }
 
 impl std::fmt::Debug for GearEntry {
@@ -864,6 +891,15 @@ pub enum RegistryError {
     // Cancellation error
     #[error("operation cancelled by termination signal")]
     Cancelled,
+
+    /// A gear's context construction + `init()` did not finish within the
+    /// configured init deadline (the async path; a synchronous block that wedges
+    /// a runtime worker is caught by the force-exit watchdog instead).
+    #[error("initialization timed out for gear '{gear}' after {timeout:?}")]
+    InitTimeout {
+        gear: &'static str,
+        timeout: std::time::Duration,
+    },
 
     // Build/topo-sort errors
     #[error("unknown gear '{0}'")]

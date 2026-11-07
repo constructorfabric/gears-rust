@@ -986,11 +986,10 @@ async fn a_system_root_serves_and_is_present_while_the_application_group_waits()
         .expect("clean shutdown");
 }
 
-/// A refused publication leaves the system root serving until shutdown, then
-/// the run reports the application group that never started.
+/// Publication failure stops the listener and returns without an external signal.
 #[tokio::test]
 #[tracing_test::traced_test]
-async fn a_failed_application_group_is_returned_after_the_system_root_served() {
+async fn a_failed_application_group_stops_the_system_root_and_returns() {
     let addr = free_addr();
     let directory = Arc::new(RecordingDirectory::default());
     let root = Arc::new(AxisGear);
@@ -1031,30 +1030,9 @@ async fn a_failed_application_group_is_returned_after_the_system_root_served() {
         host.run_oop_serving(oop_options("axis-gear", addr, &directory, None)),
     ));
 
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    while !logs_contain("the application group did not start") {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the failure is reported"
-        );
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    assert_eq!(
-        http_get(addr, "/anon").await.map(|r| r.0),
-        Some(200),
-        "the system root keeps serving"
-    );
-    assert_eq!(
-        http_get(addr, "/published").await.map(|r| r.0),
-        Some(503),
-        "the application routes never attach"
-    );
-    assert!(!server.is_finished(), "until shutdown");
-
-    cancel.cancel();
     let err = tokio::time::timeout(Duration::from_secs(5), server)
         .await
-        .expect("ends after cancel")
+        .expect("ends without an external signal")
         .expect("no panic")
         .unwrap_err();
     let message = format!("{err:#}");
@@ -1063,6 +1041,10 @@ async fn a_failed_application_group_is_returned_after_the_system_root_served() {
         "{message}"
     );
     assert_eq!(side.handled.load(Ordering::SeqCst), 0);
+    assert!(
+        http_get(addr, "/healthz").await.is_none(),
+        "listener is closed"
+    );
 }
 
 /// Dropping the `OoP` lifecycle future while the root's publication is pending
@@ -1186,6 +1168,46 @@ impl RestApiCapability for Unadvertised {
 
     fn advertised_in_directory(&self) -> bool {
         false
+    }
+}
+
+/// Both system and application roots honor the advertisement opt-out.
+#[tokio::test]
+async fn an_unadvertised_oop_root_stays_out_of_the_directory() {
+    for system in [true, false] {
+        let addr = free_addr();
+        let directory = Arc::new(RecordingDirectory::default());
+        let hidden = Arc::new(Unadvertised);
+        let mut builder = RegistryBuilder::default();
+        builder.register_core_with_meta("hidden-root", &[], hidden.clone() as Arc<dyn Gear>);
+        builder.register_rest_with_meta("hidden-root", hidden as Arc<dyn RestApiCapability>);
+        if system {
+            builder.register_system_with_meta(
+                "hidden-root",
+                Arc::new(SystemMarker) as Arc<dyn crate::contracts::SystemCapability>,
+            );
+        }
+        let cancel = CancellationToken::new();
+        let host = HostRuntime::new(
+            builder.build_topo_sorted().unwrap(),
+            Arc::new(EmptyConfigProvider),
+            DbOptions::None,
+            Arc::new(ClientHub::new()),
+            cancel.clone(),
+            Uuid::new_v4(),
+            None,
+        );
+        let server =
+            tokio::spawn(host.run_oop_serving(oop_options("hidden-root", addr, &directory, None)));
+        assert!(poll_status(addr, "/readyz", 200, Duration::from_secs(5)).await);
+        cancel.cancel();
+        server.await.unwrap().unwrap();
+
+        let registered = directory.registered_gears.lock().clone();
+        assert!(
+            registered.is_empty(),
+            "system={system}: unexpected registrations {registered:?}"
+        );
     }
 }
 

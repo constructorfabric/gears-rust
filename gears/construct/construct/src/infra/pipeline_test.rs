@@ -1,0 +1,635 @@
+//! The round trip through the gear's own wiring: a connector's record goes
+//! through intake, the queue, the planner (over a scripted model), the checks,
+//! Admission and the writer into graph storage's in-memory store, and the
+//! profile read reads it back.
+
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use async_trait::async_trait;
+use authz_resolver_sdk::models::{EvaluationRequest, EvaluationResponse};
+use authz_resolver_sdk::{AuthZResolverApi, PolicyEnforcer};
+use serde_json::json;
+use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
+use tokio_util::sync::CancellationToken;
+use toolkit::api::canonical_prelude::CanonicalError;
+use toolkit_security::{PlatformSecurityContext, SecurityContext};
+use uuid::Uuid;
+
+use super::pipeline::assemble;
+use crate::config::{CategoryCheckConfig, ConstructConfig};
+use crate::domain::model_client::{
+    ModelClient, ModelError, ModelOutput, ModelRequest, ModelResponse, ToolCall, Usage,
+};
+use crate::domain::profile::Category;
+use crate::domain::profile_read::OriginKind;
+use crate::domain::record_intake::IntakeOutcome;
+use crate::test_support::{
+    AllowResolver, IntakeFixture, chat_record, fake_graph_storage, inmem_db, settings_service,
+    unchecked_processing,
+};
+
+/// A model that answers with the given answers in turn, then the last again.
+struct Scripted(Mutex<VecDeque<ModelResponse>>);
+
+#[async_trait]
+impl ModelClient for Scripted {
+    async fn complete(
+        &self,
+        _ctx: &SecurityContext,
+        _request: &ModelRequest,
+    ) -> Result<ModelResponse, ModelError> {
+        let mut answers = self.0.lock().unwrap();
+        Ok(if answers.len() > 1 {
+            answers.pop_front().unwrap()
+        } else {
+            answers.front().cloned().unwrap()
+        })
+    }
+}
+
+fn answer(output: ModelOutput) -> ModelResponse {
+    ModelResponse {
+        output,
+        usage: Some(Usage {
+            input_tokens: 100,
+            output_tokens: 20,
+        }),
+    }
+}
+
+/// The model adds one skill, then says the plan is complete.
+fn adds_a_skill() -> Arc<Scripted> {
+    Arc::new(Scripted(Mutex::new(VecDeque::from([
+        answer(ModelOutput::ToolCalls(vec![ToolCall {
+            id: "call_0".to_owned(),
+            name: "add".to_owned(),
+            arguments: json!({ "property": "skills", "value": { "name": "Rust" }, "confidence": 0.9 }),
+        }])),
+        answer(ModelOutput::Text("The plan is complete.".to_owned())),
+    ]))))
+}
+
+fn in_tenant(tenant: Uuid) -> SecurityContext {
+    SecurityContext::builder()
+        .subject_id(Uuid::new_v4())
+        .subject_tenant_id(tenant)
+        .build()
+        .unwrap()
+}
+
+#[tracing_test::traced_test]
+#[tokio::test]
+async fn a_record_is_planned_checked_admitted_written_read_back_and_deleted_by_its_subject() {
+    let db = inmem_db().await;
+    let cfg = ConstructConfig {
+        processing_identity: Some(Uuid::new_v4()),
+        processing: unchecked_processing(),
+        profile_category_check: Some(CategoryCheckConfig::OneCall),
+        ..ConstructConfig::default()
+    }
+    .validated()
+    .unwrap();
+    let pipeline = assemble(
+        &cfg,
+        Some(adds_a_skill()),
+        fake_graph_storage(),
+        Arc::new(settings_service(&db, Arc::new(AllowResolver), true)),
+        Arc::new(crate::test_support::MemoryReviews::default()),
+        PolicyEnforcer::new(Arc::new(AllowResolver)),
+    )
+    .expect("the pipeline assembles");
+    let worker = pipeline.worker.expect("processing is wired");
+    let intake = IntakeFixture {
+        hand_off_to: Some(Arc::clone(&pipeline.hand_off)),
+        ..IntakeFixture::default()
+    }
+    .build(&db);
+    let (tenant, subject) = (Uuid::new_v4(), Uuid::new_v4());
+    let cancel = CancellationToken::new();
+    let running = tokio::spawn(worker.run(cancel.clone()));
+
+    let outcome = intake
+        .submit(
+            &in_tenant(Uuid::new_v4()),
+            tenant,
+            chat_record(subject, "chat/t/1", "v1"),
+        )
+        .await
+        .expect("intake answers");
+    assert_eq!(outcome, IntakeOutcome::Received);
+
+    let reader = in_tenant(tenant);
+    let read_back = async {
+        loop {
+            let view = pipeline.profile.read(&reader, None, subject).await.unwrap();
+            if !view.categories.is_empty() {
+                return view;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    };
+    let view = tokio::time::timeout(Duration::from_secs(30), read_back)
+        .await
+        .expect("the record is processed");
+    cancel.cancel();
+    running.await.unwrap();
+
+    // The subject deletes the fact through Subject Control, over the same
+    // writer and graph storage, and the profile read no longer serves it.
+    let owner = crate::test_support::context_of(subject, tenant);
+    let own = pipeline
+        .subject_control
+        .view(&owner, subject, &toolkit_odata::ODataQuery::new())
+        .await
+        .expect("the subject's view");
+    let [stored] = own.page.items.as_slice() else {
+        panic!("one fact in the subject's view, got {own:?}");
+    };
+    pipeline
+        .subject_control
+        .delete(&owner, subject, &stored.fact.node_key)
+        .await
+        .expect("the subject deletes its fact");
+    let after = pipeline.profile.read(&reader, None, subject).await.unwrap();
+    assert!(
+        after.categories.is_empty(),
+        "deleted, so not served: {after:?}"
+    );
+    let own_after = pipeline
+        .subject_control
+        .view(&owner, subject, &toolkit_odata::ODataQuery::new())
+        .await
+        .unwrap();
+    assert!(own_after.page.items.is_empty(), "{own_after:?}");
+    assert!(
+        own_after.version > own.version,
+        "the delete moved the profile's version on: {:?} then {:?}",
+        own.version,
+        own_after.version
+    );
+
+    let [skills] = view.categories.as_slice() else {
+        panic!("one category, got {view:?}");
+    };
+    assert_eq!(skills.category, Category::Skill);
+    let [fact] = skills.facts.as_slice() else {
+        panic!("one fact, got {:?}", skills.facts);
+    };
+    assert_eq!(fact.property, "skills");
+    assert_eq!(fact.value, json!({ "name": "Rust" }));
+    assert_eq!(fact.origin, OriginKind::Connector);
+    assert_eq!(
+        fact.produced_at,
+        Some(OffsetDateTime::parse("2026-09-10T09:13:05Z", &Rfc3339).unwrap()),
+        "the record's observed_at"
+    );
+    assert!(
+        logs_contain("no sensitive-data check"),
+        "the operator is told that no check runs"
+    );
+}
+
+/// A model whose call panics; it counts its calls.
+#[derive(Default)]
+struct Panics(std::sync::atomic::AtomicUsize);
+
+#[async_trait]
+impl ModelClient for Panics {
+    async fn complete(
+        &self,
+        _ctx: &SecurityContext,
+        _request: &ModelRequest,
+    ) -> Result<ModelResponse, ModelError> {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        panic!("the model client broke")
+    }
+}
+
+#[tracing_test::traced_test]
+#[tokio::test]
+async fn a_record_whose_processing_panics_is_dropped_and_the_worker_goes_on() {
+    let db = inmem_db().await;
+    let model = Arc::new(Panics::default());
+    let cfg = ConstructConfig {
+        processing_identity: Some(Uuid::new_v4()),
+        processing: unchecked_processing(),
+        profile_category_check: Some(CategoryCheckConfig::OneCall),
+        ..ConstructConfig::default()
+    }
+    .validated()
+    .unwrap();
+    let pipeline = assemble(
+        &cfg,
+        Some(Arc::clone(&model) as _),
+        fake_graph_storage(),
+        Arc::new(settings_service(&db, Arc::new(AllowResolver), true)),
+        Arc::new(crate::test_support::MemoryReviews::default()),
+        PolicyEnforcer::new(Arc::new(AllowResolver)),
+    )
+    .expect("the pipeline assembles");
+    let worker = pipeline.worker.expect("processing is wired");
+    let load = worker.load();
+    let intake = IntakeFixture {
+        hand_off_to: Some(Arc::clone(&pipeline.hand_off)),
+        ..IntakeFixture::default()
+    }
+    .build(&db);
+    let cancel = CancellationToken::new();
+    let running = tokio::spawn(worker.run(cancel.clone()));
+
+    intake
+        .submit(
+            &in_tenant(Uuid::new_v4()),
+            Uuid::new_v4(),
+            chat_record(Uuid::new_v4(), "chat/t/1", "v1"),
+        )
+        .await
+        .expect("intake answers");
+    let dropped = async {
+        while !logs_contain("processing a record panicked") || load.in_flight() > 0 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(30), dropped)
+        .await
+        .expect("the panic is caught");
+
+    assert!(logs_contain("the model client broke"));
+    assert!(logs_contain(r#"stage="worker""#));
+    assert!(logs_contain(r#"reason="processing_failed""#));
+    // The worker goes on: a second record reaches the model too.
+    intake
+        .submit(
+            &in_tenant(Uuid::new_v4()),
+            Uuid::new_v4(),
+            chat_record(Uuid::new_v4(), "chat/t/2", "v1"),
+        )
+        .await
+        .expect("intake answers");
+    let second = async {
+        while model.0.load(std::sync::atomic::Ordering::SeqCst) < 2 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(30), second)
+        .await
+        .expect("the worker takes the next record after a panic");
+    cancel.cancel();
+    running.await.unwrap();
+}
+
+#[tracing_test::traced_test]
+#[tokio::test]
+async fn without_a_model_records_are_dropped_with_an_event_and_no_worker_runs() {
+    let db = inmem_db().await;
+    let cfg = ConstructConfig {
+        processing_identity: Some(Uuid::new_v4()),
+        processing: unchecked_processing(),
+        profile_category_check: Some(CategoryCheckConfig::OneCall),
+        ..ConstructConfig::default()
+    }
+    .validated()
+    .unwrap();
+    let pipeline = assemble(
+        &cfg,
+        None,
+        fake_graph_storage(),
+        Arc::new(settings_service(&db, Arc::new(AllowResolver), true)),
+        Arc::new(crate::test_support::MemoryReviews::default()),
+        PolicyEnforcer::new(Arc::new(AllowResolver)),
+    )
+    .unwrap();
+    let intake = IntakeFixture {
+        hand_off_to: Some(Arc::clone(&pipeline.hand_off)),
+        ..IntakeFixture::default()
+    }
+    .build(&db);
+
+    let outcome = intake
+        .submit(
+            &in_tenant(Uuid::new_v4()),
+            Uuid::new_v4(),
+            chat_record(Uuid::new_v4(), "chat/t/1", "v1"),
+        )
+        .await
+        .unwrap();
+
+    assert!(pipeline.worker.is_none());
+    assert_eq!(outcome, IntakeOutcome::Received);
+    assert!(logs_contain("event=\"record_dropped\""));
+    assert!(logs_contain("reason=\"no_planner\""));
+    assert!(
+        logs_contain("partly configured"),
+        "a model is missing, so it warns"
+    );
+}
+
+#[tokio::test]
+async fn without_a_processing_identity_the_profile_read_is_not_configured() {
+    let db = inmem_db().await;
+
+    let pipeline = assemble(
+        &ConstructConfig::default().validated().unwrap(),
+        Some(adds_a_skill()),
+        fake_graph_storage(),
+        Arc::new(settings_service(&db, Arc::new(AllowResolver), true)),
+        Arc::new(crate::test_support::MemoryReviews::default()),
+        PolicyEnforcer::new(Arc::new(AllowResolver)),
+    )
+    .unwrap();
+    let tenant = Uuid::new_v4();
+
+    let result = pipeline
+        .profile
+        .read(&in_tenant(tenant), None, Uuid::new_v4())
+        .await;
+
+    assert!(
+        pipeline.worker.is_none(),
+        "no processing without an identity"
+    );
+    assert!(
+        matches!(
+            result,
+            Err(crate::domain::error::DomainError::NotConfigured(_))
+        ),
+        "{result:?}"
+    );
+}
+
+/// [`AllowResolver`] that records the category each request asks about.
+#[derive(Default)]
+struct CategoriesAsked(Mutex<Vec<Option<String>>>);
+
+#[async_trait]
+impl AuthZResolverApi for CategoriesAsked {
+    async fn evaluate(
+        &self,
+        ctx: PlatformSecurityContext,
+        request: EvaluationRequest,
+    ) -> Result<EvaluationResponse, CanonicalError> {
+        if request.resource.resource_type == crate::domain::profile_read::PROFILE_TYPE {
+            self.0.lock().unwrap().push(
+                request
+                    .resource
+                    .properties
+                    .get(crate::domain::profile_read::CATEGORY_PROPERTY)
+                    .and_then(|v| v.as_str())
+                    .map(str::to_owned),
+            );
+        }
+        AllowResolver.evaluate(ctx, request).await
+    }
+}
+
+#[tokio::test]
+async fn the_configured_category_check_reaches_the_profile_read() {
+    for (check, per_category) in [
+        (CategoryCheckConfig::OneCall, 0),
+        (CategoryCheckConfig::PerCategory, Category::ALL.len()),
+    ] {
+        let db = inmem_db().await;
+        let asked = Arc::new(CategoriesAsked::default());
+        let cfg = ConstructConfig {
+            processing_identity: Some(Uuid::new_v4()),
+            processing: unchecked_processing(),
+            profile_category_check: Some(check),
+            ..ConstructConfig::default()
+        }
+        .validated()
+        .unwrap();
+        let pipeline = assemble(
+            &cfg,
+            None,
+            fake_graph_storage(),
+            Arc::new(settings_service(&db, Arc::new(AllowResolver), true)),
+            Arc::new(crate::test_support::MemoryReviews::default()),
+            PolicyEnforcer::new(Arc::clone(&asked) as Arc<dyn AuthZResolverApi>),
+        )
+        .unwrap();
+
+        pipeline
+            .profile
+            .read(&in_tenant(Uuid::new_v4()), None, Uuid::new_v4())
+            .await
+            .unwrap();
+
+        let asked = asked.0.lock().unwrap().clone();
+        assert_eq!(
+            asked.iter().filter(|category| category.is_some()).count(),
+            per_category,
+            "{check:?}: {asked:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn without_a_processing_identity_even_an_empty_profile_is_not_configured() {
+    let db = inmem_db().await;
+    let pipeline = assemble(
+        &ConstructConfig::default().validated().unwrap(),
+        None,
+        fake_graph_storage(),
+        // Personalization off by default: the read would serve nothing.
+        Arc::new(settings_service(&db, Arc::new(AllowResolver), false)),
+        Arc::new(crate::test_support::MemoryReviews::default()),
+        PolicyEnforcer::new(Arc::new(AllowResolver)),
+    )
+    .unwrap();
+
+    let result = pipeline
+        .profile
+        .read(&in_tenant(Uuid::new_v4()), None, Uuid::new_v4())
+        .await;
+
+    assert!(
+        matches!(
+            result,
+            Err(crate::domain::error::DomainError::NotConfigured(_))
+        ),
+        "{result:?}"
+    );
+}
+
+#[tracing_test::traced_test]
+#[tokio::test]
+async fn without_the_opt_in_to_run_unchecked_no_worker_runs_and_it_warns() {
+    let db = inmem_db().await;
+    let cfg = ConstructConfig {
+        processing_identity: Some(Uuid::new_v4()),
+        profile_category_check: Some(CategoryCheckConfig::OneCall),
+        ..ConstructConfig::default()
+    }
+    .validated()
+    .unwrap();
+
+    let pipeline = assemble(
+        &cfg,
+        Some(adds_a_skill()),
+        fake_graph_storage(),
+        Arc::new(settings_service(&db, Arc::new(AllowResolver), true)),
+        Arc::new(crate::test_support::MemoryReviews::default()),
+        PolicyEnforcer::new(Arc::new(AllowResolver)),
+    )
+    .unwrap();
+
+    assert!(
+        pipeline.worker.is_none(),
+        "an identity and a model are not enough while no sensitive-data check exists"
+    );
+    assert!(logs_contain("run_without_sensitive_data_checks"));
+}
+
+#[tokio::test]
+async fn without_a_model_the_subject_still_deletes_its_facts() {
+    use crate::domain::planner::processing::{PlanWriter as _, ProcessingContexts as _, Written};
+    use crate::infra::processing_contexts::ServiceIdentity;
+    use crate::infra::storage::graph::root::PayloadCounter;
+    use crate::infra::storage::graph::types::GraphTypes;
+    use crate::infra::storage::graph::writer::{GraphPlanWriter, SoftDelete, WriterPorts};
+
+    let db = inmem_db().await;
+    let identity = Uuid::new_v4();
+    let cfg = ConstructConfig {
+        processing_identity: Some(identity),
+        profile_category_check: Some(CategoryCheckConfig::OneCall),
+        ..ConstructConfig::default()
+    }
+    .validated()
+    .unwrap();
+    let graph = fake_graph_storage();
+    let pipeline = assemble(
+        &cfg,
+        None,
+        Arc::clone(&graph),
+        Arc::new(settings_service(&db, Arc::new(AllowResolver), true)),
+        Arc::new(crate::test_support::MemoryReviews::default()),
+        PolicyEnforcer::new(Arc::new(AllowResolver)),
+    )
+    .unwrap();
+    assert!(pipeline.worker.is_none(), "no model, no processing");
+    // A fact stored earlier, by a deployment that had a model.
+    let (tenant, subject) = (Uuid::new_v4(), Uuid::new_v4());
+    let (construct, _) = ServiceIdentity::new(identity)
+        .for_tenant(tenant)
+        .await
+        .unwrap();
+    let mut plan = crate::test_support::connector_plan(vec![crate::test_support::add_value(
+        "skill",
+        "skills",
+        json!({ "name": "Rust" }),
+    )]);
+    plan.tenant_id = tenant;
+    plan.subject_id = subject;
+    plan.profile_version = None;
+    let writer = GraphPlanWriter::new(WriterPorts {
+        client: Arc::clone(&graph),
+        types: Arc::new(GraphTypes::new(Arc::clone(&graph))),
+        version: Arc::new(PayloadCounter),
+        removal: Arc::new(SoftDelete::new(Arc::clone(&graph))),
+    });
+    assert_eq!(
+        writer.write(&construct, &plan).await.unwrap(),
+        Written::Stored
+    );
+    let owner = crate::test_support::context_of(subject, tenant);
+    let everything = toolkit_odata::ODataQuery::new();
+    let before = pipeline
+        .subject_control
+        .view(&owner, subject, &everything)
+        .await
+        .unwrap();
+    let [fact] = before.page.items.as_slice() else {
+        panic!("one fact, got {before:?}");
+    };
+
+    pipeline
+        .subject_control
+        .delete(&owner, subject, &fact.fact.node_key)
+        .await
+        .expect("a delete needs no model");
+
+    let after = pipeline
+        .subject_control
+        .view(&owner, subject, &everything)
+        .await
+        .unwrap();
+    assert!(after.page.items.is_empty(), "{after:?}");
+}
+
+#[tokio::test]
+async fn a_correction_needs_the_opt_in_to_store_values_unchecked() {
+    use crate::domain::error::DomainError;
+    use crate::domain::profile::Category;
+    use crate::domain::review_queue::Resolution;
+    use crate::domain::subject_settings::SubjectKey;
+
+    let db = inmem_db().await;
+    let resolve = |unchecked: bool| {
+        let db = db.clone();
+        async move {
+            let cfg = ConstructConfig {
+                processing_identity: Some(Uuid::new_v4()),
+                processing: crate::config::ProcessingConfig {
+                    run_without_sensitive_data_checks: unchecked,
+                    ..crate::config::ProcessingConfig::default()
+                },
+                profile_category_check: Some(CategoryCheckConfig::OneCall),
+                ..ConstructConfig::default()
+            }
+            .validated()
+            .unwrap();
+            let key = SubjectKey {
+                tenant_id: Uuid::new_v4(),
+                subject_id: Uuid::new_v4(),
+            };
+            let reviews = Arc::new(crate::test_support::MemoryReviews::default());
+            let request = reviews.open_on_at(
+                key,
+                &crate::test_support::stored_fact(
+                    Category::Skill,
+                    "skills",
+                    json!({ "name": "Rust" }),
+                    10,
+                ),
+                100,
+            );
+            let pipeline = assemble(
+                &cfg,
+                None,
+                fake_graph_storage(),
+                Arc::new(settings_service(&db, Arc::new(AllowResolver), true)),
+                reviews,
+                PolicyEnforcer::new(Arc::new(AllowResolver)),
+            )
+            .unwrap();
+            pipeline
+                .review_queue
+                .resolve(
+                    &crate::test_support::context_of(Uuid::new_v4(), key.tenant_id),
+                    request.id,
+                    Resolution::Corrected {
+                        property: "skills".to_owned(),
+                        value: json!({ "name": "Go" }),
+                        reason: None,
+                    },
+                )
+                .await
+        }
+    };
+
+    let without = resolve(false).await;
+    let with = resolve(true).await;
+
+    assert!(
+        matches!(without, Err(DomainError::NotConfigured(_))),
+        "{without:?}"
+    );
+    assert!(
+        with.is_ok(),
+        "with the opt-in it runs; the fact is not in graph storage, so it closes as deleted: {with:?}"
+    );
+}

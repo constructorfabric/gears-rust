@@ -17,7 +17,7 @@ use crate::domain::error::DomainError;
 use crate::domain::ports::metric_registry::MetricMode;
 use crate::domain::ports::metrics::DenialReason;
 use crate::domain::tokens;
-use crate::test_support::{DenyAllPdp, PermitTenantsPdp, ctx, tenant};
+use crate::test_support::{DenyAllPdp, PermitTenantsPdp, SpanCapture, ctx, tenant};
 
 fn item(amount: i64, key: &str) -> BatchItemRequest {
     BatchItemRequest {
@@ -84,6 +84,53 @@ async fn an_allowed_batch_applies_every_item_and_echoes_their_keys() {
     assert!(
         h.metrics.evaluations().is_empty(),
         "no operation-labelled series for a batch"
+    );
+}
+
+#[tokio::test]
+async fn a_batch_opens_the_same_spans_for_one_item_and_for_fifty() {
+    let h = Harness::new().await;
+    h.quota(Some(10_000)).await;
+    // Warm the artifact cache, so neither traced batch prepares the policy.
+    let warm = h
+        .operations()
+        .batch_debit(&ctx(), batch(vec![item(1, "w")], "warm"))
+        .await
+        .expect("warm");
+    assert_eq!(warm.result, BatchResult::Allowed);
+    let capture = SpanCapture::default();
+
+    let single = capture
+        .within(
+            h.operations()
+                .batch_debit(&ctx(), batch(vec![item(1, "a0")], "one")),
+        )
+        .await
+        .expect("one item");
+    assert_eq!(single.result, BatchResult::Allowed);
+    let one = capture.names();
+    capture.clear();
+    let fifty = (0..50).map(|i| item(1, &format!("b{i}"))).collect();
+    let many = capture
+        .within(h.operations().batch_debit(&ctx(), batch(fifty, "fifty")))
+        .await
+        .expect("fifty items");
+    assert_eq!(many.result, BatchResult::Allowed);
+
+    assert_eq!(capture.names(), one, "no span per item");
+    assert!(
+        one.contains(&"quota_enforcement.operations.batch_debit".to_owned()),
+        "{one:?}"
+    );
+    let admission = capture
+        .spans()
+        .into_iter()
+        .find(|s| s.name == "quota_enforcement.admission")
+        .expect("one admission span");
+    assert_eq!(admission.item_count, Some(50), "it covers every item");
+    assert_eq!(
+        admission.parent.as_deref(),
+        Some("quota_enforcement.operations.batch_debit")
     );
 }
 

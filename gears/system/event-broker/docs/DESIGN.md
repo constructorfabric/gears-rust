@@ -404,6 +404,11 @@ resource the broker stores. It is declared by its owning gear in the GTS invento
 `event-broker-sdk` declares the base type in the inventory. A published event is an instance of the derived type,
 and the derived schema *is* the payload contract, narrowing the base's `data` member.
 
+The Rust base is `event_broker_sdk::gts::EventV1<D>`. Owning gears declare derived types with
+`#[toolkit_gts::gts_type_schema(base = EventV1, ..)]`; their fields define `data`, and the macro
+submits the schema to the inventory. A payload-bearing declaration requires `data`; a unit declaration
+leaves it optional. See the [SDK declaration example](../event-broker-sdk/README.md#gts-event-declarations).
+
 The metadata governing a type lives in its `x-gts-traits`, whose shape the base declares in
 `x-gts-traits-schema`. Trait keywords are schema-only, so none of these can appear in a published event - a
 producer cannot supply them even by mistake:

@@ -1,0 +1,39 @@
+{
+  "$id": "gts://gts.cf.core.graph.node.v1~cf.core.graph.owned_node.v1~cf.construct.profile.root.v1~",
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "description": "The root of one subject's profile. Every fact hangs from it by a has-fact edge. Construct is its only writer and changes it on every write, so its version counter equals graph storage's stored node version and serves as the profile's compare-and-set. `removals` lists the facts the last writes removed whose soft delete may not have run yet; readers treat them as removed.",
+  "type": "object",
+  "allOf": [
+    { "$ref": "gts://gts.cf.core.graph.node.v1~cf.core.graph.owned_node.v1~" },
+    {
+      "type": "object",
+      "properties": {
+        "payload": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["subject_id", "version", "removals"],
+          "properties": {
+            "subject_id": {
+              "description": "The subject the profile belongs to, a platform user id.",
+              "type": "string",
+              "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+            },
+            "version": {
+              "description": "The profile version: 1 when the root is created, one more on every write.",
+              "type": "integer",
+              "minimum": 1
+            },
+            "removals": {
+              "description": "Node keys of removed facts whose soft delete may still be pending.",
+              "type": "array",
+              "uniqueItems": true,
+              "maxItems": 1000,
+              "items": { "type": "string", "minLength": 1, "maxLength": 2048 }
+            }
+          }
+        }
+      },
+      "required": ["payload"]
+    }
+  ]
+}

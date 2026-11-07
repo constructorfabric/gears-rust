@@ -278,6 +278,7 @@ pub(super) struct Chain {
     pub(super) rules: Result<AdmissionRules, fn() -> DomainError>,
     pub(super) writer: Arc<Writer>,
     pub(super) events: Arc<RecordingEvents>,
+    pub(super) reviews: Arc<crate::test_support::MemoryReviews>,
 }
 
 impl Chain {
@@ -295,6 +296,7 @@ impl Chain {
             rules: Ok(open_rules()),
             writer: Writer::answering(written),
             events,
+            reviews: Arc::default(),
         }
     }
 
@@ -303,7 +305,16 @@ impl Chain {
     }
 
     pub(super) async fn manage(&self, deadline: Instant) -> Result<Managed, DomainError> {
-        let (ctx, scope) = processing_context(TENANT);
+        self.manage_as(processing_context(TENANT).1, deadline).await
+    }
+
+    /// A manage-facts call by an agent whose scope is `scope`.
+    pub(super) async fn manage_as(
+        &self,
+        scope: AccessScope,
+        deadline: Instant,
+    ) -> Result<Managed, DomainError> {
+        let (ctx, _) = processing_context(TENANT);
         self.processing()
             .manage(&ctx, &scope, &agent_message(), deadline)
             .await
@@ -330,6 +341,7 @@ impl Chain {
                 profiles: Arc::clone(&self.profiles) as Arc<dyn ProfileSource>,
                 writer: Arc::clone(&self.writer) as Arc<dyn PlanWriter>,
                 events,
+                reviews: Arc::clone(&self.reviews) as _,
             },
             2,
         )

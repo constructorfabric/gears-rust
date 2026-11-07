@@ -75,29 +75,16 @@ fn split_fixtures(entities: &[Value]) -> (Vec<Value>, Vec<(String, i64)>) {
                 "description": "a topic this integration test publishes to",
             }));
         } else if id.starts_with(event_base) {
-            let allowed: Vec<&str> = entity["allowed_subject_types"]
-                .as_array()
-                .map(|values| {
-                    values
-                        .iter()
-                        .map(|value| value.as_str().expect("a subject-type pattern is a string"))
-                        .collect()
-                })
-                .unwrap_or_default();
-            let mut schema = event_broker_sdk::gts::derived_event_type_schema(
-                id,
-                entity["topic_id"]
-                    .as_str()
-                    .expect("an event-type fixture names its topic"),
-                entity
-                    .get("data_schema")
-                    .cloned()
-                    .unwrap_or_else(|| serde_json::json!({})),
-                &allowed,
-            );
-            if let Some(pointer) = entity.get("partition_key").and_then(Value::as_str) {
-                schema["x-gts-traits"]["partition_key"] = serde_json::json!(pointer);
-            }
+            let topic = entity["topic_id"]
+                .as_str()
+                .expect("an event-type fixture names its topic");
+            let mut event = entity.clone();
+            event["topic"] = serde_json::json!(topic);
+            let fixtures = event_broker::test_support::StaticTypesRegistry::of(serde_json::json!([
+                { "id": topic, "partitions": 1 },
+                event,
+            ]));
+            let schema = fixtures.event_type_schemas()[0].clone();
             documents.push(schema);
         } else {
             panic!("fixture '{id}' is neither a topic instance nor an event type");

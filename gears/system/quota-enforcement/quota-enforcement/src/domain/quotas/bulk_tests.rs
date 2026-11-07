@@ -296,6 +296,46 @@ async fn a_bulk_create_commits_every_draft_and_a_lowered_limit_refuses_its_repla
 }
 
 #[tokio::test]
+async fn a_bulk_update_admits_every_item_under_one_admission_span() {
+    let pdp = Arc::new(PermitTenantsPdp::new(vec![tenant().as_uuid()]));
+    let h = Harness::new(pdp).await;
+    let created = h
+        .quotas()
+        .bulk_create(
+            &ctx(),
+            creates("ten", (1..=10).map(|i| draft(&format!("u{i}"))).collect()),
+        )
+        .await
+        .expect("ten drafts");
+    let ids: Vec<QuotaId> = created.items.iter().map(|item| item.quota_id).collect();
+    let capture = crate::test_support::SpanCapture::default();
+    capture
+        .within(h.quotas().bulk_update(
+            &ctx(),
+            updates(
+                "u-ten",
+                ids.iter().map(|id| (*id, cap_patch(300))).collect(),
+            ),
+        ))
+        .await
+        .expect("ten patches");
+    let admission = capture
+        .spans()
+        .into_iter()
+        .find(|s| s.name == "quota_enforcement.admission")
+        .expect("one admission span");
+    assert_eq!(
+        admission.item_count,
+        Some(10),
+        "one PDP call per item, one span"
+    );
+    assert_eq!(
+        admission.parent.as_deref(),
+        Some("quota_enforcement.quotas.bulk_update")
+    );
+}
+
+#[tokio::test]
 async fn the_configured_limit_is_checked_before_any_pdp_call() {
     let pdp = Arc::new(PermitTenantsPdp::new(vec![tenant().as_uuid()]));
     let h = Harness::new(pdp.clone()).await;

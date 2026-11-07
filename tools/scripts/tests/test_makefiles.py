@@ -197,6 +197,22 @@ class RepositoryMakeTests(unittest.TestCase):
         self.assertEqual(skipped.returncode, 0, skipped.stdout + skipped.stderr)
         self.assertIn("SKIP: GEAR=toolkit-db", skipped.stdout)
 
+    def test_openapi_waits_for_readiness_before_fetching_the_document(self):
+        for gear in ("", "file-parser"):
+            with self.subTest(gear=gear):
+                result = self.make(
+                    "-n", "-o", "py-env", "-o", ".example-server-build",
+                    "openapi", f"GEAR={gear}",
+                    "EXAMPLE_SERVER_ALL_FEATURES=file-parser",
+                    "OPENAPI_URL=http://127.0.0.1:18087/cf/openapi.json",
+                )
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                wait = 'while ! curl -fsS "http://127.0.0.1:18087/cf/readyz"'
+                fetch = 'curl -fsS "http://127.0.0.1:18087/cf/openapi.json" -o'
+                self.assertIn(wait, result.stdout)
+                self.assertIn(fetch, result.stdout)
+                self.assertLess(result.stdout.index(wait), result.stdout.index(fetch))
+
 
 # Paths and names that exist only in gears-rust.
 REPOSITORY_ONLY = ("apps/", "testing/", "tools/", "example-server", "toolkit", "mini-chat", "PY_ENV", "$(PYTHON)")

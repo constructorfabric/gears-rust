@@ -38,7 +38,16 @@ GEARS_JUNIT_ENRICH := tools/scripts/junit_enrich.py
 # Keep in sync with the `Install cargo-shear` step in shear-nightly.yml.
 SHEAR_VERSION ?= 1.13.1
 
+# shellcheck-py version installed into the venv by `make setup` (ships the shellcheck binary).
+# Keep in sync with the `Install shellcheck` step in githooks.yml.
+SHELLCHECK_PY_VERSION ?= 0.11.0.1
+
 CI := 1
+
+# Auto-install git hooks on any make run (idempotent, silent unless it installs something;
+# skipped in CI or with GEARS_NO_HOOKS=1; see .githooks/install.sh).
+_HOOKS_MSG := $(shell sh $(dir $(lastword $(MAKEFILE_LIST))).githooks/install.sh --quiet 2>/dev/null)
+$(if $(_HOOKS_MSG),$(info $(_HOOKS_MSG)))
 
 # Python helper scripts must run inside a repository-managed virtual environment.
 # PYTHON_BOOTSTRAP (gears.mk) is used only to create that environment;
@@ -46,14 +55,19 @@ CI := 1
 PY_ENV_DIR ?= .venv
 ifeq ($(OS),Windows_NT)
 PYTHON ?= $(PY_ENV_DIR)/Scripts/python
+SHELLCHECK ?= $(PY_ENV_DIR)/Scripts/shellcheck
 else
 PYTHON ?= $(PY_ENV_DIR)/bin/python
+SHELLCHECK ?= $(PY_ENV_DIR)/bin/shellcheck
 endif
-PY_ENV_STAMP := $(PY_ENV_DIR)/.requirements-stamp
+# The stamp name carries the shellcheck pin, so bumping SHELLCHECK_PY_VERSION re-runs py-env.
+PY_ENV_STAMP := $(PY_ENV_DIR)/.requirements-stamp-shellcheck-$(SHELLCHECK_PY_VERSION)
 PY_REQUIREMENTS := testing/requirements.txt testing/e2e/requirements.txt
 
 OPENAPI_PORT ?= 8087
 OPENAPI_URL ?= http://127.0.0.1:$(OPENAPI_PORT)/openapi.json
+# Bootstrap can serve a partial document before application routes are attached.
+OPENAPI_READY_URL ?= $(patsubst %/openapi.json,%/readyz,$(OPENAPI_URL))
 OPENAPI_OUT ?= docs/api/api.json
 OPENAPI_CONFIG ?= config/e2e-local.yaml
 
@@ -78,7 +92,7 @@ GTS_VALIDATOR_MIN_VERSION ?= 0.16.1
 
 # -------- Set up --------
 
-.PHONY: setup py-env
+.PHONY: setup py-env shellcheck install-hooks uninstall-hooks
 
 py-env: $(PY_ENV_STAMP)
 	$(call print_target_banner)
@@ -88,11 +102,27 @@ $(PY_ENV_STAMP): $(PY_REQUIREMENTS)
 	$(PYTHON_BOOTSTRAP) -m venv $(PY_ENV_DIR)
 	$(PYTHON) -m pip install --upgrade pip
 	$(PYTHON) -m pip install -r testing/requirements.txt -r testing/e2e/requirements.txt
+	$(PYTHON) -m pip install shellcheck-py==$(SHELLCHECK_PY_VERSION)
 	@mkdir -p $(dir $(PY_ENV_STAMP))
 	@cat $(PY_REQUIREMENTS) > $(PY_ENV_STAMP)
 
+## Lint the git hook scripts with the pinned shellcheck (installed by setup)
+shellcheck: py-env
+	$(call print_target_banner)
+	@$(SHELLCHECK) -s sh -x .githooks/install.sh .githooks/lib.sh .githooks/pre-commit .githooks/pre-push .githooks/tests/run.sh
+
+## Install git hooks (pre-commit, pre-push) as symlinks into the git hooks dir
+install-hooks:
+	$(call print_target_banner)
+	@sh .githooks/install.sh
+
+## Remove the git hooks installed by install-hooks (only symlinks into .githooks)
+uninstall-hooks:
+	$(call print_target_banner)
+	@sh .githooks/install.sh --uninstall
+
 ## Install all required development tools
-setup: .setup-stamp py-env
+setup: .setup-stamp py-env install-hooks
 	$(call print_target_banner)
 
 # Re-run setup when a makefile changes (prerequisites are set at the end of this file),
@@ -321,7 +351,7 @@ else
 	@command -v curl >/dev/null || (echo "curl is required to generate OpenAPI spec" && exit 1)
 	@echo "Starting cf-gears-example-server to generate OpenAPI spec..."
 	@mkdir -p $$(dirname "$(if $(GEAR),$(GEAR_OPENAPI_TMP),$(OPENAPI_OUT))") && \
-	$(call start_server_and_wait,$(EXAMPLE_SERVER_DEBUG_BINARY) --config $(OPENAPI_CONFIG) --port $(OPENAPI_PORT),$(OPENAPI_URL),300) && \
+	$(call start_server_and_wait,$(EXAMPLE_SERVER_DEBUG_BINARY) --config $(OPENAPI_CONFIG) --port $(OPENAPI_PORT),$(OPENAPI_READY_URL),300) && \
 	echo "Fetching OpenAPI spec..." && \
 	curl -fsS "$(OPENAPI_URL)" -o "$(if $(GEAR),$(GEAR_OPENAPI_TMP),$(OPENAPI_OUT))" && \
 	if [ -n "$(GEAR)" ]; then \
@@ -336,7 +366,7 @@ else
 	@command -v curl >/dev/null || (echo "curl is required to generate OpenAPI spec" && exit 1)
 	@echo "Starting cf-gears-example-server to generate OpenAPI spec..."
 	@mkdir -p $$(dirname "$(OPENAPI_OUT)") && \
-	$(call start_server_and_wait,$(EXAMPLE_SERVER_DEBUG_BINARY) --config $(OPENAPI_CONFIG) --port $(OPENAPI_PORT),$(OPENAPI_URL),300) && \
+	$(call start_server_and_wait,$(EXAMPLE_SERVER_DEBUG_BINARY) --config $(OPENAPI_CONFIG) --port $(OPENAPI_PORT),$(OPENAPI_READY_URL),300) && \
 	echo "Fetching OpenAPI spec..." && \
 	curl -fsS "$(OPENAPI_URL)" -o "$(OPENAPI_OUT)" && \
 	echo "Sorting OpenAPI JSON for deterministic ordering..." && \
@@ -380,6 +410,7 @@ test-macros: install-tools
 	$(call print_target_banner)
 	$(call nextest_run,macros-db,-p cf-gears-toolkit-db-macros)
 	$(call nextest_run,macros-toolkit,-p cf-gears-toolkit-macros-tests)
+	$(call nextest_run,macros-gts-lto,-p cf-gears-toolkit-gts-macros --test release_lto --run-ignored ignored-only)
 
 ## Run the graph-storage gear's database-free suites
 ## Unit tests, the in-memory conformance lane, the domain-service and REST

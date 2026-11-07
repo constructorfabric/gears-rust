@@ -594,7 +594,7 @@ through `EvaluationOrchestrator` into the storage plugin (phase-2). Does not own
 
 Public S2S surface for eight consumer operations: `debit`, `rollback`, `reserve`, `commit`, `release`, `batch_debit`,
 `evaluate_preview`, and `snapshot`, plus the management-plane `credit`, which is served on the same surface but
-authorized as its own action and exposed in the SDK on `QuotaManagerClientV1` only.
+authorized as its own action and exposed in the SDK on `QuotaManagerApi` only.
 
 ##### Responsibility scope
 
@@ -965,7 +965,7 @@ QE exposes three contractual surfaces:
 | `GET`    | `/v1/quota-enforcement/quotas/{id}`            | Read single Quota                                                                                                                                                                                                                                                                                                                           |
 | `PATCH`  | `/v1/quota-enforcement/quotas/{id}`            | Update Quota. The body may name the immutable fields `metric`, `quota_type`, `period`, `subject` only to be rejected: `quota_type = rate` → 501 `NOT_YET_IMPLEMENTED` first, any other present immutable field (explicit `null` included) → 400 `IMMUTABLE_FIELD`; an empty patch → 400 `PATCH_EMPTY`; unknown fields → 422.                    |
 | `POST`   | `/v1/quota-enforcement/quotas/{id}/deactivate` | Deactivate Quota (cascades to active leases)                                                                                                                                                                                                                                                                                                |
-| `GET`    | `/v1/quota-enforcement/quotas`                 | List/filter Quotas (paginated; PDP-scoped). Query: `tenant_id`, `projection_type` + `subject_id` (must appear together, `LIST_SUBJECT_INCOMPLETE`), `metric`, `status`, repeatable `id` (bounded, `LIST_TOO_MANY_IDS`), `limit` (bounded, `LIST_LIMIT_OUT_OF_RANGE`), `cursor` (opaque; one the plugin did not issue is 400 `CURSOR_INVALID`); invalid parameters are 400. Ordered by `quota_id` ascending (`UUIDv7`); the cursor carries position only and tenant and PDP scope are re-applied on every page. Response `{ items: [QuotaView], next_cursor }`. |
+| `GET`    | `/v1/quota-enforcement/quotas`                 | List/filter Quotas (paginated; PDP-scoped) with OData. `$filter` takes `eq` on `tenant_id`, `projection_type`, `subject_id`, `metric` and `status`, and `eq` or `in` on `id`, joined by `and`; each field once, `projection_type` and `subject_id` together (`LIST_SUBJECT_INCOMPLETE`), `id` bounded (`LIST_TOO_MANY_IDS`). Any other field, operator or connective is 400 `INVALID_FILTER`, never ignored, and so is any query key the list does not read (`UNSUPPORTED_QUERY_PARAM`). `$orderby` accepts only `id asc`; `$top` (alias `limit`) is bounded (`INVALID_LIMIT`); `$select` is refused. The `cursor` is a forward-only `CursorV1` wrapping the plugin's opaque one and bound to the effective filter, defaulted tenant included: another filter is 400 `FILTER_MISMATCH`, a backward or foreign cursor `INVALID_CURSOR`. Ordered by `quota_id` ascending (`UUIDv7`); tenant and PDP scope are re-applied on every page. Response `Page<QuotaView>`: `{ items, page_info: { next_cursor, prev_cursor: null, limit } }`. |
 | `POST`   | `/v1/quota-enforcement/operations/debit`       | Debit (`cpt-cf-quota-enforcement-fr-debit`)                                                                                                                                                                                                                                                                                                 |
 | `POST`   | `/v1/quota-enforcement/operations/credit`      | S2S Credit (`cpt-cf-quota-enforcement-fr-credit`)                                                                                                                                                                                                                                                                                            |
 | `POST`   | `/v1/quota-enforcement/operations/rollback`    | Rollback (`cpt-cf-quota-enforcement-fr-rollback`)                                                                                                                                                                                                                                                                                           |
@@ -974,10 +974,10 @@ QE exposes three contractual surfaces:
 | `POST`   | `/v1/quota-enforcement/leases`                 | Acquire Lease (`cpt-cf-quota-enforcement-fr-lease-acquire`)                                                                                                                                                                                                                                                                                 |
 | `POST`   | `/v1/quota-enforcement/leases/{token}/commit`  | Commit Lease (`cpt-cf-quota-enforcement-fr-lease-commit`)                                                                                                                                                                                                                                                                                   |
 | `POST`   | `/v1/quota-enforcement/leases/{token}/release` | Release Lease (`cpt-cf-quota-enforcement-fr-lease-release`)                                                                                                                                                                                                                                                                                 |
-| `POST`   | `/v1/quota-enforcement/snapshot`               | S2S Quota Snapshot read for explicit caller-supplied tenant/subject/metric filters authorized by PDP; cursor-paginated. Product backends use this same surface for end-user views; end users never call QE.                                                                                                                                                                                                      |
+| `POST`   | `/v1/quota-enforcement/snapshot`               | S2S Quota Snapshot read for explicit caller-supplied tenant/subject/metric filters authorized by PDP; cursor-paginated. Product backends use this same surface for end-user views; end users never call QE. Not an OData list: the body names explicit targets the PDP authorizes as one set, which `$filter` could only express with `or`.                                                                                                                                                                                                      |
 | `POST`   | `/v1/quota-enforcement/policies`               | Create Policy                                                                                                                                                                                                                                                                                                                               |
 | `GET`    | `/v1/quota-enforcement/policies/{id}`          | Read latest active Policy                                                                                                                                                                                                                                                                                                                   |
-| `GET`    | `/v1/quota-enforcement/policies/{id}/versions` | List Policy versions (paginated)                                                                                                                                                                                                                                                                                                            |
+| `GET`    | `/v1/quota-enforcement/policies/{id}/versions` | List Policy versions, oldest first. No `$filter`; `$orderby` accepts only `version asc`; `$top` (alias `limit`) is bounded; the forward-only `cursor` is bound to the policy id. Response `Page<PolicyVersionMeta>`                                                                                                                                                                                                                                                                                                            |
 | `PATCH`  | `/v1/quota-enforcement/policies/{id}`          | Update Policy (creates new immutable version)                                                                                                                                                                                                                                                                                               |
 | `POST`   | `/v1/quota-enforcement/policies/{id}/rollback` | Rollback to a prior version                                                                                                                                                                                                                                                                                                                 |
 | `DELETE` | `/v1/quota-enforcement/policies/{id}`          | Soft-delete (narrow-scope only; cannot delete seeded global). Returns **204 No Content** on success. Idempotent on retry per PRD §5.9: repeated DELETE against an already-deleted `policy_id` returns 204 (no-op). 404 only when `policy_id` was never created.                                                                             |
@@ -1087,7 +1087,7 @@ Three traits split by actor role; every method is async, takes a `SecurityContex
 engine, notification sink) is bound `Send + Sync + 'static` so it registers in ToolKit's
 `ClientHub` (`ClientHub::register` requires those bounds), and async trait methods return `Send` futures.
 
-**`QuotaEnforcementClientV1`** — Quota Consumer surface:
+**`QuotaEnforcementApi`** — Quota Consumer surface:
 
 | Method                                    | Returns                     | Realises                                                                                                                                                                                                                                                      |
 | ----------------------------------------- | --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -1104,36 +1104,44 @@ engine, notification sink) is bound `Send + Sync + 'static` so it registers in T
 `Denied { decision: Decision }`. A bare `LeaseToken` return cannot represent a `Denied` reserve, which PRD §3.4
 requires to surface as a Decision verdict at HTTP 200, never as an error.
 
-**`QuotaManagerClientV1`** — Quota Manager surface:
+**`QuotaManagerApi`** — Quota Manager surface:
 
 | Method                                      | Returns                         | Realises                                                                                                                                          |
 | ------------------------------------------- | ------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `create_quota(spec: QuotaSpec)`             | `QuotaId`                       | `cpt-cf-quota-enforcement-fr-quota-lifecycle`; the public create shape carries no `constraint_contract`, the gear fills it from the catalogue        |
-| `update_quota(id, patch)`                   | `()`                            | `cpt-cf-quota-enforcement-fr-quota-lifecycle`                                                                                                     |
+| `update_quota(req: UpdateQuotaRequest)`     | `()`                            | `cpt-cf-quota-enforcement-fr-quota-lifecycle`; the update shape `QuotaUpdate` carries no `constraint_contract`, the gear fills it with `metadata`    |
 | `deactivate_quota(id)`                      | `DeactivateOutcome`             | `cpt-cf-quota-enforcement-fr-quota-lifecycle` (cascade resolved leases)                                                                           |
-| `read_quotas(filter, page)`                 | `PageResult<QuotaView>`         | `cpt-cf-quota-enforcement-fr-quota-lifecycle`; the public read shape is the stored `Quota` plus the server-computed `currently_within_window` (one clock reading per response) and the current `metric_kind` (`null` when the registry no longer knows the metric); storage `read_quotas` keeps returning `PageResult<Quota>` |
+| `read_quotas(req: ReadQuotasRequest)`       | `PageResult<QuotaView>`         | `cpt-cf-quota-enforcement-fr-quota-lifecycle`; the public read shape is the stored `Quota` plus the server-computed `currently_within_window` (one clock reading per response) and the current `metric_kind` (`null` when the registry no longer knows the metric); storage `read_quotas` keeps returning `PageResult<Quota>` |
 | `credit(req: CreditRequest)`                | `Decision`                      | `cpt-cf-quota-enforcement-fr-credit` (management-plane counter correction, authorized as its own action) |
 | `evaluate_preview(req: ManagementPreviewRequest)` | `DecisionPreview`          | Explicit target under manager PDP scope; `cpt-cf-quota-enforcement-fr-evaluate-preview`                                                           |
 | `snapshot(req: ManagementSnapshotRequest)`  | `PageResult<QuotaSnapshot>`      | Explicit target under manager PDP scope; snapshot read requirements                                                                                |
 
-**`QuotaOperatorClientV1`** — Platform Operator surface. Quota Resolution Policy lifecycle methods are
+**`QuotaOperatorApi`** — Platform Operator surface. Quota Resolution Policy lifecycle methods are
 operator-only per `cpt-cf-quota-enforcement-fr-authorization` and deliberately absent from
-`QuotaManagerClientV1`; explicit-target reads and previews are available on both surfaces under different PDP grants:
+`QuotaManagerApi`; explicit-target reads and previews are available on both surfaces under different PDP grants:
 
 | Method                                      | Returns                         | Realises                                                                                                                                          |
 | ------------------------------------------- | ------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `create_policy(p: PolicyDraft)`             | `PolicyVersion`                 | `cpt-cf-quota-enforcement-fr-quota-resolution-policy-versioning`; an active Policy at the same scope is rejected with `PolicyScopeOccupied` (409 `POLICY_SCOPE_OCCUPIED`)                                                                                  |
-| `update_policy(scope, if_match_version, p)` | `PolicyVersion`                 | same — creates new immutable version; `if_match_version` enforces lost-update protection (PRD §5.9), rejected with `VERSION_CONFLICT` on mismatch |
-| `rollback_policy(scope, target)`            | `PolicyVersion`                 | same — rollback to prior version                                                                                                                  |
-| `delete_policy(scope)`                      | `()`                            | same — soft-delete, narrow-scope only                                                                                                             |
-| `list_policy_versions(scope, page)`         | `PageResult<PolicyVersionMeta>` | same                                                                                                                                              |
+| `update_policy(req: UpdatePolicyRequest)`   | `PolicyVersion`                 | same — creates new immutable version; `if_match_version` enforces lost-update protection (PRD §5.9), rejected with `VERSION_CONFLICT` on mismatch |
+| `rollback_policy(req: RollbackPolicyRequest)` | `PolicyVersion`                 | same — rollback to prior version                                                                                                                  |
+| `delete_policy(req: DeletePolicyRequest)`   | `()`                            | same — soft-delete, narrow-scope only                                                                                                             |
+| `list_policy_versions(req: ListPolicyVersionsRequest)` | `PageResult<PolicyVersionMeta>` | same                                                                                                                                              |
 | `evaluate_preview(req: ManagementPreviewRequest)` | `DecisionPreview`        | Explicit target under operator PDP scope                                                                                                          |
 | `snapshot(req: ManagementSnapshotRequest)`  | `PageResult<QuotaSnapshot>`     | Explicit target under operator PDP scope                                                                                                          |
 
-All three traits are implemented by `quota-enforcement-sdk-rest-client` (HTTP transport) and by
-`quota-enforcement-sdk-in-process` (direct in-process call when QE is bundled in the caller's binary). Cross-gear
-callers MUST use the SDK and MUST NOT depend on the QE gateway's internal types
-(`cpt-cf-quota-enforcement-constraint-toolkit`).
+Each trait is a ToolKit `#[toolkit::contract]` (`version = "v1"`); a method with more than one argument takes one
+request struct, so every method maps to one JSON body. The gear provides each contract with
+`#[toolkit::provides(transports = [local, rest])]`: by default `ClientHub` holds the in-process implementation, and
+`client_wiring.<contract>` in the gear configuration can wire a generated REST client instead. The SDK's
+`#[toolkit::rest_contract]` projections (`rest` module; features `rest-client` and `rest-server`) generate those
+clients and the server routes: `POST /quota-enforcement/v1/...`, one route per method, internal (not exposed at the
+edge) and authenticated. They run on the tenant plane: the client forwards the caller's bearer token, the route
+rebuilds the `SecurityContext` from the re-validated token, so the PDP judges the original caller. The gear serves
+these routes from its own domain service, never from the `ClientHub` client, and they sit beside the public REST
+API above. OData is the public HTTP grammar only: these routes take the typed `QuotaFilter` and `PageRequest` bodies, so a Rust caller keeps compile-time-checked filters, and the SDK exports `QuotaFilterField`, the field set the public list's `$filter` publishes. Retries follow the idempotency key: reads and keyed writes are retryable, unkeyed
+writes (Quota create, update and deactivate, and every policy write) are not. Cross-gear callers MUST use the SDK
+and MUST NOT depend on the QE gateway's internal types (`cpt-cf-quota-enforcement-constraint-toolkit`).
 
 #### Storage Plugin Trait
 
@@ -1476,7 +1484,7 @@ renegotiating the corresponding invariant or NFR, and that renegotiation is out 
 | ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | Metrics emission    | The `QeMetrics` domain port, whose `OpenTelemetry` adapter records on a scoped `Meter` from the ToolKit meter provider (logs and spans use `tracing` macros); export pipeline (OTLP / Prometheus exporter) configured by the platform binary via `toolkit`'s `otel` feature.                                                     |
 | Cardinality         | Bounded label sets per `cpt-cf-quota-enforcement-constraint-bounded-cardinality`. IDs, projection types, caller attribution, and raw/unregistered metric input MUST NOT appear as metric labels. Canonical registered `metric` is permitted only on catalogue-declared instruments. |
-| Tracing             | OpenTelemetry; spans nested under `qe.gateway.handle_request` root.                                                                                                                                          |
+| Tracing             | OpenTelemetry; `quota_enforcement.*` spans nested under the platform's request span (`http_request` for REST).                                                                                               |
 | Operator dashboards | Out of DESIGN scope; maintained in the infrastructure repository.                                                                                                                                            |
 
 **Dependency Rules** (per project conventions):
@@ -2400,10 +2408,25 @@ declare them in the catalogue above and are populated only after registry/catalo
 Caller attribution is intentionally not a metric dimension: although typed, the registry does not bound the number of
 service projection types across deployments. It is available on sampled traces and structured diagnostics instead.
 
-**Tracing.** OpenTelemetry traces propagate from the `qe.gateway.handle_request` root. Stage spans:
-`subject_resolution`, `applicable_quotas_fetch`, `policy_lookup`, `engine_evaluate`, `invariant_check`,
-`storage.apply_debit_plan`, `notification.enqueue`. Attribute keys: `qe.tenant_id`, `qe.metric`, `qe.engine_id`,
-`qe.policy_id`, `qe.policy_version`, `qe.result`.
+**Tracing.** Spans follow the platform `tracing` conventions and nest under the request span the platform opens
+(`http_request` for REST); an in-process call has none above them. Each operation opens
+`quota_enforcement.<area>.<op>`, for example `quota_enforcement.operations.debit`, `quota_enforcement.quotas.list` or
+`quota_enforcement.policies.update`, with `tenant_id` and, where the request names them, `quota_id`, `metric`,
+`policy_id`, and `item_count` for batch and bulk envelopes. Under it, as siblings:
+
+- `quota_enforcement.admission`: the operation's whole admission phase, every PDP call it makes. A batch or bulk
+  envelope admits each item with its own PDP call, so this one span covers all of them and records `item_count`; its
+  duration is the aggregate admission time, not one call.
+- `quota_enforcement.engine.evaluate`, for an evaluating operation: the storage attempts and any preparation retries
+  (`preparations` records how many), with `quota_enforcement.engine.prepare` (`policy_id`, `version`) under it when a
+  policy version is compiled.
+
+Each storage plugin call that writes is `quota_enforcement.storage.<method>`, under the evaluation span when it
+evaluates. Plain reads open no span: a bulk update or deactivate reads each target under its own item's scope, and its
+replay checks are paged reads, so read spans would grow with the envelope. Their time stays inside the operation span.
+No span is opened per item or per engine invocation: the engine runs inside the storage transaction, once per batch
+item, and is measured by `engine_evaluation_seconds` instead. Identifiers are span attributes only, never metric labels; the
+`SecurityContext`, lease tokens and metadata are never recorded.
 
 **Structured logging.** Tracing crate. The system never logs metric values, metadata content, or subject identifiers
 verbatim at INFO level.

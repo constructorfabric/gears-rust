@@ -72,7 +72,7 @@ fn topic_base_schema_matches_committed_file() {
 fn event_base_schema_matches_committed_file() {
     committed_matches(
         "gts.cf.core.events.event.v1~.schema.json",
-        &emitted(&EventV1::gts_schema_with_refs_as_string()),
+        &emitted(&EventV1::<()>::gts_schema_with_refs_as_string()),
         "`crate::gts::EventV1`",
     );
 }
@@ -105,70 +105,18 @@ fn generated_base_schemas_validate_with_gts() {
             emitted(&TopicV1::gts_schema_with_refs_as_string()),
         ),
         (
-            EventV1::TYPE_ID,
-            emitted(&EventV1::gts_schema_with_refs_as_string()),
+            EventV1::<()>::TYPE_ID,
+            emitted(&EventV1::<()>::gts_schema_with_refs_as_string()),
         ),
     ] {
         store
             .register_schema(id, &schema)
             .expect("register base schema");
     }
-    for id in [TopicV1::TYPE_ID, EventV1::TYPE_ID] {
+    for id in [TopicV1::TYPE_ID, EventV1::<()>::TYPE_ID] {
         store
             .validate_schema_with(id, gts::GtsRefValidation::None)
             .expect("generated base schema must use valid GTS keywords");
-    }
-}
-
-fn admit_event_with_subject_pattern(pattern: &str) -> Result<gts::ResolvedType, gts::StoreError> {
-    let mut store = gts::GtsStore::new();
-    let base = emitted(&EventV1::gts_schema_with_refs_as_string());
-    store.register_schema(EventV1::TYPE_ID, &base).unwrap();
-    let type_id = "gts.cf.core.events.event.v1~fabrikam.shop.orders.order_placed.v1~";
-    let derived = crate::gts::derived_event_type_schema(
-        type_id,
-        "gts.cf.core.events.topic.v1~fabrikam.shop._.orders.v1",
-        serde_json::json!({}),
-        &[pattern],
-    );
-    store.register_schema(type_id, &derived).unwrap();
-    store.validate_schema_with(type_id, gts::GtsRefValidation::None)
-}
-
-#[test]
-fn event_type_admission_accepts_concrete_wildcard_and_instance_subject_patterns() {
-    for pattern in [
-        "gts.*",
-        "gts.fabrikam.shop.orders.*",
-        "gts.fabrikam.shop.orders.order.v*",
-        "gts.fabrikam.shop.orders.order.v1.*",
-        "gts.fabrikam.shop.orders.order.v1~",
-        "gts.fabrikam.shop.orders.order.v1.2~*",
-        "gts.fabrikam.shop.orders.order.v1~fabrikam.shop.orders.*",
-        "gts.fabrikam.shop.orders.order.v1~fabrikam.shop.orders.special.v1~",
-        "gts.fabrikam.shop.orders.order.v1~fabrikam.shop.orders.named.v1",
-    ] {
-        gts::GtsIdPattern::try_new(pattern).expect("valid GTS pattern fixture");
-        admit_event_with_subject_pattern(pattern)
-            .unwrap_or_else(|error| panic!("subject pattern {pattern} must be admitted: {error}"));
-    }
-}
-
-#[test]
-fn event_type_admission_rejects_malformed_subject_patterns() {
-    let too_long = format!("gts.fabrikam.shop.orders.{}.v1~", "a".repeat(1024));
-    for pattern in [
-        "not-gts.*",
-        "gts.fabrikam.*.orders.order.v1~",
-        "gts.fabrikam.shop.orders.*~*",
-        "gts.fabrikam.shop.orders.ord*",
-        "gts.fabrikam.shop.orders.order.v01~",
-        &too_long,
-    ] {
-        assert!(
-            admit_event_with_subject_pattern(pattern).is_err(),
-            "invalid subject type pattern {pattern} must be rejected"
-        );
     }
 }
 
@@ -238,7 +186,7 @@ fn subscription_schema_rejects_malformed_and_non_event_type_selectors() {
 
 #[test]
 fn event_identifier_fields_accept_concrete_ids_but_reject_wildcards() {
-    let schema = emitted(&EventV1::gts_schema_with_refs_as_string());
+    let schema = emitted(&EventV1::<()>::gts_schema_with_refs_as_string());
     let validator = gts::XGtsRefValidator::new();
     for field in ["type", "subject_type"] {
         // Keeps the base's `$id`, which a `/$id` constraint resolves to.
@@ -265,22 +213,11 @@ fn event_identifier_fields_accept_concrete_ids_but_reject_wildcards() {
 // Worked examples
 // ---------------------------------------------------------------------------
 //
-// Both documents under `docs/schemas/examples/` are derived type schemas, which
-// `#[gts_type_schema]` cannot declare here: its derived form fills a generic slot
-// on its base (the `PluginV1<P>` pattern) and neither of these bases is generic.
-// So they stay hand-written JSON, and the checks below stand in for generation -
-// an example that stops deriving from its base, or claims a trait the base does
-// not declare, fails the build. `fabrikam` is the vendor this repository uses for
-// a third party (`docs/TOOLKIT_PLUGINS.md`), and is one of the four registered
-// with `gts-validator`.
+// The worked event schema is a hand-written owner example; the topic is an
+// instance document. Both must conform to the generated base schemas. Rust
+// derived declarations are exercised separately in `tests/gts_contract.rs`.
 
-/// Holds a committed derived-type example to the base it claims to derive from:
-/// it must `$ref` that base, its trait values must satisfy the base's generated
-/// `x-gts-traits-schema`, and it must declare no trait the base does not.
-///
-/// The examples stay JSON documents rather than Rust declarations because
-/// `#[gts_type_schema]`'s derived form fills a generic slot on its base (the
-/// `PluginV1<P>` pattern), and neither of these bases is generic.
+/// Checks an owner example's base reference and trait declarations.
 fn example_conforms_to_base(example_file: &str, base: &serde_json::Value, base_uri: &str) {
     let example = committed(example_file);
 
@@ -320,7 +257,7 @@ fn example_conforms_to_base(example_file: &str, base: &serde_json::Value, base_u
 fn committed_example_event_type_conforms_to_the_generated_base() {
     example_conforms_to_base(
         "examples/gts.cf.core.events.event.v1~fabrikam.shop.orders.order_placed.v1~.schema.json",
-        &emitted(&EventV1::gts_schema_with_refs_as_string()),
+        &emitted(&EventV1::<()>::gts_schema_with_refs_as_string()),
         toolkit_gts::gts_uri!("cf.core.events.event.v1~"),
     );
 }
@@ -362,58 +299,4 @@ fn a_topic_missing_a_required_property_is_rejected() {
         validator.iter_errors(&without_description).next().is_some(),
         "a topic without a description must not validate"
     );
-}
-
-/// A derived event type may only *narrow* its base. An empty payload schema
-/// admits any JSON value, which is wider than the base's `["object", "null"]`,
-/// and `types-registry` refuses the document with "Schema at `$.data` changes
-/// type incompatibly" - which stops the whole gear from booting, since the
-/// registry admits its configuration-seeded entities at startup.
-///
-/// That failure reached a running process once because nothing here covered
-/// this helper at all: every fixture and the mock build their event types
-/// through it, and none of them validates against the base.
-#[test]
-fn an_unconstrained_payload_renders_as_the_bases_own_type_not_as_any() {
-    let base_data =
-        committed("gts.cf.core.events.event.v1~.schema.json")["properties"]["data"]["type"].clone();
-
-    let derived = crate::gts::derived_event_type_schema(
-        "gts.cf.core.events.event.v1~example.eb.narrowing.foo.v1~",
-        "gts.cf.core.events.topic.v1~example.eb.narrowing.topic.v1",
-        serde_json::json!({}),
-        &["gts.example.eb.narrowing.subject.v1~"],
-    );
-
-    let narrowing = &derived["allOf"][1]["properties"]["data"];
-    assert_eq!(
-        narrowing["type"], base_data,
-        "stating no constraints means whatever the base allows, so the member \
-         carries the base's own type rather than an empty schema"
-    );
-    assert_ne!(
-        *narrowing,
-        serde_json::json!({}),
-        "an empty schema here is what registration refuses"
-    );
-}
-
-/// The other half: a payload contract the caller supplies is written through
-/// untouched, since narrowing is exactly what it is for.
-#[test]
-fn a_supplied_payload_contract_is_written_through_unchanged() {
-    let contract = serde_json::json!({
-        "type": "object",
-        "required": ["order_id"],
-        "properties": { "order_id": { "type": "string", "format": "uuid" } },
-    });
-
-    let derived = crate::gts::derived_event_type_schema(
-        "gts.cf.core.events.event.v1~example.eb.narrowing.foo.v1~",
-        "gts.cf.core.events.topic.v1~example.eb.narrowing.topic.v1",
-        contract.clone(),
-        &[],
-    );
-
-    assert_eq!(derived["allOf"][1]["properties"]["data"], contract);
 }

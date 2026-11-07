@@ -8,6 +8,7 @@ use super::engines::{EngineRegistry, PolicyArtifactCache};
 use super::error::DomainError;
 use super::pep::actions;
 use super::ports::metrics::{PolicyTransition, QeMetrics};
+use crate::domain::admission::admission_span;
 use async_trait::async_trait;
 use quota_enforcement_sdk::{
     EngineValidationInput, EnvironmentInputs, EventId, NotificationEvent, NotificationEventKind,
@@ -22,6 +23,7 @@ use std::sync::Arc;
 use time::OffsetDateTime;
 use toolkit_macros::domain_model;
 use toolkit_security::SecurityContext;
+use tracing::Instrument as _;
 
 /// Server-owned schema resolution and activation compatibility.
 #[async_trait]
@@ -101,6 +103,7 @@ impl PolicyManagement<'_> {
     /// # Errors
     /// Admission, bounded input, engine/schema validation, or atomic storage failure.
     // @cpt-flow:cpt-cf-quota-enforcement-flow-policy-write:p1
+    #[tracing::instrument(name = "quota_enforcement.policies.create", skip_all, fields(engine_id = %spec.engine_id))]
     pub async fn create(
         &self,
         ctx: &SecurityContext,
@@ -112,7 +115,11 @@ impl PolicyManagement<'_> {
             spec.comment.as_deref(),
         )?;
         self.comment(spec.description.as_deref())?;
-        let admitted = self.admission.admit_operator(ctx, actions::CREATE).await?;
+        let admitted = self
+            .admission
+            .admit_operator(ctx, actions::CREATE)
+            .instrument(admission_span(1))
+            .await?;
         // @cpt-begin:cpt-cf-quota-enforcement-flow-policy-write:p1:inst-pw-engine-lookup
         self.require_engine(&spec.engine_id)?;
         // @cpt-end:cpt-cf-quota-enforcement-flow-policy-write:p1:inst-pw-engine-lookup
@@ -165,6 +172,7 @@ impl PolicyManagement<'_> {
     /// Validate the complete merged configuration, then conditionally create a version.
     /// # Errors
     /// Admission, missing/deleted policy, validation, version conflict, or backend failure.
+    #[tracing::instrument(name = "quota_enforcement.policies.update", skip_all, fields(policy_id = %id))]
     pub async fn update(
         &self,
         ctx: &SecurityContext,
@@ -182,7 +190,11 @@ impl PolicyManagement<'_> {
                 "version and timeout must be positive",
             ));
         }
-        let admitted = self.admission.admit_operator(ctx, actions::UPDATE).await?;
+        let admitted = self
+            .admission
+            .admit_operator(ctx, actions::UPDATE)
+            .instrument(admission_span(1))
+            .await?;
         let current = self.active(&id).await?;
         if current.version != patch.if_match_version {
             return Err(self.storage_error(StorageError::VersionConflict {
@@ -232,6 +244,7 @@ impl PolicyManagement<'_> {
     /// # Errors
     /// Admission, incompatible/terminal/unknown version, or transactional failure.
     // @cpt-flow:cpt-cf-quota-enforcement-flow-policy-rollback:p1
+    #[tracing::instrument(name = "quota_enforcement.policies.rollback", skip_all, fields(policy_id = %id, target_version = target))]
     pub async fn rollback(
         &self,
         ctx: &SecurityContext,
@@ -243,6 +256,7 @@ impl PolicyManagement<'_> {
         let admitted = self
             .admission
             .admit_operator(ctx, actions::POLICY_ROLLBACK)
+            .instrument(admission_span(1))
             .await?;
         // Storage's order (deleted, unknown, rolled back), before catalogue drift can mask it.
         if self.storage.read_active_policy_by_id(&id).await?.is_none() {
@@ -307,6 +321,7 @@ impl PolicyManagement<'_> {
     /// # Errors
     /// Admission, protected global/unknown ID, or storage failure.
     // @cpt-flow:cpt-cf-quota-enforcement-flow-policy-delete:p1
+    #[tracing::instrument(name = "quota_enforcement.policies.delete", skip_all, fields(policy_id = %id))]
     pub async fn delete(
         &self,
         ctx: &SecurityContext,
@@ -314,7 +329,11 @@ impl PolicyManagement<'_> {
         comment: Option<String>,
     ) -> Result<(), DomainError> {
         self.comment(comment.as_deref())?;
-        let _admitted = self.admission.admit_operator(ctx, actions::DELETE).await?;
+        let _admitted = self
+            .admission
+            .admit_operator(ctx, actions::DELETE)
+            .instrument(admission_span(1))
+            .await?;
         let events = [event(Some(id.clone()), "deleted")];
         // @cpt-begin:cpt-cf-quota-enforcement-flow-policy-delete:p1:inst-prd-delete-return
         if matches!(
@@ -333,13 +352,18 @@ impl PolicyManagement<'_> {
     /// Read the active or a specific retained version after operator admission.
     /// # Errors
     /// Admission, unknown/deleted ID or missing version, or storage failure.
+    #[tracing::instrument(name = "quota_enforcement.policies.read", skip_all, fields(policy_id = %id))]
     pub async fn read(
         &self,
         ctx: &SecurityContext,
         id: &PolicyId,
         version: Option<u32>,
     ) -> Result<PolicyVersion, DomainError> {
-        let _admitted = self.admission.admit_operator(ctx, actions::GET).await?;
+        let _admitted = self
+            .admission
+            .admit_operator(ctx, actions::GET)
+            .instrument(admission_span(1))
+            .await?;
         match version {
             None => self.active(id).await,
             Some(version) => self
@@ -356,10 +380,17 @@ impl PolicyManagement<'_> {
         }
     }
 
+    /// The bounds this service runs with.
+    #[must_use]
+    pub const fn limits(&self) -> PolicyLimits {
+        self.limits
+    }
+
     /// Read immutable history with the storage-issued opaque cursor. An absent
     /// `limit` means the platform default, within the configured maximum.
     /// # Errors
     /// Admission, invalid pagination, missing policy, or backend failure.
+    #[tracing::instrument(name = "quota_enforcement.policies.list", skip_all, fields(policy_id = %id))]
     pub async fn list(
         &self,
         ctx: &SecurityContext,
@@ -381,7 +412,11 @@ impl PolicyManagement<'_> {
                 "page exceeds configured bounds",
             ));
         }
-        let _admitted = self.admission.admit_operator(ctx, actions::LIST).await?;
+        let _admitted = self
+            .admission
+            .admit_operator(ctx, actions::LIST)
+            .instrument(admission_span(1))
+            .await?;
         Ok(self.storage.list_policy_versions(id, page).await?)
     }
 

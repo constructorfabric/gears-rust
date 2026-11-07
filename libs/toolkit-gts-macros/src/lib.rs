@@ -270,12 +270,22 @@ fn submit(
     collector: Collector,
     newtype: &str,
     record: &TokenStream2,
+    gts_id: &TokenStream2,
 ) -> TokenStream2 {
     let global = quote! {
         #crate_path::inventory::submit! { #record }
     };
     match collector {
-        Collector::Global => global,
+        Collector::Global => quote! {
+            #global
+            #crate_path::inventory::submit! {
+                #crate_path::local::GlobalOnlyDeclaration {
+                    module_path: ::std::module_path!(),
+                    manifest_dir: ::std::env!("CARGO_MANIFEST_DIR"),
+                    gts_id: #gts_id,
+                }
+            }
+        },
         Collector::GlobalAndLocal => {
             let newtype = Ident::new(newtype, proc_macro2::Span::call_site());
             quote! {
@@ -332,7 +342,7 @@ fn expand_gts_type_schema(
             schema_fn: || #schema_fn_body,
         }
     };
-    let submit = submit(&crate_path, collector, "TypeSchema", &record);
+    let submit = submit(&crate_path, collector, "TypeSchema", &record, &type_id);
     Ok(quote! {
         #[#crate_path::__private::upstream_struct_to_gts_schema(#attr)]
         #input
@@ -615,7 +625,7 @@ fn expand_gts_instance(input: TokenStream2, collector: Collector) -> syn::Result
                 .expect("GTS instance must serialize cleanly"),
         }
     };
-    let submit_block = submit(&crate_path, collector, "Instance", &record);
+    let submit_block = submit(&crate_path, collector, "Instance", &record, &instance_id);
 
     if attrs.is_empty() {
         Ok(submit_block)
@@ -802,5 +812,11 @@ fn expand_gts_instance_raw(input: TokenStream2, collector: Collector) -> syn::Re
             }),
         }
     };
-    Ok(submit(&crate_path, collector, "Instance", &record))
+    Ok(submit(
+        &crate_path,
+        collector,
+        "Instance",
+        &record,
+        &instance_id,
+    ))
 }

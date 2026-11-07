@@ -80,3 +80,42 @@ fn the_character_count_stops_once_it_passes_the_limit() {
     assert_eq!(text_chars_up_to(&value, 5), 7);
     assert_eq!(text_chars_up_to(&value, 100), 12);
 }
+
+#[test]
+fn a_change_touches_the_stored_entity_it_changes_and_a_new_entity_touches_none() {
+    use crate::domain::plan::{Change, NodeKey, Property};
+
+    let stored = NodeKey("construct:t:stored".to_owned());
+    let property = Property::new("skills", serde_json::json!({ "name": "Rust" }));
+    let touching = [
+        Change::AddProperty {
+            entity: stored.clone(),
+            property: property.clone(),
+        },
+        Change::ReplaceProperty {
+            entity: stored.clone(),
+            property: property.clone(),
+        },
+        Change::ReplaceEntity {
+            old: stored.clone(),
+            key: NodeKey("construct:t:new".to_owned()),
+            properties: vec![property.clone()],
+        },
+        Change::RemoveEntity {
+            entity: stored.clone(),
+        },
+        Change::RemoveProperty {
+            entity: stored.clone(),
+            name: "skills".to_owned(),
+        },
+    ];
+
+    for change in &touching {
+        assert_eq!(change.touches(), Some(&stored), "{change:?}");
+    }
+    let new = Change::AddEntity {
+        key: NodeKey("construct:t:new".to_owned()),
+        properties: vec![property],
+    };
+    assert_eq!(new.touches(), None);
+}

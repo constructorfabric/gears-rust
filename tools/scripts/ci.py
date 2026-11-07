@@ -2,7 +2,7 @@
 """Cross-platform Gears CI utility (fmt, clippy, test, security, fuzz, E2E).
 
 For E2E this is the *orchestration engine*: `e2e-local` / `e2e-docker` build (or
-reuse) the server binary, start it from a config file, wait for `/healthz`, run
+reuse) the server binary, start it from a config file, wait for `/readyz`, run
 pytest against the live HTTP API, then tear the server down. Focused local runs
 are driven by `tools/scripts/run_e2e.py`, which calls this script's
 `e2e-local` subcommand for suites whose `launcher` is `e2e-launcher`.
@@ -34,6 +34,7 @@ from lib.platform import (
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 PYTHON = sys.executable or "python"
+E2E_STARTUP_TIMEOUT_SECS = 15
 
 
 def run_cmd(cmd, env=None, cwd=None):
@@ -374,11 +375,13 @@ def _print_log_file(path, label):
 
 
 def wait_for_health(
-    base_url, timeout_secs=30, server_process=None, error_log=None, output_log=None
+    base_url, timeout_secs=E2E_STARTUP_TIMEOUT_SECS, server_process=None,
+    error_log=None, output_log=None,
 ):
-    url = f"{base_url.rstrip('/')}/healthz"
+    # Liveness is served before migrations and application preparation complete.
+    url = f"{base_url.rstrip('/')}/readyz"
     step(f"Waiting for API to be ready at {url}")
-    start = time.time()
+    start = time.monotonic()
     attempt = 0
     while True:
         # Check if the server process crashed before we even connect
@@ -400,11 +403,13 @@ def wait_for_health(
                     print(f"API is ready (after {attempt} attempts)")
                     return
         except (URLError, HTTPError, ConnectionResetError, OSError) as e:
+            if isinstance(e, HTTPError):
+                e.close()
             # Server may be starting up or restarting
             if attempt % 10 == 0:  # Log every 10 attempts
                 print(f"Still waiting... (attempt {attempt}, error: {type(e).__name__})")
 
-        if time.time() - start > timeout_secs:
+        if time.monotonic() - start > timeout_secs:
             print(f"ERROR: The API readiness check timed out after {attempt} attempts")
             _print_log_file(output_log, "server stdout")
             _print_log_file(error_log, "server stderr")
@@ -534,7 +539,7 @@ def cmd_e2e(args):
             )
             docker_env_started = True
 
-            # Wait for healthz
+            # Wait for application readiness, not just the early probe listener.
             wait_for_health(base_url)
         else:
             step("Running E2E tests in local mode")
@@ -604,6 +609,11 @@ def cmd_e2e(args):
                 # Set RUST_LOG to enable debug logging for types_registry module
                 server_env = os.environ.copy()
                 server_env["RUST_LOG"] = "types_registry=debug,info"
+                # A wildcard bind address has no discoverable endpoint. The
+                # local launcher already knows the URL serving its REST gears.
+                server_env.setdefault(
+                    "APP__GEARS__API_GATEWAY__CONFIG__ADVERTISE_URI", base_url
+                )
                 # Match platform_headers before AppConfig loads the gateway config.
                 # config_or_default does not expand placeholders in the YAML secret.
                 if "E2E_INTERNAL_TOKEN" in server_env:
@@ -642,7 +652,6 @@ def cmd_e2e(args):
             # Wait for server to be ready, checking for early crash
             wait_for_health(
                 base_url,
-                timeout_secs=60,
                 server_process=server_process,
                 error_log=server_error_file,
                 output_log=server_log_file,

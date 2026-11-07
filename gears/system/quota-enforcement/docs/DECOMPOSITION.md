@@ -245,7 +245,7 @@ not here.
   - PATCH /v1/quota-enforcement/quotas/{id}
   - POST /v1/quota-enforcement/quotas/{id}/deactivate
   - GET /v1/quota-enforcement/quotas
-  - `QuotaManagerClientV1` Quota methods (`create_quota`, `update_quota`, `deactivate_quota`, `read_quotas`)
+  - `QuotaManagerApi` Quota methods (`create_quota`, `update_quota`, `deactivate_quota`, `read_quotas`)
 
 - **Sequences**:
 
@@ -280,7 +280,7 @@ not here.
   - Debit-Plan invariant enforcement at the Engine boundary with violation telemetry
   - `most-restrictive-wins` binding-Quota selection and validity-window prefilter; sandboxed cost-bounded `cel`
   - Static CEL checking against snapshotted request and constraint schemas, including pair compatibility
-  - Operator-only Policy surface (`QuotaOperatorClientV1`)
+  - Operator-only Policy surface (`QuotaOperatorApi`)
 
 - **Out of scope**:
   - Applying Debit Plans to counters (feature `consumption-operations`)
@@ -324,7 +324,7 @@ not here.
   - PATCH /v1/quota-enforcement/policies/{id}
   - POST /v1/quota-enforcement/policies/{id}/rollback
   - DELETE /v1/quota-enforcement/policies/{id}
-  - `QuotaOperatorClientV1` Policy methods; `QuotaResolutionEngineV1` plugin trait
+  - `QuotaOperatorApi` Policy methods; `QuotaResolutionEngineV1` plugin trait
 
 - **Sequences**:
 
@@ -406,8 +406,8 @@ not here.
   - POST /v1/quota-enforcement/operations/credit
   - POST /v1/quota-enforcement/operations/rollback
   - POST /v1/quota-enforcement/operations/preview
-  - `QuotaEnforcementClientV1` (`debit`, `rollback`, `evaluate_preview`)
-  - `QuotaManagerClientV1` (`credit`)
+  - `QuotaEnforcementApi` (`debit`, `rollback`, `evaluate_preview`)
+  - `QuotaManagerApi` (`credit`)
 
 - **Sequences**:
 
@@ -476,7 +476,7 @@ not here.
   - POST /v1/quota-enforcement/leases
   - POST /v1/quota-enforcement/leases/{token}/commit
   - POST /v1/quota-enforcement/leases/{token}/release
-  - `QuotaEnforcementClientV1` (`acquire_lease`, `commit_lease`, `release_lease`)
+  - `QuotaEnforcementApi` (`acquire_lease`, `commit_lease`, `release_lease`)
 
 - **Sequences**:
 
@@ -531,7 +531,7 @@ not here.
 
 - **API**:
   - POST /v1/quota-enforcement/operations/batch-debit
-  - `QuotaEnforcementClientV1` (`batch_debit`)
+  - `QuotaEnforcementApi` (`batch_debit`)
 
 - **Sequences**:
 
@@ -586,7 +586,7 @@ not here.
 
 - **API**:
   - POST /v1/quota-enforcement/snapshot
-  - `QuotaEnforcementClientV1` (`snapshot`)
+  - `QuotaEnforcementApi` (`snapshot`)
 
 - **Sequences**:
 

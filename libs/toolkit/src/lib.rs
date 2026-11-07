@@ -120,6 +120,7 @@ pub use toolkit_utils::var_expand;
 
 // Core gear contracts and traits
 pub mod contracts;
+mod grpc_registration;
 // Type-safe API operation builder
 pub mod api;
 pub use api::{
@@ -177,11 +178,13 @@ pub use backends::{
     BackendKind, GearRuntimeBackend, InstanceHandle, LocalProcessBackend, OopBackend,
     OopGearConfig, OopSpawnConfig,
 };
-pub use lifecycle::{Lifecycle, Runnable, Status, StopReason, WithLifecycle};
+pub use lifecycle::{
+    DEFAULT_READY_WARN_AFTER, Lifecycle, Runnable, Status, StopReason, WithLifecycle,
+};
 pub use plugins::GtsPluginSelector;
 pub use runtime::{
-    DEFAULT_SHUTDOWN_DEADLINE, DbOptions, Endpoint, GearInstance, GearManager, OopGearSpawnConfig,
-    OopSpawnOptions, RunOptions, ShutdownOptions, run,
+    DEFAULT_INIT_DEADLINE, DEFAULT_SHUTDOWN_DEADLINE, DbOptions, Endpoint, GearInstance,
+    GearManager, OopGearSpawnConfig, OopSpawnOptions, RunOptions, ShutdownOptions, run,
 };
 
 #[cfg(feature = "bootstrap")]

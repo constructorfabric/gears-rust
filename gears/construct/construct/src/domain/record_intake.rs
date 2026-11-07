@@ -19,10 +19,14 @@ use super::plan::{Origin, Plan};
 pub use super::refusal::{Place, Refusal, RefusalReason};
 use super::subject_settings::{SubjectKey, SubjectSettingsRepository, SubjectSettingsService};
 
+/// The GTS type a policy names records by: the connector record base type,
+/// which every record type derives from.
+pub(crate) const RECORD_TYPE: &str = construct_sdk::gts::RECORD_BASE_TYPE;
+
 /// Authorization resource type for sending records, scoped by tenant. The
 /// tenant is the one the connector names, not the connector's own.
 pub(crate) const RECORD_RESOURCE: ResourceType =
-    ResourceType::from_static("construct.record", &[pep_properties::OWNER_TENANT_ID]);
+    ResourceType::from_static(RECORD_TYPE, &[pep_properties::OWNER_TENANT_ID]);
 
 pub(crate) mod actions {
     pub const SEND: &str = "send";
@@ -227,6 +231,23 @@ pub enum DropStage {
     Admission,
     /// The profile writer.
     Writer,
+    /// The processing worker, outside any one stage: the record's processing
+    /// panicked.
+    Worker,
+}
+
+impl DropStage {
+    /// The stage's name in the drop event, in logs and in metrics.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Planner => "planner",
+            Self::Checks => "checks",
+            Self::Admission => "admission",
+            Self::Writer => "writer",
+            Self::Worker => "worker",
+        }
+    }
 }
 
 /// Why processing dropped a received record.

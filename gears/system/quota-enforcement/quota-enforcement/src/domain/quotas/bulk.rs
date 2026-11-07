@@ -24,7 +24,9 @@
 //! resolved subject set to fingerprint, and a key is unique per tenant and
 //! bulk operation. The payload digest covers the tenant and every item.
 
+use crate::domain::admission::admission_span;
 use std::collections::HashSet;
+use tracing::Instrument as _;
 
 use quota_enforcement_sdk::{
     BulkCreateEntry, BulkCreateEnvelope, BulkCreated, BulkDeactivateEntry, BulkDeactivateEnvelope,
@@ -449,6 +451,7 @@ impl QuotaManagement<'_> {
     /// error wrapped in [`DomainError::BulkItem`].
     // @cpt-flow:cpt-cf-quota-enforcement-flow-bulk-create:p2
     // @cpt-algo:cpt-cf-quota-enforcement-algo-bulk-envelope:p2
+    #[tracing::instrument(name = "quota_enforcement.quotas.bulk_create", skip_all, fields(tenant_id = %request.tenant_id, item_count = request.items.len()))]
     pub async fn bulk_create(
         &self,
         ctx: &SecurityContext,
@@ -475,6 +478,7 @@ impl QuotaManagement<'_> {
                 actions::CREATE,
                 AdmissionTarget::tenant(tenant),
             )
+            .instrument(admission_span(request.items.len()))
             .await?;
         // @cpt-end:cpt-cf-quota-enforcement-algo-bulk-envelope:p2:inst-qbe-authz
         // @cpt-end:cpt-cf-quota-enforcement-flow-bulk-create:p2:inst-qbc-request
@@ -617,6 +621,7 @@ impl QuotaManagement<'_> {
     /// As [`QuotaManagement::bulk_create`], with the item errors of
     /// [`QuotaManagement::update`].
     // @cpt-flow:cpt-cf-quota-enforcement-flow-bulk-update:p2
+    #[tracing::instrument(name = "quota_enforcement.quotas.bulk_update", skip_all, fields(tenant_id = %request.tenant_id, item_count = request.items.len()))]
     pub async fn bulk_update(
         &self,
         ctx: &SecurityContext,
@@ -627,7 +632,10 @@ impl QuotaManagement<'_> {
         self.check_envelope(request.items.len(), &request.idempotency_key)?;
         self.check_configured_limit(request.items.len())?;
         let ids: Vec<QuotaId> = request.items.iter().map(|item| item.quota_id).collect();
-        let targets = self.admit_items(ctx, actions::UPDATE, &ids).await?;
+        let targets = self
+            .admit_items(ctx, actions::UPDATE, &ids)
+            .instrument(admission_span(ids.len()))
+            .await?;
         // @cpt-end:cpt-cf-quota-enforcement-flow-bulk-update:p2:inst-qbu-request
         let payload = EnvelopeDigest {
             tenant_id: tenant,
@@ -717,6 +725,7 @@ impl QuotaManagement<'_> {
     /// As [`QuotaManagement::bulk_create`], with the item errors of
     /// [`QuotaManagement::deactivate`].
     // @cpt-flow:cpt-cf-quota-enforcement-flow-bulk-deactivate:p2
+    #[tracing::instrument(name = "quota_enforcement.quotas.bulk_deactivate", skip_all, fields(tenant_id = %request.tenant_id, item_count = request.items.len()))]
     pub async fn bulk_deactivate(
         &self,
         ctx: &SecurityContext,
@@ -727,7 +736,10 @@ impl QuotaManagement<'_> {
         self.check_envelope(request.items.len(), &request.idempotency_key)?;
         self.check_configured_limit(request.items.len())?;
         let ids: Vec<QuotaId> = request.items.iter().map(|item| item.quota_id).collect();
-        let targets = self.admit_items(ctx, actions::DEACTIVATE, &ids).await?;
+        let targets = self
+            .admit_items(ctx, actions::DEACTIVATE, &ids)
+            .instrument(admission_span(ids.len()))
+            .await?;
         // @cpt-end:cpt-cf-quota-enforcement-flow-bulk-deactivate:p2:inst-qbd-request
         let payload: EnvelopeDigest<'_, ()> = EnvelopeDigest {
             tenant_id: tenant,

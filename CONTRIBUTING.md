@@ -283,6 +283,19 @@ export RUST_BACKTRACE=full
 ```
 
 
+### 2.6.1. Git Hooks
+
+The first `make` run installs git hooks from `.githooks/` as symlinks into your git hooks directory (it respects `core.hooksPath` and never overwrites an existing hook). They run the checks that most often fail in CI, scoped to what changed:
+
+- `pre-commit` (staged files): rustfmt, `cfs validate`, offline lychee link check, CRLF.
+- `pre-push` (changes vs a base ref): clippy on the changed workspace packages and the workspace packages that depend on them, architecture lints (`cargo gears lint --dylint`), forbidden words (needs bash >= 4 and jq: `brew install bash jq` on macOS).
+
+The `pre-push` base is the first ref found of `$GEARS_HOOKS_BASE`, `git config gears.hooksBase`, `upstream/main`, `origin/main`, `main` (an explicit override that does not exist skips the checks). It is never fetched, so in a fork keep `upstream/main` up to date (it is preferred over the fork's `origin/main`) or set the override. Changed packages that are not workspace members (such as `tools/fuzz`) are skipped; without `jq` or when `cargo metadata` fails, clippy runs on the whole workspace instead (slower, but correct). dylint runs workspace-wide on any push touching Rust/Cargo files, plus the OAGW `-F cluster` run of `make dylint` when OAGW is affected. Measured on an Apple M2 Pro with 32 GB: with a cold cache (after a toolchain update or `cargo clean`) clippy on the whole workspace takes about 6 minutes, dylint about 4.5 and the OAGW pass about 1. With a warm cache, a push touching one gear or an SDK takes 20 seconds to 1.5 minutes of clippy (the upper end right after a build with a different package set, because features unify differently), a change to a crate most of the workspace depends on (such as the toolkit macros) about 3 minutes, and dylint a few seconds.
+
+A check whose tool is not installed is skipped with a notice. Bypass with `git commit --no-verify` / `git push --no-verify`. Opt out with `GEARS_NO_HOOKS=1` and remove with `make uninstall-hooks`. The hooks run only in clones where `make` (or `make install-hooks`) ran once, which records `gears.hooks=true` in that clone's local git config; `make uninstall-hooks` disables them for that clone persistently (the auto-install respects it) and `make install-hooks` turns them back on. In other repos sharing the same hooks directory (global `core.hooksPath`) the hooks do nothing.
+
+When editing `.githooks`, run `make shellcheck` (installed by `make setup`, pinned to the CI version) and `sh .githooks/tests/run.sh`; CI runs both (the tests on Linux, macOS and Windows Git Bash).
+
 ### 2.7. Sign Your Commits (DCO)
 
 This project uses the Developer Certificate of Origin (DCO) version 1.1.

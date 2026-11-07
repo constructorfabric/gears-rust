@@ -9,10 +9,10 @@
 use event_broker::test_support::EventBrokerHarness;
 use event_broker::test_support::type_registry::registry_holding;
 use event_broker_sdk::EventBrokerError;
-use event_broker_sdk::gts::{EventV1, TopicV1};
+use event_broker_sdk::gts::{EventV1, EventV1Traits, TopicV1};
 use gts::GtsIdPattern;
 use serde_json::json;
-use toolkit_gts::GtsSchema;
+use toolkit_gts::{GtsSchema, gts_type_schema};
 use toolkit_security::PlatformSecurityContext;
 use types_registry_sdk::{ListEntitiesRequest, PlatformTypesRegistryApiExt};
 
@@ -30,20 +30,18 @@ toolkit_gts::inventory::submit! {
     }
 }
 
-toolkit_gts::inventory::submit! {
-    toolkit_gts::InventoryTypeSchema {
-        type_id: PROBE_EVENT_TYPE,
-        schema_fn: || {
-            event_broker_sdk::gts::derived_event_type_schema(
-                PROBE_EVENT_TYPE,
-                PROBE_TOPIC,
-                json!({}),
-                &[],
-            )
-            .to_string()
-        },
-    }
-}
+#[gts_type_schema(
+    dir_path = "schemas",
+    base = EventV1,
+    type_id = toolkit_gts::gts_id!("cf.core.events.event.v1~x.eb.inventory.probe.v1~"),
+    description = "A gear contract linked into the test binary.",
+    properties = "",
+    traits = EventV1Traits::builder()
+        .with_topic(PROBE_TOPIC)
+        .with_allowed_subject_types(Vec::<String>::new())
+        .build(),
+)]
+struct ProbeEventV1;
 
 fn pattern(pattern: &str) -> ListEntitiesRequest {
     ListEntitiesRequest::matching(GtsIdPattern::try_new(pattern).expect("a valid GTS pattern"))
@@ -94,7 +92,7 @@ async fn registry_holding_seeds_only_the_broker_base_types() {
         .map(|schema| schema.type_id.as_ref().to_owned())
         .collect();
     event_schemas.sort();
-    assert_eq!(event_schemas, vec![EventV1::TYPE_ID.to_owned()]);
+    assert_eq!(event_schemas, vec![EventV1::<()>::TYPE_ID.to_owned()]);
 
     let mut topic_instances: Vec<String> = registry
         .list_instances(&ctx, pattern("gts.cf.core.events.topic.v1~*"))

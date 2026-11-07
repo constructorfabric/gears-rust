@@ -94,6 +94,10 @@ pub async fn run_server(config: AppConfig) -> Result<()> {
         None => None,
     };
 
+    // Apply configured lifecycle deadlines (absent fields keep framework defaults).
+    let init_deadline = config.server.init_deadline();
+    let shutdown_deadline = config.server.shutdown_deadline();
+
     // Run the ToolKit runtime with the root cancellation token.
     // Shutdown is driven by the signal handler spawned above, not by ShutdownOptions::Signals.
     // OoP gears are spawned after parent publication, application startup and
@@ -105,7 +109,9 @@ pub async fn run_server(config: AppConfig) -> Result<()> {
         instance_id,
     )
     .with_oop(oop_options)
-    .with_internal_token_provider(internal_token_provider);
+    .with_internal_token_provider(internal_token_provider)
+    .with_init_deadline(init_deadline)
+    .with_shutdown_deadline(shutdown_deadline);
 
     let result = run(run_options).await;
 
@@ -245,6 +251,9 @@ async fn publish_gts(
     options: &PublishGtsOptions,
     cancel: &CancellationToken,
 ) -> Result<()> {
+    // Match startup validation without running gear lifecycle hooks.
+    let registry = crate::registry::GearRegistry::discover_and_build()?;
+    validate_deployment_configuration(&registry, config)?;
     let internal_auth = platform_credential(config)?;
     let (_, provider) = super::oop::build_platform_credentials(internal_auth, cancel).await?;
     let provider = provider.ok_or_else(|| {
@@ -268,6 +277,16 @@ async fn publish_gts(
     )
     .await?;
     publication_result(&report)
+}
+
+fn validate_deployment_configuration(
+    registry: &crate::registry::GearRegistry,
+    config: &dyn crate::config::ConfigProvider,
+) -> Result<()> {
+    for entry in registry.gears() {
+        entry.validate_gts_publication_config(config)?;
+    }
+    Ok(())
 }
 
 /// The platform credential `publish-gts` sends: `oop_http.internal_auth`.
@@ -466,6 +485,30 @@ pub fn init_procedure(config: &AppConfig) -> Result<()> {
 mod publish_gts_tests {
     use super::*;
     use crate::gts_publication::deployment::{GtsDeploymentOutcome, GtsDeploymentReport};
+
+    #[test]
+    fn deployment_rejects_publication_options_on_a_nonpublishing_gear() {
+        struct PlainGear;
+        #[async_trait::async_trait]
+        impl crate::Gear for PlainGear {
+            async fn init(&self, _ctx: &crate::GearCtx) -> Result<()> {
+                panic!("deployment validation must not initialize gears")
+            }
+        }
+
+        let mut builder = crate::registry::RegistryBuilder::default();
+        builder.register_core_with_meta("plain-gear", &[], Arc::new(PlainGear));
+        let registry = builder.build_topo_sorted().unwrap();
+        let mut config = AppConfig::default();
+        validate_deployment_configuration(&registry, &config).unwrap();
+        config.gears.insert(
+            "plain-gear".to_owned(),
+            serde_json::json!({"config": {"gts_publication": {"timeout": "1s"}}}),
+        );
+        let error = validate_deployment_configuration(&registry, &config).unwrap_err();
+        assert!(error.to_string().contains("plain-gear"), "{error}");
+        assert!(error.to_string().contains("gts_publication"), "{error}");
+    }
 
     #[test]
     fn publish_gts_needs_the_platform_credential() {

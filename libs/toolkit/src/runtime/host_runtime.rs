@@ -7,7 +7,7 @@
 //!    wiring, `post_init`, initial gRPC services, `start`.
 //! 3. Application preparation: `pre_init`, migrations, registry-client wiring,
 //!    then concurrent GTS publication. All manifests must be admitted before
-//!    any application `init`; the system group keeps serving if admission fails.
+//!    any application `init`; failed admission stops the process for restart.
 //! 4. Application `init`, remaining client wiring, legacy registry finalization,
 //!    `post_init`, REST composition, late gRPC installation, `start`.
 //! 5. In-process host: advertise REST providers, then spawn configured children
@@ -28,6 +28,13 @@
 //!   `post_init` and `start` in both profiles.
 //!
 //! Prefer `consumes` for inter-gear calls; use `deps` for local init ordering.
+
+#[path = "host_runtime_rest.rs"]
+mod rest_bootstrap;
+
+#[path = "rest_advertiser.rs"]
+mod rest_advertiser;
+use rest_advertiser::RestAdvertiser;
 
 use axum::Router;
 use std::collections::HashSet;
@@ -103,27 +110,92 @@ const LATE_GRPC_INSTALL_TIMEOUT: std::time::Duration = std::time::Duration::from
 enum AppStartup {
     /// Every application gear initialized and started.
     Started,
-    /// A publication was refused or expired: no application `init` ran. The
-    /// system group keeps serving until shutdown, after which the run returns
-    /// this [`RegistryError::ApplicationGroupNotStarted`].
+    /// Publication failed before application init; cleanup precedes the error return.
     Failed(RegistryError),
     /// Shutdown came first.
     Cancelled,
 }
 
-/// The failure of an application group that did not start, logged once here
-/// with its cause: the system group keeps serving until shutdown.
+/// Log the preparation failure before cleanup and error return.
 fn startup_failure(outcome: AppStartup) -> Option<RegistryError> {
     match outcome {
         AppStartup::Failed(failure) => {
             tracing::error!(
                 error = %failure,
-                "the application group did not start; serving the system group only until shutdown"
+                "the application group did not start; stopping the process"
             );
             Some(failure)
         }
         AppStartup::Started | AppStartup::Cancelled => None,
     }
+}
+
+/// Default per-gear init deadline (10 minutes); see [`HostRuntime::with_init_deadline`].
+pub const DEFAULT_INIT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Verdict of a force-exit watchdog's wait, kept free of `process::exit` so the
+/// decision is unit-testable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WatchdogVerdict {
+    /// Disarmed in time: the guarded work finished or its future was dropped.
+    Disarmed,
+    /// The deadline elapsed first; the caller must force-exit.
+    TimedOut,
+}
+
+/// Block until the watchdog is disarmed (`disarm_rx` signalled or dropped) or
+/// `deadline` elapses. Runs on an OS thread (see [`arm_force_exit_watchdog`]) so
+/// the bound holds even when the guarded code blocks a runtime worker
+/// synchronously, which an async timer cannot observe.
+fn watchdog_verdict(
+    disarm_rx: &std::sync::mpsc::Receiver<()>,
+    deadline: std::time::Duration,
+) -> WatchdogVerdict {
+    match disarm_rx.recv_timeout(deadline) {
+        Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => WatchdogVerdict::Disarmed,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => WatchdogVerdict::TimedOut,
+    }
+}
+
+/// Grace the force-exit diagnostic gets before the process exits regardless.
+const FORCE_EXIT_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Log a force-exit diagnostic and terminate the process with code 1.
+///
+/// A backstop timer is armed *first* so a wedged writer (e.g. a full `stderr`
+/// pipe) can delay the message but not the exit. `message` is mirrored to
+/// `stderr` so it survives tracing being off or unflushed.
+fn force_exit(message: &str) -> ! {
+    std::thread::spawn(|| {
+        std::thread::sleep(FORCE_EXIT_GRACE);
+        std::process::exit(1);
+    });
+
+    tracing::error!("{message}");
+    {
+        use std::io::Write as _;
+        _ = writeln!(std::io::stderr().lock(), "ERROR {message}");
+    }
+
+    std::process::exit(1);
+}
+
+/// Arm a thread that [`force_exit`]s unless the returned sender is dropped within
+/// `deadline`. Dropping it (normal completion *or* the guarded future being
+/// cancelled) disarms the watchdog, so a cancelled phase never force-exits.
+/// Shared by the init and stop phases.
+#[must_use = "bind the returned sender for the guarded region; dropping it disarms the watchdog"]
+fn arm_force_exit_watchdog(
+    deadline: std::time::Duration,
+    message: String,
+) -> std::sync::mpsc::Sender<()> {
+    let (disarm_tx, disarm_rx) = std::sync::mpsc::channel::<()>();
+    std::thread::spawn(move || {
+        if watchdog_verdict(&disarm_rx, deadline) == WatchdogVerdict::TimedOut {
+            force_exit(&message);
+        }
+    });
+    disarm_tx
 }
 
 /// Owns the lifecycle orchestration for `ToolKit`: encapsulates all runtime
@@ -173,6 +245,9 @@ pub struct HostRuntime {
     oop_options: Option<OopSpawnOptions>,
     /// Maximum time allowed for graceful shutdown before hard-stop signal is sent.
     shutdown_deadline: std::time::Duration,
+    /// Per-gear deadline for context construction and [`Gear::init`](crate::contracts::Gear::init).
+    /// Expiry force-exits the process (see [`DEFAULT_INIT_DEADLINE`]).
+    init_deadline: std::time::Duration,
 }
 
 impl HostRuntime {
@@ -226,7 +301,7 @@ impl HostRuntime {
             gears_cfg,
             dep_checker,
             gts_admitted,
-            advertiser: Arc::new(RestAdvertiser::new(instance_id)),
+            advertiser: Arc::new(RestAdvertiser::new(instance_id, &owned)),
             start_called: parking_lot::Mutex::new(HashSet::new()),
             wired: parking_lot::Mutex::new(HashSet::new()),
             #[cfg(test)]
@@ -237,7 +312,23 @@ impl HostRuntime {
             db_options,
             oop_options,
             shutdown_deadline: DEFAULT_SHUTDOWN_DEADLINE,
+            init_deadline: DEFAULT_INIT_DEADLINE,
         }
+    }
+
+    /// Set the per-gear deadline for context construction and [`Gear::init`](crate::contracts::Gear::init).
+    ///
+    /// A stuck `.await` returns [`RegistryError::InitTimeout`]; a synchronous
+    /// block force-exits the process. Defaults to [`DEFAULT_INIT_DEADLINE`].
+    #[must_use]
+    pub fn with_init_deadline(mut self, deadline: std::time::Duration) -> Self {
+        self.init_deadline = deadline;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn init_deadline(&self) -> std::time::Duration {
+        self.init_deadline
     }
 
     /// Set a custom shutdown deadline for graceful gear stop.
@@ -504,6 +595,9 @@ impl HostRuntime {
     }
 
     /// INIT phase: initialize `entries` in the given order.
+    ///
+    /// Each gear's context construction and [`Gear::init`] share a force-exit
+    /// watchdog bounded by [`Self::init_deadline`] (see [`Self::init_gear`]).
     async fn run_init_phase_for(&self, entries: &[&GearEntry]) -> Result<(), RegistryError> {
         tracing::info!(gears = entries.len(), "Phase: init");
 
@@ -512,27 +606,70 @@ impl HostRuntime {
                 tracing::warn!("Init phase cancelled by signal");
                 return Err(RegistryError::Cancelled);
             }
-            let ctx =
-                self.ctx_builder
-                    .for_gear(entry.name)
-                    .await
-                    .map_err(|e| RegistryError::Init {
-                        gear: entry.name,
-                        source: e,
-                    })?;
             tracing::info!(gear = entry.name, "Initializing a gear...");
-            entry
-                .core
-                .init(&ctx)
-                .await
-                .map_err(|e| RegistryError::Init {
-                    gear: entry.name,
-                    source: e,
-                })?;
+            self.init_gear(entry).await?;
             tracing::info!(gear = entry.name, "Initialized a gear.");
         }
 
         Ok(())
+    }
+
+    /// Run a single gear's context construction and `init()` under a two-tier
+    /// bound on [`Self::init_deadline`]:
+    ///
+    /// - An async `tokio::time::timeout` catches the common case (a stuck
+    ///   `.await`) and returns a recoverable [`RegistryError::InitTimeout`].
+    /// - An OS-thread force-exit watchdog, armed at a *longer* deadline, is the
+    ///   only thing that can catch init blocking a worker *synchronously* (where
+    ///   the async timer can never fire); it disarms when init finishes or this
+    ///   future is dropped.
+    async fn init_gear(&self, entry: &GearEntry) -> Result<(), RegistryError> {
+        let gear_name = entry.name;
+        let deadline = self.init_deadline;
+        // Longer than the async bound so the recoverable path wins when the timer
+        // can actually fire.
+        let backstop = deadline.saturating_mul(2);
+        let _watchdog = arm_force_exit_watchdog(
+            backstop,
+            format!(
+                "init timed out; the gear appears hung, force exiting gear={gear_name} timeout_secs={}",
+                backstop.as_secs()
+            ),
+        );
+
+        let init =
+            async {
+                let ctx = self.ctx_builder.for_gear(entry.name).await.map_err(|e| {
+                    RegistryError::Init {
+                        gear: entry.name,
+                        source: e,
+                    }
+                })?;
+
+                entry
+                    .core
+                    .init(&ctx)
+                    .await
+                    .map_err(|e| RegistryError::Init {
+                        gear: entry.name,
+                        source: e,
+                    })
+            };
+
+        match tokio::time::timeout(deadline, init).await {
+            Ok(result) => result,
+            Err(_elapsed) => {
+                tracing::error!(
+                    gear = gear_name,
+                    timeout_secs = deadline.as_secs(),
+                    "init timed out waiting on the gear; returning an error"
+                );
+                Err(RegistryError::InitTimeout {
+                    gear: gear_name,
+                    timeout: deadline,
+                })
+            }
+        }
     }
 
     /// Consumer proxy-wiring phase (eventual readiness).
@@ -838,37 +975,15 @@ impl HostRuntime {
     fn build_gts_manifests(&self) -> Result<Vec<GtsPublicationPlan>, RegistryError> {
         let mut manifests = Vec::new();
         for entry in self.registry.gears() {
+            entry
+                .validate_gts_publication_config(self.gears_cfg.as_ref())
+                .map_err(|source| RegistryError::Publication {
+                    gear: entry.name,
+                    source,
+                })?;
             let Some(publication) = entry.caps.query::<GtsPublicationCap>() else {
-                // The section would be stripped from the typed configuration and
-                // never read: a misplaced policy, refused rather than ignored.
-                if self
-                    .gears_cfg
-                    .get_gear_config(entry.name)
-                    .and_then(|gear| gear.get("config"))
-                    .and_then(|config| config.get(crate::config::GTS_PUBLICATION_CONFIG_KEY))
-                    .is_some()
-                {
-                    return Err(RegistryError::Publication {
-                        gear: entry.name,
-                        source: anyhow::anyhow!(
-                            "gears.{}.config.{} is set, but this gear publishes no GTS \
-                             documents: it declares no `gts_publication(...)`",
-                            entry.name,
-                            crate::config::GTS_PUBLICATION_CONFIG_KEY
-                        ),
-                    });
-                }
                 continue;
             };
-            if entry.is_system() {
-                return Err(RegistryError::Publication {
-                    gear: entry.name,
-                    source: anyhow::anyhow!(
-                        "a system gear initializes before the GTS barrier, so it cannot \
-                         publish GTS documents with `gts_publication(...)`"
-                    ),
-                });
-            }
             let descriptor = publication.descriptor();
             let manifest = descriptor
                 .build_gts_manifest(self.gears_cfg.as_ref())
@@ -945,6 +1060,7 @@ impl HostRuntime {
             if outcome != crate::discovery::WireOutcome::Remote {
                 continue;
             }
+            self.check_child_registry_dependency(publisher.owner_gear, publisher.dep_gear)?;
             let advertised_here = self.registry.gears().iter().any(|entry| {
                 entry.name == publisher.dep_gear
                     && entry
@@ -975,6 +1091,40 @@ impl HostRuntime {
             .iter()
             .find(|e| e.name == gear)
             .map(GearEntry::is_system)
+    }
+
+    /// A remote publisher cannot discover its own unstarted child. An explicit
+    /// endpoint may name an already-running external registry instead.
+    fn check_child_registry_dependency(
+        &self,
+        publisher: &'static str,
+        provider: &str,
+    ) -> Result<(), RegistryError> {
+        let child = self.oop_options.as_ref().is_some_and(|options| {
+            options
+                .gears
+                .iter()
+                .any(|child| child.gear_name == provider)
+        });
+        if !child {
+            return Ok(());
+        }
+        let wiring = read_consumer_wiring(self.gears_cfg.as_ref(), publisher, provider).map_err(
+            |source| RegistryError::Publication {
+                gear: publisher,
+                source,
+            },
+        )?;
+        if wiring.is_some_and(|wiring| wiring.endpoint.is_some()) {
+            return Ok(());
+        }
+        Err(RegistryError::Publication {
+            gear: publisher,
+            source: anyhow::anyhow!(
+                "'{publisher}' publishes to child '{provider}', which starts only after parent \
+                 preparation; use an in-process registry or an already-running external registry"
+            ),
+        })
     }
 
     /// Reject early wiring to a local application provider before any gear runs:
@@ -1010,6 +1160,9 @@ impl HostRuntime {
                         descriptor.provider
                     ),
                 });
+            }
+            if !manifest.is_empty() && self.local_group(descriptor.provider).is_none() {
+                self.check_child_registry_dependency(descriptor.gear, descriptor.provider)?;
             }
         }
         Ok(())
@@ -1194,50 +1347,18 @@ impl HostRuntime {
                 gear: host_entry.name,
                 source: e,
             })?;
-        let hc_registry = Arc::new(
-            crate::healthcheck::RestHealthcheckRegistry::with_cancellation(
-                host_ctx.cancellation_token().clone(),
-            ),
-        );
-        // Include unresolved consumed dependencies, application preparation and
-        // draining in the gateway's aggregated readiness report.
-        hc_registry.register(
-            "readiness",
-            Arc::new(super::readiness::ReadinessHealthcheck::new(Arc::clone(
-                &self.dep_checker,
-            ))),
-        );
-        let mut router = host
+        let hc_registry = self.rest_health_registry();
+        let router = host
             .rest_prepare(&host_ctx, Router::new(), Arc::clone(&hc_registry))
             .map_err(|source| RegistryError::RestPrepare {
                 gear: host_entry.name,
                 source,
             })?;
 
-        // The router stays local to this single composition phase: the host's
-        // prepared routes and layers are the base for every provider's routes.
-        for entry in self.registry.gears() {
-            let Some(rest) = entry.caps.query::<RestApiCap>() else {
-                continue;
-            };
-            let ctx = self
-                .ctx_builder
-                .for_gear(entry.name)
-                .await
-                .map_err(|source| RegistryError::RestRegister {
-                    gear: entry.name,
-                    source,
-                })?;
-            router = rest
-                .register_rest(&ctx, router, host.as_registry())
-                .map_err(|source| RegistryError::RestRegister {
-                    gear: entry.name,
-                    source,
-                })?;
-            if let Some(check) = rest.healthcheck(&ctx) {
-                hc_registry.register(entry.name, check);
-            }
-        }
+        let all: Vec<_> = self.registry.gears().iter().collect();
+        let router = self
+            .add_rest_routes(router, &hc_registry, &all, host.as_registry())
+            .await?;
 
         // Host finalize: attach /openapi.json and /docs, persist Router if needed (no server start)
         host.rest_finalize(&host_ctx, router, hc_registry)
@@ -1527,10 +1648,9 @@ impl HostRuntime {
         Ok(())
     }
 
-    /// Run the stop phase with a watchdog that force-exits the process if the
-    /// stop phase hangs on a blocking syscall. The watchdog is disarmed whether
-    /// the stop phase succeeds or fails, so a failing stop phase does not leave
-    /// the watchdog active and eventually force-exit the process.
+    /// Run the stop phase under a force-exit watchdog so a stop that hangs on a
+    /// blocking syscall cannot wedge shutdown. The watchdog disarms when the
+    /// phase returns (success or failure) or if this future is dropped.
     async fn run_stop_phase_guarded(&self) -> Result<(), RegistryError> {
         let gear_count = u32::try_from(self.registry.gears().len().max(1)).unwrap_or(1);
         let stop_timeout = self
@@ -1539,32 +1659,15 @@ impl HostRuntime {
             .and_then(|d| d.checked_add(std::time::Duration::from_secs(5)))
             .unwrap_or(self.shutdown_deadline);
 
-        // Use a channel to arm/disarm the watchdog. If the lifecycle future is
-        // dropped before the stop phase finishes (e.g. an outer timeout), the
-        // sender is dropped and the watchdog exits without killing the process.
-        let (disarm_tx, disarm_rx) = std::sync::mpsc::channel::<()>();
-        std::thread::spawn(move || {
-            match disarm_rx.recv_timeout(stop_timeout) {
-                Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                    // Stop phase completed, or the lifecycle future was cancelled.
-                }
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                    tracing::warn!(
-                        timeout_secs = stop_timeout.as_secs(),
-                        "shutdown: stop phase timed out, force exiting"
-                    );
-                    std::process::exit(1);
-                }
-            }
-        });
+        let _watchdog = arm_force_exit_watchdog(
+            stop_timeout,
+            format!(
+                "shutdown: stop phase timed out, force exiting timeout_secs={}",
+                stop_timeout.as_secs()
+            ),
+        );
 
-        let stop_result = self.run_stop_phase().await;
-        // Disarm the watchdog before propagating the stop-phase result. This runs
-        // for both success and failure so a failing stop phase does not leave the
-        // watchdog armed and eventually force-exit the process.
-        let _ = disarm_tx.send(()).ok();
-
-        stop_result
+        self.run_stop_phase().await
     }
 
     /// End a pending preparation, the runtime's own tasks and the gRPC
@@ -1572,7 +1675,25 @@ impl HostRuntime {
     /// stop every started gear. Runs after a failed startup as at shutdown;
     /// it never cancels the caller's token.
     async fn shut_down(&self) -> Result<(), RegistryError> {
+        self.dep_checker.set_draining(true);
         self.owned.cancel();
+        // Stop discovery traffic before joining a potentially slow HTTP drain.
+        if tokio::time::timeout(self.shutdown_deadline, self.deregister_rest_providers())
+            .await
+            .is_err()
+        {
+            tracing::warn!("REST provider deregistration timed out");
+        }
+        if let Some((entry, host)) = self.rest_host() {
+            match tokio::time::timeout(self.shutdown_deadline, host.rest_shutdown_bootstrap()).await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    tracing::warn!(gear = entry.name, %error, "REST bootstrap shutdown failed");
+                }
+                Err(_) => tracing::warn!(gear = entry.name, "REST bootstrap shutdown timed out"),
+            }
+        }
         self.grpc_installers.close();
         if let Some(oop) = &self.oop_options {
             // Bound child shutdown so in-process gears still stop if reaping hangs.
@@ -1739,11 +1860,6 @@ impl HostRuntime {
         };
 
         if !self.advertiser.is_enabled() {
-            if !self.advertiser.first_attempt() {
-                // An earlier stage found no endpoint or directory: the host
-                // already started, neither appears later.
-                return Ok(());
-            }
             let Some(endpoint) = self.wait_for_rest_endpoint(&host).await else {
                 tracing::warn!(
                     "directory-register: REST host endpoint unavailable; skipping REST provider registration"
@@ -1851,8 +1967,10 @@ impl HostRuntime {
         };
         let failed = startup_failure(outcome);
 
-        // Wait for cancellation
-        self.cancel.cancelled().await;
+        // Return failed preparation to the supervisor after cleanup.
+        if failed.is_none() {
+            self.cancel.cancelled().await;
+        }
 
         // Stop phase with hard timeout. Blocking stop implementations are
         // guarded by a watchdog thread so a hang cannot block shutdown,
@@ -1898,6 +2016,7 @@ impl HostRuntime {
         let manifests = self.build_gts_manifests()?;
         let regs = self.consumer_registrations();
         self.check_wiring_groups(&manifests, &regs)?;
+        let mut rest = self.bind_rest_bootstrap().await?;
 
         // System group, complete: pre-init, migrations, init, its clients,
         // post-init.
@@ -1908,11 +2027,13 @@ impl HostRuntime {
         self.wire_system_clients(&regs)?;
         self.run_post_init_phase_for(&system).await?;
 
-        // System gRPC services run during application preparation. The REST
-        // host starts later, once every application's routes can be composed.
+        // Serve system routes on the listener already hosting probes.
         let mut grpc_seen = HashSet::new();
         self.run_grpc_initial_phase(&mut grpc_seen).await?;
         self.run_start_phase_for(&system).await?;
+        if let Some(composition) = &mut rest {
+            self.publish_system_rest(composition, &system).await?;
+        }
 
         // Application group: pre-init, migrations, the registry clients, then
         // the GTS barrier.
@@ -1933,9 +2054,12 @@ impl HostRuntime {
         self.run_legacy_finalization().await?;
         self.run_post_init_phase_for(&app).await?;
 
-        // Compose the full REST surface before its host starts. Install the
-        // application gRPC services on the system hub, then start applications.
-        let _router = self.run_rest_phase().await?;
+        // Attach the full REST/gRPC surface before starting applications.
+        if let Some(composition) = rest {
+            self.finish_rest_bootstrap(composition, &app).await?;
+        } else {
+            let _router = self.run_rest_phase().await?;
+        }
         self.run_grpc_late_phase(&mut grpc_seen).await?;
         self.run_start_phase_for(&app).await?;
         let all: Vec<&GearEntry> = self.registry.gears().iter().collect();
@@ -1949,125 +2073,10 @@ impl HostRuntime {
     }
 }
 
-/// Advertises in-process REST providers in the directory, each at most once.
-///
-/// The directory-register phase enables it with the gateway endpoint, for the
-/// system and application groups together, after the REST host starts. Only
-/// the in-process host path enables it: in `OoP` serving, `oop_serve` owns
-/// presence + deregister, so nothing is advertised or deregistered here.
-struct RestAdvertiser {
-    instance_id: String,
-    state: parking_lot::Mutex<AdvertiserState>,
-}
-
-#[derive(Default)]
-struct AdvertiserState {
-    target: Option<(Arc<dyn crate::DirectoryClient>, String)>,
-    advertised: Vec<&'static str>,
-    attempted: bool,
-}
-
-impl RestAdvertiser {
-    fn new(instance_id: Uuid) -> Self {
-        Self {
-            instance_id: instance_id.to_string(),
-            state: parking_lot::Mutex::new(AdvertiserState::default()),
-        }
-    }
-
-    fn enable(&self, dir: Arc<dyn crate::DirectoryClient>, endpoint: String) {
-        self.state.lock().target = Some((dir, endpoint));
-    }
-
-    fn is_enabled(&self) -> bool {
-        self.state.lock().target.is_some()
-    }
-
-    /// `true` the first time only: whether to look for an endpoint to enable.
-    fn first_attempt(&self) -> bool {
-        !std::mem::replace(&mut self.state.lock().attempted, true)
-    }
-
-    /// Advertise `gear`, unless not enabled yet or already advertised.
-    async fn advertise(&self, gear: &'static str) {
-        let (dir, endpoint) = {
-            let mut state = self.state.lock();
-            let Some((dir, endpoint)) = state.target.clone() else {
-                return;
-            };
-            if state.advertised.contains(&gear) {
-                return;
-            }
-            state.advertised.push(gear);
-            (dir, endpoint)
-        };
-        let instance_id = &self.instance_id;
-        // The directory keys instances by (gear, instance_id). grpc-hub
-        // registers this same (gear, instance_id) with its gRPC services, in
-        // the start phase or later on a retry; the store keeps them when this
-        // registration carries none (`GearInstance::with_metadata_of`).
-        // Carrying them forward also carries the version.
-        //
-        // Labels are deliberately NOT read-and-rewritten here. Carrying them
-        // through would make this a cross-process read-modify-write with no
-        // compare-and-set: any label change committed between the read and
-        // the write would be silently reverted. Instead we register with an
-        // empty label set, which `GearInstance::with_metadata_of` treats as
-        // "preserve the stored labels" — an atomic no-op on labels.
-        let (grpc_services, version) = match dir.list_instances(gear).await {
-            Ok(insts) => insts
-                .into_iter()
-                .find(|i| &i.instance_id == instance_id)
-                .map(|i| (i.grpc_services, i.version))
-                .unwrap_or_default(),
-            Err(e) => {
-                // A failed directory read must not silently drop the
-                // carried-forward metadata: log it, then fall back to an
-                // empty augmentation so REST registration still proceeds.
-                tracing::warn!(
-                    gear,
-                    error = %e,
-                    "directory-register: failed to read existing registration; \
-                     re-registering with empty grpc_services/version"
-                );
-                (Vec::new(), None)
-            }
-        };
-        // OpenAPI spec is published separately (grpc-hub start phase); the
-        // REST-augmentation registration does not carry it. Labels are
-        // omitted so the store preserves the stored set (see above).
-        let mut info = crate::RegisterInstanceInfo::new(gear.to_owned(), instance_id.clone())
-            .with_grpc_services(grpc_services)
-            .with_rest_endpoint(crate::ServiceEndpoint::new(endpoint.clone()));
-        if let Some(version) = version {
-            info = info.with_version(version);
-        }
-        match dir.register_instance(info).await {
-            Ok(()) => {
-                tracing::info!(gear, endpoint = %endpoint, "registered REST provider in directory");
-            }
-            Err(e) => {
-                tracing::warn!(gear, error = %e, "directory-register: failed to register REST provider");
-            }
-        }
-    }
-
-    /// Deregister every advertised gear and disable further advertisement.
-    async fn deregister_all(&self) {
-        let (target, gears) = {
-            let mut state = self.state.lock();
-            (state.target.take(), std::mem::take(&mut state.advertised))
-        };
-        let Some((dir, _)) = target else {
-            return;
-        };
-        for gear in gears {
-            if let Err(e) = dir.deregister_instance(gear, &self.instance_id).await {
-                tracing::warn!(gear, error = %e, "directory-deregister: failed to deregister REST provider");
-            }
-        }
-    }
-}
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+#[path = "rest_advertiser_tests.rs"]
+mod rest_advertiser_tests;
 
 /// Composed `OoP` router, serialized `OpenAPI`, and auth policy from the same specs.
 #[cfg(feature = "bootstrap")]
@@ -2220,6 +2229,10 @@ impl HostRuntime {
         let serve_result = match outcome {
             Ok(outcome) => {
                 let failed = startup_failure(outcome);
+                // End failed preparation promptly so the supervisor can restart.
+                if failed.is_some() {
+                    self.cancel.cancel();
+                }
                 // Serve until cancelled, drain, then deregister.
                 let joined = server.join().await;
                 match failed {
@@ -2264,6 +2277,14 @@ impl HostRuntime {
         let app = self.group(false);
         let advertised = server.options().gear_name.clone();
         let advertised_is_system = system.iter().any(|e| e.name == advertised.as_str());
+        let root_is_advertised = || {
+            self.registry
+                .gears()
+                .iter()
+                .find(|entry| entry.name == advertised.as_str())
+                .and_then(|entry| entry.caps.query::<RestApiCap>())
+                .is_none_or(|rest| rest.advertised_in_directory())
+        };
 
         let manifests = self.build_gts_manifests()?;
         let regs = self.consumer_registrations();
@@ -2287,7 +2308,7 @@ impl HostRuntime {
                 .compose_oop_router(server.options(), hc_registry, &system, composition)
                 .await?;
             server.publish_bootstrap_routes(router, openapi, route_auth);
-            if advertised_is_system {
+            if advertised_is_system && root_is_advertised() {
                 server.start_presence();
             }
             // Every co-hosted system provider is discoverable at once,
@@ -2344,7 +2365,9 @@ impl HostRuntime {
         server.attach(router, openapi, route_auth)?;
         // First presence of an application root; a system root's restarts
         // with the full `OpenAPI` document.
-        server.start_presence();
+        if root_is_advertised() {
+            server.start_presence();
+        }
         self.dep_checker.mark_resolved(PREPARATION_GATE);
         Ok(AppStartup::Started)
     }
@@ -3381,6 +3404,249 @@ mod tests {
         );
     }
 
+    /// The force-exit watchdog (shared by init and stop) fires only when it is
+    /// never disarmed within the deadline. The decision is split from
+    /// `process::exit` into `watchdog_verdict` so it is unit-testable without
+    /// killing the test process; these cover the hung case and both disarm cases.
+    #[test]
+    fn watchdog_times_out_when_not_disarmed() {
+        let (_tx, rx) = std::sync::mpsc::channel::<()>();
+        // Hold the sender; never signal → the deadline elapses → TimedOut.
+        assert_eq!(
+            watchdog_verdict(&rx, std::time::Duration::from_millis(20)),
+            WatchdogVerdict::TimedOut
+        );
+    }
+
+    #[test]
+    fn init_watchdog_subprocess() {
+        const CHILD_MODE: &str = "TOOLKIT_INIT_WATCHDOG_TEST_MODE";
+        struct WatchdogGear(String);
+
+        #[async_trait::async_trait]
+        impl Gear for WatchdogGear {
+            async fn init(&self, _ctx: &GearCtx) -> anyhow::Result<()> {
+                match self.0.as_str() {
+                    "success" => (),
+                    // Async hang: the async timeout observes it → recoverable error.
+                    "async-hang" | "cancelled" => {
+                        std::future::pending::<()>().await;
+                    }
+                    // Synchronous block: no async timer can fire; only the
+                    // OS-thread watchdog catches it → force-exit.
+                    "blocking" | "blocking-no-tracing" => {
+                        std::thread::sleep(std::time::Duration::from_secs(3600));
+                    }
+                    "error" => anyhow::bail!("init failed"),
+                    other => panic!("unexpected watchdog test mode: {other}"),
+                }
+                Ok(())
+            }
+        }
+
+        let Ok(mode) = std::env::var(CHILD_MODE) else {
+            for (mode, expected_code) in [
+                ("success", 0),
+                ("async-hang", 0),
+                ("blocking", 1),
+                ("blocking-no-tracing", 1),
+                ("error", 0),
+                ("cancelled", 0),
+            ] {
+                let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "runtime::host_runtime::tests::init_watchdog_subprocess",
+                        "--nocapture",
+                    ])
+                    .env(CHILD_MODE, mode)
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
+                    .spawn()
+                    .unwrap();
+                let limit = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                while child.try_wait().unwrap().is_none() {
+                    if std::time::Instant::now() >= limit {
+                        child.kill().unwrap();
+                        let output = child.wait_with_output().unwrap();
+                        panic!("watchdog subprocess {mode} hung: {output:?}");
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                let output = child.wait_with_output().unwrap();
+                assert_eq!(
+                    output.status.code(),
+                    Some(expected_code),
+                    "{mode}: {output:?}"
+                );
+                if mode.starts_with("blocking") {
+                    // One line must carry ERROR + message + gear name (holds even
+                    // with tracing OFF, where only the stderr fallback is emitted).
+                    let logs = String::from_utf8_lossy(&output.stderr);
+                    assert!(
+                        logs.lines().any(|line| line.contains("ERROR")
+                            && line.contains("init timed out")
+                            && line.contains("watchdog-test")),
+                        "{logs}"
+                    );
+                }
+            }
+            return;
+        };
+
+        tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(if mode == "blocking-no-tracing" {
+                tracing::level_filters::LevelFilter::OFF
+            } else {
+                tracing::level_filters::LevelFilter::INFO
+            })
+            .with_writer(std::io::stderr)
+            .try_init()
+            .unwrap();
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let mut builder = RegistryBuilder::default();
+                builder.register_core_with_meta(
+                    "watchdog-test",
+                    &[],
+                    Arc::new(WatchdogGear(mode.clone())) as Arc<dyn Gear>,
+                );
+                let runtime = HostRuntime::new(
+                    builder.build_topo_sorted().unwrap(),
+                    Arc::new(EmptyConfigProvider) as Arc<dyn ConfigProvider>,
+                    DbOptions::None,
+                    Arc::new(ClientHub::new()),
+                    CancellationToken::new(),
+                    Uuid::new_v4(),
+                    None,
+                )
+                .with_init_deadline(std::time::Duration::from_millis(200));
+
+                #[allow(
+                    clippy::match_same_arms,
+                    reason = "`success` returns normally; in `blocking*` the same call never returns and the watchdog force-exits"
+                )]
+                match mode.as_str() {
+                    "cancelled" => {
+                        // Dropping the phase future disarms the watchdog: no exit.
+                        assert!(
+                            tokio::time::timeout(
+                                std::time::Duration::from_millis(20),
+                                runtime.run_init_phase(),
+                            )
+                            .await
+                            .is_err()
+                        );
+                    }
+                    "success" => {
+                        runtime.run_init_phase().await.unwrap();
+                    }
+                    "async-hang" => {
+                        // Recoverable error, not a force-exit.
+                        let err = runtime.run_init_phase().await.unwrap_err();
+                        assert!(matches!(
+                            err,
+                            RegistryError::InitTimeout {
+                                gear: "watchdog-test",
+                                ..
+                            }
+                        ));
+                    }
+                    "error" => {
+                        let err = runtime.run_init_phase().await.unwrap_err();
+                        assert!(matches!(
+                            err,
+                            RegistryError::Init {
+                                gear: "watchdog-test",
+                                ..
+                            }
+                        ));
+                    }
+                    // Never returns; the OS-thread watchdog force-exits instead.
+                    "blocking" | "blocking-no-tracing" => {
+                        runtime.run_init_phase().await.unwrap();
+                    }
+                    other => panic!("unexpected watchdog test mode: {other}"),
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+            });
+    }
+
+    #[test]
+    fn watchdog_disarms_when_signalled() {
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        tx.send(()).unwrap();
+        // A generous deadline proves we return on the signal, not by timing out.
+        assert_eq!(
+            watchdog_verdict(&rx, std::time::Duration::from_secs(30)),
+            WatchdogVerdict::Disarmed
+        );
+    }
+
+    #[test]
+    fn watchdog_disarms_when_sender_is_dropped() {
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        drop(tx); // guarded future dropped before it finished
+        assert_eq!(
+            watchdog_verdict(&rx, std::time::Duration::from_secs(30)),
+            WatchdogVerdict::Disarmed
+        );
+    }
+
+    /// When `GearContextBuilder::for_gear` fails (here: the gear's database
+    /// config references a global server that does not exist), the init phase
+    /// must surface it as `RegistryError::Init` naming the gear — not hang or
+    /// force-exit.
+    #[cfg(feature = "db")]
+    #[tokio::test]
+    async fn init_ctx_failure_surfaces_as_init_error() {
+        use figment::{Figment, providers::Serialized};
+
+        struct NeedsDbGear;
+
+        #[async_trait::async_trait]
+        impl Gear for NeedsDbGear {
+            async fn init(&self, _ctx: &GearCtx) -> anyhow::Result<()> {
+                Ok(())
+            }
+        }
+
+        let mut builder = RegistryBuilder::default();
+        builder.register_core_with_meta("needsdb", &[], Arc::new(NeedsDbGear) as Arc<dyn Gear>);
+        let registry = builder.build_topo_sorted().unwrap();
+
+        let figment = Figment::new().merge(Serialized::defaults(serde_json::json!({
+            "gears": {
+                "needsdb": {
+                    "database": { "server": "does-not-exist" }
+                }
+            }
+        })));
+        let db_manager =
+            toolkit_db::DbManager::from_figment(figment, std::path::PathBuf::from("/tmp/test"))
+                .unwrap();
+
+        let runtime = HostRuntime::new(
+            registry,
+            Arc::new(EmptyConfigProvider) as Arc<dyn ConfigProvider>,
+            DbOptions::Manager(Arc::new(db_manager)),
+            Arc::new(ClientHub::new()),
+            CancellationToken::new(),
+            Uuid::new_v4(),
+            None,
+        );
+
+        let err = runtime.run_init_phase().await.unwrap_err();
+        assert!(
+            matches!(err, RegistryError::Init { gear, .. } if gear == "needsdb"),
+            "expected RegistryError::Init for needsdb, got {err:?}"
+        );
+    }
+
     /// A REST gear opting out of directory advertisement is served but not
     /// advertised (nor deregistered) as a REST provider.
     #[test]
@@ -3663,3 +3929,8 @@ mod tests {
 #[cfg_attr(coverage_nightly, coverage(off))]
 #[path = "host_runtime_preparation_tests.rs"]
 mod host_runtime_preparation_tests;
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+#[path = "host_runtime_rest_bootstrap_tests.rs"]
+mod host_runtime_rest_bootstrap_tests;

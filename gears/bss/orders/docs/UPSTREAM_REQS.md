@@ -703,7 +703,7 @@ obligation is recorded for whichever specification takes it.
 **Shared documentation follow-up — open (2026-09-22).** Event Broker SDK and GTS guideline
 maintainers should reconcile `guidelines/GTS.md` with the canonical declarations in
 [`event-broker-sdk/src/gts.rs`](../../../system/event-broker/event-broker-sdk/src/gts.rs): event
-base `gts.cf.core.events.event.v1~`, business content in `data`, the closed `EventTraits`
+base `gts.cf.core.events.event.v1~`, business content in `data`, the closed `EventV1Traits`
 vocabulary, topic-level retention, and publish-required envelope members. The old
 `gts.cf.core.events.type.v1~` spelling also appears in `gears/settings-service/docs/DESIGN.md`;
 its owners must review that contract separately. Closure requires correcting the guideline

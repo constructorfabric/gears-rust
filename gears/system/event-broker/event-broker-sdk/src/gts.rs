@@ -12,6 +12,8 @@
 //! macro emits here, not from `docs/schemas/`. The two files under
 //! `docs/schemas/` are generated from this module and held to it by
 //! `gts_tests`, so per-field keywords live in the schemars attributes below.
+//! Gears declare event types with `#[gts_type_schema(base = EventV1, ..)]`;
+//! the derived struct's fields define the event's `data` contract.
 
 use gts::{GtsInstanceId, GtsTypeId, SELF_ID_REF};
 use schemars::JsonSchema;
@@ -37,7 +39,7 @@ const ASCII_PRINTABLE_OR_EMPTY: &str = r"^[\x20-\x7E]*$";
 #[schemars(transparent)]
 pub struct SubjectTypeRef(#[schemars(extend("x-gts-pattern-ref" = gts_id!("*")))] pub String);
 
-/// The default the base declares for [`EventTraits::partition_key`]: the event's
+/// The default the base declares for [`EventV1Traits::partition_key`]: the event's
 /// tenant. Every event carries one, so the default always resolves.
 const TENANT_POINTER: &str = "/tenant_id";
 
@@ -66,16 +68,89 @@ pub struct TopicRef(pub String);
 #[allow(clippy::doc_markdown)]
 #[derive(Serialize, JsonSchema, GtsTraitsSchema)]
 #[serde(deny_unknown_fields)]
-pub struct EventTraits {
+pub struct EventV1Traits {
     /// Full GTS topic identifier of the stream that events of this type are published to. A topic is an instance, so this never ends in `~`.
-    pub topic: TopicRef,
+    topic: TopicRef,
     /// GTS Type-id patterns describing which subject types an event of this type may declare in subject_type (concrete Type match, wildcard suffix `<prefix>.*`, or bare base Type `<base>~` with implicit derived-type coverage). Enforced at publish time, independent of the subject_type:produce/:consume authorization check.
     #[serde(default)]
-    pub allowed_subject_types: Vec<SubjectTypeRef>,
+    allowed_subject_types: Vec<SubjectTypeRef>,
     /// JSON Pointer naming the member of an event whose value determines its partition. May point into `data`, which a bare field name could not express. Defaults to the event's tenant, so a type declaring nothing partitions per tenant. The broker checks at registration that the pointer names a member this type's resolved schema declares.
     #[serde(default = "default_partition_key")]
     #[schemars(extend("default" = TENANT_POINTER))]
-    pub partition_key: PartitionKeyRef,
+    partition_key: PartitionKeyRef,
+}
+
+impl EventV1Traits {
+    /// Starts a builder requiring a topic and allowed subject-type patterns.
+    ///
+    /// Both required methods may be called in either order. The partition
+    /// pointer defaults to `/tenant_id`. All values are serialized explicitly.
+    #[must_use]
+    pub fn builder() -> EventV1TraitsBuilder {
+        EventV1TraitsBuilder {
+            topic: (),
+            allowed_subject_types: (),
+            partition_key: default_partition_key(),
+        }
+    }
+}
+
+/// Builds [`EventV1Traits`]; `build` is available only after both required setters.
+///
+/// The type parameters store each required value, or `()` while it is missing.
+pub struct EventV1TraitsBuilder<T = (), S = ()> {
+    topic: T,
+    allowed_subject_types: S,
+    partition_key: PartitionKeyRef,
+}
+
+impl<T, S> EventV1TraitsBuilder<T, S> {
+    /// Sets the topic that events of this type are published to (required).
+    #[must_use]
+    pub fn with_topic(self, topic: impl Into<String>) -> EventV1TraitsBuilder<TopicRef, S> {
+        EventV1TraitsBuilder {
+            topic: TopicRef(topic.into()),
+            allowed_subject_types: self.allowed_subject_types,
+            partition_key: self.partition_key,
+        }
+    }
+
+    /// Sets the allowed subject-type patterns (required).
+    ///
+    /// An explicitly empty list denies every subject type at publish time.
+    #[must_use]
+    pub fn with_allowed_subject_types(
+        self,
+        patterns: impl IntoIterator<Item = impl Into<String>>,
+    ) -> EventV1TraitsBuilder<T, Vec<SubjectTypeRef>> {
+        EventV1TraitsBuilder {
+            topic: self.topic,
+            allowed_subject_types: patterns
+                .into_iter()
+                .map(|pattern| SubjectTypeRef(pattern.into()))
+                .collect(),
+            partition_key: self.partition_key,
+        }
+    }
+
+    /// Sets the JSON Pointer used to partition events, overriding `/tenant_id`.
+    #[must_use]
+    pub fn with_partition_key(mut self, pointer: impl Into<String>) -> Self {
+        self.partition_key = PartitionKeyRef(pointer.into());
+        self
+    }
+}
+
+impl EventV1TraitsBuilder<TopicRef, Vec<SubjectTypeRef>> {
+    /// Builds the traits after a topic and allowed subject types have been supplied.
+    #[must_use]
+    pub fn build(self) -> EventV1Traits {
+        EventV1Traits {
+            topic: self.topic,
+            allowed_subject_types: self.allowed_subject_types,
+            partition_key: self.partition_key,
+        }
+    }
 }
 
 fn default_partition_key() -> PartitionKeyRef {
@@ -145,10 +220,10 @@ pub struct EventMeta {
     type_id = gts_id!("cf.core.events.event.v1~"),
     description = "Event schema. Single canonical resource shape used by both publish input (POST /v1/events, POST /v1/events:batch) and read responses (poll / query). Per-direction semantics are encoded via JSON Schema field-level markers: `writeOnly` fields (meta) are accepted on publish and stripped on read; `readOnly` fields (partition, sequence, sequence_time) are server-stamped on read and rejected with 400 BadRequest if supplied on publish. The top-level `required` list is the union of publish-required and read-required fields; strict-validator producers must filter `readOnly` fields before submission.",
     properties = "id,r#type,tenant_id,source,subject,subject_type,occurred_at,trace_parent,data,partition,sequence,sequence_time,meta",
-    traits_schema = inline(EventTraits),
+    traits_schema = inline(EventV1Traits),
     gts_abstract = true,
 )]
-pub struct EventV1 {
+pub struct EventV1<D> {
     /// Client-provided unique event identifier (UUID).
     pub id: Uuid,
     /// Full GTS event-type identifier. The event is an instance of that derived type. ASCII only.
@@ -183,8 +258,7 @@ pub struct EventV1 {
     pub trace_parent: Option<String>,
     /// Event payload, validated at ingest against the resolved schema of the event's type. The only field where UTF-8 (or any non-ASCII bytes) is permitted; all other event fields are ASCII per platform convention. May be absent for body-less events (e.g., notification-only events whose semantics are fully carried by `type` + `subject`).
     #[serde(default)]
-    #[schemars(with = "Option<serde_json::Map<String, serde_json::Value>>")]
-    pub data: Option<serde_json::Value>,
+    pub data: Option<D>,
     /// Server-stamped partition for the event, surfaced on read. Computed at ingest via the partition contract. Producers MUST NOT supply this field on publish; doing so is rejected with 400 BadRequest.
     #[schemars(range(min = 0), extend("readOnly" = true))]
     pub partition: i32,
@@ -238,55 +312,6 @@ pub fn data_contract(resolved: &serde_json::Value) -> serde_json::Value {
     let mut branches = Vec::new();
     collect(resolved, 0, &mut branches);
     serde_json::json!({ "allOf": branches })
-}
-
-/// Assembles the derived event-type schema document for `type_id`: the payload
-/// contract as a narrowing of the base's `data` member, and the governing
-/// metadata as `x-gts-traits`.
-///
-/// Test fixtures and the mock register event types through this rather than
-/// storing a bare payload schema, so what they hold is the same shape
-/// `types-registry` provisions - which means the shape it will actually admit.
-///
-/// A `data_schema` with no constraints of its own is rendered as the base's own
-/// `["object", "null"]` rather than passed through as an empty schema. An empty
-/// schema admits any JSON value, which is *wider* than the base's member, and a
-/// derived type may only narrow: registration refuses the document with
-/// "Schema at '$.data' changes type incompatibly". A caller stating no
-/// constraints means "whatever the base allows", and that is what this writes.
-#[must_use]
-pub fn derived_event_type_schema(
-    type_id: &str,
-    topic: &str,
-    data_schema: serde_json::Value,
-    allowed_subject_types: &[&str],
-) -> serde_json::Value {
-    serde_json::json!({
-        "$id": format!("{}{type_id}", toolkit_gts::GTS_ID_URI_PREFIX),
-        "$schema": "http://json-schema.org/draft-07/schema#",
-        "x-gts-traits": {
-            "topic": topic,
-            "allowed_subject_types": allowed_subject_types,
-            "partition_key": TENANT_POINTER,
-        },
-        "type": "object",
-        "allOf": [
-            { "$ref": toolkit_gts::gts_uri!("cf.core.events.event.v1~") },
-            {
-                "type": "object",
-                "properties": {
-                    "data": if data_schema
-                        .as_object()
-                        .is_some_and(serde_json::Map::is_empty)
-                    {
-                        serde_json::json!({ "type": ["object", "null"] })
-                    } else {
-                        data_schema
-                    },
-                },
-            },
-        ],
-    })
 }
 
 /// Consumer-group resource type - PEP/error matching only, no schema

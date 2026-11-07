@@ -16,6 +16,8 @@
 //! `pub fn gts_declarations() -> Vec<(String, String)>`: `(GTS id, JSON text)`
 //! pairs using only std types across crate boundaries. A `local` macro without
 //! that declaration fails to compile because the collector is missing.
+//! Listed crates must use `local::*` throughout; collection rejects leftover root
+//! declarations and names their omitted IDs.
 //! Process-wide readers, including an embedded types-registry, still see every
 //! declaration. Merge a gear's crate collectors with [`merge_declarations`]
 //! or [`DeclarationMerge`].
@@ -49,9 +51,16 @@ macro_rules! declare_gts_inventory {
 
         /// The GTS Type Schemas and Instances this crate declares, as
         /// `(GTS id, JSON text)` sorted by id.
+        ///
+        /// # Panics
+        /// If root-macro declarations remain; migrate them to `toolkit_gts::local::*`.
         #[must_use]
         pub fn gts_declarations() -> ::std::vec::Vec<(::std::string::String, ::std::string::String)>
         {
+            $crate::local::__assert_local_declarations(
+                ::std::module_path!(),
+                ::std::env!("CARGO_MANIFEST_DIR"),
+            );
             $crate::local::__collect(
                 $crate::inventory::iter::<__toolkit_gts_inventory::TypeSchema>
                     .into_iter()
@@ -62,6 +71,41 @@ macro_rules! declare_gts_inventory {
             )
         }
     };
+}
+
+/// Global-only declaration provenance; keeps existing inventory record layouts unchanged.
+#[doc(hidden)]
+pub struct GlobalOnlyDeclaration {
+    pub module_path: &'static str,
+    pub manifest_dir: &'static str,
+    pub gts_id: &'static str,
+}
+
+crate::inventory::collect!(GlobalOnlyDeclaration);
+
+/// Reject incomplete migration of a declaring crate to its local collector.
+///
+/// # Panics
+/// If the crate has a root-macro declaration absent from its local collector.
+#[doc(hidden)]
+pub fn __assert_local_declarations(crate_root: &str, manifest_dir: &str) {
+    let mut omitted: Vec<_> = crate::inventory::iter::<GlobalOnlyDeclaration>
+        .into_iter()
+        .filter(|entry| {
+            entry.manifest_dir == manifest_dir
+                && entry.module_path.split("::").next() == Some(crate_root)
+        })
+        .map(|entry| entry.gts_id)
+        .collect();
+    omitted.sort_unstable();
+    omitted.dedup();
+    assert!(
+        omitted.is_empty(),
+        "crate `{crate_root}` has global-only GTS declarations: {}; use \
+         toolkit_gts::local::gts_type_schema, toolkit_gts::local::gts_instance! or \
+         toolkit_gts::local::gts_instance_raw! for every declaration in a published crate",
+        omitted.join(", ")
+    );
 }
 
 /// The body of a generated `gts_declarations()`.

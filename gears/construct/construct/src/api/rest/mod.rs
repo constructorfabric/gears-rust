@@ -11,7 +11,16 @@ mod error_test;
 mod dto_test;
 
 #[cfg(test)]
+mod profile_routes_test;
+
+#[cfg(test)]
 mod routes_test;
 
 #[cfg(test)]
+mod review_queue_routes_test;
+
+#[cfg(test)]
 mod settings_routes_test;
+
+#[cfg(test)]
+mod subject_control_routes_test;

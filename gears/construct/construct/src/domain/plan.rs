@@ -4,6 +4,8 @@
 //! through [`Plan::values`], [`Origin::written_by_a_person`], and each step's
 //! entity kind, confidence and [`Change::stores_values`].
 
+use std::borrow::Borrow;
+
 use serde_json::Value;
 use time::OffsetDateTime;
 use toolkit_macros::domain_model;
@@ -13,8 +15,25 @@ use uuid::Uuid;
 /// maps its numbered values back to node keys and gives each new entity a new
 /// one.
 #[domain_model]
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct NodeKey(pub String);
+
+impl NodeKey {
+    /// A new key for an entity in `tenant_id`. Every new entity gets one,
+    /// also a value that returns after a delete or replaces another, because
+    /// a deleted key cannot be reused.
+    #[must_use]
+    pub fn new_in(tenant_id: Uuid) -> Self {
+        Self(format!("construct:{tenant_id}:{}", Uuid::new_v4()))
+    }
+}
+
+/// A key compares as its text, so a set of keys is looked up by `&str`.
+impl Borrow<str> for NodeKey {
+    fn borrow(&self) -> &str {
+        &self.0
+    }
+}
 
 /// Who a plan comes from. The connector of a record is the source of the trust
 /// check.
@@ -38,6 +57,10 @@ pub enum Origin {
     Reviewer { reviewer: Uuid },
     /// A tenant administrator's added or edited fact.
     Administrator { administrator: Uuid },
+    /// The subject's own delete of one of its facts. Subject Control builds
+    /// the only such plan, with one removal; it never reaches Admission, and
+    /// the writer refuses to store a fact from it.
+    Subject { subject: Uuid },
 }
 
 impl Origin {
@@ -56,6 +79,7 @@ impl Origin {
             Self::Agent { .. } => "agent",
             Self::Reviewer { .. } => "reviewer",
             Self::Administrator { .. } => "administrator",
+            Self::Subject { .. } => "subject",
         }
     }
 
@@ -66,7 +90,8 @@ impl Origin {
             Self::Connector { connector, .. } => connector.clone(),
             Self::Agent { agent: id }
             | Self::Reviewer { reviewer: id }
-            | Self::Administrator { administrator: id } => id.to_string(),
+            | Self::Administrator { administrator: id }
+            | Self::Subject { subject: id } => id.to_string(),
         }
     }
 }
@@ -150,6 +175,20 @@ impl Change {
                 (index == 0).then_some(&mut property.value)
             }
             Self::RemoveEntity { .. } | Self::RemoveProperty { .. } => None,
+        }
+    }
+
+    /// The stored entity the change touches: the one it replaces, removes or
+    /// adds a property to. None for a new entity.
+    #[must_use]
+    pub fn touches(&self) -> Option<&NodeKey> {
+        match self {
+            Self::AddEntity { .. } => None,
+            Self::AddProperty { entity, .. }
+            | Self::ReplaceProperty { entity, .. }
+            | Self::RemoveEntity { entity }
+            | Self::RemoveProperty { entity, .. } => Some(entity),
+            Self::ReplaceEntity { old, .. } => Some(old),
         }
     }
 

@@ -20,8 +20,8 @@ pub use gear_manager::{
 };
 pub use grpc_installers::{GearInstallers, GrpcInstallerData, GrpcInstallerStore, LateBatch};
 pub use host_runtime::{
-    DEFAULT_SHUTDOWN_DEADLINE, DbOptions, HostRuntime, TOOLKIT_DIRECTORY_ENDPOINT_ENV,
-    TOOLKIT_MODULE_CONFIG_ENV,
+    DEFAULT_INIT_DEADLINE, DEFAULT_SHUTDOWN_DEADLINE, DbOptions, HostRuntime,
+    TOOLKIT_DIRECTORY_ENDPOINT_ENV, TOOLKIT_MODULE_CONFIG_ENV,
 };
 // `DynBearerAuthenticator` / `DynInternalAuthenticator` used to be defined
 // here; they now live in `toolkit_security`, so consumers import them from
