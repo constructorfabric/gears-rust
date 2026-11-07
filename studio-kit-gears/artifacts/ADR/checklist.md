@@ -671,6 +671,29 @@ For architectural decisions with broad impact, check ALL applicable domains.
 
 **Where it belongs**: Complete the ADR before publishing, or use "Proposed" status
 
+### SEM-ADR-001: Downstream Drift Check
+**Severity**: HIGH
+
+An ADR is frequently authored *after* the gear's DESIGN (and sometimes after DECOMPOSITION/
+FEATURE) already exist — linking to them (checked elsewhere) is not the same as checking
+they still hold.
+
+**What to check**:
+- [ ] The gear's existing `DESIGN.md` was actually checked for content this decision
+  contradicts (a principle, constraint, component, or sequence it supersedes), not just
+  linked from the ADR's Key ADRs reference
+- [ ] Any downstream `DECOMPOSITION.md`/`FEATURE*.md` that depends on the contradicted
+  DESIGN content was identified, even if not itself edited here
+- [ ] Every contradiction found is named explicitly in this ADR's Consequences section —
+  never silently left for someone else to notice later
+- [ ] When a contradiction was found, the required follow-up (`cf-gears-doc-design`, and
+  any downstream preset) is stated as required, not merely offered as one option among
+  several
+
+**Where it belongs**: This ADR's own authoring/review stage — not a separate
+chain-reconciliation pass; this check exists precisely because no such pass runs
+automatically today ([gears-rust#5195](https://github.com/constructorfabric/gears-rust/issues/5195))
+
 ---
 
 # ADR-Specific Quality Checks

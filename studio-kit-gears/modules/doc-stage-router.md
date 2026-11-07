@@ -13,6 +13,16 @@ required or optional), `GEARS_DOC_NEXT_SKILL`, `GEARS_DOC_PATH_RULE`,
 `GEARS_DOC_EXAMPLE`, and optionally `GEARS_DOC_COMPANION` (a section of one
 other artifact the author stage must update in the same change).
 
+One DESIGN-only addition to the otherwise kind-agnostic close stage:
+`GearsDocDesignAmendImpactCheck` runs `cf-gears-change-impact-analysis`
+automatically whenever a DESIGN with an already-decomposed/already-implemented
+downstream (a DECOMPOSITION plus at least one closed FEATURE) closes again, so
+a mid-chain DESIGN amendment surfaces its downstream impact right away — non-
+blockingly, same as every other use of that workflow — instead of only at
+`GearsCodeChainSweep`'s end-of-chain re-check (`modules/code-stage-router.md`),
+which remains the actual blocking backstop for whatever this earlier, advisory
+signal was missed or ignored.
+
 ```pdsl
 UNIT GearsDocStageEntry
 PURPOSE: Resolve the stage and target of this gears document run, then route it.
@@ -52,15 +62,31 @@ RULES:
 ```pdsl
 UNIT GearsDocTargetResolve
 PURPOSE: Resolve the single artifact path this run works on.
+STATE:
+  SET GEARS_CATALOG_MATCH: string | unset (default unset, scope workflow_run)
 DO:
   SET GEARS_TARGET_PATH = the explicit document path in the request WHEN GEARS_TARGET_PATH == unset AND the request names one
   SET GEARS_TARGET_PATH = the path GEARS_DOC_PATH_RULE derives for the gear named in the request WHEN GEARS_TARGET_PATH == unset AND the request names a gear
   SET GEARS_TARGET_PATH = the path GEARS_DOC_PATH_RULE derives for GEARS_GEAR, the gear the previous preset handed off, WHEN GEARS_TARGET_PATH == unset AND GEARS_GEAR is set
-  EMIT "Which gear is this <GEARS_DOC_KIND> for? Reply with the gear name (the directory under gears/) or the document path." WHEN GEARS_TARGET_PATH == unset
+  RUN GearsDocCatalogCheck WHEN GEARS_TARGET_PATH == unset AND (GEARS_DOC_KIND == UPSTREAM_REQS OR GEARS_DOC_KIND == PRD)
+  EMIT "Which gear is this <GEARS_DOC_KIND> for? Reply with the gear name (the directory under gears/) or the document path.", plus ` {gears_md} already catalogs this need as "<GEARS_CATALOG_MATCH's heading>" (<its scenario markers>) — if that's what you mean, reply with a directory name for it (e.g. a kebab-case slug of the heading); otherwise name a different gear.` WHEN GEARS_CATALOG_MATCH is set, WHEN GEARS_TARGET_PATH == unset
   STOP_TURN WHEN GEARS_TARGET_PATH == unset
   SET GEARS_GEAR = the gear directory that contains GEARS_TARGET_PATH
 RULES:
   ALWAYS keep one run bound to one artifact path; multi-artifact work belongs in cf-documenting-planning
+  ALWAYS run GearsDocCatalogCheck for UPSTREAM_REQS/PRD before concluding no gear was named and asking the user to invent one — a wrong "this must be new" assumption here compounds into a duplicate gear existing alongside {gears_md}'s own already-planned entry for the same need (confirmed live: a user asked for "email storage", {gears_md} already has an "Emails Storage" catalog entry, and nothing had consulted it before this point)
+```
+
+```pdsl
+UNIT GearsDocCatalogCheck
+PURPOSE: Before treating an unnamed gear as brand-new, check whether {gears_md}'s own catalog already names this need under a different heading.
+DO:
+  LOAD {gears_md}
+  RUN match the request's own described need against {gears_md}'s catalog entries (section headings and their scenario bullets), by meaning, not literal gear-directory-name substring
+  SET GEARS_CATALOG_MATCH = the matched section's heading plus its implemented/planned (`[x]`/`[ ]`) scenario markers WHEN a plausible match is found, else unset
+RULES:
+  NEVER block or add a turn on its own; this only sets state that GearsDocTargetResolve's existing question incorporates
+  NEVER treat an unrelated or weakly-related catalog section as a match; a false "this already exists" suggestion is its own kind of harm — leave GEARS_CATALOG_MATCH unset when genuinely unsure
 ```
 
 ```pdsl
@@ -159,14 +185,36 @@ RULES:
 ```
 
 ```pdsl
+UNIT GearsDocDesignAmendImpactCheck
+PURPOSE: When a DESIGN this gear already decomposed/implemented downstream is closing again (an amendment, not its first authoring), surface its downstream impact immediately instead of only at GearsCodeChainSweep's end-of-chain re-check.
+STATE:
+  SET GEARS_DESIGN_HAS_REALIZED_DOWNSTREAM: boolean (default false, scope workflow_run)
+DO:
+  RUN check whether gears/<GEARS_GEAR>/docs/DECOMPOSITION.md exists AND at least one file under gears/<GEARS_GEAR>/docs/features/ (per GEARS_DOC_PATH_RULE for FEATURE, `workflows/doc-feature.md` — not a `FEATURE*.md` glob at the `docs/` level, which no real gear uses) has its `featstatus-*-implemented` checkbox checked, and SET GEARS_DESIGN_HAS_REALIZED_DOWNSTREAM accordingly
+  LOAD {workflow_change_impact_analysis}
+  RUN ChangeImpactAnalysis with MODE=cascade-tracking, UPSTREAM_ARTIFACT_TYPE=DESIGN, UPSTREAM_ARTIFACT_ID=GEARS_TARGET_PATH, BASELINE_REF=HEAD (the last committed revision of GEARS_TARGET_PATH, i.e. before this close's own uncommitted edits), CURRENT_REF=the working tree now, WHEN GEARS_DESIGN_HAS_REALIZED_DOWNSTREAM
+  EMIT the resulting report path and its findings summary prominently in this close's own report, labeled "Downstream impact of this DESIGN amendment", naming every affected FEATURE explicitly (not just a count), WHEN GEARS_DESIGN_HAS_REALIZED_DOWNSTREAM
+RULES:
+  ALWAYS run this only WHEN GEARS_DOC_KIND == DESIGN; every other artifact kind skips this unit entirely
+  NEVER run ChangeImpactAnalysis here when GEARS_DESIGN_HAS_REALIZED_DOWNSTREAM is false — a DESIGN with no DECOMPOSITION/closed FEATURE yet has nothing downstream to impact
+  NEVER block this DESIGN's own close on the impact-analysis result — ChangeImpactAnalysis's own contract is advisory-only ("NEVER block a merge from this workflow"), and this check inherits that; a downstream-impact finding is a strongly-surfaced recommendation, never an added DOD gate
+  ALWAYS run this before GearsDocClose's own DOD check so its findings land in the same close report, not a separate one
+  ALWAYS keep every affected FEATURE named in this unit's EMIT part of "current context" for GearsDocClose's own NextActionsOffer call, so re-validating that FEATURE is naturally synthesized as one of its 3-5 candidate actions — never invent a separate next-action field; NextActionsOffer has exactly one pinned slot and synthesizes the rest from context
+```
+
+```pdsl
 UNIT GearsDocClose
 PURPOSE: Check the definition of done, report, and offer the next artifact of the chain.
 DO:
-  RUN `cfs validate-toc <GEARS_TARGET_PATH>` and `cfs validate --artifact <GEARS_TARGET_PATH>`
-  RUN check every item of "{gears_doc_phase}#definition-of-done" against those results and the review findings in GEARS_FORWARD_PAYLOAD
-  EMIT a SKILL_RESULT envelope with skill = GEARS_DOC_SKILL, status = completed when every definition-of-done item holds else failed, produced_artifacts = doc-changes for GEARS_TARGET_PATH plus phase-status, report_outputs = the validation result, missing_artifacts = every definition-of-done item that fails (validation errors, unresolved CRITICAL or MAJOR finding IDs, uncovered upstream IDs) or [] when all hold, assumptions = any recorded overrides, and suggested_next_skills = [GEARS_DOC_NEXT_SKILL]
-  SET NEXT_ACTION_PINNED_SKILL = GEARS_DOC_NEXT_SKILL and NEXT_ACTION_PAYLOAD = GEARS_GEAR and GEARS_UPSTREAM_PATH = GEARS_TARGET_PATH, with no GEARS_STAGE or GEARS_TARGET_PATH, so the next preset starts authoring its own document for the same gear, WHEN every definition-of-done item holds
-  SET NEXT_ACTION_PINNED_SKILL = GEARS_DOC_SKILL and NEXT_ACTION_PAYLOAD = GEARS_STAGE validate, GEARS_TARGET_PATH, GEARS_GEAR, plus the failing definition-of-done items WHEN a definition-of-done item fails, so the gate runs again and routes to author or fix from fresh evidence
+  RUN GearsDocDesignAmendImpactCheck WHEN GEARS_DOC_KIND == DESIGN
+  RUN `cfs validate-toc <GEARS_TARGET_PATH>` and `cfs validate --artifact <GEARS_TARGET_PATH>` and keep the result as ci-findings
+  LOAD {cf-studio-path}/.core/skills/studio/modules/runtime/artifact-dod-check.md
+  SET DOD_INPUT_ITEMS = the items of "{gears_doc_phase}#definition-of-done", each normalized to item_id, summary, and required; for the upstream-ID-coverage item, set its coverage_hints to the cross-reference/coverage findings in the ci-findings result above (`cfs validate --artifact` already checks `covered_by` completeness and that every ID reference resolves), so a genuinely-covered artifact has something to match against instead of being marked unclear for lack of a hint
+  SET TARGET_ARTIFACTS = doc-changes (ref GEARS_TARGET_PATH), ci-findings (ref the validation result above), and review-findings (ref GEARS_FORWARD_PAYLOAD)
+  RUN ArtifactDodCheckContract
+  EMIT a SKILL_RESULT envelope with skill = GEARS_DOC_SKILL, status = completed WHEN ARTIFACT_DOD_STATUS == ready else failed, produced_artifacts = doc-changes for GEARS_TARGET_PATH plus phase-status, report_outputs = ARTIFACT_DOD_COVERAGE, missing_artifacts = the ARTIFACT_DOD_COVERAGE entries with coverage_status uncovered or unclear, or [] WHEN ARTIFACT_DOD_STATUS == ready, assumptions = any recorded overrides, and suggested_next_skills = [GEARS_DOC_NEXT_SKILL]
+  SET NEXT_ACTION_PINNED_SKILL = GEARS_DOC_NEXT_SKILL and NEXT_ACTION_PAYLOAD = GEARS_GEAR and GEARS_UPSTREAM_PATH = GEARS_TARGET_PATH, with no GEARS_STAGE or GEARS_TARGET_PATH, so the next preset starts authoring its own document for the same gear, WHEN ARTIFACT_DOD_STATUS == ready
+  SET NEXT_ACTION_PINNED_SKILL = GEARS_DOC_SKILL and NEXT_ACTION_PAYLOAD = GEARS_STAGE validate, GEARS_TARGET_PATH, GEARS_GEAR, plus the uncovered or unclear ARTIFACT_DOD_COVERAGE entries WHEN ARTIFACT_DOD_STATUS == blocked, so the gate runs again and routes to author or fix from fresh evidence
   LOAD {cf-studio-path}/.core/skills/studio/modules/ui/next-actions.md
   RUN NextActionsOffer
 RULES:

@@ -30,6 +30,7 @@
 - [ ] Keep checkbox and status consistency: a parent is checked only when all nested referenced blocks are checked, and no checkbox ID repeats within a feature block
 
 ### Semantic
+- [ ] Before finalizing feature boundaries, check `{gears_md}`'s gear catalog, `{repo_playbook}`'s broader standards/tooling map, and candidate existing gears' `PRD.md`/`DESIGN.md` for overlap with functionality that already exists or is already planned
 - [ ] Trace every feature candidate to PRD, DESIGN, ADR, or UPSTREAM_REQS IDs when those sources exist
 - [ ] Provide 100 percent explicit coverage of required design elements and requirements passthrough
 - [ ] List Requirements Covered, Design Components, Sequences, and Data for every feature, using `None` only when explicitly true

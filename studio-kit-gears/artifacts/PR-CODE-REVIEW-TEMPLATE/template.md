@@ -44,32 +44,45 @@ No reviewer comments found.
 
 ---
 
+## Architecture
+
+{PR-level structural/design assessment from step 4b (ARCH-001 through ARCH-007),
+ completed before any per-file review. Findings serious enough to affect the merge
+ decision must also appear in the Verdict. Use a single "No issues" line when empty —
+ this section is mandatory even with no findings.}
+
+---
+
 ## Own Findings
 
 ### Correctness {icon}
 
-{Assessment of logic, edge cases, error handling.}
+{Assessment of logic, edge cases, error handling. For Rust changes, informed by the
+ `toolkit-pr-review` pass (step 4c3) rather than derived from scratch.}
 
 ### Cargo / Clippy / Architecture Lints / Rustfmt Conformance {icon}
 
-{Assessment of tooling conformance. N/A if no Rust code changed.}
+{Assessment of tooling conformance, from the `toolkit-pr-review` architecture/toolkit
+ rule modules. N/A if no Rust code changed.}
 
 ### Code Style & Idiomatic Patterns {icon}
 
-{Assessment of naming, structure, Rust idioms.}
+{Assessment of naming, structure, Rust idioms, from the `toolkit-pr-review` design pass.}
 
 ### Performance {icon}
 
-{Assessment of performance implications. N/A if not applicable.}
+{Assessment of performance implications, from the `toolkit-pr-review` async/perf pass.
+ N/A if not applicable.}
 
 ### Test Coverage {icon}
 
-{Assessment of unit tests and e2e tests in testing/ folder.
- Note missing coverage for new code paths.}
+{Assessment of unit tests and e2e tests in testing/ folder, from the `toolkit-pr-review`
+ tests pass. Note missing coverage for new code paths.}
 
 ### Security {icon}
 
-{Assessment of vulnerabilities, auth, input validation.}
+{Assessment of vulnerabilities, auth, input validation, from the `toolkit-pr-review`
+ security pass.}
 
 ### Mistakes & Potential Misbehaviors {icon}
 
@@ -110,5 +123,7 @@ No reviewer comments found.
 - The **Reviewer Comment Analysis** section is mandatory — it ensures the
   final verdict accounts for existing human feedback, not just the LLM's
   own code analysis.
+- The **Architecture** section is mandatory — it ensures PR-level structural
+  findings are captured before per-file review narrows focus.
 - Icons: ✅ (pass), ⚠️ (concern), ❌ (fail), 🟢 (low risk), 🟡 (medium), 🔴 (high).
 - The verdict must be one of: `✅ APPROVE`, `⚠️ REQUEST CHANGES`, `💬 COMMENT`.

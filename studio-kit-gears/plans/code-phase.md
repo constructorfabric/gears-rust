@@ -28,7 +28,7 @@ implements. Work outside the slice waits for the next phase.
 ### Relevant Files
 
 The canonical gear layout from
-`docs/toolkit_unified_system/02_gear_layout_and_sdk_pattern.md` is the
+`{toolkit_unified_system}/02_gear_layout_and_sdk_pattern.md` is the
 `relevant-files-map`:
 
 | Path | Holds |
