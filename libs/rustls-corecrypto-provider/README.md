@@ -33,7 +33,7 @@ Keychain-stored / Secure-Enclave private keys (the current
 `load_private_key` path imports from in-memory PKCS#1 / PKCS#8 / SEC1 DER
 bytes — Keychain-store integration is a documented future opt-in in
 ADR 0004). **Minimum macOS version for the FIPS witness: 12 (Monterey)**
-— the OE whitelist in [`oe.rs`](src/oe.rs) covers macOS 12, 13, 14, 15;
+— the OE whitelist in [`oe.rs`](src/oe.rs) covers macOS 12, 13, 14, 15, 26;
 the crate compiles and runs on older macOS but `CryptoProvider::fips()`
 will return `false` on those hosts (no panic — see "Runtime FIPS witness"
 below).
@@ -126,7 +126,7 @@ release — see "Open questions / TODO" below.
 Every `fips()` impl in this crate delegates to a single function,
 [`oe::fips_witness_ok()`](src/oe.rs). It returns `true` iff (a) the
 running macOS major is inside [`oe::SUPPORTED_OE_MACOS_MAJOR`] (today:
-`[12, 13, 14, 15]`), or (b) the override env-var
+`[12, 13, 14, 15, 26]`), or (b) the override env-var
 [`oe::OE_OVERRIDE_ENV`] (`CF_GEARS_FIPS_OE_OVERRIDE`) is set. On any
 other macOS version `fips_witness_ok()` returns `false` and so does
 every `fips()` impl in the crate; downstream `ClientConfig::fips()` /
@@ -209,6 +209,7 @@ the CMVP search URL below):
 | v13.0 | macOS 13 (Ventura) | **TBD — verify at CMVP search before relying** |
 | v14.0 / v14.1 | macOS 14 (Sonoma) | **TBD — verify at CMVP search before relying** |
 | v18.3 | macOS 15 (Sequoia) | **TBD — verify at CMVP search before relying** |
+| TBD | macOS 26 (Tahoe) | **TBD — verify at CMVP search before relying** |
 
 > Cert numbers intentionally not pinned in this table: Apple publishes /
 > updates the macOS-corecrypto CMVP certificates on its own cadence, and a
