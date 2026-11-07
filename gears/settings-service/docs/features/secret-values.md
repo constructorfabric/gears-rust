@@ -126,6 +126,7 @@ A `secret` declaration's default is a placeholder, an empty value of the type, e
 6. [x] - `p1` - Credential Store: fetch the plaintext for the winning row's reference in the winning row's tenant; **IF** the store has no entry → **RETURN** `NotFound` on the value; **IF** it cannot answer → **RETURN** `Unavailable` - `inst-sv-resolve-6`
 7. [x] - `p1` - Append a `secret_use` record for the key at the requested scope's tenant, actor the caller's subject, post-image masked, in its own transaction; **IF** it cannot be written → **RETURN** `Unavailable` and hand out no plaintext - `inst-sv-resolve-7`
 8. [x] - `p1` - **RETURN** the plaintext; it is neither cached nor logged, and the cache keeps holding the reference only - `inst-sv-resolve-8`
+9. [x] - `p1` - On every exit of this flow, count `settings_secret_use_total` by `result`: `allowed` once the plaintext of step 8 is returned, `denied` when step 4 refused; any other outcome — a malformed handle (step 2), a missing credential (steps 5–6), a store or audit outage — counts neither. The refusal of step 4 is also counted by the enforcement point on `settings_authz_denial_total` under `operation` `read` — deliberately, the two counters answer different questions - `inst-sv-resolve-9`
 
 ### Remove a Secret Value
 
@@ -261,7 +262,7 @@ A write to a `secret`-trait declaration **MUST** hand the plaintext to the store
 
 - [x] `p1` - **ID**: `cpt-cf-settings-service-dod-secret-values-machine-path`
 
-`SettingsReaderClient::resolve_secret` **MUST** be the only operation yielding plaintext, **MUST** authorize the caller for `read` on the value resource naming that declaration before the store is asked anything, **MUST** append one `secret_use` record per resolution with the value masked and refuse the plaintext when the record cannot be written, **MUST** never cache plaintext, and **MUST** answer an unconfigured secret as `NotFound` on the value, which the SDK projects to `SecretNotConfigured`, rather than `Unauthorized` or the placeholder.
+`SettingsReaderClient::resolve_secret` **MUST** be the only operation yielding plaintext, **MUST** authorize the caller for `read` on the value resource naming that declaration before the store is asked anything, **MUST** append one `secret_use` record per resolution with the value masked and refuse the plaintext when the record cannot be written, **MUST** never cache plaintext, and **MUST** answer an unconfigured secret as `NotFound` on the value, which the SDK projects to `SecretNotConfigured`, rather than `Unauthorized` or the placeholder. It **MUST** count each resolution on `settings_secret_use_total` by `result` — `allowed` when plaintext is returned, `denied` when the gate refuses — and count no other outcome — not a malformed handle, a missing credential nor a store or audit outage.
 
 **Implements**:
 - `cpt-cf-settings-service-flow-secret-values-resolve`
@@ -358,3 +359,6 @@ The system **MUST** let an interactive caller stage a `secret`-trait value ahead
 - [x] Removing or reverting a secret row deletes the store entry after the commit, and the scope resolves to the placeholder afterwards
 - [x] No plaintext is ever present in the effective cache; the cached entry carries the reference only
 - [x] A `secret`-trait declaration with a non-empty default is refused at registration
+- [x] An allowed resolution counts one `allowed` on `settings_secret_use_total`
+- [x] A resolution the gate refuses counts one `denied` and one `settings_authz_denial_total` denial under `operation` `read`
+- [x] A malformed handle, a missing credential and a store outage count nothing on `settings_secret_use_total`

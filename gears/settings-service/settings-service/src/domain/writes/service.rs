@@ -27,7 +27,7 @@ use crate::domain::category::{DomainVisibility, is_visible};
 use crate::domain::declaration::{Declaration, DeclarationRepository};
 use crate::domain::error::DomainError;
 use crate::domain::ports::{
-    ChangePublisher, SecretManager, StepUpOperation, ValueEvent, WriteMetrics,
+    ChangePublisher, SecretManager, StepUpOperation, ValueEvent, WriteMetrics, labels,
 };
 use crate::domain::precondition;
 use crate::domain::resolution::{EffectiveValue, ScopeTarget, ValueResolver, scope_class};
@@ -131,6 +131,17 @@ pub enum Change {
     Revert,
     /// Remove the scope's own row.
     Remove,
+}
+
+/// The kind of change a [`Change`] is, for `settings_changes_committed_total`:
+/// a stored or adopted value counts as `set`.
+#[must_use]
+pub fn change_type_of(change: &Change) -> &'static str {
+    match change {
+        Change::Set(_) | Change::AdoptSecret { .. } => labels::SET,
+        Change::Revert => labels::REVERT,
+        Change::Remove => labels::REMOVE,
+    }
 }
 
 /// A change after staging: validated, and with a secret already in the store.
@@ -526,7 +537,7 @@ where
             // A setting that needs a person to confirm it is by definition not
             // one a machine may set: refused before any validation.
             if !actor.is_interactive() {
-                self.metrics.step_up(operation, "service_principal");
+                self.metrics.step_up(operation, labels::SERVICE_PRINCIPAL);
                 return Err(denied());
             }
             // @cpt-end:cpt-cf-settings-service-algo-value-writes-gates:p1:inst-vw-gate-4
@@ -601,7 +612,7 @@ where
         {
             Ok(()) => {
                 // @cpt-begin:cpt-cf-settings-service-algo-value-writes-step-up:p1:inst-vw-su-6
-                self.metrics.step_up(operation, "verified");
+                self.metrics.step_up(operation, labels::VERIFIED);
                 Ok(())
                 // @cpt-end:cpt-cf-settings-service-algo-value-writes-step-up:p1:inst-vw-su-6
             }
@@ -1063,7 +1074,15 @@ where
     }
 
     /// What follows a durable commit, in this order: evict, then publish.
-    pub async fn after_commit(&self, committed: &Committed, actor: &WriteActor) {
+    ///
+    /// `change_type` is the kind of change the coordinator knows, for
+    /// `settings_changes_committed_total`; `None` counts nothing there.
+    pub async fn after_commit(
+        &self,
+        committed: &Committed,
+        actor: &WriteActor,
+        change_type: Option<&'static str>,
+    ) {
         // @cpt-begin:cpt-cf-settings-service-algo-value-writes-commit:p1:inst-vw-commit-8
         self.resolver.cache().invalidate(
             &committed.key,
@@ -1080,8 +1099,13 @@ where
                 change_set_id: committed.change_set_id,
             })
             .await;
-        self.metrics.value_write("committed");
+        self.metrics.value_write(labels::COMMITTED);
         // @cpt-end:cpt-cf-settings-service-algo-value-writes-commit:p1:inst-vw-commit-9
+        // @cpt-begin:cpt-cf-settings-service-algo-value-writes-commit:p1:inst-vw-commit-11
+        if let Some(change_type) = change_type {
+            self.metrics.change(change_type, labels::COMMITTED);
+        }
+        // @cpt-end:cpt-cf-settings-service-algo-value-writes-commit:p1:inst-vw-commit-11
         // @cpt-begin:cpt-cf-settings-service-flow-secret-values-remove:p1:inst-sv-remove-3
         // @cpt-begin:cpt-cf-settings-service-flow-secret-values-set:p1:inst-sv-set-8
         // @cpt-dod:cpt-cf-settings-service-dod-secret-values-cleanup:p1
@@ -1106,6 +1130,10 @@ where
     }
 
     /// What follows a rejection: a durable notification and a count.
+    ///
+    /// `change_type` is the kind of change that was refused, when it can be
+    /// told; `None` — an unrecognised operation, a refusal on the entry's
+    /// text — counts on the write signal only.
     pub async fn after_rejection(
         &self,
         key: &str,
@@ -1113,6 +1141,7 @@ where
         actor: &WriteActor,
         reason: &DomainError,
         change_set_id: Uuid,
+        change_type: Option<&'static str>,
     ) {
         // An internal fault's diagnostic stays in this process's log; the event
         // may travel further than the log does.
@@ -1133,7 +1162,18 @@ where
                 change_set_id,
             })
             .await;
-        self.metrics.value_write("rejected");
+        self.metrics.value_write(labels::REJECTED);
+        // @cpt-begin:cpt-cf-settings-service-algo-value-writes-commit:p1:inst-vw-commit-11
+        if let Some(change_type) = change_type {
+            self.metrics.change(change_type, labels::REJECTED);
+        }
+        // @cpt-end:cpt-cf-settings-service-algo-value-writes-commit:p1:inst-vw-commit-11
+    }
+
+    /// Count the refusal of a non-interactive caller before a batch's entries
+    /// are judged, as the gate counts one for a single change.
+    pub fn count_service_principal_refusal(&self, operation: StepUpOperation) {
+        self.metrics.step_up(operation, labels::SERVICE_PRINCIPAL);
     }
 
     /// The read-only report: validity with field-level detail, the current

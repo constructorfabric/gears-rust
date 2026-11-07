@@ -20,7 +20,7 @@ use crate::audit::{ActorTenant, AuditOperation, AuditRecord, AuditSink, AuditVal
 use crate::domain::access::AccessRepository;
 use crate::domain::declaration::DeclarationRepository;
 use crate::domain::error::DomainError;
-use crate::domain::ports::{SecretManager, SecretResolveGate};
+use crate::domain::ports::{SecretManager, SecretResolveGate, SecurityMetrics, labels};
 use crate::domain::resolution::{ScopeTarget, ValueResolver};
 use crate::domain::secrets::decode_handle;
 use crate::domain::value::ValueRepository;
@@ -34,6 +34,7 @@ pub struct SecretResolver<D, V, A, S> {
     secrets: Arc<dyn SecretManager>,
     gate: Arc<dyn SecretResolveGate>,
     sink: S,
+    metrics: Arc<dyn SecurityMetrics>,
 }
 
 impl<D, V, A, S> SecretResolver<D, V, A, S>
@@ -44,18 +45,21 @@ where
     S: AuditSink,
 {
     /// Assemble the path over the resolver, the Secret Manager, the
-    /// per-setting gate and the audit sink.
+    /// per-setting gate, the audit sink and the port the secret uses are
+    /// counted on.
     pub fn new(
         resolver: Arc<ValueResolver<D, V, A>>,
         secrets: Arc<dyn SecretManager>,
         gate: Arc<dyn SecretResolveGate>,
         sink: S,
+        metrics: Arc<dyn SecurityMetrics>,
     ) -> Self {
         Self {
             resolver,
             secrets,
             gate,
             sink,
+            metrics,
         }
     }
 
@@ -100,7 +104,16 @@ where
         // @cpt-begin:cpt-cf-settings-service-flow-secret-values-resolve:p1:inst-sv-resolve-4
         // Before the store is asked anything, and whether or not a credential
         // exists: a caller without the grant learns nothing either way.
-        self.gate.may_resolve(ctx, effective.declaration_id).await?;
+        if let Err(refusal) = self.gate.may_resolve(ctx, effective.declaration_id).await {
+            // The gate's refusal — a deny or an undecidable decision, both
+            // `Unauthorized` by the gate (`inst-sv-resolve-4`) — counts
+            // `denied`; the authorization counter beside it tells the reasons
+            // apart. Any other outcome counts nothing.
+            if matches!(refusal, DomainError::Unauthorized { .. }) {
+                self.count_use(labels::DENIED);
+            }
+            return Err(refusal);
+        }
         // @cpt-end:cpt-cf-settings-service-flow-secret-values-resolve:p1:inst-sv-resolve-4
         // @cpt-begin:cpt-cf-settings-service-flow-secret-values-resolve:p1:inst-sv-resolve-5
         // The placeholder default is not a credential. `NotFound` on the value
@@ -145,9 +158,20 @@ where
             .append(conn, &AccessScope::allow_all(), record)
             .await?;
         // @cpt-end:cpt-cf-settings-service-flow-secret-values-resolve:p1:inst-sv-resolve-7
+        self.count_use(labels::ALLOWED);
         // @cpt-begin:cpt-cf-settings-service-flow-secret-values-resolve:p1:inst-sv-resolve-8
         Ok(plaintext)
         // @cpt-end:cpt-cf-settings-service-flow-secret-values-resolve:p1:inst-sv-resolve-8
+    }
+}
+
+impl<D, V, A, S> SecretResolver<D, V, A, S> {
+    /// Count one machine secret use by `result`: `allowed` once the plaintext
+    /// is about to be returned, `denied` when the gate refused.
+    fn count_use(&self, result: &'static str) {
+        // @cpt-begin:cpt-cf-settings-service-flow-secret-values-resolve:p1:inst-sv-resolve-9
+        self.metrics.secret_use(result);
+        // @cpt-end:cpt-cf-settings-service-flow-secret-values-resolve:p1:inst-sv-resolve-9
     }
 }
 

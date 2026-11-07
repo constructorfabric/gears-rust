@@ -20,3 +20,6 @@ pub use service::DeclarationService;
 /// Where a declaration came from: authored by an administrator, or
 /// contributed by a gear. Every source, in the order the gauges report them.
 pub const SOURCES: [&str; 2] = ["admin_authored", "module_contributed"];
+
+/// A declaration's status, in the order the gauges report them.
+pub const STATUSES: [&str; 2] = ["active", "retired"];

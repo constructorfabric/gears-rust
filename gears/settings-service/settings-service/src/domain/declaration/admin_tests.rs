@@ -28,7 +28,7 @@ use crate::infra::storage::pending_secret_repo::PendingSecretRepo;
 use crate::infra::storage::value_repo::ValueRepo;
 use crate::infra::type_validator::GtsTypeValidator;
 use crate::test_support::{
-    BOOL, FixedStepUp, RecordingAudit, RecordingMetrics, RecordingRegistrar, RecordingSecrets,
+    BOOL, FixedStepUp, RecordingAudit, RecordingRegistrar, RecordingSecrets, RecordingWriteMetrics,
     ResolutionHarness, SECRET, TEXT, resolution_catalogue,
 };
 
@@ -46,7 +46,7 @@ struct Harness {
     audit: Arc<RecordingAudit>,
     registrar: Arc<RecordingRegistrar>,
     secrets: Arc<RecordingSecrets>,
-    metrics: Arc<RecordingMetrics>,
+    metrics: Arc<RecordingWriteMetrics>,
 }
 
 impl Harness {
@@ -67,7 +67,7 @@ impl Harness {
         let audit = Arc::new(RecordingAudit::default());
         let registrar = Arc::new(RecordingRegistrar::default());
         let secrets = Arc::new(RecordingSecrets::default());
-        let metrics = Arc::new(RecordingMetrics::default());
+        let metrics = Arc::new(RecordingWriteMetrics::default());
         let admin = DeclarationAdmin::new(
             DeclarationRepo,
             CategoryRepo,
@@ -1581,7 +1581,11 @@ async fn evolution_needs_step_up_and_may_not_cross_the_secret_boundary() {
         DeclarationStatus::Active,
         "nothing moved"
     );
-    assert!(h.by_key(&v1.key.replace(".v1~", ".v2~")).await.is_none());
+    assert!(
+        h.by_key(&v1.key.replace(".retry_policy.v1~", ".retry_policy.v2~"))
+            .await
+            .is_none()
+    );
 }
 
 #[tokio::test]
@@ -2462,6 +2466,15 @@ impl ValueRepository for BatchRecordingValues {
         source: &str,
     ) -> Result<u64, DomainError> {
         ValueRepo.count_flagged(conn, scope, source).await
+    }
+
+    async fn count_by_scope_kind<C: toolkit_db::secure::DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        root: Uuid,
+    ) -> Result<std::collections::HashMap<(String, &'static str), u64>, DomainError> {
+        ValueRepo.count_by_scope_kind(conn, scope, root).await
     }
 
     async fn list_review<C: toolkit_db::secure::DBRunner>(
@@ -3605,4 +3618,220 @@ async fn a_release_task_that_panics_counts_every_entry_it_did_not_report_as_fail
             )),
         }
     });
+}
+
+// ---- `settings_step_up_total` on the step-up-gated declaration actions.
+
+/// The re-declaration of `retry_policy` as text: what evolves the active path.
+fn as_text(h: &Harness) -> CreateDeclaration {
+    let mut request = h.request("retry_policy");
+    request.value_type_id = TEXT.to_owned();
+    request.default_value = json!("gentle");
+    request
+}
+
+#[tokio::test]
+async fn a_step_up_gated_update_a_retire_a_reactivate_and_an_evolution_each_count_verified() {
+    let h = Harness::verified().await;
+    let v1 = h
+        .create(h.request("retry_policy"), &admin_actor())
+        .await
+        .expect("created")
+        .declaration;
+    assert!(
+        h.metrics.step_ups().is_empty(),
+        "a fresh create asks no step-up"
+    );
+
+    // Loosening is step-up gated.
+    let tag = etag_of(&v1);
+    h.update(
+        v1.id,
+        Some(tag.as_str()),
+        json!({"requires_step_up": false}),
+        &admin_actor(),
+    )
+    .await
+    .expect("loosened");
+    assert_eq!(h.metrics.step_ups(), vec![("update", "verified")]);
+
+    // An evolution to the next major.
+    h.create(as_text(&h), &admin_actor())
+        .await
+        .expect("evolved");
+    assert_eq!(
+        h.metrics.step_ups(),
+        vec![("update", "verified"), ("evolve", "verified")]
+    );
+
+    // Retire the active major, then re-declare it: a reactivation.
+    let v2 = h
+        .by_key(&v1.key.replace(".retry_policy.v1~", ".retry_policy.v2~"))
+        .await
+        .expect("the evolved declaration");
+    let tag = etag_of(&v2);
+    h.retire(v2.id, Some(tag.as_str()), &admin_actor())
+        .await
+        .expect("retired");
+    // The path's composed key is the first major's: a revive keeps its shape.
+    h.create(h.request("retry_policy"), &admin_actor())
+        .await
+        .expect("reactivated");
+    assert_eq!(
+        h.metrics.step_ups(),
+        vec![
+            ("update", "verified"),
+            ("evolve", "verified"),
+            ("retire", "verified"),
+            ("reactivate", "verified"),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_declaration_action_without_a_valid_assertion_counts_the_refusal_code() {
+    let h = Harness::with_step_up(Arc::new(FixedStepUp::refusing(StepUpRefusal::Missing))).await;
+    let v1 = h
+        .create(h.request("retry_policy"), &admin_actor())
+        .await
+        .expect("created")
+        .declaration;
+    let tag = etag_of(&v1);
+
+    h.update(
+        v1.id,
+        Some(tag.as_str()),
+        json!({"requires_step_up": false}),
+        &admin_actor(),
+    )
+    .await
+    .expect_err("refused");
+    h.retire(v1.id, Some(tag.as_str()), &admin_actor())
+        .await
+        .expect_err("refused");
+    h.create(as_text(&h), &admin_actor())
+        .await
+        .expect_err("refused");
+    // A retired row to revive, seeded the way retirement leaves it.
+    let other = h
+        .create(h.request("other_policy"), &admin_actor())
+        .await
+        .expect("created")
+        .declaration;
+    h.base.retire(other.id).await;
+    h.create(h.request("other_policy"), &admin_actor())
+        .await
+        .expect_err("refused");
+
+    assert_eq!(
+        h.metrics.step_ups(),
+        vec![
+            ("update", "missing"),
+            ("retire", "missing"),
+            ("evolve", "missing"),
+            ("reactivate", "missing"),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_verifier_that_cannot_answer_counts_its_own_code_not_a_verdict() {
+    let h = Harness::with_step_up(Arc::new(FixedStepUp::refusing(StepUpRefusal::Unavailable(
+        "authn down".to_owned(),
+    ))))
+    .await;
+    let v1 = h
+        .create(h.request("retry_policy"), &admin_actor())
+        .await
+        .expect("created")
+        .declaration;
+    let tag = etag_of(&v1);
+    let err = h
+        .retire(v1.id, Some(tag.as_str()), &admin_actor())
+        .await
+        .expect_err("outage");
+    assert!(matches!(err, DomainError::Unavailable { .. }), "{err:?}");
+    assert_eq!(h.metrics.step_ups(), vec![("retire", "unavailable")]);
+}
+
+#[tokio::test]
+async fn a_declaration_action_by_a_non_interactive_caller_counts_service_principal() {
+    let h = Harness::verified().await;
+    let v1 = h
+        .create(h.request("retry_policy"), &admin_actor())
+        .await
+        .expect("created")
+        .declaration;
+    let tag = etag_of(&v1);
+    h.update(
+        v1.id,
+        Some(tag.as_str()),
+        json!({"requires_step_up": false}),
+        &service_actor(),
+    )
+    .await
+    .expect_err("a machine cannot re-authenticate");
+    h.retire(v1.id, Some(tag.as_str()), &service_actor())
+        .await
+        .expect_err("a machine cannot re-authenticate");
+    h.create(as_text(&h), &service_actor())
+        .await
+        .expect_err("a machine cannot re-authenticate");
+    let other = h
+        .create(h.request("other_policy"), &admin_actor())
+        .await
+        .expect("created")
+        .declaration;
+    h.base.retire(other.id).await;
+    h.create(h.request("other_policy"), &service_actor())
+        .await
+        .expect_err("a machine cannot re-authenticate");
+
+    assert_eq!(
+        h.metrics.step_ups(),
+        vec![
+            ("update", "service_principal"),
+            ("retire", "service_principal"),
+            ("evolve", "service_principal"),
+            ("reactivate", "service_principal"),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_metadata_update_that_needs_no_step_up_counts_nothing() {
+    let h = Harness::verified().await;
+    let v1 = h
+        .create(h.request("retry_policy"), &admin_actor())
+        .await
+        .expect("created")
+        .declaration;
+
+    // Loosening: counted, so the recorder is known to be wired.
+    let tag = etag_of(&v1);
+    h.update(
+        v1.id,
+        Some(tag.as_str()),
+        json!({"requires_step_up": false}),
+        &admin_actor(),
+    )
+    .await
+    .expect("loosened");
+    assert_eq!(h.metrics.step_ups(), vec![("update", "verified")]);
+
+    // Tightening and a descriptive edit are not gated.
+    let tag = etag_of(&h.load(v1.id).await);
+    h.update(
+        v1.id,
+        Some(tag.as_str()),
+        json!({"requires_step_up": true, "description": "retried"}),
+        &admin_actor(),
+    )
+    .await
+    .expect("tightened");
+    assert_eq!(
+        h.metrics.step_ups(),
+        vec![("update", "verified")],
+        "a metadata update that needs no step-up counts nothing"
+    );
 }

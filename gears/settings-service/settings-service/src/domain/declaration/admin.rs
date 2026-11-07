@@ -29,7 +29,7 @@ use crate::domain::declaration::{
     DeclarationStatus,
 };
 use crate::domain::error::DomainError;
-use crate::domain::ports::{SecretManager, StepUpOperation, WriteMetrics};
+use crate::domain::ports::{SecretManager, StepUpOperation, WriteMetrics, labels};
 use crate::domain::precondition::{self, ETag};
 use crate::domain::resolution::EffectiveCache;
 use crate::domain::secrets::pending::PendingSecretRepository;
@@ -1227,8 +1227,10 @@ where
         // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-reactivate:p1:inst-decl-react-8
         // Reactivation changes whether a live setting resolves: gated like a
         // value change, before anything else is inspected.
+        // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-reactivate:p1:inst-decl-react-17
         self.verify_step_up(actor, StepUpOperation::Reactivate)
             .await?;
+        // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-reactivate:p1:inst-decl-react-17
         // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-reactivate:p1:inst-decl-react-8
         // The row for update, then read again by id: a purge of this retired
         // declaration holds the row until it commits, so this waits for it and
@@ -1355,7 +1357,9 @@ where
         // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-evolve:p1:inst-decl-evolve-3
         // Evolution retires a live setting's current major: gated like a value
         // change, before anything else is inspected.
+        // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-evolve:p1:inst-decl-evolve-9
         self.verify_step_up(actor, StepUpOperation::Evolve).await?;
+        // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-evolve:p1:inst-decl-evolve-9
         // The active row for update, then read again by id: a retire and a
         // purge of it, or another evolution, hold it until they commit, so
         // this waits for them and sees what they left — a row gone is `404`,
@@ -1598,7 +1602,9 @@ where
         // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-update:p1:inst-decl-update-8
         // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-update:p1:inst-decl-update-11
         if needs_step_up {
+            // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-update:p1:inst-decl-update-16
             self.verify_step_up(actor, StepUpOperation::Update).await?;
+            // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-update:p1:inst-decl-update-16
         }
         // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-update:p1:inst-decl-update-11
         // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-update:p1:inst-decl-update-10
@@ -1718,7 +1724,9 @@ where
         // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-retire:p1:inst-decl-retire-5
         // Retire drops a live setting out of resolution at once: gated like a
         // value change, before the declaration is even looked up.
+        // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-retire:p1:inst-decl-retire-15
         self.verify_step_up(actor, StepUpOperation::Retire).await?;
+        // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-retire:p1:inst-decl-retire-15
         // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-retire:p1:inst-decl-retire-5
         // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-retire:p1:inst-decl-retire-4
         // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-retire:p1:inst-decl-retire-6
@@ -2130,15 +2138,19 @@ where
 
     /// The step-up gate, as the value write path applies it: an interactive
     /// caller must present a fresh assertion; a service principal cannot and
-    /// is refused outright. The outcome is counted in `settings_step_up_total`
-    /// under `operation`.
+    /// is refused outright. Each outcome is counted on
+    /// `settings_step_up_total` under the `operation` the caller names.
     async fn verify_step_up(
         &self,
         actor: &WriteActor,
         operation: StepUpOperation,
     ) -> Result<(), DomainError> {
+        // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-update:p1:inst-decl-update-16
+        // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-retire:p1:inst-decl-retire-15
+        // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-reactivate:p1:inst-decl-react-17
+        // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-evolve:p1:inst-decl-evolve-9
         if !actor.is_interactive() {
-            self.metrics.step_up(operation, "service_principal");
+            self.metrics.step_up(operation, labels::SERVICE_PRINCIPAL);
             return Err(DomainError::Unauthorized {
                 resource: settings_service_sdk::gts::DECLARATION_SCHEMA,
             });
@@ -2156,7 +2168,7 @@ where
             .await
         {
             Ok(()) => {
-                self.metrics.step_up(operation, "verified");
+                self.metrics.step_up(operation, labels::VERIFIED);
                 Ok(())
             }
             Err(refusal) => {
@@ -2178,6 +2190,10 @@ where
                 }
             }
         }
+        // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-evolve:p1:inst-decl-evolve-9
+        // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-reactivate:p1:inst-decl-react-17
+        // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-retire:p1:inst-decl-retire-15
+        // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-update:p1:inst-decl-update-16
     }
 
     async fn record<C: DBRunner>(

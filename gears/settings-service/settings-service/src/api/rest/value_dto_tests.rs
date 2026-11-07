@@ -53,6 +53,7 @@ fn effective(classification: &str) -> EffectiveValue {
         fallback_scope: None,
         traits: json!({}),
         trail: Vec::new(),
+        scope_class: "cascading",
         data_classification: classification.to_owned(),
         domain_affinity: None,
         secret_backed: false,

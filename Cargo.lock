@@ -4215,7 +4215,7 @@ dependencies = [
 
 [[package]]
 name = "cf-gears-settings-service"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4246,6 +4246,7 @@ dependencies = [
  "inventory",
  "jsonschema 0.60.2",
  "opentelemetry",
+ "opentelemetry_sdk",
  "regex",
  "sea-orm",
  "sea-orm-migration",

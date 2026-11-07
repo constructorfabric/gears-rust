@@ -1515,3 +1515,132 @@ async fn a_batch_asks_the_registry_once_per_distinct_value_type() {
     assert!(outcomes.iter().all(Result::is_ok), "{outcomes:?}");
     assert_eq!(counting.traits.load(std::sync::atomic::Ordering::SeqCst), 2);
 }
+
+// ---- The reader boundary's report: the resolver reports, the reader records.
+
+#[tokio::test]
+async fn a_reader_resolve_reports_a_cache_hit_as_the_cache_source() {
+    let h = Harness::new().await;
+    let d = h
+        .declare("strict", scope_class::CASCADING, json!(false))
+        .await;
+    h.set(d, h.tree.a, json!(true)).await;
+    h.resolve("strict", tenant(h.tree.b))
+        .await
+        .expect("fills the cache");
+    let conn = h.db.conn().expect("connection");
+
+    let read = h
+        .resolver
+        .resolve_for_reader(&conn, &h.key("strict"), tenant(h.tree.b))
+        .await
+        .expect("resolves");
+
+    assert_eq!(read.source, "cache");
+    assert_eq!(read.value.value, json!(true));
+}
+
+#[tokio::test]
+async fn a_reader_resolve_reports_a_resolving_miss_with_a_non_zero_span() {
+    let h = Harness::new().await;
+    let d = h
+        .declare("strict", scope_class::CASCADING, json!(false))
+        .await;
+    h.set(d, h.tree.a, json!(true)).await;
+    let conn = h.db.conn().expect("connection");
+
+    let read = h
+        .resolver
+        .resolve_for_reader(&conn, &h.key("strict"), tenant(h.tree.b))
+        .await
+        .expect("resolves");
+
+    assert_eq!(read.source, "resolve");
+    assert_eq!(read.value.value, json!(true));
+    assert!(
+        read.elapsed > Duration::ZERO,
+        "the span runs from the cache lookup to the outcome, the walk included"
+    );
+}
+
+#[tokio::test]
+async fn a_reader_resolve_passes_an_error_through_unchanged() {
+    let h = Harness::new().await;
+    let gone = h.declare("gone", scope_class::LOCAL, json!(1)).await;
+    h.retire(gone).await;
+    h.declare("strict", scope_class::CASCADING, json!(false))
+        .await;
+    let conn = h.db.conn().expect("connection");
+
+    let err = h
+        .resolver
+        .resolve_for_reader(&conn, &h.key("ghost"), tenant(h.tree.b))
+        .await
+        .expect_err("not found");
+    assert!(matches!(err, DomainError::NotFound { .. }), "{err:?}");
+
+    let err = h
+        .resolver
+        .resolve_for_reader(&conn, &h.key("gone"), tenant(h.tree.b))
+        .await
+        .expect_err("retired");
+    assert!(matches!(err, DomainError::Retired { .. }), "{err:?}");
+
+    h.hierarchy.set_unavailable(true);
+    let err = h
+        .resolver
+        .resolve_for_reader(&conn, &h.key("strict"), tenant(h.tree.b))
+        .await
+        .expect_err("unavailable");
+    assert!(matches!(err, DomainError::Unavailable { .. }), "{err:?}");
+}
+
+#[tokio::test]
+async fn a_bulk_reader_resolve_reports_each_key_and_fails_the_request_without_the_root() {
+    let h = Harness::new().await;
+    for name in ["one", "two", "three"] {
+        h.declare(name, scope_class::CASCADING, json!(1)).await;
+    }
+    h.resolve("one", tenant(h.tree.b))
+        .await
+        .expect("fills the cache for one key");
+    let keys = [h.key("one"), h.key("two"), h.key("three")];
+    let conn = h.db.conn().expect("connection");
+
+    let reports = h
+        .resolver
+        .resolve_bulk_for_reader(&conn, &keys, tenant(h.tree.b))
+        .await
+        .expect("served");
+
+    let sources: Vec<&str> = reports
+        .iter()
+        .map(|(_, read)| read.as_ref().expect("resolves").source)
+        .collect();
+    assert_eq!(sources, vec!["cache", "resolve", "resolve"]);
+
+    h.platform.go_down();
+    let err = h
+        .resolver
+        .resolve_bulk_for_reader(&conn, &keys, tenant(h.tree.b))
+        .await
+        .expect_err("no key can be resolved without the root");
+    assert!(matches!(err, DomainError::Unavailable { .. }), "{err:?}");
+}
+
+#[tokio::test]
+async fn a_plain_resolve_reports_nothing_for_a_reader_to_record() {
+    // The administrative read, the write path's resolves, the secret path and
+    // subtree resolution all go through `resolve`, whose answer is the value
+    // alone: there is no report for anything to record.
+    let h = Harness::new().await;
+    h.declare("strict", scope_class::CASCADING, json!(false))
+        .await;
+    let conn = h.db.conn().expect("connection");
+    let value: Arc<EffectiveValue> = h
+        .resolver
+        .resolve(&conn, &h.key("strict"), tenant(h.tree.b))
+        .await
+        .expect("resolves");
+    assert_eq!(value.value, json!(false));
+}

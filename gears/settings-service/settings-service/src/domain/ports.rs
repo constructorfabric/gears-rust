@@ -267,6 +267,10 @@ pub trait WriteMetrics: Send + Sync {
     /// `settings_declaration_purge_secret_releases_total{result=failed}`: one
     /// Credential Store entry a purge could not release.
     fn purge_release_failed(&self);
+    /// `settings_changes_committed_total` by change type and outcome: the
+    /// per-type breakdown of [`Self::value_write`], one call per change whose
+    /// kind is known.
+    fn change(&self, change_type: &'static str, outcome: &'static str);
 }
 
 /// What the managed lifecycle's passes report.
@@ -279,6 +283,13 @@ pub trait LifecycleMetrics: Send + Sync {
     /// `pruned`. A failed pass and one with nothing to prune both delete
     /// nothing; this is what tells them apart.
     fn retention_pass(&self, result: &'static str, pruned: u64);
+    /// `settings_service_up`: 1 while the lifecycle runs, 0 once it is told to
+    /// stop.
+    fn service_up(&self, up: bool);
+    /// `settings_declarations_total` for one `source` and `status`.
+    fn declarations(&self, source: &'static str, status: &'static str, count: u64);
+    /// `settings_values_total` for one `scope_class` and `scope_kind`.
+    fn values(&self, scope_class: &'static str, scope_kind: &'static str, count: u64);
 }
 
 /// What the actor name lookup of a history page reports.
@@ -297,7 +308,29 @@ impl ActorNameMetrics for NoActorNameMetrics {
     fn pass(&self, _result: &'static str, _duration: std::time::Duration) {}
 }
 
-/// Counts nothing; the test binding.
+/// What the reader boundary reports about an effective-value read.
+pub trait ReadMetrics: Send + Sync {
+    /// `settings_cache_lookups_total` by `result` and `scope_class`, for a
+    /// lookup that resolved to a value.
+    fn lookup(&self, result: &'static str, scope_class: &'static str);
+    /// `settings_effective_read_duration_seconds` by `source` and
+    /// `scope_class`.
+    fn read(&self, source: &'static str, scope_class: &'static str, seconds: f64);
+    /// `settings_resolve_failures_total` by `reason`.
+    fn resolve_failure(&self, reason: &'static str);
+}
+
+/// What the enforcement points, the Secret Manager and the audit sink report.
+pub trait SecurityMetrics: Send + Sync {
+    /// `settings_authz_denial_total` by `operation` and `reason`.
+    fn authz_denial(&self, operation: &'static str, reason: &'static str);
+    /// `settings_secret_use_total` by `result`.
+    fn secret_use(&self, result: &'static str);
+    /// `settings_audit_events_total` by `kind`.
+    fn audit_event(&self, kind: &'static str);
+}
+
+/// Counts nothing; the test binding of every metrics port.
 #[domain_model]
 pub struct NoMetrics;
 
@@ -306,4 +339,124 @@ impl WriteMetrics for NoMetrics {
     fn step_up(&self, _operation: StepUpOperation, _result: &'static str) {}
     fn purge_released(&self) {}
     fn purge_release_failed(&self) {}
+    fn change(&self, _change_type: &'static str, _outcome: &'static str) {}
 }
+
+impl LifecycleMetrics for NoMetrics {
+    fn needs_review(&self, _source: &'static str, _count: u64) {}
+    fn retention_pass(&self, _result: &'static str, _pruned: u64) {}
+    fn service_up(&self, _up: bool) {}
+    fn declarations(&self, _source: &'static str, _status: &'static str, _count: u64) {}
+    fn values(&self, _scope_class: &'static str, _scope_kind: &'static str, _count: u64) {}
+}
+
+impl ReadMetrics for NoMetrics {
+    fn lookup(&self, _result: &'static str, _scope_class: &'static str) {}
+    fn read(&self, _source: &'static str, _scope_class: &'static str, _seconds: f64) {}
+    fn resolve_failure(&self, _reason: &'static str) {}
+}
+
+impl SecurityMetrics for NoMetrics {
+    fn authz_denial(&self, _operation: &'static str, _reason: &'static str) {}
+    fn secret_use(&self, _result: &'static str) {}
+    fn audit_event(&self, _kind: &'static str) {}
+}
+
+/// The label values the metrics ports take, each a finite set the DESIGN
+/// names (§7 *Feature Metrics*): nothing a request carries — a key, a tenant,
+/// an actor, a value, a path — is ever a label.
+pub mod labels {
+    /// `settings_changes_committed_total` / `settings_value_writes_total`.
+    pub const COMMITTED: &str = "committed";
+    /// A change that was refused or whose commit failed.
+    pub const REJECTED: &str = "rejected";
+    /// Both outcomes.
+    pub const OUTCOMES: [&str; 2] = [COMMITTED, REJECTED];
+
+    /// A stored or adopted value (`create` and `change` both count it).
+    pub const SET: &str = "set";
+    /// A revert to the inherited value.
+    pub const REVERT: &str = "revert";
+    /// A removal of the override.
+    pub const REMOVE: &str = "remove";
+    /// A clone of one scope's value onto another.
+    pub const CLONE: &str = "clone";
+    /// The kinds of change.
+    pub const CHANGE_TYPES: [&str; 4] = [SET, REVERT, REMOVE, CLONE];
+
+    /// A lookup answered from the cache.
+    pub const HIT: &str = "hit";
+    /// A lookup that fell through to the walk.
+    pub const MISS: &str = "miss";
+    /// Both lookup results.
+    pub const LOOKUP_RESULTS: [&str; 2] = [HIT, MISS];
+
+    /// A read served from the cache.
+    pub const CACHE: &str = "cache";
+    /// A read that resolved.
+    pub const RESOLVE: &str = "resolve";
+    /// Both read sources.
+    pub const READ_SOURCES: [&str; 2] = [CACHE, RESOLVE];
+
+    /// A dependency that cannot answer.
+    pub const UNAVAILABLE: &str = "unavailable";
+    /// A failure that is the service's own.
+    pub const INTERNAL: &str = "internal";
+    /// Both resolve-failure reasons.
+    pub const RESOLVE_FAILURES: [&str; 2] = [UNAVAILABLE, INTERNAL];
+
+    /// The decision point said no.
+    pub const DENIED: &str = "denied";
+    /// The decision point could not be reached (the same word as
+    /// [`UNAVAILABLE`]).
+    pub const AUTHZ_UNAVAILABLE: &str = "unavailable";
+    /// The returned constraints could not be compiled.
+    pub const CONSTRAINTS: &str = "constraints";
+    /// The authorization refusal reasons.
+    pub const AUTHZ_REASONS: [&str; 3] = [DENIED, AUTHZ_UNAVAILABLE, CONSTRAINTS];
+
+    /// The actions an enforcement point asks for. `read_unmasked` is not among
+    /// them: that entitlement is a probe, answered by masking, never counted.
+    pub const AUTHZ_OPERATIONS: [&str; 6] =
+        ["read", "write", "create", "update", "delete", "delegate"];
+
+    /// A retention pass that ran to its end.
+    pub const RETENTION_OK: &str = "ok";
+    /// A retention pass a failure stopped early.
+    pub const RETENTION_FAILED: &str = "failed";
+    /// The retention pass results.
+    pub const RETENTION_RESULTS: [&str; 2] = [RETENTION_OK, RETENTION_FAILED];
+
+    /// A plaintext resolution that was handed out.
+    pub const ALLOWED: &str = "allowed";
+    /// The secret-use results.
+    pub const SECRET_USE_RESULTS: [&str; 2] = [ALLOWED, DENIED];
+
+    /// An audit record of a mutation (a staging included).
+    pub const MUTATION: &str = "mutation";
+    /// An audit record of a machine secret use.
+    pub const SECRET_USE: &str = "secret_use";
+    /// The audit event kinds.
+    pub const AUDIT_KINDS: [&str; 2] = [MUTATION, SECRET_USE];
+
+    /// A verified assertion.
+    pub const VERIFIED: &str = "verified";
+    /// A caller with no person behind it, refused for want of an assertion.
+    pub const SERVICE_PRINCIPAL: &str = "service_principal";
+    /// A refusal's own code, as `StepUpRefusal::code` spells it.
+    pub const STEP_UP_REFUSALS: [&str; 9] = [
+        "missing",
+        "not_configured",
+        "unavailable",
+        "signature",
+        "subject_mismatch",
+        "auth_time_missing",
+        "stale",
+        "assurance",
+        "claims",
+    ];
+}
+
+#[cfg(test)]
+#[path = "ports_tests.rs"]
+mod ports_tests;
