@@ -15,6 +15,7 @@ the conformance suite's dedup scenarios cover it. S2 (`Prefer: wait`) answers
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import uuid
 from datetime import datetime, timezone
 
@@ -28,6 +29,7 @@ from .conftest import (
     EVENT_TYPE_BYTES,
     EVENT_TYPE_DRAIN,
     EVENT_TYPE_RETENTION,
+    EVENT_TYPE_SLOW_PUBLISH,
     RETENTION_DURATION_S,
     RETENTION_SEGMENT_EVENTS,
     SUBJECT_TYPE,
@@ -36,6 +38,8 @@ from .conftest import (
     TOPIC_BYTES,
     TOPIC_DRAIN,
     TOPIC_RETENTION,
+    TOPIC_RETENTION_AGE_S,
+    TOPIC_SLOW_PUBLISH,
     TRACE_ID,
     SseFrameReader,
 )
@@ -169,14 +173,94 @@ async def test_a_consumer_joined_before_any_publish_receives_the_first_event(api
             }
 
 
-async def _read(test_env, sub_id: str, count: int) -> list[dict]:
-    """The next `count` event payloads on `sub_id`'s stream, then closes it."""
+# How long a read waits for each next event. `POST /events` acks with 202
+# before the outbox has stored the event, so a read-back waits on the drain:
+# its rate is ~80 events/s on a debug build (1000 events stored over 12-15 s
+# locally, idle or at load average 100+), so consecutive events arrive tens of
+# milliseconds apart and 15 s only trips on a stream that has stopped.
+EVENT_WAIT_S = 15
+
+
+class _Stream:
+    """An open SSE stream on one subscription, read `count` events at a time."""
+
+    def __init__(self, reader: SseFrameReader):
+        self._reader = reader
+
+    async def take(self, count: int) -> list[dict]:
+        """The next `count` event payloads.
+
+        A stream that stops short fails with what it did deliver - how many
+        events, the first and last sequence and `data.n`, and how long the read
+        ran - so a short read because events were removed before they were
+        read (`n` starts late or skips) is told apart from a stall.
+        """
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        events: list[dict] = []
+        while len(events) < count:
+            try:
+                events.append((await self._reader.await_kind("event", timeout=EVENT_WAIT_S))["payload"])
+            except (AssertionError, TimeoutError) as stalled:
+                raise AssertionError(
+                    f"{_short_read(events, count, loop.time() - started)} ({type(stalled).__name__}: {stalled})"
+                ) from stalled
+        return events
+
+    async def take_during(self, count: int, publishing) -> list[dict]:
+        """The next `count` event payloads, read while `publishing` runs.
+
+        Read concurrently, not once `publishing` is done: frames left unread
+        fill the socket buffers, the server then stops reading the backend, and
+        what it has not read yet keeps ageing as if no one were reading.
+
+        A plain task rather than a `TaskGroup`, so a failure surfaces as itself
+        and not as an `ExceptionGroup` that hides its message in the summary.
+        """
+        reading = asyncio.ensure_future(self.take(count))
+        try:
+            await publishing
+        except BaseException:
+            reading.cancel()
+            with contextlib.suppress(BaseException):
+                await reading
+            raise
+        return await reading
+
+
+@contextlib.asynccontextmanager
+async def _stream(test_env, sub_id: str):
+    """`sub_id`'s SSE stream, open once its topology frame has arrived.
+
+    Open it before publishing what it is to read back: it then delivers each
+    event as soon as the outbox stores it, so an event's age when read is the
+    stream's lag behind storage, not that plus however long the publish took.
+    """
     async with httpx.AsyncClient(base_url=f"{test_env.base_url}/event-broker/v1", timeout=None) as stream_client:
         async with stream_client.stream("GET", f"/events:sse?subscription_id={sub_id}") as stream_resp:
             assert stream_resp.status_code == 200
             reader = SseFrameReader(stream_resp)
             await reader.await_kind("topology", timeout=5)
-            return [(await reader.await_kind("event", timeout=15))["payload"] for _ in range(count)]
+            yield _Stream(reader)
+
+
+async def _read(test_env, sub_id: str, count: int) -> list[dict]:
+    """The next `count` event payloads on `sub_id`'s stream, then closes it."""
+    async with _stream(test_env, sub_id) as stream:
+        return await stream.take(count)
+
+
+def _short_read(events: list[dict], count: int, elapsed: float) -> str:
+    """What a read that stopped short delivered, for its failure message."""
+    if not events:
+        return f"0 of {count} events delivered in {elapsed:.1f}s"
+    first, last = events[0], events[-1]
+    return (
+        f"{len(events)} of {count} events delivered in {elapsed:.1f}s: "
+        f"sequences {first['sequence']}..{last['sequence']}, "
+        f"data.n {(first.get('data') or {}).get('n')}..{(last.get('data') or {}).get('n')}, "
+        f"first stored at {first['sequence_time']}, last at {last['sequence_time']}"
+    )
 
 
 async def _seek(client, sub_id: str, value, topic: str = TOPIC_RETENTION) -> object:
@@ -194,37 +278,71 @@ async def _resolved(client, sub_id: str, value, topic: str) -> int:
     return resp.json()["positions"][topic][0]["value"]
 
 
+# How long the age test polls for the floor to pass the old batch, from the
+# fresh event's publish. Not derived from the age bound, so the read after it
+# keeps TOPIC_RETENTION_AGE_S - FLOOR_POLL_S before the fresh event ages out.
+FLOOR_POLL_S = 6
+
+
 @pytest.mark.backend_sensitive
 @pytest.mark.timeout(60, func_only=True)
 async def test_retention_removes_the_events_past_their_age_and_keeps_the_rest(api, test_env):
     """Retention by age (feature 0007 §2.6), seen through SEEK and delivery.
 
-    TOPIC_RETENTION keeps events RETENTION_DURATION_S. One storage segment's
+    TOPIC_RETENTION keeps events TOPIC_RETENTION_AGE_S. One storage segment's
     worth of events is published and left to age past that; one more is then
     published. The backend removes exactly the aged ones - by event or by whole
     segment, the old batch is one segment - and keeps the new one: "earliest"
     resolves at or past the last aged event's sequence and below the new one's
     (a backend with gaps may count a position between them as removed), a seek
     below it is refused, and a read from the start delivers the new event first.
+
+    Margins (memory backend, debug build; sweeps run every second, so an event
+    goes at an age between TOPIC_RETENTION_AGE_S and one second more):
+
+    - Read-back of the old batch: the stream is open and read while the batch
+      is published, so an event's age when read is the stream's lag behind
+      the outbox - at most 0.06 s measured, against an age bound of 8 s, also
+      with the publish slowed to 11 s. Read only after the publish, as it
+      once was, the front of the batch aged out before the stream opened
+      whenever the publish went on longer than the age bound after the first
+      event was stored, and the read then waited for events that were gone;
+      test_a_batch_published_for_longer_than_its_age_bound_is_read_back_whole
+      fails every time on that shape on the memory backend.
+    - The batch is stored at the outbox's rate, ~80 events/s, so the read-back
+      takes 12-15 s; consecutive events arrived at most 0.5 s apart, against
+      EVENT_WAIT_S of 15 s.
+    - The floor deadline, `published_at + FLOOR_POLL_S`: the fresh event is
+      stored after its POST, so it ages out no earlier than
+      `published_at + TOPIC_RETENTION_AGE_S`, which leaves the read after the
+      poll at least TOPIC_RETENTION_AGE_S - FLOOR_POLL_S = 12 - 6 = 6 s for a
+      stream open and one stored event. The deadline does not follow the age:
+      `published_at + age - 2` leaves 2 s at any age.
+    - The 60 s bound: the read-back (12-15 s), the age wait (at most
+      TOPIC_RETENTION_AGE_S + 1 = 13 s), the floor poll (at most FLOOR_POLL_S
+      = 6 s) and one read, about 35 s; in CI the whole test took 22-26 s in
+      the 15 green runs of 2026-11-04, with an age bound 4 s shorter.
     """
     tenant_id = str(uuid.uuid4())
     interest = [{"topic": TOPIC_RETENTION, "tenant_id": tenant_id, "types": [EVENT_TYPE_RETENTION]}]
     async with api() as client:
         reader_sub = await _subscribe(client, TOPIC_RETENTION, interest)
         assert (await _seek(client, reader_sub, "earliest")).status_code == 200
-        for start in range(0, RETENTION_SEGMENT_EVENTS, 100):
-            batch = [_event(EVENT_TYPE_RETENTION, tenant_id, n) for n in range(start, start + 100)]
-            resp = await client.post("/events:batch", json={"events": batch})
-            assert resp.status_code == 202
-
     # Reading the batch back waits for it to be stored and gives the last
-    # sequence and storage time, which is what its age runs from.
-    old = await _read(test_env, reader_sub, RETENTION_SEGMENT_EVENTS)
+    # sequence and storage time, which is what its age runs from. The stream
+    # opens first: the outbox stores the batch while it is still being
+    # published, and a read opened only afterwards could find its front
+    # already removed.
+    async with _stream(test_env, reader_sub) as stream, api() as client:
+        old = await stream.take_during(
+            RETENTION_SEGMENT_EVENTS,
+            _publish(client, EVENT_TYPE_RETENTION, tenant_id, RETENTION_SEGMENT_EVENTS),
+        )
     assert [e["data"]["n"] for e in old] == list(range(RETENTION_SEGMENT_EVENTS))
     last_old = old[-1]
     stored_at = datetime.fromisoformat(last_old["sequence_time"].replace("Z", "+00:00"))
     aged_for = (datetime.now(timezone.utc) - stored_at).total_seconds()
-    await asyncio.sleep(max(0.0, RETENTION_DURATION_S - aged_for) + 1)
+    await asyncio.sleep(max(0.0, TOPIC_RETENTION_AGE_S - aged_for) + 1)
 
     fresh = _event(EVENT_TYPE_RETENTION, tenant_id, RETENTION_SEGMENT_EVENTS)
     async with api() as client:
@@ -232,9 +350,9 @@ async def test_retention_removes_the_events_past_their_age_and_keeps_the_rest(ap
         assert (await client.post("/events", json=fresh)).status_code == 202
 
         sub_id = await _subscribe(client, TOPIC_RETENTION, interest)
-        # The fresh event ages out RETENTION_DURATION_S after it was stored, so
-        # the floor must reach the old batch's end well before then.
-        deadline = published_at + RETENTION_DURATION_S - 2
+        # The fresh event ages out TOPIC_RETENTION_AGE_S after it was stored,
+        # so the floor must reach the old batch's end well before then.
+        deadline = published_at + FLOOR_POLL_S
         while True:
             seek = await _seek(client, sub_id, "earliest")
             assert seek.status_code == 200
@@ -243,7 +361,7 @@ async def test_retention_removes_the_events_past_their_age_and_keeps_the_rest(ap
                 break
             assert asyncio.get_running_loop().time() < deadline, (
                 f"the floor is {floor}, not {last_old['sequence']}, "
-                f"{RETENTION_DURATION_S}s after the old events aged out"
+                f"{FLOOR_POLL_S}s after the fresh event was published"
             )
             await asyncio.sleep(0.25)
 
@@ -292,8 +410,11 @@ async def test_retention_removes_the_events_past_their_age_and_keeps_the_rest(ap
     }
 
 
-async def _publish(client, event_type: str, tenant_id: str, count: int, data=lambda n: {"n": n}) -> list[dict]:
-    """Publish `count` events in batches of 100 (the batch limit); returns them."""
+async def _publish(
+    client, event_type: str, tenant_id: str, count: int, data=lambda n: {"n": n}, pause_s: float = 0
+) -> list[dict]:
+    """Publish `count` events in batches of 100 (the batch limit), pausing
+    `pause_s` after each; returns them."""
     events = []
     for start in range(0, count, 100):
         batch = []
@@ -304,6 +425,8 @@ async def _publish(client, event_type: str, tenant_id: str, count: int, data=lam
         resp = await client.post("/events:batch", json={"events": batch})
         assert resp.status_code == 202, resp.text
         events.extend(batch)
+        if pause_s:
+            await asyncio.sleep(pause_s)
     return events
 
 
@@ -314,8 +437,15 @@ BYTES_EVENTS = 2500
 BYTES_PAD = "x" * 1000
 
 
+BYTES_TIMEOUT_S = 90
+# What the byte-bound test keeps of BYTES_TIMEOUT_S past its own deadline (the
+# final seek and the pytest timeout's slack), so that deadline fires first and
+# says which phase ran out.
+BYTES_FINAL_S = 5
+
+
 @pytest.mark.backend_sensitive
-@pytest.mark.timeout(90, func_only=True)
+@pytest.mark.timeout(BYTES_TIMEOUT_S, func_only=True)
 async def test_retention_by_bytes_keeps_a_suffix_within_the_bound(api, test_env):
     """Retention by bytes (feature 0007 §2.6), seen through SEEK and delivery.
 
@@ -325,7 +455,17 @@ async def test_retention_by_bytes_keeps_a_suffix_within_the_bound(api, test_env)
     the backend's granularity allows - and what stays is an unbroken run of the
     newest ones: "earliest" moves above 0, and a read from it delivers the
     newest events in publish order through the last one.
+
+    Budget: one deadline, BYTES_FINAL_S short of BYTES_TIMEOUT_S from the
+    start, bounds the publish, the floor poll and the read together, so the
+    run fails on its own message rather than on the pytest timeout. The read
+    ends with the last of the 2500 events, which is stored at the outbox's
+    rate (~80 events/s): in CI the whole test took 30-40 s in the 19 runs of
+    2026-11-04, under half of the 85 s the deadline gives.
     """
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    deadline = started + BYTES_TIMEOUT_S - BYTES_FINAL_S
     tenant_id = str(uuid.uuid4())
     interest = [{"topic": TOPIC_BYTES, "tenant_id": tenant_id, "types": [EVENT_TYPE_BYTES]}]
     async with api() as client:
@@ -334,20 +474,29 @@ async def test_retention_by_bytes_keeps_a_suffix_within_the_bound(api, test_env)
         )
         # Every publish has been accepted; wait for the bound to take effect.
         sub_id = await _subscribe(client, TOPIC_BYTES, interest)
-        deadline = asyncio.get_running_loop().time() + 60
         while await _resolved(client, sub_id, "earliest", TOPIC_BYTES) == 0:
-            assert asyncio.get_running_loop().time() < deadline, "nothing was removed past the byte bound"
+            assert loop.time() < deadline, "nothing was removed past the byte bound"
             await asyncio.sleep(0.5)
 
     # The remaining run: read from the floor until the last published event.
     delivered = []
+    read_started = loop.time()
     async with httpx.AsyncClient(base_url=f"{test_env.base_url}/event-broker/v1", timeout=None) as stream_client:
         async with stream_client.stream("GET", f"/events:sse?subscription_id={sub_id}") as stream_resp:
             assert stream_resp.status_code == 200
             reader = SseFrameReader(stream_resp)
             await reader.await_kind("topology", timeout=5)
             while not delivered or delivered[-1]["id"] != published[-1]["id"]:
-                delivered.append((await reader.await_kind("event", timeout=15))["payload"])
+                remaining = min(EVENT_WAIT_S, deadline - loop.time())
+                try:
+                    delivered.append((await reader.await_kind("event", timeout=remaining))["payload"])
+                except (AssertionError, TimeoutError) as stalled:
+                    last_n = delivered[-1]["data"]["n"] if delivered else None
+                    raise AssertionError(
+                        f"the read from the floor stopped at data.n {last_n}, before the last published "
+                        f"event ({BYTES_EVENTS - 1}): {len(delivered)} events in "
+                        f"{loop.time() - read_started:.1f}s ({type(stalled).__name__}: {stalled})"
+                    ) from stalled
 
     # Removal may go on while the run is read (a backend removing one segment
     # per pass), so the reader can skip what goes under it. What must hold:
@@ -374,14 +523,27 @@ async def test_latest_still_names_the_last_event_once_retention_removed_every_on
     remove all of it - and left to age out. Once nothing is stored, "earliest"
     and "latest" both resolve to the last event's sequence, never back to 0,
     and the next event published is delivered above it.
+
+    Margins (see the age test for the read-back's): the floor deadline, three
+    times RETENTION_DURATION_S from the end of the read-back, is against the
+    last event's removal at most RETENTION_DURATION_S + 1 s after it was
+    stored, and the last event is stored about when the read-back ends, so
+    its removal is due 8-9 s into the 24 s deadline. The 60 s bound covers the
+    read-back (12-15 s), that deadline (24 s) and one read; in CI the whole
+    test took 21-26 s in the 15 green runs of 2026-11-04.
     """
     tenant_id = str(uuid.uuid4())
     interest = [{"topic": TOPIC_DRAIN, "tenant_id": tenant_id, "types": [EVENT_TYPE_DRAIN]}]
     async with api() as client:
         reader_sub = await _subscribe(client, TOPIC_DRAIN, interest)
         assert (await _seek(client, reader_sub, "earliest", TOPIC_DRAIN)).status_code == 200
-        await _publish(client, EVENT_TYPE_DRAIN, tenant_id, RETENTION_SEGMENT_EVENTS)
-    stored = await _read(test_env, reader_sub, RETENTION_SEGMENT_EVENTS)
+    # Open before publishing, as in the age test: the batch starts ageing
+    # while it is still being published.
+    async with _stream(test_env, reader_sub) as stream, api() as client:
+        stored = await stream.take_during(
+            RETENTION_SEGMENT_EVENTS,
+            _publish(client, EVENT_TYPE_DRAIN, tenant_id, RETENTION_SEGMENT_EVENTS),
+        )
     head = stored[-1]["sequence"]
 
     async with api() as client:
@@ -415,3 +577,48 @@ async def test_latest_still_names_the_last_event_once_retention_removed_every_on
         "sequence_time": delivered["sequence_time"],
     }
     assert delivered["sequence"] > head
+
+
+# The slow-publish test's pause after each batch of 100: ten batches, so the
+# publish goes on ~10 s, past RETENTION_DURATION_S and the second a sweep may
+# take on top of it.
+SLOW_PUBLISH_PAUSE_S = 1
+
+
+@pytest.mark.backend_sensitive
+@pytest.mark.timeout(60, func_only=True)
+async def test_a_batch_published_for_longer_than_its_age_bound_is_read_back_whole(api, test_env):
+    """The retention tests' read-back, against a publish slower than the age bound.
+
+    TOPIC_SLOW_PUBLISH keeps events RETENTION_DURATION_S. RETENTION_SEGMENT_EVENTS
+    events are published in batches of 100, SLOW_PUBLISH_PAUSE_S after each,
+    so the publish goes on ~10 s. The outbox stores each batch as it comes, so
+    the first events reach their age bound before the last ones are
+    published. A stream opened before the publish and read while it runs
+    delivers every event, in order.
+
+    This is a slow runner's publish made deterministic. Read only after the
+    publish, as the retention tests once did, the stream on the memory
+    backend opens after the front of the batch was swept and the read fails
+    every time, the first events missing:
+    `950 of 1000 events delivered ... data.n 50..999`. The backends that
+    remove whole segments keep the batch's segment until well after the
+    publish, so there the test passes either way.
+    """
+    tenant_id = str(uuid.uuid4())
+    interest = [{"topic": TOPIC_SLOW_PUBLISH, "tenant_id": tenant_id, "types": [EVENT_TYPE_SLOW_PUBLISH]}]
+    async with api() as client:
+        sub_id = await _subscribe(client, TOPIC_SLOW_PUBLISH, interest)
+        assert (await _seek(client, sub_id, "earliest", TOPIC_SLOW_PUBLISH)).status_code == 200
+    async with _stream(test_env, sub_id) as stream, api() as client:
+        delivered = await stream.take_during(
+            RETENTION_SEGMENT_EVENTS,
+            _publish(
+                client,
+                EVENT_TYPE_SLOW_PUBLISH,
+                tenant_id,
+                RETENTION_SEGMENT_EVENTS,
+                pause_s=SLOW_PUBLISH_PAUSE_S,
+            ),
+        )
+    assert [e["data"]["n"] for e in delivered] == list(range(RETENTION_SEGMENT_EVENTS))
