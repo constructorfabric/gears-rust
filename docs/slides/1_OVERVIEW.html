@@ -286,7 +286,7 @@ correctness, and maintainability matter more than raw implementation speed.</p>
 │  ├─ system/       # Control plane (api-gateway, authn/authz, tenant, registries, oagw)
 │  └─ &lt;service&gt;/    # Business/domain &amp; GenAI gears (mini-chat, file-parser, ...)
 ├─ apps/            # Executable apps composing gears (example server)
-├─ examples/        # Reference gears (users-info, oop-gears, fips-probe)
+├─ examples/        # Reference gears (users-info, api-contracts, fips-probe)
 ├─ tools/           # CI scripts, fuzz targets
 └─ docs/            # Manifest, gears registry, toolkit_unified_system, arch, security
 </code></pre>
@@ -356,11 +356,10 @@ into the platform. Directory is still <code>gears/&lt;name&gt;/</code>.</p>
 <p>The <strong>logical model stays identical</strong> regardless of the physical boundary.</p>
 <ul>
 <li><strong>In-process (default)</strong> — gears share one runtime; communicate via typed <code>ClientHub</code> clients; wired by Tookit</li>
-<li><strong>Out-of-process</strong> — gears as separate processes over <strong>gRPC</strong>
+<li><strong>Out-of-process</strong> — gears as separate processes over <strong>REST</strong> (gRPC opt-in)
 <ul>
-<li><code>HostRuntime</code> OoP orchestration hooks</li>
-<li><code>toolkit-transport-grpc</code> transport library</li>
-<li><code>examples/oop-gears/</code> demonstrates the pattern</li>
+<li><code>HostRuntime</code> OoP orchestration hooks (<code>runtime.type: oop</code> spawns workers)</li>
+<li><code>config/oop-self-hosted.yaml</code> + <code>examples/toolkit/hello/</code> demonstrate the pattern</li>
 </ul>
 </li>
 </ul>

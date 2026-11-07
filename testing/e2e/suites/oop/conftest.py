@@ -10,12 +10,17 @@ Topology (all on 127.0.0.1):
     api-contracts-oop            :9092   (PaymentApi REST provider)
     api-contracts-consumer-oop   :9093   (resolves PaymentApi from the provider)
 
-This is a Profile 2 (Host + Workers) topology on loopback: flight-control runs
+This is a distributed-runtime topology on loopback: flight-control runs
 the DirectoryService + built-in edge, and the workers are separate OoP
-processes discovered through the directory. It exercises the same OoP software
-path (bootstrap, directory-resolved REST clients, edge reverse-proxy) that a
-Profile 3 (Kubernetes) deployment shares — only with processes on 127.0.0.1
-instead of pods behind an external gateway. Heavy work (cargo build, process
+processes started manually here, discovered through the directory. It exercises
+the same OoP software path (bootstrap, directory-resolved REST clients, edge
+reverse-proxy) that Profile 2 (host-spawned workers) and Profile 3 (Kubernetes)
+deployments share — only with processes on 127.0.0.1 instead of host-spawned
+children or pods in Kubernetes. The self-hosted (Profile 2) side of
+the machinery is covered by the sibling suite `testing/e2e/suites/oop_self_hosted`;
+run separately via `make e2e-oop-self-hosted`.
+
+Heavy work (cargo build, process
 boot, route sync) happens in the session fixture; run pytest with
 `-o timeout_func_only=true` so the per-test timeout does not count fixture setup
 (the `make e2e-oop` target does this).

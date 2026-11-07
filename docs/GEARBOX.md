@@ -141,8 +141,8 @@ gates its own tests.
 ## Where this stands
 
 There are 64 descriptors: 55 for gears in the workspace and nine for designs that have no code
-yet. Every gear carries one except four examples (`hello`, `users-info`, `calculator`,
-`calculator-gateway`), which stay invisible to composition until someone writes theirs.
+yet. Every gear carries one except four examples (`hello`, `users-info`, `api-contracts`,
+`api-contracts-consumer`), which stay invisible to composition until someone writes theirs.
 
 Eleven descriptors curate features and fourteen declare none and need none; the rest are not
 curated, so the tool offers their whole feature table.
