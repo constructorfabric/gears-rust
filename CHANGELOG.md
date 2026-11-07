@@ -9,6 +9,10 @@ release-plz updates this file in the Release PR.
 
 ## [Unreleased]
 
+### Changed
+
+- utoipa 6.0.0 changed the representation of documented `$ref` fields and nullable (`Option<T>`) fields in the generated OpenAPI document (`docs/api/api.json`): a documented `$ref` is now a bare `$ref` plus `description` instead of a single-member `oneOf`, and nullable fields use a `oneOf` ordered `[$ref, null]`. There is no wire-level change.
+
 ## [0.1.13](https://github.com/constructorfabric/gears-rust/compare/cf-gears-model-registry-sdk-v0.1.12...cf-gears-model-registry-sdk-v0.1.13) - 2026-10-30
 
 ### Other
