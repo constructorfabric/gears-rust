@@ -28,12 +28,16 @@ use std::time::Duration;
 
 use graph_storage::domain::embedding::{EmbeddingCoordinator, SpaceState};
 use graph_storage::infra::embedding::fake::FakeEmbeddingProvider;
+use std::collections::BTreeMap;
+
 use graph_storage_sdk::models::{
-    DeleteRequest, EdgeSpec, IngestOptions, IngestRequest, ItemFamily, NodeSpec, ProjectionRequest,
-    ReadSnapshot, RemainingBudget, ReplaceScope, SearchMode, SearchRequest, Subject,
-    TypeRegistration,
+    DeleteRequest, Direction, EdgeSpec, HopBudget, IngestOptions, IngestRequest, ItemFamily,
+    NodeId, NodeSpec, ProjectionRequest, ReadSnapshot, RemainingBudget, ReplaceScope, SearchMode,
+    SearchRequest, Subject, TypeRegistration,
 };
-use graph_storage_sdk::plugin_api::{EmbeddingPlan, GraphStoreError, GraphStoreV1, StoreCtx};
+use graph_storage_sdk::plugin_api::{
+    EmbeddingPlan, ExpandRequest, GraphEngineV1, GraphStoreError, GraphStoreV1, StoreCtx,
+};
 use tokio_util::sync::CancellationToken;
 use toolkit_security::AccessScope;
 use uuid::Uuid;
@@ -1890,7 +1894,7 @@ pub const EVOLVING: &str =
 /// (gts sec 4.4) and the checker reports `incompatible`. Measured over the
 /// Studio domain model as the exporter emits it today, that is 188 of 188 node
 /// types.
-fn requirement_revision(
+pub fn requirement_revision(
     properties: &serde_json::Value,
     required: &[&str],
     index: &[&str],
@@ -1921,7 +1925,7 @@ fn requirement_revision(
     }
 }
 
-fn requirement_properties(
+pub fn requirement_properties(
     status_values: &[&str],
     with_owner: bool,
     urgency: bool,
@@ -1941,7 +1945,7 @@ fn requirement_properties(
 }
 
 /// Model v7: what the graph already holds 10 000 of.
-fn requirement_v1() -> TypeRegistration {
+pub fn requirement_v1() -> TypeRegistration {
     requirement_revision(
         &requirement_properties(&["proposed", "approved"], false, false),
         &["key", "statement"],
@@ -1949,7 +1953,7 @@ fn requirement_v1() -> TypeRegistration {
     )
 }
 
-fn requirement(key: &str, status: &str) -> NodeSpec {
+pub fn requirement(key: &str, status: &str) -> NodeSpec {
     NodeSpec {
         node_key: key.to_owned(),
         type_id: EVOLVING.to_owned(),
@@ -1982,7 +1986,7 @@ async fn seed_requirements(store: &dyn GraphStoreV1, ctx: &StoreCtx<'_>, statuse
         .expect("the requirements commit");
 }
 
-fn update_options() -> graph_storage_sdk::models::TypeRegistrationOptions {
+pub fn update_options() -> graph_storage_sdk::models::TypeRegistrationOptions {
     graph_storage_sdk::models::TypeRegistrationOptions {
         on_existing: graph_storage_sdk::models::OnExisting::Update,
         revalidate: false,
@@ -3808,10 +3812,19 @@ pub async fn every_update_of_a_node_advances_its_version(
             .expect("the update commits");
     }
 
-    // One create plus eight updates is version nine, and the only way to ask
-    // is to offer a version and see whether it is accepted.
-    let mut probe = batch(vec![node("versioned", "probe")], Vec::new());
+    // One create plus eight updates is version nine: the read says so, and
+    // the store accepts a write offering exactly that.
     let expected = i64::try_from(WRITERS + 1).expect("the writer count fits an i64");
+    let read = store
+        .get_node(&reader, &"versioned".to_owned(), 1)
+        .await
+        .expect("the node reads");
+    assert_eq!(
+        read.envelope.version,
+        Some(expected),
+        "the read reports the version"
+    );
+    let mut probe = batch(vec![node("versioned", "probe")], Vec::new());
     probe.nodes[0].expected_version = Some(expected);
     ingest_batch(store.as_ref(), &reader, probe)
         .await
@@ -5431,7 +5444,7 @@ pub async fn an_edge_type_evolves_over_its_own_rows(store: &dyn GraphStoreV1, te
 pub const OTHER_THING: &str =
     "gts.cf.core.graph.node.v1~cf.core.graph.owned_node.v1~acme.gs._.other_thing.v1~";
 
-fn other_thing_type() -> TypeRegistration {
+pub fn other_thing_type() -> TypeRegistration {
     TypeRegistration {
         type_id: OTHER_THING.to_owned(),
         schema: serde_json::json!({
@@ -5485,6 +5498,10 @@ pub async fn a_same_key_ingest_may_not_change_the_type(store: &dyn GraphStoreV1,
 /// `options.report_per_item` answers with one outcome per item of the batch,
 /// in batch order — the convergence-observability lever DESIGN § 3.3 names,
 /// and off by default so a producer that only wants the counts pays nothing.
+///
+/// Batch order, not write order: a store may write in key order (the
+/// built-in one does, so overlapping batches cannot deadlock), and the
+/// batches below are deliberately not in key order.
 pub async fn per_item_outcomes_follow_the_batch_order(store: &dyn GraphStoreV1, tenant: Uuid) {
     use graph_storage_sdk::models::ItemOutcome as O;
 
@@ -5512,9 +5529,9 @@ pub async fn per_item_outcomes_follow_the_batch_order(store: &dyn GraphStoreV1, 
     // the batch, so it shows in the counts and not in the list.
     let mut told = batch(
         vec![
+            node("pi-c", "c"),
             node("pi-a", "a"),
             node("pi-b", "b, renamed"),
-            node("pi-c", "c"),
         ],
         vec![edge("pi-a", "pi-b"), edge("pi-b", "pi-d")],
     );
@@ -5524,7 +5541,7 @@ pub async fn per_item_outcomes_follow_the_batch_order(store: &dyn GraphStoreV1, 
         .expect("reported batch commits");
     assert_eq!(
         first.per_item_nodes.as_deref(),
-        Some(&[O::Unchanged, O::Updated, O::Inserted][..])
+        Some(&[O::Inserted, O::Unchanged, O::Updated][..])
     );
     assert_eq!(
         first.per_item_edges.as_deref(),
@@ -5552,6 +5569,41 @@ pub async fn per_item_outcomes_follow_the_batch_order(store: &dyn GraphStoreV1, 
     assert_eq!(
         again.per_item_edges.as_deref(),
         Some(&[O::Unchanged, O::Unchanged][..])
+    );
+
+    // Edges stored under a derived key, so their key order is unrelated to
+    // the request's: existing and new ones alternate, and a list replayed in
+    // any other order than the request's breaks the alternation.
+    let ring = |n: usize| -> Vec<EdgeSpec> {
+        (0..n)
+            .map(|i| edge(&format!("pi-r{i}"), &format!("pi-r{}", (i + 1) % n)))
+            .collect()
+    };
+    ingest_batch(store, &ctx, batch(Vec::new(), ring(6)))
+        .await
+        .expect("the existing edges commit");
+    let mut mixed = batch(Vec::new(), Vec::new());
+    for (old, new) in ring(6).into_iter().zip(
+        ring(7)
+            .into_iter()
+            .skip(6)
+            .chain((0..5).map(|i| edge(&format!("pi-r{i}"), &format!("pi-r{}", i + 2)))),
+    ) {
+        mixed.edges.push(old);
+        mixed.edges.push(new);
+    }
+    mixed.options.report_per_item = true;
+    let interleaved = ingest_batch(store, &ctx, mixed)
+        .await
+        .expect("the interleaved batch commits");
+    assert_eq!(
+        interleaved.per_item_edges.as_deref(),
+        Some(
+            &(0..6)
+                .flat_map(|_| [O::Unchanged, O::Inserted])
+                .collect::<Vec<_>>()[..]
+        ),
+        "the edge outcomes are in the order the batch listed them"
     );
 
     // Materialization is the fourth node outcome, and it is per item too.
@@ -7109,4 +7161,463 @@ pub async fn a_replacement_leaves_alone_what_does_not_carry_its_attribute(
         .get_node(&ctx, &"unscoped".to_owned(), 1)
         .await
         .expect("a node without the attribute is left alone by every replacement");
+}
+
+// ---------------------------------------------------------------------------
+// Direction, discriminator and version on reads (gears-rust #5239, #5240,
+// #5529)
+// ---------------------------------------------------------------------------
+
+/// `a → b` twice (discriminators `x` and `y`) and `a → c` with none: the
+/// graph every direction and discriminator case below reads.
+async fn seed_relations(store: &dyn GraphStoreV1, ctx: &StoreCtx<'_>) {
+    store
+        .register_types(ctx, ontology_batch())
+        .await
+        .expect("the ontology registers");
+    let related = |dst: &str, discriminator: Option<&str>| EdgeSpec {
+        discriminator: discriminator.map(ToOwned::to_owned),
+        ..edge("rel-a", dst)
+    };
+    ingest_batch(
+        store,
+        ctx,
+        batch(
+            vec![node("rel-a", "a"), node("rel-b", "b"), node("rel-c", "c")],
+            vec![
+                related("rel-b", Some("x")),
+                related("rel-b", Some("y")),
+                related("rel-c", None),
+            ],
+        ),
+    )
+    .await
+    .expect("the relations commit");
+}
+
+async fn hop(
+    engine: &dyn GraphEngineV1,
+    ctx: &StoreCtx<'_>,
+    frontier: Vec<NodeId>,
+    direction: Direction,
+    discriminators: Option<&[&str]>,
+) -> (Vec<NodeId>, Vec<(String, String, Option<String>)>) {
+    let response = engine
+        .expand(
+            ctx,
+            ExpandRequest {
+                frontier,
+                direction,
+                edge_types: None,
+                discriminators: discriminators
+                    .map(|values| values.iter().map(|&v| v.to_owned()).collect()),
+                labels: None,
+                budget: HopBudget {
+                    max_frontier: 100,
+                    max_edges_scanned: 1_000,
+                },
+                with_degrees: false,
+            },
+        )
+        .await
+        .expect("the hop runs");
+    let mut edges: Vec<(String, String, Option<String>)> = response
+        .edges
+        .into_iter()
+        .map(|e| (e.src, e.dst, e.discriminator))
+        .collect();
+    edges.sort();
+    let mut reached = response.reached;
+    reached.sort_unstable();
+    (reached, edges)
+}
+
+/// A hop follows only the direction it is asked for (the acceptance of
+/// gears-rust #5239: edge A → B, from B `Outgoing` finds nothing, `Incoming`
+/// finds A, `Either` finds A).
+pub async fn a_hop_follows_only_its_direction(
+    store: &dyn GraphStoreV1,
+    engine: &dyn GraphEngineV1,
+    tenant: Uuid,
+) {
+    let scope = AccessScope::for_tenant(tenant);
+    let ctx = ctx(tenant, &scope, None);
+    seed_relations(store, &ctx).await;
+    let ids: BTreeMap<String, NodeId> = store
+        .resolve_node_ids(&ctx, &["rel-a".into(), "rel-b".into(), "rel-c".into()])
+        .await
+        .expect("the keys resolve")
+        .into_iter()
+        .collect();
+    let (a, b, c) = (ids["rel-a"], ids["rel-b"], ids["rel-c"]);
+
+    let (reached, edges) = hop(engine, &ctx, vec![b], Direction::Outgoing, None).await;
+    assert!(
+        reached.is_empty() && edges.is_empty(),
+        "nothing leaves b: {edges:?}"
+    );
+
+    for direction in [Direction::Incoming, Direction::Either] {
+        let (reached, edges) = hop(engine, &ctx, vec![b], direction, None).await;
+        assert_eq!(reached, vec![a], "{direction:?} from b reaches a");
+        assert_eq!(edges.len(), 2, "{direction:?}: both a → b edges: {edges:?}");
+    }
+
+    // Both ends of a → b in the frontier. `Outgoing` scans the edge for its
+    // source, and must not carry the walk back to that source as if it had
+    // been followed in.
+    let (reached, _) = hop(engine, &ctx, vec![a, b], Direction::Outgoing, None).await;
+    let mut want = vec![b, c];
+    want.sort_unstable();
+    assert_eq!(
+        reached, want,
+        "an outgoing hop reaches only destinations, even when the source is in the frontier"
+    );
+}
+
+/// A traversed edge says which relation it is, and a hop can be narrowed to
+/// some (the acceptance of gears-rust #5240: two edges of one type from A to
+/// B with `x` and `y` both come back with their discriminators, and with the
+/// filter `x` only the `x` edge does).
+pub async fn a_hop_reports_and_filters_discriminators(
+    store: &dyn GraphStoreV1,
+    engine: &dyn GraphEngineV1,
+    tenant: Uuid,
+) {
+    let scope = AccessScope::for_tenant(tenant);
+    let ctx = ctx(tenant, &scope, None);
+    seed_relations(store, &ctx).await;
+    let a = store
+        .resolve_node_ids(&ctx, &["rel-a".to_owned()])
+        .await
+        .expect("the key resolves")[0]
+        .1;
+    let b = store
+        .resolve_node_ids(&ctx, &["rel-b".to_owned()])
+        .await
+        .expect("the key resolves")[0]
+        .1;
+    let ab = |d: Option<&str>| {
+        (
+            "rel-a".to_owned(),
+            "rel-b".to_owned(),
+            d.map(ToOwned::to_owned),
+        )
+    };
+    let ac = ("rel-a".to_owned(), "rel-c".to_owned(), None);
+
+    let (_, edges) = hop(engine, &ctx, vec![a], Direction::Outgoing, None).await;
+    assert_eq!(
+        edges,
+        vec![ab(Some("x")), ab(Some("y")), ac.clone()],
+        "every edge carries its own discriminator, and none when it has none"
+    );
+
+    let (reached, edges) = hop(engine, &ctx, vec![a], Direction::Outgoing, Some(&["x"])).await;
+    assert_eq!(
+        edges,
+        vec![ab(Some("x"))],
+        "the filter keeps the x edge only"
+    );
+    assert_eq!(reached, vec![b], "and reaches only through it");
+
+    let (reached, edges) = hop(engine, &ctx, vec![a], Direction::Outgoing, Some(&["z"])).await;
+    assert!(
+        reached.is_empty() && edges.is_empty(),
+        "an edge without a discriminator never matches a filter: {edges:?}"
+    );
+
+    // The node read names the relation too: it is the same question asked
+    // of a node's own edges.
+    let view = store
+        .get_node(&ctx, &"rel-a".to_owned(), 100)
+        .await
+        .expect("the node reads");
+    let mut adjacency: Vec<(String, Option<String>)> = view
+        .adjacency
+        .into_iter()
+        .map(|entry| (entry.neighbor_key, entry.discriminator))
+        .collect();
+    adjacency.sort();
+    assert_eq!(
+        adjacency,
+        vec![
+            ("rel-b".to_owned(), Some("x".to_owned())),
+            ("rel-b".to_owned(), Some("y".to_owned())),
+            ("rel-c".to_owned(), None),
+        ],
+        "the node read's adjacency carries each edge's discriminator"
+    );
+}
+
+/// Every read that returns a node returns the version `expected_version`
+/// compares against, so read → change → write-if-unchanged can be written;
+/// an edge carries none.
+pub async fn a_read_returns_the_version_a_write_compares_against(
+    store: &dyn GraphStoreV1,
+    tenant: Uuid,
+) {
+    let scope = AccessScope::for_tenant(tenant);
+    let ctx = ctx(tenant, &scope, None);
+    seed_relations(store, &ctx).await;
+
+    let version_of = |view: &graph_storage_sdk::models::NodeView| view.envelope.version;
+    let first = store
+        .get_node(&ctx, &"rel-a".to_owned(), 10)
+        .await
+        .expect("the node reads");
+    assert_eq!(version_of(&first), Some(1), "a new node is at version 1");
+
+    // Write back on the version just read: accepted, and the read moves.
+    let mut update = batch(vec![node("rel-a", "a, renamed")], Vec::new());
+    update.nodes[0].expected_version = version_of(&first);
+    ingest_batch(store, &ctx, update)
+        .await
+        .expect("a write on the version just read commits");
+    let second = store
+        .get_node(&ctx, &"rel-a".to_owned(), 10)
+        .await
+        .expect("the node reads");
+    assert_eq!(version_of(&second), Some(2), "the update advanced it");
+
+    // The same stale version again: refused, because someone wrote between.
+    let mut stale = batch(vec![node("rel-a", "a, overwritten")], Vec::new());
+    stale.nodes[0].expected_version = version_of(&first);
+    assert!(
+        ingest_batch(store, &ctx, stale).await.is_err(),
+        "a write on a version that moved is refused"
+    );
+
+    // The projection row and the traversal hydration are the other two
+    // reads a producer edits from.
+    let page = store
+        .project_table(&ctx, ProjectionRequest::default())
+        .await
+        .expect("projection succeeds");
+    let row = page
+        .items
+        .iter()
+        .find(|row| row.node_key == "rel-a")
+        .expect("the node is projected");
+    assert_eq!(row.envelope.version, Some(2), "the projection row agrees");
+    let id = store
+        .resolve_node_ids(&ctx, &["rel-a".to_owned()])
+        .await
+        .expect("the key resolves")[0]
+        .1;
+    let hydrated = store
+        .hydrate_nodes(&ctx, &[id])
+        .await
+        .expect("hydration succeeds");
+    assert_eq!(hydrated[0].envelope.version, Some(2), "hydration agrees");
+
+    let edge_key = second.adjacency[0].edge_key.clone();
+    let edge = store
+        .get_edge(&ctx, &edge_key)
+        .await
+        .expect("the edge reads");
+    assert_eq!(edge.envelope.version, None, "an edge carries no version");
+}
+
+/// Batches that overlap on keys, written at once, all land (gears-rust
+/// #5042).
+///
+/// Studio's ordinary shape: two syncs of one repository, a sync and a manual
+/// edit, two backend replicas. Each writer upserts its own random subset of
+/// one shared key pool, in its own order, with edges between the keys it
+/// names -- some of them to keys no batch has written yet, which become
+/// phantoms -- and a few new edges every writer declares alike. Row locks taken in request order made two such batches lock the
+/// same rows in opposite orders, and the server broke the cycle by killing
+/// one: most of these batches came back `SERIALIZATION`. A store whose writes
+/// lock rows in one canonical order has no cycle to break, so every batch
+/// commits and the only waiting is behind a lock, never a retry.
+pub async fn overlapping_batches_all_land(store: std::sync::Arc<dyn GraphStoreV1>, tenant: Uuid) {
+    const KEYS: usize = 40;
+    const WRITERS: usize = 6;
+    const ROUNDS: usize = 4;
+    const PER_BATCH: usize = 16;
+
+    let scope = AccessScope::for_tenant(tenant);
+    let reader = ctx(tenant, &scope, None);
+    store
+        .register_types(&reader, ontology_batch())
+        .await
+        .expect("the ontology registers");
+
+    // A deterministic shuffle per writer and round: a fixed seed is a
+    // reproducible failure, and a different order per writer is the point.
+    let anchors = std::iter::once("anchor".to_owned())
+        .chain((0..ROUNDS).flat_map(|round| (1..=4).map(move |k| format!("anchor-{round}-{k}"))))
+        .map(|key| node(&key, "anchor"))
+        .collect();
+    ingest_batch(store.as_ref(), &reader, batch(anchors, Vec::new()))
+        .await
+        .expect("the anchors commit");
+
+    let pick = |writer: usize, round: usize| -> Vec<usize> {
+        let mut keys: Vec<usize> = (0..KEYS).collect();
+        let mut state = (writer * 7_919 + round * 104_729 + 1) as u64;
+        for i in (1..keys.len()).rev() {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            let j = usize::try_from(state >> 33).expect("fits") % (i + 1);
+            keys.swap(i, j);
+        }
+        keys.truncate(PER_BATCH);
+        keys
+    };
+
+    for round in 0..ROUNDS {
+        let gate = std::sync::Arc::new(tokio::sync::Barrier::new(WRITERS));
+        // Collected on purpose: every writer must be spawned before any is
+        // awaited, or the first waits at the gate for writers never started.
+        #[expect(
+            clippy::needless_collect,
+            reason = "spawning lazily would deadlock the barrier"
+        )]
+        let writers: Vec<_> = (0..WRITERS)
+            .map(|writer| {
+                let store = std::sync::Arc::clone(&store);
+                let gate = std::sync::Arc::clone(&gate);
+                let keys = pick(writer, round);
+                tokio::spawn(async move {
+                    let scope = AccessScope::for_tenant(tenant);
+                    let ctx = ctx(tenant, &scope, None);
+                    let name = |k: usize| format!("pool-{k}");
+                    let nodes = keys
+                        .iter()
+                        .map(|&k| node(&name(k), &format!("w{writer} r{round}")))
+                        .collect();
+                    // A chain in the writer's own order, plus one edge to a
+                    // key outside the pool, which is a phantom until a node
+                    // of that key is written -- by nobody, here.
+                    let mut edges: Vec<EdgeSpec> = keys
+                        .windows(2)
+                        .map(|pair| edge(&name(pair[0]), &name(pair[1])))
+                        .collect();
+                    edges.push(edge(&name(keys[0]), &format!("far-{}", keys[1] % 8)));
+                    gate.wait().await;
+                    ingest_batch(store.as_ref(), &ctx, batch(nodes, edges)).await
+                })
+            })
+            .collect();
+        for (writer, task) in writers.into_iter().enumerate() {
+            task.await
+                .expect("the writer task does not panic")
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "round {round}, writer {writer}: overlapping batches must not abort \
+                         each other: {error}"
+                    )
+                });
+        }
+    }
+
+    // Edge-only batches: every writer declares the same new edges between
+    // anchors that exist and that no batch writes, so no node lock orders the
+    // writers first and two of them race to insert one new edge key.
+    for round in 0..ROUNDS {
+        let gate = std::sync::Arc::new(tokio::sync::Barrier::new(WRITERS));
+        #[expect(
+            clippy::needless_collect,
+            reason = "spawning lazily would deadlock the barrier"
+        )]
+        let writers: Vec<_> = (0..WRITERS)
+            .map(|_| {
+                let store = std::sync::Arc::clone(&store);
+                let gate = std::sync::Arc::clone(&gate);
+                let edges = (1..=4)
+                    .map(|k| edge("anchor", &format!("anchor-{round}-{k}")))
+                    .collect();
+                tokio::spawn(async move {
+                    let scope = AccessScope::for_tenant(tenant);
+                    let ctx = ctx(tenant, &scope, None);
+                    gate.wait().await;
+                    ingest_batch(store.as_ref(), &ctx, batch(Vec::new(), edges)).await
+                })
+            })
+            .collect();
+        for (writer, task) in writers.into_iter().enumerate() {
+            task.await
+                .expect("the writer task does not panic")
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "edge round {round}, writer {writer}: one new edge declared by \
+                         several batches must not abort any of them: {error}"
+                    )
+                });
+        }
+    }
+}
+
+/// A count answers how many rows the listing with the same type set and
+/// `$filter` holds across all its pages, and says when it stopped counting
+/// (gears-rust #5108 point 1, #5529 item 2).
+pub async fn a_count_agrees_with_the_listing(store: &dyn GraphStoreV1, tenant: Uuid) {
+    let scope = AccessScope::for_tenant(tenant);
+    let ctx = ctx(tenant, &scope, None);
+    seed_tickets(store, &ctx).await;
+    let count = |filter: &str, max: u64| {
+        let request = projection(&[INDEXED], filter, &[]);
+        let ctx = &ctx;
+        async move {
+            store
+                .count_table(ctx, request, max)
+                .await
+                .expect("the count answers")
+        }
+    };
+
+    let all = count("", 100).await;
+    assert_eq!((all.count, all.capped), (5, false), "every ticket");
+    assert!(
+        all.revision.revision > 0,
+        "the count reports what it observed"
+    );
+
+    let high = count("payload/severity eq 'high'", 100).await;
+    let listed = store
+        .project_table(
+            &ctx,
+            projection(
+                &[INDEXED],
+                "payload/severity eq 'high'",
+                &[("node_key", toolkit_odata::SortDir::Asc)],
+            ),
+        )
+        .await
+        .expect("the listing answers");
+    assert_eq!(
+        high.count,
+        listed.items.len() as u64,
+        "the count is the listing's length"
+    );
+    assert_eq!((high.count, high.capped), (3, false));
+
+    assert_eq!(
+        count("payload/severity eq 'none'", 100).await.count,
+        0,
+        "a filter nothing matches counts zero"
+    );
+
+    let capped = count("payload/severity eq 'high'", 2).await;
+    assert_eq!(
+        (capped.count, capped.capped),
+        (2, true),
+        "past the ceiling the count is the ceiling, and says so"
+    );
+    let exact = count("payload/severity eq 'high'", 3).await;
+    assert_eq!(
+        (exact.count, exact.capped),
+        (3, false),
+        "exactly the ceiling is an exact count"
+    );
+
+    // A tombstoned row is not listed, so it is not counted.
+    store
+        .soft_delete(&ctx, DeleteRequest::Node("t1".to_owned()))
+        .await
+        .expect("the delete commits");
+    assert_eq!(count("payload/severity eq 'high'", 100).await.count, 2);
 }

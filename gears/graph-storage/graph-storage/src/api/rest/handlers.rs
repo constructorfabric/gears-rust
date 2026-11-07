@@ -355,12 +355,25 @@ pub async fn project_nodes(
     Query(params): Query<ProjectionTypeParams>,
     OData(query): OData,
 ) -> ApiResult<Json<toolkit_odata::Page<dto::GraphNodeRowDto>>> {
-    let patterns: Vec<String> = params
-        .type_pattern
-        .map(|raw| raw.split(',').map(|p| p.trim().to_owned()).collect())
-        .unwrap_or_default();
+    let patterns = params.patterns();
     let page = services.project_nodes(&ctx, &patterns, query).await?;
     Ok(Json(page.map_items(dto::GraphNodeRowDto::from)))
+}
+
+/// How many nodes the projection lists for the same `type_pattern` and
+/// `$filter`. The same `OData` extractor binds the query, so a `$filter` means
+/// here what it means on the listing; the options a count has no use for are
+/// refused by the service.
+#[tracing::instrument(skip_all, fields(user.id = %ctx.subject_id()))]
+pub async fn count_nodes(
+    Extension(ctx): Extension<SecurityContext>,
+    Extension(services): Extension<Arc<GraphServices>>,
+    Query(params): Query<ProjectionTypeParams>,
+    OData(query): OData,
+) -> ApiResult<Json<dto::GraphNodeCountDto>> {
+    let patterns = params.patterns();
+    let count = services.count_nodes(&ctx, &patterns, query).await?;
+    Ok(Json(count.into()))
 }
 
 /// The type narrowing of a projection.
@@ -372,6 +385,18 @@ pub async fn project_nodes(
 pub struct ProjectionTypeParams {
     /// Comma-separated GTS identifier patterns.
     pub type_pattern: Option<String>,
+}
+
+impl ProjectionTypeParams {
+    /// The patterns, split on commas and trimmed. The one reading of the
+    /// parameter for the listing and its count, which must narrow alike.
+    #[must_use]
+    pub fn patterns(&self) -> Vec<String> {
+        self.type_pattern
+            .as_deref()
+            .map(|raw| raw.split(',').map(|p| p.trim().to_owned()).collect())
+            .unwrap_or_default()
+    }
 }
 
 #[tracing::instrument(skip_all, fields(user.id = %ctx.subject_id()))]
@@ -421,6 +446,16 @@ pub async fn search(
     Ok(Json(response.into()))
 }
 
+/// The SDK owns both directions of this spelling, as for the search mode.
+fn parse_direction(raw: Option<&str>) -> Result<Option<m::Direction>, DomainError> {
+    raw.map(|raw| {
+        raw.parse::<m::Direction>().map_err(|unknown| {
+            DomainError::invalid(format!("{unknown}; expected outgoing, incoming or either"))
+        })
+    })
+    .transpose()
+}
+
 #[tracing::instrument(skip_all, fields(user.id = %ctx.subject_id()))]
 pub async fn traverse(
     Extension(ctx): Extension<SecurityContext>,
@@ -436,6 +471,8 @@ pub async fn traverse(
                 edge_type_patterns: request.edge_type_patterns,
                 node_type_patterns: request.node_type_patterns,
                 max_nodes: request.max_nodes,
+                direction: parse_direction(request.direction.as_deref())?,
+                edge_discriminators: request.edge_discriminators,
             },
         )
         .await?;
@@ -456,6 +493,7 @@ pub async fn neighborhood(
                 depth: request.depth,
                 node_budget: request.node_budget,
                 include_phantoms: request.include_phantoms,
+                direction: parse_direction(request.direction.as_deref())?,
             },
         )
         .await?;
@@ -469,4 +507,24 @@ pub async fn revision(
 ) -> ApiResult<Json<dto::GraphRevisionDto>> {
     let revision = services.revision(&ctx).await?;
     Ok(Json(revision.into()))
+}
+
+#[cfg(test)]
+mod projection_type_params_tests {
+    use super::ProjectionTypeParams;
+
+    #[test]
+    fn patterns_are_split_on_commas_and_trimmed() {
+        // The split does not read the patterns, so plain words stand in for
+        // GTS identifiers, which the architecture lints keep out of literals.
+        let params = ProjectionTypeParams {
+            type_pattern: Some("first , second".to_owned()),
+        };
+        assert_eq!(params.patterns(), ["first", "second"]);
+        assert!(
+            ProjectionTypeParams { type_pattern: None }
+                .patterns()
+                .is_empty()
+        );
+    }
 }

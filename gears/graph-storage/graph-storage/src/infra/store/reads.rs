@@ -278,6 +278,7 @@ fn envelope_of_node(model: &node::Model, revision: GraphRevision) -> ElementEnve
             subject_id,
             subject_type: model.deleted_by_subject_type.clone(),
         }),
+        version: Some(model.version),
         graph_revision: revision,
     }
 }
@@ -422,6 +423,7 @@ pub async fn get_node(
                     .get(&neighbour.gts_node_type_id)
                     .cloned()
                     .unwrap_or_else(unknown),
+                discriminator: e.discriminator.clone(),
             });
         }
     }
@@ -457,6 +459,7 @@ fn envelope_of_edge(model: &edge::Model, revision: GraphRevision) -> ElementEnve
             subject_id,
             subject_type: model.deleted_by_subject_type.clone(),
         }),
+        version: None,
         graph_revision: revision,
     }
 }
@@ -594,14 +597,20 @@ pub async fn node_types(
         .collect())
 }
 
-pub async fn project_table(
-    store: &PgGraphStore,
+/// The scoped, tombstone-free node select a listing reads, narrowed to its
+/// type set, with the payload paths each selected type declares.
+async fn listing_select(
     ctx: &StoreCtx<'_>,
-    req: ProjectionRequest,
-) -> Result<OdataPage<NodeRow>, GraphStoreError> {
-    let conn = store.db().conn().map_err(|error| map_db_error(&error))?;
-
-    let mut select = node::Entity::find()
+    conn: &impl DBRunner,
+    type_set: Option<&graph_storage_sdk::models::TypeIdSet>,
+) -> Result<
+    (
+        toolkit_db::secure::SecureSelect<node::Entity, toolkit_db::secure::Scoped>,
+        Vec<BTreeMap<String, crate::domain::ontology::ScalarKind>>,
+    ),
+    GraphStoreError,
+> {
+    let mut select = crate::infra::projections::node_listing_select()
         .secure()
         .scope_with(ctx.scope)
         .filter(Condition::all().add(node::Column::DeletedAt.is_null()));
@@ -610,13 +619,13 @@ pub async fn project_table(
     // ids narrow the statement, the declarations decide what `$filter` and
     // `$orderby` may name (ADR-0003).
     let mut declared_kinds: Vec<BTreeMap<String, crate::domain::ontology::ScalarKind>> = Vec::new();
-    if let Some(set) = &req.type_set {
+    if let Some(set) = type_set {
         let names: Vec<String> = set.0.iter().cloned().collect();
         let types = gts_type::Entity::find()
             .secure()
             .scope_with(ctx.scope)
             .filter(Condition::all().add(gts_type::Column::GtsTypeId.is_in(names)))
-            .project_all(&conn, |query| {
+            .project_all(conn, |query| {
                 type_traits_columns(query).into_model::<TypeTraits>()
             })
             .await
@@ -628,6 +637,17 @@ pub async fn project_table(
             .collect();
         select = select.filter(Condition::all().add(node::Column::GtsNodeTypeId.is_in(ids)));
     }
+
+    Ok((select, declared_kinds))
+}
+
+pub async fn project_table(
+    store: &PgGraphStore,
+    ctx: &StoreCtx<'_>,
+    req: ProjectionRequest,
+) -> Result<OdataPage<NodeRow>, GraphStoreError> {
+    let conn = store.db().conn().map_err(|error| map_db_error(&error))?;
+    let (select, declared_kinds) = listing_select(ctx, &conn, req.type_set.as_ref()).await?;
 
     // The listing's identity, and the cursor's claim to continue it. Both
     // paths below mint a cursor from `filter_hash` and compare an incoming
@@ -677,6 +697,69 @@ pub async fn project_table(
     .map_err(map_odata_err)?;
 
     rows_to_page(ctx, &conn, page.items, page.page_info).await
+}
+
+/// How many rows `project_table` lists for `req`, up to `max`.
+///
+/// The same select and the same `$filter` as the listing -- the platform's
+/// column filter or the gear's payload plan, whichever the listing would use
+/// -- so the count cannot disagree with the pages. The database counts at
+/// most `max + 1` matching rows (`count_bound`), and one row comes back: the
+/// bound makes its cost a function of configuration rather than of the
+/// tenant's size, and nothing per row crosses the wire.
+pub async fn count_table(
+    store: &PgGraphStore,
+    ctx: &StoreCtx<'_>,
+    req: ProjectionRequest,
+    max: u64,
+) -> Result<graph_storage_sdk::models::NodeCount, GraphStoreError> {
+    let conn = store.db().conn().map_err(|error| map_db_error(&error))?;
+    let (mut select, declared_kinds) = listing_select(ctx, &conn, req.type_set.as_ref()).await?;
+    let invalid = |what: String| GraphStoreError::InvalidQuery { what };
+
+    if crate::domain::projection::mentions_payload(&req.query) {
+        let admitted = req
+            .type_set
+            .as_ref()
+            .map(|_| crate::domain::projection::admitted_paths(&declared_kinds));
+        let plan = crate::domain::projection::plan(&req.query, admitted.as_ref())
+            .map_err(|error| invalid(error.0))?;
+        if let Some(predicate) = &plan.filter {
+            select = select.filter(crate::infra::store::projection::condition(predicate));
+        }
+    } else if let Some(filter) = &req.query.filter {
+        let node = toolkit_odata::filter::convert_expr_to_filter_node::<Field>(filter)
+            .map_err(|error| invalid(error.to_string()))?;
+        let condition = toolkit_db::odata::sea_orm_filter::filter_node_to_condition::<
+            Field,
+            NodeODataMapper,
+        >(&node)
+        .map_err(invalid)?;
+        select = select.filter(condition);
+    }
+
+    let seen = count_bound(select, max)
+        .count(&conn)
+        .await
+        .map_err(map_scope_err)?;
+    Ok(graph_storage_sdk::models::NodeCount {
+        count: std::cmp::Ord::min(seen, max),
+        capped: seen > max,
+        revision: observed_revision(ctx, &conn).await?,
+    })
+}
+
+/// The statement a count runs: the listing's select, limited to `max + 1`
+/// rows. `SecureSelect::count` is `SeaORM`'s `PaginatorTrait::count`, which
+/// wraps the select as it is in `SELECT COUNT(*) FROM (...)` and keeps its
+/// `LIMIT` (it clears only the ordering), so the database stops at the bound
+/// and answers one number. One past `max` is what tells "exactly `max`" from
+/// "more than `max`".
+fn count_bound(
+    select: toolkit_db::secure::SecureSelect<node::Entity, toolkit_db::secure::Scoped>,
+    max: u64,
+) -> toolkit_db::secure::SecureSelect<node::Entity, toolkit_db::secure::Scoped> {
+    select.limit(max.saturating_add(1))
 }
 
 /// The projection when a payload path is named: the shared plan rendered by
@@ -808,7 +891,24 @@ async fn rows_to_page(
 
 #[cfg(test)]
 mod tests {
-    use super::{node, stored_vector_columns};
+    use super::{count_bound, node, stored_vector_columns};
+
+    /// A count is bounded in the database: the statement it counts over
+    /// carries `LIMIT max + 1`. The answer would be the same without it --
+    /// `count_table` clamps to `max` -- so only the statement shows the
+    /// difference between counting the bound and counting the tenant.
+    #[test]
+    fn a_count_stops_one_row_past_its_ceiling() {
+        use sea_orm::{EntityTrait, QueryTrait};
+        use toolkit_db::secure::SecureEntityExt;
+
+        let scope = toolkit_security::AccessScope::for_tenant(uuid::Uuid::nil());
+        let sql = count_bound(node::Entity::find().secure().scope_with(&scope), 10_000)
+            .into_inner()
+            .build(sea_orm::DatabaseBackend::Postgres)
+            .to_string();
+        assert!(sql.contains("LIMIT 10001"), "{sql}");
+    }
 
     /// The embedding-state statement does not read the wide columns.
     ///

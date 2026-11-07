@@ -38,6 +38,12 @@ use graph_storage_sdk::models::{
 use crate::config::GraphStorageConfig;
 use crate::domain::error::DomainError;
 
+/// How many values `edge_discriminators` may carry. Every one is a bind
+/// parameter of the edge scan on every hop, and `PostgreSQL` accepts at most
+/// 65 535 per statement: past that the scan fails and the walk would answer
+/// `Internal` instead of a refusal the caller can act on.
+pub const EDGE_DISCRIMINATORS_MAX: usize = 1_000;
+
 fn exceeded(what: impl Into<String>) -> DomainError {
     DomainError::LimitExceeded { what: what.into() }
 }
@@ -120,6 +126,21 @@ pub fn admit_identifier(
 /// database meets unbounded. The bound on `type_id` was missing for as long
 /// as this was a list of fields someone remembered to write down, while
 /// every field beside it was checked.
+/// Bring an ingest batch to its canonical form before anything reads it.
+///
+/// An empty discriminator is no discriminator: the edge key already hashes
+/// the two alike (`identity::derive_edge_key`), so the stored column must
+/// agree, or one edge identity reads back as `Some("")` or `None` by which
+/// write came first and an `edge_discriminators` filter matches some of its
+/// rows and not others.
+pub fn normalize_ingest(request: &mut IngestRequest) {
+    for edge in &mut request.edges {
+        if edge.discriminator.as_deref() == Some("") {
+            edge.discriminator = None;
+        }
+    }
+}
+
 pub fn admit_ingest(cfg: &GraphStorageConfig, request: &IngestRequest) -> Result<(), DomainError> {
     let IngestRequest {
         nodes,
@@ -385,6 +406,8 @@ pub fn admit_traverse(
         edge_type_patterns,
         node_type_patterns,
         max_nodes,
+        direction: _,
+        edge_discriminators,
     } = request;
     let depth = *depth;
     if seeds.is_empty() {
@@ -431,6 +454,25 @@ pub fn admit_traverse(
     for (index, pattern) in node_type_patterns.iter().enumerate() {
         admit_identifier(cfg, &format!("node_type_patterns[{index}]"), pattern)?;
     }
+    if edge_discriminators.len() > EDGE_DISCRIMINATORS_MAX {
+        return Err(exceeded(format!(
+            "edge_discriminators carries {} values; the bound is {EDGE_DISCRIMINATORS_MAX}",
+            edge_discriminators.len()
+        )));
+    }
+    // Held to the bound ingest holds a discriminator to: a longer value can
+    // match no stored edge, and every one is bound into the edge scan.
+    for (index, discriminator) in edge_discriminators.iter().enumerate() {
+        admit_identifier(cfg, &format!("edge_discriminators[{index}]"), discriminator)?;
+        // Ingest stores an empty discriminator as none, so `""` can match no
+        // edge; refused rather than answered with an empty walk.
+        if discriminator.is_empty() {
+            return Err(DomainError::invalid(format!(
+                "edge_discriminators[{index}] is empty; an edge ingested with an empty \
+                 discriminator has none, and no list matches an edge without one"
+            )));
+        }
+    }
     Ok(())
 }
 
@@ -443,6 +485,7 @@ pub fn admit_neighborhood(
         depth,
         node_budget,
         include_phantoms: _,
+        direction: _,
     } = request;
     let depth = *depth;
     // The same ceiling bounded walks use, and for the same reason: both drive
@@ -571,6 +614,41 @@ pub fn bind_listing_to_cursor(
     }
     query.filter_hash = identity;
     Ok(query)
+}
+/// A count of a listing: the projection's bounds, and nothing a page needs.
+///
+/// A count has no pages, so an ordering, a page size, a cursor or a column
+/// selection cannot apply to it; each is refused by name rather than
+/// ignored, so a caller who believes one narrowed the count is told it did
+/// not.
+pub fn admit_count(
+    cfg: &GraphStorageConfig,
+    type_patterns: &[String],
+    query: &toolkit_odata::ODataQuery,
+) -> Result<(), DomainError> {
+    admit_projection(cfg, type_patterns, query)?;
+    let toolkit_odata::ODataQuery {
+        filter: _,
+        order,
+        limit,
+        cursor,
+        filter_hash: _,
+        select,
+    } = query;
+    for (present, option) in [
+        (!order.0.is_empty(), "$orderby"),
+        (limit.is_some(), "$top"),
+        (cursor.is_some(), "cursor"),
+        (select.is_some(), "$select"),
+    ] {
+        if present {
+            return Err(DomainError::invalid(format!(
+                "a count has no pages, so {option} does not apply to it; send the $filter and \
+                 type_pattern of the listing alone"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// The tabular projection: the type patterns it is narrowed to, and the
@@ -808,6 +886,7 @@ mod tests {
             depth,
             node_budget: None,
             include_phantoms: true,
+            direction: None,
         }
     }
 
@@ -923,6 +1002,30 @@ mod tests {
         admit_neighborhood(&loosened, &neighborhood(0)).expect_err("depth 0 is not a walk");
     }
 
+    /// The discriminator list is bounded by count as well as by length: each
+    /// value is a bind parameter of every hop's edge scan.
+    #[test]
+    fn edge_discriminators_are_bounded_by_count() {
+        use graph_storage_sdk::models::TraverseRequest;
+
+        use super::{DomainError, EDGE_DISCRIMINATORS_MAX};
+
+        let cfg = GraphStorageConfig::default();
+        let walk = |count: usize| TraverseRequest {
+            seeds: vec!["root".to_owned()],
+            depth: 1,
+            edge_discriminators: (0..count).map(|i| format!("d{i}")).collect(),
+            ..TraverseRequest::default()
+        };
+        admit_traverse(&cfg, &walk(EDGE_DISCRIMINATORS_MAX)).expect("the bound itself is admitted");
+        let refusal = admit_traverse(&cfg, &walk(EDGE_DISCRIMINATORS_MAX + 1))
+            .expect_err("one value over the bound is refused");
+        assert!(
+            matches!(refusal, DomainError::LimitExceeded { ref what } if what.contains("edge_discriminators")),
+            "refused as a limit naming the field: {refusal}"
+        );
+    }
+
     /// The two endpoints answer the same question the same way.
     #[test]
     fn neighborhood_and_traversal_refuse_the_same_depths() {
@@ -938,6 +1041,8 @@ mod tests {
             edge_type_patterns: Vec::new(),
             node_type_patterns: Vec::new(),
             max_nodes: None,
+            direction: None,
+            edge_discriminators: Vec::new(),
         };
         for depth in 0..=8u8 {
             assert_eq!(

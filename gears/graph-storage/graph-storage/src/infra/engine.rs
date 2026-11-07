@@ -218,6 +218,14 @@ async fn live_edges(
         select =
             select.filter(Condition::all().add(edge::Column::GtsEdgeTypeId.is_in(ids.clone())));
     }
+    // In the scan, not after it: an edge of another relation must not spend
+    // this hop's edge budget, nor reach a node that spends the walk's. `IN`
+    // never matches a NULL discriminator, which is the contract.
+    if let Some(discriminators) = &req.discriminators {
+        select = select.filter(
+            Condition::all().add(edge::Column::Discriminator.is_in(discriminators.clone())),
+        );
+    }
     // One row past the budget, so the difference between "exactly the budget"
     // and "more than the budget" is observable; the extra row is then dropped.
     let mut rows: Vec<EdgeHop> = select
@@ -275,6 +283,8 @@ async fn live_edges(
         .collect::<std::collections::BTreeMap<_, _>>();
 
     let frontier: std::collections::BTreeSet<i64> = req.frontier.iter().copied().collect();
+    let follows_out = matches!(req.direction, Direction::Outgoing | Direction::Either);
+    let follows_in = matches!(req.direction, Direction::Incoming | Direction::Either);
     let mut reached: Vec<i64> = Vec::new();
     let mut edges = Vec::new();
     for e in &rows {
@@ -283,10 +293,13 @@ async fn live_edges(
             // denied and nonexistent are indistinguishable.
             continue;
         };
-        if frontier.contains(&e.src_node_id) {
+        // Reached only the way the hop walks. An edge between two frontier
+        // nodes is scanned for its source under `Outgoing`, and must not
+        // carry the walk back to that source as if it were followed in.
+        if follows_out && frontier.contains(&e.src_node_id) {
             reached.push(e.dst_node_id);
         }
-        if frontier.contains(&e.dst_node_id) {
+        if follows_in && frontier.contains(&e.dst_node_id) {
             reached.push(e.src_node_id);
         }
         edges.push(EdgeRef {
@@ -294,6 +307,7 @@ async fn live_edges(
             edge_type_id: names.get(&e.gts_edge_type_id).cloned().unwrap_or_default(),
             src: src.clone(),
             dst: dst.clone(),
+            discriminator: e.discriminator.clone(),
         });
     }
     reached.sort_unstable();

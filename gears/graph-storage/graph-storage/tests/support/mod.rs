@@ -246,7 +246,13 @@ impl GraphEngineV1 for HopOverStore {
                 let admitted = req
                     .edge_types
                     .as_ref()
-                    .is_none_or(|set| set.contains(&entry.edge_type_id));
+                    .is_none_or(|set| set.contains(&entry.edge_type_id))
+                    && req.discriminators.as_ref().is_none_or(|wanted| {
+                        entry
+                            .discriminator
+                            .as_ref()
+                            .is_some_and(|value| wanted.contains(value))
+                    });
                 if !wanted || !admitted {
                     continue;
                 }
@@ -260,6 +266,7 @@ impl GraphEngineV1 for HopOverStore {
                     edge_type_id: entry.edge_type_id,
                     src,
                     dst,
+                    discriminator: entry.discriminator,
                 });
                 neighbours.push(entry.neighbor_key);
             }
@@ -601,6 +608,15 @@ pub mod without_node_types {
             req: ProjectionRequest,
         ) -> Result<toolkit_odata::Page<NodeRow>, GraphStoreError> {
             self.0.project_table(ctx, req).await
+        }
+
+        async fn count_table(
+            &self,
+            ctx: &StoreCtx<'_>,
+            req: ProjectionRequest,
+            max: u64,
+        ) -> Result<NodeCount, GraphStoreError> {
+            self.0.count_table(ctx, req, max).await
         }
 
         async fn load_topology(

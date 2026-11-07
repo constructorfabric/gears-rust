@@ -548,3 +548,213 @@ async fn an_existing_identifier_is_a_conflict_by_default_and_updatable_on_reques
         "and how many rows that ground rests on: {updated}"
     );
 }
+
+/// The read-surface fields the domain-model query needs (gears-rust #5239,
+/// #5240, #5529) reach the wire: a direction and a discriminator filter on the
+/// walk, the discriminator on every edge reference, and the node's version in
+/// its envelope.
+#[tokio::test]
+async fn a_walk_takes_a_direction_and_discriminators_and_reads_name_them() {
+    let stand = Stand::new(Harness::allowed());
+    seed(&stand).await;
+    let (status, body) = stand
+        .post(
+            "/ingest",
+            &serde_json::json!({
+                "nodes": [
+                    {"node_key": "dir-a", "type_id": conformance::OWNED},
+                    {"node_key": "dir-b", "type_id": conformance::OWNED}
+                ],
+                "edges": [
+                    {"type_id": conformance::LINK, "src_node_key": "dir-a",
+                     "dst_node_key": "dir-b", "discriminator": "uses"},
+                    {"type_id": conformance::LINK, "src_node_key": "dir-a",
+                     "dst_node_key": "dir-b", "discriminator": "advances"}
+                ]
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let walk = |direction: &str, discriminators: &[&str]| {
+        serde_json::json!({
+            "seeds": ["dir-b"], "depth": 1,
+            "direction": direction, "edge_discriminators": discriminators
+        })
+    };
+    let (status, outgoing) = stand.post("/graph/traverse", &walk("outgoing", &[])).await;
+    assert_eq!(status, StatusCode::OK, "{outgoing}");
+    assert_eq!(
+        outgoing["edges"].as_array().map(Vec::len),
+        Some(0),
+        "{outgoing}"
+    );
+
+    let (status, incoming) = stand
+        .post("/graph/traverse", &walk("incoming", &["uses"]))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{incoming}");
+    assert_eq!(
+        incoming["edges"].as_array().map(Vec::len),
+        Some(1),
+        "{incoming}"
+    );
+    assert_eq!(incoming["edges"][0]["discriminator"], "uses", "{incoming}");
+    assert_eq!(incoming["edges"][0]["src"], "dir-a", "{incoming}");
+
+    let (status, around) = stand
+        .post(
+            "/graph/neighborhood",
+            &serde_json::json!({"root": "dir-b", "depth": 1, "direction": "outgoing"}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{around}");
+    assert_eq!(
+        around["nodes"].as_array().map(Vec::len),
+        Some(1),
+        "only the root: {around}"
+    );
+
+    let (status, problem) = stand.post("/graph/traverse", &walk("sideways", &[])).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "an unknown direction is refused: {problem}"
+    );
+
+    let (status, node) = stand.get("/nodes/dir-a").await;
+    assert_eq!(status, StatusCode::OK, "{node}");
+    assert_eq!(node["envelope"]["version"], 1, "{node}");
+    let mut named: Vec<&str> = node["adjacency"]
+        .as_array()
+        .expect("adjacency is a list")
+        .iter()
+        .filter_map(|entry| entry["discriminator"].as_str())
+        .collect();
+    named.sort_unstable();
+    assert_eq!(named, vec!["advances", "uses"], "{node}");
+
+    let edge_key = node["adjacency"][0]["edge_key"]
+        .as_str()
+        .expect("an edge key");
+    let (status, edge) = stand.get(&format!("/edges/{edge_key}")).await;
+    assert_eq!(status, StatusCode::OK, "{edge}");
+    assert!(
+        edge["envelope"].get("version").is_none(),
+        "an edge's envelope carries no version: {edge}"
+    );
+}
+
+/// An empty discriminator is no discriminator: the edge key already hashed
+/// the two alike, and now the edge reads back with none, whichever form came
+/// first. A filter value `""` could then match nothing, so it is refused.
+#[tokio::test]
+async fn an_empty_discriminator_is_stored_as_none_and_refused_as_a_filter() {
+    let stand = Stand::new(Harness::allowed());
+    seed(&stand).await;
+    let edge = |discriminator: Option<&str>| {
+        let mut edge = serde_json::json!({
+            "type_id": conformance::LINK, "src_node_key": "empty-a", "dst_node_key": "empty-b"
+        });
+        if let Some(value) = discriminator {
+            edge["discriminator"] = serde_json::json!(value);
+        }
+        edge
+    };
+    let (status, body) = stand
+        .post(
+            "/ingest",
+            &serde_json::json!({
+                "nodes": [
+                    {"node_key": "empty-a", "type_id": conformance::OWNED},
+                    {"node_key": "empty-b", "type_id": conformance::OWNED}
+                ],
+                "edges": [edge(Some(""))]
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = stand
+        .post("/ingest", &serde_json::json!({"edges": [edge(None)]}))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (status, node) = stand.get("/nodes/empty-a").await;
+    assert_eq!(status, StatusCode::OK, "{node}");
+    let adjacency = node["adjacency"].as_array().expect("adjacency is a list");
+    assert_eq!(adjacency.len(), 1, "one identity, one edge: {node}");
+    assert!(
+        adjacency[0]["discriminator"].is_null(),
+        "read back with none: {node}"
+    );
+
+    let (status, problem) = stand
+        .post(
+            "/graph/traverse",
+            &serde_json::json!({"seeds": ["empty-a"], "depth": 1, "edge_discriminators": [""]}),
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "an empty filter value is refused: {problem}"
+    );
+}
+
+/// `GET /nodes:count` answers the listing's total, and refuses the options a
+/// count has no use for rather than ignoring them (#5108 point 1, #5529
+/// item 2).
+#[tokio::test]
+async fn a_listing_has_a_count_beside_it() {
+    let stand = Stand::new(Harness::allowed());
+    seed(&stand).await;
+    let (status, body) = stand.post("/ingest", &ingest_body()).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (status, counted) = stand.get("/nodes:count").await;
+    assert_eq!(status, StatusCode::OK, "{counted}");
+    assert_eq!(counted["count"], 2, "{counted}");
+    assert_eq!(counted["capped"], false, "{counted}");
+    assert!(
+        counted["revision"]["revision"].as_i64() > Some(0),
+        "{counted}"
+    );
+
+    let (status, problem) = stand.get("/nodes:count?$orderby=node_key").await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a count has no order: {problem}"
+    );
+    let (status, problem) = stand.get("/nodes:count?limit=5").await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "nor a page size: {problem}"
+    );
+}
+
+/// The count is a custom method, not a path segment, so no node key loses
+/// its path to it: a node keyed `count` is read and deleted at
+/// `/nodes/count` like any other. A static `/nodes/count` route took the
+/// whole path, every method included -- a `DELETE` answered 405 and never
+/// reached the node.
+#[tokio::test]
+async fn a_node_keyed_count_is_read_and_deleted_by_its_path() {
+    let stand = Stand::new(Harness::allowed());
+    seed(&stand).await;
+    let body = serde_json::json!({
+        "nodes": [{"node_key": "count", "type_id": conformance::OWNED, "name": "keyed count"}]
+    });
+    let (status, answer) = stand.post("/ingest", &body).await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+
+    let (status, node) = stand.get("/nodes/count").await;
+    assert_eq!(status, StatusCode::OK, "{node}");
+    assert_eq!(node["node_key"], "count", "{node}");
+
+    let (status, answer) = stand.delete("/nodes/count").await;
+    assert!(status.is_success(), "{status}: {answer}");
+    let (status, gone) = stand.get("/nodes/count").await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{gone}");
+}
