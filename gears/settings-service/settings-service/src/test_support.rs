@@ -884,6 +884,33 @@ impl ResolutionHarness {
             .expect("metadata");
     }
 
+    /// Flag a declaration `anonymous_exposable`, the rest of its metadata as
+    /// `declare` leaves it. The classification must be `public`, as the
+    /// schema check demands.
+    pub async fn expose(&self, declaration_id: Uuid) {
+        let conn = self.db.conn().expect("connection");
+        DeclarationRepo
+            .update_metadata(
+                &conn,
+                &AccessScope::allow_all(),
+                declaration_id,
+                crate::domain::declaration::DeclarationMetadata {
+                    mode: "standard".to_owned(),
+                    display_name: None,
+                    description: None,
+                    domain_affinity: None,
+                    licence_feature: None,
+                    data_classification: "public".to_owned(),
+                    requires_step_up: true,
+                    anonymous_exposable: true,
+                },
+                None,
+                true,
+            )
+            .await
+            .expect("metadata");
+    }
+
     /// Bind a declaration to an administrative domain, the rest of its
     /// metadata as `declare` leaves it.
     pub async fn bind_domain(&self, declaration_id: Uuid, domain: &str) {
@@ -1275,6 +1302,8 @@ pub struct RecordingSecrets {
     pub entries: Mutex<HashMap<String, String>>,
     pub deleted: Mutex<Vec<String>>,
     pub unavailable: std::sync::atomic::AtomicBool,
+    /// No store is bound: the deployment has no Credential Store.
+    pub unconfigured: std::sync::atomic::AtomicBool,
     pub stores: std::sync::atomic::AtomicUsize,
     /// The next store lands in the store and answers with a failure: the
     /// ambiguous outcome of a network that dropped the response.
@@ -1284,6 +1313,9 @@ pub struct RecordingSecrets {
     pub row_probe: Mutex<Option<RowProbe>>,
     /// What the probe saw at each release, in order.
     pub row_present_at_release: Mutex<Vec<bool>>,
+    /// Told once per release that completed: what a test waits on instead of
+    /// the clock to know a sweep ran.
+    pub released: tokio::sync::Notify,
 }
 
 impl RecordingSecrets {
@@ -1320,7 +1352,16 @@ impl RecordingSecrets {
             .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
+    /// Behave as a deployment with no Credential Store from now on.
+    pub fn go_unconfigured(&self) {
+        self.unconfigured
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
     fn check(&self) -> Result<(), DomainError> {
+        if self.unconfigured.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(DomainError::secret_storage_not_configured("the fake store"));
+        }
         if self.unavailable.load(std::sync::atomic::Ordering::SeqCst) {
             return Err(DomainError::Unavailable {
                 detail: "the fake store is down".to_owned(),
@@ -1332,6 +1373,10 @@ impl RecordingSecrets {
 
 #[async_trait]
 impl crate::domain::ports::SecretManager for RecordingSecrets {
+    fn is_configured(&self) -> bool {
+        !self.unconfigured.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     fn mint_reference(&self, key: &str, tenant: Uuid) -> String {
         let n = self
             .stores
@@ -1414,6 +1459,7 @@ impl crate::domain::ports::SecretManager for RecordingSecrets {
             .lock()
             .expect("secrets lock")
             .push(secret_ref.to_owned());
+        self.released.notify_one();
         Ok(())
     }
 }
@@ -1890,6 +1936,12 @@ impl RestHarness {
             Arc::clone(&enforcer),
             names,
         );
+        let router = crate::api::rest::public_routes::register_routes(
+            router,
+            &openapi,
+            Arc::clone(&inner.resolver),
+            Arc::clone(&inner.db),
+        );
         let router = crate::api::rest::search_routes::register_routes(
             router,
             &openapi,
@@ -1960,6 +2012,26 @@ impl RestHarness {
             Arc::clone(&published),
             step_up_for_writes,
         );
+        let router = crate::api::rest::maintenance_routes::register_routes(
+            router,
+            &openapi,
+            Arc::clone(&coordinator),
+            Arc::clone(&inner.db),
+            Arc::new(
+                crate::api::rest::maintenance_handlers::MaintenanceSettings {
+                    retention: Duration::from_hours(365 * 24),
+                    // Small, so a test shows the budget running out with a handful
+                    // of records.
+                    batches: crate::infra::maintenance::PruneBatches {
+                        size: 2,
+                        max_batches: 2,
+                    },
+                    metrics: Arc::new(QuietLifecycle),
+                },
+            ),
+            Arc::clone(&inner.resolver),
+            Arc::clone(&enforcer),
+        );
         let router = crate::api::rest::value_routes::register_routes(
             router,
             &openapi,
@@ -2013,11 +2085,18 @@ impl RestHarness {
             uri,
             body,
             if_match,
-            caller,
+            Some(caller),
             Some("application/json"),
             None,
         )
         .await
+    }
+
+    /// A request with no principal at all: no token, no security context, as
+    /// the anonymous surface receives it.
+    pub async fn send_anonymous(&self, method: &str, uri: &str) -> Answer {
+        self.dispatch(method, uri, None, None, None, None, None)
+            .await
     }
 
     /// The same as `send`, carrying the given `x-request-id`: what an audit
@@ -2035,7 +2114,7 @@ impl RestHarness {
             uri,
             None,
             if_match,
-            context_for(caller),
+            Some(context_for(caller)),
             None,
             Some(request_id),
         )
@@ -2058,7 +2137,7 @@ impl RestHarness {
             uri,
             Some(body.as_bytes().to_vec()),
             if_match,
-            context_for(caller),
+            Some(context_for(caller)),
             Some("application/json"),
             None,
         )
@@ -2080,7 +2159,7 @@ impl RestHarness {
             uri,
             Some(body.as_bytes().to_vec()),
             None,
-            context_for(caller),
+            Some(context_for(caller)),
             content_type,
             None,
         )
@@ -2096,7 +2175,7 @@ impl RestHarness {
         uri: &str,
         body: Option<Vec<u8>>,
         if_match: Option<&str>,
-        caller: SecurityContext,
+        caller: Option<SecurityContext>,
         content_type: Option<&str>,
         request_id: Option<&str>,
     ) -> Answer {
@@ -2115,7 +2194,9 @@ impl RestHarness {
         }
         let payload = body.map_or_else(axum::body::Body::empty, axum::body::Body::from);
         let mut request = builder.body(payload).expect("a well-formed request");
-        request.extensions_mut().insert(caller);
+        if let Some(caller) = caller {
+            request.extensions_mut().insert(caller);
+        }
         let response = self
             .router
             .clone()
@@ -2194,6 +2275,14 @@ impl RestHarness {
             .cloned()
             .unwrap_or_default()
     }
+}
+
+/// Reports nothing from the lifecycle passes; the test binding.
+pub struct QuietLifecycle;
+
+impl crate::domain::ports::LifecycleMetrics for QuietLifecycle {
+    fn needs_review(&self, _source: &'static str, _count: u64) {}
+    fn retention_pass(&self, _result: &'static str, _pruned: u64) {}
 }
 
 /// The write coordinator over a harness's database.

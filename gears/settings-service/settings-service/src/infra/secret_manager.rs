@@ -7,7 +7,7 @@
 //! beyond this service's tables: a tenant's users hold no path to the entry
 //! through the store's own API.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
 use authz_resolver_sdk::PolicyEnforcer;
@@ -17,6 +17,7 @@ use credstore_sdk::{
 use secrecy::SecretString;
 use serde_json::Value;
 use settings_service_sdk::gts::VALUE_SCHEMA;
+use toolkit::ClientHub;
 use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
@@ -66,24 +67,64 @@ const FIRST_PARTY_TOKEN_SCOPE: &str = "*";
 const STORE_SUBJECT_TYPE: &str = toolkit_gts::gts_id!("cf.core.security.subject_service.v1~");
 
 /// The Secret Manager bound to `credstore`.
+///
+/// With `secret_storage: required` the manager is built over the hub: the
+/// store's client is looked up at first use and kept once found. That it is
+/// there at all is checked by the gear's `post_init`, so a host without
+/// credstore does not start. With `disabled` there is no hub: every operation
+/// yields [`DomainError::NotConfigured`] and [`SecretManager::is_configured`]
+/// is `false`, so the deployment serves every setting that is not secret.
+/// [`Self::new`] is for tests and for a client already in hand.
 // @cpt-dod:cpt-cf-settings-service-dod-secret-values-manager:p1
 pub struct CredStoreSecretManager {
-    client: Arc<dyn CredStoreClientV1>,
+    hub: Option<Arc<ClientHub>>,
+    client: OnceLock<Arc<dyn CredStoreClientV1>>,
     namespace: Uuid,
     principal: Uuid,
 }
 
 impl CredStoreSecretManager {
-    /// Bind to the store's client.
+    /// Bind to the store's client, already in hand.
     #[must_use]
     pub fn new(client: Arc<dyn CredStoreClientV1>) -> Self {
+        Self::build(None, OnceLock::from(client))
+    }
+
+    /// Bind to the store through the hub: the client is looked up at first
+    /// use and kept once found.
+    #[must_use]
+    pub fn from_hub(hub: Arc<ClientHub>) -> Self {
+        Self::build(Some(hub), OnceLock::new())
+    }
+
+    /// Bind to no store: the deployment stores no secret settings.
+    #[must_use]
+    pub fn disabled() -> Self {
+        Self::build(None, OnceLock::new())
+    }
+
+    fn build(hub: Option<Arc<ClientHub>>, client: OnceLock<Arc<dyn CredStoreClientV1>>) -> Self {
         let namespace = Uuid::new_v5(&Uuid::NAMESPACE_URL, NAMESPACE_NAME);
         let principal = Uuid::new_v5(&namespace, b"principal");
         Self {
+            hub,
             client,
             namespace,
             principal,
         }
+    }
+
+    /// The store's client, or the refusal when none is bound or registered.
+    fn client(&self, operation: &str) -> Result<Arc<dyn CredStoreClientV1>, DomainError> {
+        if let Some(client) = self.client.get() {
+            return Ok(Arc::clone(client));
+        }
+        let found = self
+            .hub
+            .as_ref()
+            .and_then(|hub| hub.get::<dyn CredStoreClientV1>().ok())
+            .ok_or_else(|| DomainError::secret_storage_not_configured(operation))?;
+        Ok(Arc::clone(self.client.get_or_init(|| found)))
     }
 
     /// The fixed principal this gear presents to the store.
@@ -163,6 +204,14 @@ fn bytes_of(plaintext: &Value) -> Vec<u8> {
 
 #[async_trait]
 impl SecretManager for CredStoreSecretManager {
+    fn is_configured(&self) -> bool {
+        self.client.get().is_some()
+            || self
+                .hub
+                .as_ref()
+                .is_some_and(|hub| hub.get::<dyn CredStoreClientV1>().is_ok())
+    }
+
     fn mint_reference(&self, key: &str, tenant: Uuid) -> String {
         // @cpt-begin:cpt-cf-settings-service-flow-secret-values-set:p1:inst-sv-set-3
         // Apart from the store on purpose: the caller writes the reference
@@ -179,13 +228,14 @@ impl SecretManager for CredStoreSecretManager {
         secret_ref: &str,
         plaintext: &Value,
     ) -> Result<(), DomainError> {
+        let client = self.client("storing a secret")?;
         let secret_ref = Self::parse_ref(secret_ref)?;
         let ctx = self.context(tenant)?;
         // @cpt-begin:cpt-cf-settings-service-flow-secret-values-set:p1:inst-sv-set-4
         // @cpt-begin:cpt-cf-settings-service-flow-secret-values-set:p1:inst-sv-set-5
         // Create-only under the caller's fresh reference: nothing this write
         // does can touch the entry the row currently holds.
-        self.client
+        client
             .create(
                 &ctx,
                 &secret_ref,
@@ -205,9 +255,10 @@ impl SecretManager for CredStoreSecretManager {
         tenant: Uuid,
         secret_ref: &str,
     ) -> Result<SecretString, DomainError> {
+        let client = self.client("resolving a secret")?;
         let reference = Self::parse_ref(secret_ref)?;
         let ctx = self.context(tenant)?;
-        let found = match self.client.get(&ctx, &reference).await {
+        let found = match client.get(&ctx, &reference).await {
             Ok(found) => found,
             Err(CredStoreError::NotFound) => None,
             Err(err) => return Err(unavailable("resolve the secret", &err)),
@@ -233,10 +284,10 @@ impl SecretManager for CredStoreSecretManager {
         tenant: Uuid,
         secret_ref: &str,
     ) -> Result<(), DomainError> {
+        let client = self.client("releasing a secret")?;
         let reference = Self::parse_ref(secret_ref)?;
         let ctx = self.context(tenant)?;
-        match self
-            .client
+        match client
             .delete(&ctx, &reference, WritePrecondition::Exists)
             .await
         {

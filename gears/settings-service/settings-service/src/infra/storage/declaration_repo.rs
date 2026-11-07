@@ -4,7 +4,9 @@ use std::collections::{HashMap, HashSet};
 
 use async_trait::async_trait;
 use sea_orm::sea_query::{Expr, Query};
-use sea_orm::{ActiveValue::Set, ColumnTrait, EntityTrait, ExprTrait, QueryFilter, QuerySelect};
+use sea_orm::{
+    ActiveValue::Set, ColumnTrait, EntityTrait, ExprTrait, QueryFilter, QueryOrder, QuerySelect,
+};
 use toolkit_db::odata::{LimitCfg, ODataFieldMapping, encode_cursor_value, paginate_odata};
 use toolkit_db::secure::{DBRunner, SecureDeleteExt, SecureEntityExt, SecureUpdateExt};
 use toolkit_odata::{CursorV1, ODataOrderBy, ODataQuery, Page, SortDir};
@@ -672,6 +674,23 @@ impl DeclarationRepository for DeclarationRepo {
         .map_err(db_error)?;
         // @cpt-end:cpt-cf-settings-service-flow-value-resolution-admin-browse:p1:inst-vr-browse-9
         Ok(rows.into_iter().map(|m| m.key).collect())
+    }
+
+    async fn find_anonymous_exposable<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+    ) -> Result<Vec<Declaration>, DomainError> {
+        let rows = DeclarationEntity::find()
+            .filter(declaration::Column::AnonymousExposable.eq(true))
+            .filter(declaration::Column::Status.eq(DeclarationStatus::Active.as_str()))
+            .order_by_asc(declaration::Column::Key)
+            .secure()
+            .scope_with(scope)
+            .all(conn)
+            .await
+            .map_err(db_error)?;
+        Ok(rows.into_iter().map(to_domain).collect())
     }
 
     async fn find_by_ids<C: DBRunner>(

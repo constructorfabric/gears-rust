@@ -153,6 +153,16 @@ impl From<DomainError> for CanonicalError {
                 .with_detail(detail)
                 .create(),
 
+            // Canonical failed precondition, never 503: secret storage is not
+            // bound in this deployment, which no retry changes.
+            DomainError::NotConfigured { detail } => SettingsResource::failed_precondition()
+                .with_precondition_violation(
+                    "secret_storage",
+                    format!("secret storage is not configured: {detail}"),
+                    precondition::SECRET_STORAGE_NOT_CONFIGURED,
+                )
+                .create(),
+
             // 500 — the diagnostic goes to the in-process channel the platform
             // strips from the wire, so nothing internal reaches the caller.
             // @cpt-begin:cpt-cf-settings-service-algo-gear-foundation-problem-mapping:p1:inst-gf-problem-6

@@ -28,7 +28,6 @@ use crate::domain::validation::TypeValidator;
 use settings_service_sdk::api::{SettingsContributionClient, SettingsReaderClient};
 
 use crate::config::SettingsServiceConfig;
-use crate::log_text::LogSafe;
 
 /// The Settings Service gear.
 ///
@@ -40,8 +39,15 @@ use crate::log_text::LogSafe;
 /// reading settings during *its* init could turn into an unsortable cycle
 /// (DESIGN.md §4.9). Everything else is consumed: the authorization resolver is
 /// declared below and wired by the runtime's proxy-wiring phase after init, so
-/// the enforcer fetches it from the hub on first use; the tenant resolver is
-/// fetched the same way (see [`crate::infra::platform_scope`]) — its SDK has no
+/// the enforcer fetches it from the hub on first use. The Credential Store is
+/// in neither `deps` nor `consumes`: it is an ordinary application gear, so
+/// its init order relative to this gear is not guaranteed. With
+/// `secret_storage: required` (the default) its client is looked up in the hub
+/// at first use and kept, and `post_init`, which the runtime calls after every
+/// gear of the group has initialized, refuses to start without it; with
+/// `disabled` the gear does not look for
+/// it (see [`crate::infra::secret_manager`]). The tenant resolver is
+/// fetched from the hub on first use as well (see [`crate::infra::platform_scope`]) — its SDK has no
 /// REST projection yet, so it cannot carry a `consumes` declaration until it
 /// does, and in the Embedded profile R1 is limited to the two paths coincide.
 /// The resolver over the concrete repositories, as the gear and its REST
@@ -55,7 +61,7 @@ pub type ConcreteResolver = crate::domain::resolution::ValueResolver<
 #[toolkit::consumes(contract = authz_resolver_sdk::AuthZResolverApi, from = "authz-resolver")]
 #[toolkit::gear(
     name = "settings-service",
-    deps = [types_registry, credstore],
+    deps = [types_registry],
     capabilities = [db, rest, stateful],
     lifecycle(entry = "serve", stop_timeout = "30s", await_ready)
 )]
@@ -112,6 +118,15 @@ impl Default for SettingsService {
 /// How often the managed lifecycle releases the staged secrets nobody claimed.
 const SWEEP_TICK: Duration = Duration::from_mins(1);
 
+/// How often the managed lifecycle prunes audit records past their retention
+/// horizon. A horizon is at least twelve months away, so once a day loses
+/// nothing and keeps the pass cheap.
+const RETENTION_TICK: Duration = Duration::from_hours(24);
+
+/// How often the managed lifecycle refreshes the needs-review gauge: two
+/// indexed counts, cheap enough for a minute's resolution on a dashboard.
+const REVIEW_TICK: Duration = Duration::from_mins(1);
+
 /// An interval that delays rather than bursts after a missed tick.
 fn ticking(period: Duration) -> tokio::time::Interval {
     let mut interval = tokio::time::interval(period);
@@ -119,36 +134,66 @@ fn ticking(period: Duration) -> tokio::time::Interval {
     interval
 }
 
-/// How often the managed lifecycle prunes audit records past their retention
-/// horizon. A horizon is at least twelve months away, so once a day loses
-/// nothing and keeps the pass cheap.
-const RETENTION_TICK: Duration = Duration::from_hours(24);
-
-/// How the retention pass takes a backlog: batches of `size`, at most
-/// `per_tick` of them a tick, each its own short statement and commit.
-#[derive(Debug, Clone, Copy)]
-struct PruneBatches {
-    size: u64,
-    per_tick: u32,
+/// The loops this replica runs, from the `background` switches.
+///
+/// A switched-off loop has no interval at all, so it never ticks, the first
+/// immediate tick included: nothing about it runs on this replica, and the
+/// pass is the operator's to request through the maintenance routes.
+struct Loops {
+    sweep: Option<tokio::time::Interval>,
+    retention: Option<tokio::time::Interval>,
+    review: Option<tokio::time::Interval>,
 }
 
-/// Ten thousand a batch and a hundred batches a tick: a million records, about
-/// seven days' worth at the declared bound of fifty million a year, so a
-/// backlog after a long outage clears in days while no statement runs long.
-const PRUNE_BATCHES: PruneBatches = PruneBatches {
-    size: 10_000,
-    per_tick: 100,
-};
+impl Loops {
+    fn from_config(background: crate::config::BackgroundConfig) -> Self {
+        Self {
+            sweep: background.pending_secret_sweep.then(|| ticking(SWEEP_TICK)),
+            retention: background.audit_retention.then(|| ticking(RETENTION_TICK)),
+            review: background.needs_review_gauge.then(|| ticking(REVIEW_TICK)),
+        }
+    }
+}
 
-/// How often the managed lifecycle refreshes the needs-review gauge: two
-/// indexed counts, cheap enough for a minute's resolution on a dashboard.
-const REVIEW_TICK: Duration = Duration::from_mins(1);
+/// The next tick of a loop, or never when the loop is switched off.
+async fn next_tick(interval: &mut Option<tokio::time::Interval>) {
+    match interval {
+        Some(interval) => {
+            interval.tick().await;
+        }
+        None => std::future::pending().await,
+    }
+}
 
 impl SettingsService {
+    /// The Secret Manager over the Credential Store. The store is in neither
+    /// `deps` nor `consumes`: it is an ordinary application gear, so its client
+    /// may not be in the hub yet during this gear's init. `required` builds the
+    /// manager over the hub, which looks the client up at first use; that the
+    /// client is there is checked by [`Gear::post_init`]. `disabled` does not
+    /// look at all.
+    fn secret_manager(
+        ctx: &GearCtx,
+        config: &SettingsServiceConfig,
+    ) -> Arc<dyn crate::domain::ports::SecretManager> {
+        match config.secret_storage {
+            crate::config::SecretStorage::Required => Arc::new(
+                crate::infra::secret_manager::CredStoreSecretManager::from_hub(ctx.client_hub()),
+            ),
+            crate::config::SecretStorage::Disabled => {
+                tracing::warn!(
+                    "secret storage is disabled: secret settings are refused with \
+                     `secret storage is not configured`"
+                );
+                Arc::new(crate::infra::secret_manager::CredStoreSecretManager::disabled())
+            }
+        }
+    }
+
     /// The managed lifecycle: the pending-secret sweep and the needs-review
-    /// gauge once a minute, and the audit retention pass once a day, until
-    /// cancelled. The only long-running
-    /// work this gear owns; everything else is request-driven.
+    /// gauge once a minute, and the audit retention pass once a day, each
+    /// only if `background` leaves it on, until cancelled. The only
+    /// long-running work this gear owns; everything else is request-driven.
     #[allow(
         clippy::redundant_pub_crate,
         reason = "module-private serve entry-point invoked by the toolkit runtime"
@@ -160,215 +205,44 @@ impl SettingsService {
     ) -> anyhow::Result<()> {
         let writes = self.writes()?;
         let db = self.db()?;
-        let retention = Duration::from_hours(u64::from(self.config()?.audit_retention_days) * 24);
+        let config = self.config()?;
+        let retention = Duration::from_hours(u64::from(config.audit_retention_days) * 24);
+        let loops = Loops::from_config(config.background);
         ready.notify();
         info!(
-            tick_secs = SWEEP_TICK.as_secs(),
-            "pending-secret sweep and audit retention started"
+            sweep = config.background.pending_secret_sweep,
+            retention = config.background.audit_retention,
+            review = config.background.needs_review_gauge,
+            "background passes started"
         );
         let metrics = crate::infra::lifecycle_metrics::OtelLifecycleMetrics::new();
-        Self::tick_until_cancelled(&writes, &db, retention, &metrics, &cancel).await;
-        info!("pending-secret sweep and audit retention stopped");
+        Self::tick_until_cancelled(&writes, &db, retention, &metrics, loops, &cancel).await;
+        info!("background passes stopped");
         Ok(())
     }
 
-    /// The periodic passes, until the lifecycle is cancelled.
+    /// The periodic passes, until the lifecycle is cancelled. With every loop
+    /// off this waits for the cancellation and does nothing else.
     async fn tick_until_cancelled(
         writes: &crate::infra::value_writes::WriteCoordinator,
         db: &DBProvider<DbError>,
         retention: Duration,
         metrics: &dyn crate::domain::ports::LifecycleMetrics,
+        mut loops: Loops,
         cancel: &CancellationToken,
     ) {
-        let mut interval = ticking(SWEEP_TICK);
-        let mut retention_interval = ticking(RETENTION_TICK);
-        let mut review_interval = ticking(REVIEW_TICK);
+        use crate::infra::maintenance;
         loop {
             tokio::select! {
                 biased;
                 () = cancel.cancelled() => break,
-                _ = interval.tick() => Self::sweep_once(writes, cancel).await,
-                _ = retention_interval.tick() => Self::retention_tick(db, retention, cancel, metrics).await,
-                _ = review_interval.tick() => Self::review_once(db, metrics).await,
-            }
-        }
-    }
-
-    /// One refresh of the needs-review gauge, logged and never fatal. Every
-    /// source is published, zero included, so a fixed backlog reads zero
-    /// rather than its last count; a failed pass leaves the gauge as it was
-    /// until the next tick.
-    async fn review_once(
-        db: &DBProvider<DbError>,
-        metrics: &dyn crate::domain::ports::LifecycleMetrics,
-    ) {
-        match Self::count_needs_review(db).await {
-            Ok(counts) => {
-                for (source, count) in counts {
-                    metrics.needs_review(source, count);
+                () = next_tick(&mut loops.sweep) => maintenance::sweep_once(writes, cancel).await,
+                () = next_tick(&mut loops.retention) => {
+                    maintenance::retention_tick(db, retention, cancel, metrics).await;
                 }
-            }
-            Err(err) => tracing::warn!(
-                err = %LogSafe(&err),
-                "needs-review gauge refresh failed; retried next tick"
-            ),
-        }
-    }
-
-    /// The flagged overrides per declaration source, across every tenant.
-    async fn count_needs_review(
-        db: &DBProvider<DbError>,
-    ) -> Result<Vec<(&'static str, u64)>, crate::domain::error::DomainError> {
-        use crate::domain::value::ValueRepository as _;
-        let conn = db.conn().map_err(|err| {
-            crate::domain::error::DomainError::dependency_unavailable(
-                "database",
-                "open a connection",
-                err,
-            )
-        })?;
-        let scope = toolkit_security::AccessScope::allow_all();
-        let mut counts = Vec::with_capacity(crate::domain::declaration::SOURCES.len());
-        for source in crate::domain::declaration::SOURCES {
-            let count = crate::infra::storage::value_repo::ValueRepo
-                .count_flagged(&conn, &scope, source)
-                .await?;
-            counts.push((source, count));
-        }
-        Ok(counts)
-    }
-
-    /// The daily tick: one retention pass against the clock now.
-    async fn retention_tick(
-        db: &DBProvider<DbError>,
-        retention: Duration,
-        cancel: &CancellationToken,
-        metrics: &dyn crate::domain::ports::LifecycleMetrics,
-    ) {
-        Self::prune_once(
-            db,
-            retention,
-            time::OffsetDateTime::now_utc(),
-            PRUNE_BATCHES,
-            cancel,
-            metrics,
-        )
-        .await;
-    }
-
-    /// One audit retention pass, logged and never fatal: records past their
-    /// horizon leave — an explicit `retain_until`, or `occurred_at` plus the
-    /// configured default — batch by batch, until a batch comes back short,
-    /// the tick's cap is reached or the lifecycle is stopped. What the pass
-    /// did not reach, or a failed batch left, waits for the next tick; what
-    /// earlier batches deleted stays deleted. Returns how many records went.
-    async fn prune_once(
-        db: &DBProvider<DbError>,
-        default_retention: Duration,
-        now: time::OffsetDateTime,
-        batches: PruneBatches,
-        cancel: &CancellationToken,
-        metrics: &dyn crate::domain::ports::LifecycleMetrics,
-    ) -> u64 {
-        let (pruned, failure) = Self::prune(db, default_retention, now, batches, cancel).await;
-        // Reported whatever happened: a failed pass and one with nothing to
-        // prune both return zero, and only this tells them apart.
-        metrics.retention_pass(if failure.is_some() { "failed" } else { "ok" }, pruned);
-        if pruned > 0 {
-            info!(pruned, "audit records past their retention horizon pruned");
-        }
-        if let Some(err) = failure {
-            tracing::warn!(
-                pruned,
-                err = %LogSafe(&err),
-                "audit retention pass failed; the rest is retried next tick"
-            );
-        }
-        pruned
-    }
-
-    /// One pass of the sweep, logged and never fatal: what it could not
-    /// release waits for the next tick.
-    async fn sweep_once(
-        writes: &crate::infra::value_writes::WriteCoordinator,
-        cancel: &CancellationToken,
-    ) {
-        // @cpt-begin:cpt-cf-settings-service-flow-secret-values-stage:p1:inst-sv-stage-9
-        match writes
-            .sweep_expired(crate::infra::value_writes::SWEEP_LIMIT, cancel)
-            .await
-        {
-            Ok(0) => {}
-            Ok(released) => info!(released, "expired staged secrets released"),
-            Err(err) => tracing::warn!(
-                err = %LogSafe(&err),
-                "pending-secret sweep failed; retried next tick"
-            ),
-        }
-        // @cpt-end:cpt-cf-settings-service-flow-secret-values-stage:p1:inst-sv-stage-9
-    }
-
-    /// The retention pass itself: how many records it pruned, and the failure
-    /// that stopped it early, for the caller to log.
-    async fn prune(
-        db: &DBProvider<DbError>,
-        default_retention: Duration,
-        now: time::OffsetDateTime,
-        batches: PruneBatches,
-        cancel: &CancellationToken,
-    ) -> (u64, Option<crate::domain::error::DomainError>) {
-        let Ok(retention) = time::Duration::try_from(default_retention) else {
-            return (
-                0,
-                Some(crate::domain::error::DomainError::Internal {
-                    diagnostic: "the audit retention does not fit a timestamp span".to_owned(),
-                }),
-            );
-        };
-        let conn = match db.conn() {
-            Ok(conn) => conn,
-            Err(err) => {
-                return (
-                    0,
-                    Some(crate::domain::error::DomainError::dependency_unavailable(
-                        "database",
-                        "open a connection",
-                        err,
-                    )),
-                );
-            }
-        };
-        let scope = toolkit_security::AccessScope::allow_all();
-        // The configured retention first, where the trigger reads it: the
-        // database then refuses deleting anything younger by any path, and a
-        // write that fails fails the pass, which the pass metric reports.
-        let days =
-            u32::try_from(default_retention.as_secs().div_euclid(86_400)).unwrap_or(u32::MAX);
-        if let Err(err) = crate::infra::storage::audit_store::AuditStore
-            .record_retention(&conn, &scope, days)
-            .await
-        {
-            return (0, Some(err));
-        }
-        let mut pruned = 0;
-        for _ in 0..batches.per_tick {
-            if cancel.is_cancelled() {
-                break;
-            }
-            match crate::infra::storage::audit_store::AuditStore
-                .prune_expired(&conn, &scope, now, retention, batches.size)
-                .await
-            {
-                Ok(batch) => {
-                    pruned += batch;
-                    if batch < batches.size {
-                        break;
-                    }
-                }
-                Err(err) => return (pruned, Some(err)),
+                () = next_tick(&mut loops.review) => maintenance::review_once(db, metrics).await,
             }
         }
-        (pruned, None)
     }
 
     /// The bootstrap configuration, once initialization has run.
@@ -671,14 +545,9 @@ impl Gear for SettingsService {
                 ctx.client_hub(),
                 &config.step_up,
             )?);
-        // `credstore` is in `deps`, so its client is available here.
-        let credstore = ctx
-            .client_hub()
-            .get::<dyn credstore_sdk::CredStoreClientV1>()
-            .map_err(|e| anyhow::anyhow!("{}: credstore client: {e}", Self::MODULE_NAME))?;
-        let secrets: Arc<dyn crate::domain::ports::SecretManager> = Arc::new(
-            crate::infra::secret_manager::CredStoreSecretManager::new(credstore),
-        );
+        // The Secret Manager over the Credential Store, which it looks up at
+        // first use (see `secret_manager`).
+        let secrets = Self::secret_manager(ctx, &config);
         let step_up_for_admin = Arc::clone(&step_up);
         // One counter set for the write path and the declaration admin, so
         // `settings_step_up_total` is one series per operation.
@@ -731,6 +600,7 @@ impl Gear for SettingsService {
             Arc::new(
                 crate::infra::setting_type_registrar::TypesRegistryRegistrar::new(self.types()?),
             ),
+            Arc::clone(&secrets),
             audit,
         ));
         let contribution_client: Arc<dyn SettingsContributionClient> =
@@ -780,6 +650,33 @@ impl Gear for SettingsService {
         info!("Settings Service gear initialized");
         // @cpt-end:cpt-cf-settings-service-algo-gear-foundation-gear-init:p1:inst-gf-init-12
 
+        Ok(())
+    }
+
+    /// With `secret_storage: required`, refuses to start when no Credential
+    /// Store client is registered.
+    ///
+    /// The check is here and not in `init` because `credstore` is an ordinary
+    /// application gear outside this gear's `deps`, so the order of their
+    /// inits is not guaranteed. The runtime calls `post_init` after every gear
+    /// of the group has initialized and before routes are mounted, so a host
+    /// that carries credstore has its client in the hub by now. Until then,
+    /// for instance in contributions made from other gears' `post_init`, the
+    /// manager finds the client lazily.
+    async fn post_init(&self, ctx: &GearCtx) -> anyhow::Result<()> {
+        let config = self.config()?;
+        if config.secret_storage == crate::config::SecretStorage::Required {
+            ctx.client_hub()
+                .get::<dyn credstore_sdk::CredStoreClientV1>()
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "{}: secret_storage is `required` but no Credential Store client is \
+                         registered ({e}); add the credstore gear to the host, or set \
+                         `secret_storage: disabled` if this deployment stores no secrets",
+                        Self::MODULE_NAME
+                    )
+                })?;
+        }
         Ok(())
     }
 }
@@ -843,6 +740,31 @@ impl RestApiCapability for SettingsService {
             self.access()?,
             self.db()?,
             self.enforcer()?,
+        );
+        // Maintenance: one pass of the loops, asked for by an external
+        // scheduler. Authenticated and internal, never `.exposed()`.
+        let config = self.config()?;
+        let router = crate::api::rest::maintenance_routes::register_routes(
+            router,
+            openapi,
+            self.writes()?,
+            self.db()?,
+            Arc::new(
+                crate::api::rest::maintenance_handlers::MaintenanceSettings {
+                    retention: Duration::from_hours(u64::from(config.audit_retention_days) * 24),
+                    batches: crate::infra::maintenance::REQUEST_BATCHES,
+                    metrics: Arc::new(crate::infra::lifecycle_metrics::OtelLifecycleMetrics::new()),
+                },
+            ),
+            self.resolver()?,
+            self.enforcer()?,
+        );
+        // The anonymous read: the only route here reached without a token.
+        let router = crate::api::rest::public_routes::register_routes(
+            router,
+            openapi,
+            self.resolver()?,
+            self.db()?,
         );
         // Search: the dialect is the database's, decided here once, where the
         // provider is at hand; the service is otherwise stateless.

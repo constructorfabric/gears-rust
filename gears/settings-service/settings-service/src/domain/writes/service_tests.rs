@@ -1080,7 +1080,8 @@ async fn a_valid_re_set_clears_needs_review_and_evicts_the_cache() {
 }
 
 #[tokio::test]
-async fn a_secret_write_is_unavailable_while_nothing_is_bound_and_no_plaintext_lands() {
+async fn a_secret_write_is_not_configured_while_nothing_is_bound_and_nothing_lands() {
+    use crate::domain::secrets::pending::PendingSecretRepository as _;
     let h = WriteHarness::new().await;
     let d = h
         .base
@@ -1103,8 +1104,8 @@ async fn a_secret_write_is_unavailable_while_nothing_is_bound_and_no_plaintext_l
         )
         .await;
     assert!(
-        matches!(refused, Err(DomainError::Unavailable { .. })),
-        "{refused:?}"
+        matches!(refused, Err(DomainError::NotConfigured { .. })),
+        "a deployment state, not an outage: {refused:?}"
     );
     let conn = h.base.db.conn().expect("connection");
     assert!(
@@ -1114,6 +1115,17 @@ async fn a_secret_write_is_unavailable_while_nothing_is_bound_and_no_plaintext_l
             .expect("lookup")
             .is_none()
     );
+    // Refused before the intent row, so there is nothing for the sweep to find.
+    let leftovers = crate::infra::storage::pending_secret_repo::PendingSecretRepo
+        .list_expired(
+            &conn,
+            &AccessScope::allow_all(),
+            time::OffsetDateTime::now_utc() + time::Duration::days(1),
+            10,
+        )
+        .await
+        .expect("a readable table");
+    assert!(leftovers.is_empty(), "{leftovers:?}");
 }
 
 #[tokio::test]

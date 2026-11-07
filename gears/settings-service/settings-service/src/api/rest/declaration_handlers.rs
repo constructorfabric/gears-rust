@@ -176,10 +176,9 @@ pub async fn create_declaration(
     // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-evolve:p1:inst-decl-evolve-7
     // Retained values re-enter resolution on a revive; on an evolution the old
     // key leaves it and the new one enters. Nothing cached may keep answering
-    // for either.
-    if created.reactivated || created.evolved {
-        admin.evict(&created.declaration.key);
-    }
+    // for either. A brand-new key has no cached values, and the eviction drops
+    // only the anonymous read's stored selection.
+    admin.evict(&created.declaration.key);
     if let Some(retired) = &created.retired {
         admin.evict(retired);
     }

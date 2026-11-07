@@ -23,7 +23,7 @@
 //! reason. It becomes testable the day a required field is added — which is
 //! also the day it starts to matter.
 
-use super::{IN_PROCESS_CONTRACTS, SettingsServiceConfig};
+use super::{IN_PROCESS_CONTRACTS, SecretStorage, SettingsServiceConfig};
 
 fn parse(json: serde_json::Value) -> Result<SettingsServiceConfig, serde_json::Error> {
     serde_json::from_value(json)
@@ -142,4 +142,52 @@ fn a_local_binding_another_contract_and_no_section_at_all_are_all_accepted() {
             "{section} should be accepted"
         );
     }
+}
+
+#[test]
+fn every_background_loop_is_on_by_default() {
+    let cfg = parse(serde_json::json!({})).expect("parses");
+    assert!(cfg.background.pending_secret_sweep);
+    assert!(cfg.background.audit_retention);
+    assert!(cfg.background.needs_review_gauge);
+    assert_eq!(cfg.background, super::BackgroundConfig::default());
+}
+
+#[test]
+fn one_loop_can_be_switched_off_without_naming_the_others() {
+    let cfg =
+        parse(serde_json::json!({ "background": { "audit_retention": false } })).expect("parses");
+    assert!(!cfg.background.audit_retention);
+    assert!(
+        cfg.background.pending_secret_sweep && cfg.background.needs_review_gauge,
+        "a switch left out keeps its default"
+    );
+}
+
+#[test]
+fn a_mistyped_background_key_is_refused_rather_than_ignored() {
+    let err = parse(serde_json::json!({ "background": { "audit_retentoin": false } }))
+        .expect_err("must not parse");
+    assert!(err.to_string().contains("audit_retentoin"), "got `{err}`");
+}
+
+#[test]
+fn secret_storage_is_required_by_default() {
+    let cfg = parse(serde_json::json!({})).expect("parses");
+    assert_eq!(cfg.secret_storage, SecretStorage::Required);
+}
+
+#[test]
+fn secret_storage_takes_either_value_by_name() {
+    let disabled = parse(serde_json::json!({ "secret_storage": "disabled" })).expect("parses");
+    assert_eq!(disabled.secret_storage, SecretStorage::Disabled);
+    let required = parse(serde_json::json!({ "secret_storage": "required" })).expect("parses");
+    assert_eq!(required.secret_storage, SecretStorage::Required);
+}
+
+#[test]
+fn an_unknown_secret_storage_value_is_refused() {
+    let err =
+        parse(serde_json::json!({ "secret_storage": "optional" })).expect_err("must not parse");
+    assert!(err.to_string().contains("optional"), "got `{err}`");
 }

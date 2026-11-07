@@ -4,6 +4,7 @@ pub mod actor_name_metrics;
 pub mod actor_names;
 pub mod contribution_client;
 pub mod lifecycle_metrics;
+pub mod maintenance;
 pub mod platform_scope;
 pub mod reader_client;
 pub mod sdk_error_mapping;

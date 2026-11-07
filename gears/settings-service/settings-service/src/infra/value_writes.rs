@@ -137,6 +137,17 @@ pub struct BatchOutcome {
     pub results: Vec<Result<Committed, DomainError>>,
 }
 
+/// What one sweep pass did.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SweepPage {
+    /// The staged secrets released and their rows deleted.
+    pub released: usize,
+    /// Whether the pass found a full page of expired rows and released at
+    /// least one, so more may wait. A pass that released none, as when the
+    /// store is down, says `false`: calling again would find the same rows.
+    pub more: bool,
+}
+
 /// The coordinator.
 pub struct WriteCoordinator {
     db: Arc<DBProvider<DbError>>,
@@ -562,10 +573,12 @@ impl WriteCoordinator {
     /// No step-up is asked, since nothing live changes here.
     ///
     /// # Errors
-    /// The gate's refusals short of step-up; [`DomainError::Validation`] with
-    /// `not_a_secret` for a declaration whose values travel inline, or for an
-    /// invalid value; [`DomainError::Unavailable`] when the store or the
-    /// database cannot answer, in which case nothing is kept anywhere.
+    /// [`DomainError::NotConfigured`] when no secret store is bound, before
+    /// any row is written; the gate's refusals short of step-up;
+    /// [`DomainError::Validation`] with `not_a_secret` for a declaration whose
+    /// values travel inline, or for an invalid value;
+    /// [`DomainError::Unavailable`] when the store or the database cannot
+    /// answer, in which case nothing is kept anywhere.
     pub async fn stage_secret(
         &self,
         actor: &WriteActor,
@@ -577,9 +590,12 @@ impl WriteCoordinator {
         // A stage is also the moment to let go of what nobody claimed; a sweep
         // that fails is logged and tried again by the next one.
         // A request is not the lifecycle: nothing here stops it but its end.
-        if let Err(err) = self
-            .sweep_expired_in(&conn, SWEEP_LIMIT, &CancellationToken::new())
-            .await
+        // Without a store there is nothing to release, and the stage itself
+        // is refused below.
+        if self.writer.secrets().is_configured()
+            && let Err(err) = self
+                .sweep_expired_in(&conn, SWEEP_LIMIT, &CancellationToken::new())
+                .await
         {
             tracing::warn!(
                 err = %LogSafe(&err),
@@ -613,6 +629,10 @@ impl WriteCoordinator {
             });
         }
         // @cpt-end:cpt-cf-settings-service-flow-secret-values-stage:p1:inst-sv-stage-2
+        // Before the intent row: a stage with no store bound writes nothing.
+        self.writer
+            .secrets()
+            .require_configured("staging a secret")?;
         // @cpt-begin:cpt-cf-settings-service-flow-secret-values-stage:p1:inst-sv-stage-3
         // @cpt-begin:cpt-cf-settings-service-flow-secret-values-stage:p1:inst-sv-stage-4
         // Exactly the set's own staging: validated against the type, the
@@ -705,6 +725,27 @@ impl WriteCoordinator {
         limit: u64,
         stop: &CancellationToken,
     ) -> Result<usize, DomainError> {
+        Ok(self.sweep_page(limit, stop).await?.released)
+    }
+
+    /// One sweep pass as [`Self::sweep_expired`] runs it, with whether the
+    /// pass found a full page of expired rows, so there may be more behind it.
+    ///
+    /// With no secret store bound there is nothing to release: the pass does
+    /// nothing and says so at debug level only, so a deployment without the
+    /// store is not told about it every minute.
+    ///
+    /// # Errors
+    /// As [`Self::sweep_expired`].
+    pub async fn sweep_page(
+        &self,
+        limit: u64,
+        stop: &CancellationToken,
+    ) -> Result<SweepPage, DomainError> {
+        if !self.writer.secrets().is_configured() {
+            tracing::debug!("pending-secret sweep skipped: secret storage is not configured");
+            return Ok(SweepPage::default());
+        }
         let conn = self.db.conn().map_err(|e| conn_error(&e))?;
         self.sweep_expired_in(&conn, limit.min(SWEEP_LIMIT), stop)
             .await
@@ -715,13 +756,14 @@ impl WriteCoordinator {
         conn: &C,
         limit: u64,
         stop: &CancellationToken,
-    ) -> Result<usize, DomainError> {
+    ) -> Result<SweepPage, DomainError> {
         // @cpt-begin:cpt-cf-settings-service-flow-secret-values-stage:p1:inst-sv-stage-9
         let scope = AccessScope::allow_all();
         let expired = self
             .pending
             .list_expired(conn, &scope, OffsetDateTime::now_utc(), limit)
             .await?;
+        let full_page = u64::try_from(expired.len()).is_ok_and(|listed| listed >= limit);
         let mut released = 0;
         for row in expired {
             // A release already asked for is let finish: dropped halfway, the
@@ -765,7 +807,12 @@ impl WriteCoordinator {
                 released += 1;
             }
         }
-        Ok(released)
+        Ok(SweepPage {
+            released,
+            // A full page that released nothing is a store that cannot answer:
+            // the same rows come back every pass, so a scheduler must stop.
+            more: full_page && released > 0,
+        })
         // @cpt-end:cpt-cf-settings-service-flow-secret-values-stage:p1:inst-sv-stage-9
     }
 

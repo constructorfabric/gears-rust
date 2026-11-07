@@ -154,9 +154,14 @@ fn every_rejection_carries_a_word_from_the_closed_vocabulary() {
         "retired",
         "not_found",
         "unavailable",
+        "not_configured",
         "error",
     ];
     let cases: Vec<(DomainError, &str)> = vec![
+        (
+            DomainError::secret_storage_not_configured("storing a secret"),
+            "not_configured",
+        ),
         (
             DomainError::Validation {
                 field: "value".to_owned(),

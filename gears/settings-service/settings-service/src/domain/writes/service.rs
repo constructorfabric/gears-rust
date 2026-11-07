@@ -644,6 +644,8 @@ where
     /// `conn` is for the intent row a secret leaves behind first.
     ///
     /// # Errors
+    /// [`DomainError::NotConfigured`] for any change to a secret setting when
+    /// no store is bound, before anything is read or written;
     /// [`DomainError::Validation`] for an invalid value;
     /// [`DomainError::Unavailable`] when the store cannot answer — the intent
     /// row stays for the sweep, since the entry may exist without an answer;
@@ -657,6 +659,14 @@ where
         precondition: StagePrecondition<'_>,
     ) -> Result<Staged, DomainError> {
         let declaration = &gated.declaration;
+        // A secret setting's value lives in the store, so every change to one
+        // (set, adopt a staged token, revert, remove) needs it. Refused before
+        // anything is read or written: no intent row, no entry, nothing to
+        // sweep.
+        if declaration.has_secret_trait {
+            self.secrets
+                .require_configured("changing the value of a secret setting")?;
+        }
         // The tag is judged before the plaintext goes anywhere: a stale or
         // missing one is the cheapest refusal and the one a concurrent editor
         // trips most, and refusing it here leaves no store entry to release,
@@ -710,8 +720,8 @@ where
         // @cpt-end:cpt-cf-settings-service-algo-value-writes-commit:p1:inst-vw-commit-1
         // @cpt-begin:cpt-cf-settings-service-algo-value-writes-commit:p1:inst-vw-commit-4
         // Plaintext never reaches `value` for a secret: the Secret Manager
-        // takes it under a reference unique to this write, and with nothing
-        // bound the write is unavailable rather than stored in clear. The
+        // takes it under a reference unique to this write, and with no store
+        // bound the write is refused as not configured rather than stored in clear. The
         // store cannot join the row's transaction, so this runs before it.
         //
         // The intent first, durable, then the entry. The row names the

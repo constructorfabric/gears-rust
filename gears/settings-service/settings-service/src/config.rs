@@ -71,6 +71,18 @@ pub struct SettingsServiceConfig {
     #[serde(default = "default_audit_retention_days")]
     pub audit_retention_days: u32,
 
+    /// Whether this deployment stores secret settings. `required` by default,
+    /// so a host that lost its Credential Store fails at startup instead of
+    /// coming up healthy and refusing every secret; `disabled` is chosen
+    /// explicitly.
+    #[serde(default)]
+    pub secret_storage: SecretStorage,
+
+    /// Which periodic passes this replica runs. Absent, all three do, as
+    /// they always have.
+    #[serde(default)]
+    pub background: BackgroundConfig,
+
     /// The step-up policy. Absent, the defaults: a five-minute window, no
     /// pins, no assurance requirement — the verifier is bound either way.
     #[serde(default)]
@@ -84,6 +96,60 @@ pub struct SettingsServiceConfig {
     /// a silent hole.
     #[serde(default)]
     pub client_wiring: std::collections::BTreeMap<String, WiringEntry>,
+}
+
+/// Whether the deployment stores secret settings, and so whether init needs the
+/// Credential Store.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SecretStorage {
+    /// The Credential Store's client must be registered in `ClientHub` when
+    /// this gear initializes, and init fails without it. `credstore` is a
+    /// `system` gear and registers its client in its own init, and the runtime
+    /// initializes every system gear before any other, so the client is there
+    /// by then whenever the host carries the store.
+    #[default]
+    Required,
+    /// The deployment stores no secret settings. The gear does not look for the
+    /// store, logs one warning at init, and refuses every operation that needs
+    /// secret storage with `secret storage is not configured`.
+    Disabled,
+}
+
+/// Which periodic passes this replica runs.
+///
+/// Every replica of the gear runs the same three loops, so N replicas do the
+/// same work N times. Each loop can be switched off here; the pending-secret
+/// sweep and the audit retention pass can then be requested once per cluster
+/// by an external scheduler through the maintenance routes
+/// (`POST /settings-service/v1/maintenance/...`). The needs-review gauge has
+/// no route: switched off, it is simply not refreshed.
+///
+/// All three default to `true`, so a deployment that configures nothing runs
+/// what it always ran. A disabled loop never ticks, not even the first
+/// immediate tick.
+// Three independent switches, one per loop; a state enum would only re-encode
+// them.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct BackgroundConfig {
+    /// Release the staged secrets nobody claimed, once a minute.
+    pub pending_secret_sweep: bool,
+    /// Prune the audit records past their retention horizon, once a day.
+    pub audit_retention: bool,
+    /// Refresh the needs-review gauge, once a minute.
+    pub needs_review_gauge: bool,
+}
+
+impl Default for BackgroundConfig {
+    fn default() -> Self {
+        Self {
+            pending_secret_sweep: true,
+            audit_retention: true,
+            needs_review_gauge: true,
+        }
+    }
 }
 
 /// One `client_wiring` entry, read for its transport alone.

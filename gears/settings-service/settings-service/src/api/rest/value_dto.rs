@@ -228,7 +228,7 @@ pub struct BatchItemDto {
     pub change: Option<SetResultDto>,
     /// Why, when rejected — one of a fixed vocabulary: `invalid`,
     /// `if_match_required`, `stale`, `conflict`, `forbidden`, `retired`,
-    /// `not_found`, `unavailable` or `error`.
+    /// `not_found`, `unavailable`, `not_configured` or `error`.
     /// `retired` also covers a declaration retired after the client assembled
     /// the change: the check runs again as each change commits.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -261,6 +261,7 @@ pub fn rejection_code(err: &DomainError) -> &'static str {
         DomainError::Retired { .. } => "retired",
         DomainError::NotFound { .. } => "not_found",
         DomainError::Unavailable { .. } => "unavailable",
+        DomainError::NotConfigured { .. } => "not_configured",
         // `StepUpRequired` never reaches an entry: a batch verifies step-up
         // once, before any change is evaluated, and refuses the whole request
         // with the 401 challenge. It falls through here on purpose.

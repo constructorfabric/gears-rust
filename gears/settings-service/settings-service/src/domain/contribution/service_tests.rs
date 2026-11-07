@@ -101,6 +101,30 @@ impl Harness {
         registrar: RecordingRegistrar,
         source: FakeSource,
     ) -> Self {
+        Self::build_with_secrets(
+            db,
+            registrar,
+            source,
+            Arc::new(crate::test_support::RecordingSecrets::default()),
+        )
+    }
+
+    /// A deployment with no Credential Store bound.
+    async fn without_secret_storage() -> Self {
+        Self::build_with_secrets(
+            sqlite_provider().await,
+            RecordingRegistrar::default(),
+            catalogue(),
+            Arc::new(crate::domain::ports::NoSecretManager),
+        )
+    }
+
+    fn build_with_secrets(
+        db: Arc<DBProvider<DbError>>,
+        registrar: RecordingRegistrar,
+        source: FakeSource,
+        secrets: Arc<dyn crate::domain::ports::SecretManager>,
+    ) -> Self {
         let audit = Arc::new(RecordingAudit::default());
         let registrar = Arc::new(registrar);
         let service = Arc::new(ContributionService::new(
@@ -109,6 +133,7 @@ impl Harness {
             ValueRepo,
             Arc::new(GtsTypeValidator::new(source)),
             Arc::clone(&registrar) as Arc<dyn crate::domain::contribution::SettingTypeRegistrar>,
+            secrets,
             Arc::clone(&audit),
         ));
         let published = Arc::new(RecordingPublisher::default());
@@ -487,6 +512,126 @@ async fn an_unknown_value_type_is_refused() {
     );
     let result = h.register(vec![unknown]).await;
     assert_eq!(codes(&result), vec![reason::VALUE_TYPE_UNKNOWN]);
+}
+
+#[tokio::test]
+async fn a_secret_declaration_is_refused_alone_while_no_secret_storage_is_configured() {
+    // A secret setting's values live in the store, so declaring one with none
+    // bound would leave nowhere to set it. Only that item is refused, with its
+    // own reason; the plain declaration of the same call still registers.
+    let h = Harness::without_secret_storage().await;
+    let token = ContributedDeclaration::new(
+        key("security", "api_token", 1),
+        SECRET.to_owned(),
+        json!(""),
+        ScopeClass::Cascading,
+    );
+    let plain = ContributedDeclaration::new(
+        key("network", "proxy_enabled", 1),
+        BOOL.to_owned(),
+        json!(false),
+        ScopeClass::Cascading,
+    );
+
+    let result = h.register(vec![token, plain]).await;
+
+    assert_eq!(result.registered, 1, "{:?}", result.errors);
+    assert_eq!(codes(&result), vec![reason::SECRET_STORAGE_NOT_CONFIGURED]);
+    assert!(h.stored(&key("security", "api_token", 1)).await.is_none());
+    assert!(
+        h.stored(&key("network", "proxy_enabled", 1))
+            .await
+            .is_some()
+    );
+}
+
+#[tokio::test]
+async fn reviving_a_retired_secret_declaration_is_refused_without_secret_storage() {
+    // Registered and retired while a store was bound; the same module then
+    // contributes it again after a restart with none. The revive is refused
+    // for the item and the declaration stays retired.
+    let h = Harness::new().await;
+    let token = || {
+        ContributedDeclaration::new(
+            key("security", "api_token", 1),
+            SECRET.to_owned(),
+            json!(""),
+            ScopeClass::Cascading,
+        )
+    };
+    assert_eq!(h.register(vec![token()]).await.registered, 1);
+    h.retire_as(MODULE, vec![key("security", "api_token", 1)])
+        .await;
+    let without_store = Harness::build_with_secrets(
+        Arc::clone(&h.db),
+        RecordingRegistrar::default(),
+        catalogue(),
+        Arc::new(crate::domain::ports::NoSecretManager),
+    );
+
+    let result = without_store.register(vec![token()]).await;
+
+    assert_eq!(result.reactivated, 0);
+    assert_eq!(codes(&result), vec![reason::SECRET_STORAGE_NOT_CONFIGURED]);
+    let stored = without_store
+        .stored(&key("security", "api_token", 1))
+        .await
+        .expect("row");
+    assert_eq!(stored.status, DeclarationStatus::Retired);
+}
+
+#[tokio::test]
+async fn upgrading_a_secret_declaration_to_a_new_major_is_refused_without_secret_storage() {
+    // v1 registered while a store was bound; v2 of the same key, a secret type
+    // again, arrives after a restart with none. The upgrade is refused for the
+    // item before anything is written: no successor, and v1 stays active.
+    let h = Harness::new().await;
+    let secret = |major| {
+        ContributedDeclaration::new(
+            key("security", "api_token", major),
+            SECRET.to_owned(),
+            json!(""),
+            ScopeClass::Cascading,
+        )
+    };
+    assert_eq!(h.register(vec![secret(1)]).await.registered, 1);
+    let without_store = Harness::build_with_secrets(
+        Arc::clone(&h.db),
+        RecordingRegistrar::default(),
+        catalogue(),
+        Arc::new(crate::domain::ports::NoSecretManager),
+    );
+
+    let result = without_store.register(vec![secret(2)]).await;
+
+    assert_eq!(result.registered, 0);
+    assert_eq!(codes(&result), vec![reason::SECRET_STORAGE_NOT_CONFIGURED]);
+    assert!(
+        without_store
+            .stored(&key("security", "api_token", 2))
+            .await
+            .is_none()
+    );
+    let v1 = without_store
+        .stored(&key("security", "api_token", 1))
+        .await
+        .expect("v1");
+    assert_eq!(v1.status, DeclarationStatus::Active);
+}
+
+#[tokio::test]
+async fn a_declaration_that_is_not_secret_registers_without_secret_storage() {
+    let h = Harness::without_secret_storage().await;
+    let plain = ContributedDeclaration::new(
+        key("network", "proxy_enabled", 1),
+        BOOL.to_owned(),
+        json!(false),
+        ScopeClass::Cascading,
+    );
+
+    let result = h.register(vec![plain]).await;
+
+    assert_eq!(result.registered, 1, "{:?}", result.errors);
 }
 
 #[tokio::test]
@@ -1410,6 +1555,13 @@ impl DeclarationRepository for JournalingDeclarations {
             .find_by_category(conn, scope, category_id)
             .await
     }
+    async fn find_anonymous_exposable<C: toolkit_db::secure::DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+    ) -> Result<Vec<Declaration>, crate::domain::error::DomainError> {
+        DeclarationRepo.find_anonymous_exposable(conn, scope).await
+    }
     async fn find_by_ids<C: toolkit_db::secure::DBRunner>(
         &self,
         conn: &C,
@@ -1462,6 +1614,8 @@ async fn each_setting_type_is_registered_before_its_row_is_written() {
         Arc::new(GtsTypeValidator::new(catalogue())),
         Arc::new(JournalingRegistrar(Arc::clone(&journal)))
             as Arc<dyn crate::domain::contribution::SettingTypeRegistrar>,
+        Arc::new(crate::test_support::RecordingSecrets::default())
+            as Arc<dyn crate::domain::ports::SecretManager>,
         Arc::new(RecordingAudit::default()),
     ));
     let client = ContributionClient::new(

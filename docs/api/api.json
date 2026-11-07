@@ -1244,7 +1244,7 @@
             ]
           },
           "error": {
-            "description": "Why, when rejected — one of a fixed vocabulary: `invalid`,\n`if_match_required`, `stale`, `conflict`, `forbidden`, `retired`,\n`not_found`, `unavailable` or `error`.\n`retired` also covers a declaration retired after the client assembled\nthe change: the check runs again as each change commits.",
+            "description": "Why, when rejected — one of a fixed vocabulary: `invalid`,\n`if_match_required`, `stale`, `conflict`, `forbidden`, `retired`,\n`not_found`, `unavailable`, `not_configured` or `error`.\n`retired` also covers a declaration retired after the client assembled\nthe change: the check runs again as each change commits.",
             "type": [
               "string",
               "null"
@@ -15766,6 +15766,26 @@
         ],
         "type": "object"
       },
+      "PruneResultDto": {
+        "description": "What one audit prune request did.",
+        "properties": {
+          "deleted": {
+            "description": "Audit records deleted by this request.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "more": {
+            "description": "Whether the request's budget ran out before a short batch showed the\nbacklog was gone: the scheduler calls again until this is `false`.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "deleted",
+          "more"
+        ],
+        "type": "object"
+      },
       "PspSettlementReportRequest": {
         "description": "`POST /ledger/control/psp-settlement-report` request body: the PSP's net settled\namount for `(tenant, period)`.",
         "properties": {
@@ -15792,6 +15812,39 @@
           "period_id",
           "report_id",
           "settled"
+        ],
+        "type": "object"
+      },
+      "PublicSettingDto": {
+        "description": "One exposable setting at the requested tenant.",
+        "properties": {
+          "key": {
+            "description": "The setting's GTS key.",
+            "type": "string"
+          },
+          "value": {
+            "description": "Its effective value at the requested tenant."
+          }
+        },
+        "required": [
+          "key",
+          "value"
+        ],
+        "type": "object"
+      },
+      "PublicSettingsDto": {
+        "description": "The anonymous read's answer: the exposable settings, in key order.\n\nNot paged: the set is the declarations an administrator flagged, a short\nreviewed list, not a table that grows with tenants.",
+        "properties": {
+          "items": {
+            "description": "The exposable settings with their values; empty for a tenant that has\nnone, for one that does not exist and for an unusable `tenant`.",
+            "items": {
+              "$ref": "#/components/schemas/PublicSettingDto"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "items"
         ],
         "type": "object"
       },
@@ -19587,7 +19640,7 @@
             ]
           },
           "outcome": {
-            "description": "`resolved`, `not_found`, `retired`, `unavailable` or `error`.",
+            "description": "`resolved`, `not_found`, `retired`, `unavailable`, `not_configured` or `error`.",
             "type": "string"
           }
         },
@@ -20678,6 +20731,26 @@
         },
         "required": [
           "rate"
+        ],
+        "type": "object"
+      },
+      "SweepResultDto": {
+        "description": "What one sweep request did.",
+        "properties": {
+          "more": {
+            "description": "Whether a full page of expired rows was found and some of it released,\nso more may remain: the scheduler calls again until this is `false`,\nwhich it also is when the store cannot release anything.",
+            "type": "boolean"
+          },
+          "processed": {
+            "description": "Expired staged secrets released from the store, their rows deleted.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "processed",
+          "more"
         ],
         "type": "object"
       },
@@ -63704,6 +63777,184 @@
         "tags": [
           "settings-declarations"
         ]
+      }
+    },
+    "/settings-service/v1/maintenance/audit/prune": {
+      "post": {
+        "description": "Deletes audit records past their retention horizon, once, with the logic the managed lifecycle runs every day when `background.audit_retention` is on, under a budget a tenth of a tick's so the request stays short. Meant for an external scheduler when that loop is off. Platform scope only, as the sweep. Answers how many records were deleted and whether the budget ran out with more possibly waiting: call again until `more` is false.",
+        "operationId": "settings_service.prune_audit",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PruneResultDto"
+                }
+              }
+            },
+            "description": "How many audit records were deleted, and whether more may remain"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Service Unavailable"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Run one bounded audit retention pass",
+        "tags": [
+          "settings-maintenance"
+        ]
+      }
+    },
+    "/settings-service/v1/maintenance/pending-secrets/sweep": {
+      "post": {
+        "description": "Releases the staged secrets nobody claimed whose window has passed, once, with the logic the managed lifecycle runs every minute when `background.pending_secret_sweep` is on. Meant for an external scheduler when that loop is off. Platform scope only: the caller's tenant is the root tenant and the policy permits `maintain`; no step-up is asked and a service principal is accepted. Answers how many were released and whether more may remain: `more` is true only when a full page was found and some of it was released, so a scheduler calls again while it is true and stops when it is false, as it does when the store is down. With no secret storage configured it answers zero.",
+        "operationId": "settings_service.sweep_pending_secrets",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SweepResultDto"
+                }
+              }
+            },
+            "description": "How many staged secrets were released, and whether more may remain"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Service Unavailable"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Run one pending-secret sweep pass",
+        "tags": [
+          "settings-maintenance"
+        ]
+      }
+    },
+    "/settings-service/v1/public/settings": {
+      "get": {
+        "description": "No authentication. The effective values, at `tenant`, of the settings an administrator flagged `anonymous_exposable`, resolved by the ordinary cascade, and nothing else: no other setting is listed, counted or hinted at. A missing, malformed or unknown `tenant` answers 200 with an empty list, the same as a tenant with nothing exposable: no 404 and no distinguishable error. A failure of the database, the tenant resolver or the types registry answers 503, never an empty list. Throttling of this route is the gateway's responsibility.",
+        "operationId": "settings_service.read_public_settings",
+        "parameters": [
+          {
+            "description": "The tenant whose exposable settings are read",
+            "in": "query",
+            "name": "tenant",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PublicSettingsDto"
+                }
+              }
+            },
+            "description": "The exposable settings and their effective values, possibly none"
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Service Unavailable"
+          }
+        },
+        "summary": "Read the anonymous-exposable settings of a tenant",
+        "tags": [
+          "settings-public"
+        ],
+        "x-toolkit-visibility": "exposed"
       }
     },
     "/settings-service/v1/search": {

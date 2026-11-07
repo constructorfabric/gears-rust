@@ -209,6 +209,10 @@ impl RecordingSecrets {
 
 #[async_trait]
 impl SecretManager for RecordingSecrets {
+    fn is_configured(&self) -> bool {
+        true
+    }
+
     fn mint_reference(&self, _key: &str, tenant: Uuid) -> String {
         format!("minted-{tenant}")
     }

@@ -256,6 +256,12 @@ fn every_arm_renders_the_exact_status_the_api_promises() {
             },
             503,
         ),
+        // A deployment state, not an outage: a failed precondition, never the
+        // 503 a client would retry.
+        (
+            DomainError::secret_storage_not_configured("storing a secret"),
+            400,
+        ),
         (
             DomainError::Internal {
                 diagnostic: "boom".to_owned(),
@@ -351,5 +357,34 @@ fn a_missing_credential_is_a_value_not_found_and_says_so() {
     assert!(
         !declaration.to_string().contains("credential"),
         "{declaration}"
+    );
+}
+
+#[test]
+fn secret_storage_not_configured_is_a_failed_precondition_with_its_own_violation_type() {
+    let canonical = CanonicalError::from(DomainError::secret_storage_not_configured(
+        "storing a secret",
+    ));
+    let CanonicalError::FailedPrecondition { ctx, .. } = &canonical else {
+        panic!("not a failed precondition: {canonical:?}");
+    };
+    assert_eq!(
+        ctx.violations.first().map(|v| v.type_.as_str()),
+        Some(crate::precondition::SECRET_STORAGE_NOT_CONFIGURED)
+    );
+    // And not the retirement the SDK projects from the same category.
+    assert_ne!(
+        settings_service_sdk::error::precondition_kind(&canonical),
+        Some(settings_service_sdk::precondition::PreconditionKind::SettingRetired)
+    );
+    let doc = problem(DomainError::secret_storage_not_configured(
+        "storing a secret",
+    ));
+    assert!(
+        doc["detail"]
+            .as_str()
+            .or_else(|| doc["title"].as_str())
+            .is_some(),
+        "{doc}"
     );
 }

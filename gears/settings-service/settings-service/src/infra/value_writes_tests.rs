@@ -1620,6 +1620,28 @@ async fn the_sweep_releases_expired_stages_with_their_entries_and_keeps_live_one
     );
 }
 
+#[tokio::test]
+async fn a_full_page_the_store_could_not_release_does_not_say_more() {
+    let h = Harness::new().await;
+    let d = h.declare_secret("api_token").await;
+    let root = h.base.tree.root;
+    let subject = actor(root).subject();
+    let past = OffsetDateTime::now_utc() - Duration::minutes(1);
+    h.insert_pending(d, root, &subject, "one-ref", past).await;
+    h.insert_pending(d, root, &subject, "two-ref", past).await;
+    h.secrets.go_down();
+
+    // A page of one, found full, with nothing released behind it.
+    let page = h
+        .coordinator
+        .sweep_page(1, &running())
+        .await
+        .expect("the pass itself runs");
+
+    assert_eq!(page.released, 0);
+    assert!(!page.more, "the same rows would come back: stop");
+}
+
 /// Two step-up-gated `set`s at tenant `a`, whose effective access consults the
 /// tenant chain — so a transient resolver outage can hit the up-front pass.
 async fn two_gated_sets(h: &Harness) -> (Uuid, Uuid, Vec<BatchChange>) {
@@ -1916,6 +1938,10 @@ struct PurgesWhileStoring {
 
 #[async_trait::async_trait]
 impl crate::domain::ports::SecretManager for PurgesWhileStoring {
+    fn is_configured(&self) -> bool {
+        true
+    }
+
     fn mint_reference(&self, key: &str, tenant: Uuid) -> String {
         self.inner.mint_reference(key, tenant)
     }

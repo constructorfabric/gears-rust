@@ -18,6 +18,13 @@
 //! refused when an invalidation of the key or the scope has moved the
 //! generation since, because what the read brought back may predate the write
 //! that evicted the slot.
+//!
+//! The cache also holds one more thing under the same time-to-live: the
+//! selection of declarations the anonymous read serves, so a warm request does
+//! not ask the database for the list. Any declaration change on this replica
+//! drops it at once, and a store of it is refused when such a change landed
+//! after the read began; other replicas converge by the time-to-live, as they
+//! do for values.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -27,6 +34,7 @@ use toolkit_macros::domain_model;
 use uuid::Uuid;
 
 use super::{EffectiveValue, scope_class};
+use crate::domain::declaration::Declaration;
 
 struct Entry {
     stored_at: Instant,
@@ -49,6 +57,12 @@ struct Store {
     /// How many subtree evictions have touched each tenant: a hierarchy
     /// change, where no key is named at all.
     tenant_generations: HashMap<Uuid, u64>,
+    /// The anonymous read's selection of exposable declarations, and when it
+    /// was stored.
+    exposable: Option<(Instant, Arc<[Declaration]>)>,
+    /// How many declaration changes have touched any key: what a read of the
+    /// selection captures before it goes to the database.
+    declaration_generation: u64,
 }
 
 /// What a read captures before it goes to the database and hands back with
@@ -157,6 +171,8 @@ impl EffectiveCache {
                 order: VecDeque::new(),
                 key_generations: HashMap::new(),
                 tenant_generations: HashMap::new(),
+                exposable: None,
+                declaration_generation: 0,
             }),
         }
     }
@@ -331,8 +347,55 @@ impl EffectiveCache {
 
     /// Evict every scope of a key: for a declaration change, whose default or
     /// traits alter every scope's effective value at once.
+    ///
+    /// Also drops the anonymous read's stored selection and moves the
+    /// declaration generation, so a selection read before the change is not
+    /// stored after it. A value write, a subtree eviction and a per-tenant
+    /// eviction leave the selection alone: none of them changes a declaration.
     pub fn invalidate_key(&self, key: &str) {
         self.invalidate(key, scope_class::CASCADING, None);
+        let mut store = self.lock();
+        store.declaration_generation += 1;
+        store.exposable = None;
+    }
+
+    /// The stored selection of exposable declarations, if it is younger than
+    /// the time-to-live.
+    ///
+    /// An older one is dropped and reported as a miss, so a change made on
+    /// another replica is picked up within that bound.
+    #[must_use]
+    pub fn exposable(&self) -> Option<Arc<[Declaration]>> {
+        let mut store = self.lock();
+        let (stored_at, selection) = store.exposable.as_ref()?;
+        if stored_at.elapsed() > self.ttl {
+            store.exposable = None;
+            return None;
+        }
+        Some(Arc::clone(selection))
+    }
+
+    /// The declaration generation a read of the selection captures on its
+    /// miss, before it touches the database, to hand back to
+    /// [`Self::populate_exposable`].
+    #[must_use]
+    pub fn exposable_generation(&self) -> u64 {
+        self.lock().declaration_generation
+    }
+
+    /// Store the selection of exposable declarations, if no declaration change
+    /// has landed since `seen`; the answer says whether it was stored.
+    ///
+    /// A refused store is a read overtaken by a change: what it brought back
+    /// may predate it, and storing it would serve that for another
+    /// time-to-live.
+    pub fn populate_exposable(&self, selection: Arc<[Declaration]>, seen: u64) -> bool {
+        let mut store = self.lock();
+        if store.declaration_generation != seen {
+            return false;
+        }
+        store.exposable = Some((Instant::now(), selection));
+        true
     }
 
     // @cpt-begin:cpt-cf-settings-service-algo-value-resolution-cache-invalidate:p1:inst-vr-inv-4

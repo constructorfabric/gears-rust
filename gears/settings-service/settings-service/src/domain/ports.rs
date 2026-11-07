@@ -10,11 +10,37 @@ use uuid::Uuid;
 use crate::domain::error::DomainError;
 
 /// Holds `secret`-trait plaintext outside this service and hands back a
-/// reference. The real binding is the Credential Store; with nothing bound a
-/// write to a secret setting is refused as unavailable rather than stored in
-/// plaintext, and no handle resolves.
+/// reference. The real binding is the Credential Store; with nothing bound
+/// every operation that needs the store is refused with
+/// [`DomainError::NotConfigured`] rather than stored in plaintext, and no
+/// handle resolves.
+///
+/// The store is a deployment choice: the binding holds its client from init, or
+/// none when the deployment disables secret storage. [`Self::is_configured`] is the cheap
+/// question callers ask **before** any database write that precedes a store
+/// call, so a refusal leaves nothing behind. A binding that answers `false`
+/// answers every store call with [`DomainError::NotConfigured`].
 #[async_trait]
 pub trait SecretManager: Send + Sync {
+    /// Whether a secret store is bound right now.
+    ///
+    /// Cheap and free of side effects on the store: no network call. A `true`
+    /// does not say the store is reachable, only that it is bound; an
+    /// unreachable one answers [`DomainError::Unavailable`] on use.
+    fn is_configured(&self) -> bool;
+
+    /// Refuse with [`DomainError::NotConfigured`] when no store is bound.
+    ///
+    /// # Errors
+    /// [`DomainError::NotConfigured`] naming `operation`.
+    fn require_configured(&self, operation: &str) -> Result<(), DomainError> {
+        if self.is_configured() {
+            Ok(())
+        } else {
+            Err(DomainError::secret_storage_not_configured(operation))
+        }
+    }
+
     /// Mint the reference a store for the setting at `tenant` will use, unique
     /// to that write. Minted apart from the store so the caller can record it
     /// before the entry exists.
@@ -24,9 +50,10 @@ pub trait SecretManager: Send + Sync {
     /// reference from [`Self::mint_reference`].
     ///
     /// # Errors
-    /// [`DomainError::Unavailable`] when no store is bound or it cannot answer
-    /// — which does not say whether the entry exists: the caller's record of
-    /// the reference is what reclaims it either way.
+    /// [`DomainError::NotConfigured`] when no store is bound;
+    /// [`DomainError::Unavailable`] when it cannot answer, which does not say
+    /// whether the entry exists: the caller's record of the reference is what
+    /// reclaims it either way.
     async fn store_secret(
         &self,
         key: &str,
@@ -41,6 +68,7 @@ pub trait SecretManager: Send + Sync {
     ///
     /// # Errors
     /// [`DomainError::NotFound`] on the value when the store holds no entry,
+    /// [`DomainError::NotConfigured`] when no store is bound,
     /// [`DomainError::Unavailable`] when it cannot answer.
     async fn resolve_plaintext(
         &self,
@@ -52,6 +80,7 @@ pub trait SecretManager: Send + Sync {
     /// Release the entry behind `secret_ref`; an absent entry is already done.
     ///
     /// # Errors
+    /// [`DomainError::NotConfigured`] when no store is bound;
     /// [`DomainError::Unavailable`] when the store cannot answer.
     async fn delete_secret(
         &self,
@@ -65,10 +94,12 @@ pub trait SecretManager: Send + Sync {
 #[domain_model]
 pub struct NoSecretManager;
 
-const NO_STORE: &str = "secret values are not supported: no Secret Manager is bound";
-
 #[async_trait]
 impl SecretManager for NoSecretManager {
+    fn is_configured(&self) -> bool {
+        false
+    }
+
     fn mint_reference(&self, _key: &str, tenant: Uuid) -> String {
         format!("unbound-{tenant}")
     }
@@ -80,9 +111,9 @@ impl SecretManager for NoSecretManager {
         _secret_ref: &str,
         _plaintext: &Value,
     ) -> Result<(), DomainError> {
-        Err(DomainError::Unavailable {
-            detail: NO_STORE.to_owned(),
-        })
+        Err(DomainError::secret_storage_not_configured(
+            "storing a secret",
+        ))
     }
 
     async fn resolve_plaintext(
@@ -91,9 +122,9 @@ impl SecretManager for NoSecretManager {
         _tenant: Uuid,
         _secret_ref: &str,
     ) -> Result<SecretString, DomainError> {
-        Err(DomainError::Unavailable {
-            detail: NO_STORE.to_owned(),
-        })
+        Err(DomainError::secret_storage_not_configured(
+            "resolving a secret",
+        ))
     }
 
     async fn delete_secret(
@@ -102,9 +133,9 @@ impl SecretManager for NoSecretManager {
         _tenant: Uuid,
         _secret_ref: &str,
     ) -> Result<(), DomainError> {
-        Err(DomainError::Unavailable {
-            detail: NO_STORE.to_owned(),
-        })
+        Err(DomainError::secret_storage_not_configured(
+            "releasing a secret",
+        ))
     }
 }
 

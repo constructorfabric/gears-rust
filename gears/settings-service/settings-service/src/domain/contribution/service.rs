@@ -21,6 +21,7 @@ use crate::domain::declaration::{
     Declaration, DeclarationDraft, DeclarationMetadata, DeclarationRepository, DeclarationStatus,
 };
 use crate::domain::error::DomainError;
+use crate::domain::ports::SecretManager;
 use crate::domain::validation::TypeValidator;
 use crate::domain::value::{ValueDraft, ValueRepository};
 
@@ -81,6 +82,7 @@ pub struct ContributionService<D, Cat, V, S> {
     values: V,
     validator: Arc<dyn TypeValidator>,
     registrar: Arc<dyn SettingTypeRegistrar>,
+    secrets: Arc<dyn SecretManager>,
     sink: S,
 }
 
@@ -229,13 +231,16 @@ where
     V: ValueRepository,
     S: AuditSink,
 {
-    /// Build the reconciler over its repositories and ports.
+    /// Build the reconciler over its repositories and ports. The Secret
+    /// Manager is asked one thing only: whether a store is bound, before a new
+    /// secret declaration is written.
     pub fn new(
         declarations: D,
         categories: Cat,
         values: V,
         validator: Arc<dyn TypeValidator>,
         registrar: Arc<dyn SettingTypeRegistrar>,
+        secrets: Arc<dyn SecretManager>,
         sink: S,
     ) -> Self {
         Self {
@@ -244,6 +249,7 @@ where
             values,
             validator,
             registrar,
+            secrets,
             sink,
         }
     }
@@ -540,6 +546,23 @@ where
             .collect())
     }
 
+    /// A new secret declaration is refused while no secret store is bound,
+    /// before anything is written. The refusal is the item's alone, with its
+    /// own stable reason: the rest of the call still registers.
+    fn require_secret_storage(&self, derived: &Derived) -> Result<(), ItemError> {
+        if derived.has_secret_trait
+            && let Err(err) = self
+                .secrets
+                .require_configured("declaring a secret setting")
+        {
+            return Err(refused(
+                reason::SECRET_STORAGE_NOT_CONFIGURED,
+                err.wire_message(),
+            ));
+        }
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn register_new<C: DBRunner>(
         &self,
@@ -552,6 +575,7 @@ where
         derived: &Derived,
     ) -> Result<Outcome, ItemError> {
         let key = &contributed.key;
+        self.require_secret_storage(derived)?;
         // @cpt-begin:cpt-cf-settings-service-algo-module-contributions-reconcile:p1:inst-mc-rec-3
         let category_id = self
             .category_for(conn, scope, admitted.category_slug)
@@ -643,6 +667,9 @@ where
         let classification_changed = existing.data_classification != metadata.data_classification;
 
         if existing.status.is_retired() {
+            // A revived secret declaration needs the store as a new one does,
+            // and is refused for this item alone before anything is written.
+            self.require_secret_storage(derived)?;
             // @cpt-begin:cpt-cf-settings-service-algo-module-contributions-reconcile:p1:inst-mc-rec-6
             // Revive in place: the row keeps its id and its values stay where
             // they are.
@@ -733,6 +760,7 @@ where
         derived: &Derived,
         predecessor: Declaration,
     ) -> Result<Outcome, ItemError> {
+        self.require_secret_storage(derived)?;
         // @cpt-begin:cpt-cf-settings-service-algo-module-contributions-upgrade:p1:inst-mc-up-4
         // @cpt-begin:cpt-cf-settings-service-algo-module-contributions-upgrade:p1:inst-mc-up-1
         // The predecessor retires first, and only because it must: the two

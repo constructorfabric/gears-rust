@@ -66,7 +66,8 @@ where
     /// setting that is not secret-classified; [`DomainError::NotFound`] on the
     /// declaration when none exists and on the value when no credential is
     /// configured; [`DomainError::Retired`]; [`DomainError::Unauthorized`] when
-    /// the caller may not read that setting; [`DomainError::Unavailable`] when
+    /// the caller may not read that setting; [`DomainError::NotConfigured`]
+    /// when no secret store is bound; [`DomainError::Unavailable`] when
     /// the store or the audit store cannot answer.
     pub async fn resolve<C: DBRunner>(
         &self,
@@ -115,6 +116,13 @@ where
             });
         };
         // @cpt-end:cpt-cf-settings-service-flow-secret-values-resolve:p1:inst-sv-resolve-5
+        // After the gate, so a caller without the grant learns nothing about
+        // the deployment; after the placeholder check, so a setting with no
+        // credential answers `SecretNotConfigured` with or without a store;
+        // before the audit record, which a resolution that cannot happen must
+        // not leave.
+        self.secrets
+            .require_configured("resolving a secret's plaintext")?;
         // @cpt-begin:cpt-cf-settings-service-flow-secret-values-resolve:p1:inst-sv-resolve-6
         // The entry lives in the tenant whose row won, which for an inherited
         // value is an ancestor of the requested scope.
