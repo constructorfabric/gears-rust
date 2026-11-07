@@ -288,7 +288,9 @@ impl OpenApiRegistryImpl {
                         );
                         ContentBuilder::new().schema(Some(schema)).build()
                     };
-                    response.content.insert(r.content_type.to_owned(), content);
+                    response
+                        .content
+                        .insert(r.content_type.to_owned(), RefOr::T(content));
                 }
 
                 for header in &r.headers {
@@ -305,9 +307,11 @@ impl OpenApiRegistryImpl {
                     };
                     let declared = HeaderBuilder::new()
                         .description(header.description.clone())
-                        .schema(ObjectBuilder::new().schema_type(schema_type).build())
+                        .schema(Some(ObjectBuilder::new().schema_type(schema_type).build()))
                         .build();
-                    response.headers.insert(header.name.clone(), declared);
+                    response
+                        .headers
+                        .insert(header.name.clone(), RefOr::T(declared));
                 }
             }
             let responses = ResponsesBuilder::new().responses_from_iter(
