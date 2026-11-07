@@ -77,7 +77,7 @@ use crate::leader::{
     ElectionConfig, LeaderElectionBackend, LeaderElectionFeatures, LeaderStatus, LeaderWatch,
     LeaderWatchEvent, LeaderWatchSender, ResignReceiver,
 };
-use crate::lease::LeaseToken;
+use crate::lease::{FENCE_RETENTION_DEFAULT, LeaseToken};
 
 /// How many events one election watch buffers.
 ///
@@ -131,6 +131,17 @@ const REATTACH_BACKOFF: [Duration; 6] = [
 /// unwrapped.
 fn from_subscription_status(status: &tonic::Status) -> ClusterError {
     from_lease_status(status, LeaseContext::ElectionSubscription).unwrap_or(ClusterError::Shutdown)
+}
+
+/// `config` with its TTL capped at the serving gear's `MAX_LEASE_TTL`
+/// ([`FENCE_RETENTION_DEFAULT`]), so the pump's deadline and cadence match the claim
+/// the server grants and cannot overflow `Instant`.
+fn granted_config(config: ElectionConfig) -> ElectionConfig {
+    ElectionConfig::new(
+        config.ttl().min(FENCE_RETENTION_DEFAULT),
+        config.max_missed_renewals(),
+    )
+    .unwrap_or(config)
 }
 
 /// [`LeaderElectionBackend`] over the wire (§12.12).
@@ -210,6 +221,8 @@ impl RemoteLeaderElectionBackend {
 
     /// `join` plus the pump that keeps the claim and reports its transitions.
     async fn enrol(&self, name: &str, config: ElectionConfig) -> Result<LeaderWatch, ClusterError> {
+        let config = granted_config(config);
+        let issued_at = tokio::time::Instant::now();
         let joined = self.join_once(name, config).await?;
         // **Read `initial_status`, never the token's shape.** A follower receives
         // the zero token (empty name and owner, `fence: 0`) because
@@ -217,10 +230,10 @@ impl RemoteLeaderElectionBackend {
         // instead would make a follower believe it holds a lease (§6.6).
         let initial = LeaderStatus::from(joined.initial_status);
         // Arm the deadline authority on the winner's token: leadership is valid
-        // only until `now + ttl`, whatever the renewal feed does afterward (§7.3).
-        let token = matches!(initial, LeaderStatus::Leader).then(|| {
-            LeaseToken::from(joined.token).with_deadline(tokio::time::Instant::now() + config.ttl())
-        });
+        // only until `issued_at + ttl`, whatever the renewal feed does afterward
+        // (§7.3). Dated from before the join, so it never outlives the server's claim.
+        let token = matches!(initial, LeaderStatus::Leader)
+            .then(|| LeaseToken::from(joined.token).with_deadline(issued_at + config.ttl()));
         let stream = match self.subscribe(&joined.election_id).await {
             Ok(stream) => stream,
             Err(error) => {
@@ -587,11 +600,12 @@ impl ElectionPump {
         // renew), floored so the last renew before the deadline still gets one
         // real chance.
         let bound = self.renew_bound(&token);
+        let issued_at = tokio::time::Instant::now();
         match tokio::time::timeout(bound, self.backend.renew(&token, self.config.ttl())).await {
             Ok(Ok(())) => {
                 self.missed = 0;
                 // Re-arm the deadline: this renewal moved the claim's TTL forward.
-                self.arm_deadline();
+                self.arm_deadline(issued_at);
                 true
             }
             // The predicate matched nothing: lapsed, or stolen by a successor
@@ -631,9 +645,10 @@ impl ElectionPump {
             .max(MIN_RENEW_BOUND)
     }
 
-    /// Re-arms the held claim's deadline to `now + ttl`.
-    fn arm_deadline(&mut self) {
-        let deadline = tokio::time::Instant::now() + self.config.ttl();
+    /// Re-arms the held claim's deadline to `issued_at + ttl`, `issued_at` being
+    /// when the renew was sent.
+    fn arm_deadline(&mut self, issued_at: tokio::time::Instant) {
+        let deadline = issued_at + self.config.ttl();
         if let Some(token) = self.token.as_mut() {
             token.deadline = Some(deadline);
         }
@@ -680,11 +695,11 @@ impl ElectionPump {
 
     /// A follower's attempt to take a vacant or lapsed claim.
     async fn claim(&mut self) -> bool {
+        let issued_at = tokio::time::Instant::now();
         match self.backend.join_once(&self.name, self.config).await {
             Ok(joined) if matches!(joined.initial_status.into(), LeaderStatus::Leader) => {
                 self.token = Some(
-                    LeaseToken::from(joined.token)
-                        .with_deadline(tokio::time::Instant::now() + self.config.ttl()),
+                    LeaseToken::from(joined.token).with_deadline(issued_at + self.config.ttl()),
                 );
                 self.am_leader = true;
                 self.missed = 0;

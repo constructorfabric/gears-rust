@@ -147,6 +147,8 @@ Time-sensitive scenarios pass `TimeControl::Real` (a bounded real sleep), not vi
 
 Before this turn, `leader_conformance` was missing entirely — only the cache and lock suites were wired, even though `run_leader_conformance` (`SC-LEAD-001..007`) already exists in `cluster-conformance` and this plugin exposes that primitive (SDK-default-derived, §6). There was no reason not to run it; it's added above.
 
+`lock_token_conformance` and `leader_token_conformance` run the lease-token scenarios ([`SC-LTOK-*`](../../../docs/scenarios/lease-token.md)) against the native lock and the CAS leader the same way.
+
 **Routing conformance is out of scope for this plugin.** `run_routing_conformance` does not exist in `cluster-conformance` and never will — per-primitive routing (`cpt-cf-clst-fr-routing-per-primitive`) is wiring-crate logic owned entirely by `cluster/src/wiring.rs` (`ClusterWiring::from_config` dispatching through `ProviderRegistry`), not backend logic any plugin implements or could meaningfully conformance-test in isolation. That coverage belongs to the `cluster` gear's own test suite (see `PG-LOCK-011` in §4.3 below for this plugin's one routing-adjacent integration test, which exercises the wiring crate end-to-end rather than a `cluster-conformance` entry point).
 
 **Capability-gated assertions.** The conformance suite reads `features()` and `consistency()` from the constructed backend before running scenarios. For this plugin:

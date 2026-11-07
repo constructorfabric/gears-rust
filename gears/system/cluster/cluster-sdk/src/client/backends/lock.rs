@@ -19,6 +19,11 @@
 //! plainly, and so does this: a consumer holding many concurrent locks holds many
 //! pumps.
 //!
+//! The pump's lease deadline runs on `tokio::time`, so under a paused clock
+//! (`#[tokio::test(start_paused = true)]`) it lapses with virtual time: each
+//! loopback RPC can auto-advance the clock by seconds, so a short-TTL guard's
+//! renew reports `LockExpired`.
+//!
 //! # Who the owner is
 //!
 //! The server mints it. [`acquire`](DistributedLockBackend::acquire) takes an
@@ -44,7 +49,7 @@ use crate::descriptors::DescriptorCache;
 use crate::dto;
 use crate::error::ClusterError;
 use crate::grpc::stubs::lock as stubs;
-use crate::lease::LeaseToken;
+use crate::lease::{FENCE_RETENTION_DEFAULT, LeaseToken};
 use crate::lock::{DistributedLockBackend, LockFeatures, LockGuard, LockRequest};
 
 /// The guard command buffer.
@@ -53,6 +58,25 @@ use crate::lock::{DistributedLockBackend, LockFeatures, LockGuard, LockRequest};
 /// `renew` before issuing the next, so a deeper buffer would only queue commands
 /// that cannot be concurrent anyway.
 const COMMAND_BUFFER: usize = 1;
+
+/// A blocking wait as the wire's whole milliseconds, rounded **up**.
+///
+/// Rounding down, as [`duration_ms`] does, would re-issue the sub-millisecond tail
+/// of [`acquire_waiting`](DistributedLockBackend::acquire_waiting)'s budget as
+/// `timeout_ms: 0`, which the server answers at once with `LockTimeout`, spinning
+/// RPCs until the tail closed. Only a caller's own zero timeout goes out as zero.
+fn wait_ms(value: Duration) -> u64 {
+    u64::try_from(value.as_nanos().div_ceil(1_000_000)).unwrap_or(u64::MAX)
+}
+
+/// The deadline of a lease granted `ttl` from `from`, as the server grants it.
+///
+/// The TTL is clamped to [`FENCE_RETENTION_DEFAULT`], the serving gear's
+/// `MAX_LEASE_TTL`: the server grants no more, and an unclamped `Duration::MAX`
+/// would overflow `Instant + Duration` and panic in the consumer's task.
+fn granted_deadline(from: tokio::time::Instant, ttl: Duration) -> tokio::time::Instant {
+    from + ttl.min(FENCE_RETENTION_DEFAULT)
+}
 
 /// [`DistributedLockBackend`] over the wire (§12.11).
 #[derive(Debug, Clone)]
@@ -79,6 +103,32 @@ impl RemoteLockBackend {
         self.stub.clone()
     }
 
+    /// One blocking `Lock` RPC waiting up to `timeout`. The server may clamp the
+    /// wait; [`acquire_waiting`](DistributedLockBackend::acquire_waiting) owns the
+    /// re-issue loop that makes a clamp invisible to the caller.
+    async fn lock_once(
+        &self,
+        name: &str,
+        ttl: Duration,
+        timeout: Duration,
+    ) -> Result<LeaseToken, ClusterError> {
+        let request = stubs::LockRequest::from(dto::LockRequest {
+            profile: self.profile.name(),
+            name: name.to_owned(),
+            ttl_ms: duration_ms(ttl),
+            timeout_ms: wait_ms(timeout),
+            client_request_id: None,
+        });
+        let response = self
+            .stub()
+            .lock(request)
+            .await
+            .map_err(|status| from_status(&status))?;
+        Ok(decode::<dto::LockAcquired, _>(response.into_inner())?
+            .token
+            .into())
+    }
+
     /// The lease reference every token-keyed operation carries.
     fn lease_ref(&self, token: &LeaseToken, ttl: Option<Duration>) -> stubs::LeaseRef {
         stubs::LeaseRef::from(dto::LeaseRef {
@@ -90,17 +140,20 @@ impl RemoteLockBackend {
     }
 
     /// Wraps an acquired lease in the [`LockGuard`] the trait returns, spawning
-    /// the pump that holds its token.
-    fn guard(&self, token: LeaseToken) -> LockGuard {
+    /// the pump that holds its token, with the claim's deadline armed at `deadline`.
+    fn guard(&self, token: LeaseToken, deadline: tokio::time::Instant) -> LockGuard {
         let (mut commands, guard) = LockGuard::channel(token.name.clone(), COMMAND_BUFFER);
         let backend = self.clone();
+        let mut token = token.with_deadline(deadline);
         tokio::spawn(async move {
             while let Some(command) = commands.recv().await {
                 match command {
                     LockRequest::Renew { new_ttl, responder } => {
-                        responder.respond(backend.renew(&token, new_ttl).await);
+                        responder.respond(backend.renew_held(&mut token, new_ttl).await);
                     }
                     LockRequest::Release { responder } => {
+                        // Sent even past the deadline, unlike the k8s guard: the
+                        // release is holder-fenced, so it frees only our own claim.
                         responder.respond(backend.release(&token).await);
                         // Release consumes the guard, so no further command can
                         // arrive and the pump has nothing left to hold.
@@ -116,6 +169,32 @@ impl RemoteLockBackend {
             // caring about the result.
         });
         guard
+    }
+
+    /// A held guard's renew: refused locally once the claim's deadline has passed,
+    /// else the token renew, re-arming the deadline from when it was issued.
+    ///
+    /// The deadline is the authority, as for the remote election pump (§7.3, I8) and
+    /// the k8s guard task (SC-LOCK-005). A holder-only backend (k8s, no stored
+    /// deadline, DESIGN §3.19.1) cannot refuse a lapsed but unstolen renew, so
+    /// without this check the claim would be re-extended over the wire.
+    ///
+    /// The new deadline is dated from *before* the renew is sent, so it never
+    /// outlasts the claim the server granted.
+    async fn renew_held(
+        &self,
+        token: &mut LeaseToken,
+        new_ttl: Duration,
+    ) -> Result<(), ClusterError> {
+        let issued_at = tokio::time::Instant::now();
+        if token.is_expired(issued_at) {
+            return Err(ClusterError::LockExpired {
+                name: token.name.clone(),
+            });
+        }
+        self.renew(token, new_ttl).await?;
+        token.deadline = Some(granted_deadline(issued_at, new_ttl));
+        Ok(())
     }
 }
 
@@ -138,8 +217,11 @@ impl DistributedLockBackend for RemoteLockBackend {
         // Built over `acquire` rather than duplicating the RPC, exactly as the
         // cache-backed default builds its guard over its own lease method: one
         // acquisition path, so the guard and the token half cannot diverge.
+        //
+        // The deadline is dated from before the request, so it never outlives the lease.
+        let issued_at = tokio::time::Instant::now();
         let token = self.acquire(name, "", ttl).await?;
-        Ok(self.guard(token))
+        Ok(self.guard(token, granted_deadline(issued_at, ttl)))
     }
 
     async fn lock(
@@ -149,7 +231,10 @@ impl DistributedLockBackend for RemoteLockBackend {
         timeout: Duration,
     ) -> Result<LockGuard, ClusterError> {
         let token = self.acquire_waiting(name, "", ttl, timeout).await?;
-        Ok(self.guard(token))
+        // Dated from the answer: the lease was granted at an unknown point in the
+        // wait, so the request time could be a full TTL ago. This over-states the
+        // deadline by at most the response's transit time.
+        Ok(self.guard(token, granted_deadline(tokio::time::Instant::now(), ttl)))
     }
 
     /// `owner` is advisory — the server mints the real one. See the [module
@@ -185,6 +270,16 @@ impl DistributedLockBackend for RemoteLockBackend {
     ///
     /// This is also why the client sets no RPC deadline: one shorter than
     /// `timeout` would sever an acquisition the server was about to grant.
+    ///
+    /// It waits up to the caller's **whole** `timeout` (invariant I1): the server
+    /// clamps each blocking wait (the gear's `MAX_LOCK_WAIT`), so a clamped wait's
+    /// `LockTimeout` re-issues `Lock` with the remaining budget. Only a `LockTimeout`
+    /// past the caller's deadline is returned; its `waited` is the sum of the
+    /// server-measured waits (§6.9). Every other outcome ends the wait, the
+    /// backpressure refusal included.
+    ///
+    /// `owner` is advisory — the server mints the real one. See the [module
+    /// docs](self).
     async fn acquire_waiting(
         &self,
         name: &str,
@@ -193,21 +288,26 @@ impl DistributedLockBackend for RemoteLockBackend {
         timeout: Duration,
     ) -> Result<LeaseToken, ClusterError> {
         let _server_mints_the_owner = owner;
-        let request = stubs::LockRequest::from(dto::LockRequest {
-            profile: self.profile.name(),
-            name: name.to_owned(),
-            ttl_ms: duration_ms(ttl),
-            timeout_ms: duration_ms(timeout),
-            client_request_id: None,
-        });
-        let response = self
-            .stub()
-            .lock(request)
-            .await
-            .map_err(|status| from_status(&status))?;
-        Ok(decode::<dto::LockAcquired, _>(response.into_inner())?
-            .token
-            .into())
+        // `None` for a timeout past the clock's range (`Duration::MAX`): wait without end.
+        let deadline = tokio::time::Instant::now().checked_add(timeout);
+        let mut waited_total = Duration::ZERO;
+        loop {
+            let remaining = deadline.map_or(timeout, |deadline| {
+                deadline.saturating_duration_since(tokio::time::Instant::now())
+            });
+            match self.lock_once(name, ttl, remaining).await {
+                Err(ClusterError::LockTimeout { name, waited }) => {
+                    waited_total = waited_total.saturating_add(waited);
+                    if deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
+                        return Err(ClusterError::LockTimeout {
+                            name,
+                            waited: waited_total,
+                        });
+                    }
+                }
+                outcome => return outcome,
+            }
+        }
     }
 
     /// # Errors
@@ -250,5 +350,43 @@ impl DistributedLockBackend for RemoteLockBackend {
     /// is asking about.
     async fn probe(&self) -> Result<(), ClusterError> {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::{FENCE_RETENTION_DEFAULT, granted_deadline, wait_ms};
+
+    #[test]
+    fn a_blocking_wait_rounds_up_to_the_next_whole_millisecond() {
+        assert_eq!(
+            wait_ms(Duration::ZERO),
+            0,
+            "only a zero budget asks for zero"
+        );
+        assert_eq!(
+            wait_ms(Duration::from_micros(1)),
+            1,
+            "a sub-ms remainder must not go out as a zero-length wait"
+        );
+        assert_eq!(wait_ms(Duration::from_micros(999)), 1);
+        assert_eq!(wait_ms(Duration::from_millis(1)), 1, "whole ms are exact");
+        assert_eq!(wait_ms(Duration::from_micros(1_001)), 2);
+        assert_eq!(wait_ms(Duration::from_millis(350)), 350);
+        assert_eq!(wait_ms(Duration::MAX), u64::MAX, "saturates, never wraps");
+    }
+
+    #[test]
+    fn a_granted_deadline_is_clamped_to_the_servers_ceiling() {
+        let from = tokio::time::Instant::now();
+        let ttl = Duration::from_secs(30);
+        assert_eq!(granted_deadline(from, ttl), from + ttl);
+        assert_eq!(
+            granted_deadline(from, Duration::MAX),
+            from + FENCE_RETENTION_DEFAULT,
+            "an over-long TTL gets the server's grant, not an overflow"
+        );
     }
 }

@@ -32,9 +32,10 @@
 //! # Lease ownership, and the cross-check the backend will not do
 //!
 //! The lease methods on the plugin-facing traits are **token-only**: they
-//! predicate on `(name, owner, fence, deadline)` and know nothing about who is
-//! connected (§5.8.1). Verifying that the *transport* caller is `token.owner` is
-//! therefore the serving gear's authorization decision, and it lives here.
+//! predicate on `(name, owner, fence)` (plus `deadline` where stored) and know
+//! nothing about who is connected (§5.8.1). Verifying that the *transport*
+//! caller is `token.owner` is therefore the serving gear's authorization
+//! decision, and it lives here.
 //!
 //! An owner is `{caller}/{nonce}` (see [`Caller::mint_owner`]). Both halves earn
 //! their place:

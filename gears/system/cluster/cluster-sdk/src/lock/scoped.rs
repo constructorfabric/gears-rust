@@ -13,9 +13,10 @@ use crate::lock::types::LockFeatures;
 use crate::scope;
 
 /// A delegating [`DistributedLockBackend`] that prepends a validated scope prefix
-/// to every lock `name` on the write path. There is no read-path strip: a
-/// [`LockGuard`] is opaque to the consumer (DESIGN §3.8 table). Scoping composes
-/// by stacking wrappers.
+/// to every lock `name` on the write path. There is no read-path strip on either
+/// half: a [`LockGuard`] is opaque to the consumer (DESIGN §3.8 table), and a
+/// [`LeaseToken`] carries the *scoped* name the inner backend recorded, so it is
+/// presented back verbatim. Scoping composes by stacking wrappers.
 pub struct ScopedDistributedLockBackend {
     inner: Arc<dyn DistributedLockBackend>,
     prefix: String,
@@ -56,6 +57,9 @@ impl DistributedLockBackend for ScopedDistributedLockBackend {
             .await
     }
 
+    /// Acquires under the scoped name and returns the inner token unchanged, so its
+    /// [`LeaseToken::name`] is the stored, scoped name that [`renew`](Self::renew)
+    /// and [`release`](Self::release) forward as is.
     async fn acquire(
         &self,
         name: &str,
@@ -67,6 +71,7 @@ impl DistributedLockBackend for ScopedDistributedLockBackend {
             .await
     }
 
+    /// As [`acquire`](Self::acquire): scoped on the way in, returned unchanged.
     async fn acquire_waiting(
         &self,
         name: &str,
@@ -79,11 +84,11 @@ impl DistributedLockBackend for ScopedDistributedLockBackend {
             .await
     }
 
-    /// Forwarded verbatim, prefix and all: the returned token names the *scoped*
-    /// lease, and it is presented back unchanged. Re-applying the prefix here would
-    /// double it, and stripping it on the way out would leave the inner backend
-    /// unable to find its own record — the same read-path rule the [`LockGuard`]
-    /// follows (DESIGN §3.8).
+    /// Forwarded verbatim: the token names the *scoped* lease, so re-applying the
+    /// prefix would double it and stripping it would leave the inner backend unable
+    /// to find its record — the read-path rule the [`LockGuard`] follows (DESIGN
+    /// §3.8). A token thus addresses its lease from any view and survives its wire
+    /// mirror intact (invariant I7).
     async fn renew(&self, token: &LeaseToken, ttl: Duration) -> Result<(), ClusterError> {
         self.inner.renew(token, ttl).await
     }
@@ -109,14 +114,25 @@ mod tests {
 
     use super::ScopedDistributedLockBackend;
     use crate::error::ClusterError;
+    use crate::lease::LeaseToken;
     use crate::lock::backend::DistributedLockBackend;
     use crate::lock::guard::LockGuard;
     use crate::lock::types::LockFeatures;
     use crate::scope;
 
-    /// Records the lock name the backend was asked to acquire.
+    /// Records every name and token that reached the innermost backend.
     struct RecordingBackend {
         seen: Mutex<Vec<String>>,
+        tokens: Mutex<Vec<LeaseToken>>,
+    }
+
+    impl RecordingBackend {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                seen: Mutex::new(Vec::new()),
+                tokens: Mutex::new(Vec::new()),
+            })
+        }
     }
 
     #[async_trait]
@@ -140,6 +156,38 @@ mod tests {
             self.try_lock(name, _ttl).await
         }
 
+        // Recorded as the guard half records it, to assert scoping on this path too.
+        async fn acquire(
+            &self,
+            name: &str,
+            owner: &str,
+            _ttl: Duration,
+        ) -> Result<LeaseToken, ClusterError> {
+            self.seen.lock().expect("lock").push(name.to_owned());
+            Ok(LeaseToken::new(name, owner, 1))
+        }
+
+        async fn acquire_waiting(
+            &self,
+            name: &str,
+            owner: &str,
+            ttl: Duration,
+            _timeout: Duration,
+        ) -> Result<LeaseToken, ClusterError> {
+            self.acquire(name, owner, ttl).await
+        }
+
+        // Recorded whole, to assert the wrapper forwarded it byte-for-byte.
+        async fn renew(&self, token: &LeaseToken, _ttl: Duration) -> Result<(), ClusterError> {
+            self.tokens.lock().expect("lock").push(token.clone());
+            Ok(())
+        }
+
+        async fn release(&self, token: &LeaseToken) -> Result<(), ClusterError> {
+            self.tokens.lock().expect("lock").push(token.clone());
+            Ok(())
+        }
+
         async fn probe(&self) -> Result<(), ClusterError> {
             // Recorded under a name no lock could take, so a forwarded probe is
             // distinguishable from the trait's `Ok(())` default.
@@ -148,7 +196,10 @@ mod tests {
         }
     }
 
-    fn scoped(inner: Arc<RecordingBackend>, prefix: &str) -> ScopedDistributedLockBackend {
+    fn scoped(
+        inner: Arc<dyn DistributedLockBackend>,
+        prefix: &str,
+    ) -> ScopedDistributedLockBackend {
         ScopedDistributedLockBackend::new(
             inner,
             scope::validated_prefix(prefix).expect("valid prefix"),
@@ -157,10 +208,8 @@ mod tests {
 
     #[tokio::test]
     async fn try_lock_prepends_the_prefix() {
-        let backend = Arc::new(RecordingBackend {
-            seen: Mutex::new(Vec::new()),
-        });
-        let wrapper = scoped(Arc::clone(&backend), "event-broker");
+        let backend = RecordingBackend::new();
+        let wrapper = scoped(backend.clone(), "event-broker");
         assert!(
             wrapper
                 .try_lock("ledger", Duration::from_secs(30))
@@ -175,14 +224,8 @@ mod tests {
 
     #[tokio::test]
     async fn scoping_composes_when_nested() {
-        let backend = Arc::new(RecordingBackend {
-            seen: Mutex::new(Vec::new()),
-        });
-        let inner = scoped(Arc::clone(&backend), "event-broker");
-        let outer = ScopedDistributedLockBackend::new(
-            Arc::new(inner),
-            scope::validated_prefix("shard-0").expect("valid prefix"),
-        );
+        let backend = RecordingBackend::new();
+        let outer = scoped(Arc::new(scoped(backend.clone(), "event-broker")), "shard-0");
         assert!(
             outer
                 .try_lock("ledger", Duration::from_secs(30))
@@ -200,16 +243,165 @@ mod tests {
     /// unreachable backend.
     #[tokio::test]
     async fn probe_is_forwarded_through_every_scoping_layer() {
-        let backend = Arc::new(RecordingBackend {
-            seen: Mutex::new(Vec::new()),
-        });
-        let inner = scoped(Arc::clone(&backend), "event-broker");
-        let outer = ScopedDistributedLockBackend::new(
-            Arc::new(inner),
-            scope::validated_prefix("shard-0").expect("valid prefix"),
-        );
+        let backend = RecordingBackend::new();
+        let outer = scoped(Arc::new(scoped(backend.clone(), "event-broker")), "shard-0");
 
         assert!(outer.probe().await.is_ok());
         assert_eq!(backend.seen.lock().expect("lock").as_slice(), ["<probe>"]);
+    }
+
+    /// Both token-path acquisitions scope the name and return the inner token
+    /// unchanged; its `name` is the scoped key, as the opaque guard's is.
+    #[tokio::test]
+    async fn acquire_and_acquire_waiting_prepend_the_prefix_and_return_the_scoped_token() {
+        let backend = RecordingBackend::new();
+        let wrapper = scoped(backend.clone(), "event-broker");
+        let ttl = Duration::from_secs(30);
+
+        let token = wrapper
+            .acquire("ledger", "owner-a", ttl)
+            .await
+            .expect("acquire");
+        assert_eq!(token, LeaseToken::new("event-broker/ledger", "owner-a", 1));
+
+        let waited = wrapper
+            .acquire_waiting("journal", "owner-a", ttl, Duration::from_secs(5))
+            .await
+            .expect("acquire_waiting");
+        assert_eq!(
+            waited,
+            LeaseToken::new("event-broker/journal", "owner-a", 1)
+        );
+
+        assert_eq!(
+            backend.seen.lock().expect("lock").as_slice(),
+            ["event-broker/ledger", "event-broker/journal"]
+        );
+    }
+
+    /// A token minted through a *chain* of scoped wrappers carries the full chained
+    /// key, and `renew`/`release` forward it to the innermost backend unchanged —
+    /// no layer re-applies (which would double the prefix) or strips anything.
+    #[tokio::test]
+    async fn a_chained_token_is_forwarded_verbatim_on_renew_and_release() {
+        let backend = RecordingBackend::new();
+        let outer = scoped(Arc::new(scoped(backend.clone(), "a")), "b");
+
+        let token = outer
+            .acquire("ledger", "owner-a", Duration::from_secs(30))
+            .await
+            .expect("acquire");
+        assert_eq!(token.name, "a/b/ledger");
+
+        outer
+            .renew(&token, Duration::from_secs(30))
+            .await
+            .expect("renew");
+        outer.release(&token).await.expect("release");
+
+        assert_eq!(
+            backend.seen.lock().expect("lock").as_slice(),
+            ["a/b/ledger"]
+        );
+        assert_eq!(
+            backend.tokens.lock().expect("lock").as_slice(),
+            [token.clone(), token],
+            "renew and release must reach the backend with the token byte-for-byte"
+        );
+    }
+
+    /// A token presented to a *different* view still addresses the lease it was
+    /// minted for: it carries its own scoped key. Authority stays with the
+    /// backend's owner + fence check, not the view.
+    #[tokio::test]
+    async fn a_token_presented_to_another_view_still_addresses_its_own_lease() {
+        let backend = RecordingBackend::new();
+        let eu_team = scoped(backend.clone(), "eu/team");
+        let team = scoped(backend.clone(), "team");
+
+        let token = eu_team
+            .acquire("ledger", "owner-a", Duration::from_secs(30))
+            .await
+            .expect("acquire");
+        team.renew(&token, Duration::from_secs(30))
+            .await
+            .expect("renew through a sibling view");
+
+        let forwarded = backend.tokens.lock().expect("lock");
+        assert_eq!(
+            forwarded[0].name, "eu/team/ledger",
+            "the sibling view must not re-derive `team/ledger`"
+        );
+    }
+
+    /// An inner backend that always contends, echoing the scoped key.
+    struct ContendingLockBackend;
+
+    #[async_trait]
+    impl DistributedLockBackend for ContendingLockBackend {
+        fn features(&self) -> LockFeatures {
+            LockFeatures::new(true)
+        }
+
+        async fn try_lock(&self, name: &str, _ttl: Duration) -> Result<LockGuard, ClusterError> {
+            Err(ClusterError::LockContended {
+                name: name.to_owned(),
+            })
+        }
+
+        async fn lock(
+            &self,
+            name: &str,
+            ttl: Duration,
+            _timeout: Duration,
+        ) -> Result<LockGuard, ClusterError> {
+            self.try_lock(name, ttl).await
+        }
+
+        async fn acquire(
+            &self,
+            name: &str,
+            _owner: &str,
+            _ttl: Duration,
+        ) -> Result<LeaseToken, ClusterError> {
+            Err(ClusterError::LockContended {
+                name: name.to_owned(),
+            })
+        }
+
+        async fn acquire_waiting(
+            &self,
+            name: &str,
+            owner: &str,
+            ttl: Duration,
+            _timeout: Duration,
+        ) -> Result<LeaseToken, ClusterError> {
+            self.acquire(name, owner, ttl).await
+        }
+
+        async fn renew(&self, _token: &LeaseToken, _ttl: Duration) -> Result<(), ClusterError> {
+            Ok(())
+        }
+
+        async fn release(&self, _token: &LeaseToken) -> Result<(), ClusterError> {
+            Ok(())
+        }
+    }
+
+    /// A name-bearing error is forwarded unchanged on both halves, so the guard and
+    /// token paths report one scoped name for one lease.
+    #[tokio::test]
+    async fn a_name_bearing_error_names_the_scoped_key_on_both_halves() {
+        let wrapper = scoped(Arc::new(ContendingLockBackend), "event-broker");
+        let ttl = Duration::from_secs(30);
+
+        let guard_err = wrapper.try_lock("ledger", ttl).await;
+        assert!(
+            matches!(guard_err, Err(ClusterError::LockContended { name }) if name == "event-broker/ledger")
+        );
+        let token_err = wrapper.acquire("ledger", "owner-a", ttl).await;
+        assert!(
+            matches!(token_err, Err(ClusterError::LockContended { name }) if name == "event-broker/ledger")
+        );
     }
 }

@@ -6,6 +6,7 @@ use toolkit::client_hub::ClientHub;
 
 use super::LockResolverBuilder;
 use crate::error::ClusterError;
+use crate::lease::LeaseToken;
 use crate::lock::backend::DistributedLockBackend;
 use crate::lock::facade::DistributedLockV1;
 use crate::lock::guard::LockGuard;
@@ -35,6 +36,33 @@ impl DistributedLockBackend for StubBackend {
     ) -> Result<LockGuard, ClusterError> {
         let (_rx, guard) = LockGuard::channel(name.to_owned(), 1);
         Ok(guard)
+    }
+
+    async fn acquire(
+        &self,
+        name: &str,
+        owner: &str,
+        _ttl: Duration,
+    ) -> Result<LeaseToken, ClusterError> {
+        Ok(LeaseToken::new(name, owner, 1))
+    }
+
+    async fn acquire_waiting(
+        &self,
+        name: &str,
+        owner: &str,
+        _ttl: Duration,
+        _timeout: Duration,
+    ) -> Result<LeaseToken, ClusterError> {
+        Ok(LeaseToken::new(name, owner, 1))
+    }
+
+    async fn renew(&self, _token: &LeaseToken, _ttl: Duration) -> Result<(), ClusterError> {
+        Ok(())
+    }
+
+    async fn release(&self, _token: &LeaseToken) -> Result<(), ClusterError> {
+        Ok(())
     }
 }
 

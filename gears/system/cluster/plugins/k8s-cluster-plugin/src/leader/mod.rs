@@ -204,9 +204,10 @@ impl LeaderRuntime {
     // replica. It deliberately mirrors the election task's claim shape (create /
     // observation-gated steal / guarded replace) rather than driving the task's state
     // machine: `join`/`renew`/`resign` are one-shot RPCs with no watch, no status, and
-    // no per-task `Held`, so they cannot borrow the task's loop — but every write
-    // lands the same `<owner>#<fence>` `holderIdentity`, so a task-held election and a
-    // token-held one are the same lease fenced the same way.
+    // no per-task `Held`, so they cannot borrow the task's loop. Token-path writes land
+    // `<owner>#<fence>` as the `holderIdentity`; the task path (`elect`) writes the bare
+    // pod identity (§3.6). Every write is guarded and each path treats the other's
+    // holder as foreign (taken only after a full TTL), so the formats never share a claim.
 
     /// One acquire/steal attempt for `owner`: mints a fresh fence, claims a
     /// free/lapsed Lease, and hands back the [`LeaseToken`] on success. `Ok(None)`

@@ -223,7 +223,9 @@ pub trait DistributedLockApi: Send + Sync {
         req: LockRequest,
     ) -> Result<LockAcquired, CanonicalError>;
 
-    /// Conditional write on `(name, owner, fence, deadline > now())`.
+    /// Conditional write on `(name, owner, fence)`, plus `deadline > now()` where
+    /// the backend stores a deadline (not k8s, see DESIGN §3.19.1). Callers MUST
+    /// stop renewing once their own `issued_at + ttl` has passed.
     ///
     /// Retry-safe — renewing twice is harmless — but absence is **not** `Ok` here:
     /// the caller has to learn it lost the lease, so a token matching nothing is
@@ -276,6 +278,10 @@ pub trait LeaderElectionApi: Send + Sync {
     /// Renew the claim. Absence means this instance no longer holds it — the
     /// client's event pump turns that into `Status(Lost)` and keeps the
     /// subscription open rather than surfacing an error (§6.6).
+    ///
+    /// The same predicate as the lock's `renew`: `deadline > now()` is checked only
+    /// where the backend stores a deadline (not k8s, see DESIGN §3.19.1), so callers
+    /// MUST stop renewing once their own `issued_at + ttl` has passed.
     ///
     /// # Errors
     /// `lock_expired` when the token matches no live claim (§6.9).

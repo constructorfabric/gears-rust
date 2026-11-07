@@ -108,3 +108,38 @@ async fn distributed_lock_conformance_over_the_reserved_lease_keyspace() {
     )
     .await;
 }
+
+// The lease-token half: the token methods the serving gear calls for every
+// Profile-3 consumer, which the guard suites above never reach.
+
+#[tokio::test]
+async fn distributed_lock_token_conformance() {
+    cluster_conformance::run_lock_token_conformance(
+        || async {
+            let cache = cluster_sdk::reserved_lease_cache(MemCache::linearizable());
+            ScenarioBackend::bare(Arc::new(
+                CasBasedDistributedLockBackend::new(cache)
+                    .expect("linearizable cache is accepted")
+                    .with_virtual_clock(),
+            ) as Arc<dyn DistributedLockBackend>)
+        },
+        TimeControl::Virtual,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn leader_election_token_conformance() {
+    cluster_conformance::run_leader_token_conformance(
+        || async {
+            let cache = cluster_sdk::reserved_lease_cache(MemCache::linearizable());
+            ScenarioBackend::bare(Arc::new(
+                CasBasedLeaderElectionBackend::new(cache)
+                    .expect("linearizable cache is accepted")
+                    .with_virtual_clock(),
+            ) as Arc<dyn LeaderElectionBackend>)
+        },
+        TimeControl::Virtual,
+    )
+    .await;
+}

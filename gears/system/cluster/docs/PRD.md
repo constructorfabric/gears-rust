@@ -310,9 +310,9 @@ The system **MUST** allow consumers to react to leadership transitions in two wa
 - [x] `p1` - **ID**: `cpt-cf-clst-fr-leader-resign`
 
 <!-- cpt-cf-id-content -->
-The system **MUST** allow a current leader to step down explicitly during planned shutdown or maintenance, releasing the claim immediately so a successor can be elected within a backend round-trip rather than waiting for TTL expiry.
+The system **MUST** allow a current leader to step down explicitly during planned shutdown or maintenance. Stepping down **MUST** release the claim at once, so that a successor is elected without waiting for TTL expiry. Where followers watch the claim, election takes about one backend round-trip; in every deployment it takes at most one renewal interval (`renewal_interval()` = TTL / (`max_missed_renewals` + 1)).
 
-**Rationale**: Without explicit step-down, every planned restart introduces a TTL-bounded leadership gap that can be longer than the deployment can tolerate.
+**Rationale**: Without explicit step-down, every planned restart introduces a TTL-bounded leadership gap that can be longer than the deployment can tolerate. The renewal-interval bound covers followers that learn of a vacancy only on their next re-claim: remote (Profile 3) followers, and followers over a cache without exact watch. With the defaults (30 s TTL, 2 missed renewals) that is at most 10 s, against a 30 s gap without step-down.
 **Actors**: `cpt-cf-clst-actor-event-broker`, `cpt-cf-clst-actor-platform-gear`
 <!-- cpt-cf-id-content -->
 
@@ -615,6 +615,7 @@ The plugin contract — the interface a plugin author implements to adapt a back
 
 **Threshold**: A plugin compiled against the initial released version of the cluster contract MUST work against every minor and patch release of the same major version without modification.
 **Rationale**: Plugin authors are typically not the same teams as cluster maintainers (think: NATS plugin maintained by an external team). Forcing plugin authors to recompile and re-release on every cluster minor version creates an ecosystem coordination problem.
+**Note (2026-09-18, PR #4863)**: One scoped exception: the store-owned-lease methods (`acquire`/`acquire_waiting`/`renew`/`release` on `DistributedLockBackend`; `join`/`renew`/`resign` on `LeaderElectionBackend`) are required rather than defaulted, so a backend omitting them fails to compile. Profile 3 serves every lock/election RPC through them, so a missing implementation is better a build error than a per-call `Unsupported`. This SemVer-breaking change covers these methods only; see ADR-012's amendment and invariant I11 in DESIGN.md.
 **Architecture Allocation**: See DESIGN.md.
 <!-- cpt-cf-id-content -->
 
@@ -741,7 +742,7 @@ This PRD does not enumerate these contracts. Each plugin's own PRD/DESIGN docume
 - Shard assignment changes propagate to all instances reactively
 
 **Alternative Flows**:
-- **Leader steps down gracefully during planned shutdown**: The leader observes loss before shutdown completes; remaining candidates promote a new leader within a backend round-trip rather than waiting for TTL.
+- **Leader steps down gracefully during planned shutdown**: The leader observes loss before shutdown completes; remaining candidates promote a new leader within one renewal interval (about a backend round-trip where they watch the claim) rather than waiting for TTL.
 - **Leader observes transient loss**: The system reports leadership loss; the consumer continues participating without writing re-enrollment code; the next leader event is either re-acquired or follower.
 - **Watcher falls behind**: The cache-watch surfaces a lag signal; the follower reads the current shard-assignment state to recover and continues.
 <!-- cpt-cf-id-content -->

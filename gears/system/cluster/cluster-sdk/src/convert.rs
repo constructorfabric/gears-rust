@@ -40,8 +40,9 @@
 //!
 //! # A lease-keyed `NotFound` is not a cache miss
 //!
-//! `renew` / `release` / `resign` predicate on `(name, owner, fence, deadline)`,
-//! so "zero rows" covers expired, released and fenced-out alike — deliberately
+//! `renew` / `release` / `resign` predicate on `(name, owner, fence)` (plus
+//! `deadline` where the backend stores one), so "zero rows" covers expired,
+//! released and fenced-out alike — deliberately
 //! indistinguishable, so tokens are not probeable (§5.8.1). Which
 //! [`ClusterError`] that becomes depends on **which operation asked**, which is
 //! why [`to_cluster_error`] takes a [`LeaseContext`] and is a real function rather
