@@ -15,3 +15,6 @@ pub type ConcreteProfile = crate::domain::profile_read::ProfileReadService;
 
 /// Subject Control used by the REST layer.
 pub type ConcreteSubjectControl = crate::domain::subject_control::SubjectControlService;
+
+/// The Review Queue used by the REST layer.
+pub type ConcreteReviewQueue = crate::domain::review_queue::ReviewQueueService;

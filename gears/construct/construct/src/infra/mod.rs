@@ -20,6 +20,7 @@ mod record_queue_test;
 pub mod record_types;
 #[cfg(test)]
 mod record_types_test;
+pub mod review_queue_events;
 pub mod storage;
 pub mod subject_control_events;
 pub mod tenant_defaults;

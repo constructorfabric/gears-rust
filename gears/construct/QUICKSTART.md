@@ -16,7 +16,9 @@ Record intake for connectors and the profile read for applications and agents. A
 - The gear needs graph storage in its host
 - `GET /construct/v1/subjects/{subject_id}/facts`, `GET` and `DELETE …/facts/{fact_id}`: the subject's own facts, paged (`limit` up to 200, `cursor`, `$filter`, `$orderby`), one fact, and its soft delete; owner only, another subject answers `404`
 - `GET /construct/v1/subjects/{subject_id}/export`: all of a subject's data in the caller's tenant as a JSON attachment, for the data protection officer
-- Construct declares its permissions as GTS permission instances: send records, read profiles, manage facts, read or change one's own personalization settings, read or delete one's own facts, and export a subject's data. The tenant grants each in its policy engine
+- `POST` and `GET /construct/v1/subjects/{subject_id}/review-requests`: the subject flags one of its facts as incorrect (`{fact_id, comment}`) and lists its requests; a fact under an open request is not served to applications and agents, and no record or agent changes it
+- `GET /construct/v1/admin/review-requests` and `POST …/admin/review-requests/{request_id}/resolution`: a reviewer lists the tenant's open requests and resolves one as `rejected` (with a `reason`), `deleted`, or `corrected` (with `property` and `value`); a correction needs `processing.run_without_sensitive_data_checks`, like record processing
+- Construct declares its permissions as GTS permission instances: send records, read profiles, manage facts, read or change one's own personalization settings, read, delete or flag one's own facts, resolve review requests, and export a subject's data. The tenant grants each in its policy engine
 
 Full API documentation: <http://127.0.0.1:8087/cf/docs>
 
@@ -84,7 +86,7 @@ The gear is in this repository under `gears/construct`, and it is not built into
    cargo run --bin cf-gears-example-server --no-default-features --features construct,graph-storage,static-tenants,static-authn,static-authz -- --config config/quickstart.yaml run
    ```
 
-The log shows `Applying migration gear="construct"` for `initial_001`, `m002_subject_settings`, `m003_record_ids` and `m004_record_ids_key_only`, after graph storage's own migrations. The types registry is part of every example server, so the record types are there.
+The log shows `Applying migration gear="construct"` for `initial_001`, `m002_subject_settings`, `m003_record_ids`, `m004_record_ids_key_only` and `m005_review_requests`, after graph storage's own migrations. The types registry is part of every example server, so the record types are there.
 
 ## Configuration
 
@@ -117,6 +119,8 @@ gears:
         # entity_kinds: [...]        # absent: every entity kind is allowed
       profile_category_check: per_category   # required with processing_identity; one_call only for a policy plugin that answers with category constraints
 ```
+
+The model is called through OAGW, so a server with a `model` needs OAGW too: in the example server, add `oagw` to the features of the start command above (`--features construct,graph-storage,oagw,...`). Without it every model call fails as unavailable (`no OAGW client in ClientHub`), and no record is processed.
 
 An unknown key, a value in `connectors_off`, `processing_identity` or `trusted_connectors` that is not a UUID, a zero queue capacity, worker count, model round count or token count in `processing` (zero reruns is allowed), a queue capacity above 100000, more than 256 workers, more than 10 reruns, more than 64 model rounds, more than 1000000 tokens per record, a model call timeout under 1 second or above 600 seconds, the nil UUID as `processing_identity`, a processing identity without `profile_category_check` or `profile_category_check` without a processing identity, an entity kind that is not one of identity, role, skill or preference, a confidence floor outside 0 to 1, a step cap outside 1 to 10000, a value cap outside 1 to 100000, a model upstream alias that is not 1 to 63 letters, digits, `-` or `_`, starting with a letter or digit, or a model name that is not 1 to 128 printable characters with no space, stops the gear from starting. The processing identity needs graph storage's read, write, delete and type registration permissions, and the settings read, in every tenant.
 

@@ -1,5 +1,6 @@
-use crate::api::rest::error::for_rest;
+use crate::api::rest::error::{for_rest, for_reviews};
 use crate::domain::error::DomainError;
+use crate::domain::pagination::QueryError;
 use crate::domain::profile::{FactCount, FullProfile};
 use crate::domain::record_intake::{Place, Refusal, RefusalReason};
 use crate::domain::subject_settings::SubjectKey;
@@ -335,4 +336,23 @@ fn a_subject_that_is_not_visible_is_404_and_tells_nothing_more() {
             "the reason stays in the log: {text}"
         );
     }
+}
+
+#[test]
+fn a_bad_query_of_the_reviewers_list_names_review_requests_and_the_part() {
+    let problem = Problem::from(for_reviews(DomainError::InvalidQuery(QueryError::Filter(
+        "unknown field `state`".to_owned(),
+    ))));
+
+    assert_eq!(problem.status, Some(400));
+    assert_eq!(
+        problem
+            .context
+            .get("resource_type")
+            .and_then(|v| v.as_str()),
+        Some(gts_id!("cf.construct.review.request.v1~")),
+    );
+    let violation = first_violation(&problem);
+    assert_eq!(violation["field"], "$filter");
+    assert_eq!(violation["reason"], "invalid_filter");
 }

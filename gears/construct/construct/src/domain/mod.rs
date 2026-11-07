@@ -18,10 +18,13 @@ pub mod plan;
 pub mod planner;
 pub mod profile;
 pub mod profile_read;
+pub mod profile_writes;
 pub mod record_intake;
 pub mod refusal;
+pub mod review_queue;
 pub mod sensitive_data;
 pub mod settings_scope;
+pub mod subject_access;
 pub mod subject_control;
 pub mod subject_settings;
 
@@ -37,6 +40,8 @@ mod plan_test;
 mod profile_read_test;
 #[cfg(test)]
 mod record_intake_test;
+#[cfg(test)]
+mod review_queue_test;
 #[cfg(test)]
 mod sensitive_data_test;
 #[cfg(test)]

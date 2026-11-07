@@ -16,7 +16,9 @@ use crate::domain::profile::Profile;
 use crate::domain::record_intake::{
     DropEvent, DropReason, DropStage, IntakeEvents, ReceivedRecord,
 };
+use crate::domain::review_queue::FactsUnderReview;
 use crate::domain::sensitive_data::{Checked, SensitiveDataChecks};
+use crate::domain::subject_settings::SubjectKey;
 
 /// The record types the planner decides on. A mastery record is stored as it is, by its own story, and never reaches
 /// the model.
@@ -83,6 +85,7 @@ pub struct ProcessingPorts {
     pub profiles: Arc<dyn ProfileSource>,
     pub writer: Arc<dyn PlanWriter>,
     pub events: Arc<dyn IntakeEvents>,
+    pub reviews: Arc<dyn FactsUnderReview>,
 }
 
 /// Takes one received record through the planner, the sensitive-data checks, Admission and the writer. A write
@@ -101,6 +104,7 @@ enum Failure {
     NotPlanned,
     NoContext,
     ProfileRead,
+    ReviewRead,
     AdmissionRead,
     Write,
     RerunLimit,
@@ -109,7 +113,9 @@ enum Failure {
 impl Failure {
     fn stage(self) -> DropStage {
         match self {
-            Self::NotPlanned | Self::NoContext | Self::ProfileRead => DropStage::Planner,
+            Self::NotPlanned | Self::NoContext | Self::ProfileRead | Self::ReviewRead => {
+                DropStage::Planner
+            }
             Self::AdmissionRead => DropStage::Admission,
             Self::Write | Self::RerunLimit => DropStage::Writer,
         }
@@ -128,6 +134,7 @@ impl Failure {
             Self::NotPlanned | Self::RerunLimit => self.reason().name(),
             Self::NoContext => "no_context",
             Self::ProfileRead => "profile_read_failed",
+            Self::ReviewRead => "review_read_failed",
             Self::AdmissionRead => "admission_read_failed",
             Self::Write => "write_failed",
         }
@@ -173,6 +180,8 @@ pub enum NothingStored {
     NoChange,
     /// The deadline passed before the write started.
     Timeout,
+    /// Every step touched a fact under an open review request.
+    UnderReview,
     Dropped(DropReason),
 }
 
@@ -183,6 +192,7 @@ impl NothingStored {
         match self {
             Self::NoChange => "no_change",
             Self::Timeout => "timeout",
+            Self::UnderReview => "under_review",
             Self::Dropped(reason) => reason.name(),
         }
     }
@@ -289,6 +299,20 @@ impl Processing {
         if plan.steps.is_empty() {
             return Ok(Run::Done);
         }
+        self.skip_under_review(scope, &mut plan)
+            .await
+            .map_err(|err| {
+                tracing::warn!(
+                    tenant_id = %record.tenant_id,
+                    %subject_id,
+                    error = %err,
+                    "processing could not read the facts under review"
+                );
+                Failure::ReviewRead
+            })?;
+        if plan.steps.is_empty() {
+            return Ok(Run::Done);
+        }
         let Checked::Verdicts(verdicts) = self.checks.run(&plan).await else {
             return Ok(Run::Done);
         };
@@ -363,12 +387,20 @@ impl Processing {
             .profiles
             .read(ctx, message.tenant_id, message.subject_id)
             .await?;
-        let plan = match self.planner.plan_message(ctx, message, profile).await {
+        let mut plan = match self.planner.plan_message(ctx, message, profile).await {
             Ok(plan) => plan,
             Err(reason) => return Ok(Prepared::Nothing(NothingStored::Dropped(reason))),
         };
         if plan.steps.is_empty() {
             return Ok(Prepared::Nothing(NothingStored::NoChange));
+        }
+        // The open requests are Construct's own, read as Construct: under
+        // the agent's scope a request the scope does not reach would not
+        // freeze its fact.
+        let (_, construct) = self.ports.contexts.for_tenant(message.tenant_id).await?;
+        self.skip_under_review(&construct, &mut plan).await?;
+        if plan.steps.is_empty() {
+            return Ok(Prepared::Nothing(NothingStored::UnderReview));
         }
         let Checked::Verdicts(verdicts) = self.checks.run(&plan).await else {
             return Ok(Prepared::Nothing(NothingStored::Dropped(
@@ -385,6 +417,61 @@ impl Processing {
             return Ok(Prepared::Nothing(NothingStored::NoChange));
         }
         Ok(Prepared::Write(admitted))
+    }
+}
+
+impl Processing {
+    /// Drops every step of `plan` that would change or remove a fact under an
+    /// open review request, or add a property to it. The planner still sees
+    /// the fact, so the model does not add it again. `construct` is
+    /// Construct's own scope in the plan's tenant.
+    ///
+    /// The open requests are read here, outside the write's compare-and-set,
+    /// and opening a request does not move the profile's version. So a flag
+    /// that lands between this read and the write does not stop the write;
+    /// the request then points at a fact that is gone, and its resolution
+    /// closes it as deleted. The window is the length of the checks,
+    /// Admission and the write.
+    ///
+    /// @cpt-dod:cpt-cf-construct-dod-review-queue-frozen:p1
+    async fn skip_under_review(
+        &self,
+        construct: &AccessScope,
+        plan: &mut Plan,
+    ) -> Result<(), DomainError> {
+        // @cpt-begin:cpt-cf-construct-algo-review-queue-skip:p1:inst-skip-drop
+        let under_review = self
+            .ports
+            .reviews
+            .under_review(
+                construct,
+                SubjectKey {
+                    tenant_id: plan.tenant_id,
+                    subject_id: plan.subject_id,
+                },
+            )
+            .await?;
+        if under_review.is_empty() {
+            return Ok(());
+        }
+        let planned = plan.steps.len();
+        plan.steps.retain(|step| {
+            step.change
+                .touches()
+                .is_none_or(|entity| !under_review.contains(entity))
+        });
+        let dropped = planned - plan.steps.len();
+        if dropped > 0 {
+            tracing::info!(
+                event = "planner_steps_under_review_dropped",
+                tenant_id = %plan.tenant_id,
+                subject_id = %plan.subject_id,
+                dropped,
+                "planned steps on facts under review were dropped"
+            );
+        }
+        Ok(())
+        // @cpt-end:cpt-cf-construct-algo-review-queue-skip:p1:inst-skip-drop
     }
 }
 

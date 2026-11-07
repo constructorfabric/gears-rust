@@ -90,6 +90,27 @@ pub enum PageError {
     Internal(String),
 }
 
+/// Refuse a `$select`. Every list serves whole items, and a `$select` it
+/// dropped would answer 200 with more than was asked for.
+///
+/// # Errors
+///
+/// [`QueryError::Select`] when `query` has one.
+pub fn no_select(query: &ODataQuery) -> Result<(), QueryError> {
+    if query.has_select() {
+        return Err(QueryError::Select(
+            "the list serves whole items and takes no $select".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+impl From<QueryError> for PageError {
+    fn from(err: QueryError) -> Self {
+        Self::Query(err)
+    }
+}
+
 /// The page of `items` that `query` asks for.
 ///
 /// # Errors
@@ -104,13 +125,7 @@ pub fn page<T: Listed>(
     listing: &Listing<T::Field>,
 ) -> Result<Page<T>, PageError> {
     // @cpt-begin:cpt-cf-construct-algo-subject-control-paginate:p1:inst-page-limit
-    // A list serves whole items. A `$select` the list dropped would answer
-    // 200 with more than was asked for, so it is refused.
-    if query.has_select() {
-        return Err(PageError::Query(QueryError::Select(
-            "the list serves whole items and takes no $select".to_owned(),
-        )));
-    }
+    no_select(query)?;
     let limit = query.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
     // @cpt-end:cpt-cf-construct-algo-subject-control-paginate:p1:inst-page-limit
     // @cpt-begin:cpt-cf-construct-algo-subject-control-paginate:p1:inst-page-filter

@@ -9,19 +9,22 @@ use tracing::Instrument as _;
 use uuid::Uuid;
 
 use crate::api::rest::error::{
-    for_export, for_facts, for_rest, for_settings, no_such_fact, too_long,
+    bad_resolution, bad_text, for_export, for_facts, for_rest, for_reviews, for_settings,
+    no_such_fact, too_long,
 };
 use crate::api::rest::types::{
-    ConcreteIntake, ConcreteProfile, ConcreteSettings, ConcreteSubjectControl,
+    ConcreteIntake, ConcreteProfile, ConcreteReviewQueue, ConcreteSettings, ConcreteSubjectControl,
 };
 use crate::domain::plan::NodeKey;
 use crate::domain::planner::manage::ManageFacts;
 use crate::domain::record_intake::IntakeOutcome;
+use crate::domain::review_queue::{Resolution, ReviewText};
 
 use super::dto::{
-    ManageFactsRequest, ManageFactsResponse, ProfileDto, ProfileQuery, PutSubjectSettingsRequest,
-    RecordOutcomeDto, RecordQuery, RecordRequest, SubjectExportDto, SubjectFactDto,
-    SubjectFactsPageDto, SubjectSettingsDto,
+    FlagFactRequest, ManageFactsRequest, ManageFactsResponse, ProfileDto, ProfileQuery,
+    PutSubjectSettingsRequest, RecordOutcomeDto, RecordQuery, RecordRequest, ResolutionRequest,
+    ReviewRequestDto, ReviewRequestsPageDto, SubjectExportDto, SubjectFactDto, SubjectFactsPageDto,
+    SubjectSettingsDto,
 };
 
 /// The answer's status: 202 for a received record, which is processed later,
@@ -261,4 +264,97 @@ pub async fn export_subject(
         )),
     ))
     // @cpt-end:cpt-cf-construct-flow-subject-control-export:p1:inst-export-return
+}
+
+/// @cpt-dod:cpt-cf-construct-dod-review-queue-subject:p1
+pub async fn flag_fact(
+    // @cpt-begin:cpt-cf-construct-flow-review-queue-flag:p1:inst-flag-parse
+    Extension(ctx): Extension<SecurityContext>,
+    Extension(svc): Extension<Arc<ConcreteReviewQueue>>,
+    Path(subject_id): Path<Uuid>,
+    Json(body): Json<FlagFactRequest>,
+    // @cpt-end:cpt-cf-construct-flow-review-queue-flag:p1:inst-flag-parse
+) -> ApiResult<impl IntoResponse> {
+    let request = async {
+        let fact_id = fact_key(subject_id, body.fact_id)?;
+        let comment =
+            ReviewText::optional(body.comment).map_err(|rule| bad_text("comment", rule))?;
+        svc.flag(&ctx, subject_id, &fact_id, comment)
+            .await
+            .map_err(|e| for_facts(e, subject_id))
+    }
+    .instrument(subject_span("flag_fact", &ctx, subject_id))
+    .await?;
+    Ok((StatusCode::CREATED, Json(ReviewRequestDto::from(request))))
+}
+
+pub async fn list_own_review_requests(
+    // @cpt-begin:cpt-cf-construct-flow-review-queue-list-own:p1:inst-own-send
+    Extension(ctx): Extension<SecurityContext>,
+    Extension(svc): Extension<Arc<ConcreteReviewQueue>>,
+    Path(subject_id): Path<Uuid>,
+    OData(query): OData,
+    // @cpt-end:cpt-cf-construct-flow-review-queue-list-own:p1:inst-own-send
+) -> ApiResult<Json<ReviewRequestsPageDto>> {
+    let page = async {
+        svc.own_requests(&ctx, subject_id, &query)
+            .await
+            .map_err(|e| for_facts(e, subject_id))
+    }
+    .instrument(subject_span("list_review_requests", &ctx, subject_id))
+    .await?;
+    // @cpt-begin:cpt-cf-construct-flow-review-queue-list-own:p1:inst-own-return
+    Ok(Json(ReviewRequestsPageDto::from(page)))
+    // @cpt-end:cpt-cf-construct-flow-review-queue-list-own:p1:inst-own-return
+}
+
+/// A span that names the reviewer, and the request it resolves, for the
+/// error mapped and logged in it.
+fn review_span(
+    name: &'static str,
+    ctx: &SecurityContext,
+    request_id: Option<Uuid>,
+) -> tracing::Span {
+    tracing::info_span!(
+        "review_queue",
+        operation = name,
+        caller = %ctx.subject_id(),
+        tenant_id = %ctx.subject_tenant_id(),
+        request_id = request_id.map(tracing::field::display)
+    )
+}
+
+/// @cpt-dod:cpt-cf-construct-dod-review-queue-reviewer:p1
+pub async fn list_open_review_requests(
+    // @cpt-begin:cpt-cf-construct-flow-review-queue-list-open:p1:inst-open-send
+    Extension(ctx): Extension<SecurityContext>,
+    Extension(svc): Extension<Arc<ConcreteReviewQueue>>,
+    OData(query): OData,
+    // @cpt-end:cpt-cf-construct-flow-review-queue-list-open:p1:inst-open-send
+) -> ApiResult<Json<ReviewRequestsPageDto>> {
+    let page = async { svc.open_requests(&ctx, &query).await.map_err(for_reviews) }
+        .instrument(review_span("list_open", &ctx, None))
+        .await?;
+    // @cpt-begin:cpt-cf-construct-flow-review-queue-list-open:p1:inst-open-return
+    Ok(Json(ReviewRequestsPageDto::from(page)))
+    // @cpt-end:cpt-cf-construct-flow-review-queue-list-open:p1:inst-open-return
+}
+
+pub async fn resolve_review_request(
+    // @cpt-begin:cpt-cf-construct-flow-review-queue-resolve:p1:inst-resolve-parse
+    Extension(ctx): Extension<SecurityContext>,
+    Extension(svc): Extension<Arc<ConcreteReviewQueue>>,
+    Path(request_id): Path<Uuid>,
+    Json(body): Json<ResolutionRequest>,
+    // @cpt-end:cpt-cf-construct-flow-review-queue-resolve:p1:inst-resolve-parse
+) -> ApiResult<Json<ReviewRequestDto>> {
+    let request = async {
+        let resolution = Resolution::try_from(body).map_err(|mistake| bad_resolution(&mistake))?;
+        svc.resolve(&ctx, request_id, resolution)
+            .await
+            .map_err(for_reviews)
+    }
+    .instrument(review_span("resolve", &ctx, Some(request_id)))
+    .await?;
+    Ok(Json(ReviewRequestDto::from(request)))
 }

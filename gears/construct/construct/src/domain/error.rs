@@ -5,6 +5,7 @@ use toolkit_macros::domain_model;
 use super::pagination::{PageError, QueryError};
 use super::profile::FullProfile;
 use super::refusal::Refusal;
+use super::review_queue::{NotStored, ReviewConflict};
 use super::settings_scope::SettingsOutOfScope;
 
 #[domain_model]
@@ -39,6 +40,26 @@ pub enum DomainError {
     /// subject that does not exist.
     #[error("No such fact: {0}")]
     NoSuchFact(String),
+
+    /// The tenant has no review request with the id asked for.
+    #[error("No such review request: {0}")]
+    NoSuchReviewRequest(String),
+
+    /// The fact already has an open review request, or the request asked to
+    /// resolve is closed.
+    #[error("Review conflict: {0}")]
+    ReviewConflict(ReviewConflict),
+
+    /// A reviewer's correction is for another property than the fact's
+    /// (`property`), or its property's schema does not take the value
+    /// (`value`). The rule never repeats the value.
+    #[error("Invalid {field}: {rule}")]
+    InvalidValue { field: &'static str, rule: String },
+
+    /// A correction the checks or Admission did not let through; nothing was
+    /// stored.
+    #[error("Not stored: {}", .0.name())]
+    NotStored(NotStored),
 
     /// The caller's `$filter`, `$orderby` or cursor does not fit the list.
     #[error("Invalid query: {0:?}")]

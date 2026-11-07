@@ -18,6 +18,16 @@ use uuid::Uuid;
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct NodeKey(pub String);
 
+impl NodeKey {
+    /// A new key for an entity in `tenant_id`. Every new entity gets one,
+    /// also a value that returns after a delete or replaces another, because
+    /// a deleted key cannot be reused.
+    #[must_use]
+    pub fn new_in(tenant_id: Uuid) -> Self {
+        Self(format!("construct:{tenant_id}:{}", Uuid::new_v4()))
+    }
+}
+
 /// A key compares as its text, so a set of keys is looked up by `&str`.
 impl Borrow<str> for NodeKey {
     fn borrow(&self) -> &str {
@@ -165,6 +175,20 @@ impl Change {
                 (index == 0).then_some(&mut property.value)
             }
             Self::RemoveEntity { .. } | Self::RemoveProperty { .. } => None,
+        }
+    }
+
+    /// The stored entity the change touches: the one it replaces, removes or
+    /// adds a property to. None for a new entity.
+    #[must_use]
+    pub fn touches(&self) -> Option<&NodeKey> {
+        match self {
+            Self::AddEntity { .. } => None,
+            Self::AddProperty { entity, .. }
+            | Self::ReplaceProperty { entity, .. }
+            | Self::RemoveEntity { entity }
+            | Self::RemoveProperty { entity, .. } => Some(entity),
+            Self::ReplaceEntity { old, .. } => Some(old),
         }
     }
 

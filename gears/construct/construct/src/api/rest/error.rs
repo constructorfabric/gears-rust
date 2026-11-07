@@ -120,6 +120,10 @@ pub fn for_settings(e: DomainError) -> CanonicalError {
         | DomainError::InvalidQuery(_)
         | DomainError::Internal(_)
         | DomainError::ProfileFull(_)
+        | DomainError::NoSuchReviewRequest(_)
+        | DomainError::ReviewConflict(_)
+        | DomainError::InvalidValue { .. }
+        | DomainError::NotStored(_)
         | DomainError::Database(_)) => e.into(),
     }
 }
@@ -142,6 +146,15 @@ pub fn no_such_fact(subject_id: Uuid) -> CanonicalError {
 pub fn too_long(field: &str, limit: usize) -> CanonicalError {
     SubjectFactsError::invalid_argument()
         .with_field_violation(field, format!("at most {limit} characters"), "too_long")
+        .create()
+}
+
+/// A subject's text that breaks its rule, as an invalid-argument problem
+/// that names the field.
+#[must_use]
+pub fn bad_text(field: &str, rule: crate::domain::review_queue::TextRule) -> CanonicalError {
+    SubjectFactsError::invalid_argument()
+        .with_field_violation(field, rule.description(), "invalid_text")
         .create()
 }
 
@@ -174,6 +187,10 @@ pub fn for_export(e: DomainError) -> CanonicalError {
         | DomainError::Internal(_)
         | DomainError::ProfileFull(_)
         | DomainError::NotVisible(_)
+        | DomainError::NoSuchReviewRequest(_)
+        | DomainError::ReviewConflict(_)
+        | DomainError::InvalidValue { .. }
+        | DomainError::NotStored(_)
         | DomainError::Database(_)) => e.into(),
     }
 }
@@ -224,7 +241,92 @@ pub fn for_facts(e: DomainError, subject_id: Uuid) -> CanonicalError {
         | DomainError::InvalidQuery(_)
         | DomainError::Internal(_)
         | DomainError::ProfileFull(_)
+        | DomainError::NoSuchReviewRequest(_)
+        | DomainError::ReviewConflict(_)
+        | DomainError::InvalidValue { .. }
+        | DomainError::NotStored(_)
         | DomainError::Database(_)) => e.into(),
+    }
+}
+
+/// Errors about review requests.
+#[resource_error(gts_id!("cf.construct.review.request.v1~"))]
+pub struct ReviewRequestError;
+
+/// A resolution whose body does not fit its outcome, as an invalid-argument
+/// problem that names the field.
+#[must_use]
+pub fn bad_resolution(mistake: &crate::api::rest::dto::BodyMistake) -> CanonicalError {
+    ReviewRequestError::invalid_argument()
+        .with_field_violation(mistake.field, mistake.rule, "invalid_resolution")
+        .create()
+}
+
+/// A correction the checks or Admission refused, logged here, once. On the
+/// REST route (`rest`) it is `422`.
+fn not_stored(reason: crate::domain::review_queue::NotStored, rest: bool) -> CanonicalError {
+    tracing::info!(reason = reason.name(), "construct correction not stored");
+    let error = ReviewRequestError::failed_precondition().with_precondition_violation(
+        "value",
+        "the correction was not stored; the review request stays open",
+        reason.name(),
+    );
+    if rest {
+        error.with_override(Http::status_code(422)).create()
+    } else {
+        error.create()
+    }
+}
+
+/// The REST answer for a domain error on the reviewers' routes. A reviewer is
+/// told a refusal as such, 403: the routes are about the whole tenant, not one
+/// subject.
+///
+/// @cpt-dod:cpt-cf-construct-dod-review-queue-reviewer:p1
+#[must_use]
+pub fn for_reviews(e: DomainError) -> CanonicalError {
+    match e {
+        DomainError::Forbidden(msg) => {
+            tracing::warn!(msg = %msg, "construct review requests access refused");
+            ReviewRequestError::permission_denied()
+                .with_reason("ACCESS_DENIED")
+                .create()
+        }
+        DomainError::NotConfigured(msg) => {
+            tracing::error!(msg = %msg, "construct is not configured for this call");
+            ReviewRequestError::unimplemented("this deployment does not provide this call").create()
+        }
+        // A refused correction is 422, a status only the REST route carries.
+        DomainError::NotStored(reason) => not_stored(reason, true),
+        // A query of the reviewers' list names the review request resource.
+        DomainError::InvalidQuery(err) => {
+            let (field, detail, reason) = query_violation(err);
+            ReviewRequestError::invalid_argument()
+                .with_field_violation(field, detail, reason)
+                .create()
+        }
+        e @ (DomainError::Refused(_)
+        | DomainError::OutOfScope(_)
+        | DomainError::Unavailable(_)
+        | DomainError::NotVisible(_)
+        | DomainError::NoSuchFact(_)
+        | DomainError::NoSuchReviewRequest(_)
+        | DomainError::ReviewConflict(_)
+        | DomainError::InvalidValue { .. }
+        | DomainError::Internal(_)
+        | DomainError::ProfileFull(_)
+        | DomainError::Database(_)) => e.into(),
+    }
+}
+
+/// The field, detail and reason of a query a list does not take, so a
+/// client can tell a bad filter, order, cursor and select apart.
+fn query_violation(err: QueryError) -> (&'static str, String, &'static str) {
+    match err {
+        QueryError::Filter(detail) => ("$filter", detail, "invalid_filter"),
+        QueryError::Order(detail) => ("$orderby", detail, "invalid_order"),
+        QueryError::Cursor(detail) => ("cursor", detail, "invalid_cursor"),
+        QueryError::Select(detail) => ("$select", detail, "unsupported_select"),
     }
 }
 
@@ -283,15 +385,34 @@ impl From<DomainError> for CanonicalError {
                     .with_resource("fact")
                     .create()
             }
+            DomainError::NoSuchReviewRequest(msg) => {
+                tracing::warn!(msg = %msg, "construct review request not found");
+                ReviewRequestError::not_found("no such review request")
+                    .with_resource("review_request")
+                    .create()
+            }
+            // A second open request on a fact, a request already closed, or a
+            // resolution that was written but not closed: the message names
+            // the request and fact ids, and a correction's new fact id.
+            DomainError::ReviewConflict(conflict) => {
+                tracing::info!(%conflict, "construct review request conflict");
+                ReviewRequestError::aborted(conflict.to_string())
+                    .with_reason(conflict.reason())
+                    .create()
+            }
+            DomainError::InvalidValue { field, rule } => {
+                tracing::info!(field, rule = %rule, "construct correction value refused");
+                ReviewRequestError::invalid_argument()
+                    .with_field_violation(field, rule, "invalid_value")
+                    .create()
+            }
+            // The correction is refused by the checks or Admission; the
+            // request stays open, and the reason says why.
+            DomainError::NotStored(reason) => not_stored(reason, false),
             // The caller's query does not fit the list; the field violation
             // says which part, so a client can tell them apart.
             DomainError::InvalidQuery(err) => {
-                let (field, detail, reason) = match err {
-                    QueryError::Filter(detail) => ("$filter", detail, "invalid_filter"),
-                    QueryError::Order(detail) => ("$orderby", detail, "invalid_order"),
-                    QueryError::Cursor(detail) => ("cursor", detail, "invalid_cursor"),
-                    QueryError::Select(detail) => ("$select", detail, "unsupported_select"),
-                };
+                let (field, detail, reason) = query_violation(err);
                 SubjectFactsError::invalid_argument()
                     .with_field_violation(field, detail, reason)
                     .create()

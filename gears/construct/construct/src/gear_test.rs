@@ -53,6 +53,7 @@ async fn gear_with_worker() -> (ConstructGear, Arc<dyn RecordHandOff>) {
         Some(Arc::new(Unused)),
         fake_graph_storage(),
         Arc::new(settings_service(&db, Arc::new(AllowResolver), true)),
+        Arc::new(crate::test_support::MemoryReviews::default()),
         PolicyEnforcer::new(Arc::new(AllowResolver)),
     )
     .unwrap();
