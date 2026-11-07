@@ -243,10 +243,12 @@ detects by re-read, never by absence of notification; Lifecycle counts a line as
 **One outcome event per intent, echoing the caller's identity.** `SubscriptionTransitionOutcome {
 transition_request_id, source { order_id, order_version, order_line_id }, wave, kind, wave_attempt,
 correlation_id, transition, outcome: applied | failed { reason_code } | oss_unconfirmed }` for
-create, activate, void and cancel, as the twin of `SubscriptionActivated`, which carries no caller
-tuple and has no failure variant. Without it Workflow cannot correlate the event Subscriptions would
-send and falls back to the status read for every outcome; Lifecycle's completion acknowledgement
-depends on Workflow receiving a terminal outcome per line. The Workflow branch's `SUB-O16`; Seam
+create, activate, void and cancel. The current Subscriptions event is
+[`SubscriptionTransitionOutcome`](../../subscriptions/docs/DESIGN.md#events-and-topics).
+The tuple and outcomes above remain the Orders consumer requirement; their mapping to the
+Subscriptions operation identity and accepted/applied outcomes requires bilateral agreement under
+S-U01. Workflow must recover missing outcomes through status reads; Lifecycle's completion
+acknowledgement depends on a terminal outcome per line. The Workflow branch's `SUB-O16`; Seam
 Atlas names the same event in C03/C09 (ticket T12).
 
 **PriceBook provisioning amendment (D-157, D-165).** The create/activate SDK must accept the exact
@@ -1064,17 +1066,16 @@ tests) and the test provider only (PR #5259 review, thread 13).
 
 **Stage 3 status (D-231, 2026-10-22):** S5-06a, port `overlap-key`, **missing**; the gate answers `Unavailable::Missing` until delivered.
 
-**Revised scope; legacy ID retained (D-163).** The key stays the one Subscriptions already defines
-and keys its cardinality rule on: the registry-owned `catalogSubscriptionProductKey` of `SUB-G1`,
-"bound to a published SKU/product key". Products removed the Product entity but keeps SKUs, so the
-derivation proposed to Subscriptions for PriceBook is the SKU of the line's paid `recurring`
-item(s) as resolve names them; `plan_id` is not proposed, because two plans selling one family
-would stop colliding; a line with several paid recurring items yields one key per such SKU. Orders
-submits the prospective line/revision, batched and seller-scoped, to a Subscriptions key operation
-(proposed `SubscriptionsOverlapKeyV1::keys`, the SUB-P8 shape: the neighbour submits, Subscriptions
-answers) and stores the key(s) plus derivation/policy provenance as answered; it never computes the
-key. Missing key and unavailable resolver are distinct. Resolve it once per assessment, store it on
-the version, and reuse it at activation. The partner/customer dimension (Q-05) is closed for
+**Revised scope; legacy ID retained (D-163).** The current key is Subscriptions'
+versioned-policy `overlapScopeKey`, historically named `catalogSubscriptionProductKey` (SUB-G1).
+Subscriptions owns the key derivation and the returned policy version. The earlier Orders proposal
+used the SKU of each paid `recurring` item; that proposal does not fix the current owner's policy.
+Orders submits the prospective line/revision, batched and seller-scoped, to a Subscriptions key
+operation (proposed `SubscriptionsOverlapKeyV1::keys`) and stores the returned key set and policy
+provenance. It never computes the keys. The current obligation is
+[`cpt-cf-bss-subscriptions-upreq-occupancy`](../../subscriptions/docs/UPSTREAM_REQS.md#occupancy-and-atomic-entry).
+The historical SUB-P8 presence read concerned Pricing retirement, not this key operation. Missing
+key and unavailable resolver are distinct. Resolve it once per assessment, store it on the version, and reuse it at activation. The partner/customer dimension (Q-05) is closed for
 the Orders in-flight claim by D-179, which keeps `resource_tenant_id` beside the key rather than
 inside it; the subscription-side dimension rides the `SUB-O5` amendment above. A key is
 non-empty text without NUL and at most 1024 UTF-8 bytes: Orders indexes it in the unique claim
@@ -1217,7 +1218,7 @@ mitigation exists.
 - **DESIGN**: [`./DESIGN.md`](./DESIGN.md) §3.5, §3.8; [01 §3.8](DESIGN.md#contract-01-3-8), §4.4; [03 §2.2](DESIGN.md#contract-03-2-2); [06 §4.2](DESIGN.md#contract-06-4-2), §4.6
 - **Decisions**: [`./DECISIONS.md`](./DECISIONS.md) — D-32, D-56, D-108, D-111, D-122, D-124, D-150–D-179, D-182, D-185, D-186, Q-04, Q-05, Q-08, Q-26, Q-32, Q-33
 - **ADRs**: [`./ADR/0003`](./ADR/0003-cpt-cf-bss-orders-adr-fail-closed-gate.md) — the fail-closed posture that makes `SUB-O5` a blocker rather than a degradation; [`./ADR/0006`](./ADR/0006-cpt-cf-bss-orders-adr-outbox-publication.md) — the platform producer path and Event Broker readiness gate
-- **Upstream registers**: `gears/bss/subscriptions/docs/SEAMS.md` §I (`SUB-O1`…`SUB-O6`); the sibling Workflow PRD §13 (`SUB-O5`…`SUB-O9`); `gears/bss/rating/docs/SEAMS.md` for the three Rating asks; `gears/bss/contracts/docs/PRD.md` §6.6 (*Party eligibility predicate*, *Booking instant and acceptance*) for the Contracts asks; `gears/bss/subscriptions/docs/SEAMS.md` `SUB-G1` (PR #4177) for the catalog-registry product key; `gears/bss/pricing/docs` D-419–D-425 and PRD §2.2 for the Pricing reads and system subjects; `gears/bss/products/docs` P-D-189/P-D-194 for SKU lifecycle and references. Rating **is** specified in this repository, with a PRD, a DESIGN, ADRs and its own seam register, so its asks are raised against that specification.
+- **Upstream registers**: Subscriptions [Orders operations](../../subscriptions/docs/UPSTREAM_REQS.md#21-orders-operations) and [provider prerequisites](../../subscriptions/docs/UPSTREAM_REQS.md#25-provider-prerequisites-and-bilateral-acceptance) define the Orders requirements and acceptance evidence; the sibling Workflow PRD §13 (`SUB-O5`…`SUB-O9`); `gears/bss/rating/docs/UPSTREAM_REQS.md` §2.11 and [Rating `DESIGN.md` §4.10](../../rating/docs/DESIGN.md#410-launch-scope) for the three Rating asks; `gears/bss/contracts/docs/PRD.md` §6.6 (*Party eligibility predicate*, *Booking instant and acceptance*) for the Contracts asks; `gears/bss/pricing/docs` D-419–D-425 and PRD §2.2 for the Pricing reads and system subjects; `gears/bss/products/docs` P-D-189/P-D-194 for SKU lifecycle and references. Rating **is** specified in this repository, with a PRD, a DESIGN, ADRs and its own upstream register, so its asks are raised against that specification.
 - **Billing chain ownership (D-168).** The billing chain is **not** `gears/bss/ledger`. The Ledger is built and its `LedgerClientV1` is the GL posting and settlement target (`post_balanced_entry`, `settle_payment`, `allocate_payment`, `return_payment`, `record_dispute_phase`, credit application, AR balances, revenue recognition); it generates no invoices, values no at-sale facts and answers no tax, and settlement is not payment authorization. The capabilities this gear needs are owned as follows:
 
   | Capability | Owner | Register target |
