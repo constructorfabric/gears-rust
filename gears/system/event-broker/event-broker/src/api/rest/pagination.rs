@@ -50,8 +50,9 @@ pub fn paginate_by_key<T: Clone>(
     let limit = query.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
     let limit_usize = usize::try_from(limit).unwrap_or(usize::MAX);
 
+    let filter_hash = query.effective_filter_hash();
     if let Some(cursor) = &query.cursor {
-        toolkit_odata::validate_cursor_against(cursor, &order, query.filter_hash.as_deref())?;
+        toolkit_odata::validate_cursor_against(cursor, &order, filter_hash.as_deref())?;
     }
 
     let (start, end) = match &query.cursor {
@@ -77,18 +78,13 @@ pub fn paginate_by_key<T: Clone>(
         Some(last) if end < total => Some(build_cursor(
             &key_of(last),
             &order,
-            query.filter_hash.clone(),
+            filter_hash.clone(),
             "fwd",
         )?),
         _ => None,
     };
     let prev_cursor = match page_items.first() {
-        Some(first) if start > 0 => Some(build_cursor(
-            &key_of(first),
-            &order,
-            query.filter_hash.clone(),
-            "bwd",
-        )?),
+        Some(first) if start > 0 => Some(build_cursor(&key_of(first), &order, filter_hash, "bwd")?),
         _ => None,
     };
 
