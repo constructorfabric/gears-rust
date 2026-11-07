@@ -38,6 +38,12 @@ jobs:
       scan: ${{ steps.choose.outputs.scan }}
       rust: ${{ steps.choose.outputs.rust }}
     steps:
+      - name: Checkout repository
+        if: github.event_name == 'pull_request'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+
       - name: Select scan mode from changed files
         id: choose
         shell: bash
@@ -45,6 +51,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           IS_DRAFT: ${{ github.event.pull_request.draft }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: |
           set -euo pipefail
           emit() { printf 'scan=%s\nrust=%s\n' "$1" "$2" | tee -a "$GITHUB_OUTPUT"; }
@@ -52,11 +59,22 @@ jobs:
           if [[ "$GITHUB_EVENT_NAME" != pull_request ]]; then emit true full; exit 0; fi
           if [[ "$IS_DRAFT" == true ]]; then echo 'Draft PR: skipping CodeQL.'; emit false stub; exit 0; fi
 
-          # Fail closed: API error, empty or possibly truncated (3,000-file cap) list => full scan.
-          if ! files="$(gh api --paginate "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER/files?per_page=100" --jq '.[].filename')" \
-             || [[ -z "$files" ]] || (( $(wc -l <<< "$files") >= 3000 )); then
-            echo 'Incomplete PR file list; running a full scan.' >&2
-            emit true full; exit 0
+          # The changed-file list comes from git first: the REST call below hit the
+          # installation rate limit (HTTP 403) and flipped docs-only PRs to full scans.
+          # Fail closed: failure, empty or possibly truncated (3,000-file cap) list => next
+          # source; the REST API is the fallback and a full scan the last resort.
+          files=
+          if git fetch --no-tags --depth=1 origin "$BASE_SHA" \
+             && files="$(git diff --no-renames --name-only "$BASE_SHA" HEAD)" \
+             && [[ -n "$files" ]] && (( $(wc -l <<< "$files") < 3000 )); then
+            :
+          else
+            echo 'git diff file list unavailable; falling back to the REST API.' >&2
+            if ! files="$(gh api --paginate "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER/files?per_page=100" --jq '.[].filename')" \
+               || [[ -z "$files" ]] || (( $(wc -l <<< "$files") >= 3000 )); then
+              echo 'Incomplete PR file list; running a full scan.' >&2
+              emit true full; exit 0
+            fi
           fi
 
           # Only `.rs` sources and this workflow trigger a full Rust scan. Manifests
