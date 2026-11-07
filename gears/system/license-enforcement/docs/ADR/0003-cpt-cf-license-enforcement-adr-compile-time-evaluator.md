@@ -64,9 +64,10 @@ field, or registry entry changes the evaluator.
 
 The trait has these operations:
 
-- The candidate filter takes the request and returns an ordered list of binding filters. Each filter is a GTS type
-  pattern and a binding id. The store reads the grants that match any filter. The list order sets the candidate
-  order.
+- The candidate filter takes the request and returns an ordered list of binding filters. A filter addresses the
+  subject that a grant is bound to: a Subject type, a subject id, and whether a binding to a Subject type that derives
+  from it matches too. The resource does not take part in a filter: the check matches the resource type exactly. The
+  store reads the grants that match any filter. The list order sets the candidate order.
 - The evaluation takes the request, a candidate, its root, and the evaluation instant. It returns pass, pass in
   grace, or a denial reason. It evaluates the fields that it gets: the stored fields, or the root fields from `verify`.
 - The validation checks conditions or recipient rules against a contract or projection schema, at write time.
@@ -74,8 +75,8 @@ The trait has these operations:
   delegation.
 
 The filter is the boundary between the evaluator and the store. The evaluator does not see the store, and the store
-does not know the logic of the evaluator. A GTS type pattern covers the types that derive from it, so a new Subject
-type falls under an existing filter.
+does not know the logic of the evaluator. A filter that lets derived Subject types match covers the types that derive
+from its type, so a new Subject type falls under an existing filter.
 
 The crate decides how it expresses its logic: Rust code, or a policy that the crate embeds. The evaluator is a pure
 function. It reads nothing, calls nothing, and writes nothing.
@@ -91,7 +92,7 @@ and it adds a registry call to the check path.
   owns the full list.
 * The evaluator defines the form of conditions and recipient rules. It validates them at write time and evaluates
   them at check time and at delegation. Thus one implementation does both.
-* The store indexes the grants by tenant, resource type, binding type, and binding id.
+* The store indexes the grants by tenant and resource type, and by tenant, bound subject id, and resource type.
 * The conformance suite of the gear runs with each shipped evaluator crate.
 
 ### Confirmation

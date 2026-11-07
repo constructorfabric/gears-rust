@@ -5,10 +5,11 @@ use serde_json::json;
 
 use super::*;
 use crate::domain::test_support::{
-    BARE_RESOURCE, FailureKind, FakeContractRegistry, MODEL_USAGE_RESOURCE, RESOURCE_BASE,
-    SUBJECT_BASE, TENANT_SUBJECT, TestModelUsageResourceV1, USER_SUBJECT, bare_resource_schema,
-    conforming_request, model_usage_schema, request, resource, resource_base_schema, subject,
-    subject_base_schema, tenant_subject_schema, user_subject_schema,
+    ADMIN_SUBJECT, BARE_RESOURCE, FailureKind, FakeContractRegistry, MODEL_USAGE_RESOURCE,
+    RESOURCE_BASE, SUBJECT_BASE, TENANT_SUBJECT, TestModelUsageResourceV1, USER_SUBJECT,
+    admin_subject_schema, bare_resource_schema, conforming_request, model_usage_schema, request,
+    resource, resource_base_schema, subject, subject_base_schema, tenant_subject_schema,
+    user_subject_schema,
 };
 
 fn validator(registry: FakeContractRegistry) -> ContractValidator {
@@ -208,6 +209,31 @@ async fn subject_outside_admitted_subjects_is_a_violation_not_a_denial() {
     assert!(
         violation.description.contains(USER_SUBJECT),
         "description must list what the contract does admit: {violation:?}"
+    );
+}
+
+/// A subject contract derived from an admitted one is admitted.
+#[tokio::test]
+async fn subject_derived_from_an_admitted_type_is_admitted() {
+    let validator = validator(
+        FakeContractRegistry::with_test_contracts().with_contracts([admin_subject_schema()]),
+    );
+    let req = request(
+        subject(
+            ADMIN_SUBJECT,
+            Some("alice"),
+            json!({ "category": "internal" }),
+        ),
+        resource(
+            MODEL_USAGE_RESOURCE,
+            None,
+            json!({ "model_vendor": "openai", "model_name": "gpt-4o" }),
+        ),
+    );
+    let result = validator.validate(&req).await;
+    assert!(
+        result.is_ok(),
+        "derived subject must be admitted: {result:?}"
     );
 }
 

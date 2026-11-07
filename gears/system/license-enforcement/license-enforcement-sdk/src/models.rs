@@ -184,7 +184,7 @@ pub struct Permissions {
     /// The holder may `bind` and `unbind`.
     pub may_bind: bool,
     /// Maximum delegation depth below this grant; 0 means not delegable.
-    pub max_depth: u32,
+    pub max_depth: u16,
     /// The grant awaits the acceptance of its holder when it is created.
     pub requires_acceptance: bool,
 }
@@ -196,7 +196,7 @@ pub struct PermissionsInput {
     /// The holder may `bind` and `unbind`.
     pub may_bind: bool,
     /// Maximum delegation depth below this grant; 0 means not delegable.
-    pub max_depth: u32,
+    pub max_depth: u16,
     /// The grant awaits the acceptance of its holder when it is created.
     pub requires_acceptance: bool,
 }
