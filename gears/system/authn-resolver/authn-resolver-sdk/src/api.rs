@@ -7,19 +7,26 @@
 use async_trait::async_trait;
 
 use crate::error::AuthNResolverError;
-use crate::models::{AuthenticationResult, ClientCredentialsRequest};
+use crate::models::{AuthenticationRequest, AuthenticationResult, ClientCredentialsRequest};
 
 /// Public API trait for the `AuthN` resolver.
 ///
 /// This trait is registered in `ClientHub` by the gear and
 /// can be consumed by other gears (primarily the API gateway):
 ///
-/// ```ignore
-/// let authn = hub.get::<dyn AuthNResolverClient>()?;
-///
-/// // Authenticate a bearer token
-/// let result = authn.authenticate("Bearer xyz...").await?;
+/// ```no_run
+/// # use std::sync::Arc;
+/// # use authn_resolver_sdk::{AuthNResolverClient, AuthenticationRequest};
+/// # use secrecy::SecretString;
+/// # async fn example(authn: Arc<dyn AuthNResolverClient>) -> Result<(), Box<dyn std::error::Error>> {
+/// // `authn` is `hub.get::<dyn AuthNResolverClient>()?`.
+/// // Pass the raw token, without the `Bearer ` prefix; `new` always revalidates.
+/// let request = AuthenticationRequest::new(SecretString::from("eyJhbGciOiJSUzI1NiJ9..."));
+/// let result = authn.authenticate(&request).await?;
 /// let ctx = result.security_context;
+/// # let _ = ctx;
+/// # Ok(())
+/// # }
 /// ```
 ///
 /// # Security
@@ -28,11 +35,15 @@ use crate::models::{AuthenticationResult, ClientCredentialsRequest};
 /// in the `bearer_token` field for downstream PDP forwarding.
 #[async_trait]
 pub trait AuthNResolverClient: Send + Sync {
-    /// Authenticate a bearer token and return the validated identity.
+    /// Authenticate `request.bearer_token` (without the `Bearer ` prefix) and
+    /// return the validated identity.
     ///
-    /// # Arguments
-    ///
-    /// * `bearer_token` - The raw bearer token string (without "Bearer " prefix)
+    /// `request.cache_control` governs plugin-cache reuse and is forwarded to
+    /// the plugin unchanged: [`AuthenticationRequest::new`] requires a fresh
+    /// validation; a caller that accepts a plugin-cached result sets
+    /// [`crate::RequestCacheControl::AllowCached`]. The result's
+    /// `cache_control` governs caller reuse (default no-store);
+    /// [`crate::CachingAuthenticator`] uses both.
     ///
     /// # Errors
     ///
@@ -42,7 +53,7 @@ pub trait AuthNResolverClient: Send + Sync {
     /// - `Internal` for unexpected errors
     async fn authenticate(
         &self,
-        bearer_token: &str,
+        request: &AuthenticationRequest,
     ) -> Result<AuthenticationResult, AuthNResolverError>;
 
     /// Exchange `OAuth2` client credentials for a validated `SecurityContext`.
@@ -60,11 +71,18 @@ pub trait AuthNResolverClient: Send + Sync {
     /// the final granted scopes. Plugins that do not interact with an
     /// `IdP` (e.g., static dev plugins) may ignore this field.
     ///
+    /// # Caching
+    ///
+    /// [`crate::RequestCacheControl`] governs plugin-cache reuse; the result's
+    /// `cache_control` governs caller reuse (default no-store).
+    /// Use [`crate::ClientCredentialsProvider`] for repeated acquisitions.
+    ///
     /// # Errors
     ///
-    /// - `TokenAcquisitionFailed` if credentials are invalid or the `IdP` is unreachable
+    /// - `TokenAcquisitionFailed` if credentials are rejected or the obtained token is unusable
     /// - `NoPluginAvailable` if no `AuthN` plugin is registered
-    /// - `ServiceUnavailable` if the plugin is not ready
+    /// - `ServiceUnavailable` if the plugin is not ready or the `IdP` is
+    ///   unreachable (transient)
     /// - `Internal` for unexpected errors
     async fn exchange_client_credentials(
         &self,

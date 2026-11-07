@@ -803,10 +803,13 @@ async fn a_revoked_seller_grant_is_publicly_unavailable_and_operator_only_denied
         client_secret: secrecy::SecretString::from("x"),
         scopes: Vec::new(),
     };
-    let authority: Arc<dyn CommercialAuthority> = Arc::new(AuthnAuthority::new(
-        Arc::new(FakeResolver::new(Uuid::from_u128(0x0bd5), SELLER)),
-        &[identity],
-    ));
+    let authority: Arc<dyn CommercialAuthority> = Arc::new(
+        AuthnAuthority::new(
+            Arc::new(FakeResolver::new(Uuid::from_u128(0x0bd5), SELLER)),
+            &[identity],
+        )
+        .unwrap(),
+    );
     let catalog = PricingCatalogReads::new(
         pricing.clone(),
         Arc::new(FakeProducts::default()),

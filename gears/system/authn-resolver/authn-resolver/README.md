@@ -36,12 +36,13 @@ Plugin implementation  (validates tokens, returns SecurityContext)
 The primary consumer is the API Gateway's authentication middleware:
 
 ```rust
-use authn_resolver_sdk::AuthNResolverClient;
+use authn_resolver_sdk::{AuthNResolverClient, AuthenticationRequest};
 
 let authn = hub.get::<dyn AuthNResolverClient>()?;
 
-// Authenticate a bearer token
-let result = authn.authenticate("eyJhbGciOiJSUzI1NiIs...").await?;
+// Authenticate a bearer token; the request (and its cache control) reaches the plugin unchanged.
+let request = AuthenticationRequest::new("eyJhbGciOiJSUzI1NiIs...");
+let result = authn.authenticate(&request).await?;
 let security_context = result.security_context;
 // security_context contains: subject_id, subject_tenant_id, token_scopes, bearer_token
 ```

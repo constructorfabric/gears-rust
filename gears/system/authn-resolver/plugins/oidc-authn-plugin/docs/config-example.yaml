@@ -17,6 +17,7 @@
 jwt:
   supported_algorithms: ["RS256", "ES256"]      # `none` is always rejected
   clock_skew_leeway: 60s              # tolerated drift for `exp`/`iat`; hard cap 300s
+  authenticate_result_cache_ttl: 0s   # caller reuse of bearer results; 0s = no-store, hard cap 300s
   require_audience: false             # when true, tokens missing `aud` are rejected
   expected_audience:                  # `*` is a substring wildcard (only wildcard supported)
     - "https://api.example.com"

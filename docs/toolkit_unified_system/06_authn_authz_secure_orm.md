@@ -100,6 +100,7 @@ pub async fn list_users(
 | `subject_type` | No | GTS type identifier (e.g., `gts.cf.core.security.subject_user.v1~`) |
 | `token_scopes` | Yes | Capability restrictions (`["*"]` for first-party apps) |
 | `bearer_token` | No | Original token (wrapped in `Secret<String>`, forwarded to PDP) |
+| `expires_at` | No | Verified/exchanged credential expiry (UTC); revocation may be earlier. Unknown expiry does not grant indefinite reuse. |
 
 ## AuthZ: PolicyEnforcer (PEP)
 

@@ -261,7 +261,7 @@ Legacy system integration is handled through the pluggable AuthN Resolver plugin
 |--------|-------------|--------|
 | `AuthenticationResult` | Wrapper containing a validated `SecurityContext` produced by successful authentication. | `authn-resolver-sdk` models |
 | `SecurityContext` | Platform-wide identity context: `subject_id`, `subject_type`, `subject_tenant_id`, `token_scopes`, `bearer_token`. Built by the AuthN plugin, consumed by all downstream gears. | `toolkit-security` |
-| `ClientCredentialsRequest` | Request to exchange OAuth2 client credentials for a `SecurityContext`. Contains `client_id`, `client_secret` (SecretString), and optional `scopes`. | `authn-resolver-sdk` models |
+| `ClientCredentialsRequest` | Request to exchange OAuth2 client credentials for a `SecurityContext`. Contains `client_id`, `client_secret` (SecretString), optional `scopes` (`Option<ScopeSet>`, `None` = IdP defaults) and `cache_control`. | `authn-resolver-sdk` models |
 | `AuthNResolverError` | Error enum with variants: `Unauthorized`, `ServiceUnavailable`, `NoPluginAvailable`, `TokenAcquisitionFailed`, `Internal`. | `authn-resolver-sdk` error |
 
 **Relationships**:
@@ -374,6 +374,7 @@ Does not perform opaque token introspection. Does not evaluate authorization pol
 |-----------|------|---------|-------------|
 | `jwt.supported_algorithms` | string[] | `["RS256", "ES256"]` | Supported JWT signing algorithms. `none` is never accepted — configuration validation rejects it even if explicitly listed. |
 | `jwt.clock_skew_leeway` | duration | `60s` | Maximum clock skew tolerance for `exp` and `iat` claim validation. Allows tokens to be accepted up to this duration past expiry to account for clock drift between the IdP and the platform. |
+| `jwt.authenticate_result_cache_ttl` | duration | `0s` | How long callers such as the SDK `CachingAuthenticator` may reuse a successful bearer-token result. `0s` marks every result NoStore. Otherwise `cache_until` = validation start + TTL, never past the verified `exp`; missing or already-passed `exp` stays NoStore. Must be ≤ 300s (bounds revocation and key-removal latency); the programmatic builder caps at 300s. |
 | `jwt.require_audience` | boolean | `false` | Whether `aud` claim is required. When `false`, missing `aud` passes; when `true`, missing `aud` → `Unauthorized`. |
 | `jwt.expected_audience` | string[] | — | Accepted audience values. Supports `*` as a substring wildcard (e.g., `https://*.example.com`). No other wildcards (`?`, `**`) are supported. If present and JWT has `aud`, at least one `aud` value must match at least one pattern. |
 | `jwt.trusted_issuers` | array | — | Ordered trusted issuer entries. Entries are evaluated top-to-bottom, and the first match wins. Each entry must define exactly one of `issuer` or `issuer_pattern`, and optional `discovery_url`. If `discovery_url` is omitted, the matched token `iss` value is used as the discovery base URL. If `discovery_url` contains `{issuer}`, the placeholder is replaced with the actual `iss` value from the token after the entry is matched. |
@@ -517,13 +518,13 @@ Does not manage client credentials (rotation, provisioning). Does not perform us
 | `s2s_oauth.claim_mapping` | map | — | Claim mapping for obtained tokens. Falls back to `jwt.claim_mapping` if not specified. Useful when S2S tokens use different claim names. |
 | `s2s_oauth.default_subject_type` | string | — | Fallback `subject_type` value when the S2S token does not contain a `subject_type` claim (e.g., `"gts.cf.core.security.subject_user.v1~"`). Many IdPs omit type claims from `client_credentials` tokens; this parameter ensures `SecurityContext.subject_type` is always populated for S2S flows. Not applied when the claim is present in the token. |
 | `s2s_oauth.token_cache.ttl` | duration | `300s` | Max TTL for cached access tokens |
-| `s2s_oauth.token_cache.max_entries` | integer | `100` | Max cached S2S result entries. On capacity overflow, evict the least-recently-used (`LRU`) entry. |
+| `s2s_oauth.token_cache.max_entries` | integer | `100` | Max cached S2S token entries. On capacity overflow, evict the least-recently-used (`LRU`) entry. |
 
 **Operations**:
 
 | Operation | Input | Output | Key Behavior |
 |-----------|-------|--------|-------------|
-| `exchange_client_credentials` | `ClientCredentialsRequest` | `AuthenticationResult` | 1. Normalize requested `scopes` (trim, dedupe, sort) and derive a non-reversible `credential_fingerprint` from `client_secret`; build cache key = `(client_id, normalized_scopes, credential_fingerprint)`. 2. Check result cache by full cache key. 3. On hit: return cached `AuthenticationResult` (no re-validation). 4. On miss: resolve token endpoint by fetching OIDC discovery from `s2s_oauth.discovery_url` and rejecting discovery metadata whose `issuer` is not in `jwt.trusted_issuers`. 5. POST `grant_type=client_credentials` with `client_id`, `client_secret`, `scope`. 6. Parse response `{ access_token, token_type, expires_in, scope }`. 7. Validate obtained JWT via Token Validator (its `iss` is matched against `jwt.trusted_issuers` — same allowlist as inbound tokens). 8. Map claims to `SecurityContext` via Claim Mapper using `s2s_oauth.claim_mapping` (falls back to `jwt.claim_mapping`); if `subject_type` is `None` after claim mapping and `s2s_oauth.default_subject_type` is configured, apply it as fallback; set `bearer_token` to obtained access token. 9. Cache `AuthenticationResult` with TTL = `min(expires_in, s2s_oauth.token_cache.ttl)`. |
+| `exchange_client_credentials` | `ClientCredentialsRequest` | `AuthenticationResult` | Reuse a fresh token for `AllowCached`; otherwise exchange at a trusted issuer's token endpoint. Always validate the JWT and map S2S claims. Return the bearer, credential expiry and reuse policy. See [S2S flow](#s2s-client-credentials-exchange-flow-plugin-internal) for cache identity and deadlines. |
 | `resolve_token_endpoint` | — | `string` | If `s2s_oauth.discovery_url` configured → fetch `{discovery_url}/.well-known/openid-configuration` (cached), require its `issuer` to be trusted, and return its `token_endpoint`. Else → error `TokenAcquisitionFailed("s2s_oauth.discovery_url not configured")`. |
 
 #### HTTP Client
@@ -675,7 +676,7 @@ The public API for gears. Delegates to the configured plugin.
 
 | Operation | Input | Output | Key Behavior |
 |-----------|-------|--------|-------------|
-| `authenticate` | `bearer_token: &str` | `Result<AuthenticationResult, AuthNResolverError>` | Delegates to configured plugin. Returns `NoPluginAvailable` if no plugin registered. |
+| `authenticate` | `request: &AuthenticationRequest` | `Result<AuthenticationResult, AuthNResolverError>` | Forwards the request (token and `cache_control`) unchanged to the configured plugin. Returns `NoPluginAvailable` if no plugin registered. |
 | `exchange_client_credentials` | `request: &ClientCredentialsRequest` | `Result<AuthenticationResult, AuthNResolverError>` | Delegates to configured plugin. Returns `NoPluginAvailable` if no plugin registered. |
 
 #### Plugin Interface (AuthNResolverPluginClient)
@@ -688,7 +689,7 @@ Implemented by each vendor-specific plugin (this OIDC plugin, the static dev plu
 
 | Operation | Input | Output | Key Behavior |
 |-----------|-------|--------|-------------|
-| `authenticate` | `bearer_token: &str` | `Result<AuthenticationResult, AuthNResolverError>` | Vendor-specific validation: JWT local validation, claim extraction, `SecurityContext` production. |
+| `authenticate` | `request: &AuthenticationRequest` | `Result<AuthenticationResult, AuthNResolverError>` | Vendor-specific validation of `request.bearer_token`: JWT local validation, claim extraction, `SecurityContext` production. This plugin has no authenticate cache, so every call is a fresh validation and `request.cache_control` (any mode, any tag) needs no handling; results carry no `CacheTag`. |
 | `exchange_client_credentials` | `request: &ClientCredentialsRequest` | `Result<AuthenticationResult, AuthNResolverError>` | OAuth2 `client_credentials` grant: exchanges credentials for access token, validates it, maps claims to `SecurityContext`. |
 
 #### Plugin Registration & Discovery
@@ -939,35 +940,27 @@ sequenceDiagram
 
     Gear->>Resolver: exchange_client_credentials(client_id, secret, scopes)
     Resolver->>Plugin: exchange_client_credentials(request)
-    Plugin->>Cache: get(cache_key)
-
-    alt Cache Hit (result not expired)
-        Cache-->>Plugin: cached AuthenticationResult
-        Plugin-->>Resolver: AuthenticationResult
-    else Cache Miss
+    alt AllowCached and fresh token entry
+        Cache-->>Plugin: token + original OAuth/reuse deadlines
+    else Miss or Refresh (tagged or unconditional)
         Plugin->>Plugin: resolve_token_endpoint()
-        Note over Plugin,IdP: Outbound POST wrapped by HTTP Client<br/>(request_timeout + retry policy)<br/>and by Circuit Breaker keyed on host.
-        Plugin->>IdP: POST {token_endpoint}<br/>grant_type=client_credentials<br/>&client_id=...&client_secret=...&scope=...
-        IdP-->>Plugin: { access_token, expires_in }
-
-        Plugin->>Validator: validate_jwt(access_token)
-        Validator-->>Plugin: JWT claims
-
-        Plugin->>Mapper: map_claims(claims, bearer_token=access_token)
-        Mapper-->>Plugin: SecurityContext
-
-        opt subject_type is None AND s2s.default_subject_type configured
-            Plugin->>Plugin: set subject_type = s2s.default_subject_type
-        end
-
-        Plugin->>Cache: insert(cache_key, AuthenticationResult, TTL)
-        Plugin-->>Resolver: AuthenticationResult
+        Plugin->>IdP: POST client_credentials grant
+        IdP-->>Plugin: access_token + optional expires_in
+        Plugin->>Cache: insert token + original absolute deadlines
     end
-
+    Plugin->>Validator: validate_jwt(access_token)
+    Validator-->>Plugin: verified claims including exp
+    Plugin->>Mapper: map claims, bearer and original OAuth deadline
+    Mapper-->>Plugin: SecurityContext with earliest credential expiry
+    Plugin-->>Resolver: AuthenticationResult + finite reuse policy or NoStore
     Resolver-->>Gear: AuthenticationResult
 ```
 
-**Description**: S2S credential exchange for gears performing background work. On cache miss, the obtained JWT is validated through the same pipeline used by `authenticate()`, and the resulting `AuthenticationResult` is cached. On cache hit, the cached result is returned directly without re-validation — this ensures the warm-cache path is sub-millisecond (hashmap lookup + TTL check only). Cache identity is `(client_id, normalized_scopes, credential_fingerprint)`, where `normalized_scopes` is the requested scope set after normalization/deduplication/sorting and `credential_fingerprint` is derived from `client_secret` without storing the raw secret. TTL = `min(expires_in, s2s_oauth.token_cache.ttl)`. When the IdP does not include a `subject_type` claim in the `client_credentials` token (common for many IdPs), the `s2s_oauth.default_subject_type` configuration provides a fallback value so that `SecurityContext.subject_type` is always populated for S2S flows.
+The S2S cache stores tokens with original absolute OAuth/reuse deadlines. Hits preserve deadlines and validate JWTs through the `authenticate()` pipeline. Context expiry is the earlier of the OAuth deadline and verified JWT `exp`; without `expires_in`, JWT `exp` applies. Cache identity is `(client_id, normalized_scopes, credential_fingerprint)`. `normalized_scopes` is the SDK `ScopeSet` canonical form, so a `ClientCredentialsProvider` slot and this cache agree on scope identity. `ClientCredentialsRequest::scopes` is an `Option<ScopeSet>`, already validated by the SDK (RFC 6749 scope-tokens, bounded size); `None` omits the `scope` form field so the IdP applies its defaults. TTL is `min(expires_in when known, s2s_oauth.token_cache.ttl)`. Validated results are not cached here.
+
+`CacheControl` permits reuse until the earlier of policy deadline and credential expiry. Zero TTL or a policy deadline elapsed during validation yields NoStore; zero OAuth lifetime means expired. Every `RequestCacheControl::Refresh` bypasses both cache reads: a different opaque tag cannot prove freshness. This plugin advertises no tag. The SDK [ClientCredentialsProvider](../../../../../../docs/arch/authorization/DESIGN.md#s2s-caching-provider) provides caller-side reuse and on-demand refresh.
+
+When the IdP omits `subject_type`, `s2s_oauth.default_subject_type` supplies the service-account fallback.
 
 #### First-Party vs Third-Party App Detection
 
@@ -996,15 +989,17 @@ Not applicable — this plugin uses **in-memory caches only**. No persistent dat
 |-------|-----|-------|-----|-------------|---------|
 | JWKS Cache | issuer URL | JWKS key set | fresh: 1h, stale: 24h | 10 | Cached signing keys for JWT validation. Stale entries served when IdP unreachable; entries past `stale_ttl` are evicted; capacity overflow uses `LRU`. |
 | Discovery Cache | resolved discovery base URL | OIDC configuration | 1h | 10 | Cached OIDC discovery endpoints. Capacity overflow uses `LRU`. |
-| Result Cache (S2S) | `client_id + normalized_scopes + credential_fingerprint` | `AuthenticationResult` | min(config TTL, token exp) | 100 | Cached validated S2S results (SecurityContext + token). Cache hit returns result directly without re-validation. Capacity overflow uses `LRU`. |
+| Token Cache (S2S) | `client_id + normalized_scopes + credential_fingerprint` | Access token + original OAuth/reuse deadlines | min(config TTL, expires_in when known) | 100 | JWT validation and mapping still run on a hit. Refresh bypasses reuse. Capacity overflow uses `LRU`. |
 
 **Cache invariants**:
 - All caches support concurrent access (thread-safe)
 - JWKS Cache supports forced refresh on unknown `kid` (key rotation handling)
 - JWKS Cache serves stale entries (up to `stale_ttl`) when the IdP is unreachable; entries are evicted after `stale_ttl` expires
-- Result Cache (S2S) stores validated `AuthenticationResult`, not raw tokens — cache hit is a direct return with no re-validation
-- Result Cache TTL is upper-bounded by token `exp` to prevent stale positive results
-- Result Cache key is `(client_id, normalized_scopes, credential_fingerprint)`; `normalized_scopes` is deduplicated + sorted, and `credential_fingerprint` is derived from `client_secret` without storing the raw secret
+- Token Cache (S2S) stores tokens with original OAuth/reuse deadlines; hits preserve deadlines and still validate JWTs
+- Published context expiry and caller reuse are bounded by verified JWT `exp`; the lower cache never grants validity
+- Unrepresentable JWT `exp` (after year 9999) yields `Unauthorized` on bearer and S2S paths, never unknown expiry
+- Cancellation while waiting for or holding a per-key single-flight gate releases its lease; idle gates are removed
+- Token Cache key is `(client_id, normalized_scopes, credential_fingerprint)`; `normalized_scopes` is deduplicated + sorted, and `credential_fingerprint` is derived from `client_secret` without storing the raw secret
 - No raw tokens or raw secrets are used as cache keys
 - All bounded in-memory caches use least-recently-used (`LRU`) eviction when `max_entries` is reached; TTL / `stale_ttl` expiry rules apply independently
 - Single-flight pattern: concurrent cache misses for the same full cache key coalesce into a single IdP token request to prevent thundering herd
@@ -1023,15 +1018,15 @@ The plugin emits four error variants. The SDK also defines `NoPluginAvailable` (
 |--------------------|-------------|-------------|-----------------|
 | `Unauthorized` | 401 | Token validation failed | Malformed token, non-JWT token, invalid signature, expired, missing `tenant_id`, invalid `sub` (not UUID), untrusted issuer, audience mismatch, signing key not found after successful refresh |
 | `ServiceUnavailable` | 503 | Authentication dependency unavailable | IdP unreachable, JWKS fetch failed with no usable cached keys, discovery endpoint unreachable, token endpoint unreachable, circuit breaker open |
-| `TokenAcquisitionFailed` | 502 | S2S credential exchange failed | Invalid client credentials, endpoint not configured, token response parse failure, obtained token validation failure |
+| `TokenAcquisitionFailed` | 502 | S2S credential exchange failed | Invalid client credentials, endpoint not configured, token response parse failure |
 | `Internal` | 500 | Internal error | Configuration error, unexpected state |
 
 #### Fail-Closed Behavior
 
 1. **IdP unreachable (authenticate)** → Attempt from JWKS cache; if no usable cache exists → `ServiceUnavailable` → 503
 2. **JWKS/discovery fetch fails** → Attempt from cache; if no usable cache exists → `ServiceUnavailable` → 503
-3. **IdP unreachable (S2S)** → Return cached S2S result if available; otherwise `ServiceUnavailable` → 503
-4. **Any validation failure** → `Unauthorized` → 401
+3. **IdP unreachable (S2S)** → `AllowCached` may use a fresh token after validation; `Refresh` bypasses the cache. Required IdP call failure yields `ServiceUnavailable` → 503; only this error permits SDK fallback before the reuse deadline
+4. **Invalid incoming or exchanged token** → `Unauthorized` → 401; transient validation dependencies remain `ServiceUnavailable`
 5. **Missing `tenant_id` claim** → `Unauthorized("missing tenant_id")` → 401
 6. **Invalid `sub` claim** → `Unauthorized("invalid subject id")` → 401
 7. **Non-JWT token** → `Unauthorized("unsupported token format")` → 401
@@ -1246,7 +1241,7 @@ The plugin is stateless. Recovery after restart consists of: (1) re-fetching OID
 | JWKS fetch | ≤ 500ms | ≤ 1s | Async refresh; stale-while-revalidate |
 | OIDC discovery | ≤ 500ms | ≤ 1s | Cached 1h; startup only |
 | S2S exchange (cold) | ≤ 500ms | ≤ 1s | Includes IdP round-trip + JWT validation |
-| S2S exchange (warm) | ≤ 1ms | ≤ 5ms | Cached result returned directly (no re-validation) |
+| S2S exchange (warm) | ≤ 1ms | ≤ 5ms | Cached token and JWKS; JWT validation and claim mapping still run |
 
 #### Capacity
 
@@ -1294,11 +1289,11 @@ The plugin is stateless. Recovery after restart consists of: (1) re-fetching OID
 | Claim mapping — first-party client | Configured first_party_clients | `token_scopes = ["*"]` |
 | Claim mapping — third-party client | Configured first_party_clients | `token_scopes = [extracted scopes]` |
 | Claim mapping — optional `subject_type` absent | — | `subject_type = None` |
-| S2S exchange — cached result | Pre-populated result cache | Cached `AuthenticationResult` returned, no HTTP call, no re-validation |
-| S2S exchange — same `client_id`, different scopes | Pre-populated result cache for one scope set | Cache miss; token for the new scope set is acquired separately |
-| S2S exchange — same `client_id`, same scopes different order | Pre-populated result cache | Cache hit after scope normalization |
-| S2S exchange — same `client_id`, different `client_secret` | Pre-populated result cache for old credentials | Cache miss; stale entry is not reused across credential changes |
-| S2S exchange — cache miss | Mock HTTP response | Token acquired, validated, result cached |
+| S2S exchange — cached token | Pre-populated token cache | Original deadlines preserved; JWT validation and mapping run without a token-endpoint call |
+| S2S exchange — same `client_id`, different scopes | Pre-populated token cache for one scope set | Cache miss; token for the new scope set is acquired separately |
+| S2S exchange — same `client_id`, same scopes different order | Pre-populated token cache | Cache hit after scope normalization |
+| S2S exchange — same `client_id`, different `client_secret` | Pre-populated token cache for old credentials | Cache miss; stale entry is not reused across credential changes |
+| S2S exchange — cache miss | Mock HTTP response | Token acquired and cached with original deadlines; JWT validated and claims mapped |
 | S2S exchange — invalid credentials | Mock HTTP 401 | `TokenAcquisitionFailed` |
 | S2S exchange — token endpoint not configured | Empty config | `TokenAcquisitionFailed("token endpoint not configured")` |
 | Error mapping — all variants | — | Each `AuthNResolverError` variant maps correctly |
@@ -1313,7 +1308,7 @@ The plugin is stateless. Recovery after restart consists of: (1) re-fetching OID
 | Circuit breaker — trips after N failures | Mock HTTP server returning errors | `ServiceUnavailable` after threshold when no cache can satisfy the request |
 | Circuit breaker — recovers in half-open | Mock HTTP server: errors → success | Transitions closed → open → half-open → closed |
 | S2S full flow with mock IdP | Mock HTTP server serving token endpoint | `ClientCredentialsRequest` → `AuthenticationResult` |
-| S2S result caching — TTL respected | Mock HTTP server | Second exchange uses cached `AuthenticationResult`; no HTTP call, no re-validation |
+| S2S token caching — TTL respected | Mock HTTP server | Second exchange reuses the token and original deadlines; no token-endpoint call, JWT re-validation still runs |
 
 ### Known Limitations & Technical Debt
 
@@ -1324,7 +1319,7 @@ The plugin is stateless. Recovery after restart consists of: (1) re-fetching OID
 | No multi-issuer federation per tenant | Scope | Each tenant is served by exactly one issuer. Multiple issuers serving the same tenant (cross-issuer federation) is not supported. If needed, consolidate at the IdP level or partition tenants so each has a single issuer. |
 | No JWKS pinning | Security | Optional JWKS key ID pinning for production environments is documented as a security consideration but not implemented in v1. |
 | No shared cache for out-of-process mode | Reliability | In out-of-process (sidecar) deployment, each instance maintains its own in-memory caches. Shared caching (e.g., Redis) for JWKS across instances is deferred. |
-| No proactive S2S refresh | Design | The S2S cache is on-demand only. The plugin does not refresh near expiry in the background; proactive refresh is deferred to a higher-level SDK/provider layer once token lifetime propagation and refresh ownership are standardized. |
+| No periodic S2S refresh | Design | The plugin has no refresh worker. The SDK [ClientCredentialsProvider](../../../../../../docs/arch/authorization/DESIGN.md#s2s-caching-provider) starts early refresh on caller demand. |
 
 ## 5. Traceability
 

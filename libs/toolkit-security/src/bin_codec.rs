@@ -4,16 +4,15 @@ use thiserror::Error;
 
 /// Format version, written as the first byte of every encoded blob.
 ///
-/// [`decode_bin`] accepts this version and no other, so producer and consumer
-/// must agree exactly — there is no backward-compatible read path.
+/// **Bump manually whenever [`SecurityContext`]'s serialized layout changes.**
+/// postcard is positional; the version check prevents mismatched layouts
+/// from being silently misread.
+/// [`decode_bin`] rejects other versions with `UnsupportedVersion`, so
+/// producers and consumers must be upgraded together.
 ///
-/// **Bump this whenever [`SecurityContext`]'s serialized field list changes.**
-/// postcard is positional and carries no field names, so adding, removing or
-/// reordering a field silently changes the layout: an older decoder would then
-/// read the new bytes as whatever its own field order says, rather than
-/// rejecting them. The version byte is the only thing that turns that into a
-/// clean `UnsupportedVersion` error, and nothing derives it automatically.
-pub const SECCTX_BIN_VERSION: u8 = 1;
+/// - v1: `subject_id`, `subject_type`, `subject_tenant_id`, `token_scopes`.
+/// - v2: v1 plus `expires_at`.
+pub const SECCTX_BIN_VERSION: u8 = 2;
 
 /// Why a [`SecurityContext`] could not be encoded.
 #[derive(Debug, Error)]

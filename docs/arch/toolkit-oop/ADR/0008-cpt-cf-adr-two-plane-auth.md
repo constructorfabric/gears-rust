@@ -187,8 +187,12 @@ method to the `Authorization` carrier.
   listener. This is a separate type from the tenant `SecurityContext`, not a nil-tenant instance of it.
 * **`PeerAuthenticated` / `PlatformIdentity` are for workload policy only** — they never substitute for tenant-plane JWT
   validation, and `PlatformSecurityContext` is never passed to the tenant `PolicyEnforcer`.
-* **Per-hop cost** is ~0.5 ms (JWKS-cached). Deferred mitigation: bounded positive-result caching in the AuthN Resolver
-  client SDK; triggered only if benchmarks exceed budget.
+* **Per-hop cost** is ~0.5 ms (JWKS-cached). Mitigation, available as an explicit opt-in: bounded positive-result
+  caching in the AuthN Resolver client SDK (`CachingAuthenticator`, usable as a `BearerAuthenticator`). It reuses a
+  successful validation of the same token only while the producer allows it (OIDC plugin:
+  `jwt.authenticate_result_cache_ttl`, default `0s` = no-store, at most 300s, never past verified `exp`), capped by
+  the consumer's own TTL. Failures are never cached. The default adapter still validates on every call; no
+  trusted-peer shortcut is introduced.
 
 ### NFR impact
 

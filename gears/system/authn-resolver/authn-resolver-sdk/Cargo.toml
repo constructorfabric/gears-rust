@@ -23,15 +23,26 @@ secrecy = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+time = { workspace = true }
 schemars = { workspace = true }
 
 # GTS types
 gts = { workspace = true }
 toolkit-gts = { workspace = true }
 
+# ClientCredentialsProvider: owned acquisition task, single-flight, jittered refresh
+tokio = { workspace = true, features = ["rt", "sync", "time"] }
+parking_lot = { workspace = true }
+rand = { workspace = true }
+# ClientCredentialsProvider: acquisition failures and recoveries
+tracing = { workspace = true }
+
 # ToolKit dependencies
 toolkit = { workspace = true }
 toolkit-security = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt"] }
+# Integration tests must capture resolver and SDK events across crate targets.
+tracing-test = { workspace = true, features = ["no-env-filter"] }
+tokio = { workspace = true, features = ["macros", "rt", "test-util"] }
+uuid = { workspace = true }

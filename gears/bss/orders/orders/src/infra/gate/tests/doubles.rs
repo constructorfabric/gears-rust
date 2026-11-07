@@ -39,7 +39,7 @@ pub struct FakeResolver {
     /// The exchange never answers within any deadline.
     pub stall: bool,
     pub exchanges: AtomicUsize,
-    pub requests: parking_lot::Mutex<Vec<(String, Vec<String>)>>,
+    pub requests: parking_lot::Mutex<Vec<(String, Option<authn_resolver_sdk::ScopeSet>)>>,
 }
 
 impl FakeResolver {
@@ -61,7 +61,10 @@ impl FakeResolver {
 
 #[async_trait]
 impl AuthNResolverClient for FakeResolver {
-    async fn authenticate(&self, _token: &str) -> Result<AuthenticationResult, AuthNResolverError> {
+    async fn authenticate(
+        &self,
+        _request: &authn_resolver_sdk::AuthenticationRequest,
+    ) -> Result<AuthenticationResult, AuthNResolverError> {
         Err(AuthNResolverError::Internal("not used".to_owned()))
     }
     async fn exchange_client_credentials(
@@ -87,7 +90,7 @@ impl AuthNResolverClient for FakeResolver {
             builder = builder.subject_type(subject_type);
         }
         let security_context = builder.build().unwrap();
-        Ok(AuthenticationResult { security_context })
+        Ok(AuthenticationResult::new(security_context))
     }
 }
 
@@ -410,11 +413,13 @@ pub fn pricing_catalog(
         client_secret: secrecy::SecretString::from("x"),
         scopes: Vec::new(),
     };
-    let authority: std::sync::Arc<dyn CommercialAuthority> =
-        std::sync::Arc::new(AuthnAuthority::new(
+    let authority: std::sync::Arc<dyn CommercialAuthority> = std::sync::Arc::new(
+        AuthnAuthority::new(
             std::sync::Arc::new(FakeResolver::new(Uuid::from_u128(0x0bd5), seller)),
             &[identity],
-        ));
+        )
+        .unwrap(),
+    );
     crate::infra::gate::pricing_read::PricingCatalogReads::new(
         pricing,
         std::sync::Arc::new(FakeProducts::default()),

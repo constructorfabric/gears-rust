@@ -685,8 +685,9 @@ rebuilds the full context (including the bearer token) from it.
 - `SecurityContext` (`libs/toolkit-security/src/context.rs`) uses `SecretString` (from `secrecy` crate) for
   `bearer_token`, with `#[serde(skip)]`.
 - `toolkit-security/src/bin_codec.rs` already provides `encode_bin(ctx) -> Vec<u8>` and
-  `decode_bin(bytes) -> SecurityContext` using postcard with a version byte prefix (`SECCTX_BIN_VERSION = 1`). Since
-  postcard respects serde attributes, `bearer_token` is excluded from the binary encoding.
+  `decode_bin(bytes) -> SecurityContext` using positional postcard encoding (`SECCTX_BIN_VERSION = 2`, adding `expires_at`).
+  Serialized field changes require a version bump and coordinated peer upgrades; mismatches return `UnsupportedVersion`.
+  `bearer_token` is excluded from binary encoding by `#[serde(skip)]`.
 - `toolkit-transport-grpc` already provides `attach_secctx(meta, ctx)` and `extract_secctx(meta)` for gRPC binary
   metadata using the key `"x-secctx-bin"`. This works because gRPC binary metadata (keys ending in `-bin`) carries raw
   bytes.
@@ -1857,8 +1858,9 @@ async fn secctx_from_request(
 
     // Signature + claims check, JWKS-cached (~0.5 ms on hit). Returns a fully
     // populated SecurityContext, so no post-deserialization bearer-token merge.
+    let request = AuthenticationRequest::new(token); // fresh validation
     authn
-        .authenticate(token)
+        .authenticate(&request)
         .await
         .map_err(|_| SecurityContextHttpError::Unauthorized)
 }

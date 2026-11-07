@@ -1,4 +1,5 @@
 use secrecy::SecretString;
+use time::{OffsetDateTime, UtcOffset};
 use uuid::Uuid;
 
 /// Error returned when `SecurityContextBuilder::build()` is called without
@@ -13,6 +14,8 @@ pub enum SecurityContextBuildError {
         "subject_tenant_id is required - use SecurityContext::anonymous() for unauthenticated contexts"
     )]
     MissingSubjectTenantId,
+    #[error("expires_at is outside the representable range once converted to UTC")]
+    ExpiresAtOutOfRange,
 }
 
 /// `SecurityContext` encapsulates the security-related information for a request or operation.
@@ -44,6 +47,53 @@ pub struct SecurityContext {
     /// Wrapped in `SecretString` so `Debug` redacts the value automatically.
     #[serde(skip)]
     bearer_token: Option<SecretString>,
+    /// When the verified or exchanged credential behind this context expires.
+    ///
+    /// JWT `exp` or the `OAuth2` token deadline, never the `client_secret`
+    /// lifetime. Always UTC; revocation may happen earlier. `None` means
+    /// unknown expiry, not indefinite validity.
+    ///
+    /// `#[serde(default)]` accepts older JSON payloads. Positional formats
+    /// (`x-secctx-bin` postcard) require matching layouts and codec versions.
+    #[serde(default, with = "rfc3339_option")]
+    expires_at: Option<OffsetDateTime>,
+}
+
+/// `Option<OffsetDateTime>` as an `Option<String>` holding RFC 3339.
+///
+/// Uses `Option<String>` because `time::serde::rfc3339::option` requires a
+/// self-describing format and fails with postcard's `WontImplement`.
+mod rfc3339_option {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer, de, ser};
+    use time::format_description::well_known::Rfc3339;
+    use time::{OffsetDateTime, UtcOffset};
+
+    #[expect(clippy::ref_option, reason = "signature fixed by `#[serde(with)]`")]
+    pub(super) fn serialize<S: Serializer>(
+        value: &Option<OffsetDateTime>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        value
+            .map(|t| t.format(&Rfc3339))
+            .transpose()
+            .map_err(ser::Error::custom)?
+            .serialize(serializer)
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Option<OffsetDateTime>, D::Error> {
+        let Some(text) = Option::<String>::deserialize(deserializer)? else {
+            return Ok(None);
+        };
+        let parsed = OffsetDateTime::parse(&text, &Rfc3339).map_err(de::Error::custom)?;
+        // RFC 3339 parsing checks the local date-time only; the UTC instant can
+        // still fall outside `time`'s range, where `to_offset` would panic.
+        parsed
+            .checked_to_offset(UtcOffset::UTC)
+            .map(Some)
+            .ok_or_else(|| de::Error::custom("expires_at is out of range in UTC"))
+    }
 }
 
 impl SecurityContext {
@@ -65,6 +115,7 @@ impl SecurityContext {
             subject_tenant_id: Uuid::default(),
             token_scopes: Vec::new(),
             bearer_token: None,
+            expires_at: None,
         }
     }
 
@@ -125,6 +176,15 @@ impl SecurityContext {
     pub fn bearer_token(&self) -> Option<&SecretString> {
         self.bearer_token.as_ref()
     }
+
+    /// When the verified or exchanged credential behind this context expires.
+    ///
+    /// An upper bound: the credential can be revoked earlier. `None` means the
+    /// expiry is unknown, not that the context never expires.
+    #[must_use]
+    pub fn expires_at(&self) -> Option<OffsetDateTime> {
+        self.expires_at
+    }
 }
 
 /// Builds a [`SecurityContext`] field by field.
@@ -144,6 +204,7 @@ pub struct SecurityContextBuilder {
     subject_tenant_id: Option<Uuid>,
     token_scopes: Vec<String>,
     bearer_token: Option<SecretString>,
+    expires_at: Option<OffsetDateTime>,
 }
 
 impl SecurityContextBuilder {
@@ -190,6 +251,17 @@ impl SecurityContextBuilder {
         self
     }
 
+    /// Set when the verified or exchanged credential expires.
+    ///
+    /// Use the credential's own expiry (JWT `exp`, `OAuth2` token deadline),
+    /// never the lifetime of a long-lived `client_secret`. Stored in UTC;
+    /// [`build`](Self::build) fails if the instant cannot be represented there.
+    #[must_use]
+    pub fn expires_at(mut self, expires_at: OffsetDateTime) -> Self {
+        self.expires_at = Some(expires_at);
+        self
+    }
+
     /// Build the `SecurityContext`.
     ///
     /// # Errors
@@ -197,6 +269,8 @@ impl SecurityContextBuilder {
     /// Returns `SecurityContextBuildError` if `subject_id` or
     /// `subject_tenant_id` was not set. Use `SecurityContext::anonymous()`
     /// for contexts that intentionally have no authenticated subject.
+    /// Returns [`SecurityContextBuildError::ExpiresAtOutOfRange`] if
+    /// `expires_at` has no UTC representation.
     pub fn build(self) -> Result<SecurityContext, SecurityContextBuildError> {
         let subject_id = self
             .subject_id
@@ -204,12 +278,20 @@ impl SecurityContextBuilder {
         let subject_tenant_id = self
             .subject_tenant_id
             .ok_or(SecurityContextBuildError::MissingSubjectTenantId)?;
+        let expires_at = self
+            .expires_at
+            .map(|t| {
+                t.checked_to_offset(UtcOffset::UTC)
+                    .ok_or(SecurityContextBuildError::ExpiresAtOutOfRange)
+            })
+            .transpose()?;
         Ok(SecurityContext {
             subject_id,
             subject_type: self.subject_type,
             subject_tenant_id,
             token_scopes: self.token_scopes,
             bearer_token: self.bearer_token,
+            expires_at,
         })
     }
 }
@@ -447,5 +529,107 @@ mod tests {
             .unwrap();
 
         assert!(ctx.token_scopes().is_empty());
+    }
+
+    #[test]
+    fn expires_at_round_trips_through_json_as_utc_rfc3339() {
+        let in_plus_two = OffsetDateTime::from_unix_timestamp(1_893_499_200)
+            .unwrap()
+            .to_offset(UtcOffset::from_hms(2, 0, 0).unwrap());
+        let ctx = SecurityContext::builder()
+            .subject_id(Uuid::from_u128(1))
+            .subject_tenant_id(Uuid::from_u128(2))
+            .expires_at(in_plus_two)
+            .build()
+            .unwrap();
+
+        assert_eq!(ctx.expires_at(), Some(in_plus_two));
+        assert_eq!(ctx.expires_at().unwrap().offset(), UtcOffset::UTC);
+
+        let json = serde_json::to_value(&ctx).unwrap();
+        assert_eq!(json["expires_at"], "2030-01-01T12:00:00Z");
+        let back: SecurityContext = serde_json::from_value(json).unwrap();
+        assert_eq!(back.expires_at(), Some(in_plus_two));
+    }
+
+    #[test]
+    fn json_written_before_expires_at_existed_still_deserializes() {
+        let old = serde_json::json!({
+            "subject_id": "550e8400-e29b-41d4-a716-446655440001",
+            "subject_type": "service",
+            "subject_tenant_id": "550e8400-e29b-41d4-a716-446655440002",
+            "token_scopes": ["*"],
+        });
+
+        let ctx: SecurityContext = serde_json::from_value(old).unwrap();
+
+        assert!(ctx.expires_at().is_none());
+        assert_eq!(ctx.token_scopes(), ["*".to_owned()]);
+
+        let with_offset = serde_json::json!({
+            "subject_id": "550e8400-e29b-41d4-a716-446655440001",
+            "subject_tenant_id": "550e8400-e29b-41d4-a716-446655440002",
+            "expires_at": "2030-01-01T14:00:00+02:00",
+        });
+        let ctx: SecurityContext = serde_json::from_value(with_offset).unwrap();
+        let expires_at = ctx.expires_at().unwrap();
+        assert_eq!(expires_at.offset(), UtcOffset::UTC, "normalized on read");
+        assert_eq!(expires_at.unix_timestamp(), 1_893_499_200);
+    }
+
+    #[test]
+    fn json_with_a_malformed_expires_at_is_rejected() {
+        let payload = serde_json::json!({
+            "subject_id": "550e8400-e29b-41d4-a716-446655440001",
+            "subject_tenant_id": "550e8400-e29b-41d4-a716-446655440002",
+            "expires_at": "2030-01-01 12:00",
+        });
+
+        assert!(serde_json::from_value::<SecurityContext>(payload).is_err());
+    }
+
+    #[test]
+    fn json_with_an_expires_at_out_of_range_in_utc_is_rejected() {
+        // Valid RFC 3339, but year 10000 once normalized to UTC.
+        let payload = serde_json::json!({
+            "subject_id": "550e8400-e29b-41d4-a716-446655440001",
+            "subject_tenant_id": "550e8400-e29b-41d4-a716-446655440002",
+            "expires_at": "9999-12-31T23:59:59-01:00",
+        });
+
+        let err = serde_json::from_value::<SecurityContext>(payload)
+            .expect_err("out-of-range expiry must be a decode error, not a panic");
+        assert!(err.to_string().contains("expires_at"), "{err}");
+    }
+
+    #[test]
+    fn builder_rejects_an_expires_at_out_of_range_in_utc() {
+        let year_9999_minus_one = time::PrimitiveDateTime::new(
+            time::Date::from_calendar_date(9999, time::Month::December, 31).unwrap(),
+            time::Time::from_hms(23, 30, 0).unwrap(),
+        )
+        .assume_offset(UtcOffset::from_hms(-1, 0, 0).unwrap());
+
+        let err = SecurityContext::builder()
+            .subject_id(Uuid::from_u128(1))
+            .subject_tenant_id(Uuid::from_u128(2))
+            .expires_at(year_9999_minus_one)
+            .build()
+            .expect_err("expiry past the UTC range must not build");
+        assert!(
+            matches!(err, SecurityContextBuildError::ExpiresAtOutOfRange),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn expires_at_defaults_to_unknown() {
+        assert!(SecurityContext::anonymous().expires_at().is_none());
+        let ctx = SecurityContext::builder()
+            .subject_id(Uuid::from_u128(1))
+            .subject_tenant_id(Uuid::from_u128(2))
+            .build()
+            .unwrap();
+        assert!(ctx.expires_at().is_none());
     }
 }

@@ -88,7 +88,7 @@ impl ClientCredentialsExchanger for DisabledTokenExchanger {
         &self,
         _request: &ClientCredentialsRequest,
         _issuer_trust: &IssuerTrustConfig,
-    ) -> Result<String, AuthNError> {
+    ) -> Result<crate::domain::ports::ExchangedToken, AuthNError> {
         Err(AuthNError::TokenEndpointNotConfigured)
     }
 }
@@ -151,7 +151,8 @@ async fn test_authenticate_validates_with_jwks_provider() {
     let (plugin, _) = jwt_plugin_with_jwks_provider(StaticJwksProvider::available());
     let token = sign_valid_jwt();
     let result =
-        <OidcAuthNPlugin as AuthNResolverPluginClient>::authenticate(&plugin, &token).await;
+        <OidcAuthNPlugin as AuthNResolverPluginClient>::authenticate(&plugin, &request(&token))
+            .await;
 
     assert!(
         result.is_ok(),
@@ -165,7 +166,8 @@ async fn test_jwks_provider_unavailable_returns_service_unavailable() {
     let token = sign_valid_jwt();
 
     let result =
-        <OidcAuthNPlugin as AuthNResolverPluginClient>::authenticate(&plugin, &token).await;
+        <OidcAuthNPlugin as AuthNResolverPluginClient>::authenticate(&plugin, &request(&token))
+            .await;
 
     assert!(
         matches!(
@@ -189,7 +191,8 @@ async fn metrics_increment_for_successful_jwt_validation() {
     let (plugin, harness) = jwt_plugin_with_jwks_provider(StaticJwksProvider::available());
     let token = sign_valid_jwt();
     let result =
-        <OidcAuthNPlugin as AuthNResolverPluginClient>::authenticate(&plugin, &token).await;
+        <OidcAuthNPlugin as AuthNResolverPluginClient>::authenticate(&plugin, &request(&token))
+            .await;
     assert!(result.is_ok(), "JWT path should succeed: {result:?}");
 
     harness.force_flush();
@@ -352,7 +355,11 @@ async fn concurrent_authenticate_calls_all_succeed() {
         let p = Arc::clone(&plugin);
         let token = sign_valid_jwt();
         handles.push(tokio::spawn(async move {
-            <OidcAuthNPlugin as AuthNResolverPluginClient>::authenticate(p.as_ref(), &token).await
+            <OidcAuthNPlugin as AuthNResolverPluginClient>::authenticate(
+                p.as_ref(),
+                &request(&token),
+            )
+            .await
         }));
     }
 
@@ -394,7 +401,7 @@ async fn es256_token_authenticates_with_ec_jwk() {
     )
     .unwrap();
     assert!(
-        <OidcAuthNPlugin as AuthNResolverPluginClient>::authenticate(&plugin, &token)
+        <OidcAuthNPlugin as AuthNResolverPluginClient>::authenticate(&plugin, &request(&token))
             .await
             .is_ok()
     );
@@ -403,8 +410,288 @@ async fn es256_token_authenticates_with_ec_jwk() {
     signature[0] ^= 1;
     let tampered = format!("{message}.{}", URL_SAFE_NO_PAD.encode(signature));
     assert!(
-        <OidcAuthNPlugin as AuthNResolverPluginClient>::authenticate(&plugin, &tampered)
+        <OidcAuthNPlugin as AuthNResolverPluginClient>::authenticate(&plugin, &request(&tampered))
             .await
             .is_err()
     );
+}
+
+struct FixedTokenExchanger(crate::domain::ports::ExchangedToken);
+
+#[async_trait]
+impl ClientCredentialsExchanger for FixedTokenExchanger {
+    async fn exchange(
+        &self,
+        _request: &ClientCredentialsRequest,
+        _issuer_trust: &IssuerTrustConfig,
+    ) -> Result<crate::domain::ports::ExchangedToken, AuthNError> {
+        Ok(self.0.clone())
+    }
+}
+
+#[tokio::test]
+async fn exchanged_context_uses_earliest_original_expiry_and_finite_reuse_policy() {
+    use crate::domain::ports::ExchangedToken;
+    use time::OffsetDateTime;
+
+    let now = OffsetDateTime::now_utc();
+    let jwt_expiry =
+        OffsetDateTime::from_unix_timestamp(i64::try_from(future_exp()).unwrap()).unwrap();
+    let claims = serde_json::json!({
+        "sub": "550e8400-e29b-41d4-a716-446655440000",
+        "iss": TEST_ISSUER,
+        "exp": jwt_expiry.unix_timestamp(),
+        "tenant_id": "550e8400-e29b-41d4-a716-446655440111",
+    });
+    let token = sign_jwt(&claims, Some(TEST_KID));
+    let request = ClientCredentialsRequest::new("svc", secrecy::SecretString::from("secret"));
+    for oauth_expiry in [
+        None,
+        // Already elapsed: no reuse even when the lower cache allows it.
+        Some(now - std::time::Duration::from_secs(1)),
+        Some(now + std::time::Duration::from_secs(10)),
+        Some(jwt_expiry + std::time::Duration::from_secs(10)),
+    ] {
+        for cache_until in [
+            now - std::time::Duration::from_secs(1),
+            now + std::time::Duration::from_secs(100),
+        ] {
+            let plugin = OidcAuthNPluginBuilder::new(
+                base_jwt_validation_config(),
+                test_issuer_trust(),
+                TEST_S2S_DEFAULT_SUBJECT_TYPE.to_owned(),
+            )
+            .build(
+                Arc::new(StaticJwksProvider::available()),
+                Arc::new(FixedTokenExchanger(ExchangedToken {
+                    access_token: token.clone().into(),
+                    expires_at: oauth_expiry,
+                    cache_until,
+                })),
+                MetricsHarness::new().metrics(),
+            );
+            let result = plugin.exchange_client_credentials(&request).await.unwrap();
+            let expected_expiry = oauth_expiry.map_or(jwt_expiry, |expiry| expiry.min(jwt_expiry));
+            assert_eq!(result.security_context.expires_at(), Some(expected_expiry));
+            let reuse_until = cache_until.min(expected_expiry);
+            assert_eq!(
+                result.cache_control.cache_until,
+                (reuse_until > now).then_some(reuse_until),
+                "oauth {oauth_expiry:?}, lower cache until {cache_until}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn bearer_context_propagates_validated_jwt_exp_without_opt_in_to_reuse() {
+    let expiry = future_exp();
+    let token = sign_jwt(
+        &serde_json::json!({
+            "sub": "550e8400-e29b-41d4-a716-446655440000",
+            "iss": TEST_ISSUER,
+            "exp": expiry,
+            "tenant_id": "550e8400-e29b-41d4-a716-446655440111",
+        }),
+        Some(TEST_KID),
+    );
+    let result = AuthNResolverPluginClient::authenticate(&make_plugin(), &request(&token))
+        .await
+        .unwrap();
+    assert_eq!(
+        result
+            .security_context
+            .expires_at()
+            .unwrap()
+            .unix_timestamp(),
+        i64::try_from(expiry).unwrap()
+    );
+    assert!(result.cache_control.is_no_store());
+}
+
+#[tokio::test]
+async fn bearer_token_with_an_unrepresentable_exp_is_rejected_after_validation() {
+    // Valid JWT, but year 10000 exceeds OffsetDateTime's range.
+    // Reject during mapping rather than publish an unknown expiry.
+    let token = sign_jwt(
+        &serde_json::json!({
+            "sub": "550e8400-e29b-41d4-a716-446655440000",
+            "iss": TEST_ISSUER,
+            "exp": 253_402_300_800_u64,
+            "tenant_id": "550e8400-e29b-41d4-a716-446655440111",
+        }),
+        Some(TEST_KID),
+    );
+
+    let err = AuthNResolverPluginClient::authenticate(&make_plugin(), &request(&token))
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(&err, AuthNResolverError::Unauthorized(msg) if msg == "invalid credential expiry"),
+        "{err:?}"
+    );
+}
+
+// --- caller reuse policy for bearer-token results ---------------------------
+
+/// Serves the test JWKS after `delay`, to model slow validation.
+struct DelayedJwksProvider {
+    inner: StaticJwksProvider,
+    delay: std::time::Duration,
+}
+
+#[async_trait]
+impl JwksProvider for DelayedJwksProvider {
+    async fn get_jwks(&self, issuer: &str, base: &Url) -> Result<Arc<JwkSet>, AuthNError> {
+        tokio::time::sleep(self.delay).await;
+        self.inner.get_jwks(issuer, base).await
+    }
+
+    async fn force_refresh(&self, issuer: &str, base: &Url) -> Result<Arc<JwkSet>, AuthNError> {
+        self.get_jwks(issuer, base).await
+    }
+}
+
+fn plugin_with_result_ttl(
+    ttl: std::time::Duration,
+    jwks: Arc<dyn JwksProvider>,
+) -> OidcAuthNPlugin {
+    OidcAuthNPluginBuilder::new(
+        base_jwt_validation_config(),
+        test_issuer_trust(),
+        TEST_S2S_DEFAULT_SUBJECT_TYPE.to_owned(),
+    )
+    .authenticate_result_cache_ttl(ttl)
+    .build(
+        jwks,
+        Arc::new(DisabledTokenExchanger),
+        MetricsHarness::new().metrics(),
+    )
+}
+
+fn jwt_expiring_in(secs: i64) -> String {
+    let exp = time::OffsetDateTime::now_utc().unix_timestamp() + secs;
+    sign_jwt(
+        &serde_json::json!({
+            "sub": "550e8400-e29b-41d4-a716-446655440000",
+            "iss": TEST_ISSUER,
+            "exp": exp,
+            "tenant_id": "550e8400-e29b-41d4-a716-446655440111",
+        }),
+        Some(TEST_KID),
+    )
+}
+
+async fn authenticate_result(plugin: &OidcAuthNPlugin, token: &str) -> AuthenticationResult {
+    <OidcAuthNPlugin as AuthNResolverPluginClient>::authenticate(plugin, &request(token))
+        .await
+        .expect("token should validate")
+}
+
+#[tokio::test]
+async fn bearer_results_are_no_store_by_default() {
+    let result = authenticate_result(&make_plugin(), &sign_valid_jwt()).await;
+    assert!(result.cache_control.is_no_store());
+}
+
+#[tokio::test]
+async fn a_configured_ttl_allows_reuse_from_validation_start_bounded_by_exp() {
+    let ttl = std::time::Duration::from_secs(120);
+    let plugin = plugin_with_result_ttl(ttl, Arc::new(StaticJwksProvider::available()));
+
+    let before = time::OffsetDateTime::now_utc();
+    let result = authenticate_result(&plugin, &jwt_expiring_in(3600)).await;
+    let after = time::OffsetDateTime::now_utc();
+    let until = result.cache_control.cache_until.expect("reuse allowed");
+    assert!(until >= before + ttl && until <= after + ttl, "{until}");
+
+    let short = authenticate_result(&plugin, &jwt_expiring_in(30)).await;
+    assert_eq!(
+        short.cache_control.cache_until,
+        short.security_context.expires_at()
+    );
+}
+
+#[tokio::test]
+async fn slow_validation_does_not_extend_reuse_past_its_start_plus_ttl() {
+    let jwks = DelayedJwksProvider {
+        inner: StaticJwksProvider::available(),
+        delay: std::time::Duration::from_millis(300),
+    };
+    let plugin = plugin_with_result_ttl(std::time::Duration::from_millis(200), Arc::new(jwks));
+    let result = authenticate_result(&plugin, &jwt_expiring_in(3600)).await;
+    assert!(
+        result.cache_control.is_no_store(),
+        "the window closed during validation: {:?}",
+        result.cache_control
+    );
+}
+
+#[test]
+fn the_reuse_policy_requires_a_positive_ttl_and_a_future_known_expiry() {
+    let start = time::OffsetDateTime::from_unix_timestamp(1_900_000_000).unwrap();
+    let ttl = std::time::Duration::from_secs(60);
+    let secs = |n: i64| start + time::Duration::seconds(n);
+    let policy = |ttl, exp, now| authenticate_cache_control(ttl, start, exp, now).cache_until;
+
+    assert_eq!(
+        policy(std::time::Duration::ZERO, Some(secs(600)), start),
+        None,
+        "default"
+    );
+    assert_eq!(policy(ttl, None, start), None, "unknown expiry");
+    assert_eq!(
+        policy(ttl, Some(secs(-1)), start),
+        None,
+        "accepted within leeway"
+    );
+    assert_eq!(
+        policy(ttl, Some(secs(600)), secs(60)),
+        None,
+        "window closed at completion"
+    );
+    assert_eq!(
+        policy(ttl, Some(secs(600)), secs(1)),
+        Some(secs(60)),
+        "anchored at start"
+    );
+    assert_eq!(
+        policy(ttl, Some(secs(30)), secs(1)),
+        Some(secs(30)),
+        "bounded by exp"
+    );
+}
+
+#[test]
+fn an_unrepresentable_reuse_deadline_is_no_store() {
+    let start = time::OffsetDateTime::from_unix_timestamp(1_900_000_000).unwrap();
+    let far = Some(time::OffsetDateTime::new_utc(
+        time::Date::MAX,
+        time::Time::MIDNIGHT,
+    ));
+    assert_eq!(
+        authenticate_cache_control(Duration::MAX, start, far, start).cache_until,
+        None
+    );
+}
+
+#[tokio::test]
+async fn a_programmatic_ttl_is_capped_at_the_policy_bound() {
+    let plugin = plugin_with_result_ttl(Duration::MAX, Arc::new(StaticJwksProvider::available()));
+    let before = time::OffsetDateTime::now_utc();
+    let result = authenticate_result(&plugin, &jwt_expiring_in(3600)).await;
+    let until = result.cache_control.cache_until.expect("reuse allowed");
+    let after = time::OffsetDateTime::now_utc();
+    assert!(until >= before + MAX_AUTHENTICATE_RESULT_CACHE_TTL);
+    assert!(
+        until <= after + MAX_AUTHENTICATE_RESULT_CACHE_TTL,
+        "{until}"
+    );
+}
+
+/// A plugin request for `token`; these plugins have no authenticate cache, so
+/// the cache control is irrelevant.
+fn request(token: &str) -> authn_resolver_sdk::AuthenticationRequest {
+    authn_resolver_sdk::AuthenticationRequest::new(token)
 }

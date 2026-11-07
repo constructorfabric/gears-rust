@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use toolkit_gts::gts_id;
 
-use authn_resolver_sdk::{AuthNResolverPluginClient, ClientCredentialsRequest};
+use authn_resolver_sdk::{AuthNResolverPluginClient, ClientCredentialsRequest, ScopeSet};
 use criterion::{Criterion, criterion_group, criterion_main};
 use httpmock::prelude::{GET, MockServer, POST};
 use jsonwebtoken::Algorithm;
@@ -171,6 +171,7 @@ fn make_plugin(issuer: &str) -> OidcAuthNPlugin {
         s2s_claim_mapper: claim_mapper::default_config(),
         claim_mapper_options: claim_mapper::ClaimMapperOptions::default(),
         s2s_default_subject_type: BENCH_S2S_DEFAULT_SUBJECT_TYPE.to_owned(),
+        authenticate_result_cache_ttl: std::time::Duration::ZERO,
         circuit_breaker: Some(circuit_breaker_config()),
         retry_policy: retry_policy(),
         s2s: S2sConfig {
@@ -189,11 +190,11 @@ fn make_plugin(issuer: &str) -> OidcAuthNPlugin {
 }
 
 fn make_request(scopes: Vec<String>) -> ClientCredentialsRequest {
-    ClientCredentialsRequest {
-        client_id: TEST_S2S_CLIENT_ID.to_owned(),
-        client_secret: SecretString::from(TEST_S2S_CLIENT_SECRET),
-        scopes,
-    }
+    ClientCredentialsRequest::new(
+        TEST_S2S_CLIENT_ID.to_owned(),
+        SecretString::from(TEST_S2S_CLIENT_SECRET),
+    )
+    .with_scopes(ScopeSet::new(scopes).expect("bench scopes should be valid"))
 }
 
 fn p95(mut samples: Vec<Duration>) -> Duration {
