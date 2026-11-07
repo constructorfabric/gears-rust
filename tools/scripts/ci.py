@@ -34,7 +34,9 @@ from lib.platform import (
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 PYTHON = sys.executable or "python"
-E2E_STARTUP_TIMEOUT_SECS = 15
+# The server needs >15s on loaded GitHub runners; a crashed server is still caught
+# immediately by the process-exit poll in wait_for_health. Refs #5798.
+E2E_STARTUP_TIMEOUT_SECS = 60
 
 
 def run_cmd(cmd, env=None, cwd=None):

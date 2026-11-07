@@ -46,7 +46,7 @@ class TestE2EReadiness(unittest.TestCase):
 
         with (
             patch.object(ci, "urlopen", side_effect=probe),
-            patch.object(ci.time, "monotonic", side_effect=[0, 16]),
+            patch.object(ci.time, "monotonic", side_effect=[0, ci.E2E_STARTUP_TIMEOUT_SECS + 1]),
             contextlib.redirect_stdout(io.StringIO()),
             self.assertRaises(SystemExit) as exited,
         ):
