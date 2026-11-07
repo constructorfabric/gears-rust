@@ -136,6 +136,7 @@ members = [
     "examples/toolkit/hello/hello",
     "examples/cf-gears-fips-probe",
     "gears/system/types-registry/types-registry-sdk",
+    "gears/task-engine/task-engine-sdk",
     "gears/system/types-registry/types-registry",
     "gears/simple-user-settings/simple-user-settings-sdk",
     "gears/simple-user-settings/simple-user-settings",
@@ -440,6 +441,7 @@ usage-collector-sdk = { package = "cf-gears-usage-collector-sdk", version = "0.3
 quota-enforcement-engine-most-restrictive = { package = "cf-gears-quota-enforcement-engine-most-restrictive", version = "0.1.2", path = "gears/system/quota-enforcement/plugins/quota-enforcement-engine-most-restrictive" }
 quota-enforcement-sdk = { package = "cf-gears-quota-enforcement-sdk", version = "0.4.0", path = "gears/system/quota-enforcement/quota-enforcement-sdk" }
 event-broker-sdk = { package = "cf-gears-event-broker-sdk", version = "0.4.0", path = "gears/system/event-broker/event-broker-sdk" }
+task-engine-sdk = { package = "cf-gears-task-engine-sdk", version = "0.1.0", path = "gears/task-engine/task-engine-sdk" }
 event-broker = { package = "cf-gears-event-broker", path = "gears/system/event-broker/event-broker" }
 memory-event-broker-plugin = { package = "cf-gears-memory-event-broker-plugin", version = "0.1.0", path = "gears/system/event-broker/plugins/memory-event-broker-plugin" }
 postgres-event-broker-plugin = { package = "cf-gears-postgres-event-broker-plugin", version = "0.1.0", path = "gears/system/event-broker/plugins/postgres-event-broker-plugin" }
