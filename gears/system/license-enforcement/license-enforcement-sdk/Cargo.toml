@@ -51,5 +51,4 @@ secrecy = { workspace = true, optional = true }
 axum = { workspace = true, optional = true }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["rt", "macros"] }
 time = { workspace = true, features = ["macros"] }

@@ -15,6 +15,13 @@ metadata.docs.rs.all-features = true
 [lib]
 name = "toolkit"
 
+# `toolkit-http` is a feature-forwarding dependency: the `fips` feature enables
+# `toolkit-http/fips` so binaries that only turn on `toolkit/fips` still get the
+# FIPS TLS hardening in toolkit-http (its `#[cfg(feature = "fips")]` code). No
+# code in this crate imports it, so cargo-shear reports it as unused.
+[package.metadata.cargo-shear]
+ignored = ["toolkit-http"]
+
 [lints]
 workspace = true
 
