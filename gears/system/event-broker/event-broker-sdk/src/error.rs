@@ -75,6 +75,9 @@ pub mod reasons {
     pub const SCHEMA_NOT_PREPARED: &str = "schema_not_prepared";
     pub const CONSUMER_GROUP_HAS_ACTIVE_MEMBERS: &str = "consumer_group_has_active_members";
     pub const SEQUENCE_MISMATCH: &str = "sequence_mismatch";
+    /// A direct producer's resend found its next producer sequence taken too.
+    /// SDK-local: the broker never answers it.
+    pub const SEQUENCE_TAKEN: &str = "sequence_taken";
     pub const POSITIONS_NOT_SET: &str = "positions_not_set";
     pub const PARTITION_NOT_ASSIGNED: &str = "partition_not_assigned";
     /// A seek's `topology_version` differed from the subscription's
@@ -240,6 +243,42 @@ impl PositionViolationBuilder {
     }
 }
 
+/// Which kind of failure a payload decode hit, as serde_json classifies it. It carries
+/// nothing from the data: serde's own message can quote the offending value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecodeCategory {
+    /// The data is not well-formed JSON.
+    Syntax,
+    /// The data is well-formed but does not fit the payload type.
+    Data,
+    /// The data ends before a complete value.
+    Eof,
+    /// Reading the data failed.
+    Io,
+}
+
+impl From<serde_json::error::Category> for DecodeCategory {
+    fn from(category: serde_json::error::Category) -> Self {
+        match category {
+            serde_json::error::Category::Syntax => Self::Syntax,
+            serde_json::error::Category::Data => Self::Data,
+            serde_json::error::Category::Eof => Self::Eof,
+            serde_json::error::Category::Io => Self::Io,
+        }
+    }
+}
+
+impl std::fmt::Display for DecodeCategory {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Syntax => "syntax",
+            Self::Data => "data",
+            Self::Eof => "eof",
+            Self::Io => "io",
+        })
+    }
+}
+
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum EventBrokerError {
     #[error("invalid producer options: {detail}")]
@@ -261,9 +300,7 @@ pub enum EventBrokerError {
         detail: String,
     },
 
-    #[error(
-        "schema not prepared for {type_id}; call `producer.prepare::<E>()` before opening the txn"
-    )]
+    #[error("schema not prepared for {type_id}; call `prepare_event_type` before opening the txn")]
     SchemaNotPrepared { type_id: String, detail: String },
 
     #[error("event field invalid: {field}: {detail}")]
@@ -277,6 +314,14 @@ pub enum EventBrokerError {
         field: &'static str,
         detail: String,
         reason: &'static str,
+    },
+
+    /// An event's `data` did not decode as the payload type asked for. Names the type and
+    /// the failure class, and carries no part of the data.
+    #[error("event data of {type_id} does not decode as the payload type ({category})")]
+    Decode {
+        type_id: String,
+        category: DecodeCategory,
     },
 
     #[error("event data invalid for {type_id}: {errors:?}")]
@@ -315,6 +360,27 @@ pub enum EventBrokerError {
         expected_previous: i64,
         detail: String,
     },
+
+    /// A `DirectProducer` publish stamped with fresh numbers was answered
+    /// `Duplicate` twice: an earlier request whose outcome the producer did not
+    /// see took those numbers, and then the next ones too. Neither send stored
+    /// the publish's events; the next publish on the topic re-reads the head.
+    /// SDK-local: the broker never answers it.
+    #[error("the next producer sequence on topic {topic} is already taken")]
+    SequenceTaken { topic: String },
+
+    /// A `DirectProducer` publish found its topic's `max_waiting_per_topic`
+    /// publishes already queued for or holding the topic's lock, and failed at
+    /// once without sending anything. SDK-local: the broker never answers it.
+    #[error("too many publishes wait on one topic of this producer (limit {limit})")]
+    ProducerBusy { limit: usize },
+
+    /// An `OutboxProducer` was bound to a handle whose outbox has no queue of
+    /// its name, or has it with fewer partitions than an event's partition:
+    /// bind the handle started from `OutboxSetup::register`'s builder. Nothing
+    /// was written. SDK-local: the broker never answers it.
+    #[error("the outbox the producer is bound to has no queue {queue} with its partitions")]
+    OutboxQueueMismatch { queue: String },
 
     #[error("rate limit exceeded, retry after {retry_after_secs}s")]
     RateLimitExceeded {
@@ -419,7 +485,55 @@ impl EventBrokerError {
             reason: error.rule().as_reason(),
         }
     }
+
+    /// The variant's name, for logs and stored reject texts. It carries no
+    /// field value.
+    #[must_use]
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::InvalidProducerOptions { .. } => "InvalidProducerOptions",
+            Self::InvalidConsumerOptions { .. } => "InvalidConsumerOptions",
+            Self::EventTypeNotDeclared { .. } => "EventTypeNotDeclared",
+            Self::EventTypeUnknown { .. } => "EventTypeUnknown",
+            Self::TypeNotInDeclaredTopic { .. } => "TypeNotInDeclaredTopic",
+            Self::SchemaNotPrepared { .. } => "SchemaNotPrepared",
+            Self::InvalidEventField { .. } => "InvalidEventField",
+            Self::InvalidTextField { .. } => "InvalidTextField",
+            Self::Decode { .. } => "Decode",
+            Self::EventDataInvalid { .. } => "EventDataInvalid",
+            Self::TopicNotFound { .. } => "TopicNotFound",
+            Self::ConsumerGroupNotFound { .. } => "ConsumerGroupNotFound",
+            Self::ConsumerGroupHasActiveMembers { .. } => "ConsumerGroupHasActiveMembers",
+            Self::SubscriptionNotFound { .. } => "SubscriptionNotFound",
+            Self::Unauthorized { .. } => "Unauthorized",
+            Self::UnknownProducer { .. } => "UnknownProducer",
+            Self::SequenceViolation { .. } => "SequenceViolation",
+            Self::SequenceTaken { .. } => "SequenceTaken",
+            Self::ProducerBusy { .. } => "ProducerBusy",
+            Self::OutboxQueueMismatch { .. } => "OutboxQueueMismatch",
+            Self::RateLimitExceeded { .. } => "RateLimitExceeded",
+            Self::GroupAtCapacity { .. } => "GroupAtCapacity",
+            Self::RateLimited { .. } => "RateLimited",
+            Self::BatchTooLarge { .. } => "BatchTooLarge",
+            Self::SubscriptionRecoveryExhausted { .. } => "SubscriptionRecoveryExhausted",
+            Self::InvalidInitialPosition { .. } => "InvalidInitialPosition",
+            Self::PositionsNotSet { .. } => "PositionsNotSet",
+            Self::PartitionNotAssigned { .. } => "PartitionNotAssigned",
+            Self::TopologyVersionMismatch { .. } => "TopologyVersionMismatch",
+            Self::StreamingInProgress { .. } => "StreamingInProgress",
+            Self::Backend(_) => "Backend",
+            Self::OffsetManager(_) => "OffsetManager",
+            Self::Transport(_) => "Transport",
+            Self::Internal(_) => "Internal",
+            Self::Unimplemented(_) => "Unimplemented",
+            Self::Other { .. } => "Other",
+        }
+    }
 }
+
+/// The quota-violation subject of the canonical `ProducerBusy` form, the
+/// marker the reverse mapping refuses to recover it by.
+const PRODUCER_BUSY_SUBJECT: &str = "max_waiting_per_topic";
 
 impl From<EventBrokerError> for CanonicalError {
     fn from(err: EventBrokerError) -> Self {
@@ -488,6 +602,19 @@ impl From<EventBrokerError> for CanonicalError {
             } => RequestResourceError::invalid_argument()
                 .with_field_violation(field, detail, reason)
                 .create(),
+            // SDK-local: a decode happens in the caller's process, so this never travels
+            // and the reverse mapping does not recover it.
+            EventBrokerError::Decode { type_id, category } => {
+                let message = EventBrokerError::Decode {
+                    type_id: type_id.clone(),
+                    category,
+                }
+                .to_string();
+                EventResourceError::invalid_argument()
+                    .with_resource(type_id)
+                    .with_format(message)
+                    .create()
+            }
             EventBrokerError::EventDataInvalid {
                 type_id,
                 errors,
@@ -552,6 +679,27 @@ impl From<EventBrokerError> for CanonicalError {
                     reasons::SEQUENCE_MISMATCH,
                 )
                 .create(),
+            // A concurrency conflict the caller may retry: re-publishing the
+            // event stamps it from a re-read head.
+            taken @ EventBrokerError::SequenceTaken { .. } => {
+                ProducerResourceError::aborted(taken.to_string())
+                    .with_reason(reasons::SEQUENCE_TAKEN)
+                    .create()
+            }
+            // Back-pressure from this producer, never on the wire: no retry
+            // hint, and no reason key, since the reverse mapping does not
+            // recover it.
+            busy @ EventBrokerError::ProducerBusy { .. } => {
+                let detail = busy.to_string();
+                ProducerResourceError::resource_exhausted(detail.clone())
+                    .with_quota_violation(PRODUCER_BUSY_SUBJECT, detail)
+                    .create()
+            }
+            // A wiring fault in this process, never on the wire: the reverse
+            // mapping reads it back as `Internal`, not as this variant.
+            mismatch @ EventBrokerError::OutboxQueueMismatch { .. } => {
+                CanonicalError::internal(mismatch.to_string()).create()
+            }
             EventBrokerError::RateLimitExceeded {
                 retry_after_secs,
                 detail,
@@ -714,17 +862,43 @@ fn first_invalid_argument_reason(
     }
 }
 
+/// Maps the errors of the outbox an `OutboxProducer` writes to. A handle from
+/// another outbox (no queue of the producer's name, or too few partitions) is
+/// [`EventBrokerError::OutboxQueueMismatch`]; anything else is
+/// [`EventBrokerError::Internal`] with the error's text, which names queues,
+/// partitions and sizes, never a payload, and does not carry a database
+/// error's source.
+#[cfg(feature = "db")]
+impl From<toolkit_db::outbox::OutboxError> for EventBrokerError {
+    fn from(err: toolkit_db::outbox::OutboxError) -> Self {
+        use toolkit_db::outbox::OutboxError;
+
+        match err {
+            OutboxError::QueueNotRegistered(queue)
+            | OutboxError::PartitionOutOfRange { queue, .. } => Self::OutboxQueueMismatch { queue },
+            err => Self::Internal(err.to_string()),
+        }
+    }
+}
+
 /// Inverse of [`From<EventBrokerError> for CanonicalError`]. Recovers the typed
 /// SDK error from a canonical error decoded off the wire, keyed on the category,
 /// the `resource_type`, and the first violation's reason - the same identity the
-/// forward mapping stamps. See the change design's "Error mapping" table.
+/// forward mapping stamps.
 ///
-/// Variants whose payload is not fully carried on the wire (for example the
-/// `&'static str` field name in `InvalidEventField`/`InvalidTextField`, or the
-/// counted `active`/`partitions` in `GroupAtCapacity`) are recovered to the
-/// right variant with the wire-available fields; fields absent from the wire
-/// take a neutral value. Anything the table does not name falls to
-/// [`EventBrokerError::Other`], which preserves the canonical error verbatim.
+/// Variants whose payload is not fully carried on the wire (for example
+/// `InvalidEventField`/`InvalidTextField`, whose `&'static str` field name is on the
+/// wire but cannot be rebuilt as a `&'static str`, or the counted `active`/`partitions`
+/// in `GroupAtCapacity`) are recovered to the right variant with the wire-available
+/// fields; fields absent from the wire take a neutral value. Anything it does not
+/// recover, the forms of the SDK-local `SequenceTaken` and `ProducerBusy` included,
+/// falls to [`EventBrokerError::Other`], which preserves the canonical error verbatim.
+/// Of the `ResourceExhausted` errors on the producer resource, only the
+/// `ProducerBusy` form (first violation subject `max_waiting_per_topic`) is not
+/// recovered; any other reads back as [`EventBrokerError::RateLimitExceeded`]
+/// with its retry hint.
+/// The SDK-local `OutboxQueueMismatch` travels as `Internal` and reads back as
+/// [`EventBrokerError::Internal`] with the canonical internal detail.
 impl From<CanonicalError> for EventBrokerError {
     fn from(canonical: CanonicalError) -> Self {
         let detail = canonical.detail().to_owned();
@@ -780,19 +954,29 @@ impl From<CanonicalError> for EventBrokerError {
                     .and_then(|v| v.retry_after_seconds)
                     .and_then(|v| u32::try_from(v).ok())
                     .unwrap_or_default();
-                if resource_type.as_deref() == Some(resources::CONSUMER_GROUP) {
+                match resource_type.as_deref() {
                     // active/partitions are not carried on the wire; the variant
                     // is recovered, the counts default.
-                    Self::GroupAtCapacity {
+                    Some(resources::CONSUMER_GROUP) => Self::GroupAtCapacity {
                         active: 0,
                         partitions: 0,
                         detail,
+                    },
+                    // The form of the SDK-local `ProducerBusy`, which is not
+                    // recovered: a rate limit here would invite a retry loop.
+                    // Any other limit on the producer is a rate limit.
+                    Some(resources::PRODUCER)
+                        if ctx
+                            .violations
+                            .first()
+                            .is_some_and(|v| v.subject == PRODUCER_BUSY_SUBJECT) =>
+                    {
+                        Self::Other { canonical }
                     }
-                } else {
-                    Self::RateLimitExceeded {
+                    _ => Self::RateLimitExceeded {
                         retry_after_secs,
                         detail,
-                    }
+                    },
                 }
             }
 
@@ -893,8 +1077,8 @@ impl From<CanonicalError> for EventBrokerError {
                     Some(reasons::INVALID_CONSUMER_OPTIONS) => {
                         Self::InvalidConsumerOptions { detail }
                     }
-                    // The field name is `&'static str` and is not carried on the
-                    // wire, so it is recovered empty.
+                    // The wire names the field, but `field` is `&'static str`, so it
+                    // is recovered empty.
                     Some(reasons::INVALID_EVENT_FIELD) => {
                         Self::InvalidEventField { field: "", detail }
                     }
@@ -1082,6 +1266,20 @@ impl OffsetManagerError {
     }
 }
 
+/// The class of a serde_json failure (`io`, `syntax`, `data`, `eof`); serde's own
+/// message can quote the value.
+///
+/// `io` cannot happen for in-memory input (`from_slice`, `to_value`); the arm
+/// exists only because the match is exhaustive.
+pub(crate) fn json_error_category(err: &serde_json::Error) -> &'static str {
+    match err.classify() {
+        serde_json::error::Category::Io => "io",
+        serde_json::error::Category::Syntax => "syntax",
+        serde_json::error::Category::Data => "data",
+        serde_json::error::Category::Eof => "eof",
+    }
+}
+
 #[cfg(test)]
 mod canonical_roundtrip_tests {
     use super::*;
@@ -1249,5 +1447,366 @@ mod canonical_roundtrip_tests {
             ),
             17
         );
+    }
+}
+
+#[cfg(test)]
+mod kind_tests {
+    use super::*;
+
+    #[test]
+    fn kind_names_the_variant_and_none_of_its_values() {
+        let data_invalid = EventBrokerError::EventDataInvalid {
+            type_id: "PLANTED-VALUE-7f3a".to_owned(),
+            errors: vec!["PLANTED-VALUE-7f3a".to_owned()],
+            detail: "PLANTED-VALUE-7f3a".to_owned(),
+        };
+        assert_eq!(data_invalid.kind(), "EventDataInvalid");
+        assert_eq!(
+            EventBrokerError::Internal("PLANTED-VALUE-7f3a".to_owned()).kind(),
+            "Internal"
+        );
+        assert_eq!(
+            EventBrokerError::Transport("PLANTED-VALUE-7f3a".to_owned()).kind(),
+            "Transport"
+        );
+    }
+
+    #[test]
+    fn json_error_category_names_each_reachable_class() {
+        let eof = serde_json::from_slice::<serde_json::Value>(b"{").unwrap_err();
+        assert_eq!(json_error_category(&eof), "eof");
+        let syntax = serde_json::from_slice::<serde_json::Value>(b"nope").unwrap_err();
+        assert_eq!(json_error_category(&syntax), "syntax");
+        let data = serde_json::from_slice::<u32>(b"\"x\"").unwrap_err();
+        assert_eq!(json_error_category(&data), "data");
+    }
+
+    #[test]
+    fn decode_category_mirrors_serde_json_classes() {
+        let syntax = serde_json::from_slice::<serde_json::Value>(b"nope").unwrap_err();
+        let eof = serde_json::from_slice::<serde_json::Value>(b"{").unwrap_err();
+        let data = serde_json::from_slice::<u32>(b"\"x\"").unwrap_err();
+        let io = serde_json::Error::io(std::io::Error::other("x"));
+
+        let categories = [syntax, eof, data, io].map(|err| {
+            let category = DecodeCategory::from(err.classify());
+            (category, category.to_string())
+        });
+
+        assert_eq!(
+            categories,
+            [
+                (DecodeCategory::Syntax, "syntax".to_owned()),
+                (DecodeCategory::Eof, "eof".to_owned()),
+                (DecodeCategory::Data, "data".to_owned()),
+                (DecodeCategory::Io, "io".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_decode_error_is_kind_decode_and_an_invalid_argument() {
+        let type_id = toolkit_gts::gts_id!("cf.core.events.event.v1~acme.orders.order.created.v1~");
+        let err = EventBrokerError::Decode {
+            type_id: type_id.to_owned(),
+            category: DecodeCategory::Data,
+        };
+        assert_eq!(err.kind(), "Decode");
+        let display = err.to_string();
+
+        let canonical = CanonicalError::from(err);
+
+        let CanonicalError::InvalidArgument {
+            ctx: toolkit_canonical_errors::context::InvalidArgumentV1::Format { format },
+            ..
+        } = &canonical
+        else {
+            panic!("expected an InvalidArgument format error, got {canonical:?}");
+        };
+        assert_eq!(format, &display);
+        assert_eq!(canonical.detail(), display);
+        assert_eq!(canonical.resource_name(), Some(type_id));
+        assert!(
+            matches!(
+                EventBrokerError::from(canonical.clone()),
+                EventBrokerError::Other { .. }
+            ),
+            "the reverse mapping must not recover a decode error, got {:?}",
+            EventBrokerError::from(canonical)
+        );
+        assert_eq!(
+            display,
+            "event data of gts.cf.core.events.event.v1~acme.orders.order.created.v1~ does not \
+             decode as the payload type (data)"
+        );
+    }
+
+    /// `SequenceTaken` is SDK-local: its text names only the topic, and the
+    /// canonical form is an `Aborted` the reverse mapping does not recover.
+    #[test]
+    fn a_sequence_taken_error_is_an_aborted_conflict_naming_only_its_topic() {
+        let topic = toolkit_gts::gts_id!("cf.core.events.topic.v1~acme.billing.orders.stream.v1");
+        let err = EventBrokerError::SequenceTaken {
+            topic: topic.to_owned(),
+        };
+
+        let display = err.to_string();
+        let kind = err.kind();
+        let canonical = CanonicalError::from(err);
+
+        assert_eq!(
+            (display.as_str(), kind),
+            (
+                "the next producer sequence on topic \
+                 gts.cf.core.events.topic.v1~acme.billing.orders.stream.v1 is already taken",
+                "SequenceTaken"
+            )
+        );
+        let CanonicalError::Aborted {
+            ctx,
+            detail,
+            resource_type,
+            resource_name,
+            ..
+        } = &canonical
+        else {
+            panic!("expected an Aborted error, got {canonical:?}");
+        };
+        assert_eq!(
+            (
+                ctx.reason.as_str(),
+                detail.as_str(),
+                resource_type.as_deref(),
+                resource_name.as_deref()
+            ),
+            (
+                "sequence_taken",
+                display.as_str(),
+                Some(toolkit_gts::gts_id!("cf.core.events.producer.v1~")),
+                None
+            )
+        );
+        let recovered = EventBrokerError::from(canonical.clone());
+        let EventBrokerError::Other { canonical: back } = recovered else {
+            panic!("the reverse mapping must not recover a SequenceTaken, got {recovered:?}");
+        };
+        // `CanonicalError` has no `PartialEq`; its `Debug` output prints every field.
+        assert_eq!(format!("{back:?}"), format!("{canonical:?}"));
+    }
+
+    /// `ProducerBusy` is SDK-local: its text carries only the limit, and its
+    /// canonical form is a `ResourceExhausted` on the producer. The reverse
+    /// mapping does not recover it: that form comes back whole as `Other`.
+    #[test]
+    fn a_producer_busy_error_is_resource_exhausted_naming_only_its_limit() {
+        let err = EventBrokerError::ProducerBusy { limit: 64 };
+
+        let display = err.to_string();
+        let kind = err.kind();
+        let canonical = CanonicalError::from(err);
+
+        assert_eq!(
+            (display.as_str(), kind),
+            (
+                "too many publishes wait on one topic of this producer (limit 64)",
+                "ProducerBusy"
+            )
+        );
+        let CanonicalError::ResourceExhausted {
+            ctx,
+            detail,
+            resource_type,
+            resource_name,
+            ..
+        } = &canonical
+        else {
+            panic!("expected a ResourceExhausted error, got {canonical:?}");
+        };
+        let [violation] = ctx.violations.as_slice() else {
+            panic!("expected one quota violation, got {:?}", ctx.violations);
+        };
+        assert_eq!(
+            (
+                violation.subject.as_str(),
+                violation.description.as_str(),
+                violation.retry_after_seconds,
+                detail.as_str(),
+                resource_type.as_deref(),
+                resource_name.as_deref()
+            ),
+            (
+                "max_waiting_per_topic",
+                display.as_str(),
+                None,
+                display.as_str(),
+                Some(toolkit_gts::gts_id!("cf.core.events.producer.v1~")),
+                None
+            )
+        );
+        let recovered = EventBrokerError::from(canonical.clone());
+        let EventBrokerError::Other { canonical: back } = recovered else {
+            panic!("the reverse mapping must not recover a ProducerBusy, got {recovered:?}");
+        };
+        // `CanonicalError` has no `PartialEq`; its `Debug` output prints every field.
+        assert_eq!(format!("{back:?}"), format!("{canonical:?}"));
+    }
+
+    /// Only the `ProducerBusy` form is refused: another limit on the producer
+    /// resource reads back as a rate limit, with its retry hint.
+    #[test]
+    fn a_producer_resource_exhausted_that_is_not_busy_reads_back_as_a_rate_limit() {
+        let canonical = ProducerResourceError::resource_exhausted("too many producer requests")
+            .with_quota_violation("requests_per_producer", "too many producer requests")
+            .with_quota_violation_retry_after_seconds(5)
+            .create();
+
+        let recovered = EventBrokerError::from(canonical);
+
+        let EventBrokerError::RateLimitExceeded {
+            retry_after_secs,
+            detail,
+        } = &recovered
+        else {
+            panic!("expected RateLimitExceeded, got {recovered:?}");
+        };
+        assert_eq!(
+            (*retry_after_secs, detail.as_str()),
+            (5, "too many producer requests")
+        );
+    }
+
+    /// `OutboxQueueMismatch` is SDK-local: its text carries only the queue, and
+    /// its canonical form is `Internal`, which reads back as `Internal` with the
+    /// canonical internal detail, not the variant.
+    #[test]
+    fn an_outbox_queue_mismatch_is_internal_and_names_only_its_queue() {
+        let err = EventBrokerError::OutboxQueueMismatch {
+            queue: "orders-events".to_owned(),
+        };
+
+        let display = err.to_string();
+        let kind = err.kind();
+        let canonical = CanonicalError::from(err);
+
+        assert_eq!(
+            (display.as_str(), kind),
+            (
+                "the outbox the producer is bound to has no queue orders-events with its \
+                 partitions",
+                "OutboxQueueMismatch"
+            )
+        );
+        let CanonicalError::Internal { ctx, detail, .. } = &canonical else {
+            panic!("expected an Internal error, got {canonical:?}");
+        };
+        assert_eq!(
+            (
+                ctx.description.as_str(),
+                detail.as_str(),
+                canonical.resource_type()
+            ),
+            (
+                display.as_str(),
+                "An internal error occurred. Please retry later.",
+                None
+            )
+        );
+        let recovered = EventBrokerError::from(canonical);
+        let EventBrokerError::Internal(detail) = &recovered else {
+            panic!("expected Internal, got {recovered:?}");
+        };
+        assert_eq!(detail, "An internal error occurred. Please retry later.");
+    }
+
+    /// The two outbox errors of a handle from another outbox (no queue of the
+    /// producer's name, or too few partitions) name only the queue.
+    #[cfg(feature = "db")]
+    #[test]
+    fn outbox_errors_of_a_foreign_outbox_are_a_queue_mismatch() {
+        use toolkit_db::outbox::OutboxError;
+
+        for err in [
+            OutboxError::QueueNotRegistered("orders-events".to_owned()),
+            OutboxError::PartitionOutOfRange {
+                queue: "orders-events".to_owned(),
+                partition: 3,
+                max: 2,
+            },
+        ] {
+            let mapped = EventBrokerError::from(err);
+            let EventBrokerError::OutboxQueueMismatch { queue } = &mapped else {
+                panic!("expected OutboxQueueMismatch, got {mapped:?}");
+            };
+            assert_eq!(queue, "orders-events");
+        }
+    }
+
+    /// Every other outbox error is `Internal`, carrying its own text: it names
+    /// queues, partitions and sizes, never a payload.
+    #[cfg(feature = "db")]
+    #[test]
+    fn every_other_outbox_error_is_internal_with_its_text() {
+        use toolkit_db::outbox::OutboxError;
+
+        let cases = [
+            (
+                OutboxError::PayloadTooLarge {
+                    size: 70_000,
+                    max: 65_536,
+                },
+                "payload size 70000 exceeds maximum 65536",
+            ),
+            (
+                OutboxError::PartitionCountMismatch {
+                    queue: "orders-events".to_owned(),
+                    expected: 4,
+                    found: 2,
+                },
+                "partition count mismatch for queue 'orders-events': expected 4, found 2",
+            ),
+            (
+                OutboxError::EmptyTracedBatch,
+                "a traced batch must carry at least one entity",
+            ),
+            (
+                OutboxError::TracedBatchTooLarge { entities: 9 },
+                "a traced batch of 9 entities exceeds the addressable maximum",
+            ),
+            (
+                OutboxError::InvalidQueueName { reason: "empty" },
+                "invalid queue name: empty",
+            ),
+            (
+                OutboxError::InvalidPayloadType { reason: "empty" },
+                "invalid payload type: empty",
+            ),
+            (
+                OutboxError::InvalidTrace { reason: "empty" },
+                "invalid trace: empty",
+            ),
+            (
+                OutboxError::TraceTooLong {
+                    size: 300,
+                    max: 255,
+                },
+                "trace size 300 exceeds maximum 255",
+            ),
+            (
+                OutboxError::InvalidTablePrefix { reason: "empty" },
+                "invalid outbox table prefix: empty",
+            ),
+            (
+                OutboxError::Database(sea_orm::DbErr::Custom("disk full".to_owned())),
+                "Custom Error: disk full",
+            ),
+        ];
+        for (err, expected) in cases {
+            let mapped = EventBrokerError::from(err);
+            let EventBrokerError::Internal(detail) = &mapped else {
+                panic!("expected Internal, got {mapped:?}");
+            };
+            assert_eq!(detail, expected);
+        }
     }
 }

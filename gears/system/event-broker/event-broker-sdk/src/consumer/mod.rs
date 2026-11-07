@@ -23,6 +23,10 @@ mod progress_tests;
 #[cfg(test)]
 mod type_cache_tests;
 #[cfg(test)]
+mod typed_tests;
+#[cfg(all(test, feature = "db"))]
+mod typed_tx_tests;
+#[cfg(test)]
 mod types_tests;
 
 #[cfg(feature = "db")]
@@ -33,10 +37,10 @@ pub use builder::WithTx;
 pub use builder::{
     BrokerOnly, ConsumerBatchReady, ConsumerBuilder, ConsumerOffsetManager, ConsumerReady,
     ConsumerRoute, ConsumerRouteBuilder, ConsumerRouteHandlerKind, ConsumerRoutedReady,
-    NoDefaultHandler, RouteHasTopic, RouteMissingTopic,
+    NoDefaultHandler, RouteHasTopic, RouteMissingTopic, TypedRouteBuilder,
 };
 #[cfg(feature = "db")]
-pub use builder::{TxConsumerRouteBuilder, TxConsumerRoutedReady};
+pub use builder::{TxConsumerRouteBuilder, TxConsumerRoutedReady, TxTypedRouteBuilder};
 
 pub use offset_manager::{CommitOffset, Fallback, InMemoryOffsetManager, OffsetStore};
 #[cfg(feature = "db")]
@@ -47,17 +51,16 @@ pub use runtime::{Consumer, ConsumerHandle};
 
 pub use crate::api::{
     BarrierMode, ControlCode, FrameStream, PartitionPosition, Position, SeekPosition,
-    SubscriptionAssignment, TenantTraversalDepth, WireEvent, WireFrame,
+    SubscriptionAssignment, TenantTraversalDepth, WireFrame,
 };
 pub use crate::error::OffsetManagerError;
 pub use types::{
-    BatchHandlerOutcome, ConnectionDropReason, ConsumerBatching, ConsumerBuffering,
-    ConsumerCommitMode, ConsumerGroupRef, ConsumerHandler, ConsumerListenerSettings,
-    ConsumerProfile, ConsumerRetry, ConsumerRuntimeEvent, ConsumerRuntimeListener,
-    ConsumerSettings, ConsumerSettingsOverrides, ConsumerSlowDetection, EventBatch, HandlerOutcome,
-    PartitionBufferState, PartitionBufferStateSnapshot, PartitionProgress, RawEvent,
-    SingleEventHandler, SingleEventHandlerAdapter, SlowConsumerTrigger, SubscriptionFilterRef,
-    SubscriptionInterest,
+    BatchHandler, BatchHandlerOutcome, ConnectionDropReason, ConsumerBatching, ConsumerBuffering,
+    ConsumerCommitMode, ConsumerGroupRef, ConsumerListenerSettings, ConsumerProfile, ConsumerRetry,
+    ConsumerRuntimeEvent, ConsumerRuntimeListener, ConsumerSettings, ConsumerSettingsOverrides,
+    ConsumerSlowDetection, Delivery, EventBatch, EventHandler, HandlerOutcome,
+    PartitionBufferState, PartitionBufferStateSnapshot, PartitionProgress, SlowConsumerTrigger,
+    SubscriptionFilterRef, SubscriptionInterest, Undecodable,
 };
 #[cfg(feature = "db")]
-pub use types::{TxConsumerHandler, TxSingleEventHandler, TxSingleEventHandlerAdapter};
+pub use types::{TxBatchHandler, TxEventHandler, TxUndecodable};

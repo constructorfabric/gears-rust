@@ -30,6 +30,11 @@ db = ["dep:sea-orm", "dep:toolkit-db", "toolkit-db/sqlite"]
 # `toolkit-db`'s outbox pipeline is unconditional, so `db` is all this needs.
 outbox = ["db"]
 integration = []
+# Exposes `producer::TEST_QUEUE` and the `OutboxSetup::*_for_test` drain hooks
+# to other crates' tests; off in every production build. This crate's own
+# integration tests get it through the gear's `test-utils` feature, which
+# turns it on.
+test-util = []
 # REST transport implementation of `EventBrokerApi` (src/rest/) and the
 # `cf-evctl` binary. Off by default so a plain SDK build pulls in no HTTP or
 # wire dependencies (base-trait purity, docs/arch/toolkit-contract-binding).
@@ -104,3 +109,8 @@ trybuild = { workspace = true }
 # `MockDatabase`, so the unit tests read the exact DDL each backend's migration
 # emits without a live database.
 sea-orm = { workspace = true, features = ["mock"] }
+
+# Typed vs raw decode cost on the consumer path (design 7); run with `cargo bench`.
+[[bench]]
+name = "typed_decode"
+harness = false

@@ -254,7 +254,7 @@ pub async fn bulk_load(
         }
     }
 
-    let event_base = event_broker_sdk::gts::EventV1::TYPE_ID;
+    let event_base = <event_broker_sdk::gts::EventV1>::TYPE_ID;
     let schemas = match client
         .list_type_schemas(
             &ctx,
@@ -707,7 +707,7 @@ mod tests {
             "x-gts-traits": { "topic": TOPIC_ID, "allowed_subject_types": [SUBJECT_TYPE] },
             "type": "object",
             "allOf": [
-                { "$ref": format!("gts://{}", event_broker_sdk::gts::EventV1::TYPE_ID) },
+                { "$ref": format!("gts://{}", <event_broker_sdk::gts::EventV1>::TYPE_ID) },
                 { "type": "object", "properties": { "data": { "type": ["object", "null"] } } },
             ],
         });

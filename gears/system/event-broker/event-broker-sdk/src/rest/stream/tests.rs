@@ -70,3 +70,34 @@ fn sse_buffers_a_partial_event_across_chunks() {
         serde_json::from_str::<serde_json::Value>(TOPOLOGY).unwrap()
     );
 }
+
+/// Serde's message quotes the offending value, and an event frame carries
+/// producer-supplied fields; the dispatcher logs this error, so it names only
+/// the failure's category.
+#[test]
+fn an_undecodable_sse_frame_is_refused_without_quoting_its_content() {
+    let body = concat!(
+        r#"{"kind":"event","payload":{"#,
+        r#""id":"01890a5d-ac96-774b-bcce-b302099a8057","#,
+        r#""type":"gts.cf.core.events.event.v1~example.mock.showcase.rest.v1~","#,
+        r#""topic":"gts.cf.core.events.topic.v1~example.mock.showcase.rest.v1","#,
+        r#""tenant_id":"01890a5d-ac96-774b-bcce-b302099a8058","#,
+        r#""source":"svc","subject":"s-1","subject_type":"gts.x.eb.showcase.subject.v1~","#,
+        r#""occurred_at":"2026-01-02T03:04:05Z","trace_parent":null,"data":{},"#,
+        r#""partition":0,"sequence":"PLANTED-seq","sequence_time":null}}"#,
+    );
+    let serde_message = serde_json::from_str::<FrameWire>(body)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        serde_message.contains("PLANTED-seq"),
+        "serde's own message quotes the planted value: {serde_message}"
+    );
+
+    let mut sse = Decoder::sse();
+    sse.push(format!("event: event\ndata: {body}\n\n").as_bytes());
+    let Err(EventBrokerError::Transport(message)) = sse.drain() else {
+        panic!("an undecodable frame is a transport error");
+    };
+    assert_eq!(message, "undecodable stream frame (data)");
+}

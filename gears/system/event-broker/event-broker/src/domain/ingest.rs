@@ -20,6 +20,11 @@ use event_broker_sdk::models::EventType;
 
 use crate::domain::model::{Event, Meta};
 
+/// The detail a synchronous publish (`Prefer: wait`) is refused with until it is
+/// served (#5655), on the wire and in process.
+pub(crate) const SYNC_PUBLISH_NOT_SERVED: &str =
+    "synchronous publish (Prefer: wait) is not implemented yet";
+
 /// One event as a producer submits it: what the publish schema admits, and
 /// nothing the broker derives.
 ///
@@ -43,6 +48,21 @@ pub struct PublishRequest {
     pub trace_parent: Option<String>,
     pub data: serde_json::Value,
     pub meta: Option<Meta>,
+}
+
+impl PublishRequest {
+    /// Rejects a `trace_parent` that is not a W3C traceparent, as the field violation
+    /// the SDK recovers as `InvalidEventField`.
+    pub(crate) fn check_trace_parent(trace_parent: &str) -> Result<(), DomainError> {
+        if event_broker_sdk::validate::is_trace_parent(trace_parent) {
+            return Ok(());
+        }
+        Err(DomainError::TextField {
+            field: "trace_parent",
+            detail: event_broker_sdk::validate::TRACE_PARENT_RULE.to_owned(),
+            reason: event_broker_sdk::error::reasons::INVALID_EVENT_FIELD,
+        })
+    }
 }
 
 /// Outcome of admitting a batch, all-or-nothing (feature 0001 §5.2): some

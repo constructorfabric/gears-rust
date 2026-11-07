@@ -2,31 +2,26 @@ use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::sync::{Arc, Mutex, PoisonError};
 
+use gts::GtsTypeId;
 use tokio::sync::{Mutex as AsyncMutex, OnceCell};
 use toolkit_security::SecurityContext;
 use tracing::Instrument;
 
-use crate::api::EventBrokerApi;
-#[cfg(feature = "outbox")]
-use crate::api::ProducerMode;
+use crate::api::{EventBrokerApi, ProducerMode};
 use crate::error::EventBrokerError;
+use crate::gts::{EventPayload, EventV1};
 use crate::ids::ProducerId;
 use crate::models::ResetScope;
 use crate::sdk::EventBrokerSdk;
-use crate::typed_event::TypedEvent;
 
 use super::direct::{Has, Missing};
-#[cfg(feature = "outbox")]
-use super::event_factory::prepare_event;
-#[cfg(feature = "outbox")]
-use super::outbox::{ProducerOutboxEnvelope, ProducerOutboxQueue};
-#[cfg(feature = "outbox")]
-use super::registration::NewRegistration;
+use super::event_factory::PreparedEvent;
+use super::outbox::ProducerOutboxEnvelope;
 use super::registration::{
-    ProducerRegistration, ProducerRegistrationStore, RegistrationSlot, Replaced,
+    NewRegistration, ProducerRegistration, ProducerRegistrationStore, RegistrationSlot, Replaced,
 };
 use super::schema_cache::ProducerSchemaCache;
-use super::types::{DbDeduplication, ProducerIdentity, ValidationTiming};
+use super::types::{OutboxRegistration, ValidationTiming};
 
 /// One slot's registration: set once per process, by whichever drain first
 /// resolves the slot, and swapped whole when the slot's id is replaced.
@@ -36,38 +31,44 @@ type RegistrationCell = Arc<OnceCell<ProducerRegistration>>;
 /// replaced, so this process changes a slot one writer at a time.
 type SlotLock = Arc<AsyncMutex<()>>;
 
-type DbProducerBuilderState<Broker, Db, Ctx, Identity, Dedup, Topics, Patterns> =
-    PhantomData<(Broker, Db, Ctx, Identity, Dedup, Topics, Patterns)>;
+type DbProducerBuilderState<Broker, Db, Ctx, Source, Registration, Topics, Patterns> =
+    PhantomData<(Broker, Db, Ctx, Source, Registration, Topics, Patterns)>;
 
-pub struct DbProducerBuilder<
+/// Builds the [`DbProducer`] an [`OutboxSetup`](super::OutboxSetup) runs on.
+/// Checks none of its values: `OutboxSetupBuilder::build` checks each one
+/// before it builds this.
+pub(crate) struct DbProducerBuilder<
     Broker = Missing,
     Db = Missing,
     Ctx = Missing,
-    Identity = Missing,
-    Dedup = Missing,
+    Source = Missing,
+    Registration = Missing,
     Topics = Missing,
     Patterns = Missing,
 > {
     broker: Option<Arc<dyn EventBrokerApi>>,
     db: Option<toolkit_db::Db>,
     ctx: Option<SecurityContext>,
-    identity: Option<ProducerIdentity>,
-    deduplication: Option<DbDeduplication>,
+    source: Option<String>,
+    client_agent: String,
+    registration: Option<OutboxRegistration>,
     topics: Vec<String>,
     event_type_patterns: Vec<String>,
     validation_timing: ValidationTiming,
-    _state: DbProducerBuilderState<Broker, Db, Ctx, Identity, Dedup, Topics, Patterns>,
+    _state: DbProducerBuilderState<Broker, Db, Ctx, Source, Registration, Topics, Patterns>,
 }
 
 impl DbProducerBuilder {
-    /// Creates an empty builder; every required part starts unset.
-    pub(crate) fn new() -> Self {
+    /// Creates a builder with the SDK's default client agent and every
+    /// required part unset.
+    fn new() -> Self {
         Self {
             broker: None,
             db: None,
             ctx: None,
-            identity: None,
-            deduplication: None,
+            source: None,
+            client_agent: EventBrokerSdk::default_client_agent().to_owned(),
+            registration: None,
             topics: Vec::new(),
             event_type_patterns: Vec::new(),
             validation_timing: ValidationTiming::Eager,
@@ -76,191 +77,140 @@ impl DbProducerBuilder {
     }
 }
 
-impl<B, Db, C, I, D, T, P> DbProducerBuilder<B, Db, C, I, D, T, P> {
-    #[must_use]
-    pub fn broker(
-        self,
+impl<B, Db, C, S, R, T, P> DbProducerBuilder<B, Db, C, S, R, T, P> {
+    pub(crate) fn broker(
+        mut self,
         broker: Arc<dyn EventBrokerApi>,
-    ) -> DbProducerBuilder<Has, Db, C, I, D, T, P> {
-        DbProducerBuilder {
-            broker: Some(broker),
-            db: self.db,
-            ctx: self.ctx,
-            identity: self.identity,
-            deduplication: self.deduplication,
-            topics: self.topics,
-            event_type_patterns: self.event_type_patterns,
-            validation_timing: self.validation_timing,
-            _state: PhantomData,
-        }
+    ) -> DbProducerBuilder<Has, Db, C, S, R, T, P> {
+        self.broker = Some(broker);
+        self.into_state()
     }
 
-    #[must_use]
-    pub fn db(self, db: toolkit_db::Db) -> DbProducerBuilder<B, Has, C, I, D, T, P> {
-        DbProducerBuilder {
-            broker: self.broker,
-            db: Some(db),
-            ctx: self.ctx,
-            identity: self.identity,
-            deduplication: self.deduplication,
-            topics: self.topics,
-            event_type_patterns: self.event_type_patterns,
-            validation_timing: self.validation_timing,
-            _state: PhantomData,
-        }
+    pub(crate) fn db(mut self, db: toolkit_db::Db) -> DbProducerBuilder<B, Has, C, S, R, T, P> {
+        self.db = Some(db);
+        self.into_state()
     }
 
-    #[must_use]
-    pub fn security_context(
-        self,
+    pub(crate) fn security_context(
+        mut self,
         ctx: SecurityContext,
-    ) -> DbProducerBuilder<B, Db, Has, I, D, T, P> {
-        DbProducerBuilder {
-            broker: self.broker,
-            db: self.db,
-            ctx: Some(ctx),
-            identity: self.identity,
-            deduplication: self.deduplication,
-            topics: self.topics,
-            event_type_patterns: self.event_type_patterns,
-            validation_timing: self.validation_timing,
-            _state: PhantomData,
-        }
+    ) -> DbProducerBuilder<B, Db, Has, S, R, T, P> {
+        self.ctx = Some(ctx);
+        self.into_state()
     }
 
-    #[must_use]
-    pub fn identity(self, identity: ProducerIdentity) -> DbProducerBuilder<B, Db, C, Has, D, T, P> {
-        DbProducerBuilder {
-            broker: self.broker,
-            db: self.db,
-            ctx: self.ctx,
-            identity: Some(identity),
-            deduplication: self.deduplication,
-            topics: self.topics,
-            event_type_patterns: self.event_type_patterns,
-            validation_timing: self.validation_timing,
-            _state: PhantomData,
-        }
+    /// The `source` stamped on every event the producer enqueues.
+    pub(crate) fn source(
+        mut self,
+        source: impl Into<String>,
+    ) -> DbProducerBuilder<B, Db, C, Has, R, T, P> {
+        self.source = Some(source.into());
+        self.into_state()
     }
 
-    #[must_use]
-    pub fn deduplication(
-        self,
-        deduplication: impl Into<DbDeduplication>,
-    ) -> DbProducerBuilder<B, Db, C, I, Has, T, P> {
-        DbProducerBuilder {
-            broker: self.broker,
-            db: self.db,
-            ctx: self.ctx,
-            identity: self.identity,
-            deduplication: Some(deduplication.into()),
-            topics: self.topics,
-            event_type_patterns: self.event_type_patterns,
-            validation_timing: self.validation_timing,
-            _state: PhantomData,
-        }
+    /// The client agent partition ids are registered with; the SDK's default
+    /// unless set.
+    pub(crate) fn client_agent(mut self, client_agent: impl Into<String>) -> Self {
+        self.client_agent = client_agent.into();
+        self
     }
 
-    #[must_use]
-    pub fn topics<S, It>(self, topics: It) -> DbProducerBuilder<B, Db, C, I, D, Has, P>
+    pub(crate) fn registration(
+        mut self,
+        registration: OutboxRegistration,
+    ) -> DbProducerBuilder<B, Db, C, S, Has, T, P> {
+        self.registration = Some(registration);
+        self.into_state()
+    }
+
+    pub(crate) fn topics<I, It>(mut self, topics: It) -> DbProducerBuilder<B, Db, C, S, R, Has, P>
     where
-        S: Into<String>,
-        It: IntoIterator<Item = S>,
+        I: Into<String>,
+        It: IntoIterator<Item = I>,
     {
-        DbProducerBuilder {
-            broker: self.broker,
-            db: self.db,
-            ctx: self.ctx,
-            identity: self.identity,
-            deduplication: self.deduplication,
-            topics: topics.into_iter().map(Into::into).collect(),
-            event_type_patterns: self.event_type_patterns,
-            validation_timing: self.validation_timing,
-            _state: PhantomData,
-        }
+        self.topics = topics.into_iter().map(Into::into).collect();
+        self.into_state()
     }
 
-    #[must_use]
-    pub fn event_type_patterns<S, It>(
-        self,
+    pub(crate) fn event_type_patterns<I, It>(
+        mut self,
         patterns: It,
-    ) -> DbProducerBuilder<B, Db, C, I, D, T, Has>
+    ) -> DbProducerBuilder<B, Db, C, S, R, T, Has>
     where
-        S: Into<String>,
-        It: IntoIterator<Item = S>,
+        I: Into<String>,
+        It: IntoIterator<Item = I>,
     {
-        DbProducerBuilder {
-            broker: self.broker,
-            db: self.db,
-            ctx: self.ctx,
-            identity: self.identity,
-            deduplication: self.deduplication,
-            topics: self.topics,
-            event_type_patterns: patterns.into_iter().map(Into::into).collect(),
-            validation_timing: self.validation_timing,
-            _state: PhantomData,
-        }
+        self.event_type_patterns = patterns.into_iter().map(Into::into).collect();
+        self.into_state()
     }
 
-    #[must_use]
-    pub fn lazy_validation(mut self) -> Self {
+    /// Skips preparing the event types at build; an enqueue of an unprepared
+    /// type then fails with [`EventBrokerError::SchemaNotPrepared`].
+    pub(crate) fn lazy_validation(mut self) -> Self {
         self.validation_timing = ValidationTiming::Lazy;
         self
+    }
+
+    fn into_state<B2, Db2, C2, S2, R2, T2, P2>(
+        self,
+    ) -> DbProducerBuilder<B2, Db2, C2, S2, R2, T2, P2> {
+        DbProducerBuilder {
+            broker: self.broker,
+            db: self.db,
+            ctx: self.ctx,
+            source: self.source,
+            client_agent: self.client_agent,
+            registration: self.registration,
+            topics: self.topics,
+            event_type_patterns: self.event_type_patterns,
+            validation_timing: self.validation_timing,
+            _state: PhantomData,
+        }
     }
 }
 
 impl DbProducerBuilder<Has, Has, Has, Has, Has, Has, Has> {
-    pub async fn prepare_all(self) -> Result<DbProducer, EventBrokerError> {
-        self.build_inner(true).await
-    }
-
-    pub async fn build(self) -> Result<DbProducer, EventBrokerError> {
-        let prepare_all = matches!(self.validation_timing, ValidationTiming::Eager);
-        self.build_inner(prepare_all).await
-    }
-
-    async fn build_inner(self, prepare_all: bool) -> Result<DbProducer, EventBrokerError> {
+    /// Prepares every declared topic and event type unless
+    /// [`lazy_validation`](Self::lazy_validation) was set, then, for a
+    /// managed registration, reads the key's stored registrations, which must
+    /// match its mode and client agent.
+    ///
+    /// # Errors
+    ///
+    /// Whatever preparing the topics and event types, or reading the stored
+    /// registrations, fails with; [`EventBrokerError::InvalidProducerOptions`]
+    /// for a stored registration of the key whose mode or client agent
+    /// differs.
+    pub(crate) async fn build(self) -> Result<DbProducer, EventBrokerError> {
         let broker = self.broker.expect("typestate requires broker");
         let db = self.db.expect("typestate requires db");
         let ctx = self.ctx.expect("typestate requires security context");
-        let identity = self.identity.expect("typestate requires identity");
-        let deduplication = self
-            .deduplication
-            .expect("typestate requires deduplication");
-        identity.validate()?;
-        if self.topics.is_empty() || self.event_type_patterns.is_empty() {
-            return Err(EventBrokerError::InvalidProducerOptions {
-                detail: "topics and event_type_patterns are required".to_owned(),
-            });
-        }
+        let source = self.source.expect("typestate requires source");
+        let registration = self.registration.expect("typestate requires registration");
 
         let cache = Arc::new(ProducerSchemaCache::new());
-        if prepare_all {
+        if self.validation_timing == ValidationTiming::Eager {
             cache
                 .prepare_all(&broker, &ctx, &self.topics, &self.event_type_patterns)
                 .await?;
         }
 
-        let client_agent = identity.client_agent_ref().map_or_else(
-            || EventBrokerSdk::default_client_agent().to_owned(),
-            str::to_owned,
-        );
-        let registration_store = ProducerRegistrationStore::new(db.clone());
+        let registration_store = ProducerRegistrationStore::new(db);
         // Partition ids are registered as their partitions first drain; what
         // is already stored has to agree with this configuration, since a
         // producer id's mode never changes (ADR-0004).
-        if let DbDeduplication::Managed(managed) = &deduplication {
-            for registration in registration_store.load_all(&managed.key).await? {
-                registration.validate_matches(managed, &client_agent)?;
+        if let OutboxRegistration::Managed(managed) = &registration {
+            for stored in registration_store.load_all(managed.key()).await? {
+                stored.validate_matches(managed, &self.client_agent)?;
             }
         }
 
         Ok(DbProducer {
             broker,
             ctx,
-            identity,
-            deduplication,
-            client_agent,
+            source,
+            registration,
+            client_agent: self.client_agent,
             registrations: Arc::new(Mutex::new(HashMap::new())),
             slot_locks: Arc::new(Mutex::new(HashMap::new())),
             registration_store,
@@ -268,28 +218,26 @@ impl DbProducerBuilder<Has, Has, Has, Has, Has, Has, Has> {
             event_type_patterns: self.event_type_patterns,
             validation_timing: self.validation_timing,
             cache,
-            #[cfg(all(test, feature = "outbox"))]
+            #[cfg(test)]
             unlock_pause: Arc::default(),
         })
     }
 }
 
+/// The core an outbox setup builds on: the schema cache, the partition
+/// registrations and the drain's broker calls.
 #[derive(Clone)]
-pub struct DbProducer {
+pub(crate) struct DbProducer {
     /// Broker the producer publishes to.
     pub(crate) broker: Arc<dyn EventBrokerApi>,
     /// Security context publishes run under.
     pub(crate) ctx: SecurityContext,
-    /// Identity stamped on every published event.
-    // Read only by `outbox_envelope`; kept on the producer so the outbox path can
-    // stamp the client agent without re-deriving it from the builder.
-    #[cfg_attr(not(feature = "outbox"), allow(dead_code))]
-    pub(crate) identity: ProducerIdentity,
-    /// Deduplication setting the producer registers with.
-    pub(crate) deduplication: DbDeduplication,
-    // Sent when a partition's id is registered on its first drain, which only
-    // the outbox does.
-    #[cfg_attr(not(feature = "outbox"), allow(dead_code))]
+    /// The `source` stamped on every enqueued event.
+    source: String,
+    /// How the producer is known to the broker.
+    pub(crate) registration: OutboxRegistration,
+    /// Sent when a partition's id is registered on its first drain, and
+    /// stamped on every envelope as its diagnostic client agent.
     client_agent: String,
     /// The producer id of each outbox partition drained or replaced so far,
     /// by slot. The lock guards only the map: a slot registers inside its own
@@ -302,36 +250,25 @@ pub struct DbProducer {
     registration_store: ProducerRegistrationStore,
     topics: Vec<String>,
     event_type_patterns: Vec<String>,
-    // Read after `build` only by the outbox path: a lazy producer refuses to
-    // enqueue an event type it has not prepared.
-    #[cfg_attr(not(feature = "outbox"), allow(dead_code))]
+    /// A lazy producer refuses to enqueue an event type it has not prepared.
     validation_timing: ValidationTiming,
     cache: Arc<ProducerSchemaCache>,
     /// Holds a first registration between releasing its slot's write lock
     /// and caching what it read, when a test arms it.
-    #[cfg(all(test, feature = "outbox"))]
+    #[cfg(test)]
     unlock_pause: Arc<tests::UnlockPause>,
 }
 
 impl DbProducer {
-    #[must_use]
-    pub fn builder() -> DbProducerBuilder {
+    pub(crate) fn builder() -> DbProducerBuilder {
         DbProducerBuilder::new()
     }
 
-    pub async fn prepare<E: TypedEvent>(&self) -> Result<(), EventBrokerError> {
-        self.cache
-            .prepare_one(
-                &self.broker,
-                &self.ctx,
-                &self.topics,
-                &self.event_type_patterns,
-                E::TYPE_ID,
-            )
-            .await
-    }
-
-    pub async fn prepare_all(&self) -> Result<(), EventBrokerError> {
+    /// Prepares every event type the declared patterns match, and the
+    /// declared topics, as
+    /// [`OutboxSetup::prepare_all_event_types`](super::OutboxSetup::prepare_all_event_types)
+    /// does, with its errors.
+    pub(crate) async fn prepare_all(&self) -> Result<(), EventBrokerError> {
         self.cache
             .prepare_all(
                 &self.broker,
@@ -342,18 +279,9 @@ impl DbProducer {
             .await
     }
 
-    #[cfg(feature = "outbox")]
-    pub fn outbox_queue(
-        &self,
-        queue: impl Into<String>,
-        partitions: toolkit_db::outbox::Partitions,
-    ) -> Result<ProducerOutboxQueue, EventBrokerError> {
-        ProducerOutboxQueue::new(self.clone(), queue.into(), partitions)
-    }
-
     /// Resets the broker chain of every stored partition id, each keeping its
     /// id.
-    pub async fn reset_chain(&self, scope: ResetScope<'_>) -> Result<(), EventBrokerError> {
+    pub(crate) async fn reset_chain(&self, scope: ResetScope<'_>) -> Result<(), EventBrokerError> {
         for registration in self.stored_registrations("reset_chain").await? {
             self.broker
                 .reset_producer_chain(&self.ctx, registration.producer_id, scope)
@@ -374,7 +302,7 @@ impl DbProducer {
     /// [`EventBrokerError::Internal`] on a stateless producer, or when a
     /// replace task panics; whatever the broker or the registration store
     /// fail with.
-    pub async fn rotate_registration(&self) -> Result<(), EventBrokerError> {
+    pub(crate) async fn rotate_registration(&self) -> Result<(), EventBrokerError> {
         let mut registrations = self.stored_registrations("rotate_registration").await?;
         registrations.sort_by(|a, b| {
             (&a.slot.queue, a.slot.partition).cmp(&(&b.slot.queue, b.slot.partition))
@@ -389,7 +317,7 @@ impl DbProducer {
     /// Every stored partition registration of this producer's key, as
     /// `(queue, partition, producer id, generation)`, ordered by queue and
     /// partition.
-    #[cfg(feature = "outbox")]
+    #[cfg(any(test, feature = "test-util"))]
     pub(crate) async fn stored_partition_registrations(
         &self,
     ) -> Result<Vec<(String, i64, ProducerId, i64)>, EventBrokerError> {
@@ -407,12 +335,12 @@ impl DbProducer {
         &self,
         operation: &str,
     ) -> Result<Vec<ProducerRegistration>, EventBrokerError> {
-        let DbDeduplication::Managed(managed) = &self.deduplication else {
+        let OutboxRegistration::Managed(managed) = &self.registration else {
             return Err(EventBrokerError::Internal(format!(
                 "{operation} called on a stateless producer"
             )));
         };
-        self.registration_store.load_all(&managed.key).await
+        self.registration_store.load_all(managed.key()).await
     }
 
     /// The producer id messages of `partition` of `queue` publish under:
@@ -423,19 +351,18 @@ impl DbProducer {
     /// [`EventBrokerError::Internal`] on a stateless producer, or when the
     /// registration task panics; whatever the broker or the registration
     /// store fail with.
-    #[cfg(feature = "outbox")]
     pub(crate) async fn partition_producer(
         &self,
         queue: &str,
         partition: i64,
     ) -> Result<ProducerId, EventBrokerError> {
-        let DbDeduplication::Managed(managed) = &self.deduplication else {
+        let OutboxRegistration::Managed(managed) = &self.registration else {
             return Err(EventBrokerError::Internal(
                 "a stateless producer has no producer id".to_owned(),
             ));
         };
         let slot = RegistrationSlot {
-            key: managed.key.clone(),
+            key: managed.key().to_owned(),
             queue: queue.to_owned(),
             partition,
         };
@@ -448,7 +375,7 @@ impl DbProducer {
         // deadline) leaves it running through the store insert; the next
         // caller joins the same cell instead of registering a second id.
         let producer = self.clone();
-        let mode = managed.mode;
+        let mode = managed.mode();
         tokio::spawn(
             async move {
                 let mut cell = cell;
@@ -476,7 +403,6 @@ impl DbProducer {
     /// The stored registration of `slot`, else a new one registered with the
     /// broker and stored. Runs under the slot's write lock, so it reads what
     /// a replace in flight stores rather than the id that replace retires.
-    #[cfg(feature = "outbox")]
     async fn load_or_register(
         &self,
         slot: &RegistrationSlot,
@@ -508,7 +434,6 @@ impl DbProducer {
     }
 
     /// The cell of `slot`, created empty on first sight.
-    #[cfg(feature = "outbox")]
     fn registration_cell(&self, slot: &RegistrationSlot) -> RegistrationCell {
         self.registrations
             .lock()
@@ -563,18 +488,17 @@ impl DbProducer {
     ///
     /// [`EventBrokerError::Internal`] when the replace task panics; whatever
     /// the broker or the registration store fail with.
-    #[cfg(feature = "outbox")]
     pub(crate) async fn replace_unknown_producer(
         &self,
         queue: &str,
         partition: i64,
         rejected: ProducerId,
     ) -> Result<(), EventBrokerError> {
-        let DbDeduplication::Managed(managed) = &self.deduplication else {
+        let OutboxRegistration::Managed(managed) = &self.registration else {
             return Ok(());
         };
         let slot = RegistrationSlot {
-            key: managed.key.clone(),
+            key: managed.key().to_owned(),
             queue: queue.to_owned(),
             partition,
         };
@@ -664,28 +588,73 @@ impl DbProducer {
         .map_err(|err| EventBrokerError::Internal(format!("producer replace task: {err}")))?
     }
 
-    #[doc(hidden)]
-    #[cfg(feature = "outbox")]
-    pub async fn outbox_envelope<E: TypedEvent>(
+    /// Prepares the event type `type_id` and the declared topics, as
+    /// [`DirectProducer::prepare_event_type`](super::direct::DirectProducer::prepare_event_type)
+    /// does, with its errors.
+    pub(crate) async fn prepare_event_type(
         &self,
-        event: E,
+        type_id: &GtsTypeId,
+    ) -> Result<(), EventBrokerError> {
+        self.cache
+            .prepare_one(
+                &self.broker,
+                &self.ctx,
+                &self.topics,
+                &self.event_type_patterns,
+                type_id.as_ref(),
+            )
+            .await
+    }
+
+    /// The outbox partition, of `outbox_partitions`, and the envelope of the
+    /// typed `event`, an event the caller has checked as producer input; see
+    /// [`Self::outbox_envelope_of`].
+    ///
+    /// # Errors
+    ///
+    /// The errors of converting `event` to a raw [`EventV1`] and of
+    /// [`Self::outbox_envelope_of`].
+    pub(crate) async fn build_outbox_envelope<P: EventPayload>(
+        &self,
+        event: &EventV1<P>,
         outbox_partitions: u32,
     ) -> Result<(u32, ProducerOutboxEnvelope), EventBrokerError> {
+        let raw = EventV1::try_from(event)?;
+        self.outbox_envelope_of(raw, outbox_partitions).await
+    }
+
+    /// The outbox partition, of `outbox_partitions`, and the envelope of
+    /// `event`, a raw event the caller has checked as producer input, stamped
+    /// with this producer's source. Reads only the schema cache: no broker
+    /// call, so it may run inside the caller's transaction.
+    ///
+    /// # Errors
+    ///
+    /// [`EventBrokerError::EventTypeNotDeclared`] when the event's type matches
+    /// no declared pattern; [`EventBrokerError::SchemaNotPrepared`] when a lazy
+    /// producer has not prepared it; otherwise the errors of
+    /// [`PreparedEvent::new`] and of [`ProducerOutboxEnvelope::from_event`].
+    pub(crate) async fn outbox_envelope_of(
+        &self,
+        mut event: EventV1,
+        outbox_partitions: u32,
+    ) -> Result<(u32, ProducerOutboxEnvelope), EventBrokerError> {
+        let type_id = event.event_type().to_string();
         self.cache
-            .ensure_declared(&self.event_type_patterns, E::TYPE_ID)
+            .ensure_declared(&self.event_type_patterns, &type_id)
             .await?;
         if matches!(self.validation_timing, ValidationTiming::Lazy)
-            && !self.cache.is_prepared(E::TYPE_ID).await
+            && !self.cache.is_prepared(&type_id).await
         {
             return Err(EventBrokerError::SchemaNotPrepared {
-                type_id: E::TYPE_ID.to_owned(),
-                detail: "call producer.prepare::<E>() outside the business transaction first"
-                    .to_owned(),
+                type_id,
+                detail: "call prepare_event_type outside the business transaction first".to_owned(),
             });
         }
+        event.stamp_source(self.source.clone());
         // Producer metadata is stamped when the message drains, under the id of
         // the partition it drains from; nothing of it is known here.
-        let prepared = prepare_event(&self.cache, &self.identity, &self.ctx, event).await?;
+        let prepared = PreparedEvent::new(&self.cache, event).await?;
         let outbox_partition = super::partitioning::producer_outbox_partition(
             &prepared.topic,
             &prepared.key,
@@ -694,16 +663,13 @@ impl DbProducer {
         let envelope = ProducerOutboxEnvelope::from_event(
             prepared.event,
             prepared.topic,
-            self.deduplication.mode(),
-            self.identity.client_agent_ref().map_or_else(
-                || EventBrokerSdk::default_client_agent().to_owned(),
-                str::to_owned,
-            ),
-        );
+            self.registration.mode(),
+            self.client_agent.clone(),
+        )?;
         Ok((outbox_partition, envelope))
     }
 }
 
-#[cfg(all(test, feature = "outbox"))]
+#[cfg(test)]
 #[path = "db_tests.rs"]
 mod tests;

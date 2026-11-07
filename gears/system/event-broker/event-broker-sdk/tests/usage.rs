@@ -8,16 +8,15 @@
 //! | Area | Shows | Core APIs | Proof |
 //! | --- | --- | --- | --- |
 //! | Catalog | Register topic and event type | `EventBrokerHarness`, `StaticTypesRegistry` | Topic/type visible through `EventBrokerApi` |
-//! | Direct producer | Publish typed event | `Producer`, `ProducerIdentity`, `DirectDeduplication` | Event is stored by the broker |
-//! | Persisted/batch producer | Persist-confirming and batch send | `publish_persisted`, `publish_batch` | Outcomes and stored events match |
+//! | Direct producer | Publish typed event | `DirectProducer`, `EventV1`, `Ack` | Event is stored by the broker |
+//! | Persisted/batch producer | Persisted (unimplemented until #5655) and batch send | `Ack::Persisted`, `publish_batch` | Outcomes and stored events match |
 //! | Chained producer | Broker-issued producer id | `ProducerMode::Chained` | Broker cursor advances |
 //! | Consumer | In-memory offset delivery | `ConsumerBuilder`, `InMemoryOffsetManager` | Handler records event data |
 //! | Routing | Topic/type dispatch | consumer routes and default handler | Correct handler receives each event |
 //! | End-to-end | Producer -> broker -> consumer | producer and consumer together | Handler sees the produced subject |
-//! | Outbox producer | Validate and drain durable enqueue | `DbProducer`, toolkit-db outbox | Enqueued row reaches the broker |
-//! | Multi-topic outbox | One queue for multiple topics | `DbProducer` topics + outbox queue | Both topics are delivered |
+//! | Outbox producer | Validate and drain durable enqueue | `OutboxSetup`, `OutboxProducer`, toolkit-db outbox | Enqueued row reaches the broker |
+//! | Multi-topic outbox | One queue for multiple topics | `OutboxSetup` topics + outbox queue | Both topics are delivered |
 
-use std::borrow::Cow;
 #[cfg(all(feature = "db", feature = "outbox"))]
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -27,13 +26,14 @@ use async_trait::async_trait;
 use event_broker::test_support::{EventBrokerHarness, StaticTypesRegistry};
 use event_broker_sdk::backend::{Partition, TopicPartition, Wait};
 use event_broker_sdk::{
-    ConsumerBuilder, ConsumerError, ConsumerGroupRef, DirectDeduplication, Fallback, GtsIdPattern,
-    GtsInstanceId, HandlerOutcome, InMemoryOffsetManager, IngestOutcome, Producer,
-    ProducerIdentity, ProducerMode, RawEvent, Sequence, SingleEventHandler, SubscriptionInterest,
-    TypedEvent, gts_id,
+    Ack, ConsumerBuilder, ConsumerError, ConsumerGroupRef, Delivery, DirectProducer,
+    EventBrokerError, EventHandler, EventPayload, EventV1, Fallback, GtsIdPattern, GtsInstanceId,
+    GtsTypeId, HandlerOutcome, InMemoryOffsetManager, IngestOutcome, ProducerMode, Sequence,
+    SubscriptionInterest, gts_id,
 };
 #[cfg(all(feature = "db", feature = "outbox"))]
-use event_broker_sdk::{DbDeduplication, DbProducer, EventBrokerError};
+use event_broker_sdk::{OutboxRegistration, OutboxSetup};
+use gts::GtsSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::time::{Instant, sleep};
@@ -66,13 +66,11 @@ struct OrderCreated {
     total_cents: i64,
 }
 
-impl TypedEvent for OrderCreated {
+impl GtsSchema for OrderCreated {
     const TYPE_ID: &'static str = ORDER_CREATED;
-    const SUBJECT_TYPE: &'static str = ORDER_SUBJECT;
-    const SOURCE: &'static str = "order-service";
 
-    fn subject(&self) -> Cow<'_, str> {
-        Cow::Owned(self.order_id.to_string())
+    fn gts_schema_with_refs() -> serde_json::Value {
+        order_created_schema()
     }
 }
 
@@ -84,13 +82,11 @@ struct InvalidOrderCreated {
 }
 
 #[cfg(all(feature = "db", feature = "outbox"))]
-impl TypedEvent for InvalidOrderCreated {
+impl GtsSchema for InvalidOrderCreated {
     const TYPE_ID: &'static str = ORDER_CREATED;
-    const SUBJECT_TYPE: &'static str = ORDER_SUBJECT;
-    const SOURCE: &'static str = "order-service";
 
-    fn subject(&self) -> Cow<'_, str> {
-        Cow::Owned(self.order_id.to_string())
+    fn gts_schema_with_refs() -> serde_json::Value {
+        json!({ "type": "object" })
     }
 }
 
@@ -100,13 +96,11 @@ struct OrderUpdated {
     status: String,
 }
 
-impl TypedEvent for OrderUpdated {
+impl GtsSchema for OrderUpdated {
     const TYPE_ID: &'static str = ORDER_UPDATED;
-    const SUBJECT_TYPE: &'static str = ORDER_SUBJECT;
-    const SOURCE: &'static str = "order-service";
 
-    fn subject(&self) -> Cow<'_, str> {
-        Cow::Owned(self.order_id.to_string())
+    fn gts_schema_with_refs() -> serde_json::Value {
+        json!({ "type": "object" })
     }
 }
 
@@ -118,13 +112,11 @@ struct BillingCharged {
 }
 
 #[cfg(all(feature = "db", feature = "outbox"))]
-impl TypedEvent for BillingCharged {
+impl GtsSchema for BillingCharged {
     const TYPE_ID: &'static str = BILLING_CHARGED;
-    const SUBJECT_TYPE: &'static str = BILLING_SUBJECT;
-    const SOURCE: &'static str = "billing-service";
 
-    fn subject(&self) -> Cow<'_, str> {
-        Cow::Owned(self.charge_id.to_string())
+    fn gts_schema_with_refs() -> serde_json::Value {
+        json!({ "type": "object" })
     }
 }
 
@@ -133,13 +125,16 @@ struct RecordingHandler {
 }
 
 #[async_trait]
-impl SingleEventHandler for RecordingHandler {
+impl EventHandler<serde_json::Value> for RecordingHandler {
     async fn handle(
         &self,
-        event: RawEvent,
-        _attempts: u16,
+        event: EventV1,
+        _delivery: &Delivery,
     ) -> Result<HandlerOutcome, ConsumerError> {
-        self.subjects.lock().unwrap().push(event.subject);
+        self.subjects
+            .lock()
+            .unwrap()
+            .push(event.subject().to_owned());
         Ok(HandlerOutcome::Success)
     }
 }
@@ -150,11 +145,11 @@ struct NamedHandler {
 }
 
 #[async_trait]
-impl SingleEventHandler for NamedHandler {
+impl EventHandler<serde_json::Value> for NamedHandler {
     async fn handle(
         &self,
-        _event: RawEvent,
-        _attempts: u16,
+        _event: EventV1,
+        _delivery: &Delivery,
     ) -> Result<HandlerOutcome, ConsumerError> {
         self.calls.lock().unwrap().push(self.name);
         Ok(HandlerOutcome::Success)
@@ -203,12 +198,7 @@ async fn broker_exposes_registered_order_topic_and_event_type() -> TestResult {
         event_type.data_schema,
         json!({
             "allOf": [
-                {
-                    "additionalProperties": true,
-                    "default": null,
-                    "description": "Event payload, validated at ingest against the resolved schema of the event's type. The only field where UTF-8 (or any non-ASCII bytes) is permitted; all other event fields are ASCII per platform convention. May be absent for body-less events (e.g., notification-only events whose semantics are fully carried by `type` + `subject`).",
-                    "type": ["object", "null"],
-                },
+                { "type": ["object", "null"] },
                 order_created_schema(),
             ],
         })
@@ -222,25 +212,23 @@ async fn broker_exposes_registered_order_topic_and_event_type() -> TestResult {
 /// Preconditions: the orders topic and schema are registered before `prepare_all`.
 /// Expected: the event is accepted and appears in broker storage.
 #[tokio::test]
-async fn producer_stateless_publish_sends_typed_event() -> TestResult {
+async fn producer_publish_sends_typed_event() -> TestResult {
     let harness = harness_with(orders_catalog()).await;
     let broker = harness.broker();
 
-    let producer = Producer::builder()
+    let producer = DirectProducer::builder()
         .broker(Arc::clone(&broker))
         .security_context(SecurityContext::anonymous())
-        .identity(
-            ProducerIdentity::new()
-                .source("order-service")
-                .client_agent("order-service/1.0"),
-        )
-        .deduplication(DirectDeduplication::stateless())
+        .source("order-service")
+        .client_agent("order-service/1.0")
         .topics([ORDERS_TOPIC])
         .event_type_patterns(["gts.cf.core.events.event.v1~example.sdk.usage.*"])
-        .prepare_all()
+        .build()
         .await?;
 
-    let outcome = producer.publish(order_created()).await?;
+    let outcome = producer
+        .publish(order_event(order_created())?, Ack::Accepted)
+        .await?;
 
     assert_eq!(outcome, IngestOutcome::Accepted);
     wait_for_stored(&harness, ORDERS_TOPIC, 1).await;
@@ -248,31 +236,49 @@ async fn producer_stateless_publish_sends_typed_event() -> TestResult {
     Ok(())
 }
 
-/// A persisted publish reports `Accepted` while the in-process broker
-/// confirms no durable write, and the event still reaches storage.
+/// A persisted publish is refused as unimplemented while the in-process
+/// broker serves no synchronous publish, and the event is not stored.
 ///
 /// Preconditions: the producer uses the same direct setup as normal publishing.
-/// Expected: `publish_persisted` returns `Accepted` and the event is stored.
+/// Expected: `Ack::Persisted` returns `Unimplemented`; the next `Ack::Accepted`
+/// publish is stored alone.
 #[tokio::test]
-async fn producer_persisted_publish_reports_accepted_until_sync_publish_lands() -> TestResult {
+async fn a_persisted_publish_is_unimplemented_until_sync_publish_lands() -> TestResult {
     let harness = harness_with(orders_catalog()).await;
     let broker = harness.broker();
 
-    let producer = Producer::builder()
+    let producer = DirectProducer::builder()
         .broker(Arc::clone(&broker))
         .security_context(SecurityContext::anonymous())
-        .identity(ProducerIdentity::new().source("order-service"))
-        .deduplication(DirectDeduplication::stateless())
+        .source("order-service")
         .topics([ORDERS_TOPIC])
         .event_type_patterns([ORDER_CREATED])
-        .prepare_all()
+        .build()
         .await?;
 
-    let outcome = producer.publish_persisted(order_created()).await?;
+    let persisted = producer
+        .publish(
+            order_event(order_created())?,
+            Ack::Persisted {
+                within: Duration::from_secs(5),
+            },
+        )
+        .await;
+    let next = producer
+        .publish(order_event(order_created())?, Ack::Accepted)
+        .await?;
 
-    // #5655: the in-process broker confirms no durable write until synchronous publish lands.
-    assert_eq!(outcome, IngestOutcome::Accepted);
+    // #5655: the in-process broker serves no persisted publish until synchronous publish lands.
+    let Err(EventBrokerError::Unimplemented(detail)) = persisted else {
+        panic!("expected `Unimplemented`, got {persisted:?}");
+    };
+    assert_eq!(
+        detail,
+        "synchronous publish (Prefer: wait) is not implemented yet"
+    );
+    assert_eq!(next, IngestOutcome::Accepted);
     wait_for_stored(&harness, ORDERS_TOPIC, 1).await;
+    assert_eq!(stored_count(&harness, ORDERS_TOPIC).await, 1);
 
     Ok(())
 }
@@ -286,24 +292,23 @@ async fn producer_batch_publish_sends_multiple_events() -> TestResult {
     let harness = harness_with(orders_catalog()).await;
     let broker = harness.broker();
 
-    let producer = Producer::builder()
+    let producer = DirectProducer::builder()
         .broker(Arc::clone(&broker))
         .security_context(SecurityContext::anonymous())
-        .identity(ProducerIdentity::new().source("order-service"))
-        .deduplication(DirectDeduplication::stateless())
+        .source("order-service")
         .topics([ORDERS_TOPIC])
         .event_type_patterns([ORDER_CREATED])
-        .prepare_all()
+        .build()
         .await?;
 
-    let outcomes = producer
-        .publish_batch(vec![order_created(), order_created()])
+    let outcome = producer
+        .publish_batch(
+            vec![order_event(order_created())?, order_event(order_created())?],
+            Ack::Accepted,
+        )
         .await?;
 
-    assert_eq!(
-        outcomes,
-        vec![IngestOutcome::Accepted, IngestOutcome::Accepted]
-    );
+    assert_eq!(outcome, IngestOutcome::Accepted);
     wait_for_stored(&harness, ORDERS_TOPIC, 2).await;
 
     Ok(())
@@ -319,24 +324,21 @@ async fn producer_chained_mode_uses_broker_issued_id_and_sequences_events() -> T
     let broker = harness.broker();
     let ctx = SecurityContext::anonymous();
 
-    let producer = Producer::builder()
+    let producer = DirectProducer::builder()
         .broker(Arc::clone(&broker))
         .security_context(ctx.clone())
-        .identity(
-            ProducerIdentity::new()
-                .source("order-service")
-                .client_agent("order-service/1.0"),
-        )
-        .deduplication(DirectDeduplication::register_on_start(
-            ProducerMode::Chained,
-        ))
+        .source("order-service")
+        .client_agent("order-service/1.0")
+        .mode(ProducerMode::Chained)
         .topics([ORDERS_TOPIC])
         .event_type_patterns([ORDER_CREATED])
-        .prepare_all()
+        .build()
         .await?;
 
-    let producer_id = producer.producer_id().expect("broker issued producer id");
-    producer.publish(order_created()).await?;
+    let producer_id = producer.producer_id();
+    producer
+        .publish(order_event(order_created())?, Ack::Accepted)
+        .await?;
     wait_for_stored(&harness, ORDERS_TOPIC, 1).await;
 
     let cursors = broker.get_producer_cursors(&ctx, producer_id).await?;
@@ -368,19 +370,18 @@ async fn consumer_with_in_memory_offsets_receives_event() -> TestResult {
         .start()
         .await?;
 
-    let producer = Producer::builder()
+    let producer = DirectProducer::builder()
         .broker(Arc::clone(&broker))
         .security_context(SecurityContext::anonymous())
-        .identity(ProducerIdentity::new().source("order-service"))
-        .deduplication(DirectDeduplication::stateless())
+        .source("order-service")
         .topics([ORDERS_TOPIC])
         .event_type_patterns([ORDER_CREATED])
-        .prepare_all()
+        .build()
         .await?;
 
     let order = order_created();
     let subject = order.order_id.to_string();
-    producer.publish(order).await?;
+    producer.publish(order_event(order)?, Ack::Accepted).await?;
 
     wait_until(|| subjects.lock().unwrap().contains(&subject)).await;
     consumer.stop().await?;
@@ -418,23 +419,23 @@ async fn consumer_routes_events_by_topic_and_type() -> TestResult {
         .start()
         .await?;
 
-    let producer = Producer::builder()
+    let producer = DirectProducer::builder()
         .broker(Arc::clone(&broker))
         .security_context(SecurityContext::anonymous())
-        .identity(ProducerIdentity::new().source("order-service"))
-        .deduplication(DirectDeduplication::stateless())
+        .source("order-service")
         .topics([ORDERS_TOPIC])
         .event_type_patterns(["gts.cf.core.events.event.v1~example.sdk.usage.*"])
-        .prepare_all()
+        .build()
         .await?;
 
     let order = order_created();
-    producer.publish(order.clone()).await?;
+    let updated = OrderUpdated {
+        order_id: order.order_id,
+        status: "paid".to_owned(),
+    };
+    producer.publish(order_event(order)?, Ack::Accepted).await?;
     producer
-        .publish(OrderUpdated {
-            order_id: order.order_id,
-            status: "paid".to_owned(),
-        })
+        .publish(update_event(updated)?, Ack::Accepted)
         .await?;
 
     wait_until(|| calls.lock().unwrap().len() == 2).await;
@@ -468,19 +469,18 @@ async fn producer_and_consumer_round_trip_order_created() -> TestResult {
         .start()
         .await?;
 
-    let producer = Producer::builder()
+    let producer = DirectProducer::builder()
         .broker(Arc::clone(&broker))
         .security_context(SecurityContext::anonymous())
-        .identity(ProducerIdentity::new().source("order-service"))
-        .deduplication(DirectDeduplication::stateless())
+        .source("order-service")
         .topics([ORDERS_TOPIC])
         .event_type_patterns([ORDER_CREATED])
-        .prepare_all()
+        .build()
         .await?;
 
     let order = order_created();
     let subject = order.order_id.to_string();
-    producer.publish(order).await?;
+    producer.publish(order_event(order)?, Ack::Accepted).await?;
 
     wait_until(|| received.lock().unwrap().contains(&subject)).await;
     consumer.stop().await?;
@@ -490,7 +490,7 @@ async fn producer_and_consumer_round_trip_order_created() -> TestResult {
     Ok(())
 }
 
-/// A DB-aware producer rejects invalid payloads before a durable outbox row is written.
+/// An outbox producer rejects invalid payloads before a durable outbox row is written.
 ///
 /// Preconditions: the producer prepared the registered JSON schema before enqueue.
 /// Expected: enqueue fails locally and the broker stays empty.
@@ -501,31 +501,27 @@ async fn outbox_producer_validates_before_enqueue() -> TestResult {
     let harness = harness_with(orders_catalog()).await;
     let broker = harness.broker();
 
-    let producer = DbProducer::builder()
+    let setup = OutboxSetup::builder()
         .broker(Arc::clone(&broker))
         .db(db.clone())
         .security_context(SecurityContext::anonymous())
-        .identity(
-            ProducerIdentity::new()
-                .source("order-service")
-                .client_agent("order-service/1.0"),
-        )
-        .deduplication(DbDeduplication::stateless())
+        .source("order-service")
+        .registration(OutboxRegistration::Stateless)
         .topics([ORDERS_TOPIC])
         .event_type_patterns([ORDER_CREATED])
-        .prepare_all()
+        .queue(PRODUCER_QUEUE, toolkit_db::outbox::Partitions::of(4))
+        .client_agent("order-service/1.0")
+        .build()
         .await?;
 
-    let event_outbox =
-        producer.outbox_queue(PRODUCER_QUEUE, toolkit_db::outbox::Partitions::of(4))?;
-    let producer_handle = event_outbox
+    let producer_handle = setup
         .start(toolkit_db::outbox::Outbox::builder(db.clone()))
         .await?;
     let conn = db.conn()?;
 
     let err = producer_handle
-        .outbox()
-        .enqueue(&conn, invalid_order_created())
+        .producer()
+        .enqueue(&conn, invalid_order_event()?)
         .await
         .expect_err("invalid event must fail before enqueue");
 
@@ -547,31 +543,27 @@ async fn outbox_producer_drains_queue_to_broker() -> TestResult {
     let harness = harness_with(orders_catalog()).await;
     let broker = harness.broker();
 
-    let producer = DbProducer::builder()
+    let setup = OutboxSetup::builder()
         .broker(Arc::clone(&broker))
         .db(db.clone())
         .security_context(SecurityContext::anonymous())
-        .identity(
-            ProducerIdentity::new()
-                .source("order-service")
-                .client_agent("order-service/1.0"),
-        )
-        .deduplication(DbDeduplication::stateless())
+        .source("order-service")
+        .registration(OutboxRegistration::Stateless)
         .topics([ORDERS_TOPIC])
         .event_type_patterns([ORDER_CREATED])
-        .prepare_all()
+        .queue(PRODUCER_QUEUE, toolkit_db::outbox::Partitions::of(4))
+        .client_agent("order-service/1.0")
+        .build()
         .await?;
 
-    let event_outbox =
-        producer.outbox_queue(PRODUCER_QUEUE, toolkit_db::outbox::Partitions::of(4))?;
-    let producer_handle = event_outbox
+    let producer_handle = setup
         .start(toolkit_db::outbox::Outbox::builder(db.clone()))
         .await?;
     let conn = db.conn()?;
 
     producer_handle
-        .outbox()
-        .enqueue(&conn, order_created())
+        .producer()
+        .enqueue(&conn, order_event(order_created())?)
         .await?
         .fire();
 
@@ -581,7 +573,7 @@ async fn outbox_producer_drains_queue_to_broker() -> TestResult {
     Ok(())
 }
 
-/// One producer outbox queue can carry all topics configured on the `DbProducer`.
+/// One producer outbox queue can carry all topics configured on the `OutboxSetup`.
 ///
 /// Preconditions: orders and billing topics are both configured on the producer.
 /// Expected: both enqueued events are delivered under their own topics.
@@ -592,32 +584,31 @@ async fn single_outbox_queue_can_carry_multiple_topics() -> TestResult {
     let harness = harness_with(orders_and_billing_catalog()).await;
     let broker = harness.broker();
 
-    let producer = DbProducer::builder()
+    let setup = OutboxSetup::builder()
         .broker(Arc::clone(&broker))
         .db(db.clone())
         .security_context(SecurityContext::anonymous())
-        .identity(ProducerIdentity::new().source("order-service"))
-        .deduplication(DbDeduplication::stateless())
+        .source("order-service")
+        .registration(OutboxRegistration::Stateless)
         .topics([ORDERS_TOPIC, BILLING_TOPIC])
         .event_type_patterns(["gts.cf.core.events.event.v1~example.sdk.usage.*"])
-        .prepare_all()
+        .queue(PRODUCER_QUEUE, toolkit_db::outbox::Partitions::of(4))
+        .build()
         .await?;
 
-    let event_outbox =
-        producer.outbox_queue(PRODUCER_QUEUE, toolkit_db::outbox::Partitions::of(4))?;
-    let producer_handle = event_outbox
+    let producer_handle = setup
         .start(toolkit_db::outbox::Outbox::builder(db.clone()))
         .await?;
     let conn = db.conn()?;
 
     producer_handle
-        .outbox()
-        .enqueue(&conn, order_created())
+        .producer()
+        .enqueue(&conn, order_event(order_created())?)
         .await?
         .fire();
     producer_handle
-        .outbox()
-        .enqueue(&conn, billing_charged())
+        .producer()
+        .enqueue(&conn, charge_event(billing_charged())?)
         .await?
         .fire();
 
@@ -767,6 +758,36 @@ fn billing_charged_schema() -> serde_json::Value {
     })
 }
 
+fn order_event(order: OrderCreated) -> Result<EventV1<OrderCreated>, EventBrokerError> {
+    about_order(order.order_id, order)
+}
+
+fn update_event(update: OrderUpdated) -> Result<EventV1<OrderUpdated>, EventBrokerError> {
+    about_order(update.order_id, update)
+}
+
+/// The charge as an event about itself, in the anonymous caller's tenant.
+#[cfg(all(feature = "db", feature = "outbox"))]
+fn charge_event(charge: BillingCharged) -> Result<EventV1<BillingCharged>, EventBrokerError> {
+    EventV1::builder(charge.clone())
+        .tenant_id(SecurityContext::anonymous().subject_tenant_id())
+        .subject(charge.charge_id.to_string())
+        .subject_type_id(GtsTypeId::new(BILLING_SUBJECT))
+        .build()
+}
+
+/// `payload` as an event about order `order_id`, in the anonymous caller's tenant.
+fn about_order<P: EventPayload>(
+    order_id: Uuid,
+    payload: P,
+) -> Result<EventV1<P>, EventBrokerError> {
+    EventV1::builder(payload)
+        .tenant_id(SecurityContext::anonymous().subject_tenant_id())
+        .subject(order_id.to_string())
+        .subject_type_id(GtsTypeId::new(ORDER_SUBJECT))
+        .build()
+}
+
 fn order_created() -> OrderCreated {
     OrderCreated {
         order_id: Uuid::new_v4(),
@@ -774,12 +795,17 @@ fn order_created() -> OrderCreated {
     }
 }
 
+/// An order event whose `total_cents` breaks the registered schema.
 #[cfg(all(feature = "db", feature = "outbox"))]
-fn invalid_order_created() -> InvalidOrderCreated {
-    InvalidOrderCreated {
-        order_id: Uuid::new_v4(),
-        total_cents: "not-an-integer".to_owned(),
-    }
+fn invalid_order_event() -> Result<EventV1<InvalidOrderCreated>, EventBrokerError> {
+    let order_id = Uuid::new_v4();
+    about_order(
+        order_id,
+        InvalidOrderCreated {
+            order_id,
+            total_cents: "not-an-integer".to_owned(),
+        },
+    )
 }
 
 #[cfg(all(feature = "db", feature = "outbox"))]

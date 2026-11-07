@@ -4,8 +4,8 @@
 //! sequencer only after the transaction commits (P-D-221): the writer enqueues through the
 //! transaction's [`TxOutbox`], and [`transaction`] fires what the committed attempt enqueued.
 use crate::infra::broker::EventSink;
-use event_broker_sdk::TypedEvent;
 use std::{
+    borrow::Cow,
     future::Future,
     pin::Pin,
     sync::{Arc, Mutex, PoisonError},
@@ -153,29 +153,60 @@ pub enum EventsError {
     Outbox(#[source] toolkit_db::outbox::OutboxError),
 }
 
-/// Write a typed event through the bound broker producer or the interim outbox. Its wake stays
-/// with `outbox` until the transaction ends (P-D-221).
+/// The per-event envelope values a products event carries beside its `data`. `Serialize` writes
+/// that `data` into the interim envelope.
+pub(crate) trait BrokerEvent: event_broker_sdk::EventPayload + serde::Serialize {
+    /// The subject entity identifier.
+    fn subject(&self) -> Cow<'_, str>;
+    /// The tenant the event belongs to.
+    fn tenant_id(&self) -> Option<uuid::Uuid> {
+        None
+    }
+    /// The W3C trace context the event is produced under.
+    fn trace_parent(&self) -> Option<Cow<'_, str>> {
+        None
+    }
+}
+
+/// Write a typed event about a `subject_type` entity through the bound broker producer or the
+/// interim outbox. Its wake stays with `outbox` until the transaction ends (P-D-221).
 /// # Errors
 /// Returns serialization or enqueue failures; the caller must roll back its transaction.
-pub(crate) async fn enqueue_typed<E: TypedEvent>(
+pub(crate) async fn enqueue_typed<E: BrokerEvent>(
     outbox: &TxOutbox,
     runner: &(impl DBRunner + Sync),
     event: E,
+    subject_type: &str,
 ) -> Result<(), EventsError> {
     // Neither arm fires its `Wake`: the transaction is still open, and a
     // sequencer woken now would find nothing committed. `outbox` keeps it for
     // the transaction's end.
     match &outbox.sink {
-        // SDK ProducerOutbox::enqueue currently erases OutboxError into
+        // The SDK's OutboxProducer::enqueue turns a database OutboxError into
         // EventBrokerError::Internal(String), exposing no DbErr/source to recover.
-        EventSink::Broker(producer) => producer
-            .enqueue(runner, event)
-            .await
-            .map(|wake| outbox.add(wake))
-            .map_err(EventsError::from),
+        EventSink::Broker(producer) => {
+            let subject = event.subject().into_owned();
+            let tenant_id = event.tenant_id();
+            let trace_parent = event.trace_parent().map(Cow::into_owned);
+            let mut builder = event_broker_sdk::EventV1::builder(event)
+                .subject(subject)
+                .subject_type_id(event_broker_sdk::GtsTypeId::new(subject_type));
+            if let Some(tenant_id) = tenant_id {
+                builder = builder.tenant_id(tenant_id);
+            }
+            if let Some(trace_parent) = trace_parent {
+                builder = builder.trace_parent(trace_parent);
+            }
+            producer
+                .enqueue(runner, builder.build()?)
+                .await
+                .map(|wake| outbox.add(wake))
+                .map_err(EventsError::from)
+        }
         EventSink::Interim(queue) => {
-            // The SDK constructor is crate-private and DbProducer::outbox_envelope
-            // needs a prepared broker/schema cache. Persist its v1 wire format here.
+            // The SDK constructor is crate-private and only OutboxProducer::enqueue builds
+            // the envelope, which needs a prepared broker/schema cache. Persist its v1 wire
+            // format here.
             // Stateless backlog needs no producer registration; the later processor
             // honors the mode in each envelope and publishes this durable event id.
             let envelope = serde_json::json!({
@@ -184,9 +215,9 @@ pub(crate) async fn enqueue_typed<E: TypedEvent>(
                 "type": E::TYPE_ID,
                 "topic": crate::infra::broker::TOPIC,
                 "tenant_id": event.tenant_id(),
-                "source": E::SOURCE,
+                "source": crate::infra::broker::SOURCE,
                 "subject": event.subject(),
-                "subject_type": E::SUBJECT_TYPE,
+                "subject_type": subject_type,
                 "occurred_at": time::OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339).map_err(|e| EventsError::Serialize(e.to_string()))?,
                 "trace_parent": event.trace_parent(),
                 "data": serde_json::to_value(&event).map_err(|e| EventsError::Serialize(e.to_string()))?,

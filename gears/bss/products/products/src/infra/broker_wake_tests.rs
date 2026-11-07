@@ -38,7 +38,7 @@ async fn bound() -> (
     Arc<crate::api::rest::ApiState>,
     Uuid,
     crate::test_support::TestDsn,
-    event_broker_sdk::ProducerOutboxHandle,
+    event_broker_sdk::OutboxProducerHandle,
     EventBrokerHarness,
 ) {
     let mut spec = vec![json!({"id": TOPIC, "partitions": PARTITIONS})];
@@ -182,7 +182,7 @@ async fn enqueue(
         move |tx, outbox| {
             let event = event.clone();
             Box::pin(async move {
-                enqueue_typed(&outbox, tx, event).await?;
+                enqueue_typed(&outbox, tx, event, SKU_SUBJECT_TYPE).await?;
                 tokio::time::sleep(hold).await;
                 if commit {
                     Ok(())
@@ -212,6 +212,12 @@ async fn commit_unwoken(state: &crate::api::rest::ApiState, event: SkuPublished)
             move |tx| {
                 let (producer, event) = (producer.clone(), event.clone());
                 Box::pin(async move {
+                    let (subject, tenant_id) = (event.sku_id.to_string(), event.tenant_id);
+                    let event = event_broker_sdk::EventV1::builder(event)
+                        .tenant_id(tenant_id)
+                        .subject(subject)
+                        .subject_type_id(event_broker_sdk::GtsTypeId::new(SKU_SUBJECT_TYPE))
+                        .build()?;
                     producer.enqueue(tx, event).await?.discard();
                     Ok(())
                 })
@@ -287,7 +293,7 @@ async fn a_retried_attempt_drops_the_wakes_of_the_attempt_before() {
             let (seen, contended) = (seen.clone(), contended.clone());
             Box::pin(async move {
                 if seen.fetch_add(1, Ordering::SeqCst) == 0 {
-                    enqueue_typed(&outbox, tx, contended).await?;
+                    enqueue_typed(&outbox, tx, contended, SKU_SUBJECT_TYPE).await?;
                     return Err(TxError::Contended(sea_orm::DbErr::Custom(
                         "error returned from database: (code: 5) database is locked".into(),
                     )));

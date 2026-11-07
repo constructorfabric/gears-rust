@@ -1,9 +1,9 @@
 use crate::sequence::Sequence;
-use chrono::Utc;
 use toolkit_gts::gts_id;
 use uuid::Uuid;
 
-use crate::consumer::RawEvent;
+use crate::consumer::Delivery;
+use crate::gts::{EventV1, StoredPosition};
 use crate::ids::{ConsumerGroupId, TopicId};
 
 use super::{DeadLetterEnvelope, DeadLetterRecord};
@@ -11,30 +11,37 @@ use super::{DeadLetterEnvelope, DeadLetterRecord};
 const TOPIC: &str = gts_id!("cf.core.events.topic.v1~example.orders.x.x.v1");
 const EVENT_TYPE: &str = gts_id!("cf.core.events.event.v1~example.orders.rejected.x.v1~");
 
-fn raw_event() -> RawEvent {
-    RawEvent {
-        id: Uuid::new_v4(),
-        type_id: gts::GtsTypeId::new(EVENT_TYPE),
-        topic: gts::GtsInstanceId::try_new(TOPIC).unwrap(),
-        tenant_id: Uuid::new_v4(),
-        subject: "order-1".to_owned(),
-        subject_type: gts::GtsTypeId::new("gts.x.eb.test.subject.v1~"),
+const EVENT_ID: Uuid = Uuid::from_u128(0x0e1e_0001);
+
+fn raw_event() -> EventV1 {
+    EventV1::builder_for(
+        gts::GtsTypeId::new(EVENT_TYPE),
+        serde_json::json!({ "order_id": "order-1", "valid": false }),
+    )
+    .id(EVENT_ID)
+    .tenant_id(Uuid::from_u128(0x0e1e_0002))
+    .subject("order-1")
+    .subject_type_id(gts::GtsTypeId::new("gts.x.eb.test.subject.v1~"))
+    .occurred_at("2026-01-02T03:04:05Z".parse().unwrap())
+    .build()
+    .unwrap()
+    .stamp_position(StoredPosition {
         partition: 7,
         sequence: Sequence::assigned(99),
-        offset: Sequence::assigned(99),
-        occurred_at: Utc::now(),
-        sequence_time: Utc::now(),
-        trace_parent: None,
-        data: serde_json::json!({ "order_id": "order-1", "valid": false }),
-    }
+        sequence_time: "2026-01-02T03:04:06Z".parse().unwrap(),
+    })
+}
+
+fn delivery() -> Delivery {
+    Delivery::new(gts::GtsInstanceId::try_new(TOPIC).unwrap(), 7, 1)
 }
 
 #[test]
 fn dead_letter_envelope_preserves_record_context_and_payload_type_convention() {
-    let group_id = ConsumerGroupId::new(Uuid::new_v4());
+    let group_id = ConsumerGroupId::new(Uuid::from_u128(0x0e1e_0003));
     let topic_id = TopicId::from_gts(TOPIC);
     let raw = raw_event();
-    let record = DeadLetterRecord::builder(&raw, "permanent validation failure")
+    let record = DeadLetterRecord::builder(&raw, &delivery(), "permanent validation failure")
         .group_id(group_id)
         .topic_id(topic_id)
         .attempts(6)
@@ -58,14 +65,17 @@ fn dead_letter_envelope_preserves_record_context_and_payload_type_convention() {
     assert_eq!(envelope.offset, Sequence::assigned(99));
     assert_eq!(envelope.attempts, Some(6));
     assert_eq!(envelope.reason, "permanent validation failure");
-    assert_eq!(envelope.payload, raw.data);
-    assert_eq!(envelope.event_id, raw.id);
+    assert_eq!(
+        envelope.payload,
+        serde_json::json!({ "order_id": "order-1", "valid": false })
+    );
+    assert_eq!(envelope.event_id, EVENT_ID);
 }
 
 #[test]
 fn dead_letter_envelope_round_trips_from_outbox_payload() {
     let raw = raw_event();
-    let record = DeadLetterRecord::builder(&raw, "cannot project").build();
+    let record = DeadLetterRecord::builder(&raw, &delivery(), "cannot project").build();
     let envelope = DeadLetterEnvelope::from_record(record);
 
     let payload = envelope.to_vec().expect("serialize envelope");
@@ -79,7 +89,7 @@ fn dead_letter_envelope_round_trips_from_outbox_payload() {
     assert_eq!(coordinates.subject_type, "gts.x.eb.test.subject.v1~");
     assert_eq!(coordinates.partition, 7);
     assert_eq!(coordinates.offset, Sequence::assigned(99));
-    assert_eq!(coordinates.event_id, raw.id);
+    assert_eq!(coordinates.event_id, EVENT_ID);
 }
 
 #[test]

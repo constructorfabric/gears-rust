@@ -1,7 +1,7 @@
 //! The broker SDK's producer over pricing's outbox queue (D-400; Products' `bind_producer`).
 //!
-//! Where the `ClientHub` carries an `EventBrokerApi`, pricing binds a `DbProducer` as the
-//! queue's processor and events are enqueued in its envelope; where it carries none, the
+//! Where the `ClientHub` carries an `EventBrokerApi`, pricing binds an `OutboxSetup`'s producer
+//! as the queue's processor and events are enqueued in its envelope; where it carries none, the
 //! queue keeps the holding processor ([`super::events::PendingProducer`]) and nothing is ever
 //! reported delivered. A registration that is present but unusable fails the boot.
 //!
@@ -15,8 +15,8 @@ use super::{
 };
 use anyhow::Context;
 use bss_products_sdk::PRICING_SYSTEM_ACTOR;
-use event_broker_sdk::ProducerOutboxHandle;
-use toolkit_gts::gts_id;
+use event_broker_sdk::{GtsTypeId, OutboxProducerHandle};
+use toolkit_gts::{GtsSchema, gts_id};
 use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
@@ -43,7 +43,7 @@ pub async fn bind_producer(
     db: toolkit_db::Db,
     table_prefix: &str,
     partitions: toolkit_db::outbox::Partitions,
-) -> anyhow::Result<Option<(EventSink, ProducerOutboxHandle)>> {
+) -> anyhow::Result<Option<(EventSink, OutboxProducerHandle)>> {
     let broker = match hub.get::<dyn event_broker_sdk::EventBrokerApi>() {
         Ok(broker) => broker,
         // The configured-out case, and the only silent one.
@@ -53,36 +53,42 @@ pub async fn bind_producer(
                 .context("bss-pricing: the ClientHub holds an unusable EventBrokerApi"));
         }
     };
-    let producer = event_broker_sdk::DbProducer::builder()
+    let setup = event_broker_sdk::OutboxSetup::builder()
         .broker(broker)
         .db(db.clone())
         .security_context(producer_system_actor()?)
+        .source(SOURCE)
         // No version in the agent: a stored registration compares it verbatim.
-        .identity(
-            event_broker_sdk::ProducerIdentity::new()
-                .source(SOURCE)
-                .client_agent(SOURCE),
-        )
-        .deduplication(
-            event_broker_sdk::DbDeduplication::managed(event_broker_sdk::ProducerMode::Monotonic)
-                .key(SOURCE)
-                .build()?,
-        )
+        .client_agent(SOURCE)
+        .registration(event_broker_sdk::OutboxRegistration::managed(
+            event_broker_sdk::ProducerMode::Monotonic,
+            SOURCE,
+        ))
         .topics([TOPIC])
         .event_type_patterns([EVENT_TYPE_WILDCARD])
-        .prepare_all()
+        // One queue name across both processors, so an arm switch strands no row.
+        .queue(QUEUE, partitions)
+        .build()
         .await?;
     // Resolve every schema before a business transaction enqueues an event.
-    producer.prepare::<PriceBookEntryReferenceLost>().await?;
-    producer.prepare::<PlanReferenceLost>().await?;
-    producer.prepare::<PricesPublished>().await?;
-    producer.prepare::<PlanRevisionPublished>().await?;
-    producer.prepare::<ApprovalUnitDecided>().await?;
-    // One queue name across both processors, so an arm switch strands no row.
-    let queue = producer.outbox_queue(QUEUE, partitions)?;
-    let handle = queue
+    setup
+        .prepare_event_type(&GtsTypeId::new(PriceBookEntryReferenceLost::TYPE_ID))
+        .await?;
+    setup
+        .prepare_event_type(&GtsTypeId::new(PlanReferenceLost::TYPE_ID))
+        .await?;
+    setup
+        .prepare_event_type(&GtsTypeId::new(PricesPublished::TYPE_ID))
+        .await?;
+    setup
+        .prepare_event_type(&GtsTypeId::new(PlanRevisionPublished::TYPE_ID))
+        .await?;
+    setup
+        .prepare_event_type(&GtsTypeId::new(ApprovalUnitDecided::TYPE_ID))
+        .await?;
+    let handle = setup
         .start(toolkit_db::outbox::Outbox::builder(db).table_prefix(table_prefix)?)
         .await?;
-    let sink = EventSink::Broker(Box::new(handle.outbox().clone()));
+    let sink = EventSink::Broker(Box::new(handle.producer().clone()));
     Ok(Some((sink, handle)))
 }

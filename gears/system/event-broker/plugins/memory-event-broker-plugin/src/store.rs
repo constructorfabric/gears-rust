@@ -13,7 +13,8 @@ use event_broker_sdk::backend::{
     AppendRequest, Appended, BackendError, FenceKey, FenceSeq, Head, LogClaim, LogId, Partition,
     Provisioning, Retention, Stored, TopicPartition, TopicSpec,
 };
-use event_broker_sdk::{Event, GtsInstanceId, PartitionRange, Position, Sequence, TopicSegment};
+use event_broker_sdk::models::Event;
+use event_broker_sdk::{GtsInstanceId, PartitionRange, Position, Sequence, TopicSegment};
 
 /// Bytes counted per event on top of its variable-length fields: the fixed
 /// fields and bookkeeping a stored event costs.

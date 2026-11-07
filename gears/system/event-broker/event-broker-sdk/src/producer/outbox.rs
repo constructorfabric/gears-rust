@@ -4,22 +4,21 @@ use std::sync::{Arc, Mutex};
 use gts::GtsTypeId;
 use toolkit_db::outbox::{LeasedMessageHandler, MessageResult, OutboxMessage};
 
-use crate::api::{IngestOutcome, ProducerMode};
-use crate::error::EventBrokerError;
+use crate::api::{Ack, IngestOutcome, ProducerMode};
+use crate::error::{EventBrokerError, json_error_category};
+use crate::gts::{EventMeta, EventV1};
 use crate::ids::ProducerId;
-use crate::models::{Event, ProducerMeta};
 
 use super::db::DbProducer;
-use super::registration::MAX_NAME_LEN;
 
 /// The `ProducerOutboxEnvelope` shape version written on every producer-outbox
-/// row; an envelope of any other version is refused as
-/// [`EventBrokerError::Internal`].
-pub const PRODUCER_OUTBOX_ENVELOPE_VERSION: u16 = 1;
+/// row; the drain rejects an envelope of any other version right after it
+/// decodes, before any broker call.
+pub(crate) const PRODUCER_OUTBOX_ENVELOPE_VERSION: u16 = 1;
 /// The outbox payload type the SDK writes on every producer-outbox row. No
 /// outbox claim filters on it: the processor decodes every row of its queue as
 /// a `ProducerOutboxEnvelope`.
-pub const PRODUCER_OUTBOX_PAYLOAD_TYPE: &str =
+pub(crate) const PRODUCER_OUTBOX_PAYLOAD_TYPE: &str =
     "application/vnd.constructorfabric.event-broker.producer-outbox+json;version=1";
 
 /// A producer's chain is kept per `(producer_id, topic)` (ADR-0004 "Chain Scope").
@@ -28,7 +27,7 @@ type ProducerOutboxCursorMap = HashMap<ProducerOutboxCursorKey, i64>;
 type SharedProducerOutboxCursor = Arc<Mutex<ProducerOutboxCursorMap>>;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct ProducerOutboxEnvelope {
+pub(crate) struct ProducerOutboxEnvelope {
     version: u16,
     event_id: uuid::Uuid,
     #[serde(rename = "type")]
@@ -103,33 +102,43 @@ mod producer_mode_wire {
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct ProducerOutboxDiagnostics {
+pub(crate) struct ProducerOutboxDiagnostics {
     sdk_client_agent: String,
 }
 
 impl ProducerOutboxEnvelope {
     /// Wraps `event` with its routing and producer metadata for the outbox.
+    ///
+    /// # Errors
+    ///
+    /// [`EventBrokerError::Internal`] when `event` has no source, a broken internal
+    /// invariant: a prepared event always carries the producer's source.
     pub(crate) fn from_event(
-        event: Event,
+        event: EventV1,
         topic: String,
         producer_mode: ProducerMode,
         sdk_client_agent: String,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, EventBrokerError> {
+        let Some(source) = event.source().map(str::to_owned) else {
+            return Err(EventBrokerError::Internal(
+                "a prepared event has a source".to_owned(),
+            ));
+        };
+        Ok(Self {
             version: PRODUCER_OUTBOX_ENVELOPE_VERSION,
-            event_id: event.id,
-            event_type_id: event.type_id,
+            event_id: event.id(),
+            event_type_id: event.event_type().clone(),
             topic,
-            tenant_id: event.tenant_id,
-            source: event.source,
-            subject: event.subject,
-            subject_type: event.subject_type,
-            occurred_at: event.occurred_at,
-            trace_parent: event.trace_parent,
-            data: event.data,
+            tenant_id: event.tenant_id(),
+            source,
+            subject: event.subject().to_owned(),
+            subject_type: event.subject_type().clone(),
+            occurred_at: event.occurred_at(),
+            trace_parent: event.trace_parent().map(str::to_owned),
+            data: event.into_data(),
             producer_mode,
             diagnostic_metadata: ProducerOutboxDiagnostics { sdk_client_agent },
-        }
+        })
     }
 
     /// The event this envelope publishes as message `seq` under
@@ -141,13 +150,7 @@ impl ProducerOutboxEnvelope {
         seq: i64,
         producer_id: Option<ProducerId>,
         chained_previous: Option<i64>,
-    ) -> Result<Event, EventBrokerError> {
-        if self.version != PRODUCER_OUTBOX_ENVELOPE_VERSION {
-            return Err(EventBrokerError::Internal(format!(
-                "unsupported producer outbox envelope version {}",
-                self.version
-            )));
-        }
+    ) -> Result<EventV1, EventBrokerError> {
         let meta = match (self.producer_mode, producer_id) {
             (ProducerMode::Stateless, _) => None,
             (_, None) => {
@@ -156,7 +159,7 @@ impl ProducerOutboxEnvelope {
                         .to_owned(),
                 ));
             }
-            (ProducerMode::Monotonic, Some(producer_id)) => Some(ProducerMeta {
+            (ProducerMode::Monotonic, Some(producer_id)) => Some(EventMeta {
                 version: 1,
                 producer_id: Some(producer_id.0),
                 previous: None,
@@ -168,7 +171,7 @@ impl ProducerOutboxEnvelope {
                         "producer outbox chained publish is missing previous sequence".to_owned(),
                     )
                 })?;
-                Some(ProducerMeta {
+                Some(EventMeta {
                     version: 1,
                     producer_id: Some(producer_id.0),
                     previous: Some(previous),
@@ -176,283 +179,82 @@ impl ProducerOutboxEnvelope {
                 })
             }
         };
-        Ok(Event {
-            id: self.event_id,
-            type_id: self.event_type_id.clone(),
-            tenant_id: self.tenant_id,
-            source: self.source.clone(),
-            subject: self.subject.clone(),
-            subject_type: self.subject_type.clone(),
-            occurred_at: self.occurred_at,
-            trace_parent: self.trace_parent.clone(),
-            data: self.data.clone(),
-            partition: None,
-            sequence: None,
-            sequence_time: None,
-            meta,
-        })
-    }
-}
-
-#[derive(Clone)]
-pub struct ProducerOutbox {
-    producer: DbProducer,
-    outbox: Arc<toolkit_db::outbox::Outbox>,
-    queue: String,
-    partitions: u32,
-}
-
-impl ProducerOutbox {
-    /// Enqueue one typed event within the caller's transaction.
-    ///
-    /// The producer outbox row is written atomically with `runner`'s
-    /// transaction, but the write does **not** wake the sequencer on its own.
-    /// Call [`Wake::fire`](toolkit_db::outbox::Wake::fire) on
-    /// the returned handle once that transaction has committed; on rollback,
-    /// drop the handle instead. Until it is fired the event is durable but
-    /// stays unpublished until the outbox's cold reconciler discovers it.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the event fails producer validation, the envelope
-    /// cannot be serialized, or the database rejects the write.
-    pub async fn enqueue<E: crate::typed_event::TypedEvent>(
-        &self,
-        runner: &(impl toolkit_db::secure::DBRunner + Sync + ?Sized),
-        event: E,
-    ) -> Result<toolkit_db::outbox::Wake, EventBrokerError> {
-        let (partition, envelope) = self
-            .producer
-            .outbox_envelope(event, self.partitions)
-            .await?;
-        let payload = serde_json::to_vec(&envelope).map_err(|err| {
-            EventBrokerError::Internal(format!("serialize producer outbox envelope: {err}"))
-        })?;
-        let record = toolkit_db::outbox::Record::to(&self.queue, partition)
-            .payload(payload, PRODUCER_OUTBOX_PAYLOAD_TYPE)
-            .build()
-            .map_err(|err| EventBrokerError::Internal(format!("producer outbox enqueue: {err}")))?;
-        self.outbox
-            .enqueue(runner, record)
-            .await
-            .map_err(|err| EventBrokerError::Internal(format!("producer outbox enqueue: {err}")))
-    }
-
-    /// Enqueue several typed events for this producer in one batch.
-    ///
-    /// The whole batch is written atomically with `runner`'s transaction and,
-    /// like [`enqueue`](Self::enqueue), does not wake the sequencer on its own.
-    /// Call [`Wake::fire`](toolkit_db::outbox::Wake::fire) on
-    /// the returned handle once that transaction has committed; on rollback,
-    /// drop the handle instead.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if any event fails producer validation, an envelope
-    /// cannot be serialized, or the database rejects the write. A batch is
-    /// all-or-nothing: one rejected event writes none.
-    pub async fn enqueue_batch<E: crate::typed_event::TypedEvent>(
-        &self,
-        runner: &(impl toolkit_db::secure::DBRunner + Sync + ?Sized),
-        events: impl IntoIterator<Item = E>,
-    ) -> Result<toolkit_db::outbox::Wake, EventBrokerError> {
-        // Every event in the batch shares the queue and the payload type, so
-        // the batch states them once. No trace is attached: a produced event
-        // is already identified by its own id and `trace_parent`, and giving
-        // each one a trace row would be a record nobody reads.
-        let mut batch =
-            toolkit_db::outbox::Records::to(&self.queue).payload_type(PRODUCER_OUTBOX_PAYLOAD_TYPE);
-        for event in events {
-            let (partition, envelope) = self
-                .producer
-                .outbox_envelope(event, self.partitions)
-                .await?;
-            let payload = serde_json::to_vec(&envelope).map_err(|err| {
-                EventBrokerError::Internal(format!("serialize producer outbox envelope: {err}"))
-            })?;
-            batch = batch.push(partition, payload);
+        let mut builder = match &self.data {
+            Some(data) => EventV1::builder_for(self.event_type_id.clone(), data.clone()),
+            None => EventV1::builder_without_data(self.event_type_id.clone()),
         }
-        let batch = batch.build().map_err(|err| {
-            EventBrokerError::Internal(format!("producer outbox batch enqueue: {err}"))
-        })?;
-        self.outbox
-            .enqueue_batch(runner, batch)
-            .await
-            .map_err(|err| {
-                EventBrokerError::Internal(format!("producer outbox batch enqueue: {err}"))
-            })
-    }
-}
-
-#[derive(Clone)]
-pub struct ProducerOutboxQueue {
-    producer: DbProducer,
-    queue: String,
-    partitions: toolkit_db::outbox::Partitions,
-}
-
-impl ProducerOutboxQueue {
-    /// Creates a queue over `producer`.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`EventBrokerError::InvalidProducerOptions`] on the first
-    /// failing check, in this order: a blank queue name, one with leading or
-    /// trailing whitespace, and one longer than the registration row holds.
-    pub(crate) fn new(
-        producer: DbProducer,
-        queue: String,
-        partitions: toolkit_db::outbox::Partitions,
-    ) -> Result<Self, EventBrokerError> {
-        if queue.trim().is_empty() {
-            return Err(EventBrokerError::InvalidProducerOptions {
-                detail: "producer outbox queue name must not be empty".to_owned(),
-            });
+        .id(self.event_id)
+        .tenant_id(self.tenant_id)
+        .source(self.source.clone())
+        .subject(self.subject.clone())
+        .subject_type_id(self.subject_type.clone())
+        .occurred_at(self.occurred_at);
+        if let Some(trace_parent) = &self.trace_parent {
+            builder = builder.trace_parent(trace_parent.clone());
         }
-        if queue != queue.trim() {
-            return Err(EventBrokerError::InvalidProducerOptions {
-                detail: "producer outbox queue name must not have leading or trailing whitespace"
-                    .to_owned(),
-            });
+        let mut event = builder.build()?;
+        if let Some(meta) = meta {
+            event.stamp_meta(meta);
         }
-        if queue.len() > MAX_NAME_LEN {
-            return Err(EventBrokerError::InvalidProducerOptions {
-                detail: format!("producer outbox queue name must be at most {MAX_NAME_LEN} bytes"),
-            });
-        }
-        Ok(Self {
-            producer,
-            queue,
-            partitions,
-        })
-    }
-
-    pub fn register(
-        &self,
-        builder: toolkit_db::outbox::OutboxBuilder,
-    ) -> toolkit_db::outbox::LeasedQueueBuilder {
-        builder
-            .queue(&self.queue, self.partitions)
-            .leased(ProducerOutboxProcessor {
-                producer: self.producer.clone(),
-                queue: self.queue.clone(),
-                cursor_state: Arc::new(Mutex::new(HashMap::new())),
-            })
-    }
-
-    pub fn bind(&self, handle: &toolkit_db::outbox::OutboxHandle) -> ProducerOutbox {
-        ProducerOutbox {
-            producer: self.producer.clone(),
-            outbox: Arc::clone(handle.outbox()),
-            queue: self.queue.clone(),
-            partitions: u32::from(self.partitions.count()),
-        }
-    }
-
-    pub async fn start(
-        &self,
-        builder: toolkit_db::outbox::OutboxBuilder,
-    ) -> Result<ProducerOutboxHandle, EventBrokerError> {
-        let handle =
-            self.register(builder).start().await.map_err(|err| {
-                EventBrokerError::Internal(format!("start producer outbox: {err}"))
-            })?;
-        let outbox = self.bind(&handle);
-        Ok(ProducerOutboxHandle { handle, outbox })
+        Ok(event)
     }
 }
 
-pub struct ProducerOutboxHandle {
-    handle: toolkit_db::outbox::OutboxHandle,
-    outbox: ProducerOutbox,
-}
-
-impl ProducerOutboxHandle {
-    pub fn outbox(&self) -> &ProducerOutbox {
-        &self.outbox
-    }
-
-    pub async fn stop(self) {
-        self.handle.stop().await;
-    }
-}
-
-/// The queue name the `process_outbox_payload*_for_test` helpers drain as.
+/// The queue name the `OutboxSetup::process_outbox_payload*_for_test` hooks
+/// drain as.
+#[cfg(any(test, feature = "test-util"))]
 #[doc(hidden)]
 pub const TEST_QUEUE: &str = "event-broker-producer-test";
 
-impl DbProducer {
-    /// The producer id messages of `partition` of `queue` publish under,
-    /// registering it now if the partition has none yet - as its first drain
-    /// would.
-    ///
-    /// # Errors
-    ///
-    /// [`EventBrokerError::InvalidProducerOptions`] if `queue` is not a valid
-    /// outbox queue name; [`EventBrokerError::Internal`] if the producer is
-    /// stateless or the registration task panics; otherwise whatever the
-    /// broker or the registration store fail with.
-    #[doc(hidden)]
-    pub async fn partition_producer_for_test(
-        &self,
-        queue: &str,
-        partition: i64,
-    ) -> Result<ProducerId, EventBrokerError> {
-        ProducerOutboxQueue::new(
-            self.clone(),
-            queue.to_owned(),
-            toolkit_db::outbox::Partitions::of(1),
-        )?;
-        self.partition_producer(queue, partition).await
+pub(super) struct ProducerOutboxProcessor {
+    producer: DbProducer,
+    queue: String,
+    cursor_state: SharedProducerOutboxCursor,
+}
+
+/// How a failed drain step (a broker call, the partition's producer id, the
+/// event build) is answered: a transient failure retries, anything else
+/// rejects the message with its variant name only, never its `Display`,
+/// which can quote payload values.
+pub(super) fn retry_or_reject(err: &EventBrokerError) -> MessageResult {
+    match err {
+        EventBrokerError::Transport(_)
+        | EventBrokerError::RateLimitExceeded { .. }
+        | EventBrokerError::RateLimited { .. } => MessageResult::Retry,
+        err => MessageResult::Reject(format!("producer outbox message rejected: {}", err.kind())),
+    }
+}
+
+impl ProducerOutboxProcessor {
+    /// The processor that drains `queue` through `producer`, with no chain
+    /// cursor read yet.
+    pub(super) fn new(producer: DbProducer, queue: String) -> Self {
+        Self {
+            producer,
+            queue,
+            cursor_state: Arc::new(Mutex::new(HashMap::new())),
+        }
     }
 
-    /// Every stored partition registration of this producer's key, as
-    /// `(queue, partition, producer id, generation)`, ordered by queue and
-    /// partition.
-    #[doc(hidden)]
-    pub async fn registrations_for_test(
-        &self,
-    ) -> Result<Vec<(String, i64, ProducerId, i64)>, EventBrokerError> {
-        self.stored_partition_registrations().await
-    }
-
-    /// Drains one message of partition id 0 of [`TEST_QUEUE`] through the
-    /// producer outbox handler.
-    #[doc(hidden)]
-    pub async fn process_outbox_payload_for_test(
-        &self,
-        payload: Vec<u8>,
-        seq: i64,
-    ) -> MessageResult {
-        self.process_outbox_payload_with_cursor_for_test(payload, seq, None)
-            .await
-    }
-
-    /// As [`process_outbox_payload_for_test`](Self::process_outbox_payload_for_test),
-    /// with the chained cursor of the envelope's topic seeded to
-    /// `initial_chained_previous` for partition 0's producer id.
-    #[doc(hidden)]
-    pub async fn process_outbox_payload_with_cursor_for_test(
-        &self,
-        payload: Vec<u8>,
-        seq: i64,
-        initial_chained_previous: Option<i64>,
-    ) -> MessageResult {
-        let cursor_state = Arc::new(Mutex::new(HashMap::new()));
-        if let Some(previous) = initial_chained_previous
-            && let Ok(envelope) = serde_json::from_slice::<ProducerOutboxEnvelope>(&payload)
-            && let Ok(producer_id) = self.partition_producer(TEST_QUEUE, 0).await
+    /// Seeds the chain cursor of `payload`'s topic to `previous` for the
+    /// producer id of partition 0 of [`TEST_QUEUE`], as a drain that starts
+    /// mid-chain. A payload that does not decode, or a partition whose id
+    /// does not resolve, seeds nothing.
+    #[cfg(any(test, feature = "test-util"))]
+    pub(super) async fn seed_test_cursor(&self, payload: &[u8], previous: i64) {
+        if let Ok(envelope) = serde_json::from_slice::<ProducerOutboxEnvelope>(payload)
+            && let Ok(producer_id) = self.producer.partition_producer(TEST_QUEUE, 0).await
         {
-            cursor_state
+            self.cursor_state
                 .lock()
                 .expect("producer outbox cursor state lock poisoned")
                 .insert((producer_id, envelope.topic), previous);
         }
-        let processor = ProducerOutboxProcessor {
-            producer: self.clone(),
-            queue: TEST_QUEUE.to_owned(),
-            cursor_state,
-        };
+    }
+
+    /// Drains `payload` as message `seq` of partition id 0.
+    #[cfg(any(test, feature = "test-util"))]
+    pub(super) async fn handle_test_payload(&self, payload: Vec<u8>, seq: i64) -> MessageResult {
         let msg = OutboxMessage {
             partition_id: 0,
             seq,
@@ -461,28 +263,9 @@ impl DbProducer {
             created_at: chrono::Utc::now(),
             attempts: 0,
         };
-        processor.handle(&msg).await
+        self.handle(&msg).await
     }
-}
 
-struct ProducerOutboxProcessor {
-    producer: DbProducer,
-    queue: String,
-    cursor_state: SharedProducerOutboxCursor,
-}
-
-/// How a failed broker call is answered: a transient failure retries, anything
-/// else rejects the message.
-fn retry_or_reject(err: &EventBrokerError) -> MessageResult {
-    match err {
-        EventBrokerError::Transport(_)
-        | EventBrokerError::RateLimitExceeded { .. }
-        | EventBrokerError::RateLimited { .. } => MessageResult::Retry,
-        err => MessageResult::Reject(err.to_string()),
-    }
-}
-
-impl ProducerOutboxProcessor {
     /// The producer id messages of `partition` publish under, or `None` for a
     /// stateless producer.
     async fn producer_for(
@@ -504,7 +287,7 @@ impl ProducerOutboxProcessor {
         envelope: &ProducerOutboxEnvelope,
         producer_id: Option<ProducerId>,
         seq: i64,
-    ) -> Result<Event, EventBrokerError> {
+    ) -> Result<EventV1, EventBrokerError> {
         match (envelope.producer_mode, producer_id) {
             (ProducerMode::Chained, Some(producer_id)) => {
                 let previous = self
@@ -584,7 +367,12 @@ impl ProducerOutboxProcessor {
         }
         let event = match envelope.to_event(seq, Some(producer_id), Some(previous)) {
             Ok(event) => event,
-            Err(err) => return MessageResult::Reject(err.to_string()),
+            Err(err) => {
+                return MessageResult::Reject(format!(
+                    "producer outbox message rejected: {}",
+                    err.kind()
+                ));
+            }
         };
         match self.publish(&envelope.topic, &event).await {
             Err(EventBrokerError::SequenceViolation { .. }) => MessageResult::Reject(
@@ -600,16 +388,20 @@ impl ProducerOutboxProcessor {
     /// says it holds this sequence or a later one, so the next message chains
     /// onto it instead of paying a violation and a cursor refresh. The cursor
     /// only ever moves forward.
-    async fn publish(&self, topic: &str, event: &Event) -> Result<IngestOutcome, EventBrokerError> {
+    async fn publish(
+        &self,
+        topic: &str,
+        event: &EventV1,
+    ) -> Result<IngestOutcome, EventBrokerError> {
         let outcome = self
             .producer
             .broker
-            .publish(&self.producer.ctx, event)
+            .publish(&self.producer.ctx, event, Ack::Accepted)
             .await?;
         // Irrefutable, so a new outcome has to decide whether it advances.
         let (IngestOutcome::Accepted | IngestOutcome::Persisted | IngestOutcome::Duplicate) =
             outcome;
-        if let Some(meta) = &event.meta
+        if let Some(meta) = event.meta()
             && let (Some(producer_id), Some(sequence)) = (meta.producer_id, meta.sequence)
         {
             let mut cursor_state = self
@@ -644,8 +436,39 @@ impl LeasedMessageHandler for ProducerOutboxProcessor {
     async fn handle(&self, msg: &OutboxMessage) -> MessageResult {
         let envelope = match serde_json::from_slice::<ProducerOutboxEnvelope>(&msg.payload) {
             Ok(envelope) => envelope,
-            Err(err) => return MessageResult::Reject(format!("decode producer envelope: {err}")),
+            Err(err) => {
+                // Serde's message quotes the payload, so only its category is
+                // logged and stored.
+                let category = json_error_category(&err);
+                tracing::error!(
+                    queue = self.queue.as_str(),
+                    partition_id = msg.partition_id,
+                    seq = msg.seq,
+                    payload_type = msg.payload_type.as_str(),
+                    reason = "undecodable",
+                    category,
+                    "producer outbox message rejected"
+                );
+                return MessageResult::Reject(format!(
+                    "undecodable producer envelope ({category})"
+                ));
+            }
         };
+        if envelope.version != PRODUCER_OUTBOX_ENVELOPE_VERSION {
+            tracing::error!(
+                queue = self.queue.as_str(),
+                partition_id = msg.partition_id,
+                seq = msg.seq,
+                payload_type = msg.payload_type.as_str(),
+                reason = "version",
+                version = envelope.version,
+                "producer outbox message rejected"
+            );
+            return MessageResult::Reject(format!(
+                "unsupported producer envelope version {}",
+                envelope.version
+            ));
+        }
         let partition = msg.partition_id;
         // Resolving the partition's id and building the event can both call
         // the broker (registration, a chained cursor refresh), so they get the

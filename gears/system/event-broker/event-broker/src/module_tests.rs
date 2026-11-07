@@ -24,7 +24,8 @@ use event_broker_sdk::backend::{
     AppendRequest, Appended, Backend, BackendError, Dedup, LogClaim, Provisioning, Role,
     TopicPartition, TopicSpec, Wait, Watch,
 };
-use event_broker_sdk::{Event, PartitionRange, Position, Sequence, TopicSegment};
+use event_broker_sdk::models::Event;
+use event_broker_sdk::{PartitionRange, Position, Sequence, TopicSegment};
 
 struct NoopOpenApiRegistry;
 

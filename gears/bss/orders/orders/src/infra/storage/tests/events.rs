@@ -170,7 +170,7 @@ impl Env {
         .await
         .unwrap()
     }
-    pub(super) async fn stored(&self) -> Vec<event_broker_sdk::Event> {
+    pub(super) async fn stored(&self) -> Vec<event_broker_sdk::models::Event> {
         let mut all = Vec::new();
         for partition in 0..self.partitions {
             let at = TopicPartition::new(
@@ -187,7 +187,7 @@ impl Env {
         }
         all
     }
-    pub(super) async fn wait_stored(&self, n: usize) -> Vec<event_broker_sdk::Event> {
+    pub(super) async fn wait_stored(&self, n: usize) -> Vec<event_broker_sdk::models::Event> {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
         loop {
             let stored = self.stored().await;
@@ -369,7 +369,7 @@ async fn committed_transitions_deliver_root_tenant_events_routed_by_order() -> a
     for event in &stored {
         assert_eq!(
             event.type_id.as_ref(),
-            <events::OrderEvent<OrderSubmitted> as event_broker_sdk::TypedEvent>::TYPE_ID
+            <events::OrderEvent<OrderSubmitted> as toolkit_gts::GtsSchema>::TYPE_ID
         );
         assert_eq!(
             event.tenant_id,

@@ -2,12 +2,11 @@ use event_broker_sdk::Sequence;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use chrono::Utc;
 use event_broker_sdk::dlq::{DeadLetterRecord, DeadLetterSink};
 use event_broker_sdk::gts_id;
 use event_broker_sdk::{
-    ConsumerBuilder, ConsumerError, ConsumerGroupRef, EventBrokerError, Fallback, HandlerOutcome,
-    InMemoryOffsetManager, RawEvent, SingleEventHandler,
+    ConsumerBuilder, ConsumerError, ConsumerGroupRef, Delivery, EventBrokerError, EventHandler,
+    EventV1, Fallback, HandlerOutcome, InMemoryOffsetManager, StoredPosition,
 };
 use uuid::Uuid;
 
@@ -22,22 +21,23 @@ struct RecordingDeadLetterSink {
     fail: bool,
 }
 
-fn rejected_event() -> RawEvent {
-    RawEvent {
-        id: Uuid::new_v4(),
-        type_id: event_type(EVENT_TYPE),
-        topic: topic(TOPIC),
-        tenant_id: Uuid::nil(),
-        subject: "dlq-1".to_owned(),
-        subject_type: event_type(gts_id!("x.eb.showcase.subject.v1~")),
+fn rejected_event() -> EventV1 {
+    EventV1::builder_for(
+        event_type(EVENT_TYPE),
+        serde_json::json!({ "reject": true }),
+    )
+    .id(Uuid::from_u128(0xd1e_0001))
+    .tenant_id(Uuid::nil())
+    .subject("dlq-1")
+    .subject_type_id(event_type(gts_id!("x.eb.showcase.subject.v1~")))
+    .occurred_at("2026-01-02T03:04:05Z".parse().unwrap())
+    .build()
+    .unwrap()
+    .stamp_position(StoredPosition {
         partition: 0,
         sequence: Sequence::assigned(1),
-        offset: Sequence::assigned(1),
-        occurred_at: Utc::now(),
-        sequence_time: Utc::now(),
-        trace_parent: None,
-        data: serde_json::json!({ "reject": true }),
-    }
+        sequence_time: "2026-01-02T03:04:06Z".parse().unwrap(),
+    })
 }
 
 #[async_trait]
@@ -60,25 +60,28 @@ struct HandlerOwnedDlqPolicy {
 impl HandlerOwnedDlqPolicy {
     async fn park_permanent_failure(
         &self,
-        event: &RawEvent,
-        attempts: u16,
+        event: &EventV1,
+        delivery: &Delivery,
     ) -> Result<(), ConsumerError> {
-        let record = DeadLetterRecord::builder(event, "showcase reject")
-            .attempts(attempts)
-            .build();
+        let record = DeadLetterRecord::builder(event, delivery, "showcase reject").build();
         self.sink.park(record).await
     }
 }
 
 #[async_trait]
-impl SingleEventHandler for HandlerOwnedDlqPolicy {
+impl EventHandler<serde_json::Value> for HandlerOwnedDlqPolicy {
     async fn handle(
         &self,
-        event: RawEvent,
-        attempts: u16,
+        event: EventV1,
+        delivery: &Delivery,
     ) -> Result<HandlerOutcome, ConsumerError> {
-        if event.data.get("reject").and_then(|value| value.as_bool()) == Some(true) {
-            self.park_permanent_failure(&event, attempts).await?;
+        if event
+            .data()
+            .and_then(|data| data.get("reject"))
+            .and_then(|value| value.as_bool())
+            == Some(true)
+        {
+            self.park_permanent_failure(&event, delivery).await?;
             return Ok(HandlerOutcome::Success);
         }
 
@@ -130,7 +133,7 @@ async fn if_my_dead_letter_sink_fails_i_return_an_error_and_the_source_offset_is
     let handler = HandlerOwnedDlqPolicy { sink };
 
     let err = handler
-        .park_permanent_failure(&rejected_event(), 6)
+        .park_permanent_failure(&rejected_event(), &Delivery::new(topic(TOPIC), 0, 6))
         .await
         .expect_err("failed parking must keep the handler from returning success");
 

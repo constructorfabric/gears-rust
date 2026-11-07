@@ -1,0 +1,16 @@
+error[E0599]: no method named `build` found for struct `OutboxSetupBuilder<producer::direct::Has, producer::direct::Has, producer::direct::Has, producer::direct::Has, producer::direct::Has, producer::direct::Has, producer::direct::Has>` in the current scope
+  --> tests/trybuild/producer/missing_outbox_queue.rs:12:10
+   |
+ 4 |       let _ = OutboxSetup::builder()
+   |  _____________-
+ 5 | |         .broker(broker)
+ 6 | |         .db(db)
+ 7 | |         .security_context(toolkit_security::SecurityContext::anonymous())
+...  |
+11 | |         .event_type_patterns(["orders.*"])
+12 | |         .build()
+   | |         -^^^^^ method not found in `OutboxSetupBuilder<producer::direct::Has, producer::direct::Has, producer::direct::Has, producer::direct::Has, producer::direct::Has, producer::direct::Has, producer::direct::Has>`
+   | |_________|
+   |
+   |
+   = note: the method was found for `OutboxSetupBuilder<producer::direct::Has, producer::direct::Has, producer::direct::Has, producer::direct::Has, producer::direct::Has, producer::direct::Has, producer::direct::Has, producer::direct::Has>`

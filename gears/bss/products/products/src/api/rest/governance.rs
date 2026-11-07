@@ -366,6 +366,7 @@ pub(super) async fn decided(
             generation: unit.generation,
             actors,
         },
+        broker::APPROVAL_UNIT_SUBJECT_TYPE,
     )
     .await
     .map_err(TxError::from)

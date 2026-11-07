@@ -161,6 +161,7 @@ impl<'a> ApprovalSubject<DbTx<'a>> for SkuPublish {
                     published_version: s.published_version,
                     actor_ref: self.actor,
                 },
+                broker::SKU_SUBJECT_TYPE,
             )
             .await
             .map_err(ApprovalError::from)?;

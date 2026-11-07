@@ -53,7 +53,7 @@ Idempotent-producer support lets producers retry safely after transport failures
 
 ### 1.3 Actors
 
-- **Producer SDK** (`cf-gears-event-broker-sdk`): on first publish, calls `POST /v1/producers` to obtain a `producer_id` bound to its principal - one per producer partition for a partitioned producer such as `DbProducer` (see §2.5); populates `meta.producer_id` / `meta.previous` / `meta.sequence` per the registered mode; retries on transient failures.
+- **Producer SDK** (`cf-gears-event-broker-sdk`): calls `POST /v1/producers` to obtain a `producer_id` bound to its principal - `DirectProducer` once, when it is built; the outbox producer (`OutboxSetup`) one per outbox partition (see §2.5); populates `meta.producer_id` / `meta.previous` / `meta.sequence` per the registered mode. `DirectProducer` does not retry: a caller re-publishes the same event (same `id`), and the producer resends it with the numbers it carried. The outbox producer's drain retries a message with the same numbers.
 - **IngestService** (broker): validates `meta`-shape against the registered mode of `meta.producer_id`; performs chain check; updates `event_broker_producer_sequence` and `event_broker_producer.last_seen_at` (not yet implemented, tracked in #5651) atomically with the outbox enqueue.
 - **Reaper worker** (broker): purges stale `event_broker_producer` rows (per producer-registration TTL, default `P30D`) together with their `event_broker_producer_sequence` rows (not yet implemented, tracked in #5651).
 - **Operator**: invokes `POST /v1/producers/{id}:reset` for chain reset on a live `producer_id`; reads `GET /v1/producers/{id}/cursors` for diagnostics.
@@ -123,7 +123,7 @@ Idempotent-producer support lets producers retry safely after transport failures
 
 ### 2.5 Producer Partitions
 
-A producer without partitions uses one producer id for all its topics. A partitioned producer - one whose own work is split into partitions that number their events independently, such as the outbox partitions of the SDK's `DbProducer` - registers one producer id per producer partition, so each id has exactly one sequence space. One id still serves every topic its producer partition publishes to.
+A producer without partitions uses one producer id for all its topics. A partitioned producer - one whose own work is split into partitions that number their events independently, such as the outbox partitions of the SDK's outbox producer (`OutboxSetup`) - registers one producer id per producer partition, so each id has exactly one sequence space. One id still serves every topic its producer partition publishes to.
 
 The rule is required. A sequence space shared across producer partitions interleaves on a topic's chain: producer partition 3 sends `sequence = 7` after producer partition 9 sent `sequence = 40` on the same topic. Chained mode answers `412`; monotonic mode treats `7` as a duplicate, answers `200 OK` and drops the event silently. The broker cannot tell such an interleave from a retry.
 
@@ -499,7 +499,7 @@ A publish-path error about the stream names the targeted stream as its resource:
 - **AC-10**: Principal A registers a producer; principal B publishes with A's `meta.producer_id` → `403 ProducerPrincipalMismatch`.
 - **AC-11**: Producer publishes with `meta.version` greater than broker's supported → `400 UnknownMetaVersion`.
 - **AC-12**: Producer publishes with `meta` containing `sequence` but no `producer_id` → `400 MetaWithoutProducerId`.
-- **AC-13**: A batch on topic A carries a chained run for `(P, A)` that advances and a chained run for `(Q, A)` whose first `previous` does not match Q's `last_sequence = 7`; broker returns the canonical `412` (DESIGN.md §3.3 "Error Response Format") whose `sequence_mismatch` violation's `description` names `index` (the Q run's first event), `producer_id=Q`, `topic=A` and `last_sequence=7` as `key=value` text; nothing from the batch is enqueued.
+- **AC-13**: A batch on topic A carries a chained run for `(P, A)` that advances and a chained run for `(Q, A)` that neither advances nor resends Q's head (`last_sequence = 7`: its first `previous` is not 7 and none of its events has `sequence = 7`); broker returns the canonical `412` (DESIGN.md §3.3 "Error Response Format") whose `sequence_mismatch` violation's `description` names `index` (the Q run's first event), `producer_id=Q`, `topic=A` and `last_sequence=7` as `key=value` text; nothing from the batch is enqueued.
 - **AC-14**: A chained producer at `last_sequence = 10` resends the batch `[9->10, 10->11, 11->12]`; the first event is a duplicate prefix, the rest advances; `last_sequence = 12`.
 - **AC-15**: A batch in which every event is a duplicate is answered `200 OK`; a batch with no events is answered `400 empty_batch`; a batch repeating an `event.id` is answered `400 duplicate_event_id` naming the repeat at `events[<index>].id`.
 - **AC-16**: A publish with `Prefer: wait=5` is answered `201 Created` once the backend stores its events, or `202 Accepted` if 5 seconds pass first.
@@ -521,7 +521,7 @@ A publish-path error about the stream names the targeted stream as its resource:
 ## 11. E2E Test Plan
 
 - **E1 - Chained happy path**: producer fleet registers; publishes a chain of 100 events; consumer receives all in order; `last_sequence = 100`; producer-row `last_seen_at` advances (not yet implemented, tracked in #5651).
-- **E2 — Retry after timeout**: producer publishes event N; simulated transport timeout; producer retries; consumer sees event N exactly once; broker returns `200 OK` on the retry.
+- **E2 - Retry after timeout**: producer publishes event N; simulated transport timeout; the caller re-publishes the same event (same `id`); consumer sees event N exactly once; broker returns `200 OK` on the re-publish.
 - **E3 — Chain break recovery**: producer publishes `(previous=0, sequence=1)`, then `(previous=99, sequence=100)` → `412 SequenceViolation` carrying `last_sequence=1`; producer calls `GET /cursors`, observes `last_sequence=1`, corrects to `(previous=1, sequence=2)`, retries → accepted.
 - **E4 — Monotonic recovery**: monotonic producer's local DB is restored to a prior backup; producer calls `GET /cursors`, sees `last_sequence=N` higher than its local view; operator confirms broker is authoritative; producer rewinds local cursor to `N+1` and resumes.
 - **E5 — Async windowed publish (chained)**: producer fires 1000 events into an async / lossy channel; ack-poll loop calls `GET /cursors` every 5s; on detecting stalled cursor, re-publishes from stall point; eventually all 1000 land; `last_sequence = 1000`.

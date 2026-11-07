@@ -60,27 +60,54 @@ fn only_the_event_transaction_opens_and_settles_a_tx_outbox() {
     );
 }
 
-/// The interim arm's envelope is the broker SDK's (PS-21): it deserializes as
-/// `ProducerOutboxEnvelope` and serializes back to itself, field for field, so an SDK that changes
-/// its envelope fails here; and it is `stateless`, the mode the SDK's processor drains without a
-/// producer registration.
+/// The interim arm's envelope is the broker SDK's v1 producer-outbox envelope (PS-21), every
+/// field in the shape the SDK's processor drains, and it is `stateless`, the mode the processor
+/// drains without a producer registration. The SDK-shape guard lives in the broker SDK's v1 pin
+/// test (`the_v1_envelope_wire_shape_is_pinned`), which decodes a copy of this body.
 #[test]
-fn the_interim_envelope_is_the_sdks_stateless_envelope() {
+fn the_interim_envelope_is_the_v1_stateless_envelope() {
+    let tenant = uuid::Uuid::parse_str("5a0e8d1c-7b2f-4c6a-8e3d-9f4b1c2d3e4f").unwrap();
+    let unit = uuid::Uuid::parse_str("6b1f9e2d-8c3a-4d7b-9f4e-0a5c2d3e4f5a").unwrap();
+    let actor = uuid::Uuid::parse_str("7c2a0f3e-9d4b-4e8c-8a5f-1b6d3e4f5a6b").unwrap();
     let event = super::ApprovalUnitDecided {
-        tenant_id: uuid::Uuid::new_v4(),
-        unit_id: uuid::Uuid::new_v4(),
+        tenant_id: tenant,
+        unit_id: unit,
         kind: "prices".into(),
         state: "approved".into(),
         generation: 1,
-        actors: vec![uuid::Uuid::new_v4()],
+        actors: vec![actor],
     };
-    let mut ours = super::interim_envelope(&event, time::OffsetDateTime::UNIX_EPOCH).unwrap();
-    let sdk: event_broker_sdk::producer::ProducerOutboxEnvelope =
-        serde_json::from_value(ours.clone()).unwrap();
-    let back = serde_json::to_value(&sdk).unwrap();
-    // The SDK leaves an absent trace parent out; ours writes it null.
-    ours.as_object_mut().unwrap().remove("trace_parent");
-    assert_eq!(back, ours, "every field is the SDK's, in its shape");
-    assert_eq!(back["producer_mode"], "stateless");
-    assert_eq!(back["version"], 1);
+    let ours = super::interim_envelope(
+        &event,
+        super::APPROVAL_UNIT_SUBJECT_TYPE,
+        time::OffsetDateTime::UNIX_EPOCH,
+    )
+    .unwrap();
+    let event_id = uuid::Uuid::parse_str(ours["event_id"].as_str().unwrap()).unwrap();
+    assert_eq!(event_id.get_version_num(), 7, "the event id is a UUID v7");
+    assert_eq!(
+        ours,
+        serde_json::json!({
+            "version": 1,
+            "event_id": event_id.to_string(),
+            "type": "gts.cf.core.events.event.v1~cf.bss.pricing.approval_unit_decided.v1~",
+            "topic": "gts.cf.core.events.topic.v1~cf.bss.pricing.catalog.v1",
+            "tenant_id": "5a0e8d1c-7b2f-4c6a-8e3d-9f4b1c2d3e4f",
+            "source": "bss-pricing",
+            "subject": "6b1f9e2d-8c3a-4d7b-9f4e-0a5c2d3e4f5a",
+            "subject_type": "gts.cf.core.events.subject.v1~cf.bss.pricing.approval_unit.v1~",
+            "occurred_at": "1970-01-01T00:00:00Z",
+            "trace_parent": null,
+            "data": {
+                "tenantId": "5a0e8d1c-7b2f-4c6a-8e3d-9f4b1c2d3e4f",
+                "unitId": "6b1f9e2d-8c3a-4d7b-9f4e-0a5c2d3e4f5a",
+                "kind": "prices",
+                "state": "approved",
+                "generation": 1,
+                "actors": ["7c2a0f3e-9d4b-4e8c-8a5f-1b6d3e4f5a6b"]
+            },
+            "producer_mode": "stateless",
+            "diagnostic_metadata": { "sdk_client_agent": "bss-pricing" }
+        })
+    );
 }

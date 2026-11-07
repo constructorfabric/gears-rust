@@ -1,16 +1,10 @@
-use chrono::Utc;
-use gts::GtsTypeId;
-use uuid::Uuid;
-
 use crate::error::EventBrokerError;
-use crate::models::Event;
-use crate::typed_event::TypedEvent;
+use crate::gts::EventV1;
 
 use super::schema_cache::ProducerSchemaCache;
-use super::types::ProducerIdentity;
 
 pub(crate) struct PreparedEvent {
-    pub(crate) event: Event,
+    pub(crate) event: EventV1,
     /// Resolved from the event type, which owns the topic binding.
     pub(crate) topic: String,
     /// The value at the event type's partition-key pointer. Places the event in
@@ -20,46 +14,31 @@ pub(crate) struct PreparedEvent {
     pub(crate) key: String,
 }
 
-pub(crate) async fn prepare_event<E: TypedEvent>(
-    cache: &ProducerSchemaCache,
-    identity: &ProducerIdentity,
-    ctx: &toolkit_security::SecurityContext,
-    event: E,
-) -> Result<PreparedEvent, EventBrokerError> {
-    let type_id = E::TYPE_ID;
-    let subject = event.subject();
-    let tenant_id = event.tenant_id().unwrap_or_else(|| ctx.subject_tenant_id());
-    let data = serde_json::to_value(&event)
-        .map_err(|err| EventBrokerError::Internal(format!("serialize event data: {err}")))?;
+impl PreparedEvent {
+    /// Checks a built event's `data` against its prepared type's schema and resolves
+    /// its topic and partition key from that type. The envelope is checked before this,
+    /// by the builder or by the caller.
+    ///
+    /// # Errors
+    ///
+    /// [`EventBrokerError::SchemaNotPrepared`] when the event's type is not prepared,
+    /// the schema check's error, [`EventBrokerError::TopicNotFound`] when the type's
+    /// topic is not prepared, or the error of resolving the partition key.
+    pub(crate) async fn new(
+        cache: &ProducerSchemaCache,
+        event: EventV1,
+    ) -> Result<Self, EventBrokerError> {
+        let type_id = event.event_type().as_ref();
+        let data = event.data().unwrap_or(&serde_json::Value::Null);
+        cache.validate_prepared(type_id, data).await?;
+        // The event type owns the topic binding and the partition key, so both come
+        // from the prepared type.
+        let topic = cache.prepared_topic(type_id).await?;
+        let pointer = cache.prepared_partition_key(type_id).await?;
 
-    cache.validate_prepared(type_id, &data).await?;
-    // The event type owns the topic binding and the partition key, so both come
-    // from the prepared type.
-    let topic = cache.prepared_topic(type_id).await?;
-    let pointer = cache.prepared_partition_key(type_id).await?;
+        cache.ensure_topic(&topic).await?;
+        let key = event.partition_input(&pointer)?;
 
-    let prepared = Event {
-        id: Uuid::now_v7(),
-        type_id: GtsTypeId::new(type_id),
-        tenant_id,
-        source: identity.source_ref().to_owned(),
-        subject: subject.into_owned(),
-        subject_type: GtsTypeId::new(E::SUBJECT_TYPE),
-        occurred_at: Utc::now(),
-        trace_parent: event.trace_parent().map(|value| value.into_owned()),
-        data: Some(data),
-        partition: None,
-        sequence: None,
-        sequence_time: None,
-        meta: None,
-    };
-
-    cache.ensure_topic(&topic).await?;
-    let key = prepared.partition_input(&pointer)?;
-
-    Ok(PreparedEvent {
-        topic,
-        key,
-        event: prepared,
-    })
+        Ok(Self { event, topic, key })
+    }
 }

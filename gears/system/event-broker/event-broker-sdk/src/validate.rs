@@ -13,6 +13,9 @@
 //! `gears/system/event-broker/docs/schemas/`, which remain the authority: a
 //! bound that changes there changes here, and the two are cross-checked by
 //! test.
+//!
+//! `trace_parent` has a format rule rather than a text rule, so it exposes a
+//! predicate and the rule text, and each caller builds its own error.
 
 use crate::error::reasons;
 
@@ -180,4 +183,26 @@ pub fn source(value: &str) -> Result<(), TextFieldError> {
 /// outside printable ASCII, is empty, or exceeds 1024 bytes.
 pub fn subject(value: &str) -> Result<(), TextFieldError> {
     check(&SUBJECT, value)
+}
+
+/// What a rejected `trace_parent` is told: the rule, never the value.
+pub const TRACE_PARENT_RULE: &str =
+    "must be a W3C traceparent: four lowercase hex groups of 2, 32, 16 and 2 digits joined by '-'";
+
+/// Whether `value` matches the base event schema's `trace_parent` pattern,
+/// `^[0-9a-f]{2}-[0-9a-f]{32}-[0-9a-f]{16}-[0-9a-f]{2}$`.
+#[must_use]
+pub fn is_trace_parent(value: &str) -> bool {
+    const GROUP_LENGTHS: [usize; 4] = [2, 32, 16, 2];
+    let groups: Vec<&str> = value.split('-').collect();
+    groups.len() == GROUP_LENGTHS.len()
+        && groups
+            .iter()
+            .zip(GROUP_LENGTHS)
+            .all(|(group, len)| group.len() == len)
+        && groups.iter().all(|group| {
+            group
+                .bytes()
+                .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+        })
 }

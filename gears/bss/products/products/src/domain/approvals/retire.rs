@@ -74,6 +74,7 @@ impl<'a> ApprovalSubject<DbTx<'a>> for SkuRetire {
                     sku_id: i.item_id,
                     actor_ref: b.actor,
                 },
+                broker::SKU_SUBJECT_TYPE,
             )
             .await
             .map_err(ApprovalError::from)?;

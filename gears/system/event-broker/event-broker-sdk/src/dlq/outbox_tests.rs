@@ -2,10 +2,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use toolkit_gts::gts_id;
 
-use chrono::Utc;
 use uuid::Uuid;
 
-use crate::consumer::RawEvent;
+use crate::consumer::Delivery;
+use crate::gts::{EventV1, StoredPosition};
 use crate::ids::ConsumerGroupId;
 use crate::sequence::Sequence;
 
@@ -52,26 +52,28 @@ impl toolkit_db::outbox::LeasedMessageHandler for CapturingProcessor {
     }
 }
 
-fn raw_event(offset: i64) -> RawEvent {
-    RawEvent {
-        id: Uuid::new_v4(),
-        type_id: gts::GtsTypeId::new(EVENT_TYPE),
-        topic: gts::GtsInstanceId::try_new(TOPIC).unwrap(),
-        tenant_id: Uuid::new_v4(),
-        subject: format!("order-{offset}"),
-        subject_type: gts::GtsTypeId::new("gts.x.eb.test.subject.v1~"),
+fn raw_event(offset: i64) -> EventV1 {
+    EventV1::builder_for(
+        gts::GtsTypeId::new(EVENT_TYPE),
+        serde_json::json!({ "offset": offset }),
+    )
+    .id(Uuid::from_u128(u128::try_from(offset).unwrap()))
+    .tenant_id(Uuid::from_u128(0x0f1e_0001))
+    .subject(format!("order-{offset}"))
+    .subject_type_id(gts::GtsTypeId::new("gts.x.eb.test.subject.v1~"))
+    .occurred_at("2026-01-02T03:04:05Z".parse().unwrap())
+    .build()
+    .unwrap()
+    .stamp_position(StoredPosition {
         partition: 6,
         sequence: Sequence::assigned(offset),
-        offset: Sequence::assigned(offset),
-        occurred_at: Utc::now(),
-        sequence_time: Utc::now(),
-        trace_parent: None,
-        data: serde_json::json!({ "offset": offset }),
-    }
+        sequence_time: "2026-01-02T03:04:06Z".parse().unwrap(),
+    })
 }
 
 fn dead_letter_record(offset: i64) -> DeadLetterRecord {
-    DeadLetterRecord::builder(&raw_event(offset), "permanent failure")
+    let delivery = Delivery::new(gts::GtsInstanceId::try_new(TOPIC).unwrap(), 6, 1);
+    DeadLetterRecord::builder(&raw_event(offset), &delivery, "permanent failure")
         .group_id(ConsumerGroupId::from_gts(gts_id!(
             "cf.core.events.group.v1~example.orders.projector.x.v1"
         )))

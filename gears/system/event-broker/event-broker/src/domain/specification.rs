@@ -72,7 +72,8 @@ pub trait SpecificationManager: Send + Sync {
     ) -> Result<(), DomainError>;
 
     /// `GET /v1/topics` - unfiltered/unpaginated; the REST handler applies
-    /// `$filter`/pagination (`api/rest/pagination.rs`). Each topic is as
+    /// `$filter`, then pages the result with the domain pager
+    /// (`domain/paging.rs`). Each topic is as
     /// [`get_topic`](Self::get_topic) returns it.
     ///
     /// # Errors

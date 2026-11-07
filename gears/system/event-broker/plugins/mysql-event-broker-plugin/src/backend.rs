@@ -7,7 +7,8 @@ use event_broker_sdk::backend::{
     AppendRequest, Appended, Backend, BackendError, Dedup, Head, HeadWatch, LogClaim, Provisioning,
     TopicPartition, TopicSpec, Wait, Watch,
 };
-use event_broker_sdk::{Event, PartitionRange, Position, Sequence, TopicSegment};
+use event_broker_sdk::models::Event;
+use event_broker_sdk::{PartitionRange, Position, Sequence, TopicSegment};
 use futures_util::StreamExt;
 use futures_util::stream::BoxStream;
 use tokio_util::sync::CancellationToken;

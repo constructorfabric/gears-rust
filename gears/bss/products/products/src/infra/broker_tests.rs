@@ -1,27 +1,20 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 use super::*;
+use crate::infra::events::BrokerEvent;
 use crate::infra::events::{self, enqueue_typed};
 use crate::test_support::{at, enqueued_event_count, enqueued_event_envelope, test_db};
-use event_broker_sdk::TypedEvent;
 use serde::{Deserialize, Serialize};
 use toolkit_db::secure::TxConfig;
 use toolkit_db::{Db, DbError};
 
 #[test]
 fn five_event_contracts_have_stable_type_subject_source_and_tenant() {
-    fn check<E: TypedEvent>(
-        event: &E,
-        token: &str,
-        subject_type: &str,
-        subject: Uuid,
-        tenant: Uuid,
-    ) {
+    fn check<E: BrokerEvent>(event: &E, token: &str, subject: Uuid, tenant: Uuid) {
         assert_eq!(
             E::TYPE_ID,
             format!("gts.cf.core.events.event.v1~cf.bss.products.{token}.v1~")
         );
-        assert_eq!(E::SUBJECT_TYPE, subject_type);
-        assert_eq!(E::SOURCE, "bss-products");
+        assert_eq!(SOURCE, "bss-products");
         assert_eq!(event.subject(), subject.to_string());
         assert_eq!(event.tenant_id(), Some(tenant));
         assert!(gts::GtsId::try_new(E::TYPE_ID).is_ok());
@@ -38,7 +31,6 @@ fn five_event_contracts_have_stable_type_subject_source_and_tenant() {
             actor_ref: actor,
         },
         "sku_published",
-        SKU_SUBJECT_TYPE,
         sku,
         tenant,
     );
@@ -50,7 +42,7 @@ fn five_event_contracts_have_stable_type_subject_source_and_tenant() {
         published_version: 2,
         actor_ref: actor,
     };
-    check(&changed, "sku_changed", SKU_SUBJECT_TYPE, sku, tenant);
+    check(&changed, "sku_changed", sku, tenant);
     let json = serde_json::to_value(&changed).unwrap();
     assert_eq!(json["effectiveFrom"], "2026-09-02");
     assert_eq!(json["skuId"], sku.to_string());
@@ -64,7 +56,6 @@ fn five_event_contracts_have_stable_type_subject_source_and_tenant() {
             actor_ref: actor,
         },
         "sku_retired",
-        SKU_SUBJECT_TYPE,
         sku,
         tenant,
     );
@@ -76,13 +67,7 @@ fn five_event_contracts_have_stable_type_subject_source_and_tenant() {
         generation: 2,
         actors: vec![actor],
     };
-    check(
-        &decided,
-        "approval_unit_decided",
-        APPROVAL_UNIT_SUBJECT_TYPE,
-        unit,
-        tenant,
-    );
+    check(&decided, "approval_unit_decided", unit, tenant);
     assert_eq!(serde_json::to_value(&decided).unwrap()["generation"], 2);
     let released = ReferenceForceReleased {
         tenant_id: tenant,
@@ -94,13 +79,7 @@ fn five_event_contracts_have_stable_type_subject_source_and_tenant() {
         actor_ref: actor,
         reason: "abandoned reservation".into(),
     };
-    check(
-        &released,
-        "reference_force_released",
-        SKU_SUBJECT_TYPE,
-        sku,
-        tenant,
-    );
+    check(&released, "reference_force_released", sku, tenant);
     assert_eq!(
         serde_json::from_value::<ReferenceForceReleased>(serde_json::to_value(&released).unwrap())
             .unwrap(),
@@ -151,11 +130,14 @@ enum TxError {
     #[error("rollback probe")]
     Rollback,
 }
-async fn persisted<E: TypedEvent + Clone + PartialEq + std::fmt::Debug>(
+async fn persisted<
+    E: BrokerEvent + serde::de::DeserializeOwned + Clone + PartialEq + std::fmt::Debug,
+>(
     db: &Db,
     sink: &EventSink,
     dsn: &str,
     event: E,
+    subject_type: &'static str,
 ) {
     let expected = event.clone();
     events::transaction::<(), TxError, _, _>(
@@ -166,7 +148,7 @@ async fn persisted<E: TypedEvent + Clone + PartialEq + std::fmt::Debug>(
         move |tx, outbox| {
             let event = event.clone();
             Box::pin(async move {
-                enqueue_typed(&outbox, tx, event).await?;
+                enqueue_typed(&outbox, tx, event, subject_type).await?;
                 Ok(())
             })
         },
@@ -179,14 +161,13 @@ async fn persisted<E: TypedEvent + Clone + PartialEq + std::fmt::Debug>(
     )
     .await
     .unwrap();
-    let envelope: event_broker_sdk::producer::ProducerOutboxEnvelope =
-        serde_json::from_str(&raw).expect("interim backlog must decode with the SDK decoder");
-    let wire = serde_json::to_value(envelope).unwrap();
+    let wire = serde_json::from_str::<serde_json::Value>(&raw).expect("interim backlog is JSON");
     assert_eq!(wire["version"], 1);
     assert_eq!(wire["type"], E::TYPE_ID);
     assert_eq!(wire["topic"], TOPIC);
-    assert_eq!(wire["source"], E::SOURCE);
+    assert_eq!(wire["source"], SOURCE);
     assert_eq!(wire["subject"], expected.subject().as_ref());
+    assert_eq!(wire["subject_type"], subject_type);
     assert_eq!(wire["tenant_id"], expected.tenant_id().unwrap().to_string());
     assert_eq!(wire["producer_mode"], "stateless");
     assert_eq!(
@@ -233,7 +214,7 @@ async fn every_event_round_trips_through_the_interim_outbox_and_rollback_leaves_
         move |tx, outbox| {
             let event = failed_event.clone();
             Box::pin(async move {
-                enqueue_typed(&outbox, tx, event).await?;
+                enqueue_typed(&outbox, tx, event, SKU_SUBJECT_TYPE).await?;
                 Err(TxError::Rollback)
             })
         },
@@ -251,9 +232,10 @@ async fn every_event_round_trips_through_the_interim_outbox_and_rollback_leaves_
             published_version: 1,
             actor_ref: actor,
         },
+        SKU_SUBJECT_TYPE,
     )
     .await;
-    persisted(&db.db(), &sink, &dsn, changed).await;
+    persisted(&db.db(), &sink, &dsn, changed, SKU_SUBJECT_TYPE).await;
     persisted(
         &db.db(),
         &sink,
@@ -263,6 +245,7 @@ async fn every_event_round_trips_through_the_interim_outbox_and_rollback_leaves_
             sku_id: sku,
             actor_ref: actor,
         },
+        SKU_SUBJECT_TYPE,
     )
     .await;
     persisted(
@@ -277,6 +260,7 @@ async fn every_event_round_trips_through_the_interim_outbox_and_rollback_leaves_
             generation: 1,
             actors: vec![actor],
         },
+        APPROVAL_UNIT_SUBJECT_TYPE,
     )
     .await;
     persisted(
@@ -293,6 +277,7 @@ async fn every_event_round_trips_through_the_interim_outbox_and_rollback_leaves_
             actor_ref: actor,
             reason: "abandoned reservation".into(),
         },
+        SKU_SUBJECT_TYPE,
     )
     .await;
     assert_eq!(
@@ -331,6 +316,7 @@ async fn interim_outbox_retains_driver_error() {
             published_version: 1,
             actor_ref: tenant,
         },
+        SKU_SUBJECT_TYPE,
     )
     .await
     .unwrap_err();

@@ -40,7 +40,7 @@ gts = { workspace = true }
 async-trait = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
-# `event_broker_sdk::Event::occurred_at` is a chrono timestamp.
+# `event_broker_sdk::EventV1` takes a chrono `occurred_at`.
 chrono = { workspace = true }
 
 # Error handling and serialization

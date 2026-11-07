@@ -2,14 +2,15 @@ use async_trait::async_trait;
 use toolkit_security::SecurityContext;
 
 use crate::api::{
-    EventBrokerApi, FrameStream, IngestOutcome, JoinRequest, ProducerCursors, ProducerMode,
+    Ack, EventBrokerApi, FrameStream, IngestOutcome, JoinRequest, ProducerCursors, ProducerMode,
     SeekPosition, SeekResult, SubscriptionAssignment,
 };
 use crate::error::EventBrokerError;
+use crate::gts::EventV1;
 use crate::ids::{ConsumerGroupId, ProducerId, SubscriptionId};
 use crate::models::{
-    ConsumerGroup, ConsumerGroupQuery, CreateConsumerGroupRequest, Event, EventType, Page,
-    PartitionRange, ResetScope, Subscription, Topic, TopicSegment,
+    ConsumerGroup, ConsumerGroupQuery, CreateConsumerGroupRequest, EventType, Page, PartitionRange,
+    ResetScope, Subscription, Topic, TopicSegment,
 };
 
 /// The `EventBrokerApi` surface for unit-test doubles. A double implements
@@ -33,7 +34,8 @@ pub(crate) trait BrokerStub: Send + Sync {
     async fn publish(
         &self,
         _ctx: &SecurityContext,
-        _event: &Event,
+        _event: &EventV1,
+        _ack: Ack,
     ) -> Result<IngestOutcome, EventBrokerError> {
         unimplemented!("{} does not stub publish", std::any::type_name::<Self>())
     }
@@ -41,7 +43,8 @@ pub(crate) trait BrokerStub: Send + Sync {
     async fn publish_batch(
         &self,
         _ctx: &SecurityContext,
-        _events: &[Event],
+        _events: &[EventV1],
+        _ack: Ack,
     ) -> Result<IngestOutcome, EventBrokerError> {
         unimplemented!(
             "{} does not stub publish_batch",
@@ -227,17 +230,19 @@ impl<T: BrokerStub> EventBrokerApi for T {
     async fn publish(
         &self,
         ctx: &SecurityContext,
-        event: &Event,
+        event: &EventV1,
+        ack: Ack,
     ) -> Result<IngestOutcome, EventBrokerError> {
-        BrokerStub::publish(self, ctx, event).await
+        BrokerStub::publish(self, ctx, event, ack).await
     }
 
     async fn publish_batch(
         &self,
         ctx: &SecurityContext,
-        events: &[Event],
+        events: &[EventV1],
+        ack: Ack,
     ) -> Result<IngestOutcome, EventBrokerError> {
-        BrokerStub::publish_batch(self, ctx, events).await
+        BrokerStub::publish_batch(self, ctx, events, ack).await
     }
 
     async fn get_producer_cursors(

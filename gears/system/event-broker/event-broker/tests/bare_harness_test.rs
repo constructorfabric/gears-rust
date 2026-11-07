@@ -9,7 +9,7 @@
 use event_broker::test_support::EventBrokerHarness;
 use event_broker::test_support::type_registry::registry_holding;
 use event_broker_sdk::EventBrokerError;
-use event_broker_sdk::gts::{EventV1, TopicV1};
+use event_broker_sdk::gts::{EventV1, SubjectV1, TopicV1};
 use gts::GtsIdPattern;
 use serde_json::json;
 use toolkit_gts::GtsSchema;
@@ -18,6 +18,7 @@ use types_registry_sdk::{ListEntitiesRequest, PlatformTypesRegistryApiExt};
 
 const PROBE_TOPIC: &str = "gts.cf.core.events.topic.v1~x.eb.inventory.probe.v1";
 const PROBE_EVENT_TYPE: &str = "gts.cf.core.events.event.v1~x.eb.inventory.probe.v1~";
+const ORDER_SUBJECT: &str = "gts.cf.core.events.subject.v1~fabrikam.shop.orders.order.v1~";
 
 toolkit_gts::inventory::submit! {
     toolkit_gts::InventoryInstance {
@@ -94,7 +95,7 @@ async fn registry_holding_seeds_only_the_broker_base_types() {
         .map(|schema| schema.type_id.as_ref().to_owned())
         .collect();
     event_schemas.sort();
-    assert_eq!(event_schemas, vec![EventV1::TYPE_ID.to_owned()]);
+    assert_eq!(event_schemas, vec![<EventV1>::TYPE_ID.to_owned()]);
 
     let mut topic_instances: Vec<String> = registry
         .list_instances(&ctx, pattern("gts.cf.core.events.topic.v1~*"))
@@ -115,4 +116,99 @@ async fn registry_holding_seeds_only_the_broker_base_types() {
         .collect();
     topic_schemas.sort();
     assert_eq!(topic_schemas, vec![TopicV1::TYPE_ID.to_owned()]);
+
+    let mut subject_schemas: Vec<String> = registry
+        .list_type_schemas(&ctx, pattern("gts.cf.core.events.subject.v1~*"))
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|schema| schema.type_id.as_ref().to_owned())
+        .collect();
+    subject_schemas.sort();
+    assert_eq!(subject_schemas, vec![SubjectV1::<()>::TYPE_ID.to_owned()]);
+}
+
+#[tokio::test]
+async fn a_derived_subject_kind_seeded_beside_the_bases_resolves_against_the_subject_base() {
+    let registry = registry_holding(&[], &[]);
+    let ctx = PlatformSecurityContext::outbound_marker();
+    // What `#[gts_type_schema(base = SubjectV1, properties = "")]` emits for a unit kind:
+    // a copy of the expected body in `event-broker-sdk/src/gts_tests.rs`
+    // `a_derived_subject_kind_names_its_full_id_and_derives_from_the_base`; change both
+    // together.
+    let order_subject = json!({
+        "$id": "gts://gts.cf.core.events.subject.v1~fabrikam.shop.orders.order.v1~",
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "description": "An order placed in the fabrikam shop.",
+        "type": "object",
+        "allOf": [
+            { "$ref": "gts://gts.cf.core.events.subject.v1~" },
+            {
+                "type": "object",
+                "properties": {
+                    "properties": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "properties": {},
+                        "required": [],
+                    },
+                },
+            },
+        ],
+    });
+    registry.seed(ORDER_SUBJECT, order_subject.clone());
+
+    let schemas = registry
+        .list_type_schemas(&ctx, pattern(ORDER_SUBJECT))
+        .await
+        .unwrap_or_else(|err| panic!("the derived subject kind must resolve: {err:?}"));
+    let [schema] = schemas.as_slice() else {
+        panic!("expected exactly the derived subject kind, got {schemas:?}");
+    };
+    assert_eq!(schema.type_id.as_ref(), ORDER_SUBJECT);
+    assert_eq!(schema.content, Some(order_subject));
+    // The subject base, inlined: resolution needs it in the registry.
+    assert_eq!(
+        schema.resolved_schema,
+        Some(json!({
+            "$id": "gts://gts.cf.core.events.subject.v1~fabrikam.shop.orders.order.v1~",
+            "$schema": "http://json-schema.org/draft-07/schema#",
+            "allOf": [
+                {
+                    "additionalProperties": false,
+                    "description": "Subject type. The kind of entity an event is about; an event names it in `subject_type`. By convention, a gear declares each subject kind it owns as a derived type schema under this base; `subject_type` accepts any GTS type id.",
+                    "properties": {
+                        "id": {
+                            "description": "The subject's identifier, as events carry it in `subject`. ASCII only.",
+                            "maxLength": 1024,
+                            "minLength": 1,
+                            "pattern": "^[\\x20-\\x7E]+$",
+                            "type": "string",
+                        },
+                        "properties": { "type": "object" },
+                        "type": {
+                            "description": "Full GTS subject-type identifier: the derived type this subject is an instance of.",
+                            "type": "string",
+                            "x-gts-type-ref": "/$id",
+                        },
+                    },
+                    "required": ["type", "id", "properties"],
+                    "type": "object",
+                },
+                {
+                    "properties": {
+                        "properties": {
+                            "additionalProperties": false,
+                            "properties": {},
+                            "required": [],
+                            "type": "object",
+                        },
+                    },
+                    "type": "object",
+                },
+            ],
+            "description": "An order placed in the fabrikam shop.",
+            "type": "object",
+        }))
+    );
 }

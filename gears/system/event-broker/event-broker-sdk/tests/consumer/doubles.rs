@@ -4,32 +4,37 @@
 //! a fault-injecting broker *decorator*. `SeekFaultBroker` wraps a real
 //! `Arc<dyn EventBrokerApi>` (the harness broker) and delegates every operation
 //! unchanged except the seek/stream faults it injects, so a test can exercise
-//! the consumer's topology-mismatch recovery and its fail-fast on
-//! `PositionsNotSet` against the real broker. Nothing here fakes broker
-//! behaviour.
+//! the consumer's topology-mismatch recovery, its recovery from
+//! `PositionsNotSet` at open and its skip of an event without a stamped position
+//! against the real broker. Nothing here fakes broker behaviour.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::cell::RefCell;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use toolkit_security::SecurityContext;
+use tracing::level_filters::LevelFilter;
+use tracing::subscriber::Interest;
 
 use event_broker_sdk::models::{
-    ConsumerGroup, ConsumerGroupQuery, CreateConsumerGroupRequest, Event, EventType, Page,
-    PartitionRange, ResetScope, Subscription, Topic, TopicSegment,
+    ConsumerGroup, ConsumerGroupQuery, CreateConsumerGroupRequest, EventType, Page, PartitionRange,
+    ResetScope, Subscription, Topic, TopicSegment,
 };
 use event_broker_sdk::{
-    BatchHandlerOutcome, CommitOffset, ConsumerError, ConsumerGroupId, ConsumerHandler,
-    ConsumerRuntimeEvent, ConsumerRuntimeListener, EventBatch, EventBrokerApi, FrameStream,
-    IngestOutcome, JoinRequest, OffsetManagerError, OffsetStore, Position, ProducerCursors,
-    ProducerId, ProducerMode, SeekPosition, SeekResult, Sequence, SubscriptionAssignment,
-    SubscriptionId, TopicId,
+    Ack, BatchHandler, BatchHandlerOutcome, CommitOffset, ConsumerError, ConsumerGroupId,
+    ConsumerRuntimeEvent, ConsumerRuntimeListener, Delivery, EventBatch, EventBrokerApi, EventV1,
+    FrameStream, IngestOutcome, JoinRequest, OffsetManagerError, OffsetStore, Position,
+    ProducerCursors, ProducerId, ProducerMode, SeekPosition, SeekResult, Sequence,
+    SubscriptionAssignment, SubscriptionId, TopicId, WireFrame,
 };
+use futures_util::StreamExt;
 
 pub(super) type SharedScopes = Arc<Mutex<Vec<(String, u32, usize)>>>;
 pub(super) type SharedViolations = Arc<Mutex<Vec<String>>>;
 pub(super) type SharedNamedOffsets = Arc<Mutex<Vec<(&'static str, i64)>>>;
+pub(super) type SharedSubjectOffsets = Arc<Mutex<Vec<(String, i64)>>>;
 pub(super) type SharedCommits = Arc<Mutex<Vec<(ConsumerGroupId, TopicId, u32, i64)>>>;
 
 /// Records the first event of each batch as `(name, offset)` and returns a
@@ -41,17 +46,20 @@ pub(super) struct RecordingBatchHandler {
 }
 
 #[async_trait]
-impl ConsumerHandler for RecordingBatchHandler {
+impl BatchHandler<serde_json::Value> for RecordingBatchHandler {
     async fn handle_batch(
         &self,
-        batch: &EventBatch<'_>,
-        _attempts: u16,
+        batch: &EventBatch<'_, serde_json::Value>,
+        _delivery: &Delivery,
     ) -> Result<BatchHandlerOutcome, ConsumerError> {
         if let Some(event) = batch.next_event() {
-            self.calls
-                .lock()
-                .unwrap()
-                .push((self.name, event.offset.as_i64()));
+            self.calls.lock().unwrap().push((
+                self.name,
+                event
+                    .sequence()
+                    .expect("a delivered event is stamped")
+                    .as_i64(),
+            ));
         }
         Ok(self.outcome.clone())
     }
@@ -59,6 +67,8 @@ impl ConsumerHandler for RecordingBatchHandler {
 
 /// Records the `(topic, partition, len)` scope of every batch and flags any
 /// batch that mixed topics or partitions - the invariant the runtime must keep.
+/// An event names no topic, so a mixed topic shows as a mixed event type: each
+/// topic of the fixture that uses this recorder has one event type.
 #[derive(Default)]
 pub(super) struct BatchScopeRecorder {
     pub(super) scopes: SharedScopes,
@@ -66,43 +76,43 @@ pub(super) struct BatchScopeRecorder {
 }
 
 #[async_trait]
-impl ConsumerHandler for BatchScopeRecorder {
+impl BatchHandler<serde_json::Value> for BatchScopeRecorder {
     async fn handle_batch(
         &self,
-        batch: &EventBatch<'_>,
-        _attempts: u16,
+        batch: &EventBatch<'_, serde_json::Value>,
+        delivery: &Delivery,
     ) -> Result<BatchHandlerOutcome, ConsumerError> {
         let chunk = batch.next_chunk(batch.len());
         if let Some(first) = chunk.first() {
-            if chunk
-                .iter()
-                .any(|event| event.topic != first.topic || event.partition != first.partition)
-            {
+            if chunk.iter().any(|event| {
+                event.event_type() != first.event_type()
+                    || event.partition() != Some(delivery.partition())
+            }) {
                 self.violations
                     .lock()
                     .unwrap()
                     .push("batch mixed topic IDs or partitions".to_owned());
             }
             self.scopes.lock().unwrap().push((
-                first.topic.to_string(),
-                first.partition,
+                delivery.topic().to_string(),
+                delivery.partition(),
                 chunk.len(),
             ));
         }
         Ok(chunk
             .last()
             .map(|event| BatchHandlerOutcome::AdvanceThrough {
-                offset: event.offset,
+                offset: event.sequence().expect("a delivered event is stamped"),
             })
             .unwrap_or(BatchHandlerOutcome::Success))
     }
 }
 
 /// A broker decorator over the real harness broker that injects seek/stream
-/// faults, for exercising the consumer's topology-version-mismatch recovery and
-/// its fail-fast on `PositionsNotSet`. Every operation delegates unchanged
-/// except the injected ones; the call counters let a test observe the recovery
-/// path without racing timing.
+/// faults, for exercising the consumer's topology-version-mismatch recovery,
+/// its recovery from `PositionsNotSet` at open and its handling of injected frames.
+/// Every operation delegates unchanged except the injected ones; the call
+/// counters let a test observe the recovery path without racing timing.
 pub(super) struct SeekFaultBroker {
     inner: Arc<dyn EventBrokerApi>,
     /// Reject the first `seek_mismatches` seeks with `TopologyVersionMismatch`
@@ -110,9 +120,33 @@ pub(super) struct SeekFaultBroker {
     seek_mismatches: usize,
     /// Reject the first stream open with `PositionsNotSet`.
     stream_positions_not_set_once: bool,
+    /// Items the first opened stream yields ahead of the real broker's.
+    stream_prefix: Mutex<Vec<Result<WireFrame, ConsumerError>>>,
+    /// Items the first opened stream yields right after the real broker's first
+    /// frame, so the break comes on a stream that is already open.
+    stream_break: Mutex<Vec<Result<WireFrame, ConsumerError>>>,
+    /// End the first opened stream after the real broker's first frame and its
+    /// break items instead of going on to the real broker's later frames.
+    end_first_stream: AtomicBool,
+    /// Answer the first `stream` call with this fault instead of opening the real
+    /// broker's stream, so the member never streams.
+    open_fault: Mutex<Option<OpenFault>>,
     pub(super) seek_calls: Arc<AtomicUsize>,
     pub(super) get_subscription_calls: Arc<AtomicUsize>,
     pub(super) stream_calls: Arc<AtomicUsize>,
+    /// Every subscription `leave` was called with, in order.
+    pub(super) leave_calls: Arc<Mutex<Vec<SubscriptionId>>>,
+}
+
+/// How the first `stream` call fails without opening the real broker's stream.
+enum OpenFault {
+    /// `stream` itself returns the error, as an in-process open does.
+    Failure(ConsumerError),
+    /// `stream` returns a stream whose first item is the error, as a transport that
+    /// opens lazily (REST) reports a refused open.
+    Error(ConsumerError),
+    /// `stream` returns a stream that ends before its first frame.
+    End,
 }
 
 impl SeekFaultBroker {
@@ -125,10 +159,103 @@ impl SeekFaultBroker {
             inner,
             seek_mismatches,
             stream_positions_not_set_once,
+            stream_prefix: Mutex::new(Vec::new()),
+            stream_break: Mutex::new(Vec::new()),
+            end_first_stream: AtomicBool::new(false),
+            open_fault: Mutex::new(None),
             seek_calls: Arc::new(AtomicUsize::new(0)),
             get_subscription_calls: Arc::new(AtomicUsize::new(0)),
             stream_calls: Arc::new(AtomicUsize::new(0)),
+            leave_calls: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+
+    /// Makes the first opened stream yield `frames` before the real broker's.
+    pub(super) fn with_stream_prefix(self, frames: Vec<WireFrame>) -> Self {
+        Self {
+            stream_prefix: Mutex::new(frames.into_iter().map(Ok).collect()),
+            ..self
+        }
+    }
+
+    /// Makes the first opened stream yield `error` right after the real broker's
+    /// first frame, then go on to its later frames.
+    pub(super) fn with_stream_error(self, error: ConsumerError) -> Self {
+        Self {
+            stream_break: Mutex::new(vec![Err(error)]),
+            ..self
+        }
+    }
+
+    /// Makes the first opened stream end right after the real broker's first frame.
+    /// The real broker's stream stays open, unpolled after that frame, until the
+    /// consumer drops the ended one, as a transport keeps its session until the
+    /// client lets go of the response.
+    pub(super) fn with_stream_end(self) -> Self {
+        Self {
+            end_first_stream: AtomicBool::new(true),
+            ..self
+        }
+    }
+
+    /// Makes the first `stream` call return `error` without opening the real
+    /// broker's stream.
+    pub(super) fn with_open_failure(self, error: ConsumerError) -> Self {
+        Self {
+            open_fault: Mutex::new(Some(OpenFault::Failure(error))),
+            ..self
+        }
+    }
+
+    /// Makes the first `stream` call return a stream whose first item is `error`,
+    /// without opening the real broker's stream.
+    pub(super) fn with_open_error(self, error: ConsumerError) -> Self {
+        Self {
+            open_fault: Mutex::new(Some(OpenFault::Error(error))),
+            ..self
+        }
+    }
+
+    /// Makes the first `stream` call return a stream that ends before its first
+    /// frame, without opening the real broker's stream.
+    pub(super) fn with_open_end(self) -> Self {
+        Self {
+            open_fault: Mutex::new(Some(OpenFault::End)),
+            ..self
+        }
+    }
+}
+
+/// The real broker's stream with a break injected after its first frame: the
+/// `stream_break` items, then the end if `end` is set, else the real later frames.
+/// The real stream lives as long as this one, so an ended stream keeps the real
+/// session open until the consumer drops it.
+struct BreakAfterFirstFrame {
+    real: FrameStream,
+    first_seen: bool,
+    break_items: std::vec::IntoIter<Result<WireFrame, ConsumerError>>,
+    end: bool,
+}
+
+impl futures_util::Stream for BreakAfterFirstFrame {
+    type Item = Result<WireFrame, ConsumerError>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        if !self.first_seen {
+            let first = std::task::ready!(self.real.poll_next_unpin(cx));
+            self.first_seen = true;
+            return std::task::Poll::Ready(first);
+        }
+        if let Some(item) = self.break_items.next() {
+            return std::task::Poll::Ready(Some(item));
+        }
+        if self.end {
+            return std::task::Poll::Ready(None);
+        }
+        self.real.poll_next_unpin(cx)
     }
 }
 
@@ -145,16 +272,18 @@ impl EventBrokerApi for SeekFaultBroker {
     async fn publish(
         &self,
         ctx: &SecurityContext,
-        event: &Event,
+        event: &EventV1,
+        ack: Ack,
     ) -> Result<IngestOutcome, ConsumerError> {
-        self.inner.publish(ctx, event).await
+        self.inner.publish(ctx, event, ack).await
     }
     async fn publish_batch(
         &self,
         ctx: &SecurityContext,
-        events: &[Event],
+        events: &[EventV1],
+        ack: Ack,
     ) -> Result<IngestOutcome, ConsumerError> {
-        self.inner.publish_batch(ctx, events).await
+        self.inner.publish_batch(ctx, events, ack).await
     }
     async fn get_producer_cursors(
         &self,
@@ -223,6 +352,7 @@ impl EventBrokerApi for SeekFaultBroker {
         self.inner.list_subscriptions(ctx).await
     }
     async fn leave(&self, ctx: &SecurityContext, id: SubscriptionId) -> Result<(), ConsumerError> {
+        self.leave_calls.lock().unwrap().push(id);
         self.inner.leave(ctx, id).await
     }
     async fn stream(
@@ -238,7 +368,30 @@ impl EventBrokerApi for SeekFaultBroker {
                 detail: "injected".to_owned(),
             });
         }
-        self.inner.stream(ctx, id).await
+        let open_fault = self.open_fault.lock().unwrap().take();
+        match open_fault {
+            Some(OpenFault::Failure(error)) => return Err(error),
+            Some(OpenFault::Error(error)) => {
+                return Ok(Box::pin(futures_util::stream::iter([Err(error)])));
+            }
+            Some(OpenFault::End) => return Ok(Box::pin(futures_util::stream::empty())),
+            None => {}
+        }
+        let stream = self.inner.stream(ctx, id).await?;
+        let prefix = std::mem::take(&mut *self.stream_prefix.lock().unwrap());
+        let break_items = std::mem::take(&mut *self.stream_break.lock().unwrap());
+        let end = self.end_first_stream.swap(false, Ordering::SeqCst);
+        if break_items.is_empty() && !end {
+            return Ok(Box::pin(futures_util::stream::iter(prefix).chain(stream)));
+        }
+        Ok(Box::pin(futures_util::stream::iter(prefix).chain(
+            BreakAfterFirstFrame {
+                real: stream,
+                first_seen: false,
+                break_items: break_items.into_iter(),
+                end,
+            },
+        )))
     }
     async fn seek(
         &self,
@@ -297,21 +450,25 @@ pub(super) struct AckAllBatchHandler {
 }
 
 #[async_trait]
-impl ConsumerHandler for AckAllBatchHandler {
+impl BatchHandler<serde_json::Value> for AckAllBatchHandler {
     async fn handle_batch(
         &self,
-        batch: &EventBatch<'_>,
-        _attempts: u16,
+        batch: &EventBatch<'_, serde_json::Value>,
+        delivery: &Delivery,
     ) -> Result<BatchHandlerOutcome, ConsumerError> {
         let chunk = batch.next_chunk(batch.len());
-        self.calls.lock().unwrap().extend(
-            chunk
-                .iter()
-                .map(|e| (e.topic.to_string(), e.partition, e.offset.as_i64())),
-        );
+        self.calls.lock().unwrap().extend(chunk.iter().map(|e| {
+            (
+                delivery.topic().to_string(),
+                delivery.partition(),
+                e.sequence().expect("a delivered event is stamped").as_i64(),
+            )
+        }));
         Ok(chunk
             .last()
-            .map(|e| BatchHandlerOutcome::AdvanceThrough { offset: e.offset })
+            .map(|e| BatchHandlerOutcome::AdvanceThrough {
+                offset: e.sequence().expect("a delivered event is stamped"),
+            })
             .unwrap_or(BatchHandlerOutcome::Success))
     }
 }
@@ -323,22 +480,26 @@ pub(super) struct SleepingBatchHandler {
 }
 
 #[async_trait]
-impl ConsumerHandler for SleepingBatchHandler {
+impl BatchHandler<serde_json::Value> for SleepingBatchHandler {
     async fn handle_batch(
         &self,
-        batch: &EventBatch<'_>,
-        _attempts: u16,
+        batch: &EventBatch<'_, serde_json::Value>,
+        delivery: &Delivery,
     ) -> Result<BatchHandlerOutcome, ConsumerError> {
         tokio::time::sleep(self.delay).await;
         let chunk = batch.next_chunk(batch.len());
-        self.calls.lock().unwrap().extend(
-            chunk
-                .iter()
-                .map(|e| (e.topic.to_string(), e.partition, e.offset.as_i64())),
-        );
+        self.calls.lock().unwrap().extend(chunk.iter().map(|e| {
+            (
+                delivery.topic().to_string(),
+                delivery.partition(),
+                e.sequence().expect("a delivered event is stamped").as_i64(),
+            )
+        }));
         Ok(chunk
             .last()
-            .map(|e| BatchHandlerOutcome::AdvanceThrough { offset: e.offset })
+            .map(|e| BatchHandlerOutcome::AdvanceThrough {
+                offset: e.sequence().expect("a delivered event is stamped"),
+            })
             .unwrap_or(BatchHandlerOutcome::Success))
     }
 }
@@ -350,11 +511,11 @@ pub(super) struct FailingThenCommitBatchHandler {
 }
 
 #[async_trait]
-impl ConsumerHandler for FailingThenCommitBatchHandler {
+impl BatchHandler<serde_json::Value> for FailingThenCommitBatchHandler {
     async fn handle_batch(
         &self,
-        _batch: &EventBatch<'_>,
-        attempts: u16,
+        _batch: &EventBatch<'_, serde_json::Value>,
+        delivery: &Delivery,
     ) -> Result<BatchHandlerOutcome, ConsumerError> {
         {
             let mut guard = self.failures_remaining.lock().unwrap();
@@ -365,7 +526,7 @@ impl ConsumerHandler for FailingThenCommitBatchHandler {
                 ));
             }
         }
-        self.calls.lock().unwrap().push(attempts);
+        self.calls.lock().unwrap().push(delivery.attempts());
         Ok(BatchHandlerOutcome::Success)
     }
 }
@@ -407,11 +568,11 @@ pub(super) struct SequencedBatchHandler {
 }
 
 #[async_trait]
-impl ConsumerHandler for SequencedBatchHandler {
+impl BatchHandler<serde_json::Value> for SequencedBatchHandler {
     async fn handle_batch(
         &self,
-        _batch: &EventBatch<'_>,
-        _attempts: u16,
+        _batch: &EventBatch<'_, serde_json::Value>,
+        _delivery: &Delivery,
     ) -> Result<BatchHandlerOutcome, ConsumerError> {
         self.timeline.lock().unwrap().push("handle");
         Ok(BatchHandlerOutcome::Success)
@@ -470,6 +631,7 @@ pub(super) enum RuntimeEventKind {
     OffsetLoaded,
     OffsetCommitted,
     RetryScheduled,
+    EventSkipped,
 }
 
 pub(super) fn runtime_event_kind(event: &ConsumerRuntimeEvent) -> RuntimeEventKind {
@@ -498,6 +660,7 @@ pub(super) fn runtime_event_kind(event: &ConsumerRuntimeEvent) -> RuntimeEventKi
         ConsumerRuntimeEvent::OffsetLoaded { .. } => RuntimeEventKind::OffsetLoaded,
         ConsumerRuntimeEvent::OffsetCommitted { .. } => RuntimeEventKind::OffsetCommitted,
         ConsumerRuntimeEvent::RetryScheduled { .. } => RuntimeEventKind::RetryScheduled,
+        ConsumerRuntimeEvent::EventSkipped { .. } => RuntimeEventKind::EventSkipped,
     }
 }
 
@@ -533,5 +696,120 @@ impl CommitOffset for RecordingCommitOffsetManager {
             .unwrap()
             .push((*group, *topic, partition, offset.as_i64()));
         Ok(())
+    }
+}
+
+/// Records each `WARN` event a test's thread emits as one
+/// `WARN <message> <field>=<value>..` line, while it lives.
+///
+/// Capture is one global subscriber per test binary, routed by thread, never a scoped
+/// `set_default`: while one dispatcher is registered, tracing-core asks the default
+/// of whichever thread first hits a call site for its interest (`Rebuilder::JustOne`,
+/// tracing-core 0.1.36 `callsite.rs:544-575`), so another test's thread with no
+/// default caches `Interest::never` there and this test's line is never seen. A test's
+/// consumer tasks run on its current-thread runtime, so routing by thread keeps
+/// other tests' lines out.
+pub(super) struct WarnCapture {
+    lines: SharedWarnLines,
+}
+
+type SharedWarnLines = Arc<Mutex<Vec<String>>>;
+
+thread_local! {
+    static THREAD_CAPTURE: RefCell<Option<SharedWarnLines>> = const { RefCell::new(None) };
+}
+
+impl WarnCapture {
+    /// Installs the global subscriber on first use and routes this thread's `WARN`
+    /// events to the returned capture until it is dropped.
+    pub(super) fn install() -> Self {
+        static INSTALLED: OnceLock<()> = OnceLock::new();
+        INSTALLED.get_or_init(|| {
+            tracing::subscriber::set_global_default(WarnRouter)
+                .expect("no other global subscriber in the consumer test binary");
+            // A call site another test hit before the install cached the no-op
+            // default's interest; this re-asks every call site.
+            tracing::callsite::rebuild_interest_cache();
+        });
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        THREAD_CAPTURE.with(|slot| *slot.borrow_mut() = Some(Arc::clone(&lines)));
+        Self { lines }
+    }
+
+    pub(super) fn lines(&self) -> SharedWarnLines {
+        Arc::clone(&self.lines)
+    }
+}
+
+impl Drop for WarnCapture {
+    fn drop(&mut self) {
+        THREAD_CAPTURE.with(|slot| slot.borrow_mut().take());
+    }
+}
+
+/// The global subscriber behind `WarnCapture`: admits `WARN` only and appends each
+/// line to the capture of the thread that emitted it, if any.
+struct WarnRouter;
+
+impl tracing::Subscriber for WarnRouter {
+    fn register_callsite(&self, metadata: &'static tracing::Metadata<'static>) -> Interest {
+        if *metadata.level() == tracing::Level::WARN {
+            Interest::always()
+        } else {
+            Interest::never()
+        }
+    }
+
+    fn max_level_hint(&self) -> Option<LevelFilter> {
+        Some(LevelFilter::WARN)
+    }
+
+    fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+        *metadata.level() == tracing::Level::WARN
+    }
+
+    fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+
+    fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+    fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+    fn event(&self, event: &tracing::Event<'_>) {
+        // `try_with`: an event during thread teardown has no capture to reach.
+        let capture = THREAD_CAPTURE
+            .try_with(|slot| slot.borrow().clone())
+            .ok()
+            .flatten();
+        if let Some(lines) = capture {
+            let mut line = WarnLine::default();
+            event.record(&mut line);
+            lines
+                .lock()
+                .unwrap()
+                .push(format!("WARN {}{}", line.message, line.fields));
+        }
+    }
+
+    fn enter(&self, _span: &tracing::span::Id) {}
+
+    fn exit(&self, _span: &tracing::span::Id) {}
+}
+
+#[derive(Default)]
+struct WarnLine {
+    message: String,
+    fields: String,
+}
+
+impl tracing::field::Visit for WarnLine {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        if field.name() == "message" {
+            self.message = format!("{value:?}");
+        } else {
+            self.fields
+                .push_str(&format!(" {}={value:?}", field.name()));
+        }
     }
 }

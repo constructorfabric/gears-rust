@@ -1,9 +1,10 @@
 use crate::consumer::{
-    BatchHandlerOutcome, ConsumerBuffering, ConsumerBuilder, ConsumerGroupRef, ConsumerHandle,
-    ConsumerHandler, ConsumerListenerSettings, ConsumerProfile, EventBatch, Fallback,
-    HandlerOutcome, InMemoryOffsetManager, RawEvent, SingleEventHandler,
+    BatchHandler, BatchHandlerOutcome, ConsumerBuffering, ConsumerBuilder, ConsumerGroupRef,
+    ConsumerHandle, ConsumerListenerSettings, ConsumerProfile, Delivery, EventBatch, EventHandler,
+    Fallback, HandlerOutcome, InMemoryOffsetManager,
 };
 use crate::error::{ConsumerError, EventBrokerError};
+use crate::gts::EventV1;
 use gts::{GtsIdPattern, GtsInstanceId};
 use std::time::Duration;
 use toolkit_gts::{GTS_ID_PREFIX, gts_id};
@@ -19,11 +20,11 @@ fn gpat(id: impl AsRef<str>) -> GtsIdPattern {
 struct NoopHandler;
 
 #[async_trait::async_trait]
-impl SingleEventHandler for NoopHandler {
+impl EventHandler<serde_json::Value> for NoopHandler {
     async fn handle(
         &self,
-        _event: RawEvent,
-        _attempts: u16,
+        _event: EventV1,
+        _delivery: &Delivery,
     ) -> Result<HandlerOutcome, ConsumerError> {
         Ok(HandlerOutcome::Success)
     }
@@ -32,11 +33,11 @@ impl SingleEventHandler for NoopHandler {
 struct NoopBatchHandler;
 
 #[async_trait::async_trait]
-impl ConsumerHandler for NoopBatchHandler {
+impl BatchHandler<serde_json::Value> for NoopBatchHandler {
     async fn handle_batch(
         &self,
-        _batch: &EventBatch<'_>,
-        _attempts: u16,
+        _batch: &EventBatch<'_, serde_json::Value>,
+        _delivery: &Delivery,
     ) -> Result<BatchHandlerOutcome, ConsumerError> {
         Ok(BatchHandlerOutcome::Success)
     }
@@ -308,7 +309,7 @@ mod tx_typestate {
     use super::*;
     use crate::consumer::{
         CommitOffsetInTx, ConsumerOffsetManager, OffsetManagerError, OffsetStore, Position,
-        TxCommitHandle, TxConsumerHandler, TxSingleEventHandler, WithTx,
+        TxBatchHandler, TxCommitHandle, TxEventHandler, WithTx,
     };
     use crate::ids::{ConsumerGroupId, TopicId};
     use crate::sequence::Sequence;
@@ -356,11 +357,11 @@ mod tx_typestate {
     struct NoopTxHandler;
 
     #[async_trait]
-    impl TxSingleEventHandler<RecordingTxOffsetManager> for NoopTxHandler {
+    impl TxEventHandler<serde_json::Value, RecordingTxOffsetManager> for NoopTxHandler {
         async fn handle(
             &self,
-            _event: RawEvent,
-            _attempts: u16,
+            _event: EventV1,
+            _delivery: &Delivery,
             _commit: TxCommitHandle<RecordingTxOffsetManager>,
         ) -> Result<HandlerOutcome, ConsumerError> {
             Ok(HandlerOutcome::Success)
@@ -370,11 +371,11 @@ mod tx_typestate {
     struct NoopTxBatchHandler;
 
     #[async_trait]
-    impl TxConsumerHandler<RecordingTxOffsetManager> for NoopTxBatchHandler {
+    impl TxBatchHandler<serde_json::Value, RecordingTxOffsetManager> for NoopTxBatchHandler {
         async fn handle_batch(
             &self,
-            _batch: &EventBatch<'_>,
-            _attempts: u16,
+            _batch: &EventBatch<'_, serde_json::Value>,
+            _delivery: &Delivery,
             _commit: TxCommitHandle<RecordingTxOffsetManager>,
         ) -> Result<HandlerOutcome, ConsumerError> {
             Ok(HandlerOutcome::Success)

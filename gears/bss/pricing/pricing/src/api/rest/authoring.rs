@@ -85,12 +85,12 @@ pub struct AuthoringState {
 }
 /// The running outbox processor: the broker SDK's producer, or the holding one.
 enum Pipeline {
-    Broker(Box<event_broker_sdk::ProducerOutboxHandle>),
+    Broker(Box<event_broker_sdk::OutboxProducerHandle>),
     Interim(toolkit_db::outbox::OutboxHandle),
 }
 impl AuthoringState {
     /// Attach the durable event queue to the runtime database. With an `EventBrokerApi` in
-    /// the hub its processor is the broker SDK's `DbProducer`; without one it holds every
+    /// the hub its processor is the broker SDK's `OutboxSetup` producer; without one it holds every
     /// envelope and reports nothing delivered.
     /// # Errors
     /// Fails initialization if a present broker refuses the producer or the queue cannot start.

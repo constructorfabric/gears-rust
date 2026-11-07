@@ -21,85 +21,85 @@ use toolkit::api::canonical_prelude::CanonicalError;
 use toolkit_odata::ast::{CompareOperator, Expr, Value};
 use toolkit_odata::{CursorV1, ODataOrderBy, ODataQuery, OrderKey, Page, PageInfo, SortDir};
 
-const DEFAULT_LIMIT: u64 = 25;
-const MAX_LIMIT: u64 = 200;
+use crate::domain::paging::{PageCursor, PageDirection, PageLimit, PageRequest};
 
 /// Sorts `items` by `key_of` ascending (this endpoint's one fixed order),
 /// seeks to `query.cursor`'s recorded position if present, and returns one
 /// keyset page - forward from the cursor, or backward when `cursor.d ==
 /// "bwd"` (built by this function itself for `prev_cursor`; a client never
-/// constructs one).
+/// constructs one). The seek and the page bounds are the domain pager's
+/// ([`PageRequest::page`]); this function owns the `CursorV1` token and its
+/// validation.
 ///
 /// # Errors
 /// Returns the mapped `CanonicalError` (`400`) if `query.cursor` doesn't
 /// match this endpoint's fixed order or the current `$filter` - a stale or
-/// foreign cursor - or if cursor encoding fails.
-pub fn paginate_by_key<T: Clone>(
-    mut items: Vec<T>,
+/// foreign cursor - or if cursor encoding fails. It also returns `400` for a
+/// cursor with no key or an unknown direction; `CursorV1::decode` already
+/// rejects both, so only a hand-built cursor reaches that branch.
+pub fn paginate_by_key<T>(
+    items: Vec<T>,
     query: &ODataQuery,
     key_field: &'static str,
     key_of: impl Fn(&T) -> String,
 ) -> Result<Page<T>, CanonicalError> {
-    items.sort_by_key(|item| key_of(item));
-    let total = items.len();
-
     let order = ODataOrderBy(vec![OrderKey {
         field: key_field.to_owned(),
         dir: SortDir::Asc,
     }]);
-    let limit = query.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
-    let limit_usize = usize::try_from(limit).unwrap_or(usize::MAX);
+    let limit = query
+        .limit
+        .map_or_else(PageLimit::default, PageLimit::clamped);
 
-    if let Some(cursor) = &query.cursor {
-        toolkit_odata::validate_cursor_against(cursor, &order, query.filter_hash.as_deref())?;
-    }
-
-    let (start, end) = match &query.cursor {
-        None => (0, limit_usize.min(total)),
-        Some(cursor) if cursor.d == "bwd" => {
-            // `cursor.k[0]` is the first item's key of the page this
-            // `prev_cursor` was built from - everything strictly before it,
-            // taking the `limit` items closest to it.
-            let before = items.partition_point(|item| key_of(item) < cursor.k[0]);
-            (before.saturating_sub(limit_usize), before)
-        }
+    let request = match &query.cursor {
+        None => PageRequest::first(limit),
         Some(cursor) => {
-            // `cursor.k[0]` is the last item's key of the previous page -
-            // everything strictly after it.
-            let after = items.partition_point(|item| key_of(item) <= cursor.k[0]);
-            (after, (after + limit_usize).min(total))
+            toolkit_odata::validate_cursor_against(cursor, &order, query.filter_hash.as_deref())?;
+            PageRequest::at(PageCursor::try_from(cursor)?, limit)
         }
     };
+    let page = request.page(items, key_of);
 
-    let page_items = items[start..end].to_vec();
-
-    let next_cursor = match page_items.last() {
-        Some(last) if end < total => Some(build_cursor(
-            &key_of(last),
-            &order,
-            query.filter_hash.clone(),
-            "fwd",
-        )?),
-        _ => None,
-    };
-    let prev_cursor = match page_items.first() {
-        Some(first) if start > 0 => Some(build_cursor(
-            &key_of(first),
-            &order,
-            query.filter_hash.clone(),
-            "bwd",
-        )?),
-        _ => None,
-    };
+    let next_cursor = page
+        .next
+        .map(|cursor| build_cursor(&cursor.key, &order, query.filter_hash.clone(), "fwd"))
+        .transpose()?;
+    let prev_cursor = page
+        .prev
+        .map(|cursor| build_cursor(&cursor.key, &order, query.filter_hash.clone(), "bwd"))
+        .transpose()?;
 
     Ok(Page::new(
-        page_items,
+        page.items,
         PageInfo {
             next_cursor,
             prev_cursor,
-            limit,
+            limit: page.limit.into(),
         },
     ))
+}
+
+/// A decoded `CursorV1` as a domain keyset position: its single key (`k[0]`)
+/// and its direction (`d`). `CursorV1::decode` already guarantees both, so
+/// the rejections only fire on a hand-built cursor.
+impl TryFrom<&CursorV1> for PageCursor {
+    type Error = CanonicalError;
+
+    fn try_from(cursor: &CursorV1) -> Result<Self, Self::Error> {
+        let key = cursor
+            .k
+            .first()
+            .ok_or_else(|| CanonicalError::from(toolkit_odata::Error::CursorInvalidKeys))?;
+        let direction = match cursor.d.as_str() {
+            "fwd" => PageDirection::Forward,
+            "bwd" => PageDirection::Backward,
+            _ => return Err(toolkit_odata::Error::CursorInvalidDirection.into()),
+        };
+        Ok(PageCursor {
+            key: key.clone(),
+            direction,
+        })
+    }
 }
 
 /// Builds an opaque `CursorV1` token seeking from `key_value` in `direction`

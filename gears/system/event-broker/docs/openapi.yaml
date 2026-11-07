@@ -66,7 +66,7 @@ paths:
             head. The event is already durable; nothing is written and the response
             carries no body.
         "400":
-          description: Validation error (read-only/unknown field, unknown producer, etc.)
+          description: Validation error (read-only/unknown field, malformed `trace_parent`, etc.)
           content:
             application/problem+json:
               schema:
@@ -78,7 +78,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/Problem"
         "404":
-          description: Topic or event type not registered.
+          description: Topic, event type or producer not registered.
           content:
             application/problem+json:
               schema:
@@ -165,8 +165,10 @@ paths:
             is written and the response carries no body.
         "400":
           description: >-
-            Validation error, or a batch run rule broken - each a
-            `field_violations` entry naming the event by its position:
+            Validation error, or a batch run rule broken. An envelope field
+            violation (for example a malformed `trace_parent`) names the bare
+            field, as on `POST /v1/events`, and rejects the whole batch. A run
+            rule violation is a `field_violations` entry:
             `empty_batch` (no events; field `events`), `duplicate_event_id` (an
             `id` repeated within the batch; field `events[<index>].id`, the
             repeat), `malformed_run` (a chained run's events do not link - every
@@ -186,7 +188,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/Problem"
         "404":
-          description: Topic or event type not registered.
+          description: Topic, event type or producer not registered.
           content:
             application/problem+json:
               schema:

@@ -16,13 +16,12 @@ use std::time::Duration;
 use admission_control_sdk::gts::refusal_event_type_schema;
 use admission_control_sdk::{ADMISSION_CONTROL_RESOURCE, REFUSAL_EVENT_TYPE, RefusalEvent};
 use chrono::{DateTime, Utc};
-use event_broker_sdk::{Event, EventBrokerApi, GtsTypeId};
+use event_broker_sdk::{Ack, EventBrokerApi, EventBrokerError, EventV1, GtsTypeId};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use toolkit::ClientHub;
 use toolkit_security::SecurityContext;
 use types_registry_sdk::{RegisterResult, TypesRegistryClient};
-use uuid::Uuid;
 
 use crate::domain::service::{EventEnvelope, EventSink};
 use crate::infra::metrics::AdmissionControlMetrics;
@@ -78,29 +77,29 @@ impl EventSink for QueuePublisher {
 
 /// The broker event for `queued`: tenant the resource tenant, subject the
 /// correlation identifier, `data` the payload.
-#[must_use]
-pub fn to_broker_event(queued: &QueuedEvent) -> Event {
+///
+/// # Errors
+///
+/// The builder's field errors ([`EventBrokerError::InvalidEventField`],
+/// [`EventBrokerError::InvalidTextField`]) when an envelope field breaks its rule.
+pub fn to_broker_event(queued: &QueuedEvent) -> Result<EventV1, EventBrokerError> {
     let QueuedEvent { envelope, event } = queued;
     let occurred_at = DateTime::from_timestamp(
         envelope.occurred_at.unix_timestamp(),
         envelope.occurred_at.nanosecond(),
     )
     .unwrap_or(DateTime::<Utc>::UNIX_EPOCH);
-    Event {
-        id: Uuid::new_v4(),
-        type_id: GtsTypeId::new(REFUSAL_EVENT_TYPE),
-        tenant_id: envelope.tenant_id,
-        source: EVENT_SOURCE.to_owned(),
-        subject: envelope.correlation_id.to_string(),
-        subject_type: GtsTypeId::new(ADMISSION_CONTROL_RESOURCE),
-        occurred_at,
-        trace_parent: None,
-        data: serde_json::to_value(event).ok(),
-        partition: None,
-        sequence: None,
-        sequence_time: None,
-        meta: None,
+    let event_type = GtsTypeId::new(REFUSAL_EVENT_TYPE);
+    match serde_json::to_value(event) {
+        Ok(data) => EventV1::builder_for(event_type, data),
+        Err(_) => EventV1::builder_without_data(event_type),
     }
+    .tenant_id(envelope.tenant_id)
+    .source(EVENT_SOURCE)
+    .subject(envelope.correlation_id.to_string())
+    .subject_type_id(GtsTypeId::new(ADMISSION_CONTROL_RESOURCE))
+    .occurred_at(occurred_at)
+    .build()
 }
 
 /// Registers the refusal event type.
@@ -233,8 +232,14 @@ async fn deliver(
     let broker = hub
         .try_get::<dyn EventBrokerApi>()
         .ok_or_else(|| "event broker unavailable".to_owned())?;
-    let broker_event = to_broker_event(event);
-    match tokio::time::timeout(PUBLISH_TIMEOUT, broker.publish(identity, &broker_event)).await {
+    let broker_event =
+        to_broker_event(event).map_err(|error| format!("refusal event not built: {error}"))?;
+    match tokio::time::timeout(
+        PUBLISH_TIMEOUT,
+        broker.publish(identity, &broker_event, Ack::Accepted),
+    )
+    .await
+    {
         Ok(Ok(_)) => Ok(()),
         Ok(Err(error)) => Err(format!("publication failed: {error}")),
         Err(_elapsed) => Err("event broker did not answer".to_owned()),

@@ -11,15 +11,20 @@ use crate::consumer::dispatcher::SlotDispatcher;
 #[cfg(feature = "db")]
 use crate::consumer::dispatcher::TxSlotDispatcher;
 use crate::consumer::offset_manager::CommitOffset;
+use crate::consumer::types::{BatchHandlerAdapter, DeliverBatch, Delivered, EventHandlerAdapter};
+#[cfg(feature = "db")]
+use crate::consumer::types::{DeliverTxBatch, TxBatchHandlerAdapter, TxEventHandlerAdapter};
 use crate::consumer::{
-    BatchHandlerOutcome, ConsumerGroupRef, ConsumerHandler, SingleEventHandler,
-    SingleEventHandlerAdapter,
+    BatchHandler, BatchHandlerOutcome, ConsumerGroupRef, Delivery, EventBatch, EventHandler,
 };
 #[cfg(feature = "db")]
-use crate::consumer::{CommitOffsetInTx, TxConsumerHandler, TxSingleEventHandlerAdapter};
+use crate::consumer::{
+    CommitOffsetInTx, HandlerOutcome, TxBatchHandler, TxCommitHandle, TxEventHandler,
+};
 use crate::error::{ConsumerError, EventBrokerError};
+use crate::gts::StoredPosition;
 use crate::ids::SubscriptionId;
-use gts::{GtsId, GtsIdPattern, GtsTypeId};
+use gts::{GtsId, GtsIdPattern, GtsInstanceId, GtsTypeId};
 
 struct SlotHandle {
     subscription_id: Arc<tokio::sync::Mutex<Option<SubscriptionId>>>,
@@ -39,19 +44,19 @@ pub struct ConsumerHandle {
 
 pub(crate) struct RoutedHandlerEntry {
     route: ConsumerRoute,
-    handler: Arc<dyn ConsumerHandler>,
+    handler: Arc<dyn DeliverBatch>,
 }
 
 pub(crate) struct RoutedBatchHandler {
-    default_handler: Option<Arc<dyn ConsumerHandler>>,
+    default_handler: Option<Arc<dyn DeliverBatch>>,
     routes: Vec<RoutedHandlerEntry>,
 }
 
 impl RoutedBatchHandler {
     pub(crate) fn new(
-        default_handler: Option<Arc<dyn ConsumerHandler>>,
+        default_handler: Option<Arc<dyn DeliverBatch>>,
         routes: Vec<ConsumerRoute>,
-        route_handlers: Vec<Arc<dyn ConsumerHandler>>,
+        route_handlers: Vec<Arc<dyn DeliverBatch>>,
     ) -> Result<Self, EventBrokerError> {
         if routes.len() != route_handlers.len() {
             return Err(EventBrokerError::Internal(format!(
@@ -76,21 +81,21 @@ impl RoutedBatchHandler {
 #[cfg(feature = "db")]
 pub(crate) struct TxRoutedHandlerEntry<OM: CommitOffsetInTx> {
     route: ConsumerRoute,
-    handler: Arc<dyn TxConsumerHandler<OM>>,
+    handler: Arc<dyn DeliverTxBatch<OM>>,
 }
 
 #[cfg(feature = "db")]
 pub(crate) struct TxRoutedBatchHandler<OM: CommitOffsetInTx> {
-    default_handler: Option<Arc<dyn TxConsumerHandler<OM>>>,
+    default_handler: Option<Arc<dyn DeliverTxBatch<OM>>>,
     routes: Vec<TxRoutedHandlerEntry<OM>>,
 }
 
 #[cfg(feature = "db")]
 impl<OM: CommitOffsetInTx> TxRoutedBatchHandler<OM> {
     pub(crate) fn new(
-        default_handler: Option<Arc<dyn TxConsumerHandler<OM>>>,
+        default_handler: Option<Arc<dyn DeliverTxBatch<OM>>>,
         routes: Vec<ConsumerRoute>,
-        route_handlers: Vec<Arc<dyn TxConsumerHandler<OM>>>,
+        route_handlers: Vec<Arc<dyn DeliverTxBatch<OM>>>,
     ) -> Result<Self, EventBrokerError> {
         if routes.len() != route_handlers.len() {
             return Err(EventBrokerError::Internal(format!(
@@ -114,86 +119,99 @@ impl<OM: CommitOffsetInTx> TxRoutedBatchHandler<OM> {
 
 #[cfg(feature = "db")]
 #[async_trait::async_trait]
-impl<OM> TxConsumerHandler<OM> for TxRoutedBatchHandler<OM>
+impl<OM> DeliverTxBatch<OM> for TxRoutedBatchHandler<OM>
 where
     OM: CommitOffsetInTx + 'static,
 {
-    async fn handle_batch(
+    async fn deliver(
         &self,
-        batch: &crate::consumer::EventBatch<'_>,
-        attempts: u16,
-        commit: crate::consumer::TxCommitHandle<OM>,
-    ) -> Result<crate::consumer::HandlerOutcome, ConsumerError> {
+        batch: &EventBatch<'_, serde_json::Value>,
+        positions: &[StoredPosition],
+        delivery: &Delivery,
+        commit: TxCommitHandle<OM>,
+    ) -> Result<HandlerOutcome, ConsumerError> {
         let Some(event) = batch.next_event() else {
-            return Ok(crate::consumer::HandlerOutcome::Success);
+            return Ok(HandlerOutcome::Success);
         };
 
         if let Some(entry) = self
             .routes
             .iter()
-            .find(|entry| route_matches(&entry.route, event))
+            .find(|entry| entry.route.matches(delivery.topic(), event.event_type()))
         {
-            return entry.handler.handle_batch(batch, attempts, commit).await;
+            return entry
+                .handler
+                .deliver(batch, positions, delivery, commit)
+                .await;
         }
 
         if let Some(default_handler) = &self.default_handler {
-            return default_handler.handle_batch(batch, attempts, commit).await;
+            return default_handler
+                .deliver(batch, positions, delivery, commit)
+                .await;
         }
 
         Err(EventBrokerError::InvalidConsumerOptions {
             detail: format!(
                 "no transactional consumer route matched topic '{}' and event type '{}'",
-                event.topic, event.type_id
+                delivery.topic(),
+                event.event_type()
             ),
         })
     }
 }
 
 #[async_trait::async_trait]
-impl ConsumerHandler for RoutedBatchHandler {
-    async fn handle_batch(
+impl DeliverBatch for RoutedBatchHandler {
+    async fn deliver(
         &self,
-        batch: &crate::consumer::EventBatch<'_>,
-        attempts: u16,
-    ) -> Result<BatchHandlerOutcome, ConsumerError> {
+        batch: &EventBatch<'_, serde_json::Value>,
+        positions: &[StoredPosition],
+        delivery: &Delivery,
+    ) -> Result<Delivered, ConsumerError> {
         let Some(event) = batch.next_event() else {
-            return Ok(BatchHandlerOutcome::Success);
+            return Ok(BatchHandlerOutcome::Success.into());
         };
 
         if let Some(entry) = self
             .routes
             .iter()
-            .find(|entry| route_matches(&entry.route, event))
+            .find(|entry| entry.route.matches(delivery.topic(), event.event_type()))
         {
-            return entry.handler.handle_batch(batch, attempts).await;
+            return entry.handler.deliver(batch, positions, delivery).await;
         }
 
         if let Some(default_handler) = &self.default_handler {
-            return default_handler.handle_batch(batch, attempts).await;
+            return default_handler.deliver(batch, positions, delivery).await;
         }
 
         Err(EventBrokerError::InvalidConsumerOptions {
             detail: format!(
                 "no consumer route matched topic '{}' and event type '{}'",
-                event.topic, event.type_id
+                delivery.topic(),
+                event.event_type()
             ),
         })
     }
 }
 
-fn route_matches(route: &ConsumerRoute, event: &crate::consumer::RawEvent) -> bool {
-    route.topic == event.topic
-        && route
-            .event_type
-            .as_ref()
-            .is_none_or(|pattern| event_type_matches(pattern, &event.type_id))
-}
+impl ConsumerRoute {
+    /// Whether this route serves an event of `event_type` read from `topic`: the topic
+    /// is the route's, and the type matches its pattern or the route has none.
+    pub(crate) fn matches(&self, topic: &GtsInstanceId, event_type: &GtsTypeId) -> bool {
+        self.topic == *topic
+            && self
+                .event_type
+                .as_ref()
+                .is_none_or(|pattern| Self::event_type_matches(pattern, event_type))
+    }
 
-/// Whether a delivered event's type matches a route's GTS pattern, via the
-/// canonical `gts` matcher. The type id is already validated, so a parse failure
-/// simply does not match rather than aborting dispatch.
-fn event_type_matches(pattern: &GtsIdPattern, event_type: &GtsTypeId) -> bool {
-    GtsId::try_new(event_type.as_ref()).is_ok_and(|id| id.matches_pattern(pattern))
+    /// Whether a delivered event's type matches a route's GTS pattern, via the
+    /// canonical `gts` matcher. The type id is already validated, so a parse failure
+    /// simply does not match rather than aborting dispatch.
+    fn event_type_matches(pattern: &GtsIdPattern, event_type: &GtsTypeId) -> bool {
+        GtsId::try_new(event_type.as_ref()).is_ok_and(|id| id.matches_pattern(pattern))
+    }
 }
 
 impl ConsumerHandle {
@@ -231,10 +249,10 @@ impl Consumer {
     ) -> Result<Self, EventBrokerError>
     where
         M: CommitOffset + 'static,
-        H: SingleEventHandler + 'static,
+        H: EventHandler<serde_json::Value> + 'static,
     {
-        let handler = SingleEventHandlerAdapter::new(Arc::new(handler));
-        Self::new_with_batch_slots(builder, handler).await
+        let handler = EventHandlerAdapter::new(handler);
+        Self::new_with_batch_slots_with_cancel(builder, handler, None).await
     }
 
     /// Starts one subscription slot per parallel worker, each dispatching event batches to `handler`.
@@ -244,8 +262,9 @@ impl Consumer {
     ) -> Result<Self, EventBrokerError>
     where
         M: CommitOffset + 'static,
-        H: ConsumerHandler + 'static,
+        H: BatchHandler<serde_json::Value> + 'static,
     {
+        let handler = BatchHandlerAdapter::new(handler);
         Self::new_with_batch_slots_with_cancel(builder, handler, None).await
     }
 
@@ -256,7 +275,7 @@ impl Consumer {
     ) -> Result<Self, EventBrokerError>
     where
         M: CommitOffset + 'static,
-        H: ConsumerHandler + 'static,
+        H: DeliverBatch + 'static,
     {
         let settings = builder.effective_settings()?;
         let parallelism = builder.parallelism;
@@ -335,16 +354,16 @@ impl Consumer {
     /// Starts one subscription slot per parallel worker, dispatching events to the route handler matching topic and type, else the default handler.
     pub(crate) async fn new_with_routed_slots<M>(
         builder: ConsumerBuilder<crate::consumer::builder::BrokerOnly<M>>,
-        default_handler: Option<Arc<dyn ConsumerHandler>>,
+        default_handler: Option<Arc<dyn DeliverBatch>>,
         routes: Vec<ConsumerRoute>,
-        route_handlers: Vec<Arc<dyn ConsumerHandler>>,
+        route_handlers: Vec<Arc<dyn DeliverBatch>>,
     ) -> Result<Self, EventBrokerError>
     where
         M: CommitOffset + 'static,
     {
         let handler = RoutedBatchHandler::new(default_handler, routes, route_handlers)?;
 
-        Self::new_with_batch_slots(builder, handler).await
+        Self::new_with_batch_slots_with_cancel(builder, handler, None).await
     }
 
     /// Builds a tx-capable runtime that delivers events to `handler` one at a time.
@@ -355,10 +374,10 @@ impl Consumer {
     ) -> Result<Self, EventBrokerError>
     where
         M: CommitOffsetInTx + 'static,
-        H: crate::consumer::TxSingleEventHandler<M> + 'static,
+        H: TxEventHandler<serde_json::Value, M> + 'static,
     {
-        let handler = TxSingleEventHandlerAdapter::new(Arc::new(handler));
-        Self::new_with_tx_batch_slots(builder, handler).await
+        let handler = TxEventHandlerAdapter::new(handler);
+        Self::new_with_tx_deliver_slots(builder, handler).await
     }
 
     /// Builds a tx-capable runtime that delivers batches to `handler`.
@@ -369,7 +388,21 @@ impl Consumer {
     ) -> Result<Self, EventBrokerError>
     where
         M: CommitOffsetInTx + 'static,
-        H: TxConsumerHandler<M> + 'static,
+        H: TxBatchHandler<serde_json::Value, M> + 'static,
+    {
+        let handler = TxBatchHandlerAdapter::new(handler);
+        Self::new_with_tx_deliver_slots(builder, handler).await
+    }
+
+    /// Builds a tx-capable runtime that hands each batch to `handler`.
+    #[cfg(feature = "db")]
+    async fn new_with_tx_deliver_slots<M, H>(
+        builder: ConsumerBuilder<WithTx<M>>,
+        handler: H,
+    ) -> Result<Self, EventBrokerError>
+    where
+        M: CommitOffsetInTx + 'static,
+        H: DeliverTxBatch<M> + 'static,
     {
         let settings = builder.effective_settings()?;
         let parallelism = builder.parallelism;
@@ -448,16 +481,16 @@ impl Consumer {
     #[cfg(feature = "db")]
     pub(crate) async fn new_with_tx_routed_slots<M>(
         builder: ConsumerBuilder<WithTx<M>>,
-        default_handler: Option<Arc<dyn TxConsumerHandler<M>>>,
+        default_handler: Option<Arc<dyn DeliverTxBatch<M>>>,
         routes: Vec<ConsumerRoute>,
-        route_handlers: Vec<Arc<dyn TxConsumerHandler<M>>>,
+        route_handlers: Vec<Arc<dyn DeliverTxBatch<M>>>,
     ) -> Result<Self, EventBrokerError>
     where
         M: CommitOffsetInTx + 'static,
     {
         let handler = TxRoutedBatchHandler::new(default_handler, routes, route_handlers)?;
 
-        Self::new_with_tx_batch_slots(builder, handler).await
+        Self::new_with_tx_deliver_slots(builder, handler).await
     }
 
     /// Graceful shutdown: cancel all tasks and await drain.

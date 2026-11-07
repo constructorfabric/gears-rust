@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
-use gts::{GtsIdPattern, GtsInstanceId};
+use gts::{GtsIdError, GtsIdPattern, GtsInstanceId, GtsSchema};
 use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
@@ -12,14 +12,24 @@ use crate::error::EventBrokerError;
 use crate::sdk::EventBrokerSdk;
 
 use super::runtime::{Consumer, ConsumerHandle};
-use super::{
-    CommitOffset, ConsumerBatching, ConsumerBuffering, ConsumerCommitMode, ConsumerGroupRef,
-    ConsumerHandler, ConsumerListenerSettings, ConsumerProfile, ConsumerRetry,
-    ConsumerRuntimeListener, ConsumerSettings, ConsumerSettingsOverrides, ConsumerSlowDetection,
-    SingleEventHandler, SubscriptionFilterRef, SubscriptionInterest,
+use super::types::{
+    BatchHandlerAdapter, DeliverBatch, EventHandlerAdapter, TypedBatchHandlerAdapter,
+    TypedEventHandlerAdapter,
 };
 #[cfg(feature = "db")]
-use super::{CommitOffsetInTx, LocalDbOffsetManager, TxConsumerHandler, TxSingleEventHandler};
+use super::types::{
+    DeliverTxBatch, TxBatchHandlerAdapter, TxEventHandlerAdapter, TxTypedBatchHandlerAdapter,
+    TxTypedEventHandlerAdapter, TxUndecodable,
+};
+use super::{
+    BatchHandler, CommitOffset, ConsumerBatching, ConsumerBuffering, ConsumerCommitMode,
+    ConsumerGroupRef, ConsumerListenerSettings, ConsumerProfile, ConsumerRetry,
+    ConsumerRuntimeListener, ConsumerSettings, ConsumerSettingsOverrides, ConsumerSlowDetection,
+    EventHandler, SubscriptionFilterRef, SubscriptionInterest, Undecodable,
+};
+#[cfg(feature = "db")]
+use super::{CommitOffsetInTx, LocalDbOffsetManager, TxBatchHandler, TxEventHandler};
+use crate::gts::EventPayload;
 
 // ---- Typestate markers (zero-sized) ----
 
@@ -79,10 +89,6 @@ pub struct ConsumerBuilder<M = ()> {
     pub(crate) session_timeout: Option<Duration>,
     /// Optional content filter applied to every subscription interest.
     pub(crate) filter: Option<Filter>,
-    /// Initial delay of the reconnect/retry backoff.
-    pub(crate) retry_base: Duration,
-    /// Upper bound of the reconnect/retry backoff.
-    pub(crate) retry_max: Duration,
     /// Settings profile providing the base buffering, batching and retry defaults.
     pub(crate) profile: ConsumerProfile,
     /// Explicit per-setting overrides layered on top of `profile`.
@@ -116,8 +122,6 @@ impl ConsumerBuilder<()> {
             client_agent: EventBrokerSdk::default_client_agent().into(),
             session_timeout: Some(Duration::from_secs(60)),
             filter: None,
-            retry_base: Duration::from_secs(1),
-            retry_max: Duration::from_secs(60),
             profile: ConsumerProfile::default_profile(),
             settings_overrides: ConsumerSettingsOverrides::default(),
             commit_mode: ConsumerCommitMode::default(),
@@ -142,8 +146,6 @@ impl ConsumerBuilder<()> {
             client_agent: EventBrokerSdk::default_client_agent().into(),
             session_timeout: Some(Duration::from_secs(60)),
             filter: None,
-            retry_base: Duration::from_secs(1),
-            retry_max: Duration::from_secs(60),
             profile: ConsumerProfile::default_profile(),
             settings_overrides: ConsumerSettingsOverrides::default(),
             commit_mode: ConsumerCommitMode::default(),
@@ -233,14 +235,6 @@ impl<M> ConsumerBuilder<M> {
         });
         self
     }
-    pub fn retry_base(mut self, d: Duration) -> Self {
-        self.retry_base = d;
-        self
-    }
-    pub fn retry_max(mut self, d: Duration) -> Self {
-        self.retry_max = d;
-        self
-    }
     pub fn profile(mut self, profile: ConsumerProfile) -> Self {
         self.profile = profile;
         self
@@ -257,10 +251,10 @@ impl<M> ConsumerBuilder<M> {
         self.settings_overrides.slow_detection = Some(slow_detection);
         self
     }
+    /// Overrides the profile's handler backoff: a delivery the handler retries or
+    /// fails waits `base_delay`, doubling per attempt up to `max_delay`.
     pub fn retry(mut self, retry: ConsumerRetry) -> Self {
         self.settings_overrides.retry = Some(retry);
-        self.retry_base = retry.base_delay;
-        self.retry_max = retry.max_delay;
         self
     }
     pub fn listener_settings(mut self, listener: ConsumerListenerSettings) -> Self {
@@ -312,8 +306,6 @@ impl ConsumerBuilder<()> {
             heartbeat_drop_threshold: self.heartbeat_drop_threshold,
             session_timeout: self.session_timeout,
             filter: self.filter,
-            retry_base: self.retry_base,
-            retry_max: self.retry_max,
             profile: self.profile,
             settings_overrides: self.settings_overrides,
             commit_mode: self.commit_mode,
@@ -351,7 +343,10 @@ pub struct ConsumerRoutedReady<M, H> {
     /// Routes in registration order; `route_handlers[i]` serves `routes[i]`.
     pub(crate) routes: Vec<ConsumerRoute>,
     /// Handlers for the routes, index-aligned with `routes`.
-    pub(crate) route_handlers: Vec<Arc<dyn ConsumerHandler>>,
+    pub(crate) route_handlers: Vec<Arc<dyn DeliverBatch>>,
+    /// Why each typed route that could not be registered was refused; `start()`
+    /// reports the first.
+    pub(crate) invalid_routes: Vec<String>,
 }
 
 #[cfg(feature = "db")]
@@ -359,11 +354,14 @@ pub struct TxConsumerRoutedReady<M: CommitOffsetInTx + 'static> {
     /// Builder carrying the consumer configuration.
     pub(crate) builder: ConsumerBuilder<WithTx<M>>,
     /// Handler for events no route matches.
-    pub(crate) default_handler: Option<Arc<dyn TxConsumerHandler<M>>>,
+    pub(crate) default_handler: Option<Arc<dyn DeliverTxBatch<M>>>,
     /// Routes in registration order; `route_handlers[i]` serves `routes[i]`.
     pub(crate) routes: Vec<ConsumerRoute>,
     /// Handlers for the routes, index-aligned with `routes`.
-    pub(crate) route_handlers: Vec<Arc<dyn TxConsumerHandler<M>>>,
+    pub(crate) route_handlers: Vec<Arc<dyn DeliverTxBatch<M>>>,
+    /// Why each typed route that could not be registered was refused; `start()`
+    /// reports the first.
+    pub(crate) invalid_routes: Vec<String>,
 }
 
 pub struct NoDefaultHandler;
@@ -402,7 +400,7 @@ pub enum ConsumerRouteHandlerKind {
 impl<M: CommitOffset + 'static> ConsumerBuilder<BrokerOnly<M>> {
     pub fn handler<H>(self, handler: H) -> ConsumerReady<BrokerOnly<M>, H>
     where
-        H: SingleEventHandler + 'static,
+        H: EventHandler<serde_json::Value> + 'static,
     {
         ConsumerReady {
             builder: self,
@@ -412,7 +410,7 @@ impl<M: CommitOffset + 'static> ConsumerBuilder<BrokerOnly<M>> {
 
     pub fn batch_handler<H>(self, handler: H) -> ConsumerBatchReady<BrokerOnly<M>, H>
     where
-        H: ConsumerHandler + 'static,
+        H: BatchHandler<serde_json::Value> + 'static,
     {
         ConsumerBatchReady {
             builder: self,
@@ -422,7 +420,7 @@ impl<M: CommitOffset + 'static> ConsumerBuilder<BrokerOnly<M>> {
 
     pub fn default_handler<H>(self, handler: H) -> ConsumerRoutedReady<BrokerOnly<M>, H>
     where
-        H: SingleEventHandler + 'static,
+        H: EventHandler<serde_json::Value> + 'static,
     {
         ConsumerRoutedReady {
             builder: self,
@@ -430,6 +428,7 @@ impl<M: CommitOffset + 'static> ConsumerBuilder<BrokerOnly<M>> {
             has_default_handler: true,
             routes: Vec::new(),
             route_handlers: Vec::new(),
+            invalid_routes: Vec::new(),
         }
     }
 
@@ -441,6 +440,7 @@ impl<M: CommitOffset + 'static> ConsumerBuilder<BrokerOnly<M>> {
                 has_default_handler: false,
                 routes: Vec::new(),
                 route_handlers: Vec::new(),
+                invalid_routes: Vec::new(),
             },
             topic: None,
             event_type: None,
@@ -453,7 +453,7 @@ impl<M: CommitOffset + 'static> ConsumerBuilder<BrokerOnly<M>> {
 impl<M: CommitOffsetInTx + 'static> ConsumerBuilder<WithTx<M>> {
     pub fn handler<H>(self, handler: H) -> ConsumerReady<WithTx<M>, H>
     where
-        H: TxSingleEventHandler<M> + 'static,
+        H: TxEventHandler<serde_json::Value, M> + 'static,
     {
         ConsumerReady {
             builder: self,
@@ -463,7 +463,7 @@ impl<M: CommitOffsetInTx + 'static> ConsumerBuilder<WithTx<M>> {
 
     pub fn batch_handler<H>(self, handler: H) -> ConsumerBatchReady<WithTx<M>, H>
     where
-        H: TxConsumerHandler<M> + 'static,
+        H: TxBatchHandler<serde_json::Value, M> + 'static,
     {
         ConsumerBatchReady {
             builder: self,
@@ -473,14 +473,15 @@ impl<M: CommitOffsetInTx + 'static> ConsumerBuilder<WithTx<M>> {
 
     pub fn default_handler<H>(self, handler: H) -> TxConsumerRoutedReady<M>
     where
-        H: TxSingleEventHandler<M> + 'static,
+        H: TxEventHandler<serde_json::Value, M> + 'static,
     {
-        let handler = super::TxSingleEventHandlerAdapter::<_, M>::new(Arc::new(handler));
+        let handler = TxEventHandlerAdapter::<_, M>::new(handler);
         TxConsumerRoutedReady {
             builder: self,
             default_handler: Some(Arc::new(handler)),
             routes: Vec::new(),
             route_handlers: Vec::new(),
+            invalid_routes: Vec::new(),
         }
     }
 
@@ -491,6 +492,7 @@ impl<M: CommitOffsetInTx + 'static> ConsumerBuilder<WithTx<M>> {
                 default_handler: None,
                 routes: Vec::new(),
                 route_handlers: Vec::new(),
+                invalid_routes: Vec::new(),
             },
             topic: None,
             event_type: None,
@@ -510,6 +512,11 @@ impl<M, H> ConsumerRoutedReady<M, H> {
     }
 
     fn validate_routes(&self) -> Result<(), EventBrokerError> {
+        if let Some(detail) = self.invalid_routes.first() {
+            return Err(EventBrokerError::InvalidConsumerOptions {
+                detail: detail.clone(),
+            });
+        }
         if self.builder.topics.is_empty() {
             return Err(EventBrokerError::InvalidConsumerOptions {
                 detail: "routed consumer requires at least one configured topic".to_owned(),
@@ -583,6 +590,11 @@ where
     }
 
     fn validate_routes(&self) -> Result<(), EventBrokerError> {
+        if let Some(detail) = self.invalid_routes.first() {
+            return Err(EventBrokerError::InvalidConsumerOptions {
+                detail: detail.clone(),
+            });
+        }
         if self.builder.topics.is_empty() {
             return Err(EventBrokerError::InvalidConsumerOptions {
                 detail: "routed consumer requires at least one configured topic".to_owned(),
@@ -673,7 +685,7 @@ impl<M, H> ConsumerRouteBuilder<M, H, RouteHasTopic> {
     fn push_broker_route(
         mut self,
         handler_kind: ConsumerRouteHandlerKind,
-        handler: Arc<dyn ConsumerHandler>,
+        handler: Arc<dyn DeliverBatch>,
     ) -> ConsumerRoutedReady<M, H> {
         let topic = self
             .topic
@@ -721,7 +733,7 @@ where
     fn push_tx_route(
         mut self,
         handler_kind: ConsumerRouteHandlerKind,
-        handler: Arc<dyn TxConsumerHandler<M>>,
+        handler: Arc<dyn DeliverTxBatch<M>>,
     ) -> TxConsumerRoutedReady<M> {
         let topic = self
             .topic
@@ -740,19 +752,139 @@ impl<M, H> ConsumerRouteBuilder<BrokerOnly<M>, H, RouteHasTopic>
 where
     M: CommitOffset + 'static,
 {
-    pub fn handler<RH>(self, _handler: RH) -> ConsumerRoutedReady<BrokerOnly<M>, H>
+    pub fn handler<RH>(self, handler: RH) -> ConsumerRoutedReady<BrokerOnly<M>, H>
     where
-        RH: SingleEventHandler + 'static,
+        RH: EventHandler<serde_json::Value> + 'static,
     {
-        let handler = super::SingleEventHandlerAdapter::new(Arc::new(_handler));
+        let handler = EventHandlerAdapter::new(handler);
         self.push_broker_route(ConsumerRouteHandlerKind::Single, Arc::new(handler))
     }
 
-    pub fn batch_handler<RH>(self, _handler: RH) -> ConsumerRoutedReady<BrokerOnly<M>, H>
+    pub fn batch_handler<RH>(self, handler: RH) -> ConsumerRoutedReady<BrokerOnly<M>, H>
     where
-        RH: ConsumerHandler + 'static,
+        RH: BatchHandler<serde_json::Value> + 'static,
     {
-        self.push_broker_route(ConsumerRouteHandlerKind::Batch, Arc::new(_handler))
+        let handler = BatchHandlerAdapter::new(handler);
+        self.push_broker_route(ConsumerRouteHandlerKind::Batch, Arc::new(handler))
+    }
+
+    /// Makes this a typed route for payload `P`: it serves the events of `P`'s type and
+    /// of the types derived from it, replacing any type an earlier
+    /// [`event_type`](Self::event_type) set, and its handler gets each event decoded as
+    /// `P`. `undecodable` says what happens to an event whose data does not decode as
+    /// `P`.
+    pub fn event<P: EventPayload>(
+        self,
+        undecodable: Undecodable,
+    ) -> TypedRouteBuilder<BrokerOnly<M>, H, P> {
+        TypedRouteBuilder {
+            route: self,
+            event_type: GtsIdPattern::try_new(P::innermost_type_id()),
+            undecodable,
+            _payload: std::marker::PhantomData,
+        }
+    }
+}
+
+/// A route with its topic, a payload type `P` and an [`Undecodable`] policy, waiting
+/// for its handler. Made by [`ConsumerRouteBuilder::event`].
+pub struct TypedRouteBuilder<M, H, P> {
+    route: ConsumerRouteBuilder<M, H, RouteHasTopic>,
+    /// `P`'s type id as a route pattern, or why it is not one.
+    event_type: Result<GtsIdPattern, GtsIdError>,
+    undecodable: Undecodable,
+    _payload: std::marker::PhantomData<fn() -> P>,
+}
+
+// Prints the route's topic, type and policy; the routes and handlers gathered so far
+// are left out.
+impl<M, H, P: GtsSchema> std::fmt::Debug for TypedRouteBuilder<M, H, P> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TypedRouteBuilder")
+            .field(
+                "topic",
+                &self.route.topic.as_ref().map_or("", AsRef::<str>::as_ref),
+            )
+            .field("event_type", &P::innermost_type_id())
+            .field("undecodable", &self.undecodable)
+            .finish()
+    }
+}
+
+impl<M, H, P> TypedRouteBuilder<BrokerOnly<M>, H, P>
+where
+    M: CommitOffset + 'static,
+    P: EventPayload,
+{
+    /// Registers `handler` for the route's events. An event that decodes as `P` goes to
+    /// `handler`: `Success` advances through it, `Retry` retries it. One that does not
+    /// decode goes by the route's [`Undecodable`] policy.
+    ///
+    /// A `P` whose type id is not a GTS type id registers no route; `start()` then
+    /// refuses the consumer with [`EventBrokerError::InvalidConsumerOptions`].
+    pub fn handler<RH>(self, handler: RH) -> ConsumerRoutedReady<BrokerOnly<M>, H>
+    where
+        RH: EventHandler<P> + 'static,
+    {
+        self.push_typed_route(ConsumerRouteHandlerKind::Single, |undecodable| {
+            Arc::new(TypedEventHandlerAdapter::<_, P>::new(handler, undecodable))
+        })
+    }
+
+    /// Registers `handler` for the route's batches: the events of `P`'s type and of the
+    /// types derived from it. Each batch is decoded as `P` in delivery order, up to the
+    /// first event that does not decode; `handler` gets the events before it, the typed
+    /// prefix.
+    ///
+    /// - A non-empty batch whose events all decode goes to `handler` whole, and its
+    ///   outcome passes through unchanged; an empty batch succeeds without `handler`.
+    /// - After a typed prefix, `handler`'s `Retry`, and an `AdvanceThrough` short of the
+    ///   prefix's last event, are returned as they are. An `AdvanceThrough` to an offset
+    ///   outside the prefix, the undecodable event's included, is a handler error: it is
+    ///   reported and the batch retried. `handler`'s `Success`, or an `AdvanceThrough` to
+    ///   the prefix's last event, hands the undecodable event to the route's
+    ///   [`Undecodable`] policy.
+    /// - `Stall` advances through the prefix and stops at the event; with no prefix it
+    ///   retries. `Skip` advances past the event and reports it. `Fallback(h)` hands the
+    ///   raw event to `h`: its `Success` advances past the event, its `Retry` advances
+    ///   through the prefix, or with no prefix retries.
+    /// - The events after the undecodable one are not decoded, and no outcome advances
+    ///   through them.
+    /// - An error from `handler` or from a fallback handler is reported and the whole
+    ///   batch retried, so a prefix `handler` already handled is handed to it again.
+    ///
+    /// A `P` whose type id is not a GTS type id registers no route; `start()` then
+    /// refuses the consumer with [`EventBrokerError::InvalidConsumerOptions`].
+    pub fn batch_handler<RH>(self, handler: RH) -> ConsumerRoutedReady<BrokerOnly<M>, H>
+    where
+        RH: BatchHandler<P> + 'static,
+    {
+        self.push_typed_route(ConsumerRouteHandlerKind::Batch, |undecodable| {
+            Arc::new(TypedBatchHandlerAdapter::<_, P>::new(handler, undecodable))
+        })
+    }
+
+    /// Registers the adapter `adapter` builds from the route's policy, under `P`'s type
+    /// id; a `P` whose id is no GTS type id records why in `invalid_routes` instead.
+    fn push_typed_route(
+        self,
+        handler_kind: ConsumerRouteHandlerKind,
+        adapter: impl FnOnce(Undecodable) -> Arc<dyn DeliverBatch>,
+    ) -> ConsumerRoutedReady<BrokerOnly<M>, H> {
+        let mut route = self.route;
+        match self.event_type {
+            Ok(pattern) => {
+                route.event_type = Some(pattern);
+                route.push_broker_route(handler_kind, adapter(self.undecodable))
+            }
+            Err(err) => {
+                route.ready.invalid_routes.push(format!(
+                    "typed route payload type id {:?} is not a GTS type id: {err}",
+                    P::innermost_type_id()
+                ));
+                route.ready
+            }
+        }
     }
 }
 
@@ -761,19 +893,151 @@ impl<M> TxConsumerRouteBuilder<M, RouteHasTopic>
 where
     M: CommitOffsetInTx + 'static,
 {
-    pub fn handler<RH>(self, _handler: RH) -> TxConsumerRoutedReady<M>
+    pub fn handler<RH>(self, handler: RH) -> TxConsumerRoutedReady<M>
     where
-        RH: TxSingleEventHandler<M> + 'static,
+        RH: TxEventHandler<serde_json::Value, M> + 'static,
     {
-        let handler = super::TxSingleEventHandlerAdapter::new(Arc::new(_handler));
+        let handler = TxEventHandlerAdapter::new(handler);
         self.push_tx_route(ConsumerRouteHandlerKind::Single, Arc::new(handler))
     }
 
-    pub fn batch_handler<RH>(self, _handler: RH) -> TxConsumerRoutedReady<M>
+    pub fn batch_handler<RH>(self, handler: RH) -> TxConsumerRoutedReady<M>
     where
-        RH: TxConsumerHandler<M> + 'static,
+        RH: TxBatchHandler<serde_json::Value, M> + 'static,
     {
-        self.push_tx_route(ConsumerRouteHandlerKind::Batch, Arc::new(_handler))
+        let handler = TxBatchHandlerAdapter::new(handler);
+        self.push_tx_route(ConsumerRouteHandlerKind::Batch, Arc::new(handler))
+    }
+
+    /// Makes this a typed transactional route for payload `P`: it serves the events of
+    /// `P`'s type and of the types derived from it, replacing any type an earlier
+    /// [`event_type`](Self::event_type) set. `undecodable` says what happens to an
+    /// event whose data does not decode as `P`.
+    pub fn event<P: EventPayload>(
+        self,
+        undecodable: TxUndecodable<M>,
+    ) -> TxTypedRouteBuilder<M, P> {
+        TxTypedRouteBuilder {
+            route: self,
+            event_type: GtsIdPattern::try_new(P::innermost_type_id()),
+            undecodable,
+            _payload: std::marker::PhantomData,
+        }
+    }
+}
+
+/// A transactional route with its topic, a payload type `P` and a [`TxUndecodable`]
+/// policy, waiting for its handler. Made by [`TxConsumerRouteBuilder::event`].
+#[cfg(feature = "db")]
+pub struct TxTypedRouteBuilder<M: CommitOffsetInTx + 'static, P> {
+    route: TxConsumerRouteBuilder<M, RouteHasTopic>,
+    /// `P`'s type id as a route pattern, or why it is not one.
+    event_type: Result<GtsIdPattern, GtsIdError>,
+    undecodable: TxUndecodable<M>,
+    _payload: std::marker::PhantomData<fn() -> P>,
+}
+
+// Prints the route's topic, type and policy; the routes and handlers gathered so far
+// are left out.
+#[cfg(feature = "db")]
+impl<M: CommitOffsetInTx + 'static, P: GtsSchema> std::fmt::Debug for TxTypedRouteBuilder<M, P> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TxTypedRouteBuilder")
+            .field(
+                "topic",
+                &self.route.topic.as_ref().map_or("", AsRef::<str>::as_ref),
+            )
+            .field("event_type", &P::innermost_type_id())
+            .field("undecodable", &self.undecodable)
+            .finish()
+    }
+}
+
+#[cfg(feature = "db")]
+impl<M, P> TxTypedRouteBuilder<M, P>
+where
+    M: CommitOffsetInTx + 'static,
+    P: EventPayload,
+{
+    /// Registers `handler` for the route's events: the events of `P`'s type and of the
+    /// types derived from it. An event that decodes as `P` goes to `handler` with the
+    /// delivery's commit handle, and its outcome passes through: the consumer advances
+    /// through what `handler` committed. One that does not decode goes by the route's
+    /// [`TxUndecodable`] policy.
+    ///
+    /// A `P` whose type id is not a GTS type id registers no route; `start()` then
+    /// refuses the consumer with [`EventBrokerError::InvalidConsumerOptions`].
+    pub fn handler<RH>(self, handler: RH) -> TxConsumerRoutedReady<M>
+    where
+        RH: TxEventHandler<P, M> + 'static,
+    {
+        self.push_typed_tx_route(ConsumerRouteHandlerKind::Single, |undecodable| {
+            Arc::new(TxTypedEventHandlerAdapter::<_, P, M>::new(
+                handler,
+                undecodable,
+            ))
+        })
+    }
+
+    /// Registers `handler` for the route's batches: the events of `P`'s type and of the
+    /// types derived from it. Each batch is decoded as `P` in delivery order, up to the
+    /// first event that does not decode; `handler` gets the events before it, the typed
+    /// prefix, with a commit handle that commits only offsets of the prefix.
+    ///
+    /// - A non-empty batch whose events all decode goes to `handler` whole, with the
+    ///   delivery's commit handle, and its outcome passes through; an empty batch
+    ///   succeeds without `handler`.
+    /// - After a typed prefix, `handler`'s `Retry` is returned as it is. After its
+    ///   `Success`, the undecodable event goes to the route's [`TxUndecodable`] policy
+    ///   only if `handler` committed the prefix's last event. Had it committed an
+    ///   earlier one, the consumer advances through that one; had it committed none,
+    ///   the consumer reports the missing commit, as for any transactional handler.
+    /// - `Stall` succeeds after the committed prefix, and the consumer advances through
+    ///   it; with no prefix it retries. The runtime delivers one event per call, so
+    ///   `Stall` stops at the undecodable event.
+    /// - `Fallback(h)` hands the raw event to `h` with a commit handle that commits only
+    ///   that event's offset. Its `Success` passes through; its `Retry` succeeds after
+    ///   the committed prefix, or with no prefix retries.
+    /// - An error from `handler`, or from a fallback handler with no prefix, is reported
+    ///   and the batch retried. A fallback error after the committed prefix is logged
+    ///   and the call succeeds: the prefix is committed in its own transaction, so while
+    ///   the consumer owns the partition it is not handed to `handler` again.
+    ///
+    /// A `P` whose type id is not a GTS type id registers no route; `start()` then
+    /// refuses the consumer with [`EventBrokerError::InvalidConsumerOptions`].
+    pub fn batch_handler<RH>(self, handler: RH) -> TxConsumerRoutedReady<M>
+    where
+        RH: TxBatchHandler<P, M> + 'static,
+    {
+        self.push_typed_tx_route(ConsumerRouteHandlerKind::Batch, |undecodable| {
+            Arc::new(TxTypedBatchHandlerAdapter::<_, P, M>::new(
+                handler,
+                undecodable,
+            ))
+        })
+    }
+
+    /// Registers the adapter `adapter` builds from the route's policy, under `P`'s type
+    /// id; a `P` whose id is no GTS type id records why in `invalid_routes` instead.
+    fn push_typed_tx_route(
+        self,
+        handler_kind: ConsumerRouteHandlerKind,
+        adapter: impl FnOnce(TxUndecodable<M>) -> Arc<dyn DeliverTxBatch<M>>,
+    ) -> TxConsumerRoutedReady<M> {
+        let mut route = self.route;
+        match self.event_type {
+            Ok(pattern) => {
+                route.event_type = Some(pattern);
+                route.push_tx_route(handler_kind, adapter(self.undecodable))
+            }
+            Err(err) => {
+                route.ready.invalid_routes.push(format!(
+                    "typed route payload type id {:?} is not a GTS type id: {err}",
+                    P::innermost_type_id()
+                ));
+                route.ready
+            }
+        }
     }
 }
 
@@ -784,7 +1048,7 @@ where
 impl<M, H> ConsumerReady<BrokerOnly<M>, H>
 where
     M: CommitOffset + 'static,
-    H: SingleEventHandler + 'static,
+    H: EventHandler<serde_json::Value> + 'static,
 {
     pub async fn start(self) -> Result<ConsumerHandle, EventBrokerError> {
         let consumer = Consumer::new_with_slots(self.builder, self.handler).await?;
@@ -804,7 +1068,7 @@ where
 impl<M, H> ConsumerBatchReady<BrokerOnly<M>, H>
 where
     M: CommitOffset + 'static,
-    H: ConsumerHandler + 'static,
+    H: BatchHandler<serde_json::Value> + 'static,
 {
     pub async fn start(self) -> Result<ConsumerHandle, EventBrokerError> {
         let consumer = Consumer::new_with_batch_slots(self.builder, self.handler).await?;
@@ -825,7 +1089,7 @@ where
 impl<M, H> ConsumerBatchReady<WithTx<M>, H>
 where
     M: CommitOffsetInTx + 'static,
-    H: TxConsumerHandler<M> + 'static,
+    H: TxBatchHandler<serde_json::Value, M> + 'static,
 {
     pub async fn start(self) -> Result<ConsumerHandle, EventBrokerError> {
         let consumer = Consumer::new_with_tx_batch_slots(self.builder, self.handler).await?;
@@ -836,11 +1100,11 @@ where
 impl<M, H> ConsumerRoutedReady<BrokerOnly<M>, H>
 where
     M: CommitOffset + 'static,
-    H: SingleEventHandler + 'static,
+    H: EventHandler<serde_json::Value> + 'static,
 {
     pub async fn start(self) -> Result<ConsumerHandle, EventBrokerError> {
         self.validate_routes()?;
-        let default_handler = super::SingleEventHandlerAdapter::new(Arc::new(self.default_handler));
+        let default_handler = EventHandlerAdapter::new(self.default_handler);
         let consumer = Consumer::new_with_routed_slots(
             self.builder,
             Some(Arc::new(default_handler)),
@@ -889,7 +1153,7 @@ where
 impl<M, H> ConsumerReady<WithTx<M>, H>
 where
     M: CommitOffsetInTx + 'static,
-    H: TxSingleEventHandler<M> + 'static,
+    H: TxEventHandler<serde_json::Value, M> + 'static,
 {
     pub async fn start(self) -> Result<ConsumerHandle, EventBrokerError> {
         let consumer = Consumer::new_with_tx_slots(self.builder, self.handler).await?;

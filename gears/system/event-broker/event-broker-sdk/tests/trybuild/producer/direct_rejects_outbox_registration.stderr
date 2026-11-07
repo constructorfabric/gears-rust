@@ -1,0 +1,5 @@
+error[E0599]: no method named `registration` found for struct `DirectProducerBuilder<Broker, Ctx, Source, Topics, Patterns>` in the current scope
+ --> tests/trybuild/producer/direct_rejects_outbox_registration.rs:4:39
+  |
+4 |     let _ = DirectProducer::builder().registration(OutboxRegistration::Stateless);
+  |                                       ^^^^^^^^^^^^ method not found in `DirectProducerBuilder`

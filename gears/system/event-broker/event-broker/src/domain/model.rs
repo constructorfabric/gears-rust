@@ -335,6 +335,26 @@ pub struct ConsumerGroup {
     pub created_at: DateTime<Utc>,
 }
 
+/// Which consumer groups a listing keeps: the documented filterable fields,
+/// `id` (any of `ids`) and `kind`. An empty `ids` and no `kind` keep every
+/// group.
+#[domain_model]
+#[derive(Debug, Clone, Default)]
+pub struct ConsumerGroupFilter {
+    pub ids: Vec<GtsInstanceId>,
+    pub kind: Option<ConsumerGroupKind>,
+}
+
+impl ConsumerGroupFilter {
+    /// Whether `group` passes every field this filter sets.
+    #[must_use]
+    pub fn matches(&self, group: &ConsumerGroup) -> bool {
+        let id_matches = self.ids.is_empty() || self.ids.contains(&group.id);
+        let kind_matches = self.kind.is_none_or(|kind| kind == group.kind);
+        id_matches && kind_matches
+    }
+}
+
 /// Caller-suppliable fields for `DeliveryService::create_consumer_group`
 /// (`docs/openapi.yaml`'s `POST /v1/consumer-groups`'s `requestBody` is
 /// itself optional; `client_agent` is required only once a body is sent at

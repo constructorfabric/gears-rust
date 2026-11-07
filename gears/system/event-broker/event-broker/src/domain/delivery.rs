@@ -104,8 +104,8 @@ pub trait DeliveryService: Send + Sync {
     /// comment.
     async fn leave(&self, ctx: &SecurityContext, subscription_id: Uuid) -> Result<(), DomainError>;
 
-    /// Unfiltered/unpaginated - the REST handler applies `$filter`/pagination
-    /// (`api/rest/pagination.rs`).
+    /// Unfiltered/unpaginated - the REST handler applies `$filter`, then pages
+    /// the result with the domain pager (`domain/paging.rs`).
     async fn list_subscriptions(
         &self,
         ctx: &SecurityContext,
@@ -159,7 +159,8 @@ pub trait DeliveryService: Send + Sync {
     ) -> Result<crate::domain::model::ConsumerGroup, DomainError>;
 
     /// Unfiltered/unpaginated beyond tenant scoping - the REST handler
-    /// applies `$filter`/pagination (`api/rest/pagination.rs`), matching
+    /// applies `$filter` and `LocalBroker` its typed filter, and both page the
+    /// result with the domain pager (`domain/paging.rs`), matching
     /// `list_topics`/`list_event_types`. `Anonymous` groups are filtered to
     /// `ctx`'s authorized tenant(s); `Named` groups are returned unfiltered
     /// (`eb-tenant-isolation-fix`).

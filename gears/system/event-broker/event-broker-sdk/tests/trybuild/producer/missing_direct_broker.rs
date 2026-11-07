@@ -1,10 +1,9 @@
-use event_broker_sdk::{DirectDeduplication, Producer, ProducerIdentity};
+use event_broker_sdk::DirectProducer;
 
 fn main() {
-    let _ = Producer::builder()
+    let _ = DirectProducer::builder()
         .security_context(toolkit_security::SecurityContext::anonymous())
-        .identity(ProducerIdentity::new().source("orders"))
-        .deduplication(DirectDeduplication::stateless())
+        .source("orders")
         .topics(["orders"])
         .event_type_patterns(["orders.*"])
         .build();

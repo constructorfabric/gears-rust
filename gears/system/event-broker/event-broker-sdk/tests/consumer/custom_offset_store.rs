@@ -6,8 +6,8 @@ use async_trait::async_trait;
 use event_broker_sdk::gts_id;
 use event_broker_sdk::{
     CommitOffset, ConsumerBuilder, ConsumerCommitMode, ConsumerError, ConsumerGroupId,
-    ConsumerGroupRef, Fallback, HandlerOutcome, OffsetManagerError, OffsetStore, Position,
-    RawEvent, SingleEventHandler, TopicId,
+    ConsumerGroupRef, Delivery, EventHandler, EventV1, Fallback, HandlerOutcome,
+    OffsetManagerError, OffsetStore, Position, TopicId,
 };
 
 use super::common::{publish_json, topic, topic_fixture, wait_until};
@@ -59,11 +59,11 @@ impl CommitOffset for RecordingOffsetStore {
 struct AckingHandler;
 
 #[async_trait]
-impl SingleEventHandler for AckingHandler {
+impl EventHandler<serde_json::Value> for AckingHandler {
     async fn handle(
         &self,
-        _event: RawEvent,
-        _attempts: u16,
+        _event: EventV1,
+        _delivery: &Delivery,
     ) -> Result<HandlerOutcome, ConsumerError> {
         Ok(HandlerOutcome::Success)
     }

@@ -1,5 +1,5 @@
-//! With an `EventBrokerApi` in the `ClientHub`, pricing binds the broker SDK's `DbProducer`
-//! to its outbox queue (D-400, Products' pattern): committed events reach the broker, an
+//! With an `EventBrokerApi` in the `ClientHub`, pricing binds the broker SDK's `OutboxSetup`
+//! producer to its outbox queue (D-400, Products' pattern): committed events reach the broker, an
 //! interrupted dispatch is retried from the durable envelope, and a rolled-back transaction
 //! delivers nothing.
 //!
@@ -13,16 +13,20 @@ use bss_pricing::{
     api::rest::authoring::AuthoringState,
     infra::{
         events::{self, APPROVAL_UNIT_SUBJECT_TYPE, EventSink, PRICE_BOOK_SUBJECT_TYPE, TOPIC},
-        reference_events::{PlanReferenceLost, PriceBookEntryReferenceLost},
+        reference_events::{
+            PLAN_ITEM_SUBJECT_TYPE, PRICE_BOOK_ENTRY_SUBJECT_TYPE, PlanReferenceLost,
+            PriceBookEntryReferenceLost,
+        },
     },
 };
 use entry_support::policy_support;
 use entry_support::{Script, app_for, request, test_db, user_of};
 use event_broker::test_support::{EventBrokerHarness, StaticTypesRegistry};
 use event_broker_sdk::backend::{Partition, TopicPartition, Wait};
-use event_broker_sdk::{GtsInstanceId, Sequence, TypedEvent, api::EventBrokerApi};
+use event_broker_sdk::{GtsInstanceId, Sequence, api::EventBrokerApi};
 use serde_json::json;
 use std::{collections::BTreeSet, sync::Arc, time::Duration};
+use toolkit_gts::GtsSchema;
 use uuid::Uuid;
 
 const PUBLISHED: &str = "gts.cf.core.events.event.v1~cf.bss.pricing.prices_published.v1~";
@@ -110,7 +114,14 @@ async fn enqueue(
         move |tx, outbox| {
             let event = event.clone();
             Box::pin(async move {
-                events::enqueue(&outbox, tx, &event, time::OffsetDateTime::now_utc()).await?;
+                events::enqueue(
+                    &outbox,
+                    tx,
+                    &event,
+                    PRICE_BOOK_ENTRY_SUBJECT_TYPE,
+                    time::OffsetDateTime::now_utc(),
+                )
+                .await?;
                 tokio::time::sleep(hold).await;
                 if commit {
                     Ok(())
@@ -130,11 +141,11 @@ async fn enqueue(
 async fn a_bound_producer_delivers_committed_events_retries_dispatch_and_drops_rollbacks() {
     let broker = broker_knowing(&[
         (PriceBookEntryReferenceLost::TYPE_ID, ENTRY_SUBJECT_TYPE),
-        (PlanReferenceLost::TYPE_ID, PlanReferenceLost::SUBJECT_TYPE),
+        (PlanReferenceLost::TYPE_ID, PLAN_ITEM_SUBJECT_TYPE),
         (PUBLISHED, PRICE_BOOK_SUBJECT_TYPE),
         (
             events::PlanRevisionPublished::TYPE_ID,
-            events::PlanRevisionPublished::SUBJECT_TYPE,
+            events::PLAN_SUBJECT_TYPE,
         ),
         (DECIDED, APPROVAL_UNIT_SUBJECT_TYPE),
     ])
@@ -353,6 +364,15 @@ async fn commit_unwoken(state: &AuthoringState, event: PriceBookEntryReferenceLo
             move |tx| {
                 let (producer, event) = (producer.clone(), event.clone());
                 Box::pin(async move {
+                    let subject = event.price_book_entry_id.to_string();
+                    let tenant_id = event.tenant_id;
+                    let event = event_broker_sdk::EventV1::builder(event)
+                        .tenant_id(tenant_id)
+                        .subject(subject)
+                        .subject_type_id(event_broker_sdk::GtsTypeId::new(
+                            PRICE_BOOK_ENTRY_SUBJECT_TYPE,
+                        ))
+                        .build()?;
                     producer.enqueue(tx, event).await?.discard();
                     Ok(())
                 })
@@ -454,7 +474,8 @@ async fn a_retried_attempt_drops_the_wakes_of_the_attempt_before() {
             Box::pin(async move {
                 if seen.fetch_add(1, Ordering::SeqCst) == 0 {
                     let now = time::OffsetDateTime::now_utc();
-                    events::enqueue(&outbox, tx, &contended, now).await?;
+                    events::enqueue(&outbox, tx, &contended, PRICE_BOOK_ENTRY_SUBJECT_TYPE, now)
+                        .await?;
                     return Err(anyhow::Error::new(sea_orm::DbErr::Custom(
                         "error returned from database: (code: 5) database is locked".into(),
                     )));
@@ -491,38 +512,38 @@ async fn a_door_wakes_the_sequencer_once_its_transaction_commits() {
     );
 }
 
-/// Every pricing event type, by the struct that implements `TypedEvent`: the census the bound
+/// Every pricing event type, by the struct that implements `GtsSchema`: the census the bound
 /// producer is held to.
 const EVENT_TYPES: [(&str, &str, &str); 5] = [
     (
         "PriceBookEntryReferenceLost",
         PriceBookEntryReferenceLost::TYPE_ID,
-        PriceBookEntryReferenceLost::SUBJECT_TYPE,
+        PRICE_BOOK_ENTRY_SUBJECT_TYPE,
     ),
     (
         "PlanReferenceLost",
         PlanReferenceLost::TYPE_ID,
-        PlanReferenceLost::SUBJECT_TYPE,
+        PLAN_ITEM_SUBJECT_TYPE,
     ),
     (
         "PricesPublished",
         events::PricesPublished::TYPE_ID,
-        events::PricesPublished::SUBJECT_TYPE,
+        PRICE_BOOK_SUBJECT_TYPE,
     ),
     (
         "PlanRevisionPublished",
         events::PlanRevisionPublished::TYPE_ID,
-        events::PlanRevisionPublished::SUBJECT_TYPE,
+        events::PLAN_SUBJECT_TYPE,
     ),
     (
         "ApprovalUnitDecided",
         events::ApprovalUnitDecided::TYPE_ID,
-        events::ApprovalUnitDecided::SUBJECT_TYPE,
+        APPROVAL_UNIT_SUBJECT_TYPE,
     ),
 ];
 
-/// The names of every `impl TypedEvent for <Name>` under `src/`, so a new event type fails the
-/// census until it is listed (and so prepared at bind).
+/// The names of every `impl toolkit_gts::GtsSchema for <Name>` under `src/`, so a new event type
+/// fails the census until it is listed (and so prepared at bind).
 fn typed_events_in_src() -> std::collections::BTreeSet<String> {
     fn walk(dir: &std::path::Path, out: &mut std::collections::BTreeSet<String>) {
         for entry in std::fs::read_dir(dir).unwrap() {
@@ -531,8 +552,8 @@ fn typed_events_in_src() -> std::collections::BTreeSet<String> {
                 walk(&path, out);
             } else if path.extension().is_some_and(|e| e == "rs") {
                 let text = std::fs::read_to_string(&path).unwrap();
-                for (at, _) in text.match_indices("impl TypedEvent for ") {
-                    let rest = &text[at + "impl TypedEvent for ".len()..];
+                for (at, _) in text.match_indices("impl toolkit_gts::GtsSchema for ") {
+                    let rest = &text[at + "impl toolkit_gts::GtsSchema for ".len()..];
                     let name: String = rest
                         .chars()
                         .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
@@ -576,7 +597,7 @@ async fn bind_with(
         .map(|state| (Arc::new(state), dsn, broker))
 }
 
-/// The event census (run 3.5): every type pricing implements is a `TypedEvent` under
+/// The event census (run 3.5): every `GtsSchema` type pricing implements is an event under
 /// `gts.cf.core.events.event.v1~cf.bss.pricing.<name>.v1~` from `bss-pricing`, and the bound
 /// producer prepares each one at bind — a broker that lacks any one of them fails the boot
 /// rather than failing the first business transaction that announces it.
@@ -589,7 +610,7 @@ async fn the_bound_producer_prepares_every_pricing_event_type_at_bind() {
     assert_eq!(
         typed_events_in_src(),
         listed,
-        "the census lists every TypedEvent"
+        "the census lists every GtsSchema event"
     );
     for (name, type_id, subject) in EVENT_TYPES {
         let short = type_id

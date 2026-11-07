@@ -4,8 +4,9 @@ use uuid::Uuid;
 
 use gts::{GtsInstanceId, GtsTypeId};
 
-use crate::consumer::RawEvent;
+use crate::consumer::Delivery;
 use crate::error::ConsumerError;
+use crate::gts::EventV1;
 use crate::ids::{ConsumerGroupId, TopicId};
 use crate::sequence::Sequence;
 
@@ -27,29 +28,77 @@ pub struct DeadLetterRecord {
 }
 
 impl DeadLetterRecord {
-    pub fn builder(event: &RawEvent, reason: impl Into<String>) -> DeadLetterRecordBuilder {
+    /// Starts a record of `event`, delivered as `delivery` says, parked for `reason`.
+    ///
+    /// The topic, its `topic_id`, the partition and `attempts` come from `delivery`; the
+    /// event type, subject, subject type and id from `event`. `offset` is the event's
+    /// sequence, or [`Sequence::NONE`] (no position) for an event that carries none.
+    /// `payload` is the event's data, or JSON `null` for a body-less event. `occurred_at`
+    /// is the time `builder` is called (the dead-lettering time), unless set.
+    #[must_use]
+    pub fn builder(
+        event: &EventV1,
+        delivery: &Delivery,
+        reason: impl Into<String>,
+    ) -> DeadLetterRecordBuilder {
         DeadLetterRecordBuilder {
-            event: event.clone(),
             reason: reason.into(),
             group_id: None,
-            topic_id: Some(TopicId::from_gts(&event.topic)),
-            attempts: None,
+            topic_id: Some(TopicId::from_gts(delivery.topic())),
+            topic: delivery.topic().clone(),
+            event_type: event.event_type().clone(),
+            subject: event.subject().to_owned(),
+            subject_type: event.subject_type().clone(),
+            partition: delivery.partition(),
+            offset: event.sequence().unwrap_or(Sequence::NONE),
+            attempts: Some(delivery.attempts()),
+            payload: event.data().cloned().unwrap_or(serde_json::Value::Null),
             occurred_at: Utc::now(),
+            event_id: event.id(),
         }
     }
 
-    pub fn from_event(event: &RawEvent, reason: impl Into<String>) -> Self {
-        Self::builder(event, reason).build()
+    /// A record built as [`DeadLetterRecord::builder`] starts it.
+    #[must_use]
+    pub fn from_event(event: &EventV1, delivery: &Delivery, reason: impl Into<String>) -> Self {
+        Self::builder(event, delivery, reason).build()
     }
 }
 
 pub struct DeadLetterRecordBuilder {
-    event: RawEvent,
     reason: String,
     group_id: Option<ConsumerGroupId>,
     topic_id: Option<TopicId>,
+    topic: GtsInstanceId,
+    event_type: GtsTypeId,
+    subject: String,
+    subject_type: GtsTypeId,
+    partition: u32,
+    offset: Sequence,
     attempts: Option<u16>,
+    payload: serde_json::Value,
     occurred_at: DateTime<Utc>,
+    event_id: Uuid,
+}
+
+// Leaves the payload out: it may carry personal or secret data.
+impl std::fmt::Debug for DeadLetterRecordBuilder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeadLetterRecordBuilder")
+            .field("reason", &self.reason)
+            .field("group_id", &self.group_id)
+            .field("topic_id", &self.topic_id)
+            .field("topic", &self.topic)
+            .field("event_type", &self.event_type)
+            .field("subject", &self.subject)
+            .field("subject_type", &self.subject_type)
+            .field("partition", &self.partition)
+            .field("offset", &self.offset)
+            .field("attempts", &self.attempts)
+            .field("occurred_at", &self.occurred_at)
+            .field("event_id", &self.event_id)
+            .finish_non_exhaustive()
+    }
 }
 
 impl DeadLetterRecordBuilder {
@@ -82,17 +131,17 @@ impl DeadLetterRecordBuilder {
         DeadLetterRecord {
             group_id: self.group_id,
             topic_id: self.topic_id,
-            topic: self.event.topic.clone(),
-            event_type: self.event.type_id.clone(),
-            subject: self.event.subject.clone(),
-            subject_type: self.event.subject_type.clone(),
-            partition: self.event.partition,
-            offset: self.event.offset,
+            topic: self.topic,
+            event_type: self.event_type,
+            subject: self.subject,
+            subject_type: self.subject_type,
+            partition: self.partition,
+            offset: self.offset,
             attempts: self.attempts,
             reason: self.reason,
-            payload: self.event.data.clone(),
+            payload: self.payload,
             occurred_at: self.occurred_at,
-            event_id: self.event.id,
+            event_id: self.event_id,
         }
     }
 }

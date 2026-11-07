@@ -18,8 +18,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use uuid::Uuid;
 
-use crate::api::{ControlCode, PartitionPosition, WireEvent, WireFrame};
+use crate::api::{ControlCode, PartitionPosition, WireFrame};
 use crate::error::EventBrokerError;
+use crate::gts::{EventV1, StoredPosition};
 use crate::sequence::Sequence;
 
 // ---------------------------------------------------------------------------
@@ -71,28 +72,50 @@ pub(crate) struct PublishEventWire {
     pub meta: Option<MetaWire>,
 }
 
-impl PublishEventWire {
-    /// Builds the publish body from a public [`Event`](crate::models::Event).
-    /// Broker-stamped fields (`partition`/`sequence`/...) are never sent - the
-    /// server rejects them via `deny_unknown_fields`.
-    pub(crate) fn from_event(event: &crate::models::Event) -> Self {
-        Self {
-            id: event.id,
-            type_id: event.type_id.clone(),
-            tenant_id: event.tenant_id,
-            source: event.source.clone(),
-            subject: event.subject.clone(),
-            subject_type: event.subject_type.clone(),
-            occurred_at: event.occurred_at,
-            trace_parent: event.trace_parent.clone(),
-            data: event.data.clone(),
-            meta: event.meta.as_ref().map(|m| MetaWire {
-                version: i32::from(m.version),
-                producer_id: m.producer_id,
-                previous: m.previous,
-                sequence: m.sequence,
-            }),
-        }
+/// The publish body of an [`EventV1`]. It refuses what [`EventV1::check_publishable`]
+/// refuses, and a `meta.version` past the wire's `i32`.
+impl TryFrom<&EventV1> for PublishEventWire {
+    type Error = EventBrokerError;
+
+    fn try_from(event: &EventV1) -> Result<Self, EventBrokerError> {
+        event.check_publishable()?;
+        // `check_publishable` already refused a missing source; the type still holds an
+        // `Option`.
+        let Some(source) = event.source() else {
+            return Err(EventBrokerError::InvalidEventField {
+                field: "source",
+                detail: "required".to_owned(),
+            });
+        };
+        let meta = event
+            .meta()
+            .map(|meta| {
+                let version = i32::try_from(meta.version).map_err(|_| {
+                    EventBrokerError::InvalidEventField {
+                        field: "meta",
+                        detail: "version out of range".to_owned(),
+                    }
+                })?;
+                Ok::<_, EventBrokerError>(MetaWire {
+                    version,
+                    producer_id: meta.producer_id,
+                    previous: meta.previous,
+                    sequence: meta.sequence,
+                })
+            })
+            .transpose()?;
+        Ok(Self {
+            id: event.id(),
+            type_id: event.event_type().clone(),
+            tenant_id: event.tenant_id(),
+            source: source.to_owned(),
+            subject: event.subject().to_owned(),
+            subject_type: event.subject_type().clone(),
+            occurred_at: event.occurred_at(),
+            trace_parent: event.trace_parent().map(str::to_owned),
+            data: event.data().cloned(),
+            meta,
+        })
     }
 }
 
@@ -242,6 +265,25 @@ impl CreateConsumerGroupWire {
 pub(crate) enum ConsumerGroupKindWire {
     Anonymous,
     Named,
+}
+
+impl ConsumerGroupKindWire {
+    /// The wire token, as `$filter` compares it (`kind eq 'anonymous'`).
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Anonymous => "anonymous",
+            Self::Named => "named",
+        }
+    }
+}
+
+impl From<crate::models::ConsumerGroupKind> for ConsumerGroupKindWire {
+    fn from(k: crate::models::ConsumerGroupKind) -> Self {
+        match k {
+            crate::models::ConsumerGroupKind::Anonymous => Self::Anonymous,
+            crate::models::ConsumerGroupKind::Named => Self::Named,
+        }
+    }
 }
 
 impl From<ConsumerGroupKindWire> for crate::models::ConsumerGroupKind {
@@ -485,6 +527,69 @@ pub(crate) struct EventPayloadWire {
     pub sequence_time: Option<chrono::DateTime<chrono::Utc>>,
 }
 
+impl EventPayloadWire {
+    /// The delivered event, built through [`EventV1`]'s builder and stamped with its
+    /// position. A missing `sequence_time` takes `occurred_at`. A `trace_parent` that
+    /// is not a W3C traceparent is dropped with a warning: an event stored before ingest
+    /// checked the field can carry one, and it is optional telemetry, so it must not
+    /// stop the consumer.
+    ///
+    /// # Errors
+    ///
+    /// [`EventBrokerError::Transport`] when the payload carries no sequence or no
+    /// partition, a partition outside `u32`, or an envelope member the builder refuses.
+    /// The broker admitted the event under the rules the builder mirrors, so a refusal
+    /// means the two disagree; the error names the field, never its value.
+    fn into_event(self) -> Result<EventV1, EventBrokerError> {
+        let sequence = self.sequence.ok_or_else(|| {
+            EventBrokerError::Transport("stream event frame carried no sequence".to_owned())
+        })?;
+        let partition = self.partition.ok_or_else(|| {
+            EventBrokerError::Transport("stream event frame carried no partition".to_owned())
+        })?;
+        let partition = u32::try_from(partition).map_err(|_| {
+            EventBrokerError::Transport(
+                "stream event frame carried a partition outside u32".to_owned(),
+            )
+        })?;
+        let trace_parent = match self.trace_parent {
+            Some(trace_parent) if <EventV1>::check_trace_parent(&trace_parent).is_err() => {
+                tracing::warn!(
+                    event_id = %self.id,
+                    type_id = %self.type_id,
+                    "a delivered event carries a malformed trace_parent; delivering it without one"
+                );
+                None
+            }
+            trace_parent => trace_parent,
+        };
+        let builder = if self.data.is_null() {
+            EventV1::builder_without_data(self.type_id)
+        } else {
+            EventV1::builder_for(self.type_id, self.data)
+        };
+        let builder = builder
+            .id(self.id)
+            .tenant_id(self.tenant_id)
+            .source(self.source)
+            .subject(self.subject)
+            .subject_type_id(self.subject_type)
+            .occurred_at(self.occurred_at);
+        let builder = match trace_parent {
+            Some(trace_parent) => builder.trace_parent(trace_parent),
+            None => builder,
+        };
+        let event = builder.build().map_err(|err| {
+            EventBrokerError::Transport(format!("stream event frame broke an envelope rule: {err}"))
+        })?;
+        Ok(event.stamp_position(StoredPosition {
+            partition,
+            sequence: Sequence::assigned(sequence),
+            sequence_time: self.sequence_time.unwrap_or(self.occurred_at),
+        }))
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) struct PositionWire {
@@ -532,34 +637,12 @@ pub(crate) enum FrameWire {
 
 impl FrameWire {
     /// Converts a decoded wire frame into the public [`WireFrame`]. Malformed
-    /// content (an event missing its sequence, an unknown control code, an
-    /// invalid topic) becomes a transport error rather than a silent default.
+    /// content (an event missing its sequence or breaking an envelope rule, an
+    /// unknown control code, an invalid topic) becomes a transport error rather
+    /// than a silent default.
     pub(crate) fn into_frame(self) -> Result<WireFrame, EventBrokerError> {
         match self {
-            FrameWire::Event { payload } => {
-                let p = *payload;
-                let sequence = p.sequence.ok_or_else(|| {
-                    EventBrokerError::Transport("stream event frame carried no sequence".to_owned())
-                })?;
-                let partition = p.partition.ok_or_else(|| {
-                    EventBrokerError::Transport(
-                        "stream event frame carried no partition".to_owned(),
-                    )
-                })?;
-                Ok(WireFrame::Event(WireEvent {
-                    id: p.id,
-                    type_id: p.type_id,
-                    tenant_id: p.tenant_id,
-                    subject: p.subject,
-                    subject_type: p.subject_type,
-                    partition: u32::try_from(partition).unwrap_or_default(),
-                    sequence: Sequence::assigned(sequence),
-                    occurred_at: p.occurred_at,
-                    sequence_time: p.sequence_time.unwrap_or(p.occurred_at),
-                    trace_parent: p.trace_parent,
-                    data: p.data,
-                }))
-            }
+            FrameWire::Event { payload } => payload.into_event().map(WireFrame::Event),
             FrameWire::Heartbeat { at } => Ok(WireFrame::Heartbeat {
                 at: at.to_rfc3339(),
             }),

@@ -168,6 +168,7 @@ impl<'a> ApprovalSubject<DbTx<'a>> for SkuChange {
                     published_version: s.published_version,
                     actor_ref: b.actor,
                 },
+                broker::SKU_SUBJECT_TYPE,
             )
             .await
             .map_err(ApprovalError::from)?;

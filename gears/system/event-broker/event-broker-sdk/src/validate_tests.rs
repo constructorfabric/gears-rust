@@ -1,10 +1,12 @@
-//! Boundary tests for the text-field rules.
+//! Boundary tests for the text-field rules and the `trace_parent` format rule.
 //!
-//! Every assertion is on the whole error value - field, rule and detail - so a
-//! test says exactly what a caller would see rather than only that something
-//! failed.
+//! Every text-field assertion is on the whole error value - field, rule and
+//! detail - so a test says exactly what a caller would see rather than only
+//! that something failed.
 
-use crate::validate::{Rule, TextFieldError, client_agent, description, source, subject};
+use crate::validate::{
+    Rule, TextFieldError, client_agent, description, is_trace_parent, source, subject,
+};
 
 fn err(result: Result<(), TextFieldError>) -> TextFieldError {
     match result {
@@ -327,4 +329,21 @@ fn subject_agrees_with_the_event_schema() {
     let schema = committed_schema("gts.cf.core.events.event.v1~.schema.json");
     let node = &schema["properties"]["subject"];
     agrees_with(&declared(node), subject, false);
+}
+
+// -- trace_parent: the base event schema's W3C traceparent pattern --------
+
+#[test]
+fn a_trace_parent_must_match_the_w3c_pattern() {
+    assert!(is_trace_parent(
+        "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01"
+    ));
+    // Each value breaks exactly one rule: uppercase hex, a short group, a fifth group.
+    assert!(!is_trace_parent(
+        "00-0AF7651916CD43DD8448EB211C80319C-B7AD6B7169203331-01"
+    ));
+    assert!(!is_trace_parent("00-0af7-b7ad6b7169203331-01"));
+    assert!(!is_trace_parent(
+        "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01-ff"
+    ));
 }

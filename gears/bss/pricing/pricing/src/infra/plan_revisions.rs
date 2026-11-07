@@ -194,7 +194,7 @@ pub async fn catch_up(
         unit_id: switched.unit_id,
         actor_ref: switch_actor(&unit, &decisions),
     };
-    events::enqueue(outbox, tx, &event, now).await?;
+    events::enqueue(outbox, tx, &event, events::PLAN_SUBJECT_TYPE, now).await?;
     let published = plan_revision_repo::find(tx, &scope, tenant, switched.revision_id)
         .await?
         .ok_or_else(|| lost("row"))?;

@@ -4,18 +4,18 @@ use std::sync::Arc;
 
 use event_broker_sdk::error::ConsumerError;
 use event_broker_sdk::{
-    Consumer, ConsumerBuilder, ConsumerGroupRef, Fallback, GtsInstanceId, HandlerOutcome,
-    InMemoryOffsetManager, RawEvent, SingleEventHandler, gts_id,
+    Consumer, ConsumerBuilder, ConsumerGroupRef, Delivery, EventHandler, EventV1, Fallback,
+    GtsInstanceId, HandlerOutcome, InMemoryOffsetManager, gts_id,
 };
 
 struct NoopHandler;
 
 #[async_trait::async_trait]
-impl SingleEventHandler for NoopHandler {
+impl EventHandler<serde_json::Value> for NoopHandler {
     async fn handle(
         &self,
-        _event: RawEvent,
-        _attempts: u16,
+        _event: EventV1,
+        _delivery: &Delivery,
     ) -> Result<HandlerOutcome, ConsumerError> {
         Ok(HandlerOutcome::Success)
     }

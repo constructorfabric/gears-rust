@@ -10,7 +10,7 @@ use super::dto::{PublishBatchRequest, PublishEventRequest};
 use crate::api::rest::error::EventBrokerResourceError;
 use crate::api::rest::state::HandlerState;
 use crate::domain::error::{DomainError, ErrorCode};
-use crate::domain::ingest::{BatchAck, PublishAck, PublishRequest};
+use crate::domain::ingest::{BatchAck, PublishAck, PublishRequest, SYNC_PUBLISH_NOT_SERVED};
 
 /// `true` when the caller opted into synchronous persistence via the standard
 /// `Prefer: wait` header (RFC 7240) - asking the broker to hold the response
@@ -39,10 +39,7 @@ fn wants_sync_wait(headers: &axum::http::HeaderMap) -> bool {
 /// `501` for a `Prefer: wait` (synchronous) publish. Carries no id or user
 /// input - the caller only needs to know the mode is not available yet.
 fn sync_wait_unimplemented() -> CanonicalError {
-    EventBrokerResourceError::unimplemented(
-        "synchronous publish (Prefer: wait) is not implemented yet",
-    )
-    .create()
+    EventBrokerResourceError::unimplemented(SYNC_PUBLISH_NOT_SERVED).create()
 }
 
 /// Parse a publish body ourselves rather than through axum's `Json` extractor.
@@ -65,8 +62,9 @@ fn parse_body<T: serde::de::DeserializeOwned>(body: &Bytes) -> Result<T, DomainE
 /// `IngestService::publish_event` produces (an unauthorized event type or
 /// tenant, topic/event-type not found, payload validation, sequence
 /// violation, unknown producer), `400` when the body carries a
-/// read-only/unknown field, or `501` when the caller requests synchronous
-/// persistence via `Prefer: wait`.
+/// read-only/unknown field or a malformed `source`, `subject`, `trace_parent`
+/// or `type`, or `501` when the caller requests synchronous persistence via
+/// `Prefer: wait`.
 pub async fn publish_event(
     Extension(ctx): Extension<SecurityContext>,
     Extension(state): Extension<HandlerState>,
@@ -100,8 +98,9 @@ pub async fn publish_event(
 /// id, a malformed run, mixed topics, batch too large, an unauthorized event
 /// type or tenant, topic/event-type not found, unknown producer, payload
 /// validation, a sequence violation, or an unavailable store), `400` when the
-/// body carries a read-only/unknown field, or `501` when the caller requests
-/// synchronous persistence via `Prefer: wait`.
+/// body carries a read-only/unknown field or a malformed `source`, `subject`,
+/// `trace_parent` or `type`, or `501` when the caller requests synchronous
+/// persistence via `Prefer: wait`.
 pub async fn publish_batch(
     Extension(ctx): Extension<SecurityContext>,
     Extension(state): Extension<HandlerState>,

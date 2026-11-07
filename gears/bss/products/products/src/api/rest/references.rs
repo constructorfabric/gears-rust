@@ -418,6 +418,7 @@ async fn release(
                         actor_ref: ctx.subject_id(),
                         reason: reason.unwrap_or_default(),
                     },
+                    broker::SKU_SUBJECT_TYPE,
                 )
                 .await
                 .map_err(TxError::from)?;

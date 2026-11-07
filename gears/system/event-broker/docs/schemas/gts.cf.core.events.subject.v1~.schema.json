@@ -1,0 +1,30 @@
+{
+  "$id": "gts://gts.cf.core.events.subject.v1~",
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "description": "Subject type. The kind of entity an event is about; an event names it in `subject_type`. By convention, a gear declares each subject kind it owns as a derived type schema under this base; `subject_type` accepts any GTS type id.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "type": {
+      "description": "Full GTS subject-type identifier: the derived type this subject is an instance of.",
+      "type": "string",
+      "x-gts-type-ref": "/$id"
+    },
+    "id": {
+      "description": "The subject's identifier, as events carry it in `subject`. ASCII only.",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 1024,
+      "pattern": "^[\\x20-\\x7E]+$"
+    },
+    "properties": {
+      "type": "object"
+    }
+  },
+  "required": [
+    "type",
+    "id",
+    "properties"
+  ],
+  "x-gts-abstract": true
+}

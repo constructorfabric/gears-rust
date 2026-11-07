@@ -9,8 +9,8 @@ use super::test_support::*;
 use super::*;
 use crate::domain::failure::FailureReason;
 use bss_orders_sdk::catalog::OrderState;
-use event_broker_sdk::TypedEvent;
 use serde_json::{Value, json};
+use toolkit_gts::GtsSchema;
 use toolkit_security::PlatformSecurityContext;
 use types_registry_sdk::testing_platform::MockTypesRegistry;
 use types_registry_sdk::{GtsIdPattern, ListEntitiesRequest, PlatformTypesRegistryApiExt};
@@ -157,11 +157,8 @@ fn typed_events_map_the_envelope_exactly() {
         OrderEvent::<OrderSubmitted>::TYPE_ID,
         "gts.cf.core.events.event.v1~cf.bss.orders.event.v1~cf.bss.orders.submitted.v1~"
     );
-    assert_eq!(OrderEvent::<OrderSubmitted>::SOURCE, "bss-orders");
-    assert_eq!(
-        OrderEvent::<OrderSubmitted>::SUBJECT_TYPE,
-        "gts.cf.bss.orders.order.v1~"
-    );
+    assert_eq!(SOURCE, "bss-orders");
+    assert_eq!(ORDER_SUBJECT_TYPE, "gts.cf.bss.orders.order.v1~");
     assert_eq!(event.subject(), "0b6f0c52-6b0e-4ad8-9f5d-0c2b0d6a1e9f");
     assert_eq!(
         event.tenant_id(),

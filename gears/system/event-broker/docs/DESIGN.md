@@ -57,7 +57,7 @@ The dispatcher is a **stateless HTTP router** - it routes producer requests from
 
 Storage backends are separate plugin crates that implement the `backend::Backend` trait and provide a `backend::Provider` linked into the build ([feature 0007 §2.1, §2.7](features/0007-storage-backend-api.md#21-trait)). This allows third-party or deployment-specific backends without modifying the core event broker code.
 
-The **producer client library** (`cf-gears-event-broker-sdk`) is built on top of `toolkit-db`'s transactional outbox. Producers enqueue events within their business transaction via the outbox; the outbox pipeline (sequencer → processor) then delivers them to the ingest service. This gives producers **transactional guarantees** - events are only published if the business transaction commits - and **exactly-once semantics** via the idempotent producer protocol. The same outbox machinery also powers the ingest service itself: ingested events flow through the ingest outbox group their topic belongs to, in ingest partition `murmur3("{topic}:{key}") % group.partitions` ([feature 0005 §2.5](features/0005-backend-registry-and-routing.md#25-outbox-groups), [feature 0007 §4.1](features/0007-storage-backend-api.md#41-ingest-write-path)) before being appended to the storage backend and broadcast to delivery.
+The **producer client library** (`cf-gears-event-broker-sdk`) is built on top of `toolkit-db`'s transactional outbox. Producers enqueue events within their business transaction via the outbox; the outbox pipeline (sequencer → processor) then delivers them to the ingest service. This gives producers **transactional guarantees** - events are only published if the business transaction commits - and **exactly-once semantics** via the idempotent producer protocol. A gear without a database publishes through `DirectProducer`, which uses the same protocol with a producer id registered when it is built and its chain head in memory: no transactional guarantee, and its deduplication does not survive a restart. The same outbox machinery also powers the ingest service itself: ingested events flow through the ingest outbox group their topic belongs to, in ingest partition `murmur3("{topic}:{key}") % group.partitions` ([feature 0005 §2.5](features/0005-backend-registry-and-routing.md#25-outbox-groups), [feature 0007 §4.1](features/0007-storage-backend-api.md#41-ingest-write-path)) before being appended to the storage backend and broadcast to delivery.
 
 ### 1.2 Architecture Drivers
 
@@ -449,7 +449,7 @@ Round-trip fields (present in both directions):
 - `subject` (String, ASCII): Subject entity identifier. Required. Used for event correlation, filtering, and consumer semantics. An event type that needs subject-level ordering points its partition-key trait at this member.
 - `subject_type` (String, GTS Identifier, ASCII): Subject-type reference — the type of entity the event is about. Required and NOT derivable from `type` (event types may be generic across multiple subject kinds; body-less events have no `data` to introspect).
 - `occurred_at` (Timestamp, ISO 8601): When the event occurred (producer-stamped).
-- `trace_parent` (String, optional): W3C Trace Context parent. Validated at ingest against the W3C tracecontext format (`^[0-9a-f]{2}-[0-9a-f]{32}-[0-9a-f]{16}-[0-9a-f]{2}$`); malformed values are rejected with `400 InvalidTraceParent`. Carried on read for consumer-side trace correlation.
+- `trace_parent` (String, optional): W3C Trace Context parent. Validated at ingest against the W3C tracecontext format (`^[0-9a-f]{2}-[0-9a-f]{32}-[0-9a-f]{16}-[0-9a-f]{2}$`); malformed values are rejected with `400 InvalidArgument` (reason `invalid_event_field`), and a malformed stored `trace_parent` (an event written before ingest checked the field) is dropped on delivery by the SDK: an SDK consumer receives the event without it and a warning is logged, while the REST delivery payload carries the stored value. Carried on read for consumer-side trace correlation.
 - `data` (Object, optional): Event payload, validated against the event type's `data_schema`. May be absent for body-less events. **The only field where UTF-8 is permitted**; all other event string fields are ASCII per platform convention.
 
 `writeOnly` fields (publish-only; stripped on read):
@@ -557,25 +557,26 @@ A SEEK value outside `[RF − 1, HWM]` is rejected with `400 InvalidInitialPosit
 
 #### GTS Base-Type Quick Reference
 
-The broker owns the following GTS base types. A concrete event type is a **derived type schema** under its base; concrete topics, consumer groups, and subscriptions are **instances** of theirs. Topics and event types are registered in `types_registry` by their owning gear, not by the broker (see §"Topic Schema" and §"Event Type").
+The broker owns the following GTS base types. A concrete event type is a **derived type schema** under its base; concrete topics, consumer groups, and subscriptions are **instances** of theirs. A subject kind may be declared as a derived type schema under the subject base (see the note below the table). Topics and event types are registered in `types_registry` by their owning gear, not by the broker (see §"Topic Schema" and §"Event Type").
 
 | Base type | Concept | Source |
 |---|---|---|
 | `gts.cf.core.events.topic.v1~` | Topic base type; a concrete topic is an instance of it | [`schemas/gts.cf.core.events.topic.v1~.schema.json`](schemas/gts.cf.core.events.topic.v1~.schema.json) |
 | `gts.cf.core.events.event.v1~` | Event (single schema, `readOnly` / `writeOnly` markers per direction) | [`schemas/gts.cf.core.events.event.v1~.schema.json`](schemas/gts.cf.core.events.event.v1~.schema.json), [`ADR/0003-event-schema.md`](ADR/0003-event-schema.md) |
+| `gts.cf.core.events.subject.v1~` | Subject base type; a gear declares each subject kind it owns as a derived type schema under it (a convention: `subject_type` accepts any GTS type id) | [`schemas/gts.cf.core.events.subject.v1~.schema.json`](schemas/gts.cf.core.events.subject.v1~.schema.json) |
 | `gts.cf.core.events.consumer_group.v1~` | Consumer group resource | [`schemas/gts.cf.core.events.consumer_group.v1~.schema.json`](schemas/gts.cf.core.events.consumer_group.v1~.schema.json) |
 | `gts.cf.core.events.subscription.v1~` | Subscription resource (ephemeral, in-cache) | [`schemas/gts.cf.core.events.subscription.v1~.schema.json`](schemas/gts.cf.core.events.subscription.v1~.schema.json), [`ADR/0005-subscription-filter-typing.md`](ADR/0005-subscription-filter-typing.md) |
 | `gts.cf.core.events.backend.v1~` | Storage backend plugin contract | [`features/0007-storage-backend-api.md`](features/0007-storage-backend-api.md) |
 | `gts.cf.core.events.filter.v1~` | Filter engine plugin contract | [`ADR/0005-subscription-filter-typing.md`](ADR/0005-subscription-filter-typing.md) |
 
-`gts.cf.core.events.subject_type.v1~` appears in the broker design as an *authz-scope* resource type only (in `<gts_pattern>:<action>` permission grammar). The broker does not own a schema file for subject types — subject types are owned by the modules that emit events about them.
+`gts.cf.core.events.subject_type.v1~` appears in the broker design as an *authz-scope* resource type only (in `<gts_pattern>:<action>` permission grammar). The broker owns only the subject base type. By convention, a gear declares each subject kind it owns as a derived type schema under it; `subject_type` accepts any GTS type id, so an undeclared kind or one under another base stays valid.
 
 #### Validation Pipeline
 
 End-to-end flow when a producer publishes an event:
 
 1. **Authentication / authorization** at the API edge. `toolkit-security` populates `SecurityContext`; `authz-resolver` enforces `event_type:produce` and `tenant_id`-related scopes via the platform tenant resolver. Rejected publishes return `403`.
-2. **Envelope field validation** against the bounds `gts.cf.core.events.event.v1~.schema.json` declares (per [`ADR/0003-event-schema.md`](ADR/0003-event-schema.md)). `source` and `subject` are printable ASCII (`0x20`-`0x7E`) within their declared byte lengths; structural conformance and the closed property set are enforced by the deserializer, which rejects an unknown or `readOnly` field before this point. A violation returns `400 InvalidArgument` with one `context.field_violations[]` entry naming the field, and a `reason` of `ascii_only` or `field_too_long` so a caller knows whether to re-encode or shorten. Encoding is reported ahead of length, since shortening a mis-encoded value would not make it acceptable. This step precedes event-type lookup, so a publish whose envelope is malformed is rejected for that reason even when its `type` is also unregistered.
+2. **Envelope field validation** against the bounds `gts.cf.core.events.event.v1~.schema.json` declares (per [`ADR/0003-event-schema.md`](ADR/0003-event-schema.md)). `source` and `subject` are printable ASCII (`0x20`-`0x7E`) within their declared byte lengths; structural conformance and the closed property set are enforced by the deserializer, which rejects an unknown or `readOnly` field before this point. `trace_parent`, when present, matches the base schema's W3C traceparent pattern (`^[0-9a-f]{2}-[0-9a-f]{32}-[0-9a-f]{16}-[0-9a-f]{2}$`). A violation returns `400 InvalidArgument` with one `context.field_violations[]` entry naming the field, and a `reason`: `ascii_only` or `field_too_long` for `source` and `subject`, so a caller knows whether to re-encode or shorten, and `invalid_event_field` for `trace_parent`. Encoding is reported ahead of length, since shortening a mis-encoded value would not make it acceptable. This step precedes event-type lookup, so a publish whose envelope is malformed is rejected for that reason even when its `type` is also unregistered.
 3. **Read-only field rejection.** If the publish body contains any `readOnly` field (`partition`, `sequence`, `sequence_time`), the broker rejects with `400 BadRequest` naming the offending field.
 4. **Event-type lookup.** The broker reads `event.type` (a GTS event-type identifier) and resolves it via `types_registry.get(event.type)`. Unknown event types are rejected with `404 EventTypeNotFound`.
 5. **Subject-type membership.** `event.subject_type` is a GTS Type id (the *kind* of entity, not one instance of it) that MUST match one of the patterns in `event_type.allowed_subject_types` (concrete Type match, `.*` wildcard suffix, or bare base Type with implicit derived-type coverage). Violations return `400 SubjectTypeNotAllowed`; a malformed or instance-shaped `subject_type` itself returns `400 InvalidSubjectType`. (Corrected from an earlier `422` here, which was never reflected in the authoritative Hard-Error Catalog table below - that table's generic `InvalidArgument`/`400` mapping is what the implementation actually uses.)
@@ -787,10 +788,10 @@ Key methods:
 - `topic_state(id) → Result<Option<TopicState>>`
 - `provision_topics(backends, limits) → usize`
 
-**Current implementation status** (`eb-gts-type-registration`): `cf.core.events.topic.v1~` and
-`cf.core.events.event.v1~` are base GTS type schemas declared in `event-broker-sdk`
-(`#[gts_type_schema(..., base = true)]`), which `types-registry` seeds from the process-wide
-`toolkit-gts` inventory at startup. `SpecificationManager`'s production implementation
+**Current implementation status** (`eb-gts-type-registration`): `cf.core.events.topic.v1~`,
+`cf.core.events.event.v1~` and `cf.core.events.subject.v1~` are base GTS type schemas declared in
+`event-broker-sdk` (`#[gts_type_schema(..., base = true)]`), which `types-registry` seeds from the
+process-wide `toolkit-gts` inventory at startup. `SpecificationManager`'s production implementation
 is `infra/specification.rs`'s `TypesRegistrySpecificationManager`, which serves topics and event
 types from the gear database's specification cache (`event_broker_spec_cache`). `bulk_load` fills
 that cache from `types-registry` through `PlatformTypesRegistryApi`, resolved from `ClientHub`, at
@@ -1033,40 +1034,44 @@ The `toolkit-db` transactional outbox is the foundation for both the **producer 
 
 ##### Producer Client (SDK)
 
-Modules that produce events use the SDK's `DbProducer`, which owns a transactional producer outbox:
+Modules that produce events build the SDK's `OutboxSetup`, which starts a transactional producer outbox and hands back its `OutboxProducer`:
 
 ```rust
 // Built once at startup; wires the producer to its outbox queue.
-let producer = DbProducer::builder()
+let setup = OutboxSetup::builder()
     .broker(Arc::clone(&broker))
     .db(db.clone())
     .security_context(ctx.clone())
-    .identity(ProducerIdentity::new().source("user-service").client_agent("user-service/1.0"))
-    .deduplication(DbDeduplication::managed(ProducerMode::Chained).key("users.created").build()?)
+    .source("user-service")
+    .client_agent("user-service/1.0")
+    .registration(OutboxRegistration::managed(ProducerMode::Chained, "users.created"))
     .topics(["gts.cf.core.events.topic.v1~vendor.users.v1"])
     .event_type_patterns(["gts.cf.core.events.event.v1~vendor.users.*"])
-    .prepare_all()
+    .queue("event-broker-producer", Partitions::of(16))
+    .build()
     .await?;
-let outbox = producer.outbox_queue("event-broker-producer", Partitions::of(16))?;
-let handle = outbox.register(Outbox::builder(db.clone())).start().await?;
-let producer_outbox = outbox.bind(&handle);
+let handle = setup.start(Outbox::builder(db.clone())).await?;
+let producer = handle.producer().clone();
 
-// Inside a business transaction: enqueue a typed event. `in_transaction` fires
+// Inside a business transaction: enqueue an event. `in_transaction` fires
 // the returned wake only if the transaction commits.
+// `user_created` is an `EventV1` built with `EventV1::builder(UserCreatedV1 { user_id, /* … */ })`.
 toolkit_db::outbox::in_transaction(&db, |txn| Box::pin(async move {
-    let wake = producer_outbox.enqueue(txn, UserCreated { user_id, /* … */ }).await?;
+    let wake = producer.enqueue(txn, user_created).await?;
     Ok(((), wake))
 })).await?;
 ```
 
-A registration key and an outbox queue name are non-blank, carry no leading or trailing whitespace, and are at most 255 bytes.
+A registration key is non-blank, carries no leading or trailing whitespace, and is at most 255 bytes. An outbox queue name follows the same three rules and uses only ASCII letters, digits, `.`, `_` and `-`, starting and ending with a letter or digit (toolkit-db's queue-name rule).
 
-Under the hood, `ProducerOutbox::enqueue()` writes an outbox row (to the queue the caller named in `outbox_queue(...)`, hash-based partition key) inside the caller's transaction. The outbox handler then delivers the event to the ingest service (in-process call in standalone mode, HTTP/gRPC in cluster mode).
+Under the hood, `OutboxProducer::enqueue()` writes an outbox row inside the caller's transaction, to the queue named by the setup builder's `.queue(..)`, in outbox partition `(murmur3_x86_32("{topic}:{key}") & 0x7FFFFFFF) % partitions`, where `key` is the event's partition-key value. The outbox handler then delivers the event to the ingest service (in-process call in standalone mode, HTTP/gRPC in cluster mode).
 
 This gives producers:
 - **Transactional safety** — events are only visible if the business transaction commits
-- **At-least-once delivery** — the outbox retries until the ingest acknowledges
-- **Exactly-once via idempotent producer** — the ingest deduplicates using PID + producer sequence from the outbox message metadata
+- **At-least-once delivery** - the outbox retries a transient failure until the ingest acknowledges; a message the broker refuses for good is moved to the outbox's dead-letter table
+- **Exactly-once via idempotent producer** - with a managed registration, the ingest deduplicates using the outbox partition's producer id and the message's outbox `seq` as the producer sequence; an `OutboxRegistration::Stateless` producer has no broker-side dedup
+
+A gear without a database publishes through `DirectProducer`. It registers a fresh producer id when it is built, in mode chained by default or monotonic, never stateless, and keeps its chain heads in memory. It serializes its publishes per topic. At most `max_waiting_per_topic` publishes (default 64) wait on one topic; the next fails at once with `ProducerBusy`. After a publish whose outcome it does not see (an error or a dropped future), re-publishing the same event (same `id`) before any other publish on that topic resends the numbers it carried, so the broker answers `Duplicate` if the first attempt was stored; any other publish on that topic re-reads the producer's head from the broker first. Fresh numbers answered `Duplicate` were taken by an earlier request whose outcome the producer did not see: it resends the event once with the next numbers, and a second `Duplicate` fails the publish with `SequenceTaken`. A `SequenceViolation` answer means the numbers were stale: the next publish, the same event included, re-reads the head. Not covered: if an earlier request of another event, whose outcome was not seen, commits the numbers an event was last sent with, re-publishing that event is answered `Duplicate` although it was not stored; the broker deduplicates on the numbers, not on the event id (#5660). Likewise, a re-publish whose earlier attempt was stored is answered `SequenceViolation` when an earlier request whose outcome was not seen reaches the broker later and moves the head past it; the next publish then stores the event again. It does not retry an error by itself. Each restart registers a new producer id, and the earlier ids stay until the registration reaper removes them (not yet implemented, tracked in #5651); a re-publish across a restart is not deduplicated.
 
 ##### Ingest Pipeline
 
@@ -1115,7 +1120,7 @@ The producer SDK has its own outbox, and the ingest service has its own outbox. 
 | Producer outbox (toolkit-db, in producer module's DB schema) | Transactional write integrity — if the producer's business transaction commits, the event WILL reach the broker, even if the broker is unreachable right now | At-least-once delivery from producer to broker, atomic with business state |
 | Ingest outbox (toolkit-db, in event-broker module's DB schema) | In-pipeline order preservation + decoupling backend latency from HTTP latency | At-least-once persistence to backend, per-key order |
 
-**No table-name collision in standalone**: every Gears module owns its own DB schema (platform invariant), so `producer_outbox` in the producer module's schema and `ingest_outbox` in the event-broker's schema are distinct tables in the same database. The producer SDK never names the ingest's outbox table — it talks to its own module's outbox and lets `IngestService` (in-process trait call in standalone, HTTP in cluster) handle the rest.
+**No table-name collision in standalone**: every Gears module owns its own DB schema (platform invariant), so the producer's outbox tables in the producer module's schema and the ingest outbox tables (prefix `event_broker__ob_default`) in the event-broker's schema are distinct tables in the same database. The producer SDK never names the ingest's outbox table - it talks to its own module's outbox and lets `IngestService` (in-process trait call in standalone, HTTP in cluster) handle the rest.
 
 ##### Ack Semantics
 
@@ -1329,7 +1334,7 @@ Request body:
 Request headers:
 - `Prefer: wait=N` (optional, RFC 7240): hold the response until the events are stored on the backend or N seconds elapse, N capped by configuration; see "Sync vs Async Persist Modes" in §3.6. `Prefer: respond-async` names the default async behaviour (no-op).
 
-**Producer identity travels in `meta.producer_id`, not a header.** Producers register via `POST /v1/producers` to obtain a `producer_id` UUID bound to their principal, then set it in the publish body's `meta` block. When present, the broker uses **chained mode** if `meta.previous` is set and **monotonic mode** if only `meta.sequence` is set. When `meta` is absent (stateless mode), there is no broker-side dedup. The broker rejects a publish whose `meta.producer_id` doesn't match a producer registered to the call's principal (`403 Forbidden`).
+**Producer identity travels in `meta.producer_id`, not a header.** Producers register via `POST /v1/producers` to obtain a `producer_id` UUID bound to their principal, then set it in the publish body's `meta` block. When present, the broker applies the mode the producer registered with (`chained` or `monotonic`, [ADR-0004](ADR/0004-idempotent-producer-protocol.md)), not a mode inferred from the fields set; a monotonic producer's publish that carries `meta.previous` is rejected with `400 InvalidArgument` (reason `field_not_allowed`). When `meta` is absent (stateless mode), there is no broker-side dedup. The broker rejects a publish whose `meta.producer_id` doesn't match a producer registered to the call's principal (`403 Forbidden`).
 
 When the producer's local chain state is no longer trustworthy (DB restore, corruption, etc.), the recommended path is `GET /v1/producers/{producer_id}/cursors` to read the broker's view and reconcile. If the producer cannot reconcile, registering a fresh `producer_id` (another `POST /v1/producers`) starts a new chain - the old id's chain rows are reaped with its registration. For operator-driven chain reset (preserving the `producer_id`), call `POST /v1/producers/{producer_id}:reset` - see [`docs/features/0001-idempotent-producers.md`](features/0001-idempotent-producers.md) §4.6.
 
@@ -1347,7 +1352,7 @@ Errors (an error about the stream names the targeted stream in `context.resource
 - `400` - Read-only/unknown field on the body, or a chained/monotonic mode invariant violated
 - `403` - Caller's principal doesn't match the registered owner of the producer
 - `404` - Topic or event type not registered, or the `meta.producer_id` is not registered (never registered, or reaped after the producer-registration inactivity TTL, not yet implemented, tracked in #5651)
-- `412 SequenceViolation` - the producer chain does not advance from the broker's `last_sequence` (`previous == last && sequence > last`; gaps are accepted). The `sequence_mismatch` violation's `description` names `index`, `producer_id`, `topic` and `last_sequence` as `key=value` text. Recover via `GET /v1/producers/{producer_id}/cursors`.
+- `412 SequenceViolation` - the producer chain does not advance from the broker's `last_sequence` (`previous == last && sequence > last`; gaps are accepted) and the event is not a resend of the head (`sequence == last`, answered `200`). The `sequence_mismatch` violation's `description` names `index`, `producer_id`, `topic` and `last_sequence` as `key=value` text. Recover via `GET /v1/producers/{producer_id}/cursors`.
 - `422 SchemaViolation` - the event `data` does not satisfy the event type's `data_schema`
 
 **POST /v1/events:batch** - Publish multiple events of one topic, of one or several producer ids. The batch is all-or-nothing.
@@ -1447,7 +1452,7 @@ Errors:
 
 The MVP exposes a **single consumption endpoint** — subscription-based long-poll. All consumers go through `POST /v1/subscriptions` (JOIN) → `GET /v1/events:stream` cycle. Anonymous / stateless reads are intentionally out of scope for v1; see §4.6 Out of Scope and §4.8 Future Developments for planned extensions (`GET /v1/events:sse`, anonymous offset-based read, etc.).
 
-**A delivered event names no topic.** A topic is what an event's type declares, so the consumer resolves it from the event's `type` rather than the broker repeating a GTS identifier on every frame. The consumer resolves the event types of its declared topics when it starts, so resolution during delivery is a local lookup, and resolves a type registered after that on first sight - the same shape as the producer, which resolves its declared event types at init. The `topology` and `control` frames still name a topic per position, because a position is an assignment coordinate rather than event data.
+**The SDK's delivered event names no topic.** The consumer resolves it from the event's `type` (the REST payload's `topic` member is not used), because a topic is what an event's type declares. The consumer resolves the event types of its declared topics when it starts, so resolution during delivery is a local lookup, and resolves a type registered after that on first sight - the same shape as the producer, which resolves its declared event types at init. The `topology` and `control` frames still name a topic per position, because a position is an assignment coordinate rather than event data.
 
 **GET /v1/events:stream** — Long-poll for new events. Subscription-based; broker tracks all per-`(topic, partition)` cursor state internally. A single subscription can be assigned partitions across multiple topics (the topics this member declared at JOIN, intersected with the group's effective topic set); the response groups events by `(topic, partition)`.
 
@@ -1501,7 +1506,7 @@ Each built-in `OffsetManager` (`LocalDbOffsetManager`, `InMemoryOffsetManager`) 
 - `"at:<ISO-8601>"` → cursor set to the broker-logical sequence immediately before the first event whose `sequence_time ≥ timestamp`. Timestamp before retention floor → `retention_floor - 1`; timestamp beyond HWM → HWM (consumer will wait for future events). Malformed timestamp → `400 InvalidTimestamp`.
 - Response body returns the resolved integer offsets in the same `positions` map shape (topic GTS id → array of `{ partition, value }`) for audit.
 
-**`:stream` defensive backstop**: `GET /v1/events:stream` rejects with `409 PositionsNotSet { unseeded: [...], recovery_hint }` when any assigned partition has no committed cursor in the subscription's group. A well-behaved SDK seeds positions before opening the stream via `POST /v1/subscriptions/{id}:seek` and never observes this on the happy path; the SDK recovers from it by re-resolving via `position()` and re-SEEKing (sharing the `SubscriptionRecoveryExhausted` budget).
+**`:stream` defensive backstop**: `GET /v1/events:stream` rejects with `409 PositionsNotSet { unseeded: [...], recovery_hint }` when any assigned partition has no committed cursor in the subscription's group. A well-behaved SDK seeds positions before opening the stream via `POST /v1/subscriptions/{id}:seek` and never observes this on the happy path; the SDK recovers from it by re-resolving via `position()` and re-SEEKing after a re-JOIN (sharing the `SubscriptionRecoveryExhausted` budget).
 
 **Rebalance handling** (see [`features/0004-consumption-transport.md`](features/0004-consumption-transport.md)): a partition **loss** arrives as a non-terminal `topology` frame and the consumer keeps streaming its remaining partitions; a partition **gain** (or lose-all) terminates the subscription — the broker emits a `control` frame with `code: "terminal"` (complete final positions) as the last frame, closes gracefully, and the consumer re-JOINs (new `subscription_id`), SEEKs, and reopens. There is no mid-stream re-SEEK of a gained partition.
 
@@ -1694,7 +1699,7 @@ All errors follow RFC 9457 Problem Details (`application/problem+json`) using th
 | SchemaViolation | 422 (`TransportOverride`; category is `InvalidArgument`) | `InvalidArgument` | `invalid_argument` | No | `field_violations: [{field: "(payload)", reason: "schema_validation"}]`, `resource_type: "gts.cf.core.events.topic.v1~"`, `resource_name: <topic>`. Says what is wrong without echoing submitted content |
 | BatchTooLarge | 413 (`TransportOverride`; category is `InvalidArgument`) | `InvalidArgument` | `invalid_argument` | No | `format: <detail>` |
 | ValidationError | 400 | `InvalidArgument` | `invalid_argument` | No | `field_violations` — one per validator diagnostic |
-| TextField | 400 | `InvalidArgument` | `invalid_argument` | No | `field_violations`: one `{field, description, reason}`, `reason` being `ascii_only` or `field_too_long`. Carries no part of the submitted value |
+| TextField | 400 | `InvalidArgument` | `invalid_argument` | No | `field_violations`: one `{field, description, reason}`, `reason` being `ascii_only` or `field_too_long` for a text rule, `invalid_event_field` for a malformed identifier or `trace_parent`, or `field_not_allowed` for a field the producer's mode does not admit (`meta.previous`). Carries no part of the submitted value |
 | OffsetOutOfRange | 400 | `InvalidArgument` | `invalid_argument` | No | `field_violations`: one `{field, description, reason}` per offending entry, `field` being `positions.<topic-id>`, `reason` being `below_retention_floor` or `above_high_water_mark`. `description` quotes the valid range, which is broker state, and no part of the submitted value |
 | InvalidSubjectType, SubjectTypeNotAllowed, InvalidSubjectTypePattern | 400 | `InvalidArgument` | `invalid_argument` | No | `format: <detail>` |
 | TopicNotFound | 404 | `NotFound` | `not_found` | No | `resource_type: "gts.cf.core.events.topic.v1~"`, `resource_name: <topic>` |
@@ -1838,7 +1843,7 @@ cached JOIN decisions or SQL predicates for those checks.
 **Define path** — ABI / operator registration time:
 - `(topic_resource, "define", topic.id)` for each topic being registered
 - `(event_type_resource, "define", event_type.id)` for each event type being registered
-- Subject types are not defined by the event broker.
+- Subject kinds are not defined by the event broker; it declares only the subject base type.
 
 **Audit logging of denials**: out of MVP scope (see R34 — deferred).
 

@@ -1,10 +1,11 @@
 //! Typed registry events, broker binding and the transactional outbox sink.
 //! @cpt-dod:cpt-cf-bss-products-dod-sku-changed-payload:p1
-use event_broker_sdk::{ProducerOutbox, ProducerOutboxHandle, TypedEvent};
+use crate::infra::events::BrokerEvent;
+use event_broker_sdk::{GtsTypeId, OutboxProducer, OutboxProducerHandle};
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::sync::Arc;
-use toolkit_gts::gts_id;
+use toolkit_gts::{GtsSchema, gts_id};
 use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
@@ -27,11 +28,15 @@ pub(crate) struct SkuPublished {
     pub published_version: i64,
     pub actor_ref: Uuid,
 }
-impl TypedEvent for SkuPublished {
+impl toolkit_gts::GtsSchema for SkuPublished {
     const TYPE_ID: &'static str =
         gts_id!("cf.core.events.event.v1~cf.bss.products.sku_published.v1~");
-    const SUBJECT_TYPE: &'static str = SKU_SUBJECT_TYPE;
-    const SOURCE: &'static str = SOURCE;
+    // The registered type's `data_schema` is the contract; the producer validates against it.
+    fn gts_schema_with_refs() -> serde_json::Value {
+        serde_json::json!({ "type": "object" })
+    }
+}
+impl BrokerEvent for SkuPublished {
     fn subject(&self) -> Cow<'_, str> {
         Cow::Owned(self.sku_id.to_string())
     }
@@ -55,11 +60,15 @@ pub(crate) struct SkuChanged {
     pub published_version: i64,
     pub actor_ref: Uuid,
 }
-impl TypedEvent for SkuChanged {
+impl toolkit_gts::GtsSchema for SkuChanged {
     const TYPE_ID: &'static str =
         gts_id!("cf.core.events.event.v1~cf.bss.products.sku_changed.v1~");
-    const SUBJECT_TYPE: &'static str = SKU_SUBJECT_TYPE;
-    const SOURCE: &'static str = SOURCE;
+    // The registered type's `data_schema` is the contract; the producer validates against it.
+    fn gts_schema_with_refs() -> serde_json::Value {
+        serde_json::json!({ "type": "object" })
+    }
+}
+impl BrokerEvent for SkuChanged {
     fn subject(&self) -> Cow<'_, str> {
         Cow::Owned(self.sku_id.to_string())
     }
@@ -79,11 +88,15 @@ pub(crate) struct SkuRetired {
     pub sku_id: Uuid,
     pub actor_ref: Uuid,
 }
-impl TypedEvent for SkuRetired {
+impl toolkit_gts::GtsSchema for SkuRetired {
     const TYPE_ID: &'static str =
         gts_id!("cf.core.events.event.v1~cf.bss.products.sku_retired.v1~");
-    const SUBJECT_TYPE: &'static str = SKU_SUBJECT_TYPE;
-    const SOURCE: &'static str = SOURCE;
+    // The registered type's `data_schema` is the contract; the producer validates against it.
+    fn gts_schema_with_refs() -> serde_json::Value {
+        serde_json::json!({ "type": "object" })
+    }
+}
+impl BrokerEvent for SkuRetired {
     fn subject(&self) -> Cow<'_, str> {
         Cow::Owned(self.sku_id.to_string())
     }
@@ -106,11 +119,15 @@ pub(crate) struct ApprovalUnitDecided {
     pub generation: i32,
     pub actors: Vec<Uuid>,
 }
-impl TypedEvent for ApprovalUnitDecided {
+impl toolkit_gts::GtsSchema for ApprovalUnitDecided {
     const TYPE_ID: &'static str =
         gts_id!("cf.core.events.event.v1~cf.bss.products.approval_unit_decided.v1~");
-    const SUBJECT_TYPE: &'static str = APPROVAL_UNIT_SUBJECT_TYPE;
-    const SOURCE: &'static str = SOURCE;
+    // The registered type's `data_schema` is the contract; the producer validates against it.
+    fn gts_schema_with_refs() -> serde_json::Value {
+        serde_json::json!({ "type": "object" })
+    }
+}
+impl BrokerEvent for ApprovalUnitDecided {
     fn subject(&self) -> Cow<'_, str> {
         Cow::Owned(self.unit_id.to_string())
     }
@@ -135,11 +152,15 @@ pub(crate) struct ReferenceForceReleased {
     pub actor_ref: Uuid,
     pub reason: String,
 }
-impl TypedEvent for ReferenceForceReleased {
+impl toolkit_gts::GtsSchema for ReferenceForceReleased {
     const TYPE_ID: &'static str =
         gts_id!("cf.core.events.event.v1~cf.bss.products.reference_force_released.v1~");
-    const SUBJECT_TYPE: &'static str = SKU_SUBJECT_TYPE;
-    const SOURCE: &'static str = SOURCE;
+    // The registered type's `data_schema` is the contract; the producer validates against it.
+    fn gts_schema_with_refs() -> serde_json::Value {
+        serde_json::json!({ "type": "object" })
+    }
+}
+impl BrokerEvent for ReferenceForceReleased {
     fn subject(&self) -> Cow<'_, str> {
         Cow::Owned(self.sku_id.to_string())
     }
@@ -178,7 +199,7 @@ fn producer_system_actor() -> anyhow::Result<SecurityContext> {
 pub enum EventSink {
     /// **P-D-199's shape.** The toolkit outbox whose processor is the SDK's
     /// producer; the envelope is the broker's and the id is the SDK's.
-    Broker(Box<ProducerOutbox>),
+    Broker(Box<OutboxProducer>),
     /// The interim envelope on this gear's own toolkit queue, held by
     /// [`crate::infra::events::PendingBrokerProducer`] and never delivered.
     ///
@@ -196,7 +217,7 @@ pub(crate) async fn bind_producer(
     db: toolkit_db::Db,
     table_prefix: &str,
     partitions: toolkit_db::outbox::Partitions,
-) -> anyhow::Result<Option<(EventSink, ProducerOutboxHandle)>> {
+) -> anyhow::Result<Option<(EventSink, OutboxProducerHandle)>> {
     let broker = match hub.get::<dyn event_broker_sdk::EventBrokerApi>() {
         Ok(broker) => broker,
         // The configured-out case, and the only silent one.
@@ -210,60 +231,66 @@ pub(crate) async fn bind_producer(
         }
     };
 
-    let producer = event_broker_sdk::DbProducer::builder()
+    let setup = event_broker_sdk::OutboxSetup::builder()
         .broker(broker)
         .db(db.clone())
         .security_context(producer_system_actor()?)
-        .identity(
-            event_broker_sdk::ProducerIdentity::new()
-                .source(SOURCE)
-                // **No version here.** `ProducerRegistration::validate_matches`
-                // compares the stored `client_agent` against the supplied one and
-                // returns `InvalidProducerOptions` on any difference at build
-                // time, before any producer id is registered or replaced, so
-                // neither recovery path is an escape. A version in this string would make an ordinary
-                // `version = "0.1.0"` in the manifest an unbootable gear against
-                // an existing registration row, recoverable only by hand-editing
-                // the SDK's table. The crate is at `0.0.0` today, so the version
-                // carries no diagnostic value either.
-                .client_agent(SOURCE),
-        )
+        .source(SOURCE)
+        // **No version here.** `ProducerRegistration::validate_matches`
+        // compares the stored `client_agent` against the supplied one and
+        // returns `InvalidProducerOptions` on any difference at build
+        // time, before any producer id is registered or replaced, so
+        // neither recovery path is an escape. A version in this string would make an ordinary
+        // `version = "0.1.0"` in the manifest an unbootable gear against
+        // an existing registration row, recoverable only by hand-editing
+        // the SDK's table. The crate is at `0.0.0` today, so the version
+        // carries no diagnostic value either.
+        .client_agent(SOURCE)
         // **Monotonic, not chained**: the managed monotonic mode of P-D-47
         // (backup `3a38f0b28`). The toolkit outbox's `seq` is the durable local
         // sequence the chain's `meta.sequence` is built from, write-only, for
         // ingest-side dedup.
-        .deduplication(
-            event_broker_sdk::DbDeduplication::managed(event_broker_sdk::ProducerMode::Monotonic)
-                .key(SOURCE)
-                .build()?,
-        )
+        .registration(event_broker_sdk::OutboxRegistration::managed(
+            event_broker_sdk::ProducerMode::Monotonic,
+            SOURCE,
+        ))
         .topics([TOPIC])
         .event_type_patterns([EVENT_TYPE_WILDCARD])
-        .prepare_all()
+        // The queue name is the table prefix's own, so the producer's queue and
+        // this gear's tables are named from one constant.
+        // **`QUEUE_NAME`, not the table prefix.** The setup's `queue` takes the
+        // *queue name*, and passing the prefix here gave the two arms two
+        // different queue names over one table family - so rows an interim boot had
+        // accumulated under `QUEUE_NAME` had no processor once a broker appeared,
+        // and stopped moving. They are not lost (`Dialect::vacuum_cleanup` is scoped
+        // by `partition_id`, which is per queue), but they are stranded, and the
+        // boot is green either way. One name across both arms is what makes an arm
+        // switch survivable.
+        .queue(crate::infra::events::QUEUE_NAME, partitions)
+        .build()
         .await?;
 
     // Resolve schemas before any business transaction enqueues an event.
-    producer.prepare::<SkuPublished>().await?;
-    producer.prepare::<SkuChanged>().await?;
-    producer.prepare::<SkuRetired>().await?;
-    producer.prepare::<ApprovalUnitDecided>().await?;
-    producer.prepare::<ReferenceForceReleased>().await?;
+    setup
+        .prepare_event_type(&GtsTypeId::new(SkuPublished::TYPE_ID))
+        .await?;
+    setup
+        .prepare_event_type(&GtsTypeId::new(SkuChanged::TYPE_ID))
+        .await?;
+    setup
+        .prepare_event_type(&GtsTypeId::new(SkuRetired::TYPE_ID))
+        .await?;
+    setup
+        .prepare_event_type(&GtsTypeId::new(ApprovalUnitDecided::TYPE_ID))
+        .await?;
+    setup
+        .prepare_event_type(&GtsTypeId::new(ReferenceForceReleased::TYPE_ID))
+        .await?;
 
-    // The queue name is the table prefix's own, so the producer's queue and
-    // this gear's tables are named from one constant.
-    // **`QUEUE_NAME`, not the table prefix.** `outbox_queue`'s first argument is
-    // the *queue name*, and passing the prefix here gave the two arms two
-    // different queue names over one table family — so rows an interim boot had
-    // accumulated under `QUEUE_NAME` had no processor once a broker appeared,
-    // and stopped moving. They are not lost (`Dialect::vacuum_cleanup` is scoped
-    // by `partition_id`, which is per queue), but they are stranded, and the
-    // boot is green either way. One name across both arms is what makes an arm
-    // switch survivable.
-    let queue = producer.outbox_queue(crate::infra::events::QUEUE_NAME, partitions)?;
-    let handle = queue
+    let handle = setup
         .start(toolkit_db::outbox::Outbox::builder(db).table_prefix(table_prefix)?)
         .await?;
-    let sink = EventSink::Broker(Box::new(handle.outbox().clone()));
+    let sink = EventSink::Broker(Box::new(handle.producer().clone()));
     Ok(Some((sink, handle)))
 }
 

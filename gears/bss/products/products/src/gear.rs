@@ -135,7 +135,7 @@ impl BssProductsGear {
 /// Owns the running outbox pipeline until shutdown.
 pub enum OutboxLifetime {
     /// Broker SDK pipeline.
-    Broker(Box<event_broker_sdk::ProducerOutboxHandle>),
+    Broker(Box<event_broker_sdk::OutboxProducerHandle>),
     /// Holding pipeline when no broker is registered.
     Interim(toolkit_db::outbox::OutboxHandle),
 }
@@ -163,8 +163,8 @@ impl toolkit::contracts::DatabaseCapability for BssProductsGear {
 
         // The producer's own registration table, appended for the same reason
         // and on the same terms: the SDK owns it, this chain does not declare
-        // it, and the README requires it run *before* a `DbProducer` is
-        // constructed. Appended unconditionally rather than only where a broker
+        // it, and the SDK requires it run *before* an `OutboxSetup` is
+        // built. Appended unconditionally rather than only where a broker
         // is configured — a migration set that varies with runtime wiring gives
         // two deployments two different schemas, and the cost here is **one**
         // table a no-broker deployment never writes

@@ -16,14 +16,15 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use async_trait::async_trait;
 use event_broker_sdk::api::{
-    EventBrokerApi, FrameStream, IngestOutcome, JoinRequest, ProducerCursors, SeekPosition,
+    Ack, EventBrokerApi, FrameStream, IngestOutcome, JoinRequest, ProducerCursors, SeekPosition,
     SeekResult, SubscriptionAssignment,
 };
 use event_broker_sdk::error::EventBrokerError;
+use event_broker_sdk::gts::{EventMeta, EventV1};
 use event_broker_sdk::ids::{ConsumerGroupId, ProducerId, SubscriptionId};
 use event_broker_sdk::models::{
-    ConsumerGroup, ConsumerGroupQuery, CreateConsumerGroupRequest, Event, EventType, Page,
-    PartitionRange, ProducerMeta, ResetScope, Subscription, Topic, TopicSegment,
+    ConsumerGroup, ConsumerGroupQuery, CreateConsumerGroupRequest, EventType, Page, PartitionRange,
+    ResetScope, Subscription, Topic, TopicSegment,
 };
 use event_broker_sdk::producer::ProducerMode;
 use toolkit_security::SecurityContext;
@@ -76,7 +77,7 @@ pub enum DeliveredOutcome {
 pub struct DeliveredPublish {
     pub event_id: Uuid,
     pub subject: String,
-    pub meta: Option<ProducerMeta>,
+    pub meta: Option<EventMeta>,
     /// The wrapped broker's answer, before any injected answer replaced it.
     pub outcome: DeliveredOutcome,
     /// The producer saw a transport fault instead of `outcome`.
@@ -186,7 +187,8 @@ impl EventBrokerApi for FaultInjectingBroker {
     async fn publish(
         &self,
         ctx: &SecurityContext,
-        event: &Event,
+        event: &EventV1,
+        ack: Ack,
     ) -> Result<IngestOutcome, EventBrokerError> {
         self.publishes.fetch_add(1, Ordering::SeqCst);
         let (fault, lose_ack) = {
@@ -208,14 +210,14 @@ impl EventBrokerApi for FaultInjectingBroker {
             return Err(fault.error());
         }
         self.delivered.fetch_add(1, Ordering::SeqCst);
-        let outcome = self.inner.publish(ctx, event).await;
+        let outcome = self.inner.publish(ctx, event, ack).await;
         self.log
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .push(DeliveredPublish {
-                event_id: event.id,
-                subject: event.subject.clone(),
-                meta: event.meta.clone(),
+                event_id: event.id(),
+                subject: event.subject().to_owned(),
+                meta: event.meta().cloned(),
                 outcome: delivered_outcome(&outcome),
                 ack_lost: lose_ack,
             });
@@ -243,9 +245,10 @@ impl EventBrokerApi for FaultInjectingBroker {
     async fn publish_batch(
         &self,
         ctx: &SecurityContext,
-        events: &[Event],
+        events: &[EventV1],
+        ack: Ack,
     ) -> Result<IngestOutcome, EventBrokerError> {
-        self.inner.publish_batch(ctx, events).await
+        self.inner.publish_batch(ctx, events, ack).await
     }
 
     async fn get_producer_cursors(

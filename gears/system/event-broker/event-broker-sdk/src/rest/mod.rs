@@ -8,4 +8,4 @@ mod client;
 mod stream;
 mod wire;
 
-pub use client::{RestBroker, StreamTransport};
+pub use client::{REST_MAX_SYNC_WAIT_SECS, RestBroker, StreamTransport};

@@ -17,23 +17,24 @@ use crate::api::{
 };
 use crate::api::{
     BarrierMode, ControlCode, Filter, PartitionPosition, SeekPosition,
-    SubscriptionInterest as BrokerSubscriptionInterest, TenantTraversalDepth, WireEvent, WireFrame,
+    SubscriptionInterest as BrokerSubscriptionInterest, TenantTraversalDepth, WireFrame,
 };
 use crate::consumer::builder::subscription_filter_ref_to_filter;
 use crate::consumer::offset_manager::CommitOffset;
 #[cfg(feature = "db")]
-use crate::consumer::progress::processed_count_from_delivered_offset;
-use crate::consumer::progress::processed_count_from_outcome;
-use crate::consumer::types::{PartitionFrontier, SubscriptionInterest};
+use crate::consumer::types::DeliverTxBatch;
+use crate::consumer::types::{
+    DeliverBatch, Delivered, PartitionFrontier, SkippedEvent, SubscriptionInterest,
+};
 use crate::consumer::{
     BatchHandlerOutcome, ConnectionDropReason, ConsumerCommitMode, ConsumerGroupRef,
-    ConsumerHandler, ConsumerRuntimeEvent, ConsumerRuntimeListener, EventBatch,
-    PartitionBufferState, PartitionBufferStateSnapshot, PartitionProgress, RawEvent,
-    SlowConsumerTrigger,
+    ConsumerRuntimeEvent, ConsumerRuntimeListener, Delivery, EventBatch, PartitionBufferState,
+    PartitionBufferStateSnapshot, PartitionProgress, SlowConsumerTrigger,
 };
 #[cfg(feature = "db")]
-use crate::consumer::{CommitOffsetInTx, TxCommitHandle, TxConsumerHandler};
+use crate::consumer::{CommitOffsetInTx, TxCommitHandle};
 use crate::error::EventBrokerError;
+use crate::gts::{EventV1, StoredPosition};
 use crate::ids::{ConsumerGroupId, SubscriptionId, TopicId};
 use crate::sequence::Sequence;
 
@@ -70,7 +71,14 @@ impl TopicPartitionKey {
 
 pub(crate) struct PartitionEventBuffer {
     capacity: usize,
-    events: VecDeque<RawEvent>,
+    events: VecDeque<Buffered>,
+}
+
+/// A buffered event with the position it was delivered at. The runtime reads the
+/// position from here, so it never unwraps the event's own optional members.
+pub(crate) struct Buffered {
+    pub(crate) event: EventV1,
+    pub(crate) at: StoredPosition,
 }
 
 #[derive(Debug)]
@@ -86,12 +94,12 @@ impl PartitionEventBuffer {
         }
     }
 
-    fn push(&mut self, event: RawEvent) -> Result<(), EventBrokerError> {
+    fn push(&mut self, key: &TopicPartitionKey, event: Buffered) -> Result<(), EventBrokerError> {
         if self.events.len() >= self.capacity {
             return Err(EventBrokerError::InvalidConsumerOptions {
                 detail: format!(
                     "partition buffer capacity {} exceeded for topic '{}' partition {}",
-                    self.capacity, event.topic, event.partition
+                    self.capacity, key.topic, key.partition
                 ),
             });
         }
@@ -103,7 +111,7 @@ impl PartitionEventBuffer {
         self.events.len()
     }
 
-    fn drain_batch(&mut self, max_events: usize) -> Vec<RawEvent> {
+    fn drain_batch(&mut self, max_events: usize) -> Vec<Buffered> {
         let count = max_events.max(1).min(self.events.len());
         self.events.drain(..count).collect()
     }
@@ -214,14 +222,14 @@ impl PartitionSlowState {
 pub(crate) async fn enqueue_partition_batch(
     buffers: &PartitionBuffers,
     key: TopicPartitionKey,
-    event: RawEvent,
+    event: Buffered,
     capacity: usize,
 ) -> Result<EnqueuedPartitionBatch, EventBrokerError> {
     let mut guard = buffers.write().await;
     let buffer = guard
-        .entry(key)
+        .entry(key.clone())
         .or_insert_with(|| PartitionEventBuffer::new(capacity));
-    buffer.push(event)?;
+    buffer.push(&key, event)?;
     let buffered_count = buffer.len();
     Ok(EnqueuedPartitionBatch { buffered_count })
 }
@@ -230,7 +238,7 @@ async fn drain_partition_batch(
     buffers: &PartitionBuffers,
     key: &TopicPartitionKey,
     max_events: usize,
-) -> Vec<RawEvent> {
+) -> Vec<Buffered> {
     let mut guard = buffers.write().await;
     guard
         .get_mut(key)
@@ -241,7 +249,7 @@ async fn drain_partition_batch(
 async fn next_buffered_partition_batch(
     buffers: &PartitionBuffers,
     max_events: usize,
-) -> Option<(TopicPartitionKey, Vec<RawEvent>)> {
+) -> Option<(TopicPartitionKey, Vec<Buffered>)> {
     let mut guard = buffers.write().await;
     let key = guard
         .iter()
@@ -293,11 +301,14 @@ impl PartitionCursor {
             .unwrap_or(self.committed)
     }
 
-    pub(crate) fn advance_through_delivered_prefix(&mut self, events: &[RawEvent]) -> Sequence {
-        let Some(last) = events.last() else {
+    pub(crate) fn advance_through_delivered_prefix(
+        &mut self,
+        positions: &[StoredPosition],
+    ) -> Sequence {
+        let Some(last) = positions.last() else {
             return self.latest_offset();
         };
-        let frontier = last.offset;
+        let frontier = last.sequence;
         self.frontier = Some(PartitionFrontier::new(frontier));
         frontier
     }
@@ -306,7 +317,7 @@ impl PartitionCursor {
 /// Runs one subscription slot: JOIN, poll, dispatch, retry, re-JOIN.
 pub(crate) struct SlotDispatcher<H, OM>
 where
-    H: ConsumerHandler + 'static,
+    H: DeliverBatch + 'static,
     OM: CommitOffset + 'static,
 {
     pub slot_idx: u32,
@@ -347,7 +358,7 @@ where
 /// `TxCommitHandle::commit_offset_in_tx`.
 pub(crate) struct TxSlotDispatcher<H, OM>
 where
-    H: TxConsumerHandler<OM> + 'static,
+    H: DeliverTxBatch<OM> + 'static,
     OM: CommitOffsetInTx + 'static,
 {
     pub slot_idx: u32,
@@ -446,7 +457,7 @@ fn build_join_interests(
 #[cfg(feature = "db")]
 impl<H, OM> TxSlotDispatcher<H, OM>
 where
-    H: TxConsumerHandler<OM> + 'static,
+    H: DeliverTxBatch<OM> + 'static,
     OM: CommitOffsetInTx + 'static,
 {
     pub async fn run(
@@ -484,23 +495,36 @@ where
             }
 
             let sub_id = assignment.subscription_id;
-            let mut stream = match self.broker.stream(&ctx, sub_id).await {
-                Ok(s) => s,
-                Err(e @ EventBrokerError::PositionsNotSet { .. }) => {
-                    // A compliant consumer seeks every assigned partition before
-                    // opening the stream, and a subscription's assignment only
-                    // shrinks in place (gains arrive via terminal -> re-JOIN,
-                    // which seeks first), so this is not a transient race - the
-                    // stream was opened with an unseeded assigned partition.
-                    // Surface the protocol violation instead of masking it.
-                    return Err(e);
-                }
+            // The stream is open only at its first frame. A transport that opens lazily
+            // (REST) reports a refused open as the first item, and a stream that ends
+            // before any frame never opened: both take the failed-open arm below, with
+            // the stream already dropped.
+            let opened = match self.broker.stream(&ctx, sub_id).await {
+                Ok(mut s) => match s.next().await {
+                    Some(Ok(first)) => Ok((first, s)),
+                    Some(Err(e)) => Err(e),
+                    None => Err(EventBrokerError::Transport(
+                        "stream ended before its first frame".to_owned(),
+                    )),
+                },
+                Err(e) => Err(e),
+            };
+            if cancel.is_cancelled() {
+                break;
+            }
+            let (first, rest) = match opened {
+                Ok(opened) => opened,
                 Err(e) => {
                     warn!(
                         slot_idx = self.slot_idx,
                         error = %e,
                         "transactional stream open failed; re-joining"
                     );
+                    // A member whose stream never opened, or never got past its first
+                    // frame, may still hold a share of the partitions; a JOIN evicts only
+                    // `Disconnected` members. Leave it first; a failed leave leaves it to
+                    // the broker's timeouts.
+                    let _ = self.broker.leave(&ctx, sub_id).await;
                     assignment = self
                         .rejoin(&ctx, &group_id, sub_id, &mut consecutive_failures)
                         .await?;
@@ -515,8 +539,10 @@ where
                     continue;
                 }
             };
+            let mut stream = futures_util::stream::iter([Ok(first)]).chain(rest);
 
             let mut consecutive_heartbeats: usize = 0;
+            // Only an open stream starts the re-JOIN budget over.
             consecutive_failures = 0;
             let mut drain_before_rejoin = false;
 
@@ -529,6 +555,7 @@ where
                         consecutive_heartbeats = 0;
                         if self
                             .dispatch_event(
+                                &cancel,
                                 event,
                                 DispatchState {
                                     cursors: &cursors,
@@ -580,7 +607,14 @@ where
                     }) => {
                         self.observe_positions(&assigned).await;
                     }
-                    Err(EventBrokerError::Transport(_)) => break,
+                    Err(e @ EventBrokerError::Transport(_)) => {
+                        warn!(
+                            slot_idx = self.slot_idx,
+                            error = %e,
+                            "transactional stream transport error; re-joining"
+                        );
+                        break;
+                    }
                     Err(e) => {
                         warn!(
                             slot_idx = self.slot_idx,
@@ -597,6 +631,7 @@ where
             }
             if drain_before_rejoin {
                 self.drain_subscription_buffers(
+                    &cancel,
                     DispatchState {
                         cursors: &cursors,
                         buffers: &buffers,
@@ -612,6 +647,14 @@ where
                 .await;
                 let _ = self.broker.leave(&ctx, sub_id).await;
             }
+            // End the old stream before the re-JOIN. The broker evicts a member whose
+            // stream has closed (`Disconnected`) when the next JOIN arrives, but splits
+            // the partitions with one whose stream is still open, and that one then
+            // keeps its share until its stream closes, then `session_timeout`. Closing
+            // the stream is enough without a LEAVE, which a broken transport may not
+            // carry. That is proven in process; over REST the server notices the close
+            // when hyper does, a delay that is not measured (NEW-RESUME).
+            drop(stream);
             self.emit_runtime_event(ConsumerRuntimeEvent::SubscriptionTerminated {
                 subscription_id: sub_id,
                 reason: ConnectionDropReason::StreamTerminated,
@@ -636,49 +679,55 @@ where
 
     async fn dispatch_event(
         &self,
-        wire: WireEvent,
+        cancel: &tokio_util::sync::CancellationToken,
+        event: EventV1,
         state: DispatchState<'_>,
         active: ActiveSubscription<'_>,
     ) -> bool {
+        // A transport stamps every event it can place, so one without a position is
+        // skipped like an event no topic can be attributed to.
+        let (Some(partition), Some(sequence), Some(sequence_time)) =
+            (event.partition(), event.sequence(), event.sequence_time())
+        else {
+            warn!(
+                event_id = %event.id(),
+                type_id = %event.event_type(),
+                "a delivered event carries no stamped position; skipping it"
+            );
+            return false;
+        };
         // A topic is what an event's type declares, so it is resolved rather than
         // read off the frame. A type this consumer has not seen costs one call
         // here and none afterwards.
         let topic = match self
             .type_cache
-            .topic_of(&self.broker, active.ctx, &wire.type_id)
+            .topic_of(&self.broker, active.ctx, event.event_type())
             .await
         {
             Ok(topic) => topic,
             Err(err) => {
                 warn!(
                     error = %err,
-                    type_id = %wire.type_id,
+                    type_id = %event.event_type(),
                     "cannot attribute a delivered event to a topic; skipping it"
                 );
                 return false;
             }
         };
         let topic_id = TopicId::from_gts(&topic);
-        let key = TopicPartitionKey::new(topic.clone(), topic_id, wire.partition);
-        let raw = RawEvent {
-            id: wire.id,
-            type_id: wire.type_id.clone(),
-            topic,
-            tenant_id: wire.tenant_id,
-            subject: wire.subject,
-            subject_type: wire.subject_type,
-            partition: wire.partition,
-            sequence: wire.sequence,
-            offset: wire.sequence,
-            occurred_at: wire.occurred_at,
-            sequence_time: wire.sequence_time,
-            trace_parent: wire.trace_parent,
-            data: wire.data,
+        let key = TopicPartitionKey::new(topic, topic_id, partition);
+        let buffered = Buffered {
+            event,
+            at: StoredPosition {
+                partition,
+                sequence,
+                sequence_time,
+            },
         };
         let enqueued = match enqueue_partition_batch(
             state.buffers,
             key.clone(),
-            raw,
+            buffered,
             self.partition_buffer_capacity,
         )
         .await
@@ -694,7 +743,7 @@ where
                 state,
                 key.clone(),
                 enqueued.buffered_count,
-                wire.sequence,
+                sequence,
                 active,
             )
             .await
@@ -702,11 +751,13 @@ where
             return true;
         }
         let batch_events = drain_partition_batch(state.buffers, &key, self.batch_max_events).await;
-        self.process_batch(state, key, batch_events, active).await
+        self.process_batch(cancel, state, key, batch_events, active)
+            .await
     }
 
     async fn drain_subscription_buffers(
         &self,
+        cancel: &tokio_util::sync::CancellationToken,
         state: DispatchState<'_>,
         active: ActiveSubscription<'_>,
     ) {
@@ -721,25 +772,32 @@ where
             else {
                 break;
             };
-            let _ = self.process_batch(state, key, batch_events, active).await;
+            let _ = self
+                .process_batch(cancel, state, key, batch_events, active)
+                .await;
         }
     }
 
     async fn process_batch(
         &self,
+        cancel: &tokio_util::sync::CancellationToken,
         state: DispatchState<'_>,
         key: TopicPartitionKey,
-        batch_events: Vec<RawEvent>,
+        batch_events: Vec<Buffered>,
         active: ActiveSubscription<'_>,
     ) -> bool {
         if batch_events.is_empty() {
             return false;
         }
-        let batch_partition = batch_events[0].partition;
-        let batch_offset = batch_events
+        let (events, positions): (Vec<EventV1>, Vec<StoredPosition>) = batch_events
+            .into_iter()
+            .map(|buffered| (buffered.event, buffered.at))
+            .unzip();
+        let batch_partition = positions[0].partition;
+        let batch_offset = positions
             .last()
-            .map(|event| event.offset)
-            .unwrap_or_else(|| batch_events[0].offset);
+            .map(|at| at.sequence)
+            .unwrap_or_else(|| positions[0].sequence);
         let topic_id = key.topic_id;
 
         let mut attempts: u16 = 1;
@@ -750,22 +808,23 @@ where
                 topic_id,
                 topic: key.topic.clone(),
                 partition: batch_partition,
-                len: batch_events.len(),
+                len: events.len(),
             })
             .await;
             let commit_handle = TxCommitHandle::new(TxCommitHandleParts {
                 partition: batch_partition,
-                offsets: batch_events.iter().map(|event| event.offset).collect(),
+                offsets: positions.iter().map(|at| at.sequence).collect(),
                 offset_manager: self.offset_manager.clone(),
                 group: *active.group_id,
                 topic: topic_id,
             });
             let committed_offset = commit_handle.committed_offset.clone();
-            let batch = EventBatch::new(&batch_events);
+            let batch = EventBatch::new(&events);
+            let delivery = Delivery::new(key.topic.clone(), key.partition, attempts);
             let started_at = Instant::now();
             match self
                 .handler
-                .handle_batch(&batch, attempts, commit_handle)
+                .deliver(&batch, &positions, &delivery, commit_handle)
                 .await
             {
                 Ok(crate::consumer::HandlerOutcome::Success) => {
@@ -796,9 +855,9 @@ where
                         .await;
                         return true;
                     };
-                    let processed_count = match processed_count_from_delivered_offset(
+                    let processed_count = match BatchHandlerOutcome::processed_count_through(
                         committed_offset,
-                        &batch_events,
+                        &positions,
                     ) {
                         Ok(count) => count,
                         Err(err) => {
@@ -812,7 +871,7 @@ where
                             return true;
                         }
                     };
-                    let outcome = if processed_count == batch_events.len() {
+                    let outcome = if processed_count == positions.len() {
                         BatchHandlerOutcome::Success
                     } else {
                         BatchHandlerOutcome::AdvanceThrough {
@@ -839,7 +898,7 @@ where
                         let mut guard = state.cursors.write().await;
                         let c = guard.entry(key.clone()).or_default();
                         let frontier =
-                            c.advance_through_delivered_prefix(&batch_events[..processed_count]);
+                            c.advance_through_delivered_prefix(&positions[..processed_count]);
                         c.committed = frontier;
                         frontier
                     };
@@ -879,6 +938,9 @@ where
                     {
                         return true;
                     }
+                    if cancel.is_cancelled() {
+                        return false;
+                    }
                     trace!(
                         reason,
                         attempts, "transactional handler returned Retry; backing off"
@@ -891,7 +953,12 @@ where
                         delay: backoff,
                     })
                     .await;
-                    tokio::time::sleep(backoff).await;
+                    // Giving the batch up here advances no cursor: unless the handler
+                    // committed it, the next start delivers it again (at-least-once).
+                    tokio::select! {
+                        _ = cancel.cancelled() => return false,
+                        _ = tokio::time::sleep(backoff) => {}
+                    }
                     backoff = (backoff * 2).min(self.retry_max);
                     attempts = attempts.saturating_add(1);
                 }
@@ -915,6 +982,9 @@ where
                     {
                         return true;
                     }
+                    if cancel.is_cancelled() {
+                        return false;
+                    }
                     warn!(error = %e, "transactional handler returned Err; treating as Retry");
                     self.emit_runtime_event(ConsumerRuntimeEvent::RetryScheduled {
                         topic_id,
@@ -924,7 +994,12 @@ where
                         delay: backoff,
                     })
                     .await;
-                    tokio::time::sleep(backoff).await;
+                    // Giving the batch up here advances no cursor: unless the handler
+                    // committed it, the next start delivers it again (at-least-once).
+                    tokio::select! {
+                        _ = cancel.cancelled() => return false,
+                        _ = tokio::time::sleep(backoff) => {}
+                    }
                     backoff = (backoff * 2).min(self.retry_max);
                     attempts = attempts.saturating_add(1);
                 }
@@ -1239,7 +1314,7 @@ where
 
 impl<H, OM> SlotDispatcher<H, OM>
 where
-    H: ConsumerHandler + 'static,
+    H: DeliverBatch + 'static,
     OM: CommitOffset + 'static,
 {
     pub async fn run(
@@ -1368,22 +1443,30 @@ where
             }
 
             let sub_id = assignment.subscription_id;
-            let mut stream = match self.broker.stream(&ctx, sub_id).await {
-                Ok(s) => s,
+            // The stream is open only at its first frame. A transport that opens lazily
+            // (REST) reports a refused open as the first item, and a stream that ends
+            // before any frame never opened: both take the failed-open arm below, with
+            // the stream already dropped.
+            let opened = match self.broker.stream(&ctx, sub_id).await {
+                Ok(mut s) => match s.next().await {
+                    Some(Ok(first)) => Ok((first, s)),
+                    Some(Err(e)) => Err(e),
+                    None => Err(EventBrokerError::Transport(
+                        "stream ended before its first frame".to_owned(),
+                    )),
+                },
+                Err(e) => Err(e),
+            };
+            if cancel.is_cancelled() {
+                break;
+            }
+            let (first, rest) = match opened {
+                Ok(opened) => opened,
                 Err(EventBrokerError::SubscriptionRecoveryExhausted { .. }) => {
                     return Err(EventBrokerError::SubscriptionRecoveryExhausted {
                         attempts: consecutive_failures,
                         detail: "stream open: recovery exhausted".into(),
                     });
-                }
-                Err(e @ EventBrokerError::PositionsNotSet { .. }) => {
-                    // A compliant consumer seeks every assigned partition before
-                    // opening the stream, and a subscription's assignment only
-                    // shrinks in place (gains arrive via terminal -> re-JOIN,
-                    // which seeks first), so this is not a transient race - the
-                    // stream was opened with an unseeded assigned partition.
-                    // Surface the protocol violation instead of masking it.
-                    return Err(e);
                 }
                 Err(e) => {
                     warn!(
@@ -1391,6 +1474,11 @@ where
                         error = %e,
                         "stream open failed; re-joining"
                     );
+                    // A member whose stream never opened, or never got past its first
+                    // frame, may still hold a share of the partitions; a JOIN evicts only
+                    // `Disconnected` members. Leave it first; a failed leave leaves it to
+                    // the broker's timeouts.
+                    let _ = self.broker.leave(&ctx, sub_id).await;
                     assignment = self
                         .rejoin(&ctx, &group_id, sub_id, &mut consecutive_failures)
                         .await?;
@@ -1405,8 +1493,10 @@ where
                     continue;
                 }
             };
+            let mut stream = futures_util::stream::iter([Ok(first)]).chain(rest);
 
             let mut consecutive_heartbeats: usize = 0;
+            // Only an open stream starts the re-JOIN budget over.
             consecutive_failures = 0;
             let mut drain_before_rejoin = false;
 
@@ -1486,7 +1576,12 @@ where
                         self.commit_positions(&ctx, &group_id, sub_id, &assigned)
                             .await;
                     }
-                    Err(EventBrokerError::Transport(_)) => {
+                    Err(e @ EventBrokerError::Transport(_)) => {
+                        warn!(
+                            slot_idx = self.slot_idx,
+                            error = %e,
+                            "stream transport error; re-joining"
+                        );
                         break; // outer loop rejoins
                     }
                     Err(e) => {
@@ -1523,6 +1618,14 @@ where
                 .await;
                 let _ = self.broker.leave(&ctx, sub_id).await;
             }
+            // End the old stream before the re-JOIN. The broker evicts a member whose
+            // stream has closed (`Disconnected`) when the next JOIN arrives, but splits
+            // the partitions with one whose stream is still open, and that one then
+            // keeps its share until its stream closes, then `session_timeout`. Closing
+            // the stream is enough without a LEAVE, which a broken transport may not
+            // carry. That is proven in process; over REST the server notices the close
+            // when hyper does, a delay that is not measured (NEW-RESUME).
+            drop(stream);
             self.emit_runtime_event(ConsumerRuntimeEvent::SubscriptionTerminated {
                 subscription_id: sub_id,
                 reason: ConnectionDropReason::StreamTerminated,
@@ -1551,50 +1654,55 @@ where
     async fn dispatch_event(
         &self,
         cancel: &tokio_util::sync::CancellationToken,
-        wire: WireEvent,
+        event: EventV1,
         state: DispatchState<'_>,
         active: ActiveSubscription<'_>,
     ) -> bool {
+        // A transport stamps every event it can place, so one without a position is
+        // skipped like an event no topic can be attributed to.
+        let (Some(partition), Some(sequence), Some(sequence_time)) =
+            (event.partition(), event.sequence(), event.sequence_time())
+        else {
+            warn!(
+                event_id = %event.id(),
+                type_id = %event.event_type(),
+                "a delivered event carries no stamped position; skipping it"
+            );
+            return false;
+        };
         // A topic is what an event's type declares, so it is resolved rather than
         // read off the frame. A type this consumer has not seen costs one call
         // here and none afterwards.
         let topic = match self
             .type_cache
-            .topic_of(&self.broker, active.ctx, &wire.type_id)
+            .topic_of(&self.broker, active.ctx, event.event_type())
             .await
         {
             Ok(topic) => topic,
             Err(err) => {
                 warn!(
                     error = %err,
-                    type_id = %wire.type_id,
+                    type_id = %event.event_type(),
                     "cannot attribute a delivered event to a topic; skipping it"
                 );
                 return false;
             }
         };
         let topic_id = TopicId::from_gts(&topic);
-        let key = TopicPartitionKey::new(topic.clone(), topic_id, wire.partition);
+        let key = TopicPartitionKey::new(topic, topic_id, partition);
 
-        let raw = RawEvent {
-            id: wire.id,
-            type_id: wire.type_id.clone(),
-            topic,
-            tenant_id: wire.tenant_id,
-            subject: wire.subject,
-            subject_type: wire.subject_type,
-            partition: wire.partition,
-            sequence: wire.sequence,
-            offset: wire.sequence,
-            occurred_at: wire.occurred_at,
-            sequence_time: wire.sequence_time,
-            trace_parent: wire.trace_parent,
-            data: wire.data,
+        let buffered = Buffered {
+            event,
+            at: StoredPosition {
+                partition,
+                sequence,
+                sequence_time,
+            },
         };
         let enqueued = match enqueue_partition_batch(
             state.buffers,
             key.clone(),
-            raw,
+            buffered,
             self.partition_buffer_capacity,
         )
         .await
@@ -1610,7 +1718,7 @@ where
                 state,
                 key.clone(),
                 enqueued.buffered_count,
-                wire.sequence,
+                sequence,
                 active,
             )
             .await
@@ -1653,17 +1761,21 @@ where
         cancel: &tokio_util::sync::CancellationToken,
         state: DispatchState<'_>,
         key: TopicPartitionKey,
-        batch_events: Vec<RawEvent>,
+        batch_events: Vec<Buffered>,
         active: ActiveSubscription<'_>,
     ) -> bool {
         if batch_events.is_empty() {
             return false;
         }
-        let batch_partition = batch_events[0].partition;
-        let batch_offset = batch_events
+        let (events, positions): (Vec<EventV1>, Vec<StoredPosition>) = batch_events
+            .into_iter()
+            .map(|buffered| (buffered.event, buffered.at))
+            .unzip();
+        let batch_partition = positions[0].partition;
+        let batch_offset = positions
             .last()
-            .map(|event| event.offset)
-            .unwrap_or_else(|| batch_events[0].offset);
+            .map(|at| at.sequence)
+            .unwrap_or_else(|| positions[0].sequence);
         let topic_id = key.topic_id;
 
         let mut attempts: u16 = 1;
@@ -1677,31 +1789,33 @@ where
                 topic_id,
                 topic: key.topic.clone(),
                 partition: batch_partition,
-                len: batch_events.len(),
+                len: events.len(),
             })
             .await;
-            let batch = EventBatch::new(&batch_events);
+            let batch = EventBatch::new(&events);
+            let delivery = Delivery::new(key.topic.clone(), key.partition, attempts);
             let started_at = Instant::now();
-            match self.handler.handle_batch(&batch, attempts).await {
-                Ok(
-                    outcome @ (BatchHandlerOutcome::Success
-                    | BatchHandlerOutcome::AdvanceThrough { .. }),
-                ) => {
-                    let processed_count =
-                        match processed_count_from_outcome(&outcome, &batch_events) {
-                            Ok(Some(count)) => count,
-                            Ok(None) => unreachable!("retry outcomes are handled separately"),
-                            Err(err) => {
-                                self.emit_runtime_event(ConsumerRuntimeEvent::HandlerFailed {
-                                    topic_id,
-                                    topic: key.topic.clone(),
-                                    partition: batch_partition,
-                                    error: err.to_string(),
-                                })
-                                .await;
-                                return true;
-                            }
-                        };
+            match self.handler.deliver(&batch, &positions, &delivery).await {
+                Ok(Delivered {
+                    outcome:
+                        outcome @ (BatchHandlerOutcome::Success
+                        | BatchHandlerOutcome::AdvanceThrough { .. }),
+                    skipped,
+                }) => {
+                    let processed_count = match outcome.processed_count(&positions) {
+                        Ok(Some(count)) => count,
+                        Ok(None) => unreachable!("retry outcomes are handled separately"),
+                        Err(err) => {
+                            self.emit_runtime_event(ConsumerRuntimeEvent::HandlerFailed {
+                                topic_id,
+                                topic: key.topic.clone(),
+                                partition: batch_partition,
+                                error: err.to_string(),
+                            })
+                            .await;
+                            return true;
+                        }
+                    };
                     self.emit_runtime_event(ConsumerRuntimeEvent::HandlerBatchCompleted {
                         topic_id,
                         topic: key.topic.clone(),
@@ -1709,6 +1823,9 @@ where
                         outcome: outcome.clone(),
                     })
                     .await;
+                    if let Some(skipped) = skipped {
+                        self.report_skipped_event(&key, skipped).await;
+                    }
                     let drop_stream = self
                         .observe_handler_slow_signal(
                             state,
@@ -1723,7 +1840,7 @@ where
                         let mut guard = state.cursors.write().await;
                         let c = guard.entry(key.clone()).or_default();
                         (
-                            c.advance_through_delivered_prefix(&batch_events[..processed_count]),
+                            c.advance_through_delivered_prefix(&positions[..processed_count]),
                             false,
                         )
                     };
@@ -1743,7 +1860,10 @@ where
                     }
                     return drop_stream;
                 }
-                Ok(BatchHandlerOutcome::Retry { reason }) => {
+                Ok(Delivered {
+                    outcome: BatchHandlerOutcome::Retry { reason },
+                    ..
+                }) => {
                     self.emit_runtime_event(ConsumerRuntimeEvent::HandlerBatchCompleted {
                         topic_id,
                         topic: key.topic.clone(),
@@ -1947,6 +2067,31 @@ where
 
     async fn emit_runtime_event(&self, event: ConsumerRuntimeEvent) {
         emit_runtime_event_to(&self.listeners, self.listener_timeout, event).await;
+    }
+
+    /// Reports an event a typed route's `Skip` policy advanced past: the runtime event,
+    /// then a warn naming its id, type and decode category, never its data.
+    async fn report_skipped_event(&self, key: &TopicPartitionKey, skipped: SkippedEvent) {
+        let SkippedEvent {
+            event_id,
+            sequence,
+            type_id,
+            category,
+        } = skipped;
+        self.emit_runtime_event(ConsumerRuntimeEvent::EventSkipped {
+            topic: key.topic.clone(),
+            partition: key.partition,
+            sequence,
+            type_id: type_id.clone(),
+            category,
+        })
+        .await;
+        warn!(
+            event_id = %event_id,
+            type_id = %type_id,
+            category = %category,
+            "a delivered event does not decode as its route's payload type; skipping it"
+        );
     }
 
     /// Resolve a starting position for each slot via `CommitOffset::position`

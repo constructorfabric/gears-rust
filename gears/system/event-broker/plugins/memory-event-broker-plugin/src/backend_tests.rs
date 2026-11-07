@@ -6,7 +6,8 @@ use event_broker_sdk::backend::{
     AppendRequest, Appended, Backend, BackendError, Dedup, Fence, FenceKey, FenceSeq, Flush, Head,
     KeyedEvent, LogClaim, LogId, Partition, Replacing, Retention, TopicPartition, TopicSpec, Wait,
 };
-use event_broker_sdk::{Event, GtsInstanceId, GtsTypeId, PartitionRange, Position, Sequence};
+use event_broker_sdk::models::Event;
+use event_broker_sdk::{GtsInstanceId, GtsTypeId, PartitionRange, Position, Sequence};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 

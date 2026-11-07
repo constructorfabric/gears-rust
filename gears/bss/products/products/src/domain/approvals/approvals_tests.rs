@@ -10,9 +10,9 @@ use crate::{
 };
 use bss_approval::{ApprovalError, ApprovalSubject, Engine, Policy, Store, SubmitRequest};
 use bss_products_sdk::models::{Lifecycle, SkuContent, SkuType};
-use event_broker_sdk::TypedEvent;
 use std::sync::Arc;
 use toolkit_db::{Db, DbTx};
+use toolkit_gts::GtsSchema;
 use uuid::Uuid;
 
 async fn in_tx<T: Send + 'static>(

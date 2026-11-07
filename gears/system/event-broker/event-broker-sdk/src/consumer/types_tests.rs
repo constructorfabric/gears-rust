@@ -6,6 +6,7 @@ use uuid::Uuid;
 
 use super::*;
 use crate::error::EventBrokerError;
+use crate::gts::{EventV1, StoredPosition};
 use crate::ids::{ConsumerGroupId, EventTypeId, TopicId};
 use gts::{GtsIdPattern, GtsInstanceId};
 
@@ -20,11 +21,11 @@ fn gpat(id: impl AsRef<str>) -> GtsIdPattern {
 struct NoSecurityContextHandler;
 
 #[async_trait::async_trait]
-impl SingleEventHandler for NoSecurityContextHandler {
+impl EventHandler<serde_json::Value> for NoSecurityContextHandler {
     async fn handle(
         &self,
-        _event: RawEvent,
-        _attempts: u16,
+        _event: EventV1,
+        _delivery: &Delivery,
     ) -> Result<HandlerOutcome, EventBrokerError> {
         Ok(HandlerOutcome::Success)
     }
@@ -62,7 +63,7 @@ fn uuid_identity_newtypes_preserve_uuid_values() {
 
 #[test]
 fn handler_signature_has_no_security_context_parameter() {
-    fn assert_handler<T: SingleEventHandler>() {}
+    fn assert_handler<T: EventHandler<serde_json::Value>>() {}
 
     assert_handler::<NoSecurityContextHandler>();
 }
@@ -74,31 +75,36 @@ fn runtime_listener_signature_has_no_offset_decision_return() {
     assert_listener::<NoOffsetDecisionRuntimeListener>();
 }
 
-#[test]
-fn dead_letter_record_exposes_context_fields_for_diagnosis_and_replay() {
-    let group_id = ConsumerGroupId::new(Uuid::new_v4());
-    let topic = gts_id!("cf.core.events.topic.v1~example.orders.x.x.v1");
-    let topic_id = TopicId::from_gts(topic);
-    let payload = serde_json::json!({ "order_id": "order-1" });
-    let raw = RawEvent {
-        id: Uuid::new_v4(),
-        type_id: gts::GtsTypeId::new(gts_id!(
+fn stamped_event(offset: i64) -> EventV1 {
+    EventV1::builder_for(
+        gts::GtsTypeId::new(gts_id!(
             "cf.core.events.event.v1~example.orders.order_created.x.v1~"
         )),
-        topic: gts::GtsInstanceId::try_new(topic).unwrap(),
-        tenant_id: Uuid::new_v4(),
-        subject: "order-1".to_owned(),
-        subject_type: gts::GtsTypeId::new("gts.x.eb.test.subject.v1~"),
+        serde_json::json!({ "order_id": "order-1" }),
+    )
+    .id(Uuid::from_u128(u128::try_from(offset).unwrap()))
+    .tenant_id(Uuid::nil())
+    .subject("order-1")
+    .subject_type_id(gts::GtsTypeId::new("gts.x.eb.test.subject.v1~"))
+    .occurred_at("2026-01-02T03:04:05Z".parse().unwrap())
+    .build()
+    .unwrap()
+    .stamp_position(StoredPosition {
         partition: 3,
-        sequence: Sequence::assigned(42),
-        offset: Sequence::assigned(42),
-        occurred_at: chrono::Utc::now(),
-        sequence_time: chrono::Utc::now(),
-        trace_parent: Some("00-test".to_owned()),
-        data: payload.clone(),
-    };
+        sequence: Sequence::assigned(offset),
+        sequence_time: "2026-01-02T03:04:06Z".parse().unwrap(),
+    })
+}
 
-    let record = crate::dlq::DeadLetterRecord::builder(&raw, "schema mismatch")
+#[test]
+fn dead_letter_record_exposes_context_fields_for_diagnosis_and_replay() {
+    let group_id = ConsumerGroupId::new(Uuid::from_u128(0x7e57_0001));
+    let topic = gts_id!("cf.core.events.topic.v1~example.orders.x.x.v1");
+    let topic_id = TopicId::from_gts(topic);
+    let raw = stamped_event(42);
+    let delivery = Delivery::new(ginst(topic), 3, 1);
+
+    let record = crate::dlq::DeadLetterRecord::builder(&raw, &delivery, "schema mismatch")
         .group_id(group_id)
         .topic_id(topic_id)
         .attempts(2)
@@ -109,9 +115,29 @@ fn dead_letter_record_exposes_context_fields_for_diagnosis_and_replay() {
     assert_eq!(record.topic, topic);
     assert_eq!(record.partition, 3);
     assert_eq!(record.offset, Sequence::assigned(42));
-    assert_eq!(record.payload, payload);
+    assert_eq!(record.payload, serde_json::json!({ "order_id": "order-1" }));
     assert_eq!(record.reason, "schema mismatch");
     assert_eq!(record.attempts, Some(2));
+}
+
+/// Payloads may carry personal or secret data, so a batch prints its length only.
+#[test]
+fn an_event_batch_prints_its_length_not_its_events() {
+    let events = vec![stamped_event(10), stamped_event(11)];
+    let batch = EventBatch::new(&events);
+
+    assert_eq!(format!("{batch:?}"), "EventBatch { len: 2 }");
+}
+
+#[test]
+fn a_delivery_reads_back_its_topic_partition_and_attempts() {
+    let topic = ginst(gts_id!("cf.core.events.topic.v1~example.orders.x.x.v1"));
+
+    let delivery = Delivery::new(topic.clone(), 7, 3);
+
+    assert_eq!(delivery.topic(), &topic);
+    assert_eq!(delivery.partition(), 7);
+    assert_eq!(delivery.attempts(), 3);
 }
 
 #[test]

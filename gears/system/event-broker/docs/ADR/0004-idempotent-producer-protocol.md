@@ -171,7 +171,7 @@ Chain state is kept per `(producer_id, topic)`: `event_broker_producer_sequence`
 
 #### Producer Partitions
 
-A producer without partitions uses one producer id. A partitioned producer - one whose own work is split into partitions that number their events independently, such as the outbox partitions of the SDK's `DbProducer` - registers one producer id per producer partition, so each id has exactly one sequence space.
+A producer without partitions uses one producer id. A partitioned producer - one whose own work is split into partitions that number their events independently, such as the outbox partitions of the SDK's outbox producer (`OutboxSetup`) - registers one producer id per producer partition, so each id has exactly one sequence space.
 
 The rule is required, not advisory. A sequence space shared across producer partitions interleaves on a topic's chain: producer partition 3 sends `sequence = 7` after producer partition 9 sent `sequence = 40`. Chained mode answers `412`; monotonic mode treats `7` as a duplicate, answers `200 OK` and drops the event silently. The broker cannot tell such an interleave from a retry, so the producer guarantees one sequence space per producer id.
 

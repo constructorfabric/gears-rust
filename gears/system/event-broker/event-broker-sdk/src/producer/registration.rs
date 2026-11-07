@@ -1,11 +1,9 @@
 //! Durable managed producer registrations with UTC bindings on every SQL backend.
 
 use chrono::Utc;
-#[cfg(feature = "outbox")]
 use sea_orm::ActiveValue;
 use sea_orm::entity::prelude::*;
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
-#[cfg(feature = "outbox")]
 use toolkit_db::secure::secure_insert;
 use toolkit_db::secure::{
     AccessScope, ScopableEntity, ScopeError, SecureEntityExt, SecureUpdateExt,
@@ -15,7 +13,7 @@ use crate::api::ProducerMode;
 use crate::error::EventBrokerError;
 use crate::ids::ProducerId;
 
-use super::types::ManagedDeduplication;
+use super::types::ManagedRegistration;
 
 /// Longest registration key and queue name a row holds (`VARCHAR(255)`).
 pub(crate) const MAX_NAME_LEN: usize = 255;
@@ -102,7 +100,6 @@ impl RegistrationSlot {
 }
 
 /// A new registration's identity, before it is stored.
-#[cfg(feature = "outbox")]
 pub(crate) struct NewRegistration<'a> {
     pub(crate) slot: &'a RegistrationSlot,
     pub(crate) producer_id: ProducerId,
@@ -153,7 +150,6 @@ impl ProducerRegistrationStore {
             .collect()
     }
 
-    #[cfg(feature = "outbox")]
     pub(crate) async fn insert_new(
         &self,
         new: NewRegistration<'_>,
@@ -247,16 +243,16 @@ pub(crate) enum Replaced {
 impl ProducerRegistration {
     pub(crate) fn validate_matches(
         &self,
-        managed: &ManagedDeduplication,
+        managed: &ManagedRegistration,
         client_agent: &str,
     ) -> Result<(), EventBrokerError> {
-        if self.mode != managed.mode {
+        if self.mode != managed.mode() {
             return Err(EventBrokerError::InvalidProducerOptions {
                 detail: format!(
                     "managed producer registration '{}' has mode {}, expected {}",
                     self.slot.key,
                     mode_to_str(self.mode),
-                    mode_to_str(managed.mode)
+                    mode_to_str(managed.mode())
                 ),
             });
         }

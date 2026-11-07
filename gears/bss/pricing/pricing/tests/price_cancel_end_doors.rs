@@ -276,9 +276,7 @@ impl World {
             .iter()
             .map(|r| {
                 let text = r.try_get::<String>("", "payload").unwrap();
-                let envelope: event_broker_sdk::producer::ProducerOutboxEnvelope =
-                    serde_json::from_str(&text).unwrap();
-                serde_json::to_value(envelope).unwrap()
+                serde_json::from_str::<Value>(&text).expect("the envelope is JSON")
             })
             .filter(|e| e["type"] == PUBLISHED)
             .collect()

@@ -6,10 +6,10 @@ use async_trait::async_trait;
 use event_broker::test_support::StaticTypesRegistry;
 use event_broker_sdk::gts_id;
 use event_broker_sdk::{
-    BatchHandlerOutcome, CommitOffset, ConnectionDropReason, ConsumerBuffering, ConsumerBuilder,
-    ConsumerError, ConsumerGroupId, ConsumerGroupRef, ConsumerHandler, ConsumerRuntimeEvent,
-    ConsumerRuntimeListener, EventBatch, Fallback, InMemoryOffsetManager, OffsetManagerError,
-    OffsetStore, Position, TopicId,
+    BatchHandler, BatchHandlerOutcome, CommitOffset, ConnectionDropReason, ConsumerBuffering,
+    ConsumerBuilder, ConsumerError, ConsumerGroupId, ConsumerGroupRef, ConsumerRuntimeEvent,
+    ConsumerRuntimeListener, Delivery, EventBatch, Fallback, InMemoryOffsetManager,
+    OffsetManagerError, OffsetStore, Position, TopicId,
 };
 use serde_json::json;
 
@@ -69,11 +69,11 @@ struct SequencedBatchHandler {
 }
 
 #[async_trait]
-impl ConsumerHandler for SequencedBatchHandler {
+impl BatchHandler<serde_json::Value> for SequencedBatchHandler {
     async fn handle_batch(
         &self,
-        _batch: &EventBatch<'_>,
-        _attempts: u16,
+        _batch: &EventBatch<'_, serde_json::Value>,
+        _delivery: &Delivery,
     ) -> Result<BatchHandlerOutcome, ConsumerError> {
         self.timeline.lock().unwrap().push("handle");
         Ok(BatchHandlerOutcome::Success)
@@ -85,21 +85,21 @@ struct RecordingBatchHandler {
 }
 
 #[async_trait]
-impl ConsumerHandler for RecordingBatchHandler {
+impl BatchHandler<serde_json::Value> for RecordingBatchHandler {
     async fn handle_batch(
         &self,
-        batch: &EventBatch<'_>,
-        _attempts: u16,
+        batch: &EventBatch<'_, serde_json::Value>,
+        _delivery: &Delivery,
     ) -> Result<BatchHandlerOutcome, ConsumerError> {
         let chunk = batch.next_chunk(batch.len());
         self.subjects
             .lock()
             .unwrap()
-            .extend(chunk.iter().map(|event| event.subject.clone()));
+            .extend(chunk.iter().map(|event| event.subject().to_owned()));
         Ok(chunk
             .last()
             .map(|event| BatchHandlerOutcome::AdvanceThrough {
-                offset: event.offset,
+                offset: event.sequence().expect("a delivered event is stamped"),
             })
             .unwrap_or(BatchHandlerOutcome::Success))
     }

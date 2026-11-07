@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use async_trait::async_trait;
 use bytes::Bytes;
 use secrecy::ExposeSecret;
@@ -8,13 +10,14 @@ use toolkit_http::{HttpClient, HttpResponse, RequestBuilder};
 use toolkit_security::SecurityContext;
 
 use crate::api::{
-    EventBrokerApi, IngestOutcome, JoinRequest, ProducerCursors, ProducerMode, SeekPosition,
+    Ack, EventBrokerApi, IngestOutcome, JoinRequest, ProducerCursors, ProducerMode, SeekPosition,
     SeekResult, SubscriptionAssignment, TenantTraversalDepth,
 };
 use crate::error::EventBrokerError;
+use crate::gts::EventV1;
 use crate::ids::{ConsumerGroupId, ProducerId, SubscriptionId};
 use crate::models::{
-    ConsumerGroup, ConsumerGroupQuery, CreateConsumerGroupRequest, Event, EventType, Page,
+    ConsumerGroup, ConsumerGroupQuery, CreateConsumerGroupRequest, EventType, Page,
     PartitionAssignment, PartitionRange, ResetScope, Subscription, Topic, TopicSegment,
 };
 use crate::rest::stream;
@@ -22,6 +25,10 @@ use crate::rest::wire;
 use crate::sequence::Sequence;
 
 const V1: &str = "/event-broker/v1";
+
+/// The longest `Prefer: wait` the REST transport asks for: 5 s under the HTTP client's
+/// default 30 s request timeout, so the broker answers before the client gives up.
+pub const REST_MAX_SYNC_WAIT_SECS: u64 = 25;
 
 /// Wire framing for the delivery stream.
 ///
@@ -187,6 +194,18 @@ impl RestBroker {
         url: &str,
         body: Option<serde_json::Value>,
     ) -> Result<(u16, Bytes), EventBrokerError> {
+        self.call_with_headers(ctx, method, url, body, &[]).await
+    }
+
+    /// [`call`](Self::call) with extra request `headers`.
+    async fn call_with_headers(
+        &self,
+        ctx: &SecurityContext,
+        method: Method,
+        url: &str,
+        body: Option<serde_json::Value>,
+        headers: &[(&str, &str)],
+    ) -> Result<(u16, Bytes), EventBrokerError> {
         let mut rb = match method {
             Method::Get => self.http().get(url),
             Method::Post => self.http().post(url),
@@ -194,6 +213,9 @@ impl RestBroker {
         };
         if let Some(body) = &body {
             rb = rb.json(body).map_err(to_transport)?;
+        }
+        for (name, value) in headers {
+            rb = rb.header(name, value);
         }
         rb = self.authed(rb, ctx);
         if self.debug {
@@ -269,6 +291,43 @@ impl RestBroker {
         } else {
             Err(error_from_bytes(status, &bytes))
         }
+    }
+
+    /// Sends a publish `body` to `url` and reports the outcome its status names. A
+    /// persisted publish asks the broker to wait with `Prefer: wait=N`.
+    async fn send_publish(
+        &self,
+        ctx: &SecurityContext,
+        url: &str,
+        body: serde_json::Value,
+        ack: Ack,
+    ) -> Result<IngestOutcome, EventBrokerError> {
+        let prefer = match ack {
+            Ack::Accepted => None,
+            Ack::Persisted { within } => Some(format!("wait={}", Self::prefer_wait_secs(within))),
+        };
+        let headers: Vec<(&str, &str)> = prefer
+            .as_deref()
+            .map(|prefer| ("Prefer", prefer))
+            .into_iter()
+            .collect();
+        let (status, bytes) = self
+            .call_with_headers(ctx, Method::Post, url, Some(body), &headers)
+            .await?;
+        if (200..300).contains(&status) {
+            Ok(outcome_from_status(status))
+        } else {
+            Err(error_from_bytes(status, &bytes))
+        }
+    }
+
+    /// The `N` of `Prefer: wait=N` for `within`: whole seconds rounded up, at least 1
+    /// and at most [`REST_MAX_SYNC_WAIT_SECS`].
+    fn prefer_wait_secs(within: Duration) -> u64 {
+        within
+            .as_secs()
+            .saturating_add(u64::from(within.subsec_nanos() > 0))
+            .clamp(1, REST_MAX_SYNC_WAIT_SECS)
     }
 
     /// Follows `next_cursor` to accumulate every page of a list endpoint whose
@@ -502,37 +561,36 @@ impl EventBrokerApi for RestBroker {
         Ok(ProducerId(resp.id))
     }
 
+    /// `Ack::Persisted { within }` sends `Prefer: wait=N`: `within` in whole seconds
+    /// rounded up, at least 1 and at most [`REST_MAX_SYNC_WAIT_SECS`]. `201` reports
+    /// `Persisted`, `202` `Accepted`, `200` `Duplicate`.
     async fn publish(
         &self,
         ctx: &SecurityContext,
-        event: &Event,
+        event: &EventV1,
+        ack: Ack,
     ) -> Result<IngestOutcome, EventBrokerError> {
-        let body = wire::PublishEventWire::from_event(event);
+        let body = wire::PublishEventWire::try_from(event)?;
         let url = self.url(&format!("{V1}/events"));
-        let status = self
-            .call_status(ctx, Method::Post, &url, Some(to_value(&body)?))
-            .await?;
-        Ok(outcome_from_status(status))
+        self.send_publish(ctx, &url, to_value(&body)?, ack).await
     }
 
     async fn publish_batch(
         &self,
         ctx: &SecurityContext,
-        events: &[Event],
+        events: &[EventV1],
+        ack: Ack,
     ) -> Result<IngestOutcome, EventBrokerError> {
         let body = wire::PublishBatchWire {
             events: events
                 .iter()
-                .map(wire::PublishEventWire::from_event)
-                .collect(),
+                .map(wire::PublishEventWire::try_from)
+                .collect::<Result<_, _>>()?,
         };
         let url = self.url(&format!("{V1}/events:batch"));
         // The wire reports one status for the whole batch, no per-event body:
         // 202 when anything was enqueued, 200 when every event is a duplicate.
-        let status = self
-            .call_status(ctx, Method::Post, &url, Some(to_value(&body)?))
-            .await?;
-        Ok(outcome_from_status(status))
+        self.send_publish(ctx, &url, to_value(&body)?, ack).await
     }
 
     async fn get_producer_cursors(
@@ -582,6 +640,8 @@ impl EventBrokerApi for RestBroker {
         consumer_group_from_wire(resp)
     }
 
+    /// Sends `ids` and `kind` as `$filter`. The broker rejects a `$filter` longer than 8 KiB with
+    /// `400` (`FILTER_TOO_LONG`), so one call carries about 100 ids.
     async fn list_consumer_groups(
         &self,
         ctx: &SecurityContext,
@@ -594,11 +654,23 @@ impl EventBrokerApi for RestBroker {
         if let Some(cursor) = query.cursor {
             params.push(("cursor".to_owned(), cursor));
         }
-        if let Some(filter) = query.filter {
-            params.push(("$filter".to_owned(), filter));
+        // The documented filterable fields: `id` (eq/in) and `kind` (eq).
+        let mut filters = Vec::new();
+        match query.ids.as_slice() {
+            [] => {}
+            [id] => filters.push(format!("id eq '{}'", id.to_gts())),
+            ids => {
+                let quoted: Vec<String> =
+                    ids.iter().map(|id| format!("'{}'", id.to_gts())).collect();
+                filters.push(format!("id in ({})", quoted.join(",")));
+            }
         }
-        if let Some(orderby) = query.orderby {
-            params.push(("$orderby".to_owned(), orderby));
+        if let Some(kind) = query.kind {
+            let token = wire::ConsumerGroupKindWire::from(kind).as_str();
+            filters.push(format!("kind eq '{token}'"));
+        }
+        if !filters.is_empty() {
+            params.push(("$filter".to_owned(), filters.join(" and ")));
         }
         let qs = serde_html_form::to_string(&params).unwrap_or_default();
         let url = if qs.is_empty() {

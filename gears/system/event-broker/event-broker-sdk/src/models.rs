@@ -122,23 +122,25 @@ pub struct Page<T> {
     pub limit: u32,
 }
 
-/// Query parameters for [`EventBrokerApi::list_consumer_groups`](crate::api::EventBrokerApi::list_consumer_groups).
+/// Query parameters for
+/// [`EventBrokerApi::list_consumer_groups`](crate::api::EventBrokerApi::list_consumer_groups).
 /// Built fluently; `ConsumerGroupQuery::default()` requests the first page with the
-/// broker's default limit and no filter/order.
+/// broker's default limit and no filter. The listing has one fixed order, by id.
 ///
 /// ```ignore
-/// let q = ConsumerGroupQuery::new().limit(50).filter("name eq 'orders'");
+/// let q = ConsumerGroupQuery::new().limit(50).kind(ConsumerGroupKind::Anonymous);
 /// ```
 #[derive(Debug, Clone, Default)]
 pub struct ConsumerGroupQuery {
     /// Max items per page (broker default when unset).
     pub limit: Option<u32>,
-    /// Opaque pagination cursor from a previous page's `next_cursor`.
+    /// A cursor from a previous page's `next_cursor` or `prev_cursor`; valid only with the same
+    /// `ids` and `kind`.
     pub cursor: Option<String>,
-    /// Filter expression (backend-defined grammar).
-    pub filter: Option<String>,
-    /// Ordering expression (backend-defined grammar).
-    pub orderby: Option<String>,
+    /// Only these groups (any of them); empty means no id filter.
+    pub ids: Vec<ConsumerGroupId>,
+    /// Only groups of this kind.
+    pub kind: Option<ConsumerGroupKind>,
 }
 
 impl ConsumerGroupQuery {
@@ -156,14 +158,15 @@ impl ConsumerGroupQuery {
         self.cursor = Some(cursor.into());
         self
     }
+    /// Adds `id` to the groups the listing keeps.
     #[must_use]
-    pub fn filter(mut self, filter: impl Into<String>) -> Self {
-        self.filter = Some(filter.into());
+    pub fn id(mut self, id: ConsumerGroupId) -> Self {
+        self.ids.push(id);
         self
     }
     #[must_use]
-    pub fn orderby(mut self, orderby: impl Into<String>) -> Self {
-        self.orderby = Some(orderby.into());
+    pub fn kind(mut self, kind: ConsumerGroupKind) -> Self {
+        self.kind = Some(kind);
         self
     }
 }
@@ -180,18 +183,15 @@ pub enum ResetScope<'a> {
     Topic(&'a str),
 }
 
-/// The event envelope. Matches `gts.cf.core.events.event.v1~.schema.json` in the design and is the
-/// parameter/return type on the public [`EventBrokerApi`](crate::api::EventBrokerApi)
-/// (publish/storage side). Broker-stamped fields (`partition`, `sequence`,
-/// `sequence_time`) are `None` on publish payloads; the broker populates them on
-/// receipt. `sequence` is the only ordering key the wire carries - there is no
-/// separate `offset` on an event; a consumer's offset is the `sequence` it has
+/// The backend record of an event: what a storage backend appends (`backend::KeyedEvent`)
+/// and reads back. A transport publishes an [`EventV1`](crate::gts::EventV1) instead.
+/// Broker-stamped fields (`partition`, `sequence`, `sequence_time`) are `None` until the
+/// backend assigns them. `sequence` is the only ordering key the wire carries - there is
+/// no separate `offset` on an event; a consumer's offset is the `sequence` it has
 /// processed.
 ///
-/// This is a plain domain type with no serde derives - construct it via field
-/// init. Wire (de)serialization is the transport's concern: the `outbox` async
-/// producer round-trips it through its own `OutboxEvent` DTO, and an HTTP backend
-/// owns its own wire mapping.
+/// This is a plain domain type with no serde derives - construct it via field init. Each
+/// backend owns its own (de)serialization.
 #[derive(Debug, Clone)]
 pub struct Event {
     pub id: Uuid,
@@ -209,7 +209,7 @@ pub struct Event {
     pub sequence: Option<Sequence>,
     pub sequence_time: Option<DateTime<Utc>>,
 
-    // Publisher-only (writeOnly; stripped on read)
+    // Chain metadata a backend record can carry; the broker's backend conversions leave it unset.
     pub meta: Option<ProducerMeta>,
 }
 
@@ -217,40 +217,19 @@ impl Event {
     /// Resolves an event type's partition-key JSON Pointer against this event,
     /// yielding the value to hash for partition selection.
     ///
-    /// A JSON string resolves to its contents; any other scalar to its JSON form,
-    /// so a numeric or boolean member is still hashable. The broker checks at
-    /// event-type registration that the pointer names a declared member, so a
-    /// pointer resolving to nothing here means the event omitted an optional one.
-    ///
     /// # Errors
-    /// [`EventBrokerError::Internal`] when the pointer resolves to nothing, to
-    /// null, or to a container rather than a scalar.
+    ///
+    /// As [`resolve_partition_input`].
     pub fn partition_input(&self, pointer: &str) -> Result<String, EventBrokerError> {
-        let unusable = |detail: &str| {
-            EventBrokerError::Internal(format!("partition-key pointer `{pointer}` {detail}"))
-        };
-        match self
-            .addressable()
-            .pointer(pointer)
-            .ok_or_else(|| unusable("resolves to no member of the event"))?
-        {
-            serde_json::Value::String(text) => Ok(text.clone()),
-            serde_json::Value::Null => Err(unusable("resolves to null")),
-            value @ (serde_json::Value::Number(_) | serde_json::Value::Bool(_)) => {
-                Ok(value.to_string())
-            }
-            _ => Err(unusable(
-                "resolves to an object or array, which has no stable hash input",
-            )),
-        }
+        resolve_partition_input(&self.addressable(), pointer)
     }
 
     /// The event as its base schema declares it.
     ///
     /// [`Event`] carries no serde derives, and a pointer addresses schema member
-    /// names rather than Rust field names, so the mapping lives here - one home
-    /// for it, shared by the producer computing a partition locally and by a
-    /// broker deriving one at ingest. Only publish-time members appear: a pointer
+    /// names rather than Rust field names, so the mapping lives here; a broker
+    /// derives a partition from it at ingest. A producer resolves the same members on
+    /// an [`EventV1`](crate::gts::EventV1). Only publish-time members appear: a pointer
     /// into a server-stamped one could never resolve on the way in.
     fn addressable(&self) -> serde_json::Value {
         serde_json::json!({
@@ -267,8 +246,44 @@ impl Event {
     }
 }
 
-/// Publisher-only chain/idempotency metadata stamped onto an [`Event`] before
-/// publish (`writeOnly`; the broker strips it on read).
+/// Resolves a partition-key JSON Pointer against an event's addressable view (its
+/// publish-time members by their schema names), yielding the value to hash for
+/// partition selection.
+///
+/// A JSON string resolves to its contents; any other scalar to its JSON form,
+/// so a numeric or boolean member is still hashable. The broker checks at
+/// event-type registration that the pointer names a declared member, so a
+/// pointer resolving to nothing here means the event omitted an optional one.
+///
+/// # Errors
+///
+/// [`EventBrokerError::Internal`] when the pointer resolves to nothing, to
+/// null, or to a container rather than a scalar.
+pub(crate) fn resolve_partition_input(
+    addressable: &serde_json::Value,
+    pointer: &str,
+) -> Result<String, EventBrokerError> {
+    let unusable = |detail: &str| {
+        EventBrokerError::Internal(format!("partition-key pointer `{pointer}` {detail}"))
+    };
+    match addressable
+        .pointer(pointer)
+        .ok_or_else(|| unusable("resolves to no member of the event"))?
+    {
+        serde_json::Value::String(text) => Ok(text.clone()),
+        serde_json::Value::Null => Err(unusable("resolves to null")),
+        value @ (serde_json::Value::Number(_) | serde_json::Value::Bool(_)) => {
+            Ok(value.to_string())
+        }
+        _ => Err(unusable(
+            "resolves to an object or array, which has no stable hash input",
+        )),
+    }
+}
+
+/// Chain metadata a backend record can carry. The broker's backend conversions never set it
+/// and the plugins do not store it; a publish carries [`EventMeta`](crate::gts::EventMeta)
+/// instead.
 #[derive(Debug, Clone)]
 pub struct ProducerMeta {
     pub version: u8,

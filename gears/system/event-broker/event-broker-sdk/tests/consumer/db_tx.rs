@@ -4,14 +4,13 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use chrono::Utc;
 use event_broker_sdk::consumer::LOCAL_DB_OFFSET_STORE_MIGRATION_SQL;
 use event_broker_sdk::dlq::DeadLetterRecord;
 use event_broker_sdk::gts_id;
 use event_broker_sdk::{
-    CommitOffsetInTx, ConsumerBatching, ConsumerBuilder, ConsumerError, ConsumerGroupRef,
-    EventBatch, EventBrokerError, Fallback, HandlerOutcome, LocalDbOffsetManager, OffsetStore,
-    Position, RawEvent, TxCommitHandle, TxConsumerHandler, TxSingleEventHandler,
+    CommitOffsetInTx, ConsumerBatching, ConsumerBuilder, ConsumerError, ConsumerGroupRef, Delivery,
+    EventBatch, EventBrokerError, EventV1, Fallback, HandlerOutcome, LocalDbOffsetManager,
+    OffsetStore, Position, StoredPosition, TxBatchHandler, TxCommitHandle, TxEventHandler,
 };
 use sea_orm::{ConnectionTrait, Database, EntityTrait, PaginatorTrait, Set, Statement};
 use toolkit_db::secure::{AccessScope, SecureInsertExt};
@@ -80,15 +79,15 @@ struct TxSingleProjector {
 }
 
 #[async_trait]
-impl TxSingleEventHandler<LocalDbOffsetManager> for TxSingleProjector {
+impl TxEventHandler<serde_json::Value, LocalDbOffsetManager> for TxSingleProjector {
     async fn handle(
         &self,
-        event: RawEvent,
-        _attempts: u16,
+        event: EventV1,
+        _delivery: &Delivery,
         commit: TxCommitHandle<LocalDbOffsetManager>,
     ) -> Result<HandlerOutcome, ConsumerError> {
         let db = self.db.clone();
-        let offset = event.offset;
+        let offset = event.sequence().expect("a delivered event is stamped");
         db.transaction_ref(move |tx| {
             Box::pin(async move {
                 commit
@@ -112,18 +111,19 @@ struct TxBatchProjector {
 }
 
 #[async_trait]
-impl TxConsumerHandler<LocalDbOffsetManager> for TxBatchProjector {
+impl TxBatchHandler<serde_json::Value, LocalDbOffsetManager> for TxBatchProjector {
     async fn handle_batch(
         &self,
-        batch: &EventBatch<'_>,
-        _attempts: u16,
+        batch: &EventBatch<'_, serde_json::Value>,
+        _delivery: &Delivery,
         commit: TxCommitHandle<LocalDbOffsetManager>,
     ) -> Result<HandlerOutcome, ConsumerError> {
         let target_offset = batch
             .iter()
             .last()
             .ok_or_else(|| EventBrokerError::Internal("empty transactional batch".to_owned()))?
-            .offset;
+            .sequence()
+            .expect("a delivered event is stamped");
         let db = self.db.clone();
 
         db.transaction_ref(move |tx| {
@@ -190,27 +190,36 @@ CREATE TABLE IF NOT EXISTS showcase_dead_letters (
     (raw, db)
 }
 
-fn raw_event_for_dead_letter() -> event_broker_sdk::RawEvent {
-    event_broker_sdk::RawEvent {
-        id: Uuid::new_v4(),
-        type_id: event_broker_sdk::GtsTypeId::new(
-            "gts.cf.core.events.event.v1~example.showcase.db.dlq.v1~",
-        ),
-        topic: event_broker_sdk::GtsInstanceId::try_new(
+/// An event as a consumer is handed it, with the delivery it came on: partition 0,
+/// sequence 42.
+fn raw_event_for_dead_letter() -> (event_broker_sdk::EventV1, Delivery) {
+    let event = event_broker_sdk::EventV1::builder_for(
+        event_broker_sdk::GtsTypeId::new("gts.cf.core.events.event.v1~example.showcase.db.dlq.v1~"),
+        serde_json::json!({ "reject": true }),
+    )
+    .id(Uuid::from_u128(0xd1e_0042))
+    .tenant_id(Uuid::nil())
+    .subject("db-dlq-1")
+    .subject_type_id(event_broker_sdk::GtsTypeId::new(
+        "gts.x.eb.test.subject.v1~",
+    ))
+    .occurred_at("2026-01-02T03:04:05Z".parse().unwrap())
+    .build()
+    .unwrap()
+    .stamp_position(StoredPosition {
+        partition: 0,
+        sequence: Sequence::assigned(42),
+        sequence_time: "2026-01-02T03:04:06Z".parse().unwrap(),
+    });
+    let delivery = Delivery::new(
+        event_broker_sdk::GtsInstanceId::try_new(
             "gts.cf.core.events.topic.v1~example.showcase.db.dlq.v1",
         )
         .unwrap(),
-        tenant_id: Uuid::nil(),
-        subject: "db-dlq-1".to_owned(),
-        subject_type: event_broker_sdk::GtsTypeId::new("gts.x.eb.test.subject.v1~"),
-        partition: 0,
-        sequence: Sequence::assigned(42),
-        offset: Sequence::assigned(42),
-        occurred_at: Utc::now(),
-        sequence_time: Utc::now(),
-        trace_parent: None,
-        data: serde_json::json!({ "reject": true }),
-    }
+        0,
+        1,
+    );
+    (event, delivery)
 }
 
 async fn insert_dead_letter<TX>(
@@ -426,17 +435,19 @@ async fn if_i_want_transactional_dlq_i_write_the_record_and_offset_in_one_transa
     let group = event_broker_sdk::ConsumerGroupId::from_gts("showcase-db-dlq");
     let topic_id = event_broker_sdk::TopicId::from_gts("showcase-db-dlq-topic");
     let tx_manager = manager.clone();
-    let event = raw_event_for_dead_letter();
-    let record = DeadLetterRecord::builder(&event, "permanent validation failure")
+    let (event, delivery) = raw_event_for_dead_letter();
+    let record = DeadLetterRecord::builder(&event, &delivery, "permanent validation failure")
         .group_id(group)
         .attempts(6)
         .build();
+    let partition = delivery.partition();
+    let offset = event.sequence().expect("a delivered event is stamped");
 
     db.transaction_ref(move |tx| {
         Box::pin(async move {
             insert_dead_letter(tx, &record).await?;
             tx_manager
-                .commit_in_tx(tx, &group, &topic_id, event.partition, event.offset)
+                .commit_in_tx(tx, &group, &topic_id, partition, offset)
                 .await
                 .map_err(|err| toolkit_db::DbError::InvalidConfig(err.to_string()))?;
             Ok(())
@@ -448,10 +459,10 @@ async fn if_i_want_transactional_dlq_i_write_the_record_and_offset_in_one_transa
     assert_eq!(dead_letter_count(&raw).await, 1);
     assert_eq!(
         manager
-            .load_position(&group, &topic_id, event.partition)
+            .load_position(&group, &topic_id, delivery.partition())
             .await
             .unwrap(),
-        Position::Exact(event.offset)
+        Position::Exact(event.sequence().expect("a delivered event is stamped"))
     );
 }
 
@@ -462,18 +473,20 @@ async fn if_the_transactional_dlq_rolls_back_neither_parking_nor_offset_is_durab
     let group = event_broker_sdk::ConsumerGroupId::from_gts("showcase-db-dlq-rollback");
     let topic_id = event_broker_sdk::TopicId::from_gts("showcase-db-dlq-rollback-topic");
     let tx_manager = manager.clone();
-    let event = raw_event_for_dead_letter();
-    let record = DeadLetterRecord::builder(&event, "permanent validation failure")
+    let (event, delivery) = raw_event_for_dead_letter();
+    let record = DeadLetterRecord::builder(&event, &delivery, "permanent validation failure")
         .group_id(group)
         .attempts(6)
         .build();
+    let partition = delivery.partition();
+    let offset = event.sequence().expect("a delivered event is stamped");
 
     let result: Result<(), toolkit_db::DbError> = db
         .transaction_ref(move |tx| {
             Box::pin(async move {
                 insert_dead_letter(tx, &record).await?;
                 tx_manager
-                    .commit_in_tx(tx, &group, &topic_id, event.partition, event.offset)
+                    .commit_in_tx(tx, &group, &topic_id, partition, offset)
                     .await
                     .map_err(|err| toolkit_db::DbError::InvalidConfig(err.to_string()))?;
                 Err(toolkit_db::DbError::InvalidConfig(
@@ -487,7 +500,7 @@ async fn if_the_transactional_dlq_rolls_back_neither_parking_nor_offset_is_durab
     assert_eq!(dead_letter_count(&raw).await, 0);
     assert_eq!(
         manager
-            .load_position(&group, &topic_id, event.partition)
+            .load_position(&group, &topic_id, delivery.partition())
             .await
             .unwrap(),
         Position::Earliest

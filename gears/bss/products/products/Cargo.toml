@@ -126,8 +126,8 @@ toolkit-gts = { workspace = true }
 # `gts_instance!`'s expansion references the `gts` crate directly.
 gts = { workspace = true }
 # P-D-199: the toolkit outbox's processor is the broker SDK's own producer, not a
-# handler of this gear's. `outbox` gates `ProducerOutboxQueue`/`ProducerOutbox`
-# and pulls `db` with it; `EventBrokerApi` and `TypedEvent` are unconditional.
+# handler of this gear's. `outbox` gates `OutboxSetup`/`OutboxProducer`
+# and pulls `db` with it; `EventBrokerApi` is unconditional.
 # The gear does not *require* a broker — `Gear::init` falls back to the holding
 # processor when `ClientHub` has none — so this is a plain dependency rather
 # than a `deps = [...]` entry on the gear macro.

@@ -9,9 +9,9 @@ use axum::{
     body::Body,
     http::{Method, Request, StatusCode},
 };
-use event_broker_sdk::TypedEvent;
 use serde_json::{Value, json};
 use std::sync::Arc;
+use toolkit_gts::GtsSchema;
 use toolkit_gts::gts_id;
 use toolkit_security::SecurityContext;
 use tower::ServiceExt;

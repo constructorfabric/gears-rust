@@ -276,6 +276,26 @@ fn r4_a_single_event_linking_to_the_head_without_moving_past_it_is_a_violation()
     );
 }
 
+#[test]
+fn r4_a_resend_at_the_head_is_a_duplicate_whatever_its_previous() {
+    // Gaps are legal, so a head event's `previous` need not be `last - 1`.
+    assert_eq!(
+        chained_run(&[(3, 8)]).decide(ChainHead::At(8)),
+        RunDecision::Duplicate
+    );
+}
+
+#[test]
+fn r4_a_head_event_with_a_mismatched_previous_ends_the_duplicate_prefix() {
+    assert_eq!(
+        chained_run(&[(3, 8), (8, 9)]).decide(ChainHead::At(8)),
+        RunDecision::Advance {
+            duplicates: 1,
+            head: 9
+        }
+    );
+}
+
 // -- R5: monotonic run vs the committed head --
 
 #[test]

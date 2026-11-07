@@ -7,8 +7,8 @@ use async_trait::async_trait;
 use event_broker::test_support::StaticTypesRegistry;
 use event_broker_sdk::{
     ConsumerBuilder, ConsumerError, ConsumerGroupRef, ConsumerProfile, CreateConsumerGroupRequest,
-    EventBrokerError, Fallback, HandlerOutcome, InMemoryOffsetManager, RawEvent,
-    SingleEventHandler, gts_id,
+    Delivery, EventBrokerError, EventHandler, EventV1, Fallback, HandlerOutcome,
+    InMemoryOffsetManager, gts_id,
 };
 use serde_json::json;
 
@@ -20,11 +20,11 @@ const PAYMENTS_TOPIC: &str = gts_id!("cf.core.events.topic.v1~cf.core.payments.t
 struct NoopHandler;
 
 #[async_trait]
-impl SingleEventHandler for NoopHandler {
+impl EventHandler<serde_json::Value> for NoopHandler {
     async fn handle(
         &self,
-        _event: RawEvent,
-        _attempts: u16,
+        _event: EventV1,
+        _delivery: &Delivery,
     ) -> Result<HandlerOutcome, ConsumerError> {
         Ok(HandlerOutcome::Success)
     }

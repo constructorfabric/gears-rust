@@ -1,4 +1,4 @@
-//! Pricing's typed events (D-400): broker `TypedEvent` payloads written through the toolkit
+//! Pricing's typed events (D-400): broker `EventV1` payloads written through the toolkit
 //! outbox on the caller's transaction, in the broker's producer-outbox envelope.
 //!
 //! The runner a writer passes is the transaction of the act the event reports, so a rollback
@@ -14,7 +14,6 @@
 //! @cpt-dod:cpt-cf-bss-pricing-dod-outbox-same-tx:p1
 //! @cpt-dod:cpt-cf-bss-pricing-dod-events-typed-outbox:p1
 use super::storage::RepoError;
-use event_broker_sdk::TypedEvent;
 use serde::{Deserialize, Serialize};
 use std::{
     borrow::Cow,
@@ -52,8 +51,8 @@ const CONTENT_TYPE: &str =
 /// Where an event is enqueued: the broker SDK's producer outbox, or the holding queue.
 #[derive(Clone)]
 pub enum EventSink {
-    /// The bound `DbProducer`'s outbox: its envelope, its processor.
-    Broker(Box<event_broker_sdk::ProducerOutbox>),
+    /// The bound `OutboxProducer`: its envelope, its processor.
+    Broker(Box<event_broker_sdk::OutboxProducer>),
     /// The interim envelope on pricing's queue, held by [`PendingProducer`].
     Interim(std::sync::Arc<toolkit_db::outbox::Outbox>),
 }
@@ -226,11 +225,15 @@ pub struct PricesPublished {
     /// The principal whose act applied the unit.
     pub actor_ref: Uuid,
 }
-impl TypedEvent for PricesPublished {
+impl toolkit_gts::GtsSchema for PricesPublished {
     const TYPE_ID: &'static str =
         gts_id!("cf.core.events.event.v1~cf.bss.pricing.prices_published.v1~");
-    const SUBJECT_TYPE: &'static str = PRICE_BOOK_SUBJECT_TYPE;
-    const SOURCE: &'static str = SOURCE;
+    // The registered type's `data_schema` is the contract; the producer validates against it.
+    fn gts_schema_with_refs() -> serde_json::Value {
+        serde_json::json!({ "type": "object" })
+    }
+}
+impl BrokerEvent for PricesPublished {
     fn subject(&self) -> Cow<'_, str> {
         Cow::Owned(self.book_id.to_string())
     }
@@ -262,11 +265,15 @@ pub struct PlanRevisionPublished {
     /// or its submitter when no one voted (quorum 0, D-450).
     pub actor_ref: Uuid,
 }
-impl TypedEvent for PlanRevisionPublished {
+impl toolkit_gts::GtsSchema for PlanRevisionPublished {
     const TYPE_ID: &'static str =
         gts_id!("cf.core.events.event.v1~cf.bss.pricing.plan_revision_published.v1~");
-    const SUBJECT_TYPE: &'static str = PLAN_SUBJECT_TYPE;
-    const SOURCE: &'static str = SOURCE;
+    // The registered type's `data_schema` is the contract; the producer validates against it.
+    fn gts_schema_with_refs() -> serde_json::Value {
+        serde_json::json!({ "type": "object" })
+    }
+}
+impl BrokerEvent for PlanRevisionPublished {
     fn subject(&self) -> Cow<'_, str> {
         Cow::Owned(self.plan_id.to_string())
     }
@@ -290,11 +297,15 @@ pub struct ApprovalUnitDecided {
     /// The deciding principals: every current-generation voter and the actor, ascending.
     pub actors: Vec<Uuid>,
 }
-impl TypedEvent for ApprovalUnitDecided {
+impl toolkit_gts::GtsSchema for ApprovalUnitDecided {
     const TYPE_ID: &'static str =
         gts_id!("cf.core.events.event.v1~cf.bss.pricing.approval_unit_decided.v1~");
-    const SUBJECT_TYPE: &'static str = APPROVAL_UNIT_SUBJECT_TYPE;
-    const SOURCE: &'static str = SOURCE;
+    // The registered type's `data_schema` is the contract; the producer validates against it.
+    fn gts_schema_with_refs() -> serde_json::Value {
+        serde_json::json!({ "type": "object" })
+    }
+}
+impl BrokerEvent for ApprovalUnitDecided {
     fn subject(&self) -> Cow<'_, str> {
         Cow::Owned(self.unit_id.to_string())
     }
@@ -304,18 +315,34 @@ impl TypedEvent for ApprovalUnitDecided {
 }
 // @cpt-end:cpt-cf-bss-pricing-algo-read-contract-events-typed-events:p1:inst-read-contract-events-typed-events-1
 
+/// The per-event envelope values a pricing event carries beside its `data`. `Serialize` writes
+/// that `data` into the interim envelope.
+pub trait BrokerEvent: event_broker_sdk::EventPayload + Serialize {
+    /// The subject entity identifier.
+    fn subject(&self) -> Cow<'_, str>;
+    /// The tenant the event belongs to.
+    fn tenant_id(&self) -> Option<Uuid> {
+        None
+    }
+    /// The W3C trace context the event is produced under.
+    fn trace_parent(&self) -> Option<Cow<'_, str>> {
+        None
+    }
+}
+
 /// The broker SDK's producer-outbox envelope of `event`, as the interim arm writes it before any
 /// broker is bound. Its `producer_mode` is `stateless`, the one mode an envelope written with no
 /// producer registration can carry (D-455's note on the interim envelope, whole-branch review
 /// PS-21): the SDK's processor refuses a monotonic or chained envelope without a `producer_id`,
 /// so a held row in either would never drain once a broker is bound on the same queue; a
-/// stateless one drains, published without the producer's sequence. A test deserializes it as
-/// `event_broker_sdk::producer::ProducerOutboxEnvelope`, so a change of the SDK's envelope fails
-/// the build of that test, not a boot.
+/// stateless one drains, published without the producer's sequence. The broker SDK pins this
+/// v1 shape in its `the_v1_envelope_wire_shape_is_pinned` test, so a change of the SDK's envelope
+/// fails there, not at a boot.
 /// # Errors
 /// Serialization failures.
-pub(crate) fn interim_envelope<E: TypedEvent>(
+pub(crate) fn interim_envelope<E: BrokerEvent>(
     event: &E,
+    subject_type: &str,
     now: time::OffsetDateTime,
 ) -> Result<serde_json::Value, RepoError> {
     let serialize = |e: String| RepoError::Db(format!("{} event: {e}", E::TYPE_ID));
@@ -325,9 +352,9 @@ pub(crate) fn interim_envelope<E: TypedEvent>(
         "type": E::TYPE_ID,
         "topic": TOPIC,
         "tenant_id": event.tenant_id(),
-        "source": E::SOURCE,
+        "source": SOURCE,
         "subject": event.subject(),
-        "subject_type": E::SUBJECT_TYPE,
+        "subject_type": subject_type,
         "occurred_at": now
             .format(&time::format_description::well_known::Rfc3339)
             .map_err(|e| serialize(e.to_string()))?,
@@ -337,15 +364,16 @@ pub(crate) fn interim_envelope<E: TypedEvent>(
         "diagnostic_metadata": {"sdk_client_agent": SOURCE},
     }))
 }
-/// Enqueue one event on the caller's transaction in the broker's producer-outbox envelope. Its
-/// wake stays with `outbox` until the transaction ends (D-455).
+/// Enqueue one event about a `subject_type` entity on the caller's transaction in the broker's
+/// producer-outbox envelope. Its wake stays with `outbox` until the transaction ends (D-455).
 /// # Errors
 /// Serialization failures, and outbox failures with the driver error kept typed so a
 /// serializable transaction can retry.
-pub async fn enqueue<E: TypedEvent + Clone>(
+pub async fn enqueue<E: BrokerEvent + Clone>(
     outbox: &TxOutbox,
     tx: &(impl DBRunner + Sync),
     event: &E,
+    subject_type: &str,
     now: time::OffsetDateTime,
 ) -> Result<(), RepoError> {
     // @cpt-begin:cpt-cf-bss-pricing-algo-read-contract-events-typed-events:p1:inst-read-contract-events-typed-events-3
@@ -356,15 +384,27 @@ pub async fn enqueue<E: TypedEvent + Clone>(
         // The SDK's enqueue erases the outbox's database error into a string, so a
         // contended insert here fails the act instead of retrying it (as in Products).
         EventSink::Broker(producer) => {
+            let failed = |e: event_broker_sdk::EventBrokerError| {
+                RepoError::Db(format!("{} event: {e}", E::TYPE_ID))
+            };
+            let mut builder = event_broker_sdk::EventV1::builder(event.clone())
+                .subject(event.subject())
+                .subject_type_id(event_broker_sdk::GtsTypeId::new(subject_type));
+            if let Some(tenant_id) = event.tenant_id() {
+                builder = builder.tenant_id(tenant_id);
+            }
+            if let Some(trace_parent) = event.trace_parent() {
+                builder = builder.trace_parent(trace_parent);
+            }
             return producer
-                .enqueue(tx, event.clone())
+                .enqueue(tx, builder.build().map_err(failed)?)
                 .await
                 .map(|wake| outbox.add(wake))
-                .map_err(|e| RepoError::Db(format!("{} event: {e}", E::TYPE_ID)));
+                .map_err(failed);
         }
     };
     let serialize = |e: String| RepoError::Db(format!("{} event: {e}", E::TYPE_ID));
-    let envelope = interim_envelope(event, now)?;
+    let envelope = interim_envelope(event, subject_type, now)?;
     let record = toolkit_db::outbox::Record::to(QUEUE, 0)
         .payload(
             serde_json::to_vec(&envelope).map_err(|e| serialize(e.to_string()))?,

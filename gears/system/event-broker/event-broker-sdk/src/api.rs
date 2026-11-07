@@ -7,8 +7,8 @@ use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
 use crate::error::EventBrokerError;
+use crate::gts::EventV1;
 use crate::ids::{ConsumerGroupId, ProducerId, SubscriptionId};
-use crate::models::Event;
 use crate::models::{
     ConsumerGroup, ConsumerGroupQuery, CreateConsumerGroupRequest, EventType, Page, PartitionRange,
     ResetScope, Subscription, Topic, TopicSegment,
@@ -38,6 +38,24 @@ pub enum IngestOutcome {
     Persisted,
     /// The event matched an idempotent duplicate.
     Duplicate,
+}
+
+/// The guarantee a publish answers on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ack {
+    /// Answer once the broker admits the event: `Accepted`, or `Duplicate` for an event it
+    /// already admitted.
+    Accepted,
+    /// Hold the answer until the backend stores the event, for up to `within`: `Persisted`
+    /// once stored, `Accepted` when the wait ends first (the event stays admitted), and
+    /// `Duplicate` at once for an event the broker already admitted, which does not say
+    /// that the earlier copy is stored. The broker caps the wait by its configuration, and
+    /// each transport states how it rounds `within`. Not served yet (#5655): the broker
+    /// answers [`EventBrokerError::Unimplemented`] and admits nothing.
+    Persisted {
+        /// The longest wait the caller accepts.
+        within: Duration,
+    },
 }
 
 /// Broker `last_sequence` of a producer's chain on one topic. The chain is
@@ -130,25 +148,6 @@ pub struct JoinRequest {
     pub session_timeout: Option<Duration>,
 }
 
-/// An event received from the broker stream.
-///
-/// It names no topic: a topic is what the event's `type_id` declares, so the
-/// consumer resolves it rather than the broker repeating it on every frame.
-#[derive(Debug, Clone)]
-pub struct WireEvent {
-    pub id: Uuid,
-    pub type_id: GtsTypeId,
-    pub tenant_id: Uuid,
-    pub subject: String,
-    pub subject_type: GtsTypeId,
-    pub partition: u32,
-    pub sequence: Sequence,
-    pub occurred_at: chrono::DateTime<chrono::Utc>,
-    pub sequence_time: chrono::DateTime<chrono::Utc>,
-    pub trace_parent: Option<String>,
-    pub data: serde_json::Value,
-}
-
 /// A per-partition cursor position carried by stream topology/control frames.
 ///
 /// The topic is named rather than indexed, so a position identifies its partition
@@ -171,11 +170,18 @@ pub enum ControlCode {
 }
 
 /// One frame on the consumption stream.
-// `WireFrame::Event(WireEvent)` stays unboxed to preserve the public stream API shape.
-#[allow(clippy::large_enum_variant)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "`WireFrame::Event(EventV1)` stays unboxed to keep the public stream API shape"
+)]
 #[derive(Debug, Clone)]
 pub enum WireFrame {
-    Event(WireEvent),
+    /// A delivered event as stored: its source and the broker-stamped position
+    /// (partition, sequence, sequence time) are set. A malformed stored `trace_parent`
+    /// (an event written before ingest checked the field) is dropped on delivery with a
+    /// warning, so the event arrives without it. It names no topic: a topic is what the
+    /// event's type declares, so the consumer resolves it from the type.
+    Event(EventV1),
     Heartbeat {
         at: String,
     },
@@ -425,31 +431,41 @@ pub trait EventBrokerApi: Send + Sync {
         client_agent: &str,
     ) -> Result<ProducerId, EventBrokerError>;
 
+    /// Publishes `event` and answers on `ack`. The event must pass
+    /// [`EventV1::check_publishable`].
+    ///
+    /// # Errors
+    ///
+    /// - [`EventBrokerError::InvalidEventField`] for a broker-stamped member, a missing
+    ///   `source` or a `meta.version` the transport cannot carry; nothing is sent.
+    /// - [`EventBrokerError::Unimplemented`] for [`Ack::Persisted`], while it is not
+    ///   served (#5655).
+    /// - Otherwise the broker's error.
     async fn publish(
         &self,
         ctx: &SecurityContext,
-        event: &Event,
+        event: &EventV1,
+        ack: Ack,
     ) -> Result<IngestOutcome, EventBrokerError>;
-
-    /// Publishes and, where the implementation can confirm the backend durable
-    /// write, awaits it and returns `Persisted`. The default delegates to
-    /// [`publish`](Self::publish) and reports its outcome, `Accepted` or
-    /// `Duplicate` for an asynchronous publish.
-    async fn publish_sync(
-        &self,
-        ctx: &SecurityContext,
-        event: &Event,
-    ) -> Result<IngestOutcome, EventBrokerError> {
-        self.publish(ctx, event).await
-    }
 
     /// Publish a batch atomically. A batch is all-or-nothing (a single
     /// mode-shape or chain violation rejects the whole batch, per DESIGN), so
-    /// the outcome is one value for the batch, not one per event.
+    /// the outcome is one value for the batch, not one per event. Every event must
+    /// pass [`EventV1::check_publishable`].
+    ///
+    /// # Errors
+    ///
+    /// - [`EventBrokerError::InvalidEventField`] for the first event with a broker-stamped
+    ///   member, a missing `source` or a `meta.version` the transport cannot carry; nothing
+    ///   is sent.
+    /// - [`EventBrokerError::Unimplemented`] for [`Ack::Persisted`], while it is not
+    ///   served (#5655).
+    /// - Otherwise the broker's error.
     async fn publish_batch(
         &self,
         ctx: &SecurityContext,
-        events: &[Event],
+        events: &[EventV1],
+        ack: Ack,
     ) -> Result<IngestOutcome, EventBrokerError>;
 
     async fn get_producer_cursors(

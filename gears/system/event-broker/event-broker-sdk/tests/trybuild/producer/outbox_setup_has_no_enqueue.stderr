@@ -1,0 +1,5 @@
+error[E0599]: no method named `enqueue` found for reference `&OutboxSetup` in the current scope
+ --> tests/trybuild/producer/outbox_setup_has_no_enqueue.rs:5:19
+  |
+5 |     let _ = setup.enqueue(conn, event).await;
+  |                   ^^^^^^^ method not found in `&OutboxSetup`

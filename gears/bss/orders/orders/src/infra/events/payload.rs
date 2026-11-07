@@ -12,8 +12,6 @@ use uuid::Uuid;
 
 use crate::domain::failure::FailureReason;
 
-use super::{ORDER_SUBJECT_TYPE, SOURCE};
-
 /// The declared line cap (DESIGN §3.3 working baseline); per-line event members never exceed it.
 pub const MAX_LINES: usize = 200;
 /// Caller-supplied reason text, stored as received (audit `caller_reason`, D-143).
@@ -116,18 +114,25 @@ impl<K: EventKind> OrderEvent<K> {
         validate_summary(&self.summary)?;
         self.detail.validate(&self.summary)
     }
-}
-impl<K: EventKind> event_broker_sdk::TypedEvent for OrderEvent<K> {
-    const TYPE_ID: &'static str = K::TYPE_ID;
-    const SUBJECT_TYPE: &'static str = ORDER_SUBJECT_TYPE;
-    const SOURCE: &'static str = SOURCE;
+
     /// The canonical hyphenated order UUID, equal to `data.orderId` (§4.4 envelope mapping).
-    fn subject(&self) -> Cow<'_, str> {
+    pub fn subject(&self) -> Cow<'_, str> {
         Cow::Owned(self.summary.order_id.hyphenated().to_string())
     }
     /// Always the explicit platform-root tenant (D-95); never a business axis or the default.
-    fn tenant_id(&self) -> Option<Uuid> {
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "the shape every bss event's `tenant_id()` has; Orders always sets it (D-95)"
+    )]
+    pub fn tenant_id(&self) -> Option<Uuid> {
         Some(self.tenant)
+    }
+}
+impl<K: EventKind> toolkit_gts::GtsSchema for OrderEvent<K> {
+    const TYPE_ID: &'static str = K::TYPE_ID;
+    // The registered type's `data_schema` is the contract; the producer validates against it.
+    fn gts_schema_with_refs() -> serde_json::Value {
+        serde_json::json!({ "type": "object" })
     }
 }
 

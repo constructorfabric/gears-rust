@@ -7,7 +7,8 @@ use event_broker_sdk::backend::{
     AppendRequest, Appended, Backend, BackendError, Dedup, LogClaim, Provisioning, TopicPartition,
     TopicSpec, Wait, Watch,
 };
-use event_broker_sdk::{Event, PartitionRange, Position, Sequence, TopicSegment};
+use event_broker_sdk::models::Event;
+use event_broker_sdk::{PartitionRange, Position, Sequence, TopicSegment};
 use tokio_util::sync::CancellationToken;
 
 use crate::shared::Shared;

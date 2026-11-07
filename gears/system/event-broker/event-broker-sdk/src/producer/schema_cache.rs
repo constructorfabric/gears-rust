@@ -39,7 +39,8 @@ impl PreparedEventType {
         let errors = self
             .validator
             .iter_errors(data)
-            .map(|err| err.to_string())
+            // `to_string()` and `masked()` can both quote instance values or keys.
+            .map(|err| format!("{} at {}", err.kind().keyword(), err.schema_path()))
             .collect::<Vec<_>>();
         if errors.is_empty() {
             Ok(())
@@ -265,3 +266,7 @@ pub(crate) fn gts_pattern_matches(pattern: &str, type_id: &str) -> bool {
         pattern == type_id
     }
 }
+
+#[cfg(test)]
+#[path = "schema_cache_tests.rs"]
+mod tests;

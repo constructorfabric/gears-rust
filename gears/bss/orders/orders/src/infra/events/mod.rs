@@ -10,7 +10,7 @@
 //! The runner follows the Pricing precedent
 //! (`gears/bss/pricing/pricing/src/infra/events.rs`, D-455), without its interim holding queue:
 //! an [`EventSink`] exists only once the real producer is bound ([`super::broker`]).
-use event_broker_sdk::{EventBrokerError, ProducerOutbox};
+use event_broker_sdk::{EventBrokerError, OutboxProducer};
 use parking_lot::Mutex;
 use std::future::Future;
 use std::pin::Pin;
@@ -85,11 +85,11 @@ impl RootTenant {
 /// The bound managed producer: the only way to enqueue an Orders event.
 #[derive(Clone)]
 pub struct EventSink {
-    outbox: ProducerOutbox,
+    outbox: OutboxProducer,
     root: RootTenant,
 }
 impl EventSink {
-    pub(in crate::infra) fn new(outbox: ProducerOutbox, root: RootTenant) -> Self {
+    pub(in crate::infra) fn new(outbox: OutboxProducer, root: RootTenant) -> Self {
         Self { outbox, root }
     }
     /// The platform-root tenant every enqueued envelope carries.
@@ -288,6 +288,15 @@ impl TxEvents {
             }
             pending.enqueued = true;
         }
+        let subject = event.subject().into_owned();
+        let tenant_id = event.tenant_id();
+        let mut builder = event_broker_sdk::EventV1::builder(event)
+            .subject(subject)
+            .subject_type_id(event_broker_sdk::GtsTypeId::new(ORDER_SUBJECT_TYPE));
+        if let Some(tenant_id) = tenant_id {
+            builder = builder.tenant_id(tenant_id);
+        }
+        let event = builder.build().map_err(EventEnqueueError::Producer)?;
         let wake = self
             .sink
             .outbox

@@ -95,6 +95,7 @@ Multiple consumer instances share a group by JOINing with the same `consumer_gro
 - [positive-1.1 — Publish single (async)](producer/single/1.01-positive-publish-single-async.md) — `POST /v1/events` → `202 Accepted`; event enqueued in outbox.
 - [positive-1.2 - Publish sync (Prefer: wait)](producer/single/1.02-positive-publish-sync-wait-persisted.md) - `POST /v1/events` with `Prefer: wait` → `201 Created` after backend persist. Not yet served: `Prefer: wait` answers `501`; tracked in #5655.
 - [negative-1.5 — Read-only partition rejected](producer/single/1.05-negative-readonly-partition-rejected.md) — producer-supplied `partition` on publish → `400 Bad Request`; the backend assigns the backend partition itself.
+- [negative-1.6 - Malformed trace_parent](producer/single/1.06-negative-invalid-trace-parent.md) - a `trace_parent` that is not a W3C traceparent → `400 Invalid Argument`; nothing is admitted.
 
 #### producer/batch/ — `POST /v1/events:batch`
 - [positive-1.1 — Publish batch](producer/batch/1.01-positive-publish-batch.md) — `POST /v1/events:batch` → `202 Accepted`; one topic per batch, all-or-nothing.
@@ -104,7 +105,7 @@ Multiple consumer instances share a group by JOINing with the same `consumer_gro
 - [positive-1.1 — Register chained producer](producer/flows/1.01-positive-register-chained-producer.md) — `POST /v1/producers { mode: chained }` → `201` with `producer_id`.
 - [positive-1.2 — Register monotonic producer](producer/flows/1.02-positive-register-monotonic-producer.md) — `POST /v1/producers { mode: monotonic }` → `201`.
 - [positive-1.3 — Chained-mode sequence](producer/flows/1.03-positive-chained-mode-sequence.md) — `POST /v1/events` with `meta.producer_id` + `meta.previous/sequence`; broker deduplicates.
-- [positive-1.4 — Chain-head retry dedup](producer/flows/1.04-positive-chain-head-retry-dedup.md) — an exact retry of the current chain head returns `200` with an empty body; no second write. Dedup is chain-based (`previous`/`sequence`).
+- [positive-1.4 - Chain-head retry dedup](producer/flows/1.04-positive-chain-head-retry-dedup.md) - a resend at the current chain head (`meta.sequence == last_sequence`, whatever its `meta.previous`) returns `200` with an empty body; no second write. Dedup keys on `sequence`, not on the event `id`.
 - [positive-1.6 — Cursor recovery](producer/flows/1.06-positive-cursor-recovery.md) — `GET /v1/producers/{id}/cursors` → `{producer_id, client_agent, topics:[{topic, last_sequence}]}`; re-seeds the producer's chain per topic after desync.
 - [positive-1.7 — Chain reset](producer/flows/1.07-positive-chain-reset.md) — `POST /v1/producers/{id}:reset` → `200`; chain state cleared, audited.
 - [flow-1.9 — Desync recovery](producer/flows/1.09-flow-chained-producer-desync-recovery.md) — producer loses sequence state; first publish fails `412`; reads `/cursors`; reconciles counter; republishes successfully.
@@ -166,7 +167,7 @@ Multiple consumer instances share a group by JOINing with the same `consumer_gro
 - [positive-1.1 — List topics](topics/1.01-positive-list-topics.md) — `GET /v1/topics` → paged list of topic DTOs carrying `id`, `description`, `retention`.
 - [positive-1.2 — List topic segments](topics/1.02-positive-list-topic-segments.md) — `GET /v1/topics/segments?topic=...&partition=...` → segment manifest with RF/HWM per segment.
 - [positive-1.5 - Segments of an empty partition](topics/1.05-positive-segments-empty-partition.md) - `GET /v1/topics/segments?topic=...&partition=...` for a partition with no stored events → `200 OK` with `start_sequence: 0`, `end_sequence: 0`, null times and empty `segments[]`.
-- [positive-1.4 — List event types](topics/1.04-positive-list-event-types.md) — `GET /v1/event-types?topic=...` → paged list of event type registrations.
+- [positive-1.4 - List event types](topics/1.04-positive-list-event-types.md) - `GET /v1/event-types?$filter=topic eq '...'` → paged list of event type registrations.
 
 ---
 
@@ -191,6 +192,7 @@ Multiple consumer instances share a group by JOINing with the same `consumer_gro
 
 - [negative-1.3 — Schema validation failure](producer/single/1.03-negative-schema-validation-failure.md) — `event.data` fails JSON Schema → `422 Invalid Argument`.
 - [negative-1.5 — Read-only partition rejected](producer/single/1.05-negative-readonly-partition-rejected.md) — producer-supplied `partition` on publish → `400 Bad Request`; `partition` is consumer-facing/read-side only.
+- [negative-1.6 - Malformed trace_parent](producer/single/1.06-negative-invalid-trace-parent.md) - a `trace_parent` that is not a W3C traceparent → `400 Invalid Argument`; nothing is admitted.
 - [negative-1.2 — Mixed-topic batch](producer/batch/1.02-negative-mixed-topic-batch.md) — batch events span different topics → `400 Invalid Argument`.
 - [negative-1.3 - Batch too large](producer/batch/1.03-negative-batch-too-large.md) - over 100 events or 1 MiB → `413 Content Too Large`.
 - [negative-1.4 — Batch late validation failure](producer/batch/1.04-negative-batch-late-validation-failure.md) — later invalid event rejects whole batch → `422 Invalid Argument`.
@@ -221,7 +223,7 @@ Multiple consumer instances share a group by JOINing with the same `consumer_gro
 
 ### Producer chain errors
 
-- [negative-1.5 — Chained sequence violation](producer/flows/1.05-negative-chained-sequence-violation.md) — `meta.previous` doesn't match broker's `last_sequence` → `412 Failed Precondition`; recover via `GET /v1/producers/{id}/cursors`.
+- [negative-1.5 - Chained sequence violation](producer/flows/1.05-negative-chained-sequence-violation.md) - a chained publish that neither advances the chain nor resends its head → `412 Failed Precondition`; recover via `GET /v1/producers/{id}/cursors`.
 - [negative-1.8 — Unknown producer](producer/flows/1.08-negative-unknown-producer.md) — `meta.producer_id` not registered or reaped → `404 Not Found` naming the producer.
 
 ### Consumer group errors

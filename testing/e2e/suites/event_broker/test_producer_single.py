@@ -1,4 +1,4 @@
-"""Single-event publish scenarios (producer/single/1.01-1.05).
+"""Single-event publish scenarios (producer/single/1.01-1.06).
 
 Each test exercises one publish path:
 - 1.01: publish → 202, no body (async by default)
@@ -6,6 +6,7 @@ Each test exercises one publish path:
 - 1.03: schema validation failure → 400 (requires EVENT_TYPE_STRICT)
 - 1.04: rate limiting → 429 (xfail: rate limiting not configured in standalone)
 - 1.05: read-only ``partition`` field rejected → 400
+- 1.06: malformed ``trace_parent`` → 400
 """
 
 from __future__ import annotations
@@ -153,4 +154,45 @@ async def test_readonly_partition_rejected_returns_400(api):
         "instance": body["instance"],
         "trace_id": TRACE_ID,
         "context": body["context"],
+    }
+
+
+async def test_malformed_trace_parent_returns_400(api):
+    """scenario: producer/single/1.06-negative-invalid-trace-parent.md
+
+    A ``trace_parent`` that is not a W3C traceparent (here, uppercase hex) is
+    rejected with 400. The violation names the field and the rule, never the
+    value.
+    """
+    tenant_id = str(uuid.uuid4())
+    async with api() as client:
+        resp = await client.post(
+            "/events",
+            json={
+                **_base_event(tenant_id),
+                "trace_parent": "00-0AF7651916CD43DD8448EB211C80319C-B7AD6B7169203331-01",
+            },
+        )
+    assert resp.status_code == 400
+    body = resp.json()
+    assert body == {
+        "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~",
+        "title": "Invalid Argument",
+        "status": 400,
+        "detail": "Request validation failed",
+        "instance": body["instance"],
+        "trace_id": TRACE_ID,
+        "context": {
+            "field_violations": [
+                {
+                    "field": "trace_parent",
+                    "description": (
+                        "must be a W3C traceparent: four lowercase hex groups"
+                        " of 2, 32, 16 and 2 digits joined by '-'"
+                    ),
+                    "reason": "invalid_event_field",
+                }
+            ],
+            "resource_type": "gts.cf.core.events.request.v1~",
+        },
     }

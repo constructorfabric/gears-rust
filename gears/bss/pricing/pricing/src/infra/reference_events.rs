@@ -1,18 +1,24 @@
 //! Durable lost-reference events through the shared pricing event writer: an entry's
 //! `PriceBookEntryReferenceLost` and a plan item's `PlanReferenceLost` (D-407).
 use super::{
-    events::{self, SOURCE},
+    events::{self, BrokerEvent},
     storage::{
         RepoError,
         entity::{plan_item, price_book_entry},
     },
 };
-use event_broker_sdk::TypedEvent;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use toolkit_db::secure::DBRunner;
 use toolkit_gts::gts_id;
 use uuid::Uuid;
+
+/// `PriceBookEntryReferenceLost` is about an entry.
+pub const PRICE_BOOK_ENTRY_SUBJECT_TYPE: &str =
+    gts_id!("cf.core.events.subject.v1~cf.bss.pricing.price_book_entry.v1~");
+/// `PlanReferenceLost` is about a plan item.
+pub const PLAN_ITEM_SUBJECT_TYPE: &str =
+    gts_id!("cf.core.events.subject.v1~cf.bss.pricing.plan_item.v1~");
 // @cpt-begin:cpt-cf-bss-pricing-algo-read-contract-events-typed-events:p1:inst-read-contract-events-typed-events-1
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -23,12 +29,15 @@ pub struct PriceBookEntryReferenceLost {
     pub reservation_id: Uuid,
     pub actor_ref: Uuid,
 }
-impl TypedEvent for PriceBookEntryReferenceLost {
+impl toolkit_gts::GtsSchema for PriceBookEntryReferenceLost {
     const TYPE_ID: &'static str =
         gts_id!("cf.core.events.event.v1~cf.bss.pricing.price_book_entry_reference_lost.v1~");
-    const SUBJECT_TYPE: &'static str =
-        gts_id!("cf.core.events.subject.v1~cf.bss.pricing.price_book_entry.v1~");
-    const SOURCE: &'static str = SOURCE;
+    // The registered type's `data_schema` is the contract; the producer validates against it.
+    fn gts_schema_with_refs() -> serde_json::Value {
+        serde_json::json!({ "type": "object" })
+    }
+}
+impl BrokerEvent for PriceBookEntryReferenceLost {
     fn subject(&self) -> Cow<'_, str> {
         Cow::Owned(self.price_book_entry_id.to_string())
     }
@@ -54,7 +63,7 @@ pub async fn lost(
         reservation_id: entry.reservation_id,
         actor_ref: actor,
     };
-    events::enqueue(outbox, tx, &event, now).await
+    events::enqueue(outbox, tx, &event, PRICE_BOOK_ENTRY_SUBJECT_TYPE, now).await
 }
 
 // @cpt-begin:cpt-cf-bss-pricing-algo-read-contract-events-typed-events:p1:inst-read-contract-events-typed-events-2
@@ -73,12 +82,15 @@ pub struct PlanReferenceLost {
     pub reservation_id: Option<Uuid>,
     pub actor_ref: Uuid,
 }
-impl TypedEvent for PlanReferenceLost {
+impl toolkit_gts::GtsSchema for PlanReferenceLost {
     const TYPE_ID: &'static str =
         gts_id!("cf.core.events.event.v1~cf.bss.pricing.plan_reference_lost.v1~");
-    const SUBJECT_TYPE: &'static str =
-        gts_id!("cf.core.events.subject.v1~cf.bss.pricing.plan_item.v1~");
-    const SOURCE: &'static str = SOURCE;
+    // The registered type's `data_schema` is the contract; the producer validates against it.
+    fn gts_schema_with_refs() -> serde_json::Value {
+        serde_json::json!({ "type": "object" })
+    }
+}
+impl BrokerEvent for PlanReferenceLost {
     fn subject(&self) -> Cow<'_, str> {
         Cow::Owned(self.item_id.to_string())
     }
@@ -107,5 +119,5 @@ pub async fn item_lost(
         reservation_id: item.reservation_id,
         actor_ref: actor,
     };
-    events::enqueue(outbox, tx, &event, now).await
+    events::enqueue(outbox, tx, &event, PLAN_ITEM_SUBJECT_TYPE, now).await
 }

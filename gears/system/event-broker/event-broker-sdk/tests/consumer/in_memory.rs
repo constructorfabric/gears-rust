@@ -2,8 +2,8 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use event_broker_sdk::{
-    ConsumerBuilder, ConsumerError, ConsumerGroupRef, Fallback, HandlerOutcome,
-    InMemoryOffsetManager, RawEvent, SingleEventHandler, SubscriptionInterest, gts_id,
+    ConsumerBuilder, ConsumerError, ConsumerGroupRef, Delivery, EventHandler, EventV1, Fallback,
+    HandlerOutcome, InMemoryOffsetManager, SubscriptionInterest, gts_id,
 };
 
 use super::common::{event_pattern, publish_json, topic, topic_fixture, wait_until};
@@ -16,13 +16,16 @@ struct RecordingHandler {
 }
 
 #[async_trait]
-impl SingleEventHandler for RecordingHandler {
+impl EventHandler<serde_json::Value> for RecordingHandler {
     async fn handle(
         &self,
-        event: RawEvent,
-        _attempts: u16,
+        event: EventV1,
+        _delivery: &Delivery,
     ) -> Result<HandlerOutcome, ConsumerError> {
-        self.subjects.lock().unwrap().push(event.subject);
+        self.subjects
+            .lock()
+            .unwrap()
+            .push(event.subject().to_owned());
         Ok(HandlerOutcome::Success)
     }
 }

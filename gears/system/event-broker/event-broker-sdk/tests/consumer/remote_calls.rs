@@ -3,8 +3,8 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use event_broker_sdk::gts_id;
 use event_broker_sdk::{
-    ConsumerBuilder, ConsumerError, ConsumerGroupRef, Fallback, HandlerOutcome,
-    InMemoryOffsetManager, RawEvent, SingleEventHandler,
+    ConsumerBuilder, ConsumerError, ConsumerGroupRef, Delivery, EventHandler, EventV1, Fallback,
+    HandlerOutcome, InMemoryOffsetManager,
 };
 
 use super::common::{publish_json, topic, topic_fixture, wait_until};
@@ -26,17 +26,17 @@ struct ForwardingHandler {
 }
 
 #[async_trait]
-impl SingleEventHandler for ForwardingHandler {
+impl EventHandler<serde_json::Value> for ForwardingHandler {
     async fn handle(
         &self,
-        event: RawEvent,
-        _attempts: u16,
+        event: EventV1,
+        _delivery: &Delivery,
     ) -> Result<HandlerOutcome, ConsumerError> {
         self.remote
             .calls
             .lock()
             .unwrap()
-            .push((event.subject, self.remote.token));
+            .push((event.subject().to_owned(), self.remote.token));
         Ok(HandlerOutcome::Success)
     }
 }

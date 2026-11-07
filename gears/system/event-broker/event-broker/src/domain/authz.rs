@@ -25,14 +25,14 @@ pub const CONSUMER_GROUP_FAMILY_RESOURCE: ResourceType =
 /// Matches the event base type and its descendants. Invalid SDK metadata is
 /// handled by [`event_family`] without panicking.
 static EVENT_FAMILY: LazyLock<Option<GtsIdPattern>> =
-    LazyLock::new(|| GtsIdPattern::try_new(EventV1::TYPE_ID).ok());
+    LazyLock::new(|| GtsIdPattern::try_new(<EventV1>::TYPE_ID).ok());
 
 /// The event family pattern; fails closed when it cannot be built.
 fn event_family() -> Result<&'static GtsIdPattern, DomainError> {
     EVENT_FAMILY.as_ref().ok_or_else(|| {
         DomainError::Internal(format!(
             "event base type '{}' is not a valid GTS pattern",
-            EventV1::TYPE_ID
+            <EventV1>::TYPE_ID
         ))
     })
 }
@@ -78,7 +78,7 @@ pub fn event_type_interest_resource(pattern: &GtsIdPattern) -> Result<ResourceTy
             message: format!(
                 "event type selector '{}' cannot match any event type ({}…)",
                 pattern.pattern(),
-                EventV1::TYPE_ID
+                <EventV1>::TYPE_ID
             ),
         });
     }
@@ -87,7 +87,7 @@ pub fn event_type_interest_resource(pattern: &GtsIdPattern) -> Result<ResourceTy
         .iter()
         .any(GtsIdPatternSegment::is_wildcard);
     Ok(if wildcard {
-        ResourceType::from_static(EventV1::TYPE_ID, &[pep_properties::OWNER_TENANT_ID])
+        ResourceType::from_static(<EventV1>::TYPE_ID, &[pep_properties::OWNER_TENANT_ID])
     } else {
         ResourceType::new(
             pattern.pattern().to_owned(),

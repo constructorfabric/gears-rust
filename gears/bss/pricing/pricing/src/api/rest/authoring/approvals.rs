@@ -411,7 +411,7 @@ async fn decided(
         generation: unit.generation,
         actors,
     };
-    events::enqueue(outbox, tx, &event, now).await?;
+    events::enqueue(outbox, tx, &event, events::APPROVAL_UNIT_SUBJECT_TYPE, now).await?;
     Ok(())
 }
 /// The domain event of an applied unit, by its kind, in the apply transaction. A plan revision
@@ -463,7 +463,7 @@ async fn plan_revision_published(
         unit_id: unit.id,
         actor_ref: cmd.ctx.subject_id(),
     };
-    events::enqueue(outbox, tx, &event, now).await?;
+    events::enqueue(outbox, tx, &event, events::PLAN_SUBJECT_TYPE, now).await?;
     // @cpt-end:cpt-cf-bss-pricing-algo-plans-revision-apply:p1:inst-plans-revision-apply-3
     Ok(())
 }
@@ -524,7 +524,7 @@ async fn prices_published(
         prices,
         actor_ref: cmd.ctx.subject_id(),
     };
-    events::enqueue(outbox, tx, &event, now).await?;
+    events::enqueue(outbox, tx, &event, events::PRICE_BOOK_SUBJECT_TYPE, now).await?;
     Ok(())
 }
 

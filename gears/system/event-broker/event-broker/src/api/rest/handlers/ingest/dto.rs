@@ -64,13 +64,16 @@ impl TryFrom<PublishEventRequest> for PublishRequest {
     type Error = DomainError;
 
     fn try_from(req: PublishEventRequest) -> Result<Self, DomainError> {
-        // Envelope encoding first. The validation pipeline puts schema-level
-        // field checks ahead of event-type lookup, so an event whose `source`
-        // or `subject` is mis-encoded is rejected for that reason even when its
-        // type is also unregistered - a check placed after the lookup could
-        // never report on a publish naming an unknown type.
+        // Envelope fields first. The validation pipeline puts schema-level
+        // field checks ahead of event-type lookup, so an event whose `source`,
+        // `subject` or `trace_parent` is malformed is rejected for that reason
+        // even when its type is also unregistered - a check placed after the
+        // lookup could never report on a publish naming an unknown type.
         event_broker_sdk::validate::source(&req.source)?;
         event_broker_sdk::validate::subject(&req.subject)?;
+        if let Some(trace_parent) = &req.trace_parent {
+            PublishRequest::check_trace_parent(trace_parent)?;
+        }
 
         // A GTS **type** identifier: an event is an instance of its derived
         // event type, so the identifier a publisher sends ends in `~`.

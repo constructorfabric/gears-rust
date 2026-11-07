@@ -809,15 +809,16 @@ async fn descriptors_and_reference_columns_never_refresh_a_pending_unit() {
 
 #[test]
 fn plan_revision_published_is_a_typed_event_about_the_plan() {
-    use bss_pricing::infra::events::{PLAN_SUBJECT_TYPE, PlanRevisionPublished};
-    use event_broker_sdk::TypedEvent;
+    use bss_pricing::infra::events::{
+        BrokerEvent, PLAN_SUBJECT_TYPE, PlanRevisionPublished, SOURCE,
+    };
+    use toolkit_gts::GtsSchema;
     assert_eq!(PlanRevisionPublished::TYPE_ID, PUBLISHED);
     assert_eq!(
         PLAN_SUBJECT_TYPE,
         "gts.cf.core.events.subject.v1~cf.bss.pricing.plan.v1~"
     );
-    assert_eq!(PlanRevisionPublished::SUBJECT_TYPE, PLAN_SUBJECT_TYPE);
-    assert_eq!(PlanRevisionPublished::SOURCE, "bss-pricing");
+    assert_eq!(SOURCE, "bss-pricing");
     let plan = Uuid::new_v4();
     let event = PlanRevisionPublished {
         tenant_id: Uuid::new_v4(),

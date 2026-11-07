@@ -12,17 +12,17 @@
 //! every id is validated as the GTS kind it claims to be.
 //!
 //! The documents are held by a `MockTypesRegistry` that also holds the
-//! broker's two base types, taken from the declarations `event-broker-sdk`
-//! links into this binary's GTS inventory, so every listed type schema is
-//! resolved the way `types-registry` resolves it. Nothing else from the
-//! inventory is held: a gear's own contract is never included. A test that
-//! needs it passes a registry holding it through
+//! broker's three base types (topic, event and subject), taken from the
+//! declarations `event-broker-sdk` links into this binary's GTS inventory, so
+//! every listed type schema is resolved the way `types-registry` resolves it.
+//! Nothing else from the inventory is held: a gear's own contract is never
+//! included. A test that needs it passes a registry holding it through
 //! `EventBrokerHarnessBuilder::with_types_registry_client`.
 
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use event_broker_sdk::gts::{EventV1, TopicV1};
+use event_broker_sdk::gts::{EventV1, SubjectV1, TopicV1};
 use gts::GtsTypeId;
 use serde_json::{Value as JsonValue, json};
 use toolkit_gts::{GTS_ID_URI_PREFIX, GtsInstanceId, GtsSchema};
@@ -31,7 +31,8 @@ use types_registry_sdk::testing_platform::MockTypesRegistry;
 use crate::config::EventBrokerConfig;
 
 const TOPIC_BASE: &str = TopicV1::TYPE_ID;
-const EVENT_BASE: &str = EventV1::TYPE_ID;
+const EVENT_BASE: &str = <EventV1>::TYPE_ID;
+const SUBJECT_BASE: &str = SubjectV1::<()>::TYPE_ID;
 
 /// The backend every fixture deployment names. A fixture never builds it
 /// through configuration - the harness builds the memory backend directly - but
@@ -62,11 +63,12 @@ pub fn derived_event_type(
     )
 }
 
-/// A registry holding the broker's two base types (`TOPIC_BASE` and
-/// `EVENT_BASE`, as `event-broker-sdk` declares them), the `topics` instance
-/// documents (keyed by their `id`) and the `event_types` schema documents
-/// (keyed by their `$id`). Nothing else from this binary's GTS inventory is
-/// held, so a gear's own contract is never included.
+/// A registry holding the broker's three base types (`TOPIC_BASE`,
+/// `EVENT_BASE` and `SUBJECT_BASE`, as `event-broker-sdk` declares them), the
+/// `topics` instance documents (keyed by their `id`) and the `event_types`
+/// schema documents (keyed by their `$id`). The subject base lets a test seed a
+/// derived subject kind that resolves. Nothing else from this binary's GTS
+/// inventory is held, so a gear's own contract is never included.
 ///
 /// # Panics
 ///
@@ -76,7 +78,7 @@ pub fn derived_event_type(
 #[must_use]
 pub fn registry_holding(topics: &[JsonValue], event_types: &[JsonValue]) -> Arc<MockTypesRegistry> {
     let registry = Arc::new(MockTypesRegistry::new());
-    for base in [TOPIC_BASE, EVENT_BASE] {
+    for base in [TOPIC_BASE, EVENT_BASE, SUBJECT_BASE] {
         let entry = toolkit_gts::inventory::iter::<toolkit_gts::InventoryTypeSchema>
             .into_iter()
             .find(|entry| entry.type_id == base)

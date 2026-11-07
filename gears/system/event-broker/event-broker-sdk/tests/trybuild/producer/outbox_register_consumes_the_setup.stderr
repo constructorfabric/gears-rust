@@ -1,0 +1,15 @@
+error[E0382]: use of moved value: `setup`
+ --> tests/trybuild/producer/outbox_register_consumes_the_setup.rs:6:13
+  |
+4 | fn wire(setup: OutboxSetup, a: OutboxBuilder, b: OutboxBuilder) {
+  |         ----- move occurs because `setup` has type `OutboxSetup`, which does not implement the `Copy` trait
+5 |     let _ = setup.register(a);
+  |                   ----------- `setup` moved due to this method call
+6 |     let _ = setup.start(b);
+  |             ^^^^^ value used here after move
+  |
+note: `OutboxSetup::register` takes ownership of the receiver `self`, which moves `setup`
+ --> src/producer/outbox_setup.rs
+  |
+  |     pub fn register(self, builder: OutboxBuilder) -> (LeasedQueueBuilder, OutboxBinder) {
+  |                     ^^^^

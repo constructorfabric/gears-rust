@@ -1814,6 +1814,169 @@ async fn a_resend_overlapping_the_head_skips_the_duplicate_prefix() {
 }
 
 #[tokio::test]
+async fn a_resend_at_the_head_with_another_previous_answers_200_and_stores_nothing() {
+    let harness = run_rules_harness().await;
+    let producer_id = register_test_producer(&harness).await;
+    let tenant_id = Uuid::from_u128(0x7e7a_1901);
+    let first_id = Uuid::from_u128(0xe000_1908);
+
+    // The chain's head is 8 before the resend.
+    harness
+        .api_v1()
+        .post_events()
+        .with_body(Json(&json!({
+            "id": first_id,
+            "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
+            "tenant_id": tenant_id,
+            "source": "order-service",
+            "subject": "order-head-previous",
+            "subject_type": "gts.x.eb.t1.subject.v1~",
+            "occurred_at": "2026-05-29T10:10:00Z",
+            "meta": { "version": 1, "producer_id": producer_id, "previous": 7, "sequence": 8 },
+        })))
+        .send()
+        .await
+        .assert_status(202);
+
+    // `sequence == last` makes it a duplicate; its `previous` is not read.
+    let resend = harness
+        .api_v1()
+        .post_events()
+        .with_body(Json(&json!({
+            "id": Uuid::from_u128(0xe000_1918),
+            "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
+            "tenant_id": tenant_id,
+            "source": "order-service",
+            "subject": "order-head-previous",
+            "subject_type": "gts.x.eb.t1.subject.v1~",
+            "occurred_at": "2026-05-29T10:10:01Z",
+            "meta": { "version": 1, "producer_id": producer_id, "previous": 3, "sequence": 8 },
+        })))
+        .send()
+        .await;
+
+    resend.assert_status(200);
+    assert_eq!(resend.text(), "", "200 OK must carry no body");
+    let cursors = harness
+        .api_v1()
+        .get_producer_cursors(&producer_id.to_string())
+        .send()
+        .await;
+    cursors.assert_status(200);
+    assert_eq!(
+        cursors.json(),
+        json!({
+            "producer_id": producer_id,
+            "client_agent": "test-agent",
+            "topics": [{
+                "topic": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
+                "last_sequence": 8,
+            }],
+        })
+    );
+    let sentinel = publish_sentinel(&harness, Uuid::from_u128(0x5e7_1901), tenant_id).await;
+    assert_eq!(
+        stored_ids_through(
+            &harness,
+            "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
+            sentinel
+        )
+        .await,
+        vec![first_id, sentinel],
+        "the resend is not stored"
+    );
+}
+
+#[tokio::test]
+async fn a_batch_led_by_a_head_resend_with_another_previous_stores_only_the_rest() {
+    let harness = run_rules_harness().await;
+    let producer_id = register_test_producer(&harness).await;
+    let tenant_id = Uuid::from_u128(0x7e7a_2001);
+    let first_id = Uuid::from_u128(0xe000_2008);
+    let ninth_id = Uuid::from_u128(0xe000_2009);
+
+    // The chain's head is 8 before the batch.
+    harness
+        .api_v1()
+        .post_events()
+        .with_body(Json(&json!({
+            "id": first_id,
+            "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
+            "tenant_id": tenant_id,
+            "source": "order-service",
+            "subject": "order-head-previous",
+            "subject_type": "gts.x.eb.t1.subject.v1~",
+            "occurred_at": "2026-05-29T10:10:00Z",
+            "meta": { "version": 1, "producer_id": producer_id, "previous": 7, "sequence": 8 },
+        })))
+        .send()
+        .await
+        .assert_status(202);
+
+    // `e[0].sequence == last`: event 0 is a duplicate prefix whatever its
+    // `previous`, and event 1 advances.
+    let resp = harness
+        .api_v1()
+        .post_events_batch()
+        .with_body(Json(&json!({
+            "events": [
+                {
+                    "id": Uuid::from_u128(0xe000_2018),
+                    "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
+                    "tenant_id": tenant_id,
+                    "source": "order-service",
+                    "subject": "order-head-previous",
+                    "subject_type": "gts.x.eb.t1.subject.v1~",
+                    "occurred_at": "2026-05-29T10:10:01Z",
+                    "meta": { "version": 1, "producer_id": producer_id, "previous": 3, "sequence": 8 },
+                },
+                {
+                    "id": ninth_id,
+                    "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
+                    "tenant_id": tenant_id,
+                    "source": "order-service",
+                    "subject": "order-head-previous",
+                    "subject_type": "gts.x.eb.t1.subject.v1~",
+                    "occurred_at": "2026-05-29T10:10:02Z",
+                    "meta": { "version": 1, "producer_id": producer_id, "previous": 8, "sequence": 9 },
+                },
+            ],
+        })))
+        .send()
+        .await;
+
+    resp.assert_status(202);
+    assert_eq!(resp.text(), "", "202 Accepted must carry no body");
+    let cursors = harness
+        .api_v1()
+        .get_producer_cursors(&producer_id.to_string())
+        .send()
+        .await;
+    cursors.assert_status(200);
+    assert_eq!(
+        cursors.json(),
+        json!({
+            "producer_id": producer_id,
+            "client_agent": "test-agent",
+            "topics": [{
+                "topic": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
+                "last_sequence": 9,
+            }],
+        })
+    );
+    assert_eq!(
+        stored_ids_through(
+            &harness,
+            "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
+            ninth_id
+        )
+        .await,
+        vec![first_id, ninth_id],
+        "only the event past the head is newly stored"
+    );
+}
+
+#[tokio::test]
 async fn a_monotonic_run_skips_its_leading_duplicates() {
     let harness = run_rules_harness().await;
     let producer_id = harness
@@ -2727,6 +2890,266 @@ async fn publish_event_instance_shaped_type_returns_400() {
                 "resource_type": "gts.cf.core.events.request.v1~",
             },
         })
+    );
+}
+
+// -- trace_parent format (scenario producer/single/1.06) --
+
+#[tokio::test]
+async fn a_publish_with_a_malformed_trace_parent_is_rejected_and_stores_nothing() {
+    let harness = run_rules_harness().await;
+    let tenant_id = Uuid::from_u128(0x7e7a_1201);
+
+    let resp = harness
+        .api_v1()
+        .post_events()
+        .with_body(Json(&json!({
+            "id": Uuid::from_u128(0xe000_1201),
+            "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
+            "tenant_id": tenant_id,
+            "source": "order-service",
+            "subject": "order-42",
+            "subject_type": "gts.x.eb.t1.subject.v1~",
+            "occurred_at": "2026-05-29T10:10:00Z",
+            "trace_parent": "00-0AF7651916CD43DD8448EB211C80319C-B7AD6B7169203331-01",
+        })))
+        .send()
+        .await;
+
+    resp.assert_status(400);
+    assert_eq!(
+        resp.json(),
+        json!({
+            "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~",
+            "title": "Invalid Argument",
+            "status": 400,
+            "detail": "Request validation failed",
+            "instance": "/event-broker/v1/events",
+            "context": {
+                "field_violations": [{
+                    "field": "trace_parent",
+                    "description": "must be a W3C traceparent: four lowercase hex groups of 2, 32, 16 and 2 digits joined by '-'",
+                    "reason": "invalid_event_field",
+                }],
+                "resource_type": "gts.cf.core.events.request.v1~",
+            },
+        })
+    );
+
+    let sentinel = publish_sentinel(&harness, Uuid::from_u128(0x5e7_1201), tenant_id).await;
+    assert_eq!(
+        stored_ids_through(
+            &harness,
+            "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
+            sentinel
+        )
+        .await,
+        vec![sentinel],
+        "a rejected publish stores nothing"
+    );
+}
+
+#[tokio::test]
+async fn a_batch_with_one_malformed_trace_parent_is_rejected_whole() {
+    let harness = run_rules_harness().await;
+    let tenant_id = Uuid::from_u128(0x7e7a_1202);
+
+    let resp = harness
+        .api_v1()
+        .post_events_batch()
+        .with_body(Json(&json!({
+            "events": [
+                {
+                    "id": Uuid::from_u128(0xe000_1202),
+                    "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
+                    "tenant_id": tenant_id,
+                    "source": "order-service",
+                    "subject": "order-42",
+                    "subject_type": "gts.x.eb.t1.subject.v1~",
+                    "occurred_at": "2026-05-29T10:10:00Z",
+                },
+                {
+                    "id": Uuid::from_u128(0xe000_1203),
+                    "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
+                    "tenant_id": tenant_id,
+                    "source": "order-service",
+                    "subject": "order-42",
+                    "subject_type": "gts.x.eb.t1.subject.v1~",
+                    "occurred_at": "2026-05-29T10:10:01Z",
+                    "trace_parent": "00-0af7-b7ad6b7169203331-01",
+                },
+            ],
+        })))
+        .send()
+        .await;
+
+    resp.assert_status(400);
+    assert_eq!(
+        resp.json(),
+        json!({
+            "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~",
+            "title": "Invalid Argument",
+            "status": 400,
+            "detail": "Request validation failed",
+            "instance": "/event-broker/v1/events:batch",
+            "context": {
+                "field_violations": [{
+                    "field": "trace_parent",
+                    "description": "must be a W3C traceparent: four lowercase hex groups of 2, 32, 16 and 2 digits joined by '-'",
+                    "reason": "invalid_event_field",
+                }],
+                "resource_type": "gts.cf.core.events.request.v1~",
+            },
+        })
+    );
+
+    let sentinel = publish_sentinel(&harness, Uuid::from_u128(0x5e7_1202), tenant_id).await;
+    assert_eq!(
+        stored_ids_through(
+            &harness,
+            "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
+            sentinel
+        )
+        .await,
+        vec![sentinel],
+        "the valid first event of the rejected batch must not be stored"
+    );
+}
+
+/// The type is well-formed but unregistered, which alone answers `404`: the
+/// envelope's format is checked before the type is looked up.
+#[tokio::test]
+async fn a_malformed_trace_parent_is_rejected_before_the_type_is_looked_up() {
+    let harness = run_rules_harness().await;
+    let tenant_id = Uuid::from_u128(0x7e7a_1203);
+
+    let resp = harness
+        .api_v1()
+        .post_events()
+        .with_body(Json(&json!({
+            "id": Uuid::from_u128(0xe000_1204),
+            "type": "gts.cf.core.events.event.v1~x.eb.t1.unregistered.v1~",
+            "tenant_id": tenant_id,
+            "source": "order-service",
+            "subject": "order-42",
+            "subject_type": "gts.x.eb.t1.subject.v1~",
+            "occurred_at": "2026-05-29T10:10:00Z",
+            "trace_parent": "00-0AF7651916CD43DD8448EB211C80319C-B7AD6B7169203331-01",
+        })))
+        .send()
+        .await;
+
+    resp.assert_status(400);
+    assert_eq!(
+        resp.json(),
+        json!({
+            "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~",
+            "title": "Invalid Argument",
+            "status": 400,
+            "detail": "Request validation failed",
+            "instance": "/event-broker/v1/events",
+            "context": {
+                "field_violations": [{
+                    "field": "trace_parent",
+                    "description": "must be a W3C traceparent: four lowercase hex groups of 2, 32, 16 and 2 digits joined by '-'",
+                    "reason": "invalid_event_field",
+                }],
+                "resource_type": "gts.cf.core.events.request.v1~",
+            },
+        })
+    );
+
+    let sentinel = publish_sentinel(&harness, Uuid::from_u128(0x5e7_1203), tenant_id).await;
+    assert_eq!(
+        stored_ids_through(
+            &harness,
+            "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
+            sentinel
+        )
+        .await,
+        vec![sentinel],
+        "a rejected publish stores nothing"
+    );
+}
+
+#[tokio::test]
+async fn a_well_formed_trace_parent_is_accepted() {
+    let harness = run_rules_harness().await;
+    let event_id = Uuid::from_u128(0xe000_1205);
+    let tenant_id = Uuid::from_u128(0x7e7a_1204);
+
+    let resp = harness
+        .api_v1()
+        .post_events()
+        .with_body(Json(&json!({
+            "id": event_id,
+            "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
+            "tenant_id": tenant_id,
+            "source": "order-service",
+            "subject": "order-42",
+            "subject_type": "gts.x.eb.t1.subject.v1~",
+            "occurred_at": "2026-05-29T10:10:00Z",
+            "trace_parent": "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01",
+            "data": { "order_id": "order-42" },
+        })))
+        .send()
+        .await;
+
+    resp.assert_status(202);
+    assert_eq!(resp.text(), "", "202 Accepted carries no body");
+    assert_eq!(
+        stored_ids_through(
+            &harness,
+            "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
+            event_id
+        )
+        .await,
+        vec![event_id]
+    );
+    let stored = harness
+        .backend()
+        .read(
+            &event_broker_sdk::backend::TopicPartition::new(
+                event_broker_sdk::GtsInstanceId::try_new(
+                    "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
+                )
+                .expect("a valid topic id"),
+                event_broker_sdk::backend::Partition::new(0),
+            ),
+            event_broker_sdk::Sequence::NONE,
+            10,
+            event_broker_sdk::backend::Wait::No,
+        )
+        .await
+        .expect("read the stored events");
+    let [event] = stored.as_slice() else {
+        panic!("expected exactly one stored event, got {stored:?}");
+    };
+    // The SDK `Event` has no `PartialEq`, so the publisher-set fields compare
+    // one by one; the broker stamps the rest.
+    assert_eq!(
+        (
+            event.id,
+            event.type_id.as_ref(),
+            event.tenant_id,
+            event.source.as_str(),
+            event.subject.as_str(),
+            event.subject_type.as_ref(),
+            event.occurred_at.to_rfc3339(),
+            event.trace_parent.as_deref(),
+            &event.data,
+        ),
+        (
+            event_id,
+            "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
+            tenant_id,
+            "order-service",
+            "order-42",
+            "gts.x.eb.t1.subject.v1~",
+            "2026-05-29T10:10:00+00:00".to_owned(),
+            Some("00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01"),
+            &Some(json!({ "order_id": "order-42" })),
+        )
     );
 }
 

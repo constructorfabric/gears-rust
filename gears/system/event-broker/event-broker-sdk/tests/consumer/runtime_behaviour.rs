@@ -7,17 +7,15 @@ use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use chrono::Utc;
 use event_broker::test_support::{EventBrokerHarness, StaticTypesRegistry};
 use event_broker_sdk::{
-    BatchHandlerOutcome, ConnectionDropReason, ConsumerBuffering, ConsumerBuilder,
-    ConsumerCommitMode, ConsumerGroupRef, ConsumerListenerSettings, ConsumerRuntimeEvent,
-    ConsumerSlowDetection, Event, Fallback, GtsTypeId, InMemoryOffsetManager, PartitionBufferState,
-    Sequence, SlowConsumerTrigger, gts_id,
+    Ack, BatchHandlerOutcome, ConnectionDropReason, ConsumerBuffering, ConsumerBuilder,
+    ConsumerCommitMode, ConsumerGroupRef, ConsumerListenerSettings, ConsumerRetry,
+    ConsumerRuntimeEvent, ConsumerSlowDetection, EventV1, Fallback, GtsTypeId,
+    InMemoryOffsetManager, PartitionBufferState, Sequence, SlowConsumerTrigger, gts_id,
 };
 use serde_json::{Value, json};
 use toolkit_security::SecurityContext;
-use uuid::Uuid;
 
 use super::common::{SHOWCASE_SUBJECT_TYPE, topic};
 use super::doubles::{
@@ -52,26 +50,18 @@ async fn publish_one(
     subject: &str,
     data: Value,
 ) {
+    let event = EventV1::builder_for(
+        GtsTypeId::try_new(event_type).expect("valid event type"),
+        data,
+    )
+    .tenant_id(ctx.subject_tenant_id())
+    .source("runtime.behaviour.test")
+    .subject(subject)
+    .subject_type_id(GtsTypeId::try_new(SHOWCASE_SUBJECT_TYPE).expect("valid subject type"))
+    .build()
+    .expect("a valid event");
     broker
-        .publish(
-            ctx,
-            &Event {
-                id: Uuid::new_v4(),
-                type_id: GtsTypeId::try_new(event_type).expect("valid event type"),
-                tenant_id: ctx.subject_tenant_id(),
-                source: "runtime.behaviour.test".to_owned(),
-                subject: subject.to_owned(),
-                subject_type: GtsTypeId::try_new(SHOWCASE_SUBJECT_TYPE)
-                    .expect("valid subject type"),
-                occurred_at: Utc::now(),
-                trace_parent: None,
-                data: Some(data),
-                partition: None,
-                sequence: None,
-                sequence_time: None,
-                meta: None,
-            },
-        )
+        .publish(ctx, &event, Ack::Accepted)
         .await
         .expect("event published");
 }
@@ -228,8 +218,10 @@ async fn runtime_listener_observes_representative_non_dlq_event_variants() {
             high_watermark: 1,
             low_watermark: 0,
         })
-        .retry_base(Duration::from_millis(1))
-        .retry_max(Duration::from_millis(1))
+        .retry(ConsumerRetry {
+            base_delay: Duration::from_millis(1),
+            max_delay: Duration::from_millis(1),
+        })
         .register_listener(listener)
         .offset_manager(InMemoryOffsetManager::new(Fallback::Earliest))
         .batch_handler(FailingThenCommitBatchHandler {

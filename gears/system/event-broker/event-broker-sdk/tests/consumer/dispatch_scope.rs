@@ -7,14 +7,13 @@
 use std::collections::BTreeSet;
 use std::time::Duration;
 
-use chrono::Utc;
 use event_broker::test_support::StaticTypesRegistry;
 use event_broker_sdk::{
-    ConsumerBuilder, ConsumerGroupRef, Event, Fallback, GtsTypeId, InMemoryOffsetManager, gts_id,
+    Ack, ConsumerBuilder, ConsumerGroupRef, EventV1, Fallback, GtsTypeId, InMemoryOffsetManager,
+    gts_id,
 };
 use serde_json::json;
 use toolkit_stable_hash::murmur3_x86_32;
-use uuid::Uuid;
 
 use super::common::{SHOWCASE_SUBJECT_TYPE, fixture_from_catalog, topic};
 use super::doubles::BatchScopeRecorder;
@@ -91,25 +90,18 @@ async fn runtime_dispatch_never_mixes_topics_or_partitions_in_handler_batches() 
         (PAYMENTS_EVENT, &on_partition_0),
         (PAYMENTS_EVENT, &on_partition_1),
     ] {
+        let event = EventV1::builder_for(
+            GtsTypeId::try_new(event_type_id).expect("valid event type"),
+            json!({}),
+        )
+        .tenant_id(fx.ctx.subject_tenant_id())
+        .source("runtime.dispatch.test")
+        .subject(subject.clone())
+        .subject_type_id(subject_type.clone())
+        .build()
+        .expect("a valid event");
         fx.broker
-            .publish(
-                &fx.ctx,
-                &Event {
-                    id: Uuid::new_v4(),
-                    type_id: GtsTypeId::try_new(event_type_id).expect("valid event type"),
-                    tenant_id: fx.ctx.subject_tenant_id(),
-                    source: "runtime.dispatch.test".to_owned(),
-                    subject: subject.clone(),
-                    subject_type: subject_type.clone(),
-                    occurred_at: Utc::now(),
-                    trace_parent: None,
-                    data: Some(json!({})),
-                    partition: None,
-                    sequence: None,
-                    sequence_time: None,
-                    meta: None,
-                },
-            )
+            .publish(&fx.ctx, &event, Ack::Accepted)
             .await
             .expect("event published");
     }

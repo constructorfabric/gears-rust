@@ -1,0 +1,7 @@
+error[E0432]: unresolved import `event_broker_sdk::producer::ProducerOutboxEnvelope`
+ --> tests/trybuild/producer/outbox_envelope_is_private.rs:1:5
+  |
+1 | use event_broker_sdk::producer::ProducerOutboxEnvelope;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^----------------------
+  |                                 |
+  |                                 no `ProducerOutboxEnvelope` in `producer`

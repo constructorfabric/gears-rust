@@ -29,11 +29,13 @@ use crate::ids::ProducerId;
 use crate::producer::registration::{
     self, NewRegistration, ProducerRegistration, ProducerRegistrationStore, RegistrationSlot,
 };
-use crate::producer::types::{DbDeduplication, ProducerIdentity};
+use crate::producer::{OutboxRegistration, OutboxSetup};
 
 const KEY: &str = "orders";
 const QUEUE: &str = "event-broker-producer";
 const CLIENT_AGENT: &str = "order-service/1.0";
+const TOPIC: &str = "gts.cf.core.events.topic.v1~example.sdk.db.orders.v1";
+const EVENT_TYPE_PATTERN: &str = "gts.cf.core.events.event.v1~example.sdk.db.*";
 /// Bounds each await after a gate or pause is armed, so a held registration
 /// that never releases fails the test instead of hanging it.
 const BOUND: Duration = Duration::from_secs(1);
@@ -45,11 +47,12 @@ fn registered(n: usize) -> ProducerId {
     ))
 }
 
-/// Answers `register_producer` with `registered(n)` on its `n`th call. Before
-/// answering it reports `n` on `entered`, then waits on the gate armed for
-/// `n`, if any.
+/// Answers `register_producer` with `registered(n)` on its `n`th call, and
+/// records the client agent of each call. Before answering it reports `n` on
+/// `entered`, then waits on the gate armed for `n`, if any.
 struct ScriptedBroker {
     register_calls: AtomicUsize,
+    client_agents: StdMutex<Vec<String>>,
     gates: StdMutex<HashMap<usize, oneshot::Receiver<()>>>,
     entered: mpsc::UnboundedSender<usize>,
 }
@@ -59,6 +62,7 @@ impl ScriptedBroker {
         let (entered, entered_rx) = mpsc::unbounded_channel();
         let broker = Arc::new(Self {
             register_calls: AtomicUsize::new(0),
+            client_agents: StdMutex::new(Vec::new()),
             gates: StdMutex::new(HashMap::new()),
             entered,
         });
@@ -75,6 +79,14 @@ impl ScriptedBroker {
     fn register_calls(&self) -> usize {
         self.register_calls.load(Ordering::SeqCst)
     }
+
+    /// The client agent of each registration so far, in call order.
+    fn client_agents(&self) -> Vec<String> {
+        self.client_agents
+            .lock()
+            .expect("client agents lock")
+            .clone()
+    }
 }
 
 #[async_trait]
@@ -83,8 +95,12 @@ impl BrokerStub for ScriptedBroker {
         &self,
         _ctx: &SecurityContext,
         _mode: ProducerMode,
-        _client_agent: &str,
+        client_agent: &str,
     ) -> Result<ProducerId, EventBrokerError> {
+        self.client_agents
+            .lock()
+            .expect("client agents lock")
+            .push(client_agent.to_owned());
         let n = self.register_calls.fetch_add(1, Ordering::SeqCst) + 1;
         let gate = self.gates.lock().expect("gates lock").remove(&n);
         self.entered.send(n).expect("the test listens");
@@ -146,19 +162,11 @@ async fn managed_producer(broker: Arc<ScriptedBroker>, db: toolkit_db::Db) -> Db
         .broker(broker)
         .db(db)
         .security_context(SecurityContext::anonymous())
-        .identity(
-            ProducerIdentity::new()
-                .source("order-service")
-                .client_agent(CLIENT_AGENT),
-        )
-        .deduplication(
-            DbDeduplication::managed(ProducerMode::Chained)
-                .key(KEY)
-                .build()
-                .expect("a valid managed setting"),
-        )
-        .topics(["gts.cf.core.events.topic.v1~example.sdk.db.orders.v1"])
-        .event_type_patterns(["gts.cf.core.events.event.v1~example.sdk.db.*"])
+        .source("order-service")
+        .client_agent(CLIENT_AGENT)
+        .registration(OutboxRegistration::managed(ProducerMode::Chained, KEY))
+        .topics([TOPIC])
+        .event_type_patterns([EVENT_TYPE_PATTERN])
         .lazy_validation()
         .build()
         .await
@@ -259,89 +267,52 @@ async fn a_drop_after_register_does_not_orphan_the_broker_id() {
     );
 }
 
+/// A setup built without a client agent registers its partition ids under
+/// the SDK's default agent, and stores that agent on the registration row.
 #[tokio::test]
-async fn a_queue_name_over_255_bytes_is_refused() {
+async fn an_unset_client_agent_registers_under_the_sdk_default() {
+    const DEFAULT_AGENT: &str = concat!("event-broker-sdk/", env!("CARGO_PKG_VERSION"));
     let (broker, _entered) = ScriptedBroker::new();
-    let producer = managed_producer(broker, sqlite_db().await).await;
+    let db = sqlite_db().await;
+    let setup = OutboxSetup::builder()
+        .broker(broker.clone())
+        .db(db.clone())
+        .security_context(SecurityContext::anonymous())
+        .source("order-service")
+        .registration(OutboxRegistration::managed(ProducerMode::Chained, KEY))
+        .topics([TOPIC])
+        .event_type_patterns([EVENT_TYPE_PATTERN])
+        .queue(QUEUE, toolkit_db::outbox::Partitions::of(1))
+        .lazy_schema_loading()
+        .build()
+        .await
+        .expect("the setup builds");
 
-    let Err(EventBrokerError::InvalidProducerOptions { detail }) =
-        producer.outbox_queue("q".repeat(256), toolkit_db::outbox::Partitions::of(1))
-    else {
-        panic!("a 256-byte queue name is refused as invalid producer options");
-    };
+    let producer_id = setup
+        .partition_producer_for_test(QUEUE, 0)
+        .await
+        .expect("partition 0 registers");
+
     assert_eq!(
-        detail,
-        "producer outbox queue name must be at most 255 bytes"
+        (producer_id, broker.client_agents()),
+        (registered(1), vec![DEFAULT_AGENT.to_owned()])
     );
-
-    assert!(
-        producer
-            .outbox_queue("q".repeat(255), toolkit_db::outbox::Partitions::of(1))
-            .is_ok(),
-        "a 255-byte queue name fits the registration column"
-    );
-}
-
-#[tokio::test]
-async fn a_queue_name_with_edge_whitespace_is_refused() {
-    let (broker, _entered) = ScriptedBroker::new();
-    let producer = managed_producer(broker, sqlite_db().await).await;
-
-    for queue in ["orders ", " orders", "orders\t"] {
-        let Err(EventBrokerError::InvalidProducerOptions { detail }) =
-            producer.outbox_queue(queue, toolkit_db::outbox::Partitions::of(1))
-        else {
-            panic!("queue name {queue:?} is refused as invalid producer options");
-        };
-        assert_eq!(
-            detail, "producer outbox queue name must not have leading or trailing whitespace",
-            "queue name {queue:?}"
-        );
-    }
-}
-
-#[tokio::test]
-async fn an_overlong_queue_name_with_a_trailing_space_is_refused_for_whitespace() {
-    let (broker, _entered) = ScriptedBroker::new();
-    let producer = managed_producer(broker, sqlite_db().await).await;
-
-    let Err(EventBrokerError::InvalidProducerOptions { detail }) = producer.outbox_queue(
-        format!("{} ", "q".repeat(255)),
-        toolkit_db::outbox::Partitions::of(1),
-    ) else {
-        panic!(
-            "a 256-byte queue name with a trailing space is refused as invalid producer options"
-        );
-    };
     assert_eq!(
-        detail,
-        "producer outbox queue name must not have leading or trailing whitespace"
-    );
-}
-
-#[tokio::test]
-async fn an_all_spaces_queue_name_is_refused_as_blank() {
-    let (broker, _entered) = ScriptedBroker::new();
-    let producer = managed_producer(broker, sqlite_db().await).await;
-
-    let Err(EventBrokerError::InvalidProducerOptions { detail }) =
-        producer.outbox_queue(" ".repeat(256), toolkit_db::outbox::Partitions::of(1))
-    else {
-        panic!("a queue name of 256 spaces is refused as invalid producer options");
-    };
-    assert_eq!(detail, "producer outbox queue name must not be empty");
-}
-
-#[tokio::test]
-async fn a_queue_name_with_inner_whitespace_is_accepted() {
-    let (broker, _entered) = ScriptedBroker::new();
-    let producer = managed_producer(broker, sqlite_db().await).await;
-
-    assert!(
-        producer
-            .outbox_queue("orders created", toolkit_db::outbox::Partitions::of(1))
-            .is_ok(),
-        "inner whitespace is part of the queue name"
+        ProducerRegistrationStore::new(db)
+            .load_all(KEY)
+            .await
+            .expect("the store reads"),
+        vec![ProducerRegistration {
+            slot: RegistrationSlot {
+                key: KEY.to_owned(),
+                queue: QUEUE.to_owned(),
+                partition: 0,
+            },
+            producer_id: registered(1),
+            mode: ProducerMode::Chained,
+            client_agent: DEFAULT_AGENT.to_owned(),
+            generation: 1,
+        }]
     );
 }
 
@@ -349,9 +320,22 @@ async fn a_queue_name_with_inner_whitespace_is_accepted() {
 async fn a_test_slot_with_an_edge_whitespace_queue_is_refused() {
     let (broker, _entered) = ScriptedBroker::new();
     let db = sqlite_db().await;
-    let producer = managed_producer(broker.clone(), db.clone()).await;
+    let setup = OutboxSetup::builder()
+        .broker(broker.clone())
+        .db(db.clone())
+        .security_context(SecurityContext::anonymous())
+        .source("order-service")
+        .registration(OutboxRegistration::managed(ProducerMode::Chained, KEY))
+        .topics([TOPIC])
+        .event_type_patterns([EVENT_TYPE_PATTERN])
+        .queue(QUEUE, toolkit_db::outbox::Partitions::of(1))
+        .client_agent(CLIENT_AGENT)
+        .lazy_schema_loading()
+        .build()
+        .await
+        .expect("the setup builds");
 
-    let result = producer.partition_producer_for_test(" q", 0).await;
+    let result = setup.partition_producer_for_test(" q", 0).await;
 
     let Err(EventBrokerError::InvalidProducerOptions { detail }) = result else {
         panic!("the slot is refused as invalid producer options: {result:?}");

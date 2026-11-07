@@ -74,8 +74,9 @@ async def test_register_monotonic_producer_returns_201(api):
 async def test_chained_mode_sequence_advances(api):
     """scenario: producer/flows/1.03-positive-chained-mode-sequence.md
 
-    A chained producer publishes event N with meta.previous=N-1; the broker
-    validates the chain, admits the event, and advances last_sequence to N.
+    A chained producer publishes an event whose meta.previous is the chain head;
+    the broker validates the chain, admits the event, and advances last_sequence
+    to its sequence.
     """
     tenant_id = str(uuid.uuid4())
     async with api() as client:
@@ -120,8 +121,9 @@ async def test_chained_mode_sequence_advances(api):
 async def test_a_resend_at_the_chain_head_is_a_duplicate_whatever_its_id(api):
     """scenario: producer/flows/1.04-positive-chain-head-retry-dedup.md
 
-    Dedup keys on the chain position, so a resend at the head under a new
-    event ``id`` is still a duplicate: 200, nothing stored, the chain goes on.
+    Dedup keys on ``meta.sequence`` against the chain head, so a resend at the
+    head under a new event ``id`` is still a duplicate: 200, nothing stored, the
+    chain goes on.
     """
     tenant_id = str(uuid.uuid4())
     first_id = "e2e10400-0000-0000-0000-000000000001"
@@ -239,6 +241,190 @@ async def test_a_resend_at_the_chain_head_is_a_duplicate_whatever_its_id(api):
             "partition": 0,
             "sequence": a["sequence"],
             "sequence_time": a["sequence_time"],
+        },
+        {
+            "id": next_id,
+            "type": EVENT_TYPE_STREAM,
+            "topic": TOPIC_STREAM,
+            "tenant_id": tenant_id,
+            "source": "e2e-test",
+            "subject": "s1",
+            "subject_type": SUBJECT_TYPE,
+            "occurred_at": c["occurred_at"],
+            "trace_parent": None,
+            "data": None,
+            "partition": 0,
+            "sequence": c["sequence"],
+            "sequence_time": c["sequence_time"],
+        },
+    ]
+
+
+async def test_a_resend_at_the_chain_head_is_a_duplicate_whatever_its_previous(api):
+    """scenario: producer/flows/1.04-positive-chain-head-retry-dedup.md
+
+    A resend is a duplicate when its ``sequence`` is the head, whatever its
+    ``previous``: 200, nothing stored, the chain goes on.
+    """
+    tenant_id = str(uuid.uuid4())
+    first_id = "e2e10401-0000-0000-0000-000000000001"
+    second_id = "e2e10401-0000-0000-0000-000000000002"
+    resend_id = "e2e10401-0000-0000-0000-000000000003"
+    next_id = "e2e10401-0000-0000-0000-000000000004"
+    async with api() as client:
+        reg = await client.post(
+            "/producers",
+            json={"mode": "chained", "client_agent": "e2e-test/1.0"},
+        )
+        assert reg.status_code == 201
+        producer_id = reg.json()["id"]
+
+        first = await client.post(
+            "/events",
+            json={
+                **_event(tenant_id, event_id=first_id),
+                "meta": {
+                    "version": 1,
+                    "producer_id": producer_id,
+                    "previous": 0,
+                    "sequence": 1,
+                },
+            },
+        )
+        assert first.status_code == 202, first.text
+        assert first.text == ""
+
+        second = {
+            **_event(tenant_id, event_id=second_id),
+            "meta": {
+                "version": 1,
+                "producer_id": producer_id,
+                "previous": 1,
+                "sequence": 2,
+            },
+        }
+        head = await client.post("/events", json=second)
+        assert head.status_code == 202, head.text
+        assert head.text == ""
+
+        resend = await client.post(
+            "/events",
+            json={
+                **second,
+                "id": resend_id,
+                "meta": {
+                    "version": 1,
+                    "producer_id": producer_id,
+                    "previous": 0,
+                    "sequence": 2,
+                },
+            },
+        )
+        assert resend.status_code == 200, resend.text
+        assert resend.text == "", "200 dedup response must carry no body"
+
+        following = await client.post(
+            "/events",
+            json={
+                **_event(tenant_id, event_id=next_id),
+                "meta": {
+                    "version": 1,
+                    "producer_id": producer_id,
+                    "previous": 2,
+                    "sequence": 3,
+                },
+            },
+        )
+        assert following.status_code == 202, following.text
+        assert following.text == ""
+
+        cursors = await client.get(f"/producers/{producer_id}/cursors")
+        assert cursors.status_code == 200
+        assert cursors.json() == {
+            "producer_id": producer_id,
+            "client_agent": "e2e-test/1.0",
+            "topics": [{"topic": TOPIC_STREAM, "last_sequence": 3}],
+        }
+
+        group = await client.post("/consumer-groups")
+        assert group.status_code == 201
+        sub = await client.post(
+            "/subscriptions",
+            json={
+                "consumer_group": group.json()["id"],
+                "client_agent": "e2e-test",
+                "interests": [
+                    {
+                        "topic": TOPIC_STREAM,
+                        "tenant_id": tenant_id,
+                        "types": [EVENT_TYPE_STREAM],
+                    }
+                ],
+            },
+        )
+        assert sub.status_code == 201
+        sub_id = sub.json()["id"]
+        seek = await client.post(
+            f"/subscriptions/{sub_id}:seek",
+            json={
+                "topology_version": 1,
+                "positions": {TOPIC_STREAM: [{"partition": 0, "value": "earliest"}]},
+            },
+        )
+        assert seek.status_code == 200, seek.text
+        assert seek.json() == {
+            "positions": {TOPIC_STREAM: [{"partition": 0, "value": 0}]}
+        }
+
+        # All four events share one tenant, so one outbox partition drains
+        # them in publish order: seeing the last one rules out a stored resend
+        # behind it.
+        delivered: list[dict] = []
+        async with client.stream("GET", f"/events:sse?subscription_id={sub_id}") as stream:
+            assert stream.status_code == 200
+            reader = SseFrameReader(stream)
+            loop = asyncio.get_running_loop()
+            # 7s bounds the topology and delivery waits together, under the 10s test timeout.
+            deadline = loop.time() + 7
+            await reader.await_kind("topology", timeout=deadline - loop.time())
+            while not delivered or delivered[-1]["id"] != next_id:
+                remaining = deadline - loop.time()
+                assert remaining > 0, f"{next_id} not delivered within 7s: {delivered}"
+                delivered.append((await reader.await_kind("event", timeout=remaining))["payload"])
+
+    assert [e["id"] for e in delivered] == [first_id, second_id, next_id]
+    [a, b, c] = delivered
+    assert a["sequence"] < b["sequence"] < c["sequence"]
+    assert delivered == [
+        {
+            "id": first_id,
+            "type": EVENT_TYPE_STREAM,
+            "topic": TOPIC_STREAM,
+            "tenant_id": tenant_id,
+            "source": "e2e-test",
+            "subject": "s1",
+            "subject_type": SUBJECT_TYPE,
+            "occurred_at": a["occurred_at"],
+            "trace_parent": None,
+            "data": None,
+            "partition": 0,
+            "sequence": a["sequence"],
+            "sequence_time": a["sequence_time"],
+        },
+        {
+            "id": second_id,
+            "type": EVENT_TYPE_STREAM,
+            "topic": TOPIC_STREAM,
+            "tenant_id": tenant_id,
+            "source": "e2e-test",
+            "subject": "s1",
+            "subject_type": SUBJECT_TYPE,
+            "occurred_at": b["occurred_at"],
+            "trace_parent": None,
+            "data": None,
+            "partition": 0,
+            "sequence": b["sequence"],
+            "sequence_time": b["sequence_time"],
         },
         {
             "id": next_id,

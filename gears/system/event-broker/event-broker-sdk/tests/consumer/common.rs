@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use event_broker::test_support::{EventBrokerHarness, StaticTypesRegistry};
-use event_broker_sdk::{Event, EventBrokerApi, GtsIdPattern, GtsInstanceId, GtsTypeId};
+use event_broker_sdk::{Ack, EventBrokerApi, EventV1, GtsIdPattern, GtsInstanceId, GtsTypeId};
 use serde_json::json;
 use toolkit_security::SecurityContext;
 use uuid::Uuid;
@@ -108,28 +108,37 @@ pub async fn publish_json_with_partition_key(request: PublishJson<'_>) {
         .map(str::to_owned)
         .or_else(|| partition.map(partition_key_for_two_partition_fixture))
         .unwrap_or_else(|| ctx.subject_tenant_id().to_string());
+    let event = EventV1::builder_for(GtsTypeId::new(event_type), data)
+        .tenant_id(ctx.subject_tenant_id())
+        // The fixture's types are partitioned by this member.
+        .source(resolved_partition_key)
+        .subject(subject)
+        .subject_type_id(GtsTypeId::new(SHOWCASE_SUBJECT_TYPE))
+        .build()
+        .expect("a valid event");
     broker
-        .publish(
-            ctx,
-            &Event {
-                id: Uuid::new_v4(),
-                type_id: GtsTypeId::new(event_type),
-                tenant_id: ctx.subject_tenant_id(),
-                // The fixture's types are partitioned by this member.
-                source: resolved_partition_key,
-                subject: subject.to_owned(),
-                subject_type: GtsTypeId::new(SHOWCASE_SUBJECT_TYPE),
-                occurred_at: chrono::Utc::now(),
-                trace_parent: None,
-                data: Some(data),
-                partition: None,
-                sequence: None,
-                sequence_time: None,
-                meta: None,
-            },
-        )
+        .publish(ctx, &event, Ack::Accepted)
         .await
         .expect("event published");
+}
+
+/// An event of `event_type` with a fixed `id` and `subject`, routed to `partition`
+/// of a two-partition fixture.
+pub fn two_partition_event(
+    ctx: &SecurityContext,
+    event_type: &str,
+    id: Uuid,
+    subject: &str,
+    partition: u32,
+) -> EventV1 {
+    EventV1::builder_for(GtsTypeId::new(event_type), json!({}))
+        .id(id)
+        .tenant_id(ctx.subject_tenant_id())
+        .source(partition_key_for_two_partition_fixture(partition))
+        .subject(subject)
+        .subject_type_id(GtsTypeId::new(SHOWCASE_SUBJECT_TYPE))
+        .build()
+        .expect("a valid event")
 }
 
 fn partition_key_for_two_partition_fixture(target: u32) -> String {

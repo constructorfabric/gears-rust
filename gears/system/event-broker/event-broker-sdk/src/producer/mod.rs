@@ -4,7 +4,7 @@ mod event_factory;
 mod migrations;
 #[cfg(feature = "outbox")]
 mod partitioning;
-#[cfg(feature = "db")]
+#[cfg(feature = "outbox")]
 mod registration;
 mod schema_cache;
 mod types;
@@ -16,23 +16,23 @@ mod outbox_tests;
 #[cfg(all(test, feature = "outbox"))]
 mod partitioning_tests;
 
-#[cfg(feature = "db")]
+#[cfg(feature = "outbox")]
 mod db;
 #[cfg(feature = "outbox")]
 mod outbox;
+#[cfg(feature = "outbox")]
+mod outbox_setup;
 
 pub use crate::api::{IngestOutcome, ProducerCursors, ProducerMode, TopicCursors};
-pub use direct::{Producer, ProducerBuilder};
-pub use types::{DirectDeduplication, ProducerIdentity, ValidationTiming};
+pub use direct::{DirectProducer, DirectProducerBuilder};
 
 #[cfg(feature = "db")]
-pub use db::{DbProducer, DbProducerBuilder};
-#[cfg(feature = "db")]
 pub use migrations::producer_registration_migrations;
+#[cfg(all(feature = "outbox", any(test, feature = "test-util")))]
+pub use outbox::TEST_QUEUE;
 #[cfg(feature = "outbox")]
-pub use outbox::{
-    PRODUCER_OUTBOX_PAYLOAD_TYPE, ProducerOutbox, ProducerOutboxEnvelope, ProducerOutboxHandle,
-    ProducerOutboxQueue, TEST_QUEUE,
+pub use outbox_setup::{
+    OutboxBinder, OutboxProducer, OutboxProducerHandle, OutboxSetup, OutboxSetupBuilder,
 };
-#[cfg(feature = "db")]
-pub use types::{DbDeduplication, ManagedDeduplication};
+#[cfg(feature = "outbox")]
+pub use types::{ManagedRegistration, OutboxRegistration};

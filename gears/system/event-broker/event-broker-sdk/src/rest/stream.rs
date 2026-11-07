@@ -14,7 +14,7 @@ use http_body_util::BodyExt;
 use toolkit_security::SecurityContext;
 
 use crate::api::{ControlCode, FrameStream, WireFrame};
-use crate::error::EventBrokerError;
+use crate::error::{EventBrokerError, json_error_category};
 use crate::ids::SubscriptionId;
 use crate::rest::client::{RestBroker, StreamTransport};
 use crate::rest::wire::FrameWire;
@@ -61,9 +61,15 @@ impl Decoder {
     }
 }
 
+/// Serde's message quotes the frame's content, so the error names only its
+/// category.
 fn parse_frame(body: &[u8]) -> Result<FrameWire, EventBrokerError> {
-    serde_json::from_slice::<FrameWire>(body)
-        .map_err(|err| EventBrokerError::Transport(format!("undecodable stream frame: {err}")))
+    serde_json::from_slice::<FrameWire>(body).map_err(|err| {
+        EventBrokerError::Transport(format!(
+            "undecodable stream frame ({})",
+            json_error_category(&err)
+        ))
+    })
 }
 
 fn drain_sse(buf: &mut Vec<u8>) -> Result<Vec<FrameWire>, EventBrokerError> {

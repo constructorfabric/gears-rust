@@ -11,8 +11,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use event_broker_sdk::{
-    DbDeduplication, DbProducer, EventBrokerApi, EventBrokerError, ProducerIdentity, ProducerMode,
-    ProducerOutboxHandle,
+    EventBrokerApi, EventBrokerError, GtsTypeId, OutboxProducerHandle, OutboxRegistration,
+    OutboxSetup, ProducerMode,
 };
 use tenant_resolver_sdk::{TenantResolverClient, TenantStatus};
 use toolkit_db::outbox::{Outbox, OutboxProfile, Partitions, WorkerTuning};
@@ -24,8 +24,8 @@ use super::events::payload::{
     OrderExpired, OrderFulfillmentFailed, OrderHeld, OrderRejected, OrderResumed, OrderSubmitted,
 };
 use super::events::{
-    EVENT_TYPE_WILDCARD, EventSink, OUTBOX_PARTITIONS, OrderEvent, PRODUCER_KEY, QUEUE, RootTenant,
-    SOURCE, TOPIC,
+    EVENT_TYPE_WILDCARD, EventSink, OUTBOX_PARTITIONS, PRODUCER_KEY, QUEUE, RootTenant, SOURCE,
+    TOPIC,
 };
 
 /// The Orders producer principal's subject type presented to Event Broker.
@@ -139,7 +139,7 @@ impl ProducerReadiness {
 /// The bound producer: the transaction sink and the library worker handle.
 pub struct BoundProducer {
     sink: EventSink,
-    handle: ProducerOutboxHandle,
+    handle: OutboxProducerHandle,
 }
 impl BoundProducer {
     /// The sink transactions enqueue Orders events through.
@@ -228,10 +228,11 @@ fn classify(error: &EventBrokerError) -> BindFailure {
 }
 
 async fn prepare<K: super::events::EventKind>(
-    producer: &DbProducer,
+    setup: &OutboxSetup,
     limit: Duration,
 ) -> Result<(), BindError> {
-    match tokio::time::timeout(limit, producer.prepare::<OrderEvent<K>>()).await {
+    let type_id = GtsTypeId::new(K::TYPE_ID);
+    match tokio::time::timeout(limit, setup.prepare_event_type(&type_id)).await {
         Ok(Ok(())) => Ok(()),
         Ok(Err(e)) => Err(BindError::caused(
             BindFailure::SchemaPreparation,
@@ -255,12 +256,12 @@ async fn prepare<K: super::events::EventKind>(
 // NOT cancel-safe: `bind_until_ready` drops this future at any await when the lifecycle is
 // cancelled, and the steps it already completed are not undone. What a drop leaves behind is
 // what a failed attempt leaves, and the next bind (on this or any replica) reuses it:
-// - during or after `prepare_all`: nothing durable from registration; the SDK registers a
+// - during or after the setup's `build`: nothing durable from registration; the SDK registers a
 //   producer per outbox partition on its first delivery, under the same `PRODUCER_KEY` the
 //   next bind compares;
 // - between the eleven `prepare` steps: nothing durable; each `prepare` only resolves one event
-//   type from the broker into the dropped producer's in-memory schema cache;
-// - inside `queue.start` (toolkit-db `OutboxBuilder::start`): the queue's partition rows, which
+//   type from the broker into the dropped setup's in-memory schema cache;
+// - inside `setup.start` (toolkit-db `OutboxBuilder::start`): the queue's partition rows, which
 //   `register_queue` inserts only if absent, and possibly some spawned outbox workers. Those
 //   live in the start's local `TaskSet`, whose drop cancels their token, so they exit without
 //   processing; the start signal they wait on is never sent.
@@ -285,28 +286,23 @@ pub async fn bind(
     })?;
     let ctx = producer_context(settings)?;
     let root = root_tenant(tenants.as_ref(), &ctx, limit).await?;
-    let deduplication = DbDeduplication::managed(ProducerMode::Chained)
-        .key(PRODUCER_KEY)
-        .build()
-        .map_err(|e| {
-            BindError::caused(
-                BindFailure::ProducerRegistration,
-                "producer deduplication",
-                e,
-            )
-        })?;
-    let built = DbProducer::builder()
+    let built = OutboxSetup::builder()
         .broker(broker)
         .db(db.clone())
         .security_context(ctx)
+        .source(SOURCE)
         // No version in the agent: a stored registration compares it verbatim.
-        .identity(ProducerIdentity::new().source(SOURCE).client_agent(SOURCE))
-        .deduplication(deduplication)
+        .client_agent(SOURCE)
+        .registration(OutboxRegistration::managed(
+            ProducerMode::Chained,
+            PRODUCER_KEY,
+        ))
         .topics([TOPIC])
         .event_type_patterns([EVENT_TYPE_WILDCARD])
-        .prepare_all();
-    let producer = match tokio::time::timeout(limit, built).await {
-        Ok(Ok(producer)) => producer,
+        .queue(QUEUE, Partitions::of(OUTBOX_PARTITIONS))
+        .build();
+    let setup = match tokio::time::timeout(limit, built).await {
+        Ok(Ok(setup)) => setup,
         Ok(Err(e)) => {
             return Err(BindError::caused(
                 classify(&e),
@@ -322,20 +318,17 @@ pub async fn bind(
         }
     };
     // Every one of the eleven schemas must resolve before the first transaction can enqueue it.
-    prepare::<OrderSubmitted>(&producer, limit).await?;
-    prepare::<OrderApproved>(&producer, limit).await?;
-    prepare::<OrderRejected>(&producer, limit).await?;
-    prepare::<OrderAmended>(&producer, limit).await?;
-    prepare::<OrderHeld>(&producer, limit).await?;
-    prepare::<OrderResumed>(&producer, limit).await?;
-    prepare::<OrderCancelled>(&producer, limit).await?;
-    prepare::<OrderExpired>(&producer, limit).await?;
-    prepare::<OrderCompleted>(&producer, limit).await?;
-    prepare::<OrderFulfillmentFailed>(&producer, limit).await?;
-    prepare::<OrderAcceptanceRecorded>(&producer, limit).await?;
-    let queue = producer
-        .outbox_queue(QUEUE, Partitions::of(OUTBOX_PARTITIONS))
-        .map_err(|e| BindError::caused(BindFailure::WorkerStart, "outbox queue", e))?;
+    prepare::<OrderSubmitted>(&setup, limit).await?;
+    prepare::<OrderApproved>(&setup, limit).await?;
+    prepare::<OrderRejected>(&setup, limit).await?;
+    prepare::<OrderAmended>(&setup, limit).await?;
+    prepare::<OrderHeld>(&setup, limit).await?;
+    prepare::<OrderResumed>(&setup, limit).await?;
+    prepare::<OrderCancelled>(&setup, limit).await?;
+    prepare::<OrderExpired>(&setup, limit).await?;
+    prepare::<OrderCompleted>(&setup, limit).await?;
+    prepare::<OrderFulfillmentFailed>(&setup, limit).await?;
+    prepare::<OrderAcceptanceRecorded>(&setup, limit).await?;
     let mut builder = Outbox::builder(db).profile(OutboxProfile::high_throughput());
     if let Some(tuning) = processor_tuning {
         builder = builder.processor_tuning(tuning);
@@ -344,9 +337,9 @@ pub async fn bind(
         limit,
         BindFailure::WorkerStart,
         "outbox worker start",
-        queue.start(builder),
+        setup.start(builder),
     ))
     .await?;
-    let sink = EventSink::new(handle.outbox().clone(), root);
+    let sink = EventSink::new(handle.producer().clone(), root);
     Ok(BoundProducer { sink, handle })
 }

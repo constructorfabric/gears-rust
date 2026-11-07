@@ -31,7 +31,8 @@ use event_broker_sdk::backend::{
     AppendRequest, Appended, Backend, BackendError, Dedup, LogClaim, Provisioning, Replacing,
     Retention, TopicPartition, TopicSpec, Wait, Watch,
 };
-use event_broker_sdk::{Event, PartitionRange, Position, Sequence, TopicSegment};
+use event_broker_sdk::models::Event;
+use event_broker_sdk::{PartitionRange, Position, Sequence, TopicSegment};
 use serde_json::json;
 use tokio::sync::Notify;
 use tokio::time::timeout;

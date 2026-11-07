@@ -12,9 +12,9 @@ use admission_control_sdk::{
 use async_trait::async_trait;
 use event_broker_sdk::models::EventType;
 use event_broker_sdk::{
-    ConsumerGroup, ConsumerGroupId, ConsumerGroupQuery, CreateConsumerGroupRequest, Event,
-    EventBrokerApi, EventBrokerError, FrameStream, IngestOutcome, JoinRequest, Page,
-    PartitionRange, ProducerCursors, ProducerId, ProducerMode, ResetScope, SeekPosition,
+    Ack, ConsumerGroup, ConsumerGroupId, ConsumerGroupQuery, CreateConsumerGroupRequest,
+    EventBrokerApi, EventBrokerError, EventV1, FrameStream, GtsTypeId, IngestOutcome, JoinRequest,
+    Page, PartitionRange, ProducerCursors, ProducerId, ProducerMode, ResetScope, SeekPosition,
     SeekResult, Subscription, SubscriptionAssignment, SubscriptionId, Topic, TopicSegment,
 };
 use opentelemetry::metrics::MeterProvider as _;
@@ -41,7 +41,7 @@ use crate::infra::metrics::AdmissionControlMetrics;
 /// with `stalled`, never answers); every other operation is refused.
 #[derive(Default)]
 struct FakeBroker {
-    published: Mutex<Vec<(SecurityContext, Event)>>,
+    published: Mutex<Vec<(SecurityContext, EventV1)>>,
     failing: bool,
     stalled: bool,
 }
@@ -63,7 +63,8 @@ impl EventBrokerApi for FakeBroker {
     async fn publish(
         &self,
         ctx: &SecurityContext,
-        event: &Event,
+        event: &EventV1,
+        _: Ack,
     ) -> Result<IngestOutcome, EventBrokerError> {
         if self.failing {
             return Err(unsupported());
@@ -77,7 +78,8 @@ impl EventBrokerApi for FakeBroker {
     async fn publish_batch(
         &self,
         _: &SecurityContext,
-        _: &[Event],
+        _: &[EventV1],
+        _: Ack,
     ) -> Result<IngestOutcome, EventBrokerError> {
         Err(unsupported())
     }
@@ -220,17 +222,20 @@ fn broker_event_shape() {
         envelope: envelope(),
         event: event(),
     };
-    let event = to_broker_event(&queued);
-    assert_eq!(event.type_id, REFUSAL_EVENT_TYPE);
-    assert_eq!(event.source, EVENT_SOURCE);
-    assert_eq!(event.tenant_id, queued.envelope.tenant_id);
-    assert_eq!(event.subject, queued.envelope.correlation_id.to_string());
-    assert_eq!(event.subject_type, ADMISSION_CONTROL_RESOURCE);
-    assert_eq!(event.occurred_at.timestamp(), 1_700_000_000);
+    let event = to_broker_event(&queued).unwrap();
+    assert_eq!(event.event_type(), &GtsTypeId::new(REFUSAL_EVENT_TYPE));
+    assert_eq!(event.source(), Some(EVENT_SOURCE));
+    assert_eq!(event.tenant_id(), queued.envelope.tenant_id);
+    assert_eq!(event.subject(), queued.envelope.correlation_id.to_string());
+    assert_eq!(
+        event.subject_type(),
+        &GtsTypeId::new(ADMISSION_CONTROL_RESOURCE)
+    );
+    assert_eq!(event.occurred_at().timestamp(), 1_700_000_000);
     // The envelope fields are not repeated in the payload.
     assert_eq!(
-        event.data.unwrap(),
-        serde_json::to_value(&queued.event).unwrap()
+        event.data(),
+        Some(&serde_json::to_value(&queued.event).unwrap())
     );
 }
 

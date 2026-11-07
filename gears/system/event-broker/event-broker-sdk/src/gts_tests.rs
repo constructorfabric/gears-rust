@@ -6,18 +6,21 @@
 //! does not register. Regenerate rather than edit:
 //!
 //! ```text
-//! GTS_REGEN=1 cargo test -p cf-gears-event-broker-sdk --lib gts_tests -- --ignored
+//! GTS_REGEN=1 cargo test -p cf-gears-event-broker-sdk --features serde_json/preserve_order \
+//!     --lib gts_tests -- --ignored
 //! ```
 //!
-//! The two byte-comparison tests are `#[ignore]`d, hence `--ignored`: the emitted
-//! formatting belongs to the gts library and changes with it, so comparing bytes
+//! The committed-file comparison tests are `#[ignore]`d, hence `--ignored`: the
+//! emitted schema belongs to the gts library and changes with it, so comparing it
 //! gates on a third party's output. Drop the `GTS_REGEN=1` to compare instead of
 //! rewrite. The contract stays covered by the conformance tests below, which
 //! validate behaviour against the freshly emitted base.
 
 use gts::GtsSchema;
+use toolkit_gts::{gts_id, gts_type_schema};
+use uuid::Uuid;
 
-use crate::gts::{EventV1, TopicV1};
+use crate::gts::{EventV1, SubjectV1, TopicV1};
 
 /// Path of a gear-committed schema file, relative to the crate root.
 fn schema_path(file: &str) -> std::path::PathBuf {
@@ -53,12 +56,13 @@ fn committed_matches(file: &str, generated: &serde_json::Value, source: &str) {
         &committed(file),
         generated,
         "{file} is out of date; regenerate it from {source} with \
-         `GTS_REGEN=1 cargo test -p cf-gears-event-broker-sdk --lib gts_tests -- --ignored`"
+         `GTS_REGEN=1 cargo test -p cf-gears-event-broker-sdk \
+         --features serde_json/preserve_order --lib gts_tests -- --ignored`"
     );
 }
 
 #[test]
-#[ignore = "the emitted formatting is the gts library's to choose; run manually with `-- --ignored`"]
+#[ignore = "the emitted schema is the gts library's to choose; run manually with `-- --ignored`"]
 fn topic_base_schema_matches_committed_file() {
     committed_matches(
         "gts.cf.core.events.topic.v1~.schema.json",
@@ -68,31 +72,120 @@ fn topic_base_schema_matches_committed_file() {
 }
 
 #[test]
-#[ignore = "the emitted formatting is the gts library's to choose; run manually with `-- --ignored`"]
+#[ignore = "the emitted schema is the gts library's to choose; run manually with `-- --ignored`"]
 fn event_base_schema_matches_committed_file() {
     committed_matches(
         "gts.cf.core.events.event.v1~.schema.json",
-        &emitted(&EventV1::gts_schema_with_refs_as_string()),
+        &emitted(&<EventV1>::gts_schema_with_refs_as_string()),
         "`crate::gts::EventV1`",
     );
 }
 
 #[test]
-fn only_the_two_base_types_are_declared() {
-    // Inventory iteration order is link order, not declaration order.
+#[ignore = "the emitted schema is the gts library's to choose; run manually with `-- --ignored`"]
+fn subject_base_schema_matches_committed_file() {
+    committed_matches(
+        "gts.cf.core.events.subject.v1~.schema.json",
+        &emitted(&SubjectV1::<()>::gts_schema_with_refs_as_string()),
+        "`crate::gts::SubjectV1`",
+    );
+}
+
+#[test]
+#[ignore = "the emitted schema is the gts library's to choose; run manually with `-- --ignored`"]
+fn event_example_matches_committed_file() {
+    committed_matches(
+        "examples/gts.cf.core.events.event.v1~fabrikam.shop.orders.order_placed.v1~.schema.json",
+        &emitted(&OrderPlacedV1::gts_schema_with_refs_as_string()),
+        "`crate::gts_tests::OrderPlacedV1`",
+    );
+}
+
+/// The base requires `source` and the server-stamped members although their Rust
+/// fields are `Option`s, and `source` keeps its text constraints. Unlike the
+/// committed-file compares above, this runs in every test pass.
+#[test]
+fn the_base_schema_keeps_source_and_the_stamped_members_required() {
+    let base = emitted(&<EventV1>::gts_schema_with_refs_as_string());
+
+    assert_eq!(
+        base["required"],
+        serde_json::json!([
+            "id",
+            "type",
+            "tenant_id",
+            "source",
+            "subject",
+            "subject_type",
+            "occurred_at",
+            "partition",
+            "sequence",
+            "sequence_time",
+        ])
+    );
+    assert_eq!(
+        base["properties"]["source"],
+        serde_json::json!({
+            "description": "Origin of the event (e.g., service name). ASCII only.",
+            "type": "string",
+            "maxLength": 256,
+            "pattern": "^[\\x20-\\x7E]+$",
+        })
+    );
+    assert_eq!(
+        base["properties"]["partition"],
+        serde_json::json!({
+            "description": "Server-stamped partition for the event, surfaced on read. Computed at ingest via the partition contract. Producers MUST NOT supply this field on publish; doing so is rejected with 400 BadRequest.",
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0,
+            "readOnly": true,
+        })
+    );
+    assert_eq!(
+        base["properties"]["sequence"],
+        serde_json::json!({
+            "description": "Server-assigned monotonic ordering key per (topic, partition), surfaced on read. The only sequence consumers paginate by. Distinct from `meta.sequence` (publish-only producer-side chain field). Producers MUST NOT supply this field on publish; doing so is rejected with 400 BadRequest.",
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0,
+            "readOnly": true,
+        })
+    );
+    assert_eq!(
+        base["properties"]["sequence_time"],
+        serde_json::json!({
+            "description": "Server-stamped timestamp recording when `sequence` was assigned. Surfaced on read. Producers MUST NOT supply this field on publish; doing so is rejected with 400 BadRequest.",
+            "type": "string",
+            "format": "date-time",
+            "readOnly": true,
+        })
+    );
+}
+
+#[test]
+fn only_the_three_base_types_are_declared() {
+    // Inventory iteration order is link order, not declaration order. The derived
+    // types the tests declare are excluded by their ids, so a stray derived type the
+    // SDK declares by mistake is still caught.
+    let test_declared = [
+        <OrderSubjectV1 as GtsSchema>::TYPE_ID,
+        <OrderPlacedV1 as GtsSchema>::TYPE_ID,
+    ];
     let mut ids: Vec<&str> = toolkit_gts::inventory::iter::<toolkit_gts::InventoryTypeSchema>
         .into_iter()
         .map(|e| e.type_id)
-        .filter(|id| id.contains(".events."))
+        .filter(|id| id.contains(".events.") && !test_declared.contains(id))
         .collect();
     ids.sort_unstable();
     assert_eq!(
         ids,
         vec![
             toolkit_gts::gts_id!("cf.core.events.event.v1~"),
+            toolkit_gts::gts_id!("cf.core.events.subject.v1~"),
             toolkit_gts::gts_id!("cf.core.events.topic.v1~"),
         ],
-        "the broker declares exactly the topic and event base types"
+        "the broker declares exactly the topic, event and subject base types"
     );
 }
 
@@ -105,25 +198,115 @@ fn generated_base_schemas_validate_with_gts() {
             emitted(&TopicV1::gts_schema_with_refs_as_string()),
         ),
         (
-            EventV1::TYPE_ID,
-            emitted(&EventV1::gts_schema_with_refs_as_string()),
+            <EventV1>::TYPE_ID,
+            emitted(&<EventV1>::gts_schema_with_refs_as_string()),
+        ),
+        (
+            SubjectV1::<()>::TYPE_ID,
+            emitted(&SubjectV1::<()>::gts_schema_with_refs_as_string()),
         ),
     ] {
         store
             .register_schema(id, &schema)
             .expect("register base schema");
     }
-    for id in [TopicV1::TYPE_ID, EventV1::TYPE_ID] {
+    for id in [
+        TopicV1::TYPE_ID,
+        <EventV1>::TYPE_ID,
+        SubjectV1::<()>::TYPE_ID,
+    ] {
         store
             .validate_schema_with(id, gts::GtsRefValidation::None)
             .expect("generated base schema must use valid GTS keywords");
     }
 }
 
+/// A subject kind as the gear that owns the entity declares it.
+#[gts_type_schema(
+    dir_path = "schemas",
+    base = SubjectV1,
+    type_id = gts_id!("cf.core.events.subject.v1~fabrikam.shop.orders.order.v1~"),
+    description = "An order placed in the fabrikam shop.",
+    properties = "",
+)]
+pub(crate) struct OrderSubjectV1;
+
+/// `event-broker/tests/bare_harness_test.rs` seeds a copy of this schema; change both together.
+#[test]
+fn a_derived_subject_kind_names_its_full_id_and_derives_from_the_base() {
+    assert_eq!(
+        <OrderSubjectV1 as GtsSchema>::TYPE_ID,
+        "gts.cf.core.events.subject.v1~fabrikam.shop.orders.order.v1~"
+    );
+
+    let derived = emitted(&OrderSubjectV1::gts_schema_with_refs_as_string());
+    assert_eq!(
+        derived,
+        serde_json::json!({
+            "$id": "gts://gts.cf.core.events.subject.v1~fabrikam.shop.orders.order.v1~",
+            "$schema": "http://json-schema.org/draft-07/schema#",
+            "description": "An order placed in the fabrikam shop.",
+            "type": "object",
+            "allOf": [
+                { "$ref": "gts://gts.cf.core.events.subject.v1~" },
+                {
+                    "type": "object",
+                    "properties": {
+                        "properties": {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "properties": {},
+                            "required": [],
+                        },
+                    },
+                },
+            ],
+        })
+    );
+
+    let mut store = gts::GtsStore::new();
+    store
+        .register_schema(
+            SubjectV1::<()>::TYPE_ID,
+            &emitted(&SubjectV1::<()>::gts_schema_with_refs_as_string()),
+        )
+        .expect("register the subject base");
+    store
+        .register_schema(OrderSubjectV1::TYPE_ID, &derived)
+        .expect("register the derived subject kind");
+    store
+        .validate_schema_with(OrderSubjectV1::TYPE_ID, gts::GtsRefValidation::None)
+        .expect("a derived subject kind must validate against the subject base");
+}
+
+#[test]
+fn subject_debug_names_the_properties_type_but_never_prints_them() {
+    let subject = SubjectV1::<serde_json::Value> {
+        r#type: gts::GtsTypeId::new(OrderSubjectV1::TYPE_ID),
+        id: "order-42".to_owned(),
+        properties: serde_json::json!({ "secret": "PLANTED-VALUE-7f3a" }),
+    };
+
+    let printed = format!("{subject:?}");
+
+    assert_eq!(
+        printed,
+        format!(
+            "SubjectV1 {{ type: {:?}, id: \"order-42\", properties: {:?} }}",
+            subject.r#type,
+            std::any::type_name::<serde_json::Value>()
+        )
+    );
+    assert!(
+        !printed.contains("PLANTED-VALUE-7f3a"),
+        "Debug printed the properties: {printed}"
+    );
+}
+
 fn admit_event_with_subject_pattern(pattern: &str) -> Result<gts::ResolvedType, gts::StoreError> {
     let mut store = gts::GtsStore::new();
-    let base = emitted(&EventV1::gts_schema_with_refs_as_string());
-    store.register_schema(EventV1::TYPE_ID, &base).unwrap();
+    let base = emitted(&<EventV1>::gts_schema_with_refs_as_string());
+    store.register_schema(<EventV1>::TYPE_ID, &base).unwrap();
     let type_id = "gts.cf.core.events.event.v1~fabrikam.shop.orders.order_placed.v1~";
     let derived = crate::gts::derived_event_type_schema(
         type_id,
@@ -238,7 +421,7 @@ fn subscription_schema_rejects_malformed_and_non_event_type_selectors() {
 
 #[test]
 fn event_identifier_fields_accept_concrete_ids_but_reject_wildcards() {
-    let schema = emitted(&EventV1::gts_schema_with_refs_as_string());
+    let schema = emitted(&<EventV1>::gts_schema_with_refs_as_string());
     let validator = gts::XGtsRefValidator::new();
     for field in ["type", "subject_type"] {
         // Keeps the base's `$id`, which a `/$id` constraint resolves to.
@@ -265,22 +448,39 @@ fn event_identifier_fields_accept_concrete_ids_but_reject_wildcards() {
 // Worked examples
 // ---------------------------------------------------------------------------
 //
-// Both documents under `docs/schemas/examples/` are derived type schemas, which
-// `#[gts_type_schema]` cannot declare here: its derived form fills a generic slot
-// on its base (the `PluginV1<P>` pattern) and neither of these bases is generic.
-// So they stay hand-written JSON, and the checks below stand in for generation -
-// an example that stops deriving from its base, or claims a trait the base does
-// not declare, fails the build. `fabrikam` is the vendor this repository uses for
-// a third party (`docs/TOOLKIT_PLUGINS.md`), and is one of the four registered
-// with `gts-validator`.
+// The event-type example under `docs/schemas/examples/` is generated from
+// `OrderPlacedV1` below, like the base documents. The topic example is an
+// instance document, held to its base by validation. `fabrikam` is the vendor
+// this repository uses for a third party (`docs/TOOLKIT_PLUGINS.md`), and is one
+// of the four registered with `gts-validator`.
+
+/// The worked producer example; `docs/schemas/examples/` holds the document it generates.
+#[gts_type_schema(
+    dir_path = "schemas",
+    base = EventV1,
+    type_id = gts_id!("cf.core.events.event.v1~fabrikam.shop.orders.order_placed.v1~"),
+    description = "Worked producer example: one concrete event type. It narrows the base event's `data` member to its own payload contract, and fixes its trait values. Nothing here is a field a publisher sends - the traits govern how the broker treats events of this type, and GTS forbids trait keywords in an instance.",
+    properties = "order_id,total_cents,currency,coupon_code",
+    traits = serde_json::json!({
+        "topic": gts_id!("cf.core.events.topic.v1~fabrikam.shop._.orders.v1"),
+        "allowed_subject_types": ["gts.fabrikam.shop.orders.order.v1~"],
+    }),
+)]
+pub(crate) struct OrderPlacedV1 {
+    pub order_id: Uuid,
+    #[schemars(range(min = 0))]
+    pub total_cents: i64,
+    #[schemars(regex(pattern = r"^[A-Z]{3}$"))]
+    pub currency: String,
+    // Present on every event, `null` when unset: the macro's serde neither skips nor
+    // defaults a field; the schema requires it and admits `null`.
+    #[schemars(required, extend("type" = ["string", "null"]), length(max = 64))]
+    pub coupon_code: Option<String>,
+}
 
 /// Holds a committed derived-type example to the base it claims to derive from:
 /// it must `$ref` that base, its trait values must satisfy the base's generated
 /// `x-gts-traits-schema`, and it must declare no trait the base does not.
-///
-/// The examples stay JSON documents rather than Rust declarations because
-/// `#[gts_type_schema]`'s derived form fills a generic slot on its base (the
-/// `PluginV1<P>` pattern), and neither of these bases is generic.
 fn example_conforms_to_base(example_file: &str, base: &serde_json::Value, base_uri: &str) {
     let example = committed(example_file);
 
@@ -320,8 +520,114 @@ fn example_conforms_to_base(example_file: &str, base: &serde_json::Value, base_u
 fn committed_example_event_type_conforms_to_the_generated_base() {
     example_conforms_to_base(
         "examples/gts.cf.core.events.event.v1~fabrikam.shop.orders.order_placed.v1~.schema.json",
-        &emitted(&EventV1::gts_schema_with_refs_as_string()),
+        &emitted(&<EventV1>::gts_schema_with_refs_as_string()),
         toolkit_gts::gts_uri!("cf.core.events.event.v1~"),
+    );
+}
+
+/// The generated example is admitted by the type store and holds events to its `data`
+/// contract. A stored event is used because the base requires the `readOnly` members.
+#[test]
+fn the_worked_example_is_admitted_and_holds_events_to_its_data() {
+    let mut store = gts::GtsStore::new();
+    store
+        .register_schema(
+            <EventV1>::TYPE_ID,
+            &emitted(&<EventV1>::gts_schema_with_refs_as_string()),
+        )
+        .expect("register the event base");
+    store
+        .register_schema(
+            OrderPlacedV1::TYPE_ID,
+            &emitted(&OrderPlacedV1::gts_schema_with_refs_as_string()),
+        )
+        .expect("register the worked example");
+    store
+        .validate_schema_with(OrderPlacedV1::TYPE_ID, gts::GtsRefValidation::None)
+        .expect("the worked example must be admitted");
+
+    let stored_event = |data: serde_json::Value| {
+        serde_json::json!({
+            "id": "01930000-0000-7000-8000-000000000001",
+            "type": OrderPlacedV1::TYPE_ID,
+            "tenant_id": "01930000-0000-7000-8000-000000000002",
+            "source": "orders-service",
+            "subject": "order-1",
+            "subject_type": "gts.fabrikam.shop.orders.order.v1~",
+            "occurred_at": "2026-11-06T10:00:00Z",
+            "data": data,
+            "partition": 0,
+            "sequence": 1,
+            "sequence_time": "2026-11-06T10:00:01Z",
+        })
+    };
+    let order_id = "01930000-0000-7000-8000-000000000003";
+
+    store
+        .validate_payload_with(
+            OrderPlacedV1::TYPE_ID,
+            &stored_event(serde_json::json!({
+                "order_id": order_id,
+                "total_cents": 4299,
+                "currency": "EUR",
+                "coupon_code": null,
+            })),
+            gts::GtsRefValidation::None,
+        )
+        .expect("an event within the data contract must validate");
+
+    // The macro's serde requires every field, so the schema refuses an absent one.
+    let absent_coupon = store.validate_payload_with(
+        OrderPlacedV1::TYPE_ID,
+        &stored_event(serde_json::json!({
+            "order_id": order_id,
+            "total_cents": 4299,
+            "currency": "EUR",
+        })),
+        gts::GtsRefValidation::None,
+    );
+    let Err(gts::StoreError::ValidationError(message)) = absent_coupon else {
+        panic!("an event without `coupon_code` must be refused, got {absent_coupon:?}");
+    };
+    assert_eq!(
+        message,
+        "Validation failed: \"coupon_code\" is a required property"
+    );
+
+    let lowercase = store.validate_payload_with(
+        OrderPlacedV1::TYPE_ID,
+        &stored_event(serde_json::json!({
+            "order_id": order_id,
+            "total_cents": 4299,
+            "currency": "eur",
+            "coupon_code": null,
+        })),
+        gts::GtsRefValidation::None,
+    );
+    let Err(gts::StoreError::ValidationError(message)) = lowercase else {
+        panic!("a lowercase currency must be refused, got {lowercase:?}");
+    };
+    assert_eq!(
+        message,
+        "Validation failed: \"eur\" does not match \"^[A-Z]{3}$\""
+    );
+
+    let negative = store.validate_payload_with(
+        OrderPlacedV1::TYPE_ID,
+        &stored_event(serde_json::json!({
+            "order_id": order_id,
+            "total_cents": -1,
+            "currency": "EUR",
+            "coupon_code": null,
+        })),
+        gts::GtsRefValidation::None,
+    );
+    let Err(gts::StoreError::ValidationError(message)) = negative else {
+        panic!("a negative total must be refused, got {negative:?}");
+    };
+    assert_eq!(
+        message,
+        "Validation failed: -1 is less than the minimum of 0"
     );
 }
 

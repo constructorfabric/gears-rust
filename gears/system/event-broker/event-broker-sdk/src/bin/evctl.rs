@@ -12,11 +12,11 @@ use std::time::Duration;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use event_broker_sdk::api::{
-    FrameStream, JoinRequest, Position, SeekPosition, SubscriptionInterest, WireFrame,
+    Ack, FrameStream, JoinRequest, Position, SeekPosition, SubscriptionInterest, WireFrame,
 };
-use event_broker_sdk::models::{CreateConsumerGroupRequest, Event};
+use event_broker_sdk::models::CreateConsumerGroupRequest;
 use event_broker_sdk::rest::{RestBroker, StreamTransport};
-use event_broker_sdk::{ConsumerGroupId, EventBrokerApi};
+use event_broker_sdk::{ConsumerGroupId, EventBrokerApi, EventV1, GtsTypeId};
 use futures_util::StreamExt;
 use toolkit_security::SecurityContext;
 use uuid::Uuid;
@@ -172,22 +172,18 @@ fn security_context(
         .map_err(|e| format!("building security context: {e}"))
 }
 
-fn make_event(tenant: Uuid, args: &ProduceArgs, data: serde_json::Value) -> Event {
-    Event {
-        id: Uuid::new_v4(),
-        type_id: event_broker_sdk::GtsTypeId::new(&args.type_id),
-        tenant_id: tenant,
-        source: args.source.clone(),
-        subject: args.subject.clone(),
-        subject_type: event_broker_sdk::GtsTypeId::new(&args.subject_type),
-        occurred_at: chrono::Utc::now(),
-        trace_parent: None,
-        data: Some(data),
-        partition: None,
-        sequence: None,
-        sequence_time: None,
-        meta: None,
-    }
+fn make_event(
+    tenant: Uuid,
+    args: &ProduceArgs,
+    data: serde_json::Value,
+) -> Result<EventV1, String> {
+    EventV1::builder_for(GtsTypeId::new(&args.type_id), data)
+        .tenant_id(tenant)
+        .source(args.source.clone())
+        .subject(args.subject.clone())
+        .subject_type_id(GtsTypeId::new(&args.subject_type))
+        .build()
+        .map_err(|e| e.to_string())
 }
 
 /// Default shared group store - a fixed path so two `demo-consumer` invocations
@@ -373,11 +369,14 @@ async fn open_stream(
 fn summarize(frame: &WireFrame) -> String {
     match frame {
         WireFrame::Event(e) => format!(
-            "event seq={} partition={} subject={} data={}",
-            e.sequence.as_i64(),
-            e.partition,
-            e.subject,
-            e.data
+            "event seq={} partition={} source={} subject={} data={}",
+            e.sequence()
+                .map_or_else(|| "-".to_owned(), |sequence| sequence.as_i64().to_string()),
+            e.partition()
+                .map_or_else(|| "-".to_owned(), |partition| partition.to_string()),
+            e.source().unwrap_or("-"),
+            e.subject(),
+            e.data().unwrap_or(&serde_json::Value::Null)
         ),
         WireFrame::Heartbeat { at } => format!("heartbeat at={at}"),
         WireFrame::Topology {
@@ -415,9 +414,9 @@ async fn run() -> Result<(), String> {
     match cli.command {
         Command::Produce(args) => {
             let broker = broker(&cli.broker, StreamTransport::Multipart, cli.debug)?;
-            let event = make_event(cli.tenant, &args, read_data(&args.data)?);
+            let event = make_event(cli.tenant, &args, read_data(&args.data)?)?;
             let outcome = broker
-                .publish(&ctx, &event)
+                .publish(&ctx, &event, Ack::Accepted)
                 .await
                 .map_err(|e| e.to_string())?;
             println!("{outcome:?}");
@@ -455,8 +454,11 @@ async fn run() -> Result<(), String> {
                     "at": chrono::Utc::now().to_rfc3339(),
                     "msg": format!("demo event {emitted}"),
                 });
-                let e = make_event(cli.tenant, &event, data);
-                let outcome = broker.publish(&ctx, &e).await.map_err(|e| e.to_string())?;
+                let e = make_event(cli.tenant, &event, data)?;
+                let outcome = broker
+                    .publish(&ctx, &e, Ack::Accepted)
+                    .await
+                    .map_err(|e| e.to_string())?;
                 println!("emit {emitted}: {outcome:?}");
                 let _ = std::io::stdout().flush();
                 emitted += 1;

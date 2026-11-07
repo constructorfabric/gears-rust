@@ -72,8 +72,8 @@ parking_lot = { workspace = true }
 proptest = { workspace = true }
 # The usage reads prove a fixed statement count with toolkit-db's `QueryRecorder` (D-428).
 toolkit-db = { workspace = true, features = ["pg", "sqlite", "test-support"] }
-# The events suite decodes the interim envelope with the broker SDK's own decoder
-# (`producer::ProducerOutboxEnvelope`), which the `outbox` feature exposes.
+# Repeats the `[dependencies]` entry for the broker SDK with the same features;
+# the SDK's v1 envelope test pins the interim envelope's shape.
 event-broker-sdk = { workspace = true, features = ["db", "outbox"] }
 # The bound-producer suite (`tests/broker_producer.rs`) drives a real in-process broker: the
 # gear's own harness (`test_support::EventBrokerHarness`), which replaced the SDK's mock.

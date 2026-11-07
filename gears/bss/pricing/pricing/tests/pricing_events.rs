@@ -5,10 +5,13 @@
 mod entry_support;
 use bss_pricing::infra::{
     events::{
-        APPROVAL_UNIT_SUBJECT_TYPE, ApprovalUnitDecided, PRICE_BOOK_SUBJECT_TYPE, PricesPublished,
-        PublishedPrice, SOURCE, TOPIC,
+        APPROVAL_UNIT_SUBJECT_TYPE, ApprovalUnitDecided, BrokerEvent, PRICE_BOOK_SUBJECT_TYPE,
+        PricesPublished, PublishedPrice, SOURCE, TOPIC,
     },
-    reference_events::{PlanReferenceLost, PriceBookEntryReferenceLost},
+    reference_events::{
+        PLAN_ITEM_SUBJECT_TYPE, PRICE_BOOK_ENTRY_SUBJECT_TYPE, PlanReferenceLost,
+        PriceBookEntryReferenceLost,
+    },
     storage::{
         entity::price,
         repo::{price_book_entry_repo, price_repo},
@@ -16,11 +19,11 @@ use bss_pricing::infra::{
 };
 use entry_support::policy_support;
 use entry_support::{Fixture, Script};
-use event_broker_sdk::TypedEvent;
 use sea_orm::{ConnectionTrait, Database, DbBackend, EntityTrait, Statement};
 use serde_json::{Value, json};
 use std::sync::Arc;
 use toolkit_db::secure::{AccessScope, SecureUpdateExt};
+use toolkit_gts::GtsSchema;
 use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
@@ -136,16 +139,14 @@ impl Gov {
             .await
             .unwrap()
     }
-    /// Every envelope in the queue, decoded with the broker SDK's own decoder.
+    /// Every envelope in the queue, decoded as JSON.
     async fn envelopes(&self) -> Vec<Value> {
         self.raw("SELECT CAST(payload AS TEXT) AS payload FROM bss_pricing_outbox_body ORDER BY id")
             .await
             .iter()
             .map(|r| {
                 let text = r.try_get::<String>("", "payload").unwrap();
-                let envelope: event_broker_sdk::producer::ProducerOutboxEnvelope =
-                    serde_json::from_str(&text).expect("the broker SDK decodes the envelope");
-                serde_json::to_value(envelope).unwrap()
+                serde_json::from_str::<Value>(&text).expect("the envelope is JSON")
             })
             .collect()
     }
@@ -190,12 +191,11 @@ fn three_event_contracts_have_stable_ids_subjects_and_camel_case_payloads() {
         actor_ref: actor,
     };
     assert_eq!(PricesPublished::TYPE_ID, PUBLISHED);
-    assert_eq!(PricesPublished::SUBJECT_TYPE, PRICE_BOOK_SUBJECT_TYPE);
     assert_eq!(
         PRICE_BOOK_SUBJECT_TYPE,
         "gts.cf.core.events.subject.v1~cf.bss.pricing.price_book.v1~"
     );
-    assert_eq!(PricesPublished::SOURCE, "bss-pricing");
+    assert_eq!(SOURCE, "bss-pricing");
     assert_eq!(published.subject(), book.to_string());
     assert_eq!(published.tenant_id(), Some(tenant));
     assert_eq!(
@@ -229,14 +229,9 @@ fn three_event_contracts_have_stable_ids_subjects_and_camel_case_payloads() {
     };
     assert_eq!(ApprovalUnitDecided::TYPE_ID, DECIDED);
     assert_eq!(
-        ApprovalUnitDecided::SUBJECT_TYPE,
-        APPROVAL_UNIT_SUBJECT_TYPE
-    );
-    assert_eq!(
         APPROVAL_UNIT_SUBJECT_TYPE,
         "gts.cf.core.events.subject.v1~cf.bss.pricing.approval_unit.v1~"
     );
-    assert_eq!(ApprovalUnitDecided::SOURCE, SOURCE);
     assert_eq!(decided.subject(), unit.to_string());
     assert_eq!(decided.tenant_id(), Some(tenant));
     assert_eq!(
@@ -248,7 +243,6 @@ fn three_event_contracts_have_stable_ids_subjects_and_camel_case_payloads() {
         PriceBookEntryReferenceLost::TYPE_ID,
         "gts.cf.core.events.event.v1~cf.bss.pricing.price_book_entry_reference_lost.v1~"
     );
-    assert_eq!(PriceBookEntryReferenceLost::SOURCE, SOURCE);
     assert_eq!(
         TOPIC,
         "gts.cf.core.events.topic.v1~cf.bss.pricing.catalog.v1"
@@ -594,10 +588,9 @@ fn price_book_entry_reference_lost_is_a_typed_event_about_the_entry() {
         "gts.cf.core.events.event.v1~cf.bss.pricing.price_book_entry_reference_lost.v1~"
     );
     assert_eq!(
-        PriceBookEntryReferenceLost::SUBJECT_TYPE,
+        PRICE_BOOK_ENTRY_SUBJECT_TYPE,
         "gts.cf.core.events.subject.v1~cf.bss.pricing.price_book_entry.v1~"
     );
-    assert_eq!(PriceBookEntryReferenceLost::SOURCE, SOURCE);
     assert_eq!(lost.subject(), entry.to_string());
     assert_eq!(lost.tenant_id(), Some(tenant));
     assert_eq!(
@@ -632,10 +625,9 @@ fn plan_reference_lost_is_a_typed_event_about_the_item() {
         "gts.cf.core.events.event.v1~cf.bss.pricing.plan_reference_lost.v1~"
     );
     assert_eq!(
-        PlanReferenceLost::SUBJECT_TYPE,
+        PLAN_ITEM_SUBJECT_TYPE,
         "gts.cf.core.events.subject.v1~cf.bss.pricing.plan_item.v1~"
     );
-    assert_eq!(PlanReferenceLost::SOURCE, SOURCE);
     assert_eq!(lost.subject(), item.to_string());
     assert_eq!(lost.tenant_id(), Some(tenant));
     assert_eq!(
