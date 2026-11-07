@@ -27,8 +27,21 @@ sea-orm-migration = { workspace = true }
 async-trait = { workspace = true }
 thiserror = { workspace = true }
 time = { workspace = true }
+tracing = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros"] }
 toolkit-db = { workspace = true, features = ["sqlite"] }
+# The PostgreSQL migration suite behind `integration`: a real PostgreSQL in a
+# container, since what SQLite accepts PostgreSQL may refuse.
+testcontainers = { workspace = true }
+testcontainers-modules = { workspace = true }
+test-containers = { workspace = true }
+
+[features]
+# `tests/pg_migrations_test.rs`: `m0002_value_versions` on a real PostgreSQL via
+# testcontainers, Docker required (`make test-integration LANE=credstore-pg`).
+# Brings the PostgreSQL driver in for that lane only; the lib leaves the backend
+# to the server that hosts it.
+integration = ["toolkit-db/pg"]

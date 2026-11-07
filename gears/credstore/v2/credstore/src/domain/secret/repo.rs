@@ -57,6 +57,7 @@ pub trait SecretRepo: Send + Sync {
     /// or a `tenant` row of `req_tenant`), same resolution predicate and
     /// nearest-tenant order as [`Self::resolve_for_get`]. Private rows, the
     /// caller's own included, never take part.
+    /// Its heal flags are not computed ([`SecretRow::heal`] is the default).
     async fn resolve_non_private(
         &self,
         req_tenant: TenantId,
@@ -209,8 +210,9 @@ pub trait SecretRepo: Send + Sync {
     /// * [`IntentCommit::Lost`] — the insert hit the reference's create-only
     ///   uniqueness (a definite loss): the intent deletion commits anyway,
     ///   together with the tasks [`cleanup_tasks`] selects for
-    ///   `DeadContent::LostWrite { row_exists: false, .. }` (the fresh record
-    ///   id can never get a row).
+    ///   `DeadContent::LostWrite { .. }`; `row_exists` is read in the same
+    ///   transaction (as in `switch_value`). On the usual reference conflict
+    ///   this is the purge of the fresh key.
     /// * [`IntentCommit::IntentLost`] — the intent was already healed; the
     ///   transaction changed nothing.
     ///
@@ -283,7 +285,9 @@ pub trait SecretRepo: Send + Sync {
     /// `COUNT`) are deleted (`lease_until < now()` re-checked in the DELETE;
     /// an intent another instance already took is skipped) and the tasks
     /// [`cleanup_tasks`] selects for `DeadContent::DeadKey { .. }` are
-    /// recorded for each distinct key, all in ONE transaction. Finds
+    /// recorded for each distinct key, all in ONE transaction. At most
+    /// `HEAL_BATCH` intents are healed per call; the rest are healed by the
+    /// next access to the same reference. Finds
     /// nothing without writing anything. The caller executes the returned
     /// debts after the commit.
     async fn heal_failed_creates(
