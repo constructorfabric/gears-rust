@@ -27,6 +27,7 @@ Updated:  2026-09-01 by Virtuozzo International GmbH
 - [5. Scope](#5-scope)
   - [5.1 In Scope](#51-in-scope)
   - [5.2 Out of Scope](#52-out-of-scope)
+  - [5.3 Customization and Extensibility (Phase 1)](#53-customization-and-extensibility-phase-1)
 - [6. Functional Requirements](#6-functional-requirements)
   - [6.1 Process State Ownership](#61-process-state-ownership)
   - [6.2 Approval Execution](#62-approval-execution)
@@ -55,6 +56,7 @@ Updated:  2026-09-01 by Virtuozzo International GmbH
   - [Boundary with Orders Lifecycle (R1–R5)](#boundary-with-orders-lifecycle-r1r5)
   - [Non-Functional Requirements (Show-Stoppers)](#non-functional-requirements-show-stoppers)
   - [Authorization](#authorization)
+  - [Customization and Extensibility](#customization-and-extensibility)
 - [13. Dependencies](#13-dependencies)
 - [14. Assumptions](#14-assumptions)
 - [15. Open Questions](#15-open-questions)
@@ -83,15 +85,15 @@ Without Orders Workflow:
 - Compensation on partial fulfillment failure has no defined executor; partially provisioned orders leave stranded resources and no actionable manual task.
 - Retry and idempotency guarantees across the BSS→OSS boundary are unspecified; duplicate provisioning requests are possible.
 
-Orders Workflow fills this process gap additively, coordinating between Orders Lifecycle, the Generic Approval service, and Subscriptions without introducing new authoritative state about the order itself.
+Orders Workflow fills this process gap additively, coordinating between Orders Lifecycle, the approval policy adapter, and Subscriptions without introducing new authoritative state about the order itself.
 
-**Target users**: Approvers acting on approval requests; fulfillment operators resolving failed line tasks; system actors (Orders Lifecycle, Generic Approval service, Subscriptions/OSS events).
+**Target users**: Approvers acting on approval requests; fulfillment operators resolving failed line tasks; system actors (Orders Lifecycle, approval policy adapter, Subscriptions/OSS events).
 
 ### 1.3 Goals (Business Outcomes)
 
-- Every submitted, approved order is driven to a terminal fulfillment outcome (completed or compensated) with zero lost in-flight workflows across service restarts.
+- Every submitted, approved order is driven to a terminal fulfillment outcome (completed or compensated) with zero lost in-flight workflows across service restarts, except the counted dead-instance unwind, which ends the order through cancel (§7.1 *In-Flight Process Durability*, D-262).
 - Multi-party approval gates with configurable escalation ensure no order waits silently beyond the configured escalation window (default 72 hours).
-- Per-line fulfillment with explicit dependencies and compensation guarantees that partial failures result in a tracked manual task rather than a stranded resource.
+- Per-line fulfillment with compensation guarantees that partial failures result in a tracked manual task rather than a stranded resource.
 - Zero duplicate provisioning intents reach Subscriptions/OSS for a given order line under concurrent or retried execution.
 - Fulfillment SLA: standard orders (no manual steps, no future-dated wait) complete within 15 minutes p95 from activation-wave eligibility.
 
@@ -104,7 +106,7 @@ Orders Workflow fills this process gap additively, coordinating between Orders L
 | **Saga / Compensation** | The pattern used for multi-step fulfillment. Each step is classified **compensable** or **irreversible** at design time. This phase's two waves are both compensable: draft-void (wave 1) and activated-cancel (wave 2). On permanent failure the saga compensates compensable steps in reverse order. There is no intra-saga pivot this phase. |
 | **Process correlation identifier (`correlationId`)** | Identifier generated when a process instance starts. Distinct from a per-call idempotency key and from a downstream transition-request id. Carried on every outbound call, echoed on confirmations, and recorded in this gear's audit entries. |
 | **OrderApprovalRequest** | An entity created by Orders Workflow to track a pending approval for a specific order and approval gate. Semantics (pending/approved/rejected status cycle, idempotency by request key) are aligned with the BSS manifest §4.3 TransitionRequest/Approval pattern, but the entity is independent — Orders Workflow does not write into the Subscriptions data model. |
-| **OrderApprovalDecision** | The response emitted by the Generic Approval service for a given `OrderApprovalRequest` — carries the outcome (approved/rejected) and a reason. |
+| **OrderApprovalDecision** | The response emitted by the approval policy adapter for a given `OrderApprovalRequest` — carries the outcome (approved/rejected) and a reason. |
 | **FulfillmentTask** | An entity representing the fulfillment intent for one order line: tracks wave-aligned step progress (`pending → draft_created → activated / failed`), retry count, compensation state, the process `correlationId`, and the downstream Subscriptions transition-request identifier (join key only — **MUST NOT** be mirrored into order state, Lifecycle R5). |
 | **Provisioning intent** | A request sent from Orders Workflow to Subscriptions for one order line. Forward: **draft-create** (wave 1, not resource-affecting) or **activation** (wave 2 — Subscriptions then handles the Policy Engine gate → OSS provision → confirm sequence). Compensation: **draft-void** (wave 1) or **activated-cancel** (wave 2). Identity and idempotency of every intent are specified in §6.3 / §9.2. |
 | **Manual task** | A tracked work item assigned to a fulfillment operator when a line fails permanently, carrying a defined SLA. Every failed line MUST produce exactly one manual task with 100% visibility. |
@@ -112,7 +114,7 @@ Orders Workflow fills this process gap additively, coordinating between Orders L
 
 > **Alignment note**: `OrderApprovalRequest` / `OrderApprovalDecision` semantics are deliberately aligned with the manifest §4.3 TransitionRequest/Approval pattern (the same pattern used for approval in Subscriptions and Contracts). However, these are Orders Workflow–owned entities; Orders Workflow does NOT write into the Subscriptions or Contracts data models.
 
-> **Cross-reference**: For definitions of Order, Order Line Item, and `pricingSnapshotRef`, see the Orders Lifecycle PRD (`PRD-orders-lifecycle-202608101404`).
+> **Cross-reference**: For definitions of Order, Order Line Item and the accepted `OrderPin` — the accepted plan revision, its selected items and their price bindings (D-193) — see the Orders Lifecycle PRD (`PRD-orders-lifecycle-202608101404`), which calls it the accepted order pin (`orderPin`). Two section headings there still carry the retired name *catalog price pin* for the same artifact.
 
 ## 2. Architecture Alignment
 
@@ -161,12 +163,12 @@ Orders Workflow fills this process gap additively, coordinating between Orders L
 **Role**: The document SoR that Orders Workflow acts upon. Orders Workflow reads order state and content from Orders Lifecycle and calls Orders Lifecycle idempotently to drive state transitions (`fulfillment_started`, fulfillment acknowledgement — `completed` or `fulfillment_failed`, approval reflection). Orders Lifecycle publishes order state-change events that Orders Workflow consumes (including `OrderAmended` for re-approval, and terminal events — `OrderCancelled` / `OrderExpired` / `OrderRejected` — for process termination).
 **Integration direction**: Bidirectional — Workflow calls Lifecycle (transition calls); Lifecycle publishes events consumed by Workflow.
 
-#### Generic Approval Service
+#### Approval Policy Owner
 
 **ID**: `cpt-cf-bss-orders-workflow-actor-owf-generic-approval`
 
-**Role**: The shared BSS service that owns approval **policy**: routing, multi-party gate evaluation, and approval-requirement/threshold evaluation over the submitted request context. Orders Workflow submits `OrderApprovalRequest` instances (carrying order context, including the named TCV figure) and receives `OrderApprovalDecision` responses, and queries the approval-requirement verdict keyed on order + version. The routing and threshold configuration (who approves, under what conditions) lives in this service — not in Orders Workflow. Escalation timers are scheduled, persisted, and fired by Orders Workflow (§6.2); this service provides the escalation configuration and receives/routes the escalation command. Until the service exists, a stand-in behind the §9.2 contract returns `approval not required` (audited).
-**Integration direction**: Outbound from Orders Workflow (request); inbound decision callback or event.
+**Role**: The owner of approval **policy** — routing, multi-party gate evaluation, and approval-requirement/threshold evaluation over the submitted request context. Since D-197 (Lifecycle D-166) it **MUST** be reached only through this gear's **approval policy adapter**, a port whose contract is §9.2: Orders Workflow submits `OrderApprovalRequest` instances (carrying order context, including the stored valuation for the basis the policy owner chooses, and the named-user condition) and receives `OrderApprovalDecision` responses, and queries the approval-requirement verdict keyed on order + version. The routing and threshold configuration (who approves, under what conditions) lives behind the adapter — not in the orchestration. Escalation timers are scheduled, persisted, and fired by Orders Workflow (§6.2); the adapter provides the escalation path and receives/routes the escalation command. The phase-1 implementation is a stand-in behind the §9.2 contract that returns `approval not required` (audited), except for a seller with `approval_required = true`, whose orders it parks `approval-adapter-not-bound` (D-265, AC 0c); the intended implementation embeds the shared `cf-gears-bss-approval` library as Pricing and Products do (`DECISIONS.md` Q-14). No separate approval service is expected.
+**Integration direction**: In-process port called from inside step operations (verdict query, request submission, read by key, decision read); inbound decision event on this gear's own topic.
 
 #### Subscriptions
 
@@ -179,7 +181,7 @@ Orders Workflow fills this process gap additively, coordinating between Orders L
 
 **ID**: `cpt-cf-bss-orders-workflow-actor-owf-payments`
 
-**Role**: Provides the payment-authorization check consumed as a begin-fulfillment process precondition. Pending vs failed are process outcomes in this gear; the order remains `approved` until begin-fulfillment. Credit scoring is out of scope.
+**Role**: Provides the payment-authorization check consumed today as the provider of this gear's **financial-readiness** answer (`not-required` · `satisfied` · `pending` · `refused` with a reason), a begin-fulfillment process precondition and the final permission re-read before activation (§6.3). **Assumption pending owner agreement** (§14): Billing becomes the owner of that answer for the order version, from the accepted settlement terms and Payments' facts, and Payments its source. The order remains `approved` until begin-fulfillment. Credit scoring is out of scope.
 **Integration direction**: Outbound from Orders Workflow (authorization request).
 
 #### Events / Audit
@@ -201,12 +203,12 @@ No module-specific deviations — project defaults apply.
 
 | **Feature** | **Priority** | **Notes** |
 |-------------|-------------|-----------|
-| Approval execution: obtain the approval-requirement verdict from the policy owner (or the §9.2 stand-in) and reflect `submitted → pending_approval` or `submitted → approved`; route requests; multi-party gates; durable escalation timers (default 72 h); reflect approve/reject | `p1` | Until the Generic Approval service exists the stand-in returns `approval not required` — multi-party gates, escalation, inbox, and ACs #1–#4a are inert and deferred with the service |
-| Fulfillment plan per order line: build a `FulfillmentTask` per line; respect inter-line dependencies; advance each task through wave-aligned states `pending → draft_created → activated / failed` | `p1` | Two-phase per Lifecycle §6.1; per-line granularity; explicit dependency ordering |
+| Approval execution: obtain the approval-requirement verdict from the policy owner (or the §9.2 stand-in) and reflect `submitted → pending_approval` or `submitted → approved`; route requests; multi-party gates; durable escalation timers (default 72 h); reflect approve/reject | `p1` | Until the library adapter replaces it, the stand-in returns `approval not required`, except a seller with `approval_required = true`, whose orders it parks `approval-adapter-not-bound` (D-265) — multi-party gates, escalation, inbox, and ACs #1–#4a are inert and deferred with it |
+| Fulfillment plan per order line: build a `FulfillmentTask` per line — lines are independent (D-196); advance each task through wave-aligned states `pending → draft_created → activated / failed` | `p1` | Two-phase per Lifecycle §6.1; per-line granularity; no inter-line ordering |
 | Provisioning intents via Subscriptions: draft-create intents (wave 1), activation intents (wave 2, only after all creates succeed **and expected fulfillment time**); compensating draft-void / activated-cancel; consume confirmation **or failure** events; mark `FulfillmentTask` activated or failed | `p1` | Intent identity includes `orderVersion`; MUST NOT bypass Subscriptions or OSS directly; mixed line dates do not stagger live activations |
-| Payment authorization as a begin-fulfillment precondition (pending vs failed as process outcomes; tolerate-failure per Lifecycle) | `p1` | Order stays `approved` until begin-fulfillment; no payment_pending order state |
+| Financial readiness as a begin-fulfillment precondition and a final re-read before activation: a four-way answer (`not-required` · `satisfied` · `pending` · `refused`), tolerate-failure per Lifecycle; a seller-policy payment wait whose expiry requests Lifecycle's pre-fulfillment cancel or raises a review task | `p1` | Order stays `approved` until begin-fulfillment; no payment_pending order state; Payments is today's provider, Billing the assumed owner (§14) |
 | Retry with backoff and bounded attempts: retry **submission** failures of a wave intent with configurable backoff and a bounded attempt count; escalate to manual task on permanent failure | `p1` | Per-attempt timeout and step deadline are distinct from the retry budget; in-flight intents are not retried as resubmits |
-| Step timeout, process deadline, reconciliation sweep, and dead-letter for unknown or poisoned outcomes | `p1` | Process deadline is the overdue window (Lifecycle §6.3); it does not auto-terminal the order |
+| Step timeout, process deadline, reconciliation sweep with unknown outcomes raised as manual tasks, and platform dead letters for poisoned deliveries | `p1` | Process deadline is the overdue window (Lifecycle §6.3); it does not auto-terminal the order |
 | Concurrency and back-pressure toward provisioning (per-order parallel-line cap, aggregate inflight-intent cap, honour throttle) | `p1` | Numeric caps are a Design/ADR concern; per-tenant fairness is required |
 | Saga / compensation: two legs — draft void (wave 1) and activated cancel (wave 2); both classified compensable; on order-level failure compensate in reverse order via Subscriptions; outcomes: `fulfillment_failed` (failure), `cancelled` (workflow-mediated business cancellation), `on_hold` + manual task while remediation is pending | `p1` | Operational compensation only; posted at-sale money is reversed by Billing, not by this gear |
 | Process-execution state ownership: Workflow MUST own step progress, retry counters, saga log, timer handles, approval-request tracking, `correlationId`, and definition version; this state MUST be non-authoritative for order semantics — order state is always read from Orders Lifecycle | `p1` | Fundamental split; MUST requirement — see §6.1 |
@@ -220,19 +222,41 @@ No module-specific deviations — project defaults apply.
 - **Order document and state model** → Orders Lifecycle (`PRD-orders-lifecycle-202608101404`); state machine ownership is there.
 - **Subscription lifecycle** → Subscriptions (`PRD-subscriptions-entitlements-202601120119`); Workflow creates subscriptions; lifecycle beyond creation is Subscriptions'.
 - **Actual provisioning** → OSS Provisioning, accessed only through the subscription path per R3.
-- **Approval decision logic and routing configuration** → Generic Approval service; orchestration (when/how to call) is here; what the decision means is there.
-- **Pricing math** → the price-evaluation domain (rating gear; see the Lifecycle PRD Terminology note); Workflow performs no price computation; the catalog price pin and the non-authoritative resolved total were captured in Lifecycle. The only price access Workflow performs is reading that stored resolved total to pass it in the approval-request context (threshold evaluation is owned by the Generic Approval service; Lifecycle R4, bound in §6.5).
-- **Catalog / Plan & Price / Contracts** → untouched; already fixed in the order by Lifecycle.
+- **Approval decision logic and routing configuration** → approval policy adapter; orchestration (when/how to call) is here; what the decision means is there.
+- **Pricing math** → the price-evaluation domain (rating gear; see the Lifecycle PRD Terminology note); Workflow performs no price computation; the accepted `OrderPin` (PriceBook plan revision, selected items and price bindings) and the non-authoritative resolved total and TCV were captured in Lifecycle. The only price access Workflow performs is reading the stored valuation figure (the TCV, or the figure for the policy owner's chosen basis) through Lifecycle's version read to pass it in the approval-request context (threshold evaluation is owned by the approval policy adapter; Lifecycle R4, bound in §6.5).
+- **Pricing (PriceBook), Products, Rating and Contracts** → untouched; the plan revision, selected items, accepted price bindings and totals are fixed in the order version by Lifecycle. Workflow never calls Pricing, Products or Rating.
 - **Billing and invoicing** → Workflow never bills; the Subscription → Rating → Billing chain applies after fulfillment.
 - **Payment collection** — this gear consumes a payment-**authorization** outcome as a begin-fulfillment precondition (§6.3) and nothing further. Capture, settlement, refunds, chargebacks and disputes, strong-customer-authentication challenges (3-D Secure / SCA) and their asynchronous return, retry with an alternative instrument, and payment-service-provider webhooks are **out of scope** and belong to a Payments capability that has no canonical spec in this repository today. The consequence is that only one payment ordering is expressible here — provision first, collect after, with authorization as a risk check — which does not cover a self-service card checkout that collects before provisioning (§15, §16).
 - **CPQ / formal Quote** → out of scope per the sibling Lifecycle PRD's scope decision.
 - **Durable-execution engine selection** → ADR decision (Open Questions §15); this PRD states requirements only.
 - **Numeric timeout, retry-curve, concurrency, and sweep-schedule values** → Design/ADR; this PRD requires the axes to exist.
 - **Operator migration of a running process onto a new definition version** → out of scope; the instance runs the definition it started with.
-- **Approver reassignment / delegation of an open gate** → deferred (§15); interim answer is escalation.
-- **Approval routing configuration authoring** → Generic Approval service spec (Open Questions §15).
+- **Approver delegation of an open gate** → deferred (§15); interim answer is escalation. **Reassignment** of an open gate's named approver is in scope: an RBAC-controlled assign route that bumps the gate's generation and grants the assigning subject no approval authority (AC 4b; D-229, D-266, D-282).
+- **Approval routing configuration authoring** → the approval policy adapter's library implementation (Open Questions §15; `DECISIONS.md` Q-14).
 - **Change-category orders** (`category = change`) — out of scope for this phase. Lifecycle rejects that category until its path ships; this gear defines process only for `new_sale`.
 - **System-driven subscription transitions** (renewal, trial conversion, dunning-driven suspension) → remain owned by Subscriptions; they produce no order. Commercially initiated changes are inside the Orders boundary, phased per the Lifecycle PRD (§1.1, §15 there).
+
+### 5.3 Customization and Extensibility (Phase 1)
+
+Orders Workflow is a **canonical, platform-operated process** protecting a `p1` order-taking saga, with a deliberately small set of per-seller policy settings. It is not a tenant-configurable order-orchestration product in this phase. §8 states the principle — the orchestration layer accommodates varying commercial complexity *without bespoke workflow configurations* — and this section makes its consequences explicit, so each limit below is a declared position rather than an omission. Customization lives in the gears that own the meaning: order data in Orders Lifecycle, decomposition in the catalog (PriceBook), approval routing in the approval policy adapter (`DECISIONS.md` D-207). Every change reaches only process instances started after it (§5.2).
+
+| **Kind of change** | **Phase 1** | **Vehicle and owner** | **Why the rest is excluded** | **Reopens when** |
+|---|---|---|---|---|
+| Process flow: reorder, insert or drop a composable step; a wait, a retry, a branch over operation-result enums | Yes, platform-wide | A new definition version, published only by the Orders definition publish job after validation and the behavioural gate (D-138) | — | — |
+| Seller- or tenant-authored definition fragments; tenant functions, scripts, hooks or connectors | No | — | A new authorship surface over a `p1` saga; the platform has no pre-publish validation hook or publish audit yet; no definition `call` targets a platform Function (D-136) | The serverless-runtime validation-hook and publish-audit asks land (`DECISIONS.md` Q-10) |
+| A different definition per market, channel, product or order class | No, deliberately | — | Each variant is another protected process to gate and audit; commercial variation belongs in seller policy, in branches inside the one definition, or in the owning gear | Not planned |
+| Staged rollout of a version to a tenant or a share of orders | No, blocked on the platform | A version-scoped trigger binding | — | The serverless-runtime trigger version-selection ask lands (`UPSTREAM_REQS.md` §2.9) |
+| Per-seller runtime policy | Yes: approval escalation window, overdue window, manual-task SLA class, partial-failure policy, payment wait with its expiry action (`request-cancel` · `manual-review`), the declaration that the seller's orders require a real approval authority (`approval_required`, D-265) | A seller-policy write, bounds-checked, recorded and pinned onto new process records only (D-134, D-140) | Any other runtime setting is a definition or release change | A PRD change |
+| What a step does: guards, seam calls, schemas, new operations, the protected list, manual-task actions, tables | Not without a release | An Orders release of the owning slice, then a definition version that uses it (DESIGN §4.7) | Keeps the protected invariants in reviewed code | — |
+| Lifecycle triggers, process events, reasons, process phases | Not without a PRD change | A PRD change and an Orders release | Closed sets by design (§6.1, §6.6) | — |
+| Custom order properties or characteristics | Not in this gear; deferred | Adopter data rides on the **opaque caller-owned reference** this gear transports on every intent and never interprets (§6.3); order characteristics belong to Orders Lifecycle or the catalog and reach Workflow only as references (ADR-0013) | Workflow carries references, never a local extension bag; a typed characteristic model is a platform-wide decision, not one this gear takes alone | §15 *Typed custom properties* |
+| Customer-derived GTS payload types | No | — | Step, event, reason and authorization catalogues are fixed contracts | — |
+| Fulfillment decomposition | One `FulfillmentTask` per independent line | The plan revision with its selected items (D-196); resource-level decomposition is below the Subscriptions boundary | — | — |
+| Approval routing rules | Not in this gear | The approval policy adapter's library (§5.2, Q-14) | — | — |
+| Migration of a running instance | No | — | §5.2 | — |
+| Seller-facing preview, simulation or explanation of the applied flow | No; deferred | The definition version and policy revision are pinned on every process record, so what applied is reconstructable | With one active definition and six policy settings, what applies is the current version and the seller's settings | §15 *Preview and explainability* |
+
+**Scope statement.** An adopter whose commercial motion needs a different process — different steps, different decomposition, different routing authority — integrates **in front of** Orders through its own facade, or proposes a change to the canonical definition. It does not configure Orders into a different process.
 
 ## 6. Functional Requirements
 
@@ -244,7 +268,7 @@ No module-specific deviations — project defaults apply.
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-workflow-fr-owf-process-state-nonauth`
 
-Orders Workflow **MUST** own all process-execution state — step progress, retry counters, saga/compensation log, durable timer handles, approval-request tracking, the process `correlationId`, and the process-definition version the instance started with. Two authorities are explicitly distinguished: **Orders Lifecycle is authoritative for the commercial order document and order state**; **this gear's process audit and saga log** are authoritative for process execution progress (step progress, accepted provisioning intents, saga/compensation log, timer state, retry counters) — **independently of** durable-execution **engine** history, which is not the audit SoR. Workflow execution state **MUST** be recoverable/replayable from that gear-owned record (zero loss for committed steps per §7.1) and **MUST NOT** be presented as authoritative commercial order state: what was ordered and the current order state are **always** read from Orders Lifecycle. A process instance **MUST** execute to completion under the definition version it started with; that version **MUST** be recorded on the instance and in the audit trail. An operator **MUST NOT** migrate a running instance onto a later definition.
+Orders Workflow **MUST** own all process-execution state — step progress, retry counters, saga/compensation log, durable timer handles, approval-request tracking, the process `correlationId`, and the process-definition version the instance started with. Two authorities are explicitly distinguished: **Orders Lifecycle is authoritative for the commercial order document and order state**; **this gear's process audit and saga log** are authoritative for process execution progress (step progress, accepted provisioning intents, saga/compensation log, timer state, retry counters) — **independently of** durable-execution **engine** history, which is not the audit SoR. Workflow execution state **MUST** be recoverable/replayable from that gear-owned record (zero loss for committed steps per §7.1) — recoverable **from the record**, which every committed step, the saga log and the manual-task history guarantee, not a promise that execution continues without the platform (§7.1 *In-Flight Process Durability*, D-262) and **MUST NOT** be presented as authoritative commercial order state: what was ordered and the current order state are **always** read from Orders Lifecycle. A process instance **MUST** execute to completion under the definition version it started with; that version **MUST** be recorded on the instance and in the audit trail. An operator **MUST NOT** migrate a running instance onto a later definition.
 
 **Rationale**: Dual-SoR for order state creates divergence under partial failures and makes audit impossible from a single source. Process execution history is operational record-keeping with its own zero-loss durability requirement — non-authoritative for commercial semantics, but never casually discardable.
 
@@ -254,19 +278,21 @@ Orders Workflow **MUST** own all process-execution state — step progress, retr
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-workflow-fr-owf-start-contract`
 
-Orders Workflow **MUST** start or advance processing on the following Orders Lifecycle triggers, and only these: `OrderSubmitted` — obtain the approval-requirement verdict from the approval policy owner, reflect it into Lifecycle, and start approval execution where required (§6.2); `OrderApproved` — start (or resume) fulfillment; `OrderAmended` — supersede any processing for the prior version and start processing for the new version (§6.2); `OrderHeld` / `OrderResumed` — suspend or resume the process per §Process Suspension on Hold and Resume; `OrderAcceptanceRecorded` — re-evaluate begin-fulfillment eligibility (payment authorization and, where required, recorded buyer acceptance); terminal state events (`OrderCancelled`, `OrderExpired`, `OrderRejected`) — terminate the process (§Process Termination). Every process instance **MUST** be correlated to `orderId` + `orderVersion` and **MUST** carry a process `correlationId` generated at start — distinct from per-call idempotency keys and from downstream transition-request identifiers. Duplicate triggers (event redelivery) **MUST** be absorbed idempotently via event ID and that `correlationId`. Out-of-order triggers **MUST** be resolved by reading the current order state and version from Orders Lifecycle (R1) before acting; a trigger for a superseded order version **MUST** be ignored. The exact transport (event subscription vs. command) is a Design concern.
+Orders Workflow **MUST** start or advance processing on the following Orders Lifecycle triggers, and only these: `OrderSubmitted` — obtain the approval-requirement verdict from the approval policy owner, reflect it into Lifecycle, and start approval execution where required (§6.2); `OrderApproved` — start (or resume) fulfillment; `OrderAmended` — supersede any processing for the prior version and start processing for the new version (§6.2); `OrderHeld` / `OrderResumed` — suspend or resume the process per §Process Suspension on Hold and Resume; `OrderAcceptanceRecorded` — re-evaluate begin-fulfillment eligibility (payment authorization and, where required, recorded buyer acceptance); terminal state events (`OrderCancelled`, `OrderExpired`, `OrderRejected`) — terminate the process (§Process Termination); `OrderFulfillmentFailed` **only** when its `failure_reason` is `operator-forced-unreconciled` (Lifecycle D-182) — terminate the process without treating the order as compensated (§Process Termination). Every other `OrderFulfillmentFailed` is this gear's own acknowledgement and **MUST** be absorbed. Every Lifecycle event **MUST** be consumed under Lifecycle's event consumer contract — de-duplicate by event id, reconcile through `get_version` and the current-order read before any business effect, tolerate unknown values, never reconstruct order state, keep work durably pending on an unavailable or denied read — and passing the shared `orders-events` golden corpus with this gear's real handler is its integration sign-off gate (Lifecycle D-186; D-208). Every process instance **MUST** be correlated to `orderId` + `orderVersion` and **MUST** carry a process `correlationId` generated at start — distinct from per-call idempotency keys and from downstream transition-request identifiers. Duplicate triggers (event redelivery) **MUST** be absorbed idempotently via event ID and that `correlationId`. Out-of-order triggers **MUST** be resolved by reading the current order state and version from Orders Lifecycle (R1) before acting; a trigger for a superseded order version **MUST** be ignored. The exact transport (event subscription vs. command) is a Design concern.
 
 **Rationale**: Without a defined trigger contract the entry point is ambiguous (approval processing starts from `OrderSubmitted` plus the requirement-verdict reflection, fulfillment from `OrderApproved`) and duplicate or stale triggers could start conflicting process instances for the same order.
 
 **Actors**: `cpt-cf-bss-orders-workflow-actor-owf-orders-lifecycle`
 
-> **Data classification**: Process artifacts owned by Orders Workflow (approval requests and decisions, manual tasks, saga logs, timer handles, retry counters, dead-letter records) carry commercial order context. They **MUST** be tenant-scoped, retained at audit grade **by this gear** independently of engine history, and **MUST NOT** carry payment-card data. Classification is aligned with the underlying order record owned by Orders Lifecycle.
+> **Data classification**: Process artifacts owned by Orders Workflow (approval requests and decisions, manual tasks, saga logs, timer handles, retry counters) carry commercial order context. They **MUST** be tenant-scoped, retained at audit grade **by this gear** independently of engine history, and **MUST NOT** carry payment-card data. Classification is aligned with the underlying order record owned by Orders Lifecycle.
 
 #### Process Termination on Terminal Order Events
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-workflow-fr-owf-terminal-order-events`
 
 On consuming a terminal order state event from Orders Lifecycle (`OrderCancelled`, `OrderExpired`, or `OrderRejected`) for an order with an active process, Orders Workflow **MUST** terminate the process: cancel open approval requests and their escalation timers, cease pending provisioning intents, and execute compensation per §6.4 for any steps already completed — including **voiding any wave-1 draft subscriptions** that have not been activated (drafts are process artifacts of wave 1 and **MUST NOT** be left for a platform TTL this gear does not own). Termination **MUST** be recorded in the process audit log. The same void-on-terminate rule applies when a trigger for a superseded `orderVersion` ends processing of the prior version.
+
+**Operator-forced unreconciled failure (Lifecycle D-182).** Two fulfillment operators can force an overdue post-spawn order to `fulfillment_failed` with `failure_reason = operator-forced-unreconciled`; its evidence records `no_active_subscription_remains = unknown`. On consuming that `OrderFulfillmentFailed`, Orders Workflow **MUST** terminate the process through the same unwind — cancel open approval requests and timers, cease pending provisioning intents, and compensate through Subscriptions — **without** treating the order as compensated, and **MUST** keep, or open, the compensation manual task (`activated-cancel-failed`, order or line scope) until reconciliation through Subscriptions establishes that no active subscription remains. It **MUST NOT** call Orders Lifecycle again for that order: any call is refused against the terminal state. A completion report that meets the forced terminal is settled without a Lifecycle call and enters the same unwind (D-208).
 
 **Rationale**: Orders Lifecycle owns terminal transitions (including automatic state expiry); a process left running against a terminally closed order would issue provisioning intents and approval requests for a dead commercial artifact.
 
@@ -278,7 +304,7 @@ On consuming a terminal order state event from Orders Lifecycle (`OrderCancelled
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-workflow-fr-owf-approval-request`
 
-On `OrderSubmitted`, Orders Workflow **MUST** obtain the approval-**requirement** verdict from the approval policy owner (Generic Approval service, evaluating the order context — including the named TCV figure of the stored resolved total) and reflect it into Orders Lifecycle (`submitted → pending_approval` or `submitted → approved`) — the verdict is determined by the policy owner and computed by neither Workflow nor Lifecycle. Until that service exists, Workflow **MUST** invoke a **stand-in behind the same §9.2 expectations contract** (not a second policy author): the stand-in **MUST** return `approval not required` and the reflection **MUST** be audited as stand-in. After the service exists, unavailability **MUST** park the process with the order remaining in `submitted` (fail-closed) — Workflow **MUST NOT** fail-open to `approved`. The park **MUST NOT** suspend the Lifecycle `submitted` TTL: expiry is the bound (Lifecycle §6.3); Workflow **MUST** escalate to the fulfillment-operator / operator queue **before** that TTL elapses. The verdict query **MUST** be keyed on `orderId` + `orderVersion`; the result **MUST** be cached against that version; a later query that disagrees with an already-reflected verdict **MUST** be treated as stale and **MUST NOT** be re-reflected. For an order entering `pending_approval`, Orders Workflow **MUST** create an `OrderApprovalRequest` and submit it to the Generic Approval service. The Workflow **MUST** support multi-party gate configuration: an order **MAY** require sequential or parallel approvals from multiple parties as defined by the approval routing configuration in the Generic Approval service. Each party constitutes one gate; all gates **MUST** be satisfied before the order is considered approved. On consuming `OrderAmended` (a new order version was created), Orders Workflow **MUST** cancel any open approval gates for the prior version and, if the amended order requires approval, open new `OrderApprovalRequest`(s) keyed to the new `orderVersion` — re-approval is event-driven, per the Lifecycle amendment contract.
+On `OrderSubmitted`, Orders Workflow **MUST** obtain the approval-**requirement** verdict from the approval policy owner (this gear's approval policy adapter, evaluating the order context — including the stored valuation for the basis the policy owner chooses: the full contractual commitment, the first installment, an authorized budget, a forecast or the annualised net pre-tax TCV, forwarded with its currency, term and provenance, or explicitly `unavailable`, which **MUST NOT** be read as zero; the basis is the policy owner's choice and never a seller-policy setting) and reflect it into Orders Lifecycle (`submitted → pending_approval` or `submitted → approved`) — the verdict is determined by the policy owner and computed by neither Workflow nor Lifecycle. Until the library adapter lands, Workflow **MUST** invoke a **stand-in behind the same §9.2 expectations contract** (not a second policy author): the stand-in **MUST** return `approval not required` and the reflection **MUST** be audited as stand-in, except for a seller with `approval_required = true`: for that seller's orders the stand-in **MUST NOT** return `approval not required`, and the process **MUST** park `approval-adapter-not-bound` with the order remaining in `submitted`, fail-closed, as AC 0c states (D-265, D-307). Once the stand-in is replaced, unavailability of the policy owner behind the adapter **MUST** park the process with the order remaining in `submitted` (fail-closed) — Workflow **MUST NOT** fail-open to `approved`. The park **MUST NOT** suspend the Lifecycle `submitted` TTL: expiry is the bound (Lifecycle §6.3); Workflow **MUST** escalate to the fulfillment-operator / operator queue **before** that TTL elapses. The verdict query **MUST** be keyed on `orderId` + `orderVersion`; the result **MUST** be cached against that version; a later query that disagrees with an already-reflected verdict **MUST** be treated as stale and **MUST NOT** be re-reflected. For an order entering `pending_approval`, Orders Workflow **MUST** create an `OrderApprovalRequest` and submit it to the approval policy adapter. The Workflow **MUST** support multi-party gate configuration: an order **MAY** require sequential or parallel approvals from multiple parties as defined by the approval routing configuration in the approval policy adapter. Each party constitutes one gate; all gates **MUST** be satisfied before the order is considered approved. For the predefined order-approval stage the gate **MUST** carry a **named-user condition** — the one approver the routing configuration names in the seller's tenant scope, with the gate's generation — so that another user's decision, however broadly permitted, does not satisfy it, and a decision made under an earlier generation is refused after reassignment. Reassignment **MUST** be a separately authorized action that grants no approval authority. A gate whose named approver is missing or ineligible **MUST** park the order as `assignee-unresolved`, never auto-approve. **Assumption pending owner agreement** (§14): the shared approval library enforces the condition on the owner-side decision path, and Orders approvals are surfaced through the common BSS Approvals Inbox with no second authoritative queue; Rating computes the figure for each basis and Lifecycle stores it. On consuming `OrderAmended` (a new order version was created), Orders Workflow **MUST** cancel any open approval gates for the prior version and, if the amended order requires approval, open new `OrderApprovalRequest`(s) keyed to the new `orderVersion` — re-approval is event-driven, per the Lifecycle amendment contract. Before that "if" is answered, Orders Workflow **MUST** obtain a fresh approval-requirement verdict for the new `orderVersion` and reflect it from `submitted`, exactly as on `OrderSubmitted`; it **MUST NOT** carry the prior version's verdict forward (D-238).
 
 **Rationale**: Commercial acquisitions often require financial authorization, legal review, or partner-channel sign-off; multi-party gating is a business requirement for these flows.
 
@@ -298,7 +324,7 @@ Every `OrderApprovalRequest` **MUST** carry an idempotency key derived from the 
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-workflow-fr-owf-approval-escalation`
 
-For each open approval gate, Orders Workflow **MUST** set a durable timer with a configurable escalation window (default: 72 hours). Orders Workflow is the **single owner** of scheduling, persisting, and firing escalation timers; the Generic Approval service provides the escalation configuration and receives the escalation command — it does not own timer state. On timer expiry without a decision, the Workflow **MUST** trigger escalation: publish `OrderApprovalEscalated` and issue the escalation command to the configured escalation path via the Generic Approval service. Escalation timers **MUST** survive service restarts. After the Generic Approval service exists, an outage while a gate is **already open** **MUST** pause that gate's escalation timer (the window **MUST NOT** burn into a dead dependency) — the same pause mechanism as hold. If the outage lasts beyond a configurable threshold (value is a Design concern), Workflow **MUST** escalate to the operator queue **without** issuing the escalation command through the unavailable service; it **MUST NOT** fail-open to `approved` and **MUST NOT** auto-reject the gate.
+For each open approval gate, Orders Workflow **MUST** set a durable timer with a configurable escalation window (default: 72 hours). Orders Workflow is the **single owner** of scheduling, persisting, and firing escalation timers; the approval policy adapter provides the escalation **path** (the target the escalation command is routed to) and receives the escalation command — it does not own timer state — while the escalation window is Orders' per-seller policy (D-134, D-140). On timer expiry without a decision, the Workflow **MUST** trigger escalation: publish `OrderApprovalEscalated` and issue the escalation command to the configured escalation path via the approval policy adapter. Escalation timers **MUST** survive service restarts. Once the library adapter replaces the stand-in, an outage while a gate is **already open** **MUST** pause that gate's escalation timer (the window **MUST NOT** burn into a dead dependency) — the same pause mechanism as hold. If the outage lasts beyond a configurable threshold (value is a Design concern), Workflow **MUST** escalate to the operator queue **without** issuing the escalation command through the unavailable service; it **MUST NOT** fail-open to `approved` and **MUST NOT** auto-reject the gate.
 
 **Rationale**: Without durable escalation, approvals can stall indefinitely — blocking fulfillment and violating the customer's acquisition SLA.
 
@@ -308,7 +334,7 @@ For each open approval gate, Orders Workflow **MUST** set a durable timer with a
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-workflow-fr-owf-approval-decision`
 
-On receiving an `OrderApprovalDecision` (approved or rejected) from the Generic Approval service, Orders Workflow **MUST** call Orders Lifecycle idempotently to reflect the state transition (`pending_approval → approved` or `pending_approval → rejected`). On approval, the Workflow **MUST** proceed to fulfillment. On rejection, the Workflow **MUST** terminate the process and record the rejection reason.
+On receiving an `OrderApprovalDecision` (approved or rejected) from the approval policy adapter, Orders Workflow **MUST** call Orders Lifecycle idempotently to reflect the state transition (`pending_approval → approved` or `pending_approval → rejected`). On approval, the Workflow **MUST** proceed to fulfillment. On rejection, the Workflow **MUST** terminate the process and record the rejection reason.
 
 **Rationale**: The state reflection in Lifecycle is the canonical record of approval outcome; Workflow's role is to execute the routing and then drive the Lifecycle transition.
 
@@ -318,7 +344,7 @@ On receiving an `OrderApprovalDecision` (approved or rejected) from the Generic 
 
 - [ ] `p2` - **ID**: `cpt-cf-bss-orders-workflow-fr-owf-approver-inbox`
 
-Orders Workflow **MUST** surface pending `OrderApprovalRequest` items to eligible approvers with the order context, requesting party, gate identifier, and escalation SLA countdown, and **MUST** capture the approver's approve or reject decision with a reason. The inbox **MUST** be scoped to the approver's assigned gates; requests outside the approver's scope **MUST NOT** be shown.
+Orders Workflow **MUST** surface pending `OrderApprovalRequest` items to eligible approvers with the order context, requesting party, gate identifier, and escalation SLA countdown, and **MUST** capture the approver's approve or reject decision with a reason. The inbox **MUST** be scoped to the approver's assigned gates; requests outside the approver's scope **MUST NOT** be shown. A decision **MUST** be refused unless the deciding subject is the gate's named approver and names the gate's current generation.
 
 **Rationale**: Approvers need a single surface to view and act on pending requests within their scope; without a dedicated surface, approval decisions rely on out-of-band notifications and undermine escalation SLA visibility.
 
@@ -330,23 +356,11 @@ Orders Workflow **MUST** surface pending `OrderApprovalRequest` items to eligibl
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-workflow-fr-owf-fulfillment-plan`
 
-Orders Workflow **MUST** freeze a flat plan for each committed `orderId` + sparse `orderVersion`,
-with exactly one `FulfillmentTask` and one resulting subscription per captured order line.
-D-172 withdraws Catalog dependency-DAG construction: do not fetch or invent topology, expand
-bundles or sequence dependent lines. PriceBook composition is resolved before capture; a
-captured composed line remains one line. `dependency-graph-invalid` is historical decoding only
-and **MUST NOT** be emitted by current execution. Wave 1 creates all drafts. Wave 2 dispatches
-activation only after every create is durably confirmed and the latest service-activation date
-among all lines has been reached; persist a timer for that wait. All lines share this barrier.
-Independent calls may run concurrently within configured back-pressure. At plan construction
-and before first activation, consume canonical occupancy with active plus admitted-pending
-capacity and exact source deduplication; a collision aborts with `overlap-collision`, after
-voiding drafts. Re-check the payer market before activation; divergence similarly aborts with
-`market-divergence`. Neither is a remediation line failure. Record each wave's exact transition
-request ID, source/version/line/wave/kind/attempt identity, and applied outcome. Completion
-requires the full flat roster of distinct, actually activated subscription IDs.
+Orders Workflow **MUST** build a fulfillment plan from the approved order's line items: one `FulfillmentTask` per line item. Lines are **independent**: under PriceBook a line is one plan revision with its selected items — an add-on is an optional item of the same revision, inside the line — and nothing links one revision to another, so the order carries no inter-line dependency and Workflow resolves none (`DECISIONS.md` D-196). Workflow **MUST** **freeze** the plan per `orderId` + `orderVersion` while the order is still `approved` — **before** it calls begin-fulfillment, and therefore before any provisioning intent (D-206) — and **MUST** refuse to freeze a plan whose expected fulfillment time is at or after the earliest accepted-binding activation deadline of its lines (reason `order-binding-expired`, D-194). That refusal is a **plan-level failure**, not a line failure: no `FulfillmentTask` exists, the order stays `approved` and therefore still amendable, and Workflow **MUST** open a plan-level manual task with reason `order-binding-expired` under **either** partial-failure policy so a Seller Operator can amend the order (Lifecycle `POST /bss-orders/v1/orders/{orderId}/amendments`, development-delivered today, Lifecycle `bss/orders-stage4` D-254; D-238, D-325) — a new order version is assessed afresh by Lifecycle and carries a later deadline (D-92). If that task is exhausted, Workflow **MUST** call begin-fulfillment and then acknowledge `in_fulfillment → fulfillment_failed` with reason `order-binding-expired` and no compensation, since nothing was provisioned; Lifecycle's `fulfillment_failed` is reachable only from `in_fulfillment` (D-92, D-109). Execution is **two-phase** per the Lifecycle atomic contract (Lifecycle PRD §6.1): wave 1 creates every line's subscription in `draft` (not resource-affecting); wave 2 activates them only after every create has succeeded **and expected fulfillment time has been reached** (`max(now, latest service-activation date among lines)`). That instant means **begin connection and preparation**: Subscriptions' activation prepares the service from it and commits the actual start once readiness is in, so the barrier promises neither a ready service at that instant nor simultaneous completion across lines, and Workflow **MUST NOT** forecast provisioning duration to start earlier. The dispatch call's deadline, the asynchronous activation duration and Workflow's waiting bound are three different limits; the expiry of any of them **MUST** reconcile the same operation and is neither an activation failure nor permission to submit another activation. Mixed dates on the order **MUST NOT** stagger live activations — no activation intent is dispatched while any line still waits on its date. Compensation before activation is draft void. At plan construction **and** again immediately before the first activation intent, Workflow **MUST** consume the same overlap-presence read as the Lifecycle submit gate (`SUB-O5`). A collision is a **pre-activation abort**, not a line-execution failure: Workflow **MUST NOT** mark `FulfillmentTask`s `failed` and **MUST NOT** enter the remediate/hold policy. It **MUST** halt before any activation intent, void wave-1 drafts (draft-void leg), record a machine-readable **overlap-collision** reason on the abort, and acknowledge `in_fulfillment → fulfillment_failed` after that void. Immediately before the first activation intent, Workflow **MUST** also re-check the order market against the payer's current commercial profile; divergence **MUST** follow the same abort (reason **market-divergence**). `FulfillmentTask` progress and provisioning intents apply per wave (draft-create intent, then activation intent). Each task **MUST** record the downstream transition-request identifier returned by Subscriptions (correlation only). Every line the barrier releases is dispatched, and lines **MAY** proceed in parallel, subject to §Concurrency and Back-Pressure; no line waits on another line's activation. A **plan revision with its selected items is one line item** (never expanded into items; PriceBook admits no bundle SKU as a plan item); Workflow receives the order's line items exactly as captured by Orders Lifecycle.
 
-**Rationale**: A frozen flat roster and two-wave barrier implement the adopted atomic order contract without a second product topology or pricing model.
+**Lifecycle's flat-roster contract** (merged from the Lifecycle implementation, Lifecycle D-172 and D-198). The frozen plan for each committed `orderId` + sparse `orderVersion` holds exactly one `FulfillmentTask` and one resulting subscription per captured order line; Lifecycle D-172 withdraws Catalog dependency-DAG construction, so Workflow **MUST NOT** fetch or invent topology, expand bundles or sequence dependent lines, and a captured composed line remains one line. `dependency-graph-invalid` is historical decoding only and **MUST NOT** be emitted by current execution. The overlap reads at plan construction and before first activation **MUST** consume canonical occupancy with active plus admitted-pending capacity and exact source deduplication. Each wave **MUST** record its exact transition-request identifier, the source/version/line/wave/kind/attempt identity and the applied outcome. Completion **MUST** require the full flat roster of distinct, actually activated subscription identifiers.
+
+**Rationale**: A frozen plan per order version makes the per-line requirements and their acceptance criteria implementable and replay-consistent. The PriceBook model has no inter-line product topology, so none is invented here; the two-wave barrier is the whole ordering. Constructing the plan before begin-fulfillment keeps a binding-expiry refusal in `approved`, where amendment can still cure it; `in_fulfillment` is entered only once there is a plan worth executing (D-206). A frozen flat roster and the two-wave barrier implement the adopted atomic order contract without a second product topology or pricing model.
 
 **Actors**: `cpt-cf-bss-orders-workflow-actor-owf-orders-lifecycle`
 
@@ -354,7 +368,7 @@ requires the full flat roster of distinct, actually activated subscription IDs.
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-workflow-fr-owf-line-progress`
 
-Each `FulfillmentTask` **MUST** advance through wave-aligned states: `pending → draft_created → activated / failed`. The Workflow **MUST** emit `OrderFulfillmentStepCompleted` when — and only when — a `FulfillmentTask` reaches a terminal state (`activated` or `failed`): one event per line outcome. Intermediate advancement (`pending → draft_created`) is observable via the progress-read operation (§9.1), not via events. Order fulfillment is **atomic** (Lifecycle PRD §6.1 Atomic Fulfillment): the order **MUST** be acknowledged `completed` only when **all** lines are `activated`; the order **MUST NOT** transition to `completed` while any line is unactivated — there is no partial completion. When a line reaches permanent `failed`, the configurable partial-failure policy governs what happens next: **remediate** (default — stop new dispatch, reconcile all in-flight lines under the D-198 receiver fences, create a manual task per §6.4, and hold the order pending operator resolution) or **fail-fast** (abort immediately). If remediation resolves every failed line (retry/override succeeds), fulfillment proceeds to completion; if remediation is exhausted or the policy is fail-fast, the Workflow **MUST** compensate all subscriptions created for this order and acknowledge the failure outcome (order → `fulfillment_failed`) per §6.4.
+Each `FulfillmentTask` **MUST** advance through wave-aligned states: `pending → draft_created → activated / failed`. The Workflow **MUST** emit `OrderFulfillmentStepCompleted` when — and only when — a `FulfillmentTask` reaches a terminal state (`activated` or `failed`): one event per line outcome. Intermediate advancement (`pending → draft_created`) is observable via the progress-read operation (§9.1), not via events. Order fulfillment is **atomic** (Lifecycle PRD §6.1 Atomic Fulfillment): the order **MUST** be acknowledged `completed` only when **all** lines are `activated`; the order **MUST NOT** transition to `completed` while any line is unactivated — there is no partial completion. When a line reaches permanent `failed`, the configurable partial-failure policy governs what happens next: **remediate** (default — stop new dispatch, reconcile all in-flight lines under the D-198 receiver fences, create a manual task per §6.4, and hold the order pending operator resolution) or **fail-fast** (abort immediately). If remediation resolves every failed line (retry/override succeeds), fulfillment proceeds to completion; if remediation is exhausted or the policy is fail-fast, the Workflow **MUST** compensate all subscriptions created for this order and acknowledge the failure outcome (order → `fulfillment_failed`) per §6.4. The one exception is an activation refusal Workflow cannot classify — an unknown refusal code, a denial or an outage: under **either** policy the line keeps its actionable manual task, which is never exhausted, and the refusal is never itself an order-level failure; the order then fails only by another line's typed failure under fail-fast, which ends it at once, or, under remediate, another line's remediation exhausted, or, once the order's activation limit has elapsed, by the order-binding-expired unwind, which cites the elapsed deadline (§6.4, D-285, D-294, D-300, D-304, D-317).
 
 **Rationale**: Per-line granularity makes fulfillment progress observable (process tracking is Workflow-owned), while the commercial outcome stays atomic per the Lifecycle contract — line items in one order are one commercial intent.
 
@@ -364,12 +378,7 @@ Each `FulfillmentTask` **MUST** advance through wave-aligned states: `pending �
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-workflow-fr-owf-provisioning-intent`
 
-Orders Workflow **MUST** submit per-line intents to Subscriptions in the two waves of §Fulfillment Plan Construction: a draft-create intent per pending line (wave 1), and an activation intent per `draft_created` line only after every create has succeeded **and expected fulfillment time has been reached** (wave 2). A line **MUST NOT** receive an activation intent while another line of the same order still waits on a future service-activation date — Subscriptions does not own this wait. Workflow **MUST** set a durable timer for that wait; wake-up **MUST NOT** depend on an external trigger. Each intent — draft-create, activation, draft-void, and activated-cancel — **MUST** carry `orderId`, `orderVersion`, `orderLineId`, wave, the process `correlationId`, and an opaque caller-owned binding reference supplied by this gear. Subscriptions and OSS **MUST** treat that reference as opaque and **MUST NOT** interpret it as order state; the value **MAY** be derived from the order's external reference where present. Each intent **MUST** carry an idempotency key derived from `orderId`, `orderVersion`, line item reference, wave, command kind and rebuild-attempt discriminator — distinct from the `correlationId`. Omitting `orderVersion` from the key **MUST NOT** be permitted: a later version of the same line and wave would otherwise collide with a superseded submit. The Workflow **MUST** consume the confirmation **or failure** for the matching wave: a draft-create confirmation advances the task to `draft_created`; an activation confirmation advances it to `activated`; a **failure confirmation** for either wave advances the task to `failed` and enters the partial-failure policy (§Per-Line Progress Tracking). Confirmations and failure events **MUST** echo `orderId`, `orderVersion`, `orderLineId`, wave, the `correlationId`, and the opaque binding reference. If a wave-1 draft is auto-voided **before** its activation intent — hold, platform TTL during the date wait, or any other cause — Workflow **MUST** rebuild only the affected draft members against the same frozen `orderId` + `orderVersion`.
-Preserve completed active members. Before new activation authority, close and settle every old
-create key/intent, then obtain the Lifecycle engine's D-201 `replace_fulfillment_grant` successor
-(or the successor inside post-spawn resume). Use new full wave/kind/rebuild-attempt keys only for
-rebuilt drafts; old grants stay immutable. Before first spawn, rebuild drafts without inventing
-a grant, then bind the current roster at first spawn. Never clear/re-run spawn or reset caps. Immediately before dispatching **each** activation intent, Workflow **MUST** re-read that the target subscription is still in `draft` (not voided). A voided draft **MUST NOT** receive an activation intent; rebuild wave 1 first. Detection is this re-read — it does not depend on a draft-void notification. Orders Workflow **MUST NOT** invoke OSS Provisioning directly — the Subscriptions → Policy Engine → OSS path is the only permissible provisioning route (R3). Propagation of `correlationId` through that path is an upstream ask on Subscriptions (`SUB-O9`).
+Orders Workflow **MUST** submit per-line intents to Subscriptions in the two waves of §Fulfillment Plan Construction: a draft-create intent per pending line (wave 1), and an activation intent per `draft_created` line only after every create has succeeded **and expected fulfillment time has been reached** (wave 2). A line **MUST NOT** receive an activation intent while another line of the same order still waits on a future service-activation date — Subscriptions does not own this wait. Workflow **MUST** set a durable timer for that wait; wake-up **MUST NOT** depend on an external trigger. Each intent — draft-create, activation, draft-void, and activated-cancel — **MUST** carry `orderId`, `orderVersion`, `orderLineId`, wave, the process `correlationId`, and an opaque caller-owned binding reference supplied by this gear. Subscriptions and OSS **MUST** treat that reference as opaque and **MUST NOT** interpret it as order state; the value **MAY** be derived from the order's external reference where present. Each intent **MUST** carry **the intent idempotency key**, stated once here and referred to by §9.2 and §12: the tenant prefix followed by five components — `orderId`, `orderVersion`, line item reference, wave and command kind — and two optional tails: the forward attempt `[+{wave_attempt}]`, appended once above 1 for a rebuilt create or a line an operator retried, and, on a compensating intent only, the compensation attempt `[+c{comp_attempt}]`, appended once above 1 and minted only by a retry of the leg's compensation task, so a leg Subscriptions settled `failed` is presented again under a new key (D-258) — distinct from the `correlationId` (D-262, D-280). Omitting `orderVersion` from the key **MUST NOT** be permitted: a later version of the same line and wave would otherwise collide with a superseded submit. The Workflow **MUST** consume the confirmation **or failure** for the matching wave: a draft-create confirmation advances the task to `draft_created`; an activation confirmation advances it to `activated`; a **failure confirmation** for either wave advances the task to `failed` and enters the partial-failure policy (§Per-Line Progress Tracking). Confirmations and failure events **MUST** echo `orderId`, `orderVersion`, `orderLineId`, wave, the `correlationId`, and the opaque binding reference. If a wave-1 draft is auto-voided **before** its activation intent — hold, platform TTL during the date wait, or any other cause — Workflow **MUST** rebuild that line's draft (re-run wave 1 for it) against the same frozen `orderId` + `orderVersion` before dispatching activation intents. Immediately before dispatching **each** activation intent, Workflow **MUST** re-read the target subscription. A voided draft **MUST NOT** receive an activation intent; rebuild wave 1 first. Detection is this re-read — it does not depend on a draft-void notification. A successor draft **MUST** be authorized only by the re-read **observing** the predecessor `voided`; a new key or attempt authorizes nothing, and an unevaluable read authorizes nothing. The successor **MUST** name its predecessor, so it continues the same purchase rather than recreating it. A draft created and later voided **MUST** be recorded as a historical success — created, then lapsed — never as a failed create. A draft the re-read finds **active** **MUST NOT** be rebuilt: where Workflow's own activation intent exists the line is recovered through it; otherwise the activation is not Workflow's, and the order **MUST** fail under either partial-failure policy with reason `draft-activated-externally`, compensation cancelling that subscription with the others. **Assumption pending owner agreement** (§14): Subscriptions keeps the predecessor's acquisition, reservation, commercial and benefit references on the successor and records the link (`SUB-O18`). Rebuild touches only the affected draft members; completed active members are preserved. **Lifecycle's fulfillment grant** (merged from the Lifecycle implementation, Lifecycle D-201): before new activation authority, Workflow **MUST** close and settle every old create key and intent, then obtain the Lifecycle engine's `replace_fulfillment_grant` successor (or the successor inside post-spawn resume); new full wave/kind/rebuild-attempt keys are used only for rebuilt drafts, and old grants stay immutable. Before first spawn, drafts are rebuilt without inventing a grant, and the current roster is bound at first spawn. Workflow **MUST NOT** clear or re-run the spawn signal or reset caps. Orders Workflow **MUST NOT** invoke OSS Provisioning directly — the Subscriptions → Policy Engine → OSS path is the only permissible provisioning route (R3). Propagation of `correlationId` through that path is Subscriptions' `SUB-O14`, answered in its PR #5131.
 
 **Rationale**: All provisioning flows through Subscriptions per BSS manifest §2.1.2 and §6. Direct OSS calls from Orders Workflow would bypass the Policy Engine gate and violate the BSS boundary constraint.
 
@@ -379,7 +388,7 @@ a grant, then bind the current roster at first spawn. Never clear/re-run spawn o
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-workflow-fr-owf-payment-auth`
 
-Before calling begin-fulfillment, Orders Workflow **MUST** obtain a payment-authorization outcome for the payer (mechanism owned by Payments; consumed here as a process precondition of Lifecycle §6.1). **Pending** (authorization in flight) and **failed** are distinct process outcomes: while pending, the order remains `approved` and no begin-fulfillment call is issued; on failure without the seller tolerate-failure policy, begin-fulfillment **MUST NOT** be called (order stays `approved`); on failure with tolerate-failure, begin-fulfillment **MAY** proceed with the risk flagged on the order as required by Lifecycle. Recorded buyer acceptance, where required, is the other begin-fulfillment guard and **MUST** be satisfied before the call (Lifecycle will reject the transition otherwise). On `OrderAcceptanceRecorded`, Workflow **MUST** re-evaluate begin-fulfillment eligibility. Credit scoring is out of scope.
+Before calling begin-fulfillment, Orders Workflow **MUST** obtain the order version's **financial readiness** as one of four answers — `not-required` (nothing is required financially before execution), `satisfied`, `pending` (pending, or the result is unknown) and `refused` with a reason — consumed as a process precondition of Lifecycle §6.1 for the whole order: a pending prerequisite on one line holds the order. Today the answer is the payment-authorization outcome, mechanism owned by Payments (`authorized` → `satisfied`, `pending` → `pending`, `failed` → `refused`); **Assumption pending owner agreement** (§14): Billing answers it for the order version from the accepted settlement terms and Payments' facts, with pay-later terms from Pricing's per-item `billing_timing`. Workflow **MUST NOT** create payments, checkout sessions or invoices, compute eligibility, or read a browser redirect as readiness. Permission to begin fulfillment and final permission to activate paid service are distinct: immediately before the first activation, Workflow **MUST** re-read readiness through the same port, whatever the provider, and a new refusal then **MUST** abort before activation even where a process-level failure was tolerated at begin-fulfillment — an authorization revoked or withdrawn since begin-fulfillment, or any refusal of service admission by the readiness provider. The one refusal that proceeds is the same payment failure Lifecycle tolerated at begin-fulfillment, which is the seller's accepted risk and not a new refusal; the age of an authorization the re-read confirms never aborts (D-250). While readiness is pending the order remains `approved` and no begin-fulfillment call is issued, up to the seller's **payment wait**; when it elapses Workflow **MUST** take the seller's expiry action once — `request-cancel` asks Orders Lifecycle's workflow-mediated pre-fulfillment cancel, and `manual-review` raises one order-scope review task while readiness keeps being re-read — and **MUST NOT** record any financial consequence, which is Billing's and Payments'. **Assumption pending owner agreement** (§14): Lifecycle supports that pre-fulfillment cancel, arbitrates it against beginning fulfillment and against its own `approved` expiry, and carries an accepted cancellation to Billing and Payments; until it does, `request-cancel` falls back to the review task. A seller's payment wait **MUST NOT** exceed Lifecycle's `approved` expiry. **Pending** and **refused** are distinct process outcomes: while pending, the order remains `approved` and no begin-fulfillment call is issued; on a conclusive refusal Workflow **MUST** pass the failed outcome to begin-fulfillment, because Lifecycle alone evaluates the tolerate-failure policy — the seller's election, then the platform's, unset not tolerated (D-89; Lifecycle `bss/orders-stage4` D-257 item 3): without that policy begin-fulfillment is not **committed** — Lifecycle refuses it, Workflow records the refusal as `withheld`, and the order stays `approved`; with it, begin-fulfillment proceeds with the risk flagged on the order as required by Lifecycle. Recorded buyer acceptance, where required, is the other begin-fulfillment guard, which Lifecycle alone evaluates on the locked current version before the payment guard; Workflow **MUST NOT** evaluate it or gate the call on it: a refusal `acceptance-required-not-recorded` is recorded as `withheld` and the order stays `approved` (Lifecycle `bss/orders-stage4` D-257 items 3, 5; D-325). Acceptance is bound to one order version: after an amendment only acceptance recorded on the new version counts, and an acceptance recorded on a superseded version never satisfies it (Lifecycle OL-26; D-238). On `OrderAcceptanceRecorded`, Workflow **MUST** re-evaluate begin-fulfillment eligibility. Credit scoring is out of scope.
 
 **Rationale**: This gear dispatches the first provisioning intent and therefore enforces the money gate; collapsing pending into failed would either stall silently or provision a non-paying tenant.
 
@@ -389,9 +398,9 @@ Before calling begin-fulfillment, Orders Workflow **MUST** obtain a payment-auth
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-workflow-fr-owf-retry`
 
-The retry budget applies to **intent-submission failures** (the call was not accepted by Subscriptions). An intent already accepted and in flight **MUST NOT** be retried as a resubmit — Subscriptions rejects that class as an in-flight duplicate (upstream ask `SUB-O6`: a machine-readable in-flight rejection). The superseding action for an accepted in-flight intent is the Subscriptions cancel/void of that transition request (upstream ask `SUB-O7`), not a second submit. Each wave's submission **MUST** be retried on transient failure with backoff and a bounded maximum attempt count. **Per-attempt timeout** and **step deadline** are distinct from that retry budget (values are a Design/ADR concern). A submission that **hangs** (no accept, no fail) **MUST** be cut by the per-attempt timeout and **MUST** then consume one retry attempt; a hang **after** accept **MUST NOT** consume the retry budget and **MUST NOT** be retried as a resubmit — it is recovered by §Intent Reconciliation Sweep. Exhausting the **step deadline** or the retry budget **MUST** mark the `FulfillmentTask` `failed` and enter the partial-failure policy (§Per-Line Progress Tracking). The **process deadline** is the overdue window of §Overdue Fulfillment Escalation: it **MUST NOT** by itself mark lines `failed` and **MUST NOT** auto-terminal the order. On exhausting attempts (permanent failure), compensation is **not** triggered directly by retry exhaustion. A wave-1 create failure (nothing resource-affecting) **MUST** be distinguishable in the manual-task reason from a wave-2 activation failure. Retry configuration (backoff curve, maximum attempts, timeout values) is a Design/ADR concern. Every retry attempt **MUST** be idempotent — a retried submission **MUST NOT** produce duplicate durable effects.
+The retry budget applies to **intent-submission failures** (the call was not accepted by Subscriptions). An intent already accepted and in flight **MUST NOT** be retried as a resubmit — a same-key resubmit returns the existing request and its status, and a different request against the same subscription is rejected `transition_in_flight` (`SUB-O11`). The superseding action for an accepted in-flight intent is the Subscriptions **withdrawal** of that request, which ends it `failed` with reason `withdrawn` (`SUB-O12`), not a second submit. Each wave's submission **MUST** be retried on transient failure with backoff and a bounded maximum attempt count. **Per-attempt timeout** and **step deadline** are distinct from that retry budget (values are a Design/ADR concern). A submission that **hangs** (no accept, no fail) **MUST** be cut by the per-attempt timeout and **MUST** then consume one retry attempt; a hang **after** accept **MUST NOT** consume the retry budget and **MUST NOT** be retried as a resubmit — it is recovered by §Intent Reconciliation Sweep. Exhausting the **step deadline** or the retry budget **MUST** mark the `FulfillmentTask` `failed` and enter the partial-failure policy (§Per-Line Progress Tracking). The **process deadline** is the overdue window of §Overdue Fulfillment Escalation: it **MUST NOT** by itself mark lines `failed` and **MUST NOT** auto-terminal the order. On exhausting attempts (permanent failure), compensation is **not** triggered directly by retry exhaustion. A wave-1 create failure (nothing resource-affecting) **MUST** be distinguishable in the manual-task reason from a wave-2 activation failure. Retry configuration (backoff curve, maximum attempts, timeout values) is a Design/ADR concern. Every retry attempt **MUST** be idempotent — a retried submission **MUST NOT** produce duplicate durable effects.
 
-**Caller-side duplicate protocol.** On a client-side timeout of a call that may have been accepted, Workflow **MUST** retry **with the same idempotency key**, then confirm the outcome by lookup (sweep / `SUB-O8`) — it **MUST NOT** infer success from silence. On a conflict or in-flight rejection (`SUB-O6`) it **MUST NOT** infer success: wait, retry the same key only if the original was not accepted, then confirm by lookup; supersede an accepted in-flight intent with `SUB-O7`. A duplicate success response **MUST** be absorbed (no double-advance of the `FulfillmentTask`). The idempotency key **MUST NOT** be reused as the process `correlationId`.
+**Caller-side duplicate protocol.** On a client-side timeout of a call that may have been accepted, Workflow **MUST** retry **with the same idempotency key**, then confirm the outcome by lookup (sweep / `SUB-O13`) — it **MUST NOT** infer success from silence. On a conflict or in-flight rejection (`SUB-O11`) it **MUST NOT** infer success: wait, retry the same key only if the original was not accepted, then confirm by lookup; supersede an accepted in-flight intent with its withdrawal (`SUB-O12`). A duplicate success response **MUST** be absorbed (no double-advance of the `FulfillmentTask`). The idempotency key **MUST NOT** be reused as the process `correlationId`.
 
 **Rationale**: The BSS→OSS provisioning path is distributed and transient failures are expected; unbounded retries waste resources while zero retries leave transient failures unresolved.
 
@@ -401,7 +410,7 @@ The retry budget applies to **intent-submission failures** (the call was not acc
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-workflow-fr-owf-dead-letter`
 
-Inbound Lifecycle triggers and Subscriptions/Payments/Generic-Approval callbacks that keep failing **MUST** have a finite delivery-count cap (value is a Design concern). Exhausting that cap **MUST** park the payload in an inspectable **dead-letter** record carrying `orderId`, `orderVersion`, process `correlationId`, the source event/callback id, and the last error — with an alert to the fulfillment-operator queue. A dead-letter **MUST NOT** be an order state. A fulfillment **step** that exhausts remediation already has its inspectable object: the manual task (remediation policy) or the tracked incident (fail-fast); that path **MUST NOT** grow a second object. A compensating action that keeps throwing **MUST** land on the same incident/manual-task path already required when compensation cannot complete (§6.4), not on a silent retry loop.
+Inbound Lifecycle triggers and Subscriptions/Payments/Generic-Approval callbacks that keep failing **MUST** have a finite delivery-count cap (value is a Design concern). Dead letters are the platform's (D-72, D-262): the inspectable dead-letter record of a delivery past that cap, its alert and its re-drive are the platform event-trigger path's, surfaced to this gear's operators through the platform's dead-letter operator visibility (UPSTREAM_REQS §2.9); until that lands, a dead-lettered trigger is visible only in the platform's trigger metrics, and a dead-lettered start trigger leaves the order in `submitted` with no instance and no manual task. Orders writes no dead-letter record. A dead-letter **MUST NOT** be an order state. A fulfillment **step** that exhausts remediation already has its inspectable object: the manual task (remediation policy) or the tracked incident (fail-fast); that path **MUST NOT** grow a second object. A compensating action that keeps throwing **MUST** land on the same incident/manual-task path already required when compensation cannot complete (§6.4), not on a silent retry loop.
 
 **Rationale**: Bounded retry ends one attempt chain; without a named destination, a poisoned redelivery or a compensation that never completes has nowhere inspectable to go.
 
@@ -411,7 +420,7 @@ Inbound Lifecycle triggers and Subscriptions/Payments/Generic-Approval callbacks
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-workflow-fr-owf-intent-sweep`
 
-Orders Workflow **MUST** run a background sweep that periodically re-reads the status of every non-terminal provisioning intent on an escalating schedule (intervals are a Design concern). The sweep **MUST** drive each such intent to a terminal confirmation or failure, or to the dead-letter path of §Dead-Letter Outcome. Fencing's "reconcile in-flight intents" **MUST** use this sweep as the discovery mechanism — waiting on a confirmation that never arrives is not reconciliation. After the idempotency-key lifetime has elapsed, the sweep **MUST** be **read-only**: it **MUST NOT** resubmit under an aged-out key; lookup is by process `correlationId` plus `orderId` + `orderVersion` + order-line reference and wave, or by the recorded transition-request identifier (upstream ask `SUB-O8`: status-read). A terminal failure found by the sweep **MUST** mark the `FulfillmentTask` `failed` and enter the partial-failure policy.
+Orders Workflow **MUST** run a background sweep that periodically re-reads the status of every non-terminal provisioning intent on an escalating schedule (intervals are a Design concern). The sweep **MUST** drive each such intent to a terminal confirmation or failure; an intent whose outcome is still unknown after the sweep budget becomes unresolved and raises a line manual task through the failure stage, never a dead letter (D-97, D-125, D-262). Fencing's "reconcile in-flight intents" **MUST** use this sweep as the discovery mechanism — waiting on a confirmation that never arrives is not reconciliation. After the idempotency-key lifetime has elapsed, the sweep **MUST** be **read-only**: it **MUST NOT** resubmit under an aged-out key; lookup is by `orderId` + `orderVersion` + order-line reference + wave + intent kind + wave attempt, or by the recorded transition-request identifier (`SUB-O13`: status read) — never by a subset, because after a rebuild the lapsed draft, its void and its successor share the first four. A terminal failure found by the sweep **MUST** mark the `FulfillmentTask` `failed` and enter the partial-failure policy. A read answering "no such transition request" **after** the key lifetime proves nothing — a delayed request may still execute — so Workflow **MUST NOT** infer that the intent was never dispatched: the intent stays unresolved on a manual task until a later read recovers its result or Subscriptions confirms that the scoped attempt was never applied and is closed against late requests. **Assumption pending owner agreement** (§14): Subscriptions provides that closed-attempt fence with a retained terminal lookup (`SUB-O17`).
 
 **Rationale**: Confirmation-driven design fails closed only if a confirmation eventually arrives; lost outcomes and client-side timeouts after accept leave the task neither activated nor failed.
 
@@ -431,7 +440,7 @@ Orders Workflow **MUST** enforce a configurable concurrency limit on parallel li
 
 - [ ] `p2` - **ID**: `cpt-cf-bss-orders-workflow-fr-owf-dependency-resilience`
 
-On transient unavailability of Orders Lifecycle, Subscriptions, or Payments, Orders Workflow **MUST** retry outbound calls with backoff within the affected step's retry budget. Unavailability of the Generic Approval service after it exists is **not** this retry-then-manual-task path: it **MUST** park with the order remaining in `submitted` per §6.2. That park **MUST NOT** suspend the Lifecycle `submitted` TTL; Workflow **MUST** escalate **before** the TTL elapses. The workflow **MUST NOT** lose the process across the outage and **MUST NOT** silently stall — on exhausting the retry budget (non-GA dependencies), the workflow **MUST** escalate the affected step to a manual task for operator remediation. Every outbound call **MUST** remain idempotent under retry.
+On transient unavailability of Orders Lifecycle, Subscriptions, or Payments, Orders Workflow **MUST** retry outbound calls with backoff within the affected step's retry budget. Unavailability of the approval policy owner behind the adapter, once the stand-in is replaced, is **not** this retry-then-manual-task path: it **MUST** park with the order remaining in `submitted` per §6.2. That park **MUST NOT** suspend the Lifecycle `submitted` TTL; Workflow **MUST** escalate **before** the TTL elapses. The workflow **MUST NOT** lose the process across the outage and **MUST NOT** silently stall — on exhausting the retry budget (non-GA dependencies), the workflow **MUST** escalate the affected step to a manual task for operator remediation. Every outbound call **MUST** remain idempotent under retry.
 
 **Rationale**: Distributed BSS dependencies experience transient failures; without resilient orchestration and explicit escalation on budget exhaustion, in-flight processes stall silently and block new commercial acquisitions.
 
@@ -441,7 +450,7 @@ On transient unavailability of Orders Lifecycle, Subscriptions, or Payments, Ord
 
 - [ ] `p2` - **ID**: `cpt-cf-bss-orders-workflow-fr-owf-task-queue`
 
-Orders Workflow **MUST** surface `FulfillmentTask` manual tasks **and** dead-letter records to fulfillment operators with the task assignment state, SLA countdown, order/line context, failure reason, correlation identifiers, and available resolution actions (retry, override, escalate). The queue **MUST** be scoped to the operator's seller tenancy; tasks outside the operator's seller scope **MUST NOT** be shown.
+Orders Workflow **MUST** surface `FulfillmentTask` manual tasks — and the platform's dead letters for this gear's triggers once the platform's dead-letter operator visibility lands, otherwise none (D-262) — to fulfillment operators with the task assignment state, SLA countdown, order/line context, failure reason, correlation identifiers, and available resolution actions (retry, override, escalate). The queue **MUST** be scoped to the operator's seller tenancy; tasks outside the operator's seller scope **MUST NOT** be shown.
 
 **Rationale**: Operators need a single surface to view and resolve failed fulfillment tasks within their scope; without a dedicated queue, manual tasks are invisible until SLA breach.
 
@@ -451,7 +460,7 @@ Orders Workflow **MUST** surface `FulfillmentTask` manual tasks **and** dead-let
 
 - [ ] `p2` - **ID**: `cpt-cf-bss-orders-workflow-fr-owf-overdue-escalation`
 
-When an order remains in `in_fulfillment` — or in `on_hold` taken from `in_fulfillment` — beyond a configurable overdue window (business default: **24 hours past expected fulfillment time**, Lifecycle PRD §6.3; named owner: fulfillment operator), Orders Workflow **MUST** raise an operational escalation (notify the fulfillment operator queue with order and step context). This window **is** the process-level deadline of §Retry with Bounded Attempts: exhausting it **MUST NOT** auto-terminal the order and **MUST NOT** by itself mark lines `failed`. The outcome is an incident / operator abort (workflow-mediated cancel if the operator so decides); the order remains non-terminal until operational compensation reaches a known outcome or the operator cancels. The same window **MUST** bound a stalled operational compensation. Expected fulfillment time is `max(now, latest service-activation date among lines)` — a future-dated line does not start this clock until that date. This is the escalation path referenced by the Lifecycle State Expiry contract: neither `in_fulfillment` nor holds taken from it are auto-expired by Orders Lifecycle.
+When an order remains in `in_fulfillment` — or in `on_hold` taken from `in_fulfillment` — beyond a configurable overdue window (business default: **24 hours past expected fulfillment time**, Lifecycle PRD §6.3; named owner: fulfillment operator), Orders Workflow **MUST** raise an operational escalation (notify the fulfillment operator queue with order and step context). This window **is** the process-level deadline of §Retry with Bounded Attempts: exhausting it **MUST NOT** auto-terminal the order and **MUST NOT** by itself mark lines `failed`. The escalation **MUST** be durable and raised once per order and window, routed to the fulfillment operator as its named owner, carrying the order, version, age and the unreconciled lines. The outcome is an incident / operator abort: a workflow-mediated cancel if the operator so decides, or, once the subscription-spawn signal is recorded and compensation cannot be completed, Orders Lifecycle's two-person operator-forced `fulfillment_failed` (Lifecycle D-182; handled per §Process Termination on Terminal Order Events). Orders Workflow's own principal **MUST NOT** hold the `order × force-fail-unreconciled` grant. Otherwise the order remains non-terminal until operational compensation reaches a known outcome or the operator cancels. The same window **MUST** bound a stalled operational compensation. Expected fulfillment time is `max(now, latest service-activation date among lines)` — a future-dated line does not start this clock until that date. This is the escalation path referenced by the Lifecycle State Expiry contract: neither `in_fulfillment` nor holds taken from it are auto-expired by Orders Lifecycle.
 
 **Rationale**: A subscription-spawn signal may already be in flight, so an automatic terminal transition is unsafe; operator escalation is the safe bounded-lifetime mechanism for `in_fulfillment`.
 
@@ -483,7 +492,7 @@ Every fulfillment step **MUST** be classified at design time as **compensable** 
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-workflow-fr-owf-compensation-execution`
 
-On order-level fulfillment failure (remediation exhausted or fail-fast policy per §6.3) or on an authorized workflow cancellation, Orders Workflow **MUST** compensate in reverse order of execution across **all** subscriptions created for the order — atomic fulfillment means no created subscription survives a failed or cancelled order. Compensation has **two legs**, matching two-phase fulfillment: **draft-void** for subscriptions still in `draft` (not resource-affecting, no billable facts); **activated-cancel** for subscriptions that have received an activation intent (via Subscriptions, never directly via OSS). Draft-void and activated-cancel **MUST** be submitted as provisioning intents under the identity and idempotency contract of §Provisioning Intent to Subscriptions. A draft that cannot be voided and an activated subscription that cannot be cancelled are distinct failures and **MUST** produce distinct manual-task reasons. After **operational** compensation, the Workflow **MUST** report the outcome to Orders Lifecycle and publish `OrderFulfillmentAborted`: for a fulfillment failure, acknowledge order → `fulfillment_failed`; for an authorized workflow cancellation, submit the workflow-mediated cancel with compensation evidence (order → `cancelled`, per the Lifecycle cancel-guard exception). Operational compensation **MUST NOT** wait on a Billing credit note — posted at-sale facts are reversed in the billing chain (Lifecycle §6.1). Under the remediation policy, the order **MAY** be held (`on_hold` + manual task) before the final outcome is declared. If a compensating action cannot be completed, the Workflow **MUST NOT** report the order as compensated: the order remains non-terminal, and the Workflow **MUST** create a manual task for the compensation failure and escalate until operational compensation reaches a known outcome (overdue SLA §6.3) — matching the Lifecycle invariant that `fulfillment_failed` presupposes completed operational compensation. **Cancellation fencing**: before reporting any compensated outcome, the Workflow **MUST** (1) stop dispatching new provisioning intents, (2) identify all intents already accepted by or in flight to Subscriptions, (3) wait for or reconcile their terminal outcomes — a late success is still a created subscription; the superseding action for an accepted in-flight intent is the Subscriptions cancel/void of that transition request, (4) compensate every created subscription including late successes (draft-void or activated-cancel per wave), and (5) verify that no active subscription remains. A `FulfillmentTask` is unilaterally cancellable until its **activation** intent is accepted by Subscriptions (Lifecycle spawn signal = first activation intent); acceptance of a draft-create intent does **not** close the unilateral-cancel window. From activation-intent acceptance onward the task **MUST** be reconciled to a terminal outcome before the order-level outcome is reported. Compensation **MUST NOT** exceed the step's declared compensating action.
+On order-level fulfillment failure (remediation exhausted, a typed line failure under the fail-fast policy, or the elapsed activation limit, per §6.3 — an unresolved activation refusal is never itself one, D-285, D-294, D-304) or on an authorized workflow cancellation, Orders Workflow **MUST** compensate in reverse order of execution across **all** subscriptions created for the order — atomic fulfillment means no created subscription survives a failed or cancelled order. Compensation has **two legs**, matching two-phase fulfillment: **draft-void** for subscriptions still in `draft` (not resource-affecting, no billable facts); **activated-cancel** for subscriptions that have received an activation intent (via Subscriptions, never directly via OSS). Draft-void and activated-cancel **MUST** be submitted as provisioning intents under the identity and idempotency contract of §Provisioning Intent to Subscriptions. A draft that cannot be voided and an activated subscription that cannot be cancelled are distinct failures and **MUST** produce distinct manual-task reasons. After **operational** compensation, the Workflow **MUST** report the outcome to Orders Lifecycle and publish `OrderFulfillmentAborted` carrying the retained obligations — every line's binding reference with what Workflow voided or cancelled, stating that it released no reservation, accepted binding or payment. `OrderFulfillmentAborted` **MUST** be published on **every** unwind, including a supersession, an order Lifecycle already holds terminal (an operator-forced failure included) and any unwind before fulfillment began, where no Lifecycle call is made: for a fulfillment failure, acknowledge order → `fulfillment_failed`; for an authorized workflow cancellation, submit the workflow-mediated cancel with compensation evidence (order → `cancelled`, per the Lifecycle cancel-guard exception). Operational compensation **MUST NOT** wait on a Billing credit note — posted at-sale facts are reversed in the billing chain (Lifecycle §6.1). Under the remediation policy, the order **MAY** be held (`on_hold` + manual task) before the final outcome is declared. If a compensating action cannot be completed, the Workflow **MUST NOT** report the order as compensated: the order remains non-terminal, and the Workflow **MUST** create a manual task for the compensation failure and escalate until operational compensation reaches a known outcome (overdue SLA §6.3) — matching the Lifecycle invariant that `fulfillment_failed` presupposes completed operational compensation. **Cancellation fencing**: before reporting any compensated outcome, the Workflow **MUST** (1) stop dispatching new provisioning intents, (2) identify all intents already accepted by or in flight to Subscriptions, (3) wait for or reconcile their terminal outcomes — a late success is still a created subscription; the superseding action for an accepted in-flight intent is the Subscriptions cancel/void of that transition request, (4) compensate every created subscription including late successes (draft-void or activated-cancel per wave), and (5) verify that no active subscription remains. A `FulfillmentTask` is unilaterally cancellable until its **activation** intent is accepted by Subscriptions (Lifecycle spawn signal = first activation intent); acceptance of a draft-create intent does **not** close the unilateral-cancel window. From activation-intent acceptance onward the task **MUST** be reconciled to a terminal outcome before the order-level outcome is reported. Compensation **MUST NOT** exceed the step's declared compensating action.
 
 **Rationale**: Partial provisioning without rollback leaves stranded resources billed to the customer; compensation via Subscriptions preserves the BSS boundary (R3) during rollback as well as forward execution. Two legs keep create-phase rollback cheap and name the expensive activation-phase path without making Billing a gate on order state.
 
@@ -493,7 +502,7 @@ On order-level fulfillment failure (remediation exhausted or fail-fast policy pe
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-workflow-fr-owf-manual-task`
 
-When a `FulfillmentTask` reaches `failed` **by any route** (retry exhaustion, failure confirmation, step-deadline expiry, sweep-discovered terminal failure, or any other entrance to `failed`) under the **remediation policy** (default), Orders Workflow **MUST** create exactly one actionable manual task for the fulfillment operator **before** any terminal outcome is declared. The manual task **MUST** carry: the order ID, line item reference, failure reason, SLA deadline, and available resolution actions (retry, override, escalate). Under the **fail-fast policy**, no actionable task is created — a retry task cannot be acted on once the order is terminal; instead the Workflow **MUST** record a tracked incident/audit entry for the failed line. Failure visibility **MUST** be 100%: every permanently failed line **MUST** produce a tracked record (actionable task or incident entry); zero silent failures are permitted.
+When a `FulfillmentTask` reaches `failed` **by any route** (retry exhaustion, failure confirmation, step-deadline expiry, sweep-discovered terminal failure, or any other entrance to `failed`) under the **remediation policy** (default), Orders Workflow **MUST** create exactly one actionable manual task for the fulfillment operator **before** any terminal outcome is declared. The manual task **MUST** carry: the order ID, line item reference, failure reason, SLA deadline, and available resolution actions (retry, override, escalate). Under the **fail-fast policy**, no actionable task is created — a retry task cannot be acted on once the order is terminal; instead the Workflow **MUST** record a tracked incident/audit entry for the failed line. The one exception is an activation refusal Workflow cannot classify — an unknown refusal code, a denial or an outage (D-285, D-290): under **either** policy it **MUST** create the line's actionable manual task, unless another line's failure ends the order in the same answer under either policy — a typed failure under fail-fast, or under either policy a draft found active without Workflow's activation or a verified expiry of the binding — in which case the line gets the incident entry (D-330), and the refusal is **never** itself an order-level failure — the task is never exhausted, and the line leaves only by a retry or a verified override that lands it, by an order cancel, by the failure unwind another line starts — its typed failure under fail-fast, its task exhausted under remediate, or its external activation or verified expiry under either policy (D-257, D-300, D-304, D-330) — or, once the order's activation limit has elapsed, by the order-binding-expired unwind, which cites the elapsed deadline, not the refusal (D-294). Under fail-fast a typed failure of any line ends the order at once — in the same answer as the unresolved refusal or while its task is open — and a line keeps **one** tracked object, never both: a line whose task is open keeps that task, which stays open until the process terminates, and gets no incident entry; a line refused in the same answer as the typed failure, which never got its task, gets the incident entry (D-300); under either policy, so does a line refused in the same answer as a failure that unwinds the order with no task (D-330). Failure visibility **MUST** be 100%: every permanently failed line **MUST** produce a tracked record (actionable task or incident entry); zero silent failures are permitted.
 
 **Rationale**: Untracked failures leave customers in limbo and prevent operator remediation; a manual task with SLA is the minimum operational contract for permanent failure.
 
@@ -520,9 +529,9 @@ The seam rules **R1–R5 are normatively owned by the Orders Lifecycle PRD §6.4
 Orders Workflow **MUST** comply with Lifecycle R1–R5. The Workflow-side execution consequences, in full:
 
 - **(R1)** All order state reads and transitions go through Orders Lifecycle via idempotent calls; Workflow's durable execution history is authoritative for process progress only (§6.1) and is never presented as order state.
-- **(R2)** Approval **execution** (routing, multi-party gates, escalation timers per §6.2) happens here via the Generic Approval service; the approval-**requirement** verdict is determined by that service (the policy owner) and reflected into Lifecycle — computed by neither Workflow nor Lifecycle.
+- **(R2)** Approval **execution** (routing, multi-party gates, escalation timers per §6.2) happens here via the approval policy adapter; the approval-**requirement** verdict is determined by the policy owner behind it and reflected into Lifecycle — computed by neither Workflow nor Lifecycle.
 - **(R3)** Subscription creation and activation intents go **only** to Subscriptions — for compensation as well as forward execution; OSS Provisioning is never invoked directly.
-- **(R4)** No price computation, derivation, or modification; the only price access is reading the stored non-authoritative resolved total **solely to include it in the `OrderApprovalRequest` context**; pricing references (`priceId`, `catalogPricePin`) are opaque pass-through identifiers.
+- **(R4)** No price computation, derivation, or modification; the only price access is reading the stored valuation figure — the TCV, or the figure for the basis the approval policy owner chooses (D-235) — (Rating-computed, Lifecycle-stored; D-198) **solely to include it in the `OrderApprovalRequest` context**; pricing references (`plan_revision_id`, `price_id`, the accepted `OrderPin`) are opaque pass-through identifiers.
 - **(R5)** Per-request status of downstream Subscriptions `TransitionRequest`s is never mirrored into order state; Workflow tracks its own execution progress (`FulfillmentTask`) instead.
 
 **Rationale**: Restating the seam rules in two documents is what produced the recurring divergences between the two reviews; single-home ownership with a by-reference binding eliminates the drift channel.
@@ -542,8 +551,8 @@ Orders Workflow **MUST** publish the following named process events with idempot
 | `OrderFulfillmentStarted` | Workflow begins executing the fulfillment plan for an approved order |
 | `OrderFulfillmentStepCompleted` | A single `FulfillmentTask` (order line) reaches `activated` or `failed` |
 | `OrderFulfillmentCompleted` | All lines are `activated`; order acknowledged `completed` (atomic fulfillment — no partial completion) |
-| `OrderFulfillmentAborted` | Order-level fulfillment failure or workflow cancellation: compensation of all created subscriptions complete; order acknowledged `fulfillment_failed` (failure) or cancelled via the workflow-mediated cancel (cancellation) |
-| `OrderApprovalRequested` | An `OrderApprovalRequest` is submitted to the Generic Approval service |
+| `OrderFulfillmentAborted` | Every unwind, with its `mode`: order-level fulfillment failure or workflow cancellation (compensation of all created subscriptions complete; order acknowledged `fulfillment_failed` or cancelled via the workflow-mediated cancel), supersession, and an order Lifecycle already holds terminal; carries the retained obligations Workflow did not release |
+| `OrderApprovalRequested` | An `OrderApprovalRequest` is submitted to the approval policy adapter |
 | `OrderApprovalEscalated` | An approval gate escalation timer fires without a decision |
 
 Orders Workflow **MUST NOT** publish order-**state** events — the state-event set is owned and enumerated exclusively by the Lifecycle PRD §6.5 (single home; this PRD deliberately does not repeat the list to prevent drift). Naming note: the state event `OrderFulfillmentFailed` is Lifecycle's, emitted on the `fulfillment_failed` transition; Workflow's corresponding process event is `OrderFulfillmentAborted`. Each process event payload **MUST** carry sufficient data for downstream consumers (audit, monitoring, operator UIs) to act without fetching back the full order record. Event envelope and delivery **MUST** follow the platform event standard per BSS manifest §6; concrete attributes and payload schema are defined in Design.
@@ -564,7 +573,7 @@ Every Orders Workflow operation **MUST** be authorized by the acting actor's rol
 - Fulfillment Operator **MAY** view the manual task queue within their seller scope; **MAY** submit task resolutions (retry, override, escalate); **MUST NOT** modify commercial order content.
 - Seller Operator **MAY** cancel a running workflow with compensation and **MAY** resolve or cancel manual tasks for orders within their seller scope, with every action recorded in the audit log; **MUST NOT** cancel or act on workflows for orders outside their seller scope; **MUST NOT** modify commercial order content.
 - Orders Lifecycle (system actor) **MAY** trigger Workflow on state events it emits; **MUST NOT** be impersonated by other actors.
-- Generic Approval service (system actor) **MAY** submit `OrderApprovalDecision` callbacks; **MUST NOT** drive order state transitions directly.
+- The approval policy owner behind the adapter (system actor) **MAY** submit `OrderApprovalDecision` callbacks; **MUST NOT** drive order state transitions directly.
 - Subscriptions (system actor) **MAY** deliver per-wave confirmation or failure events; **MUST NOT** drive order state transitions directly.
 - Payments (system actor) **MAY** return a payment-authorization outcome; **MUST NOT** drive order state transitions directly.
 
@@ -582,9 +591,9 @@ Every Orders Workflow operation **MUST** be authorized by the acting actor's rol
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-workflow-nfr-owf-durability`
 
-Zero in-flight workflows **MUST** be lost across service restarts. An order whose workflow has started but not reached a terminal state **MUST** be recoverable and continue execution after restart without re-triggering steps already durably completed. Committed process state — including the saga log, manual-task history, and approval-request tracking — **MUST** survive restarts with zero loss (business RPO: zero for committed steps); restoration expectations are business-level only and the implementation mechanism is a Design/ADR concern.
+Zero in-flight workflows **MUST** be lost across service restarts, except the dead-instance unwind below, which ends the order through cancel. An order whose workflow has started but not reached a terminal state **MUST** be recoverable and continue execution after restart without re-triggering steps already durably completed. **The dead-instance unwind** (D-262): an in-flight order whose platform execution has ended and cannot be re-driven **MUST** be raised as an order-scope manual task, and is either re-driven by the platform or, by a Seller Operator's decision, cancelled with compensation through the gear's own record; re-acquisition is then a new order, since a `cancelled` or `fulfillment_failed` order cannot be amended (Orders Lifecycle `01 §3.7`); this is a counted exception to "zero lost in-flight workflows", reported, and retired once the platform re-drive is confirmed. Committed process state — including the saga log, manual-task history, and approval-request tracking — **MUST** survive restarts with zero loss (business RPO: zero for committed steps); restoration expectations are business-level only and the implementation mechanism is a Design/ADR concern.
 
-**Threshold**: Zero lost in-flight workflows across restarts; zero loss for committed process state (business RPO zero for committed steps)
+**Threshold**: Zero lost in-flight workflows across restarts, except the counted dead-instance unwind; zero loss for committed process state (business RPO zero for committed steps)
 
 **Rationale**: An in-flight workflow represents an active commercial acquisition; losing it leaves the order in an indeterminate state with no recovery path. Committed process state (saga log, manual tasks) is the only reliable record of partial progress and must survive restarts to enable resumption and audit reconstruction.
 
@@ -592,7 +601,7 @@ Zero in-flight workflows **MUST** be lost across service restarts. An order whos
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-workflow-nfr-owf-idempotency`
 
-Zero duplicate durable effects **MUST** result from retried calls to Orders Lifecycle, Subscriptions, or the Generic Approval service. Every outbound call from Workflow **MUST** carry an idempotency key; duplicates **MUST** be absorbed by the target service per its own idempotency contract.
+Zero duplicate durable effects **MUST** result from retried calls to Orders Lifecycle, Subscriptions, or the approval policy adapter. Every outbound call from Workflow **MUST** carry an idempotency key; duplicates **MUST** be absorbed by the target service per its own idempotency contract.
 
 **Threshold**: Zero duplicate durable effects per idempotency key
 
@@ -642,7 +651,7 @@ The six named process events **MUST** be delivered to the platform event bus at 
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-workflow-nfr-owf-audit`
 
-100% of process state transitions (step start, step completion, retry, timeout, sweep, escalation, compensation, dead-letter) **MUST** be recorded in **this gear's** audit log with actor identity, timestamp, idempotency key, and process `correlationId`. Zero silent drops are permitted. Engine-side execution history **MUST NOT** be the audit SoR.
+100% of the process state transitions this gear makes (step start, step completion, retry, timeout, sweep, escalation, compensation) **MUST** be recorded in **this gear's** audit log with actor identity, timestamp, idempotency key, and process `correlationId`. Zero silent drops are permitted. A delivery the platform dead-letters never reaches a step operation, so no Orders audit row records it; the platform's record is the evidence (D-262). Engine-side execution history **MUST NOT** be the audit SoR.
 
 **Threshold**: 100% coverage in process audit log
 
@@ -672,7 +681,7 @@ The Orders Workflow orchestration control plane **MUST** meet the platform BSS a
 
 - [ ] `p2` - **ID**: `cpt-cf-bss-orders-workflow-nfr-owf-retention`
 
-Completed process records (this gear's saga log, process audit, dead-letter records, and manual-task history) **MUST** be retained per the platform audit policy **independently of** durable-execution engine history. Working baseline pending program-wide NFR workshop: default retention ≥ 400 days, configurable. The engine ADR **MUST** satisfy this floor; engine purge of run history **MUST NOT** erase the gear-owned audit record.
+Completed process records (this gear's saga log, process audit, and manual-task history) **MUST** be retained per the platform audit policy **independently of** durable-execution engine history. Working baseline pending program-wide NFR workshop: default retention ≥ 400 days, configurable. The engine ADR **MUST** satisfy this floor; engine purge of run history **MUST NOT** erase the gear-owned audit record.
 
 **Threshold**: Business-level retention aligned with platform audit policy; default ≥ 400 days, configurable (working baseline)
 
@@ -694,10 +703,10 @@ Completed process records (this gear's saga log, process audit, dead-letter reco
 | **Quality Vector** | **Show-Stopper Requirements** | **Rationale** |
 |--------------------|-------------------------------|---------------|
 | **Efficiency** | Every fulfillment step MUST be idempotent; independent order lines MAY execute in parallel within the configured concurrency and aggregate caps; fulfillment latency MUST meet the 15-minute p95 SLA for standard orders. | Unbounded parallelism saturates provisioning; caps plus throttle-honour keep the SLA measurable. |
-| **Reliability** | Zero in-flight workflows MUST be lost across restarts; zero duplicate durable effects MUST result from retried calls; 100% of permanently failed lines MUST produce a manual task. | An in-flight workflow is an active commercial acquisition; durability and idempotency are the baseline for financial-grade process execution. |
+| **Reliability** | Zero in-flight workflows MUST be lost across restarts, except the counted dead-instance unwind, which ends the order through cancel (§7.1); zero duplicate durable effects MUST result from retried calls; 100% of permanently failed lines MUST produce a manual task. | An in-flight workflow is an active commercial acquisition; durability and idempotency are the baseline for financial-grade process execution. |
 | **Performance** | Process events MUST be delivered at p95 < 30 s; fulfillment MUST complete at p95 ≤ 15 min for standard orders; escalation timers MUST fire within ± 5 min of the configured window. | Latency thresholds govern customer time-to-service and operator SLA compliance; missing them degrades the entire new-acquisition flow. |
-| **Security** | Every Workflow operation MUST be authorized by actor role and scope; system actors (Generic Approval service, Subscriptions) MUST NOT drive order state transitions directly; approval decisions MUST be submitted only by authorized approvers within their assigned scope. | Cross-actor privilege escalation in an orchestration layer can bypass commercial authorization gates and alter order outcomes without proper authorization. |
-| **Versatility** | Partial-failure policy MUST be configurable; escalation windows MUST be configurable per approval gate; fulfillment plan MUST support multi-line orders with inter-line dependencies; the process engine MUST remain agnostic to the number of approval gates and order line count. | The platform supports diverse commercial models and product topologies; the orchestration layer must accommodate varying complexity without bespoke workflow configurations. |
+| **Security** | Every Workflow operation MUST be authorized by actor role and scope; system actors (approval policy adapter, Subscriptions) MUST NOT drive order state transitions directly; approval decisions MUST be submitted only by authorized approvers within their assigned scope. | Cross-actor privilege escalation in an orchestration layer can bypass commercial authorization gates and alter order outcomes without proper authorization. |
+| **Versatility** | Partial-failure policy MUST be configurable; escalation windows MUST be configurable per approval gate; fulfillment plan MUST support multi-line orders whose lines are independent (D-196); the process engine MUST remain agnostic to the number of approval gates and order line count. | The platform supports diverse commercial models and plan compositions; the orchestration layer must accommodate varying complexity without bespoke workflow configurations. |
 
 ## 9. Public Library Interfaces
 
@@ -712,14 +721,14 @@ Completed process records (this gear's saga log, process audit, dead-letter reco
 | Operation | Description | Idempotency | Concurrency |
 |-----------|-------------|-------------|-------------|
 | Start workflow | Initiate order processing per the Workflow Start Contract (§6.1): obtain and reflect the approval-requirement verdict on `OrderSubmitted`; run approval execution when required; start fulfillment on `OrderApproved` | Idempotency key REQUIRED (order ID + version) | Only one active workflow per order ID at a time |
-| Query process progress | Retrieve current step status, `FulfillmentTask` states, approval-request state, pending manual tasks, dead-letter records, process `correlationId`, and definition version for an order | Read-only | — |
+| Query process progress | Retrieve current step status, `FulfillmentTask` states, approval-request state, pending manual tasks, the platform's dead letters for the order once the platform's dead-letter operator visibility lands (D-262), process `correlationId`, and definition version for an order | Read-only | — |
 | Resolve manual task | Fulfillment operator submits a resolution action (retry / override / escalate) for a specific failed `FulfillmentTask` | Idempotency key REQUIRED | Optimistic task-version check REQUIRED |
 | Retry failed step | Operator-driven retry of a permanently failed step (resets attempt counter per policy) | Idempotency key REQUIRED | — |
 | Cancel workflow with compensation | Cancel an in-progress workflow; trigger saga compensation for any completed steps | Idempotency key REQUIRED | Optimistic workflow-version check REQUIRED |
 
 **Breaking Change Policy**: Additive changes (new optional query fields, new resolution actions) are non-breaking. Removal or rename of operations or required fields requires a major version bump (defined in Design/ADR).
 
-**Stability**: unstable (pre-GA; expected to stabilize after co-review with Orders Lifecycle PRD and Generic Approval service spec).
+**Stability**: unstable (pre-GA; expected to stabilize after co-review with the Orders Lifecycle PRD and the approval policy adapter's library implementation).
 
 ### 9.2 External Integration Contracts
 
@@ -739,7 +748,7 @@ Completed process records (this gear's saga log, process audit, dead-letter reco
 
 **Direction**: Required by Orders Workflow (calls to Orders Lifecycle).
 
-**Description**: Orders Workflow MUST call Orders Lifecycle idempotently to drive state transitions (approval reflection, begin fulfillment, fulfillment acknowledgement, hold/resume). Every call MUST carry an idempotency key **and** the process `correlationId`. The begin-fulfillment call MUST be durably committed by Lifecycle before Workflow issues any subscription-spawn signal (first activation intent), and MUST be issued only after payment authorization and, where required, recorded buyer acceptance (Lifecycle §6.1/§9.1). Orders Lifecycle MUST absorb duplicate calls with the same key. A still-processing conflict MUST NOT be inferred as success (Lifecycle §6.1). The exact transition operations are defined in the Orders Lifecycle PRD §9.1.
+**Description**: Orders Workflow MUST call Orders Lifecycle idempotently to drive state transitions (approval reflection, begin fulfillment, spawn-signal report, fulfillment acknowledgement, workflow cancel; hold and resume are driven by Lifecycle's `OrderHeld`/`OrderResumed` events and the SDK `hold`/`resume` methods are reserved, D-204). Every call MUST carry an idempotency key **and** the process `correlationId`. The begin-fulfillment call MUST be durably committed by Lifecycle before Workflow reports the subscription-spawn signal (`report_spawn_signal`, a required call made once per order between the pre-activation re-check and the first activation dispatch) and issues the first activation intent, and MUST be issued only after payment authorization, where required recorded buyer acceptance (Lifecycle §6.1/§9.1), and a frozen fulfillment plan for the same `orderVersion` (§Fulfillment Plan Construction, D-206) — the one exception being the begin-fulfillment that precedes acknowledging an exhausted plan-level failure (D-92). Orders Lifecycle MUST absorb duplicate calls with the same key. A still-processing conflict MUST NOT be inferred as success (Lifecycle §6.1). The exact transition operations are defined in the Orders Lifecycle PRD §9.1.
 
 **Compatibility**: Governed by the Orders Lifecycle PRD breaking change policy.
 
@@ -749,7 +758,7 @@ Completed process records (this gear's saga log, process audit, dead-letter reco
 
 **Direction**: Required by Orders Workflow (intents to Subscriptions).
 
-**Description**: Orders Workflow MUST submit per-line intents to Subscriptions in two waves (draft-create, then activation after expected fulfillment time — Lifecycle PRD §6.1) and MUST consume the resulting confirmation or failure events. Compensating draft-void and activated-cancel intents use the same contract. A failure confirmation MUST advance the matching `FulfillmentTask` to `failed` and enter the partial-failure policy. Each intent MUST carry `orderId`, `orderVersion`, `orderLineId`, wave, an opaque caller-owned binding reference, and an idempotency key derived from `orderId`, `orderVersion`, line item reference, **and wave**, plus the process `correlationId` (distinct from the key). Confirmations and failure events MUST echo `orderId`, `orderVersion`, `orderLineId`, wave, the `correlationId`, and the opaque binding reference. Workflow REQUIRES a status-read of a non-terminal intent by transition-request id or by `orderId` + `orderVersion` + order-line + wave (`SUB-O8`), and REQUIRES `correlationId` to be propagated on the Subscriptions → Policy Engine → OSS path (`SUB-O9`). Payload shape and event envelope are defined in Design and the Subscriptions PRD.
+**Description**: Orders Workflow MUST submit per-line intents to Subscriptions in two waves (draft-create, then activation after expected fulfillment time — Lifecycle PRD §6.1) and MUST consume the resulting confirmation or failure events. Compensating draft-void and activated-cancel intents use the same contract. A failure confirmation MUST advance the matching `FulfillmentTask` to `failed` and enter the partial-failure policy. Each intent MUST carry `orderId`, `orderVersion`, `orderLineId`, wave, an opaque caller-owned binding reference, and the intent idempotency key of §6.3 *Provisioning Intent to Subscriptions* (tenant-prefixed, with its optional attempt tails), plus the process `correlationId` (distinct from the key). Confirmations and failure events MUST echo `orderId`, `orderVersion`, `orderLineId`, wave, the `correlationId`, and the opaque binding reference. Workflow REQUIRES a status-read of a non-terminal intent by transition-request id or by `orderId` + `orderVersion` + order-line + wave + intent kind + wave attempt, plus the compensation attempt on a compensating intent (`SUB-O13`), a closed-attempt fence with retained terminal lookup (`SUB-O17`, assumed), a successor draft that keeps its predecessor's acquisition (`SUB-O18`, assumed), and REQUIRES `correlationId` to be propagated on the Subscriptions → Policy Engine → OSS path (`SUB-O14`). An activation intent carries **no start instant**: Subscriptions stamps the start at the `activate` commit, and Workflow dispatches activation only at expected fulfillment time, so nothing is backdated (`SUB-O10` as reshaped). The line's add-ons, term, auto-renewal flag and co-term date are not copied into the intent: Subscriptions resolves them at `create` from the order version the intent references (D-209). The Subscriptions counterpart is its `contract-orders-intents` (Subscriptions PR #5131, pending merge); payload shape and event envelope are defined in Design and the Subscriptions PRD.
 
 **Compatibility**: Governed by the Subscriptions PRD breaking change policy.
 
@@ -757,11 +766,11 @@ Completed process records (this gear's saga log, process audit, dead-letter reco
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-workflow-contract-owf-approval-contract`
 
-**Direction**: Required by Orders Workflow (expectations toward the Generic Approval service).
+**Direction**: Required by Orders Workflow (expectations toward the approval policy adapter).
 
-**Description**: Orders Workflow REQUIRES the Generic Approval service to satisfy the following expectations contract: (a) accept an `OrderApprovalRequest` carrying order context (including the named TCV figure of the stored resolved total), gate identifier, idempotency key, and process `correlationId`; (b) evaluate the approval requirement and thresholds per its policy configuration and support multi-party gates; (c) accept and route the escalation command issued by Orders Workflow on timer expiry (escalation timers are owned by Workflow, §6.2); (d) return an `OrderApprovalDecision` (approved/rejected) with a reason, echoing the `correlationId`; (e) be idempotent by request key; (f) answer the approval-**requirement** verdict query keyed on `orderId` + `orderVersion`, cacheable per version. Until the service exists, a stand-in behind this same contract **MUST** return `approval not required` (audited). The Generic Approval service has no canonical spec today (see §15 Open Questions and §16 Risks); this expectations contract is the normative interface until that spec exists.
+**Description**: Orders Workflow REQUIRES the approval policy adapter to satisfy the following expectations contract: (a) accept an `OrderApprovalRequest` carrying order context (including the stored valuation for the policy owner's chosen basis, with currency, term and provenance, or `unavailable`), the named-user condition with the gate's generation, gate identifier, idempotency key, and process `correlationId`; (b) evaluate the approval requirement and thresholds per its policy configuration and support multi-party gates; (c) accept and route the escalation command issued by Orders Workflow on timer expiry (escalation timers are owned by Workflow, §6.2); (d) return an `OrderApprovalDecision` (approved/rejected) with a reason, echoing the `correlationId`; (e) be idempotent by request key for the request's acceptance — a re-submit under the same key is absorbed and never changes the condition, which only (k) does; (f) answer the approval-**requirement** verdict query keyed on `orderId` + `orderVersion`, cacheable per version; (g) name, with the routing configuration, the valuation basis and the named approver per gate; (h) refuse a decision from a subject outside the condition or under a stale generation; (i) refuse a decision from the creator, the submitter or the amender of the gated version (separation of duties, Lifecycle D-130; this gear refuses it locally at the decision endpoint, D-56 as amended by D-267); (j) withdraw a held request by its request key when this gear cancels the gate (D-266); (k) re-condition a held request on a new named-user condition at a new gate generation when this gear reassigns the gate, idempotent per (request key, generation), the generation mapped onto the implementation's own and a withdrawn predecessor never answered by the key lookup (D-282, D-286). Clauses (g) and (h) on the library implementation are an assumption pending owner agreement (§14). Until the service exists, a stand-in behind this same contract **MUST** return `approval not required` (audited), except for a seller that declares approval required (`approval_required`), whose orders it **MUST** leave unobtainable so they park, never exempted (D-265). The approval policy adapter has no canonical spec today (see §15 Open Questions and §16 Risks); this expectations contract is the normative interface until that spec exists.
 
-**Compatibility**: To be governed by the Generic Approval service PRD when authored.
+**Compatibility**: Governed by this gear's design (`DECISIONS.md` D-197, Q-14); the embedded library's own contract governs the library implementation.
 
 ## 10. Use Cases
 
@@ -771,14 +780,14 @@ Completed process records (this gear's saga log, process audit, dead-letter reco
 
 **Actor**: `cpt-cf-bss-orders-workflow-actor-owf-approver`
 
-**Preconditions**: An order has been submitted (`OrderSubmitted`); approval routing configuration exists in the Generic Approval service (or the §9.2 stand-in is in use).
+**Preconditions**: An order has been submitted (`OrderSubmitted`); approval routing configuration exists in the approval policy adapter (or the §9.2 stand-in is in use).
 
 **Main Flow**:
 1. On `OrderSubmitted`, Workflow obtains the approval-requirement verdict (keyed on `orderId` + `orderVersion`) and reflects `submitted → pending_approval`.
-2. Orders Workflow creates an `OrderApprovalRequest` and submits it to the Generic Approval service; publishes `OrderApprovalRequested`.
+2. Orders Workflow creates an `OrderApprovalRequest` and submits it to the approval policy adapter; publishes `OrderApprovalRequested`.
 3. Workflow starts a durable escalation timer (default 72 h) for the gate.
 4. Approver receives notification and submits an `approved` decision.
-5. Generic Approval service delivers `OrderApprovalDecision(approved)` to Workflow.
+5. The approval policy adapter delivers `OrderApprovalDecision(approved)` to Workflow.
 6. Workflow calls Orders Lifecycle to reflect `pending_approval → approved`.
 7. Escalation timer is cancelled; Workflow proceeds to fulfillment.
 
@@ -797,14 +806,17 @@ Completed process records (this gear's saga log, process audit, dead-letter reco
 **Preconditions**: Order is in `approved` state with two independent line items; payment authorization has succeeded (or tolerate-failure is configured); recorded buyer acceptance is present where required.
 
 **Main Flow**:
-1. Workflow calls the Orders Lifecycle begin-fulfillment operation (`approved → in_fulfillment`, durably committed before any intent; preconditions per Lifecycle §6.1/§9.1); publishes `OrderFulfillmentStarted`.
-2. Two `FulfillmentTask` instances created (one per line); both start in `pending`.
+1. Workflow builds the fulfillment plan while the order is still `approved`: two `FulfillmentTask` instances (one per line), both in `pending`; the expected fulfillment time is before the earliest accepted-binding activation deadline, so the plan freezes (D-206).
+2. Workflow calls the Orders Lifecycle begin-fulfillment operation (`approved → in_fulfillment`, durably committed before any intent; preconditions per Lifecycle §6.1/§9.1); publishes `OrderFulfillmentStarted`.
 3. Wave 1: Workflow submits two parallel draft-create intents to Subscriptions (idempotency key per line **and wave**); both create confirmations arrive; each task advances to `draft_created` (no `OrderFulfillmentStepCompleted`).
 4. Wave-1 barrier: after every create has succeeded **and expected fulfillment time has been reached**, Workflow submits two parallel activation intents (wave 2). Mixed line dates wait for `max(now, latest service-activation date)` — no line is activated early.
 5. Both activation confirmations arrive; each `FulfillmentTask` advances to `activated`; `OrderFulfillmentStepCompleted` published for each.
 6. All lines `activated`; Workflow calls Orders Lifecycle to acknowledge `in_fulfillment → completed`, passing the resulting subscription identifiers (persisted on the order per the Lifecycle contract); publishes `OrderFulfillmentCompleted`.
 
 **Postconditions**: Order is `completed`; subscriptions exist for both lines; audit records all steps.
+
+**Alternative Flows**:
+- **1a. Accepted binding expires before the plan can activate**: the expected fulfillment time is at or after the earliest activation deadline, so the plan does not freeze (reason `order-binding-expired`). Begin-fulfillment is **not** called; the order stays `approved` and Workflow opens a plan-level manual task under either partial-failure policy. A Seller Operator amends the order and the new version is processed from the start; if the task is exhausted instead, Workflow calls begin-fulfillment and acknowledges `in_fulfillment → fulfillment_failed` with `order-binding-expired`, with nothing to compensate (D-92).
 
 ### UC-003 — Partial Failure With Compensation and Manual Task
 
@@ -824,7 +836,7 @@ Completed process records (this gear's saga log, process audit, dead-letter reco
 **Postconditions**: Order in `completed` state with both subscriptions active and linked on the order record; manual task resolved within SLA.
 
 **Alternative Flows**:
-- **Remediation fails (operator escalates/aborts, or fail-fast policy)**: Workflow compensates in reverse order — voids remaining drafts and cancels/deprovisions via Subscriptions every activated subscription of this order, including activated Line 1 — then acknowledges the failure outcome: Lifecycle transitions `in_fulfillment → fulfillment_failed` (and publishes the state event `OrderFulfillmentFailed`); Workflow publishes `OrderFulfillmentAborted`.
+- **Remediation fails (remediation exhausted, a typed failure under the fail-fast policy, or the order's activation limit elapsed; an unresolved activation refusal is never itself the failure, D-285, D-294, D-304)**: Workflow compensates in reverse order — voids remaining drafts and cancels/deprovisions via Subscriptions every activated subscription of this order, including activated Line 1 — then acknowledges the failure outcome: Lifecycle transitions `in_fulfillment → fulfillment_failed` (and publishes the state event `OrderFulfillmentFailed`); Workflow publishes `OrderFulfillmentAborted`.
 
 ### UC-004 — Cancel During Fulfillment With Rollback
 
@@ -867,20 +879,27 @@ Completed process records (this gear's saga log, process audit, dead-letter reco
 - **Then** the system **MUST** reflect `submitted → approved`
 - **And** **MUST NOT** create an `OrderApprovalRequest`
 
-**0b. Generic Approval service unavailable after it exists**
-- **Given** the Generic Approval service exists and is unavailable
+**0b. Approval policy owner unavailable once the stand-in is replaced**
+- **Given** the library adapter is in place and its policy owner is unavailable
 - **When** Orders Workflow cannot obtain the requirement verdict for a submitted order
 - **Then** the process **MUST** park with the order remaining in `submitted`
 - **And** **MUST NOT** fail-open to `approved`
 - **And** the park **MUST NOT** suspend the Lifecycle `submitted` TTL
 - **And** Workflow **MUST** escalate to the operator queue **before** that TTL elapses
 
-Until the Generic Approval service exists, criteria **1–4a** (including **2a**) are **deferred** (the stand-in returns `approval not required`; those paths are unreachable). Criteria **0, 0a, 0b** apply now.
+**0c. A seller that declares approval required, while the stand-in is bound**
+- **Given** the stand-in is the bound approval policy adapter and the order's seller declares `approval_required = true`
+- **When** Orders Workflow asks for the requirement verdict of a submitted order of that seller
+- **Then** the process **MUST** park with reason `approval-adapter-not-bound`, the order remaining in `submitted`
+- **And** **MUST NOT** record `approval not required` or fail-open to `approved`
+- **And** the park **MUST NOT** suspend the Lifecycle `submitted` TTL, and Workflow **MUST** escalate it to the operator queue **before** that TTL elapses, per order (D-265)
+
+Until the library adapter replaces the stand-in, criteria **0b** and **1–4a** (including **2a**) are **deferred** (the stand-in returns `approval not required` for every seller that does not declare approval required; the gate paths are unreachable, and 0b's precondition — an adapter whose policy owner can be unavailable — does not yet exist). Criteria **0**, **0a** and **0c** apply now: **0c** is the fail-closed park of **0b** reached through the stand-in, live in phase 1 (D-265, D-281).
 
 **1. Multi-party gate routing**
 - **Given** an order whose requirement verdict has been reflected to `pending_approval` with a two-party approval gate configured
 - **When** Orders Workflow picks up the order
-- **Then** the system **MUST** create one `OrderApprovalRequest` per gate party and submit each to the Generic Approval service
+- **Then** the system **MUST** create one `OrderApprovalRequest` per gate party and submit each to the approval policy adapter
 - **And** `OrderApprovalRequested` **MUST** be published for each submission
 - **And** the order **MUST NOT** transition to `approved` until all gate parties have submitted approved decisions
 
@@ -888,11 +907,11 @@ Until the Generic Approval service exists, criteria **1–4a** (including **2a**
 - **Given** an open approval gate with default 72-hour escalation window
 - **When** 72 hours elapse without an `OrderApprovalDecision` for that gate
 - **Then** the system **MUST** publish `OrderApprovalEscalated`
-- **And** the escalation notification **MUST** be sent to the configured escalation path via the Generic Approval service
+- **And** the escalation notification **MUST** be sent to the configured escalation path via the approval policy adapter
 - **And** the approval gate **MUST** remain open (not auto-rejected)
 
 **2a. Approval-service outage during an already-open gate**
-- **Given** a gate is open and the Generic Approval service becomes unavailable
+- **Given** a gate is open and the approval policy owner behind the adapter becomes unavailable
 - **When** the outage persists
 - **Then** the escalation timer for that gate **MUST** pause (the window **MUST NOT** burn)
 - **And** if the outage exceeds the configured threshold the process **MUST** escalate to the operator queue without calling the unavailable service
@@ -906,7 +925,7 @@ Until the Generic Approval service exists, criteria **1–4a** (including **2a**
 
 **4. Approval rejected**
 - **Given** an order in `pending_approval` state
-- **When** the Generic Approval service delivers an `OrderApprovalDecision(rejected)` to Workflow
+- **When** the approval policy adapter delivers an `OrderApprovalDecision(rejected)` to Workflow
 - **Then** the system **MUST** call Orders Lifecycle to reflect `pending_approval → rejected`
 - **And** the process **MUST** terminate; no fulfillment steps **MUST** begin
 
@@ -914,15 +933,29 @@ Until the Generic Approval service exists, criteria **1–4a** (including **2a**
 - **Given** a pending `OrderApprovalRequest` assigned to Approver A's gate
 - **When** Approver A opens the Approver Inbox
 - **Then** the request **MUST** appear with order context, requesting party, gate identifier, and escalation SLA countdown
-- **And** Approver A **MUST** be able to submit an approve or reject decision with a reason
+- **And** Approver A **MUST** be able to submit an approve or reject decision with a reason; a reassignment or cancellation that commits while A's decision is forwarded answers A `stale-generation` or `gate-not-open` (409), and a reassignment racing the decision on the approval unit itself (`Contended`) answers `version-mismatch` (409), retried under the same key — never an unmapped error (D-318, D-323)
 - **And** requests assigned to gates outside Approver A's scope **MUST NOT** be listed in the inbox
+
+**4b. Only the named approver decides, under the current generation**
+- **Given** an order-approval gate whose named-user condition names Approver A at generation 1
+- **When** Approver B, who holds a general approval permission, submits a decision
+- **Then** the system **MUST** refuse it before the decision reaches the library: the inbox decision route answers `not-found` (the gate is outside B's assignment, which the route does not disclose), and, once the common inbox's source adapter exists (`cpt-cf-bss-orders-workflow-upreq-approval-named-user-criterion`), B reaching the gate through it is refused `not-assignee` (403) — until then no path reaches that guard (D-323), and the guard stays as a second check in front of the library once the library carries the named-user criterion, whose own typed refusal of B also answers `not-assignee` (403) (D-332); that route is the only path to the library's approve and reject, so `record-decision`'s recorded `not-assignee` is a consistency check (D-282, D-318)
+- **When** the gate is reassigned to Approver C, raising the generation to 2, and Approver A's decision naming generation 1 arrives
+- **Then** the system **MUST** refuse it: the inbox decision route answers `not-found` (A is no longer the assignee), and `record-decision`'s assignee guard, which precedes its generation guard, would refuse it `not-assignee` (D-286, D-318); the subject that reassigned the gate **MUST NOT** gain approval authority by doing so, nor assign the gate to itself (`self-assignment-barred`, D-266)
+- **When** the gate is reassigned from A to C and back to A, raising the generation to 3, and Approver A's decision naming generation 1 arrives — a decision not yet captured, since a reassignment that meets a captured decision not yet recorded is refused `gate-not-open` (D-308)
+- **Then** the inbox decision route **MUST** refuse it with `stale-generation` (409) before forwarding it: A is the assignee again, but the decision was made under a condition the reassignments changed; `record-decision`'s generation guard remains a consistency check (D-286, D-308, D-318)
+- **And** Approver A **MUST** then be able to decide at generation 3: the decision's key carries the generation, so it is a new key, not an `idempotency-key-conflict` (D-308)
+- **When** `record-decision` nevertheless refuses a decision the library has already applied — reachable only by a defect, since the inbox route applies the same guards first
+- **Then** the gate **MUST NOT** wedge: the divergence is counted and pages (`approval-unit-divergence`), the gate's escalation window keeps running and escalates on its existing path, and a reassignment commits on a fresh approval unit instead of being refused `gate-not-open` (D-318)
+- **And** a gate whose named approver is missing or ineligible **MUST** park the order as `assignee-unresolved`, never approve it
 
 ### Fulfillment Orchestration
 
-**5. Flat fulfillment roster**
-- **Given** a committed order version with two captured lines
+**5. Flat fulfillment roster without inter-line ordering** (D-196, Lifecycle D-172)
+- **Given** a committed order version with two captured lines A and B
 - **When** all creates are confirmed and the latest requested activation date has been reached
-- **Then** both activation intents may proceed within the concurrency cap, without a dependency DAG
+- **Then** the system **MUST** submit an activation intent for every line the barrier released, without a dependency DAG, and no line waits on another line's activation
+- **And** lines **MAY** proceed in parallel, subject to the configured concurrency cap
 - **And** each line produces one distinct subscription; completion requires both applied outcomes
 - **And** historical `dependency-graph-invalid` decodes but is never emitted by current execution
 
@@ -949,9 +982,17 @@ Until the Generic Approval service exists, criteria **1–4a** (including **2a**
 **5d. Draft rebuild before activation, any cause**
 - **Given** wave-1 drafts were auto-voided before the activation intent (hold, draft TTL during the date wait, or any other cause)
 - **When** Workflow is about to dispatch an activation intent
-- **Then** the system **MUST** re-read that the target subscription is still in `draft`
-- **And** if it is voided, **MUST** rebuild the fulfillment plan (re-run wave 1) against the same frozen `orderId` + `orderVersion`
+- **Then** the system **MUST** re-read the target subscription
+- **And** if the read **observes** it voided, **MUST** record the draft as created-then-lapsed (a historical success, never a failed create) and rebuild that line's draft (re-run wave 1) against the same frozen `orderId` + `orderVersion`
+- **And** the successor **MUST** name its predecessor, and **MUST** be created on the observed void alone — never on a new key or attempt, and never on an unevaluable read
 - **And** **MUST NOT** dispatch an activation intent against a voided draft
+
+**5g. A draft found active is never rebuilt**
+- **Given** wave 2 is about to activate a line
+- **When** the re-read finds the line's subscription already active
+- **Then** the system **MUST NOT** rebuild the line
+- **And** if Workflow's own activation intent for the line exists, **MUST** recover the line through it
+- **And** otherwise **MUST** fail the order under either partial-failure policy with reason `draft-activated-externally`, and compensation **MUST** cancel that subscription with the others
 
 **6. Draft-create confirmation advances to draft_created**
 - **Given** a draft-create intent has been submitted to Subscriptions for order line L
@@ -973,12 +1014,23 @@ Until the Generic Approval service exists, criteria **1–4a** (including **2a**
 - **And** `OrderFulfillmentStepCompleted` **MUST** be published
 - **And** the partial-failure policy **MUST** apply (retry budget is for submission failures, not this path)
 
-**6b. Payment authorization pending vs failed**
+**6b. Financial readiness: four answers, two permissions**
 - **Given** an order in `approved` state
-- **When** payment authorization is pending
+- **When** financial readiness is `pending`
 - **Then** the system **MUST NOT** call begin-fulfillment
-- **When** payment authorization fails and tolerate-failure is not configured
-- **Then** the system **MUST NOT** call begin-fulfillment and the order **MUST** remain `approved`
+- **When** readiness is `refused` and tolerate-failure is not configured
+- **Then** the system **MUST** pass the failed outcome to begin-fulfillment, Lifecycle **MUST** refuse it, the refusal **MUST** be recorded as `withheld`, and the order **MUST** remain `approved` (D-89)
+- **When** readiness is `not-required` or `satisfied`
+- **Then** the system **MUST** proceed to begin-fulfillment without inventing a payment step
+- **And** immediately before the first activation the system **MUST** re-read readiness, whatever the provider, and abort on a new refusal, even where a process-level failure was tolerated at begin-fulfillment
+- **And** the same payment failure that Lifecycle tolerated at begin-fulfillment **MUST** proceed, as the seller's accepted risk, unless a re-read since begin-fulfillment has observed `satisfied` — a failure after that is a revocation and **MUST** abort (D-284) — and an authorization the re-read confirms **MUST NOT** abort for its age (D-250)
+
+**6d. Payment wait expiry**
+- **Given** an order whose readiness has stayed `pending` past the seller's payment wait
+- **When** the next evaluation runs
+- **Then** the system **MUST** take the seller's expiry action exactly once: request Lifecycle's pre-fulfillment cancel (`request-cancel`) or raise one order-scope `payment-wait-expired` review task (`manual-review`)
+- **And** where Lifecycle offers no pre-fulfillment cancel, `request-cancel` **MUST** fall back to the review task
+- **And** the system **MUST** keep re-reading readiness, so a late `satisfied` still proceeds to begin-fulfillment, and **MUST NOT** record any financial consequence
 
 **5e. Start contract includes hold and resume**
 - **Given** an active process
@@ -993,17 +1045,18 @@ Until the Generic Approval service exists, criteria **1–4a** (including **2a**
 - **And** `OrderAcceptanceRecorded` **MUST** be in the start-contract trigger list
 
 **7. Provisioning intent idempotency**
-- **Given** a wave intent for line L submitted with idempotency key `K` derived from order ID, line item reference, **and wave**
+- **Given** a wave intent for line L submitted with the intent idempotency key `K` of §6.3 (tenant-prefixed: order ID, order version, line item reference, wave and command kind, with the optional forward and compensation attempt tails)
 - **When** the intent is retried with the same key `K`
 - **Then** no duplicate subscription **MUST** be created
 - **And** Subscriptions **MUST** absorb the duplicate and return the same response
 - **And** a draft-create key **MUST NOT** collide with an activation key for the same line
+- **And** a rebuilt successor's draft-create key **MUST NOT** collide with its voided predecessor's
 
 **7a. Submission retry is mandatory; in-flight is not a resubmit**
 - **Given** a wave-intent submission fails transiently and retry budget remains
 - **When** the submission is not accepted by Subscriptions
 - **Then** the system **MUST** retry that submission with backoff within the bound
-- **And** an intent already accepted and in flight **MUST NOT** be retried as a resubmit (in-flight rejection `SUB-O6`; supersede by cancel/void `SUB-O7`)
+- **And** an intent already accepted and in flight **MUST NOT** be retried as a resubmit (in-flight rejection `SUB-O11`; supersede by withdrawal `SUB-O12`)
 
 **7b. Step timeout is distinct from retry budget; process deadline does not fail lines**
 - **Given** a wave-intent submission that hangs with no accept and no fail
@@ -1016,17 +1069,19 @@ Until the Generic Approval service exists, criteria **1–4a** (including **2a**
 **7c. Dead-letter on delivery-count cap**
 - **Given** an inbound trigger or callback that keeps failing
 - **When** the delivery-count cap is exhausted
-- **Then** an inspectable dead-letter record **MUST** exist with `orderId`, `orderVersion`, process `correlationId`, source id, and last error
-- **And** the fulfillment-operator queue **MUST** be alerted
+- **Then** the platform event-trigger path **MUST** hold the dead letter, its alert and its re-drive, and Orders **MUST NOT** write a dead-letter record (D-72, D-262)
+- **And** once the platform's dead-letter operator visibility lands, the dead letter **MUST** be visible to this gear's operators with `orderId`, `orderVersion`, source id and last error
 - **And** the order state **MUST NOT** change solely because of the dead-letter
 
 **7d. Sweep recovers unknown intent outcomes**
 - **Given** a provisioning intent accepted by Subscriptions with no confirmation or failure yet
 - **When** the reconciliation sweep runs
-- **Then** the system **MUST** re-read intent status (`SUB-O8`)
+- **Then** the system **MUST** re-read intent status (`SUB-O13`)
 - **And** after the idempotency-key lifetime the sweep **MUST NOT** resubmit under that key
+- **And** a "no such transition request" answer after the key lifetime **MUST NOT** be read as never dispatched: the intent stays unresolved on a manual task until a later read recovers its result or Subscriptions confirms non-application through its closed-attempt fence (`SUB-O17`)
+- **And** the lookup **MUST** use the full tuple — order, version, line, wave, intent kind and wave attempt, plus the compensation attempt on a compensating intent — or the transition-request identifier
 - **And** a terminal failure found by the sweep **MUST** mark the task `failed` and enter the partial-failure policy
-- **And** an outcome still unknown after the sweep budget **MUST** take the dead-letter path
+- **And** an outcome still unknown after the sweep budget **MUST** become unresolved and raise a line manual task through the failure stage, never a dead letter (D-262)
 
 **7e. Throttle does not consume retry budget**
 - **Given** Subscriptions (or the provisioning path) returns a throttle / `Retry-After` signal
@@ -1059,6 +1114,12 @@ Until the Generic Approval service exists, criteria **1–4a** (including **2a**
 - **When** Subscriptions emits the matching confirmation or failure
 - **Then** the event **MUST** echo `orderId`, `orderVersion`, `orderLineId`, wave, process `correlationId`, and the opaque caller-owned binding reference
 
+**7j. A compensation-task retry presents the leg under a new key**
+- **Given** a compensating intent (draft-void or activated-cancel) that Subscriptions settled terminal `failed` under key `K`
+- **When** an operator retries the leg's compensation task
+- **Then** the leg **MUST** be submitted under a new key `K'` carrying the next compensation attempt tail (`+c{comp_attempt}`), never re-presented under `K`
+- **And** a compensation pass or a platform retry **MUST NOT** mint a new compensation attempt (D-258, D-280)
+
 **8. All lines activated → order completes (atomic)**
 - **Given** all `FulfillmentTask` instances for the order reach `activated`
 - **When** the last task reaches `activated`
@@ -1070,7 +1131,7 @@ Until the Generic Approval service exists, criteria **1–4a** (including **2a**
 - **Given** a manual task exists for a permanently failed line within Operator O's seller scope
 - **When** Operator O opens the Task Queue
 - **Then** the task **MUST** appear with SLA countdown, order/line context, failure reason, correlation identifiers, and the available resolution actions (retry, override, escalate)
-- **And** a dead-letter record in the same seller scope **MUST** likewise appear
+- **And** once the platform's dead-letter operator visibility lands, a platform dead letter for this gear's trigger in the same seller scope **MUST** likewise appear; until then the queue is silent on dead letters (D-262)
 - **And** tasks outside Operator O's seller scope **MUST NOT** be listed in the queue
 
 ### Saga and Compensation
@@ -1078,9 +1139,15 @@ Until the Generic Approval service exists, criteria **1–4a** (including **2a**
 **9. Permanent failure triggers compensation**
 - **Given** a `FulfillmentTask` reaches `failed` by any route
 - **When** the step is marked permanently failed
-- **Then** the system **MUST** create exactly one actionable manual task for the fulfillment operator (remediation policy, default) or record a tracked incident entry and proceed directly to order-level failure (fail-fast policy)
+- **Then** the system **MUST** create exactly one actionable manual task for the fulfillment operator (remediation policy, default) or record a tracked incident entry and proceed directly to order-level failure (fail-fast policy) — except for an activation refusal with an unknown code, a denial or an outage (`refusal_kind = unresolved`), whose actionable task is created under either policy, unless another line's failure ends the order in the same answer under either policy — then the line gets the incident entry — and which is never itself an order-level failure (D-285, D-290, D-300, D-330)
 - **And** on order-level failure, the system **MUST** execute compensating actions in reverse order of execution across **all** subscriptions created for the order, via Subscriptions (never directly via OSS): **draft-void** for subscriptions still in `draft`, **activated-cancel** for subscriptions that received an activation intent
 - **And** after operational compensation the system **MUST** acknowledge `in_fulfillment → fulfillment_failed` to Orders Lifecycle and publish `OrderFulfillmentAborted` — without waiting on a Billing credit note
+
+**9b. Every unwind publishes what was not released**
+- **Given** an unwind of any mode — failure, cancel, supersession, or an order Lifecycle already holds terminal, including an operator-forced failure — before or after fulfillment began
+- **When** the outcome is recorded
+- **Then** the system **MUST** publish `OrderFulfillmentAborted` with its `mode` and the retained obligations: every line's binding reference with what Workflow voided or cancelled
+- **And** the event **MUST** state that Workflow released no reservation, accepted binding or payment, whether or not a Lifecycle call was made
 
 **9a. Steps are classified; this phase has no intra-saga pivot**
 - **Given** a fulfillment plan for this phase
@@ -1097,7 +1164,7 @@ Until the Generic Approval service exists, criteria **1–4a** (including **2a**
 - **Given** any order line reaches permanently failed state
 - **When** the partial-failure policy is applied
 - **Then** under the remediation policy an actionable manual task **MUST** exist in the fulfillment operator queue for that line **before** any terminal outcome is declared
-- **And** under the fail-fast policy a tracked incident/audit entry **MUST** exist for that line
+- **And** under the fail-fast policy a tracked incident/audit entry **MUST** exist for that line — except a line whose activation refusal is unresolved (an unknown code, a denial or an outage), for which the actionable manual task **MUST** exist under either policy, unless another line's failure ends the order in the same answer under either policy — a typed failure under fail-fast, or a draft activated externally or a verified expiry under either policy — when the line has the incident entry instead (D-330); a line whose task is open keeps it, and **MUST NOT** have both (D-285, D-290, D-300)
 - **And** zero permanently failed lines **MUST** be silently absent from tracking
 
 ### Boundary with Orders Lifecycle (R1–R5)
@@ -1122,8 +1189,8 @@ Until the Generic Approval service exists, criteria **1–4a** (including **2a**
 
 **15. Workflow-side consequence of R4: no price interaction beyond the approval-context read**
 - **Given** any Orders Workflow operation
-- **Then** the system **MUST NOT** compute, derive, or modify any price value or pricing reference (`catalogPricePin`)
-- **And** the only permitted price access is reading the stored non-authoritative resolved total solely to pass it in the approval-request context (threshold evaluation is owned by the Generic Approval service)
+- **Then** the system **MUST NOT** compute, derive, or modify any price value or pricing reference (`plan_revision_id`, `price_id`, the `OrderPin`)
+- **And** the only permitted price access is reading the stored valuation figure for the policy owner's chosen basis solely to pass it in the approval-request context (threshold evaluation is owned by the policy owner behind the approval policy adapter)
 - **And** order line references in `FulfillmentTask` instances **MUST** treat pricing fields as opaque pass-through identifiers
 
 **15a. Workflow-side consequence of R5: TransitionRequest status stays off the order**
@@ -1131,6 +1198,20 @@ Until the Generic Approval service exists, criteria **1–4a** (including **2a**
 - **When** that request's status changes
 - **Then** Workflow **MUST** record the identifier and its own task state only
 - **And** **MUST NOT** write per-request status onto the order record
+
+**15b. Operator-forced failure ends the process without a compensation claim**
+- **Given** a running process for an order that two fulfillment operators forced to `fulfillment_failed` with `failure_reason = operator-forced-unreconciled` (Lifecycle D-182)
+- **When** Workflow consumes that `OrderFulfillmentFailed`
+- **Then** Workflow **MUST** cease pending provisioning intents and timers and compensate through Subscriptions
+- **And** **MUST NOT** report the order as compensated or call Orders Lifecycle again for it
+- **And** **MUST** keep, or open, the compensation manual task until reconciliation through Subscriptions establishes that no active subscription remains
+- **And** an `OrderFulfillmentFailed` with any other `failure_reason` **MUST** be absorbed as this gear's own acknowledgement
+
+**15c. Lifecycle events pass the consumer conformance corpus**
+- **Given** Lifecycle's `orders-events` golden corpus (Lifecycle Foundation §4.4)
+- **When** it is run against this gear's real event handler with its declared per-event applicability rule
+- **Then** every case **MUST** pass before the Workflow integration is signed off
+- **And** a duplicate event **MUST** cause no second business effect, an unknown event type or state value **MUST NOT** fail the handler, and a denied or unavailable read **MUST** leave the work durably pending
 
 ### Non-Functional Requirements (Show-Stoppers)
 
@@ -1140,6 +1221,7 @@ Until the Generic Approval service exists, criteria **1–4a** (including **2a**
 - **Then** the system **MUST** resume the workflow without re-executing step X
 - **And** step Y **MUST** continue from its last durable checkpoint
 - **And** the instance **MUST** still be on definition version V
+- **And** only an instance whose platform execution has ended and cannot be re-driven is excepted: it **MUST** be raised as an order-scope manual task and ends through cancel with compensation (the dead-instance unwind, §7.1), counted and reported
 
 **17. Zero duplicate durable effects**
 - **Given** an idempotency key `K` used for a provisioning intent
@@ -1179,49 +1261,105 @@ Until the Generic Approval service exists, criteria **1–4a** (including **2a**
 - **And** the action **MUST** be recorded in the audit log with actor identity and reason
 - **And** the same request by a Seller Operator whose seller scope does not include the order **MUST** be denied
 
+### Customization and Extensibility
+
+**22. Seller policy is limited to the six settings**
+- **Given** a seller-policy write for a seller
+- **When** it names a setting other than the approval escalation window, the overdue window, the manual-task SLA class, the partial-failure policy, the payment wait with its expiry action or the `approval_required` declaration
+- **Then** the system **MUST** refuse the write
+- **And** an accepted write **MUST** be bounds-checked, recorded as a configuration revision, and applied only to process records created after it
+- **And** approval routing, thresholds, assignment, eligibility and the valuation basis **MUST** remain unreachable through seller policy; they belong to the approval policy owner behind the adapter (R2); `approval_required` sets none of them, it only stops the stand-in exempting the seller's orders (D-265)
+- **And** a payment wait longer than Lifecycle's `approved` expiry **MUST** be refused
+
+**23. Only the publish job publishes a definition version**
+- **Given** a candidate definition version
+- **When** a principal other than the Orders definition publish job attempts to publish it
+- **Then** the publish **MUST** be refused
+- **And** a version the publish job publishes **MUST** have passed the pre-publish validation rules and, in the first non-production environment, the behavioural gate over every process path
+
+**24. A step change needs an Orders release**
+- **Given** a candidate definition that calls an operation, or relies on a guard or schema, that the Orders release deployed in the environment does not declare
+- **When** the publish job validates it
+- **Then** the candidate **MUST** be refused before publish
+
+**25. No tenant-supplied code runs in the process**
+- **Given** a candidate definition containing a call to a platform Function or any tenant-authored script, hook or connector
+- **When** the publish job validates it
+- **Then** the candidate **MUST** be refused before publish
+
+**26. The opaque caller-owned reference is transported, never interpreted**
+- **Given** an order line whose intents carry the opaque caller-owned binding reference (§6.3)
+- **When** the process runs to any outcome
+- **Then** the reference **MUST** be present, unmodified, on every outbound provisioning intent for that line
+- **And** no step **MUST** branch on, validate or index its content
+
+**27. Decomposition is one task per line**
+- **Given** an approved order of N independent lines
+- **When** the fulfillment plan is frozen
+- **Then** the plan **MUST** contain exactly N `FulfillmentTask` instances, one per line
+- **And** no configuration **MUST** be able to split a line into several tasks or merge lines into one
+
+**28. Closed enumerations stay closed**
+- **Given** a trigger, process event, refusal reason, operation or manual-task action value this PRD does not define
+- **When** it is received or configured
+- **Then** the system **MUST** reject it rather than accept it as an extension
+
 ## 13. Dependencies
 
 | Dependency | Description | Criticality |
 |------------|-------------|-------------|
 | Orders Lifecycle (`PRD-orders-lifecycle-202608101404`) | Document SoR — Workflow reads order state from here and calls Lifecycle to drive all order state transitions; emits state-change events consumed by Workflow | `p1` |
-| Generic Approval service | Executes approval routing, multi-party gate evaluation, the requirement-verdict query, and escalation; no canonical spec exists today — stand-in behind §9.2 until it does (see §15 and §16) | `p1` |
-| Subscriptions (`PRD-subscriptions-entitlements-202601120119`) | Receives forward intents per line (draft-create, then activation after expected fulfillment time) and compensating draft-void / activated-cancel; owns subscription lifecycle post-creation; delivers per-wave confirmation **or failure** echoing intent identity. Upstream asks: overlap-presence (`SUB-O5`), in-flight rejection (`SUB-O6`), cancel/void of an accepted transition request (`SUB-O7`), status-read of a non-terminal intent (`SUB-O8`), identity/`correlationId` echo and propagation toward Policy Engine / OSS (`SUB-O9`) | `p1` |
-| Payments | Payment-authorization check consumed as a begin-fulfillment process precondition (§6.3); pending vs failed are process outcomes | `p1` |
+| Approval policy adapter (this gear's port; D-197, Lifecycle D-166) | Owns the approval-requirement verdict, routing, multi-party gate evaluation and escalation routing behind the §9.2 contract; the phase-1 implementation is the stand-in (`approval not required`, audited, except for a seller with `approval_required = true`, parked `approval-adapter-not-bound`, D-265); the intended implementation embeds `cf-gears-bss-approval` as Pricing and Products do (`DECISIONS.md` Q-14; see §15 and §16) | `p1` |
+| Subscriptions (`PRD-subscriptions-entitlements-202601120119`) | Receives forward intents per line (draft-create, then activation after expected fulfillment time) and compensating draft-void / activated-cancel; owns subscription lifecycle post-creation; delivers per-wave confirmation **or failure** echoing intent identity. Upstream asks, answered in Subscriptions PR #5131 (pending merge, D-209): overlap occupancy (`SUB-O5`), compensation cancel reason `order_compensation` (`SUB-O1`), resubmit returning the existing request and the `transition_in_flight` rejection (`SUB-O11`), withdrawal of an accepted request (`SUB-O12`), status read of a non-terminal intent (`SUB-O13`), `correlationId` propagation toward Policy Engine / OSS (`SUB-O14`) and identity-envelope echo (`SUB-O16`); still open: the outcome event's name and failure twin, and a create de-duplication lifetime of at least 30 days | `p1` |
+| Payments | Payment-authorization check, today's provider of the four-way financial-readiness answer consumed as a begin-fulfillment precondition and re-read before activation (§6.3) | `p1` |
+| Billing (assumed, §14) | Owner of financial readiness for the order version, from the accepted settlement terms and Payments' facts; receives accepted pre-fulfillment cancellations from Lifecycle to stop or reconcile the payment; consumes `OrderFulfillmentAborted` and its retained obligations | `p1` |
+| Pricing — **PriceBook** model | The line model this PRD assumes — a line is one accepted plan revision with its selected items and price bindings (`OrderPin`), add-ons are items of that revision, and nothing links one revision to another (D-196) — is the PriceBook model of the pricing gear, upstream since 2026-10-02 (the pricing PRD, the Products SKU registry and `cf-gears-bss-approval` landed together). The independence of lines (§6.3) and the `OrderPin` vocabulary depend on that model; if it changes shape, §6.3 and the Lifecycle line model are re-examined, not patched. | `p1` |
 | OSS Provisioning (via Subscriptions) | Accessed exclusively through Subscriptions — Workflow consumes indirectly via Subscriptions confirmation or failure events | `p2` |
 | Platform Events / Audit bus | Receives the six named process events; provides delivery guarantees and event ID de-duplication | `p1` |
-| Durable execution infrastructure | Provides long-running process durability, retries, and durable timers; selection pending ADR (see §15). Engine history is **not** the process-audit SoR; the ADR **MUST** satisfy gear-owned audit retention (§7.1) | `p1` |
+| Durable execution infrastructure | Provides long-running process durability, retries, and durable timers; selected: the serverless-runtime platform definition (ADR-0011); the gear ships only when the platform release gate passes (design `01 §3.8`, D-261). `definition_source = code` is a stated fallback property, not a shipping mode: no code sequencer is designed. Engine history is **not** the process-audit SoR; the ADR **MUST** satisfy gear-owned audit retention (§7.1) | `p1` |
 
 ## 14. Assumptions
 
-- Transient unavailability of Orders Lifecycle, Subscriptions, and Payments is handled per `cpt-cf-bss-orders-workflow-fr-owf-dependency-resilience`. Unavailability of the Generic Approval service after it exists **MUST** park the process with the order remaining in `submitted` (fail-closed, §6.2); it **MUST NOT** fail-open to `approved`. The park **MUST NOT** suspend the Lifecycle `submitted` TTL; Workflow escalates before expiry. Prolonged outages of other dependencies fall outside the scope of this PRD.
-- Until the Generic Approval service exists, a stand-in behind the §9.2 expectations contract returns `approval not required` (audited). Approval routing configuration is maintained separately and out of scope for this PRD. Multi-party gates, escalation, Approver Inbox, and ACs #1–#4a are inert until that service exists.
-- Subscriptions confirmation **or failure** events are at-least-once when they arrive; an accepted intent whose outcome never arrives is recovered by the reconciliation sweep (`SUB-O8`), not assumed successful.
+- Transient unavailability of Orders Lifecycle, Subscriptions, and Payments is handled per `cpt-cf-bss-orders-workflow-fr-owf-dependency-resilience`. Unavailability of the approval policy owner behind the adapter, once the stand-in is replaced, **MUST** park the process with the order remaining in `submitted` (fail-closed, §6.2); it **MUST NOT** fail-open to `approved`. The park **MUST NOT** suspend the Lifecycle `submitted` TTL; Workflow escalates before expiry. Prolonged outages of other dependencies fall outside the scope of this PRD.
+- Until the library adapter replaces the stand-in, a stand-in behind the §9.2 expectations contract returns `approval not required` (audited), except a seller with `approval_required = true`, whose orders it parks `approval-adapter-not-bound` (D-265). Approval routing configuration is maintained separately and out of scope for this PRD. Multi-party gates, escalation, Approver Inbox, and ACs #1–#4a are inert until the library adapter lands.
+- **Owner parts asserted ahead of agreement (2026-10-26, `UPSTREAM_REQS.md` §4 items 22 and 23).** This PRD states the following as requirements on other gears before those gears have agreed them; each names the ask that confirms or withdraws it, and Workflow's own side keeps a fallback until it lands:
+  - Billing owns the four-way financial-readiness answer, with pay-later terms from Pricing's `billing_timing` (`…-upreq-financial-readiness-through-billing`); until then Payments' authorization outcome is the provider.
+  - Orders Lifecycle offers a workflow-mediated pre-fulfillment cancel and arbitrates it against begin-fulfillment and its own `approved` expiry (`…-upreq-prefulfillment-cancel-arbitration`), and carries an accepted cancellation to Billing and Payments (`…-upreq-cancellation-reaches-payments`); until then `request-cancel` falls back to the review task.
+  - Orders Lifecycle distinguishes an assessment expiry from protected coverage (`…-upreq-assessment-expiry-vs-protected-coverage`); until then the accepted-binding deadline is the activation deadline.
+  - Orders Lifecycle and Billing accept `OrderFulfillmentAborted` on every unwind (`…-upreq-aborted-event-on-every-unwind`).
+  - The shared approval library enforces the named-user condition and its generation, and the common BSS Approvals Inbox surfaces Orders approvals with no second queue (`…-upreq-approval-named-user-criterion`); until then Workflow's inbox is the enforcement point.
+  - Rating computes, and Lifecycle stores, a valuation per basis in the shared exact money representation (`…-upreq-approval-valuation-basis`); until then only the annualised net pre-tax TCV exists, and any other basis is `unavailable`.
+  - Subscriptions provides a closed-attempt fence with retained terminal lookup (`SUB-O17`) and keeps a successor draft's acquisition references (`SUB-O18`); until then a past-lifetime not-found stays unresolved, and a successor relies on the order version alone.
+- Subscriptions confirmation **or failure** events are at-least-once when they arrive; an accepted intent whose outcome never arrives is recovered by the reconciliation sweep (`SUB-O13`), not assumed successful.
 - The program-wide NFR workshop will confirm or adjust the latency and SLA baselines in §7; values in this PRD are working baselines.
 - System-driven subscription transitions operate directly on Subscriptions without an order; nothing in this PRD alters them. Subscription `create` in the canonical gears sources is a client-invoked constructor commit — Orders Workflow becomes the caller-of-record for commercially initiated creates (Lifecycle PRD §2, §15).
-- The durable-execution infrastructure required for long-running processes, retries, and durable timers will be selected via ADR; this PRD states requirements only and is agnostic to the engine choice. Process audit and the saga log are persisted by this gear regardless of that choice.
+- The durable-execution infrastructure required for long-running processes, retries, and durable timers is selected by ADR-0011 (the serverless-runtime platform definition); the gear ships only when the platform release gate passes, and the `code` fallback is a stated property with no sequencer designed, not a shipping mode (D-261); this PRD states requirements only. Process audit and the saga log are persisted by this gear regardless of that choice.
 
 ## 15. Open Questions
 
 | **Question** | **Owner** | **Target Date** | **Answer** | **Date Answered** |
 |--------------|-----------|-----------------|------------|-------------------|
-| Durable-execution engine ADR: should Orders Workflow use the OSS Workflow Engine (`PRD-workflow-engine-202501051430`) as its durable-execution platform, or a BSS-local mechanism? Evaluation **MUST** include: which commercial data (resolved total in approval context, approver identities, tenant axes, saga log) would sit in engine-side history; isolation and retention of that history; compatibility with the BSS/OSS boundary in §2; and the requirement that gear-owned process audit is independent of engine purge. | Architecture | 2026-09-30 | — | — |
-| Generic Approval service spec: should the Generic Approval service be specified via a dedicated PRD, or should Orders Workflow use a transitional module-local execution pattern (as Contracts PRD does for its approval module)? Resolution required before the workflow design can be finalized. | Architecture | 2026-09-30 | Partial — policy owner remains Generic Approval (Lifecycle R2). Until the spec exists, a stand-in behind the §9.2 contract returns `approval not required` (audited); that is not a second policy author. Approval execution beyond that stand-in (multi-party gates, escalation, inbox) and ACs #1–#4a (including 2a) are deferred until the service exists. | 2026-08-19 |
+| Durable-execution engine ADR: should Orders Workflow use the OSS Workflow Engine (`PRD-workflow-engine-202501051430`) as its durable-execution platform, or a BSS-local mechanism? Evaluation **MUST** include: which commercial data (resolved total in approval context, approver identities, tenant axes, saga log) would sit in engine-side history; isolation and retention of that history; compatibility with the BSS/OSS boundary in §2; and the requirement that gear-owned process audit is independent of engine purge. | Architecture | 2026-09-30 | Resolved — ADR-0011 (D-65): the serverless-runtime Temporal plugin executing a versioned platform definition; neither the OSS Workflow Engine nor a BSS-local mechanism. The gear ships only when the platform release gate passes; `definition_source = code` is a stated fallback property, not a shipping mode (D-261, amending D-204). | 2026-09-24 |
+| Approval policy host: should the approval policy owner be specified via a dedicated service PRD, or should Orders Workflow host it behind a module-local adapter (as Contracts PRD does for its approval module)? | Architecture | 2026-09-30 | Answered — the policy owner is this gear's approval policy adapter (D-197; Lifecycle D-166 records the same for the sibling gear). No separate service PRD is needed: the intended implementation embeds the built `cf-gears-bss-approval` library as Pricing and Products do. Until that lands, a stand-in behind the §9.2 contract returns `approval not required` (audited), except a seller with `approval_required = true`, whose orders it parks `approval-adapter-not-bound` (D-265, AC 0c); that is not a second policy author. The gate-to-approval-unit mapping is open (`DECISIONS.md` Q-14). | 2026-09-30 |
 | Subscription-create caller-of-record (shared with the Lifecycle PRD §15): subscription `create` in the canonical gears sources is a client-invoked constructor commit with no `ContractSigned` emitter; who calls `create` per deployment surface today, and MUST the call carry an order reference? The gears approval-service gear PRD remains a TODO stub — the §9.2 expectations contract stands in until it exists. | Architecture | 2026-09-15 | — | — |
 | Partial-failure policy defaults per product line: should the default partial-failure policy ("stop new dispatch and reconcile in-flight lines") be overridden per product line or commercial tier? Scope and defaults to be confirmed. | Product | 2026-10-30 | — | — |
-| Approver absence and delegation: an open gate whose principal has left, changed role, or lost scope. | Product | 2026-10-30 | Deferred this phase. Interim answer is escalation (§6.2). Reassignment of an open gate is out of scope. | 2026-08-20 |
+| Approver absence and delegation: an open gate whose principal has left, changed role, or lost scope. | Product | 2026-10-30 | Delegation deferred this phase; interim answer is escalation (§6.2). Reassignment of an open gate's named approver is in scope since D-229/D-266: the assign route bumps the gate's generation (AC 4b, D-282). | 2026-08-20 |
 | Registering the approval expectations upstream: the approval-service gear carries an `UPSTREAM_REQS.md` register in which consumer gears declare what they need, with their own requirement IDs and priorities (currently only `model-registry` is recorded). The §9.2 expectations contract is exactly such a declaration but lives only here, so a future approval-service spec could be authored without seeing it. Should the §9.2 expectations be registered there, and does that register then become the normative home instead of §9.2? | Architecture | 2026-09-30 | — | — |
 | Payment ordering — collect-then-provision: the begin-fulfillment precondition (§6.3) reads a payment **authorization** after the order is `approved`, and at-sale money is posted only once Subscriptions emits billable facts at activation. That is provision-then-collect. A self-service card checkout inverts it: the buyer is charged at checkout and expects service only if the charge succeeds. Should payment ordering be a declared per-instance or per-order property rather than an implicit consequence of where billable facts are emitted, and which gear owns the collect-then-provision variant? | Architecture (with Product) | 2026-11-30 | — | — |
 | Payment outcome visibility and recovery: a declined instrument currently leaves the order in `approved` with no payment event, no operation to re-authorize or retry with another instrument, and expiry as the only exit — indistinguishable from an order about to fulfil. An SCA challenge is an asynchronous, user-facing wait with no representation either, since there is no `payment_pending` order state (Lifecycle §5.1) and process state is explicitly non-authoritative (§6.1). What is the minimum payment-outcome surface — an order-visible outcome, a failure event, and a re-authorize/re-capture operation — and does any of it belong on the order document rather than in the Payments capability? | Architecture (with Product, Lifecycle) | 2026-11-30 | — | — |
 | Reversal artifact after capture: compensation reverses posted at-sale facts through the billing chain (credit note / `ChargeAdjustment`). Where funds were **captured** at checkout rather than invoiced, the correct reversal is a refund through the payment-service provider — a different artifact, timing, and system of record. Which reversal path applies per payment ordering, and does the saga need to distinguish them (§6.4)? | Architecture (with Billing/Payments) | 2026-11-30 | — | — |
 | Post-terminal payment events: disputes, chargebacks, refunds, and asynchronous payment confirmations arrive after the order reaches a terminal state, while the trigger set in §6.1 is closed and Lifecycle-sourced and Payments **MUST NOT** drive order transitions directly. Do such events land exclusively on billing/payment artifacts, or does any of them require an inbound path here? | Architecture (with Billing/Payments) | 2026-11-30 | — | — |
+| Typed custom properties (§5.3): adopters will carry their own data on orders, tasks and intents. This phase offers only the opaque caller-owned reference. Should the platform adopt a typed characteristic model — schema-validated, authorized, indexed, propagated on APIs and events — and if so, which gear owns the schema registry? This is a platform-wide decision; Orders is one consumer of it, not its author. | Architecture (with Product) | 2026-12-15 | — | — |
+| Preview and explainability (§5.3): with one active definition and six seller-policy settings there is little to preview. Should a seller-facing "which definition and policy applies to this order" surface or a dry-run exist, and does the answer change if definition fragments (Q-10) ever open? Staged rollout is not part of this question: it is wanted and depends on the platform's scoped trigger binding (D-207). | Product | 2026-12-15 | — | — |
+| Line model alignment with PriceBook (§13): PriceBook is upstream since 2026-10-02. Confirm against the published pricing PRD that an add-on is an optional item of the same plan revision and that nothing links one revision to another, which is what makes lines independent (§6.3, D-196); the Orders Lifecycle PRD's two remaining *catalog price pin* headings are that gear's to rename. | Architecture (with pricing) | 2026-11-15 | — | — |
 
 ## 16. Risks
 
 | Risk | Impact | Mitigation |
 |------|--------|------------|
 | **Single payment ordering**: this gear supports provision-then-collect only, with authorization as a risk check (§5.2, §15). A self-service card checkout collects before provisioning, and the difference is structural, not a tuning parameter — capture, SCA, retry with another instrument, and refund-as-reversal have no home in the current flow. | Card-purchase flows cannot be implemented against this specification without extending it; a declined instrument is not distinguishable from a healthy order and exits only by expiry, so a buyer receives no outcome and an operator sees no failure. | Payment collection is stated out of scope explicitly rather than implied (§5.2), and the four payment Open Questions in §15 carry the ordering, visibility/recovery, reversal-artifact, and post-terminal-event decisions with named owners. Closing them requires a Payments capability spec, which does not exist in this repository today; this PRD **MUST NOT** invent one. |
-| **Approval dependency without canonical spec**: The Generic Approval service has no canonical PRD (the gears approval-service gear remains a TODO stub). | Orders Workflow cannot finalize its approval integration design or test end-to-end approval flows until the service spec exists. Design decisions may need to be revised when the spec lands. | This PRD defines an expectations contract (§9.2) as the normative interface until that spec exists. Until then a stand-in behind the same contract returns `approval not required` (audited) — not a second policy author and not a module-local fallback that would undo Lifecycle R2. The Open Question in §15 tracks the spec decision with a 2026-09-30 target. |
-| **Engine decision pending**: The durable-execution platform has not been selected; both the OSS Workflow Engine and a BSS-local mechanism are candidates. Engine history may hold commercial context and is typically purged on a short window. | Design cannot begin until the engine choice is made; if audit lives only in engine history, completed orders lose their execution record first. | This PRD states requirements only without committing to an engine. Gear-owned process audit and saga log are the audit SoR (§7.1); the ADR in §15 MUST include BSS/OSS boundary, isolation, retention, and this independence constraint. |
+| **Approval policy adapter implemented only as the stand-in**: the library-backed implementation (`cf-gears-bss-approval`, D-197) is not designed yet and the gate-to-unit mapping is open (`DECISIONS.md` Q-14). | Multi-party gates, escalation and the Approver Inbox stay inert; every order proceeds as if approval were not required, except the orders of a seller with `approval_required = true`, which park `approval-adapter-not-bound` (D-265). | This PRD defines the adapter's contract (§9.2) as the normative interface. The stand-in behind it returns `approval not required` (audited), except a seller with `approval_required = true`, whose orders it parks `approval-adapter-not-bound` (D-265) — not a second policy author and not a module-local fallback that would undo Lifecycle R2. Q-14 tracks the mapping. |
+| **Engine readiness**: The platform is selected (ADR-0011) but its UPSTREAM_REQS §2.9 asks (signal payload, attempt propagation, the principal's grant, dead-letter visibility) are unanswered, so the gear does not ship until the release gate passes (design `01 §3.8`, D-261); no code sequencer is designed. Engine history may hold commercial context and is typically purged on a short window. | Design cannot begin until the engine choice is made; if audit lives only in engine history, completed orders lose their execution record first. | This PRD states requirements only without committing to an engine. Gear-owned process audit and saga log are the audit SoR (§7.1); the ADR in §15 MUST include BSS/OSS boundary, isolation, retention, and this independence constraint. |
 | **Double-SoR drift if process state leaks into order semantics**: If Orders Workflow process state (step progress, saga log) is treated as authoritative order state, consumers will read divergent views of order state from two sources. | Operators see inconsistent order status; audit trail becomes unreliable; recovery from failures requires reconciling two stores. | §6.1 defines a MUST requirement separating process state (non-authoritative) from order state (Lifecycle SoR). R1 ACs in §12 verify Workflow reads from Lifecycle only. |
 | **Compensation gaps on partially provisioned multi-line orders**: If a step is not classified, or a compensable step has no declared action, permanent failure leaves subscriptions active with no rollback path. | Stranded subscriptions are billed to the customer without delivering service; no manual task may exist for operator remediation. | §6.4 requires classification (this phase: both waves compensable) and a declared action for compensable steps. Uncompletable compensation follows the escalation path. Manual tasks are required for every permanent failure with 100% coverage. |
 | **Canon fork conflict** (closed 2026-09-01): the BSS gears this PRD cites (subscriptions / rating / pricing) previously lived only in a pre-merge checkout, so citations were pinned by organisation and SHA. | Was: the implementation team could work from a different spec baseline, and Orders Workflow decisions could conflict with decisions taken on the fork. | Resolved — those gears are now resolved in-repo and §17 cites them by repository path rather than by external pin. The remaining unpinned dependency is the approval-service gear, whose PRD is still a stub; that exposure is carried by the separate approval-dependency risk below, not by this one. |
@@ -1251,9 +1389,12 @@ flowchart TD
     TRIGGER -- OrderSubmitted --> OBTAIN[Obtain approval-requirement verdict\nkeyed orderId + orderVersion]
     OBTAIN --> VERDICT{Verdict}
     VERDICT -- Approval required --> REFLECT_PENDING[Reflect submitted → pending_approval]
-    VERDICT -- Not required / stand-in --> REFLECT_NOAPP[Reflect submitted → approved]
+    VERDICT -->|"Not required (stand-in: seller approval_required = false)"| REFLECT_NOAPP[Reflect submitted → approved]
+    VERDICT -->|"Stand-in, seller approval_required = true"| PARK_STANDIN([Park: approval-adapter-not-bound\norder remains submitted, TTL elapses\nescalate before expiry])
     VERDICT -- GA unavailable after it exists --> PARK([Park: order remains submitted\nfail-closed, submitted TTL still elapses\nescalate before expiry])
-    REFLECT_PENDING --> SUBMIT_REQ[Submit OrderApprovalRequest\nto Generic Approval service]
+    REFLECT_PENDING --> SUBMIT_REQ[Submit OrderApprovalRequest\nto approval policy adapter]
+    REFLECT_PENDING -- Named approver missing or barred --> PARK_GATE([Park: assignee-unresolved\norder remains pending_approval\nretried each tick, escalate on outage threshold])
+    PARK_GATE -- Gates opened --> SUBMIT_REQ
     SUBMIT_REQ --> PUBLISH_REQUESTED[Publish OrderApprovalRequested]
     PUBLISH_REQUESTED --> TIMER[Start durable escalation timer\ndefault 72 h per gate]
     TIMER --> WAIT_DECISION{Decision received?}
@@ -1267,10 +1408,16 @@ flowchart TD
     TRIGGER -- OrderApproved --> PAYMENT_GUARD{Payment authorization}
     PAYMENT_GUARD -- Pending --> WAIT_PAY([Order stays approved\nno begin-fulfillment])
     WAIT_PAY --> PAYMENT_GUARD
-    PAYMENT_GUARD -- Failed, no tolerate-failure --> STAY_APPROVED([Order stays approved\nbegin-fulfillment withheld])
-    PAYMENT_GUARD -- OK / tolerate-failure --> BEGIN[Call Lifecycle approved → in_fulfillment\nbefore any intent\nPublish OrderFulfillmentStarted]
-    BEGIN --> BUILD_PLAN[Build FulfillmentTask per line\nFreeze plan, re-check SUB-O5 and market]
-    BUILD_PLAN --> WAVE1[Wave 1: draft-create intent per line\nidempotency key includes wave]
+    PAYMENT_GUARD -- Failed, no tolerate-failure --> STAY_APPROVED([Order stays approved\nLifecycle refuses begin-fulfillment: withheld])
+    PAYMENT_GUARD -- OK / tolerate-failure --> BUILD_PLAN[Order still approved:\nbuild FulfillmentTask per line\nobserve SUB-O5 and market]
+    BUILD_PLAN --> DEADLINE{Expected fulfillment time\nbefore activation deadline?}
+    DEADLINE -- No: order-binding-expired --> PLAN_TASK[Plan-level manual task\norder stays approved and amendable]
+    PLAN_TASK -- Amended --> AMENDED([New order version\nprocessed from the start])
+    PLAN_TASK -- Exhausted --> FAIL_BEGIN[Call Lifecycle approved → in_fulfillment\nnothing to compensate]
+    FAIL_BEGIN --> FAILED
+    DEADLINE -- Yes --> FREEZE[Freeze plan]
+    FREEZE --> BEGIN[Call Lifecycle approved → in_fulfillment\nbefore any intent\nPublish OrderFulfillmentStarted]
+    BEGIN --> WAVE1[Wave 1: draft-create intent per line\nidempotency key includes wave]
     WAVE1 --> CREATE_WAIT{Create confirmation or failure?}
     CREATE_WAIT -- Success --> DRAFT[FulfillmentTask → draft_created\nno OrderFulfillmentStepCompleted]
     CREATE_WAIT -- Submission failure, budget left --> WAVE1
@@ -1279,12 +1426,17 @@ flowchart TD
     BARRIER -- No --> WAIT_DATE[Durable timer: wait remaining creates\nand/or expected fulfillment time]
     WAIT_DATE --> BARRIER
     BARRIER -- Draft auto-voided before activation --> WAVE1
-    BARRIER -- Yes --> WAVE2[Wave 2: activation intent per line\nfirst activation intent = spawn/fencing signal]
+    BARRIER -- Yes --> PRE_ACT{Re-check SUB-O5, market\nand activation deadline\nimmediately before first activation}
+    PRE_ACT -- Collision / divergence / expired --> ABORT
+    PRE_ACT -- Clear --> WAVE2[Wave 2: report spawn signal to Lifecycle\nthen activation intent per line]
     WAVE2 --> ACT_WAIT{Activation confirmation or failure?}
     ACT_WAIT -- Success --> STEP_DONE[FulfillmentTask → activated\nPublish OrderFulfillmentStepCompleted]
     ACT_WAIT -- Submission failure, budget left --> WAVE2
     ACT_WAIT -- Failure confirmation / permanent --> PERM_FAIL[FulfillmentTask → failed\nPublish OrderFulfillmentStepCompleted]
-    PERM_FAIL --> POLICY{Partial-failure policy}
+    PERM_FAIL -- Typed failure --> POLICY{Partial-failure policy}
+    PERM_FAIL -- Unresolved refusal: unknown code, denial or outage --> UNRESOLVED_TASK[Line manual task under either policy\nnever exhausted, no task cancel]
+    UNRESOLVED_TASK -- Retry/override lands --> RESUME
+    UNRESOLVED_TASK -- Order cancel / binding expired / another line's unwind --> ABORT
     POLICY -- Remediate default --> HOLD_TASK[Hold order\nCreate actionable manual task with SLA]
     HOLD_TASK --> REMEDIATE{Remediation outcome?}
     REMEDIATE -- Retry/override succeeds --> RESUME[Resume from last durable checkpoint]

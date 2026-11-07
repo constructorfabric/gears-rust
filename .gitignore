@@ -59,6 +59,9 @@ dist/
 # Cypilot per-task plan artifacts (scratch data; not tracked)
 .cypilot/.plans/
 
+# Constructor Studio per-task plan artifacts (scratch data; not tracked)
+.cf-studio/.plans/
+
 CLAUDE.local.md
 .setup-stamp
 
