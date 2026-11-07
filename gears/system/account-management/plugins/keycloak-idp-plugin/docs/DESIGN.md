@@ -469,6 +469,7 @@ Ordering: local metadata resolution → service-account purge → tenant-group d
 - A pre-saga health-probe failure is `Retryable` — nothing was attempted.
 - The service-account purge deletes every `svc-{tenant_id}-*` client owned by the tenant (ownership marker checked client-side); purge failures classify to `Retryable` (retryable provider status or staged ambiguity) or `Terminal` (permanent provider rejection) and abort the saga so no live machine credential survives its tenant.
 - Tenant-group deletion treats 404/410 as `NotFound`; other failures are `Retryable`.
+- A realm deleted out from under the tenant fails earlier: its token endpoint answers 404 before the group DELETE is sent. When the bootstrap admin confirms the realm is gone (`GET /admin/realms/{realm}` → 404), the call is `NotFound`. For created bindings, the orphaned realm-admin secret is deleted from the Credential Store first. A token-endpoint 404 the probe does not confirm stays `Retryable`.
 - For created bindings only, if no sibling tenant groups remain the realm itself is deleted (404/410 tolerated), then the realm-admin secret is deleted from the Credential Store (absent-as-success). The realm-admin client is not deleted separately — it dies with the realm.
 - Shared and adopted realms are never deleted, and per-user deletion is not part of tenant deprovisioning: Account Management's hard-delete pipeline deprovisions users through `deprovision_user` before retiring the tenant boundary.
 

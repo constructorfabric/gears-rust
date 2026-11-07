@@ -85,6 +85,9 @@ struct ConfigurableStubOpenBao {
     /// One-shot override for the next `put` call's response. `None` →
     /// default `Ok(())`. Consumed on read.
     next_put_response: Mutex<Option<Result<(), CredStoreError>>>,
+    /// One-shot override for the next `delete` call's response. `None` →
+    /// default `Ok(())`. Consumed on read.
+    next_delete_response: Mutex<Option<Result<(), CredStoreError>>>,
     /// Keyed read responses (consumed on first match — same semantics as
     /// [`ConfigurableStubCS`]).
     get_responses: Mutex<std::collections::HashMap<String, GetSecretResponse>>,
@@ -93,10 +96,15 @@ struct ConfigurableStubOpenBao {
 impl ConfigurableStubOpenBao {
     fn with_put_failure(err: CredStoreError) -> Self {
         Self {
-            put_calls: Mutex::new(Vec::new()),
-            delete_calls: Mutex::new(Vec::new()),
             next_put_response: Mutex::new(Some(Err(err))),
-            get_responses: Mutex::new(std::collections::HashMap::new()),
+            ..Self::default()
+        }
+    }
+
+    fn with_delete_failure(err: CredStoreError) -> Self {
+        Self {
+            next_delete_response: Mutex::new(Some(Err(err))),
+            ..Self::default()
         }
     }
 
@@ -159,7 +167,7 @@ impl CredStoreClientV1 for ConfigurableStubOpenBao {
         _precondition: WritePrecondition,
     ) -> Result<(), CredStoreError> {
         self.delete_calls.lock().push(key.as_ref().to_owned());
-        Ok(())
+        self.next_delete_response.lock().take().unwrap_or(Ok(()))
     }
 }
 
@@ -2657,6 +2665,221 @@ async fn deprovision_5xx_on_group_delete_returns_retryable() {
         },
     )
     .await;
+}
+
+/// Mount the health probe and the bootstrap token endpoint, and make the
+/// token endpoint of `gone_realm` answer the way Keycloak does for a realm
+/// that no longer exists.
+async fn mount_token_endpoints_with_gone_realm(server: &MockServer, gone_realm: &str) {
+    mount_kc_health_probe_ok(server).await;
+    Mock::given(method("POST"))
+        .and(path("/realms/master/protocol/openid-connect/token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "access_token": "t-master",
+            "expires_in": 600
+        })))
+        .mount(server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(format!(
+            "/realms/{gone_realm}/protocol/openid-connect/token"
+        )))
+        .respond_with(
+            ResponseTemplate::new(404)
+                .set_body_json(serde_json::json!({"error": "Realm does not exist"})),
+        )
+        .mount(server)
+        .await;
+}
+
+/// Answer the bootstrap admin's `GET /admin/realms/{realm}` probe with `status`.
+async fn mount_realm_probe(server: &MockServer, realm: &str, status: u16) {
+    Mock::given(method("GET"))
+        .and(path(format!("/admin/realms/{realm}")))
+        .respond_with(
+            ResponseTemplate::new(status).set_body_json(serde_json::json!({
+                "realm": realm
+            })),
+        )
+        .expect(1)
+        .mount(server)
+        .await;
+}
+
+/// No Admin REST DELETE may be sent once the realm-admin token cannot be
+/// minted — neither the tenant group nor the realm.
+async fn mount_no_deletes(server: &MockServer) {
+    Mock::given(wm_method("DELETE"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(0)
+        .mount(server)
+        .await;
+}
+
+/// Shared realm deleted out from under the tenant: the realm-admin token
+/// POST answers 404 and the bootstrap admin confirms the realm is gone →
+/// `DeprovisionNotFound` (success-equivalent) instead of a retryable error
+/// AM would re-attempt forever.
+#[tokio::test]
+async fn deprovision_with_realm_gone_returns_not_found() {
+    let server = MockServer::start().await;
+    mount_token_endpoints_with_gone_realm(&server, "platform").await;
+    mount_realm_probe(&server, "platform", 404).await;
+    mount_no_deletes(&server).await;
+
+    let facade = build_facade(&server);
+    let ctx = build_system_ctx(Uuid::nil());
+    let req = deprovision_req(
+        Uuid::new_v4(),
+        Some(make_metadata(
+            "platform",
+            RealmBinding::Shared,
+            Uuid::new_v4(),
+            None,
+        )),
+    );
+    let err = facade
+        .deprovision_tenant_inner(&ctx, &req)
+        .await
+        .expect_err("gone realm must surface as DeprovisionNotFound");
+    assert!(
+        matches!(err, PluginError::DeprovisionNotFound { ref realm_name } if realm_name == "platform"),
+        "expected DeprovisionNotFound{{ realm_name: platform }}, got {err:?}",
+    );
+}
+
+/// Created realm already gone (e.g. a prior attempt deleted the realm but
+/// failed on the `OpenBao` step): the orphaned realm-admin secret is still
+/// deleted, then the call reports `DeprovisionNotFound`.
+#[tokio::test]
+async fn deprovision_created_with_realm_gone_deletes_secret_and_returns_not_found() {
+    let server = MockServer::start().await;
+    mount_token_endpoints_with_gone_realm(&server, "partner-created").await;
+    mount_realm_probe(&server, "partner-created", 404).await;
+    mount_no_deletes(&server).await;
+
+    let mutator = Arc::new(ConfigurableStubOpenBao::default());
+    mutator.seed_get(
+        "keycloak-idp-realm-admin-partner-created-secret",
+        "per-realm-ra-secret",
+    );
+    let facade = build_facade_with_unified_client(
+        &server,
+        Arc::clone(&mutator) as Arc<dyn CredStoreClientV1>,
+    );
+    let ctx = build_system_ctx(Uuid::nil());
+    let req = deprovision_req(
+        Uuid::new_v4(),
+        Some(make_metadata(
+            "partner-created",
+            RealmBinding::Created,
+            Uuid::new_v4(),
+            Some("keycloak-idp-realm-admin-partner-created-secret"),
+        )),
+    );
+    let err = facade
+        .deprovision_tenant_inner(&ctx, &req)
+        .await
+        .expect_err("gone realm must surface as DeprovisionNotFound");
+    assert!(
+        matches!(err, PluginError::DeprovisionNotFound { ref realm_name } if realm_name == "partner-created"),
+        "expected DeprovisionNotFound{{ realm_name: partner-created }}, got {err:?}",
+    );
+    assert_eq!(
+        *mutator.delete_calls.lock(),
+        vec!["keycloak-idp-realm-admin-partner-created-secret".to_owned()],
+        "the gone Created realm's admin secret MUST still be deleted",
+    );
+}
+
+/// The orphaned secret cleanup is part of the deprovision: if `OpenBao`
+/// refuses the delete, the call stays retryable rather than reporting
+/// the tenant as already absent.
+#[tokio::test]
+async fn deprovision_created_with_realm_gone_retries_when_secret_delete_fails() {
+    let server = MockServer::start().await;
+    mount_token_endpoints_with_gone_realm(&server, "partner-created").await;
+    mount_realm_probe(&server, "partner-created", 404).await;
+
+    let mutator = Arc::new(ConfigurableStubOpenBao::with_delete_failure(
+        CredStoreError::service_unavailable("openbao down"),
+    ));
+    mutator.seed_get(
+        "keycloak-idp-realm-admin-partner-created-secret",
+        "per-realm-ra-secret",
+    );
+    let facade = build_facade_with_unified_client(
+        &server,
+        Arc::clone(&mutator) as Arc<dyn CredStoreClientV1>,
+    );
+    let ctx = build_system_ctx(Uuid::nil());
+    let req = deprovision_req(
+        Uuid::new_v4(),
+        Some(make_metadata(
+            "partner-created",
+            RealmBinding::Created,
+            Uuid::new_v4(),
+            Some("keycloak-idp-realm-admin-partner-created-secret"),
+        )),
+    );
+    let err = facade
+        .deprovision_tenant_inner(&ctx, &req)
+        .await
+        .expect_err("failed secret delete must error");
+    assert!(
+        matches!(err, PluginError::DeprovisionRetryable { ref detail } if detail.contains("openbao delete failed")),
+        "expected DeprovisionRetryable from the OpenBao delete, got {err:?}",
+    );
+}
+
+/// A token-endpoint 404 the bootstrap admin cannot confirm — the realm
+/// still answers 200 (misrouted 404) or the probe is refused (403) — keeps
+/// the original retryable classification, and a Created realm's secret
+/// is left in place.
+#[tokio::test]
+async fn deprovision_with_unconfirmed_token_404_stays_retryable() {
+    for probe_status in [200, 403] {
+        let server = MockServer::start().await;
+        mount_token_endpoints_with_gone_realm(&server, "partner-created").await;
+        mount_realm_probe(&server, "partner-created", probe_status).await;
+        mount_no_deletes(&server).await;
+
+        let mutator = Arc::new(ConfigurableStubOpenBao::default());
+        mutator.seed_get(
+            "keycloak-idp-realm-admin-partner-created-secret",
+            "per-realm-ra-secret",
+        );
+        let facade = build_facade_with_unified_client(
+            &server,
+            Arc::clone(&mutator) as Arc<dyn CredStoreClientV1>,
+        );
+        let ctx = build_system_ctx(Uuid::nil());
+        let req = deprovision_req(
+            Uuid::new_v4(),
+            Some(make_metadata(
+                "partner-created",
+                RealmBinding::Created,
+                Uuid::new_v4(),
+                Some("keycloak-idp-realm-admin-partner-created-secret"),
+            )),
+        );
+        let err = facade
+            .deprovision_tenant_inner(&ctx, &req)
+            .await
+            .expect_err("unconfirmed token 404 must error");
+        assert!(
+            matches!(
+                err,
+                PluginError::DeprovisionRetryable { ref detail }
+                    if detail.contains("openid-connect/token") && detail.contains("404")
+            ),
+            "probe {probe_status}: expected the token-endpoint DeprovisionRetryable, got {err:?}",
+        );
+        assert!(
+            mutator.delete_calls.lock().is_empty(),
+            "probe {probe_status}: the secret MUST stay while the realm is not confirmed gone",
+        );
+    }
 }
 
 /// Missing metadata + `am.system` ctx → `DeprovisionNotFound { realm_name = "unknown" }`.

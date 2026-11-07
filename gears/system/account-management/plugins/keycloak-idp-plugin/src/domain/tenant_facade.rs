@@ -33,7 +33,7 @@ use crate::domain::audit;
 use crate::domain::credstore::CredStoreWriter;
 use crate::domain::error::{AmbiguousStage, KcStatusKind, PluginError};
 use crate::domain::kc::KcAdminClient;
-use crate::domain::kc::factory::{KeycloakAdminClientFactory, SecretSource};
+use crate::domain::kc::factory::{KeycloakAdminClientFactory, SecretSource, TOKEN_PATH_TEMPLATE};
 use crate::domain::kc::transport::truncate_2kb;
 use crate::domain::kc_provisioning::{
     PROVISIONING_TENANT_ID_ATTR, ambiguous_from_kc_error, encode_component,
@@ -238,6 +238,20 @@ fn deprovision_translate_kc(e: PluginError) -> PluginError {
         },
         other => other,
     }
+}
+
+/// `true` for a 404 from the realm's OIDC token endpoint — the first
+/// symptom of a realm that no longer exists, raised while acquiring the
+/// realm-admin client and before any Admin REST call runs.
+fn is_token_endpoint_404(e: &PluginError) -> bool {
+    matches!(
+        e,
+        PluginError::KcRest {
+            status: KcStatusKind::Http(404),
+            path_template,
+            ..
+        } if path_template == TOKEN_PATH_TEMPLATE
+    )
 }
 
 /// Classify failures from the service-account purge step when it runs as
@@ -520,8 +534,9 @@ impl TenantFacade {
     ///
     /// # Errors
     ///
-    /// * [`PluginError::DeprovisionNotFound`] — vendor 404/410 or
-    ///   `metadata = None` (success-equivalent in AM's pipeline).
+    /// * [`PluginError::DeprovisionNotFound`] — vendor 404/410, a realm the
+    ///   bootstrap admin confirms is gone, or `metadata = None`
+    ///   (success-equivalent in AM's pipeline).
     /// * [`PluginError::DeprovisionRetryable`] — transient 5xx / transport /
     ///   timeout failures on any saga step.
     /// * [`PluginError::DeprovisionTerminal`] — malformed persisted metadata
@@ -765,7 +780,7 @@ impl TenantFacade {
         // and retries on a 401 from KC's auth layer so an operator-
         // rotated realm-admin secret converges without restart
         // (DESIGN "Credentials, Token Cache, and Rotation"). `deprovision_translate_kc`
-        // applied at the outer `.await` translates any `KcRest` that
+        // applied on the error path translates any `KcRest` that
         // leaks from acquire-stage failures OR a second-401 escape
         // into `DeprovisionRetryable`; closure-returned variants
         // (`DeprovisionNotFound`, `DeprovisionRetryable`) pass through
@@ -776,7 +791,8 @@ impl TenantFacade {
             encode_component(&metadata.realm_name),
             metadata.tenant_group_id,
         );
-        self.kc_factory
+        let group_delete = self
+            .kc_factory
             .with_reactive_401(
                 &metadata.realm_name,
                 &metadata.admin_client_id,
@@ -817,8 +833,18 @@ impl TenantFacade {
                     }
                 },
             )
-            .await
-            .map_err(deprovision_translate_kc)?;
+            .await;
+        if let Err(e) = group_delete {
+            // A deleted realm takes its token endpoint with it, so the
+            // realm-admin token POST answers 404 before the group DELETE
+            // above is ever sent. Re-tagged as retryable, that would loop
+            // forever. Confirm with the bootstrap admin before treating it
+            // as already-absent, so a misrouted 404 cannot skip a cleanup.
+            if is_token_endpoint_404(&e) && self.realm_is_absent(&metadata.realm_name).await {
+                return self.deprovision_absent_realm(metadata).await;
+            }
+            return Err(deprovision_translate_kc(e));
+        }
 
         // ---- Created-only: parent emptiness check + realm/secret cleanup. ----
         if metadata.realm_binding != RealmBinding::Created {
@@ -903,11 +929,73 @@ impl TenantFacade {
             .await
             .map_err(deprovision_translate_kc)?;
 
-        // Delete the OpenBao-backed realm-admin secret. Created binding
-        // always carries `admin_secret_ref` (the non-default-shared branch
-        // above already validated this — but we re-check here instead of
-        // using `expect()` so a corrupt blob downgrades to a Terminal
-        // failure rather than panicking the worker).
+        self.delete_realm_admin_secret(metadata).await?;
+
+        Ok(true)
+    }
+
+    /// Bootstrap-admin `GET /admin/realms/{realm}`: `true` only on a
+    /// definitive 404. Any other answer — the realm exists, the bootstrap
+    /// admin lacks permissions, or the probe itself fails — is `false`, so
+    /// the caller keeps its original classification.
+    async fn realm_is_absent(&self, realm_name: &str) -> bool {
+        let realm_url = format!(
+            "{}admin/realms/{}",
+            self.kc_factory.base_url_str(),
+            encode_component(realm_name),
+        );
+        let probe = self
+            .kc_factory
+            .with_reactive_401_bootstrap(|bootstrap| {
+                let realm_url = realm_url.clone();
+                async move {
+                    let (status, body) = bootstrap
+                        .raw_request("GET", &realm_url, None, "/admin/realms/{realm}")
+                        .await?;
+                    if status == 401 {
+                        // Surface 401 as KcRest so the wrapper re-mints the
+                        // bootstrap token and retries once.
+                        return Err(PluginError::KcRest {
+                            method: "GET",
+                            path_template: "/admin/realms/{realm}".into(),
+                            status: KcStatusKind::Http(401),
+                            body_first_2kb: truncate_2kb(&body),
+                        });
+                    }
+                    Ok(status)
+                }
+            })
+            .await;
+        matches!(probe, Ok(404))
+    }
+
+    /// Deprovision a tenant whose realm is confirmed gone. The tenant group
+    /// went with the realm, so there is nothing left in Keycloak; a Created
+    /// binding still owns its realm-admin secret in `OpenBao`, which is
+    /// deleted here exactly as the last-tenant teardown would have done.
+    /// Always ends in [`PluginError::DeprovisionNotFound`] unless that
+    /// secret delete fails.
+    async fn deprovision_absent_realm(
+        &self,
+        metadata: &TenantIdpMetadataV1,
+    ) -> Result<bool, PluginError> {
+        if metadata.realm_binding == RealmBinding::Created {
+            self.delete_realm_admin_secret(metadata).await?;
+        }
+        Err(PluginError::DeprovisionNotFound {
+            realm_name: metadata.realm_name.clone(),
+        })
+    }
+
+    /// Delete a Created realm's `OpenBao`-backed realm-admin secret
+    /// (absent-as-success via [`CredStoreWriter::delete`]).
+    async fn delete_realm_admin_secret(
+        &self,
+        metadata: &TenantIdpMetadataV1,
+    ) -> Result<(), PluginError> {
+        // Created binding always carries `admin_secret_ref`; re-check here
+        // instead of using `expect()` so a corrupt blob downgrades to a
+        // Terminal failure rather than panicking the worker.
         let secret_ref_str =
             metadata
                 .admin_secret_ref
@@ -932,9 +1020,7 @@ impl TenantFacade {
         }
         delete_result.map_err(|e| PluginError::DeprovisionRetryable {
             detail: format!("openbao delete failed: {e}"),
-        })?;
-
-        Ok(true)
+        })
     }
 
     /// DELETE-with-status helper. Returns `(status, body_first_2kb)` on
