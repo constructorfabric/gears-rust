@@ -186,6 +186,16 @@ fn database_maps_to_500_without_leaking_detail() {
 }
 
 #[test]
+fn not_configured_maps_to_501_which_is_not_retried() {
+    let problem = wire(DomainError::NotConfigured(
+        "no processing identity is configured".to_owned(),
+    ));
+
+    assert_eq!(problem.status, Some(501));
+    assert!(!visible_text(&problem).contains("processing identity"));
+}
+
+#[test]
 fn unavailable_maps_to_503_without_leaking_detail() {
     let problem = wire(DomainError::Unavailable(
         "pdp at 10.0.0.7 timed out".to_owned(),
@@ -304,5 +314,25 @@ fn an_out_of_scope_error_on_the_facts_route_answers_as_no_such_subject() {
     let text = visible_text(&problem);
     for id in &ids[..3] {
         assert!(!text.contains(&id.to_string()), "{id} in {text}");
+    }
+}
+
+#[test]
+fn a_subject_that_is_not_visible_is_404_and_tells_nothing_more() {
+    for problem in [
+        wire(DomainError::NotVisible(
+            "subject 42 has a profile".to_owned(),
+        )),
+        rest(DomainError::NotVisible(
+            "subject 42 has a profile".to_owned(),
+        )),
+    ] {
+        assert_eq!(problem.status, Some(404));
+        assert_eq!(problem.detail, "no such subject");
+        let text = visible_text(&problem);
+        assert!(
+            !text.contains("has a profile"),
+            "the reason stays in the log: {text}"
+        );
     }
 }

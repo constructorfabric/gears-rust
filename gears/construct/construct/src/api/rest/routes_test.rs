@@ -14,7 +14,8 @@ use uuid::Uuid;
 
 use crate::api::rest::routes::register_routes;
 use crate::test_support::{
-    AllowResolver, DenyResolver, IntakeFixture, chat_record, inmem_db, settings_service,
+    AllowResolver, DenyResolver, IntakeFixture, chat_record, idle_profile, inmem_db,
+    settings_service,
 };
 
 const PATH: &str = "/construct/v1/records";
@@ -28,8 +29,15 @@ async fn router_with(fixture: &IntakeFixture) -> Router {
         .build()
         .unwrap();
     let settings = Arc::new(settings_service(&db, Arc::new(AllowResolver), true));
-    register_routes(Router::new(), &OpenApiRegistryImpl::new(), intake, settings)
-        .layer(Extension(ctx))
+    let profile = idle_profile(&db, Arc::new(AllowResolver));
+    register_routes(
+        Router::new(),
+        &OpenApiRegistryImpl::new(),
+        intake,
+        settings,
+        profile,
+    )
+    .layer(Extension(ctx))
 }
 
 struct Answer {
@@ -256,4 +264,34 @@ async fn until_the_planner_exists_a_record_gets_202_and_a_resend_200() {
     assert_eq!(first.status, StatusCode::ACCEPTED, "body: {}", first.body);
     assert_eq!(again.status, StatusCode::OK, "body: {}", again.body);
     assert_eq!(fixture.events.dropped.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn every_record_answer_carries_the_security_headers() {
+    let router = router_with(&IntakeFixture::default()).await;
+    let received = chat_record(Uuid::new_v4(), "p", "v");
+    let mut refused = chat_record(Uuid::new_v4(), "p", "w");
+    refused["payload"]["role"] = json!("system");
+
+    for (record, status) in [
+        (received, StatusCode::ACCEPTED),
+        (refused, StatusCode::UNPROCESSABLE_ENTITY),
+    ] {
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri(format!("{PATH}?tenant={}", Uuid::new_v4()))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(record.to_string()))
+            .unwrap();
+        let response = router.clone().oneshot(request).await.unwrap();
+
+        assert_eq!(response.status(), status);
+        for (name, value) in crate::test_support::SECURITY_HEADERS {
+            assert_eq!(
+                response.headers().get(name).and_then(|v| v.to_str().ok()),
+                Some(value),
+                "{name} on {status}"
+            );
+        }
+    }
 }

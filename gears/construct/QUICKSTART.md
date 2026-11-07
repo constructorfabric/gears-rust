@@ -1,17 +1,20 @@
 # Construct - Quickstart
 
-Record intake for connectors: a connector sends one record per request for one tenant, and Construct checks it against its GTS type and answers at once with received, repeat or refused. A received record is handed to background processing in the same transaction that keeps its identity.
+Record intake for connectors and the profile read for applications and agents. A connector sends one record per request for one tenant; Construct checks it against its GTS type and answers at once with received, repeat or refused. A received record is handed to background processing in the same transaction that keeps its identity: the planner turns it into a plan, the sensitive-data checks and Admission decide what of it is stored, and the profile writer stores it in graph storage. An application or agent then reads the subject's profile by category.
 
-**Until the Planner exists, every received record is dropped.** A record that passes the checks is answered `202`, its identity is kept, and a content-free drop event is logged; nothing from the record is processed. A resend of the same record is a repeat.
+**Processing runs only with a processing identity and a model configured, and with `processing.run_without_sensitive_data_checks: true`,** since no sensitive-data check exists yet and every value Admission lets through is stored. Without all three, a record that passes the checks is answered `202`, its identity is kept, and a content-free drop event is logged; nothing from the record is processed. A resend of the same record is a repeat. Without a processing identity, the profile read answers `501`, which a caller does not retry.
 
 **Features:**
-- One authenticated route, `POST /construct/v1/records?tenant=<tenant id>`, with one permission check (`construct.record` / `send`) for the named tenant
+- One authenticated route, `POST /construct/v1/records?tenant=<tenant id>`, with one permission check (`gts.cf.connectors.core.record.v1~` / `send`) for the named tenant
 - The record is checked against its GTS type and every type it derives from, through the types registry. The connector record types ship in the SDK and are registered when the types registry starts
 - A repeat of a received record identity (tenant, connector, provenance, version) changes nothing; the identity is kept only once processing took the record
 - Records are refused when the connector is off, or when personalization is off or an erasure is under way for the record's subject
 - Errors are RFC 9457 Problem responses
 - The gear supplies its migrations to the runtime, which runs them on boot
-- An in-process client, `ConstructClientV1::submit_record`, runs the same operation
+- `GET /construct/v1/subjects/{subject_id}/profile`: the subject's facts by category, for a caller the platform grants the permission to read profiles (`gts.cf.construct.subject.profile.v1~` / `read`), in the caller's tenant or the one named in `tenant`. A category the caller may not read is not listed
+- An in-process client, `ConstructClientV1::submit_record` and `read_profile`, runs the same operations
+- The gear needs graph storage in its host
+- Construct declares its permissions as GTS permission instances: send records, read profiles, manage facts, and read or change one's own personalization settings. The tenant grants each in its policy engine
 
 Full API documentation: <http://127.0.0.1:8087/cf/docs>
 
@@ -38,22 +41,47 @@ The gear is in this repository under `gears/construct`, and it is not built into
    use construct as _;
    ```
 
-3. In `config/quickstart.yaml`, under `gears:`, add the gear's section:
+3. Construct needs graph storage, which needs PostgreSQL 16 or later with the `vector` extension. For a local run, start one in Docker:
+
+   ```bash
+   docker run -d --name graph-storage-pg -e POSTGRES_PASSWORD=graph -e POSTGRES_DB=graph_storage -p 5432:5432 pgvector/pgvector:pg17
+   ```
+
+4. In `config/quickstart.yaml`, under `database.servers:`, add the PostgreSQL server:
 
    ```yaml
+   pg_graph:
+     host: "localhost"
+     port: 5432
+     user: "postgres"
+     password: "graph"
+   ```
+
+   and under `gears:`, add graph storage's and the gear's sections:
+
+   ```yaml
+   graph-storage:
+     database:
+       server: "pg_graph"
+       dbname: "graph_storage"
+     config:
+       embedding_dimension: 384
+       embedding_provider: fake  # local run only; see graph storage's README for onnx or remote
    construct:
      database:
        server: "sqlite_users"
        file: "construct.db"
    ```
 
-4. Start the server:
+   The `fake` provider needs no model files. Its vectors rank nothing, which is fine here: Construct reads and writes facts by key and does not search by vector.
+
+5. Start the server:
 
    ```bash
-   cargo run --bin cf-gears-example-server --no-default-features --features construct,static-tenants,static-authn,static-authz -- --config config/quickstart.yaml run
+   cargo run --bin cf-gears-example-server --no-default-features --features construct,graph-storage,static-tenants,static-authn,static-authz -- --config config/quickstart.yaml run
    ```
 
-The log shows `Applying migration gear="construct"` for `initial_001`, `m002_subject_settings` and `m003_record_ids`. The types registry is part of every example server, so the record types are there.
+The log shows `Applying migration gear="construct"` for `initial_001`, `m002_subject_settings`, `m003_record_ids` and `m004_record_ids_key_only`, after graph storage's own migrations. The types registry is part of every example server, so the record types are there.
 
 ## Configuration
 
@@ -66,9 +94,28 @@ gears:
     config:
       personalization_default: true  # personalization for a new subject while no settings service answers (default: true)
       connectors_off: []             # connectors that are off, by the subject id (a UUID) of their login (default: none)
+      processing_identity: "22222222-0000-4000-8000-000000000001"  # Construct's service account for graph storage (default: none)
+      model:                         # the planner's model, an OAGW upstream (default: none, records are dropped)
+        upstream_alias: "llm"
+        model: "gpt-4.1"
+        timeout: 60s
+      processing:                    # all optional
+        queue_capacity: 256
+        workers: 4
+        max_rounds: 8
+        max_tokens: 32000
+        max_reruns: 2
+        run_without_sensitive_data_checks: false  # true to process while no sensitive-data check exists
+      admission:                     # all optional; the same rules for every tenant
+        confidence_floor: 0.6
+        max_steps: 100
+        max_value_chars: 1000
+        # trusted_connectors: [...]  # connector identities as UUIDs; absent: every connector is trusted
+        # entity_kinds: [...]        # absent: every entity kind is allowed
+      profile_category_check: per_category   # required with processing_identity; one_call only for a policy plugin that answers with category constraints
 ```
 
-An unknown key, or a value in `connectors_off` that is not a UUID, stops the gear from starting.
+An unknown key, a value in `connectors_off`, `processing_identity` or `trusted_connectors` that is not a UUID, a zero queue capacity, worker count, model round count or token count in `processing` (zero reruns is allowed), a queue capacity above 100000, more than 256 workers, more than 10 reruns, more than 64 model rounds, more than 1000000 tokens per record, a model call timeout under 1 second or above 600 seconds, the nil UUID as `processing_identity`, a processing identity without `profile_category_check` or `profile_category_check` without a processing identity, an entity kind that is not one of identity, role, skill or preference, a confidence floor outside 0 to 1, a step cap outside 1 to 10000, a value cap outside 1 to 100000, a model upstream alias that is not 1 to 63 letters, digits, `-` or `_`, starting with a letter or digit, or a model name that is not 1 to 128 printable characters with no space, stops the gear from starting. The processing identity needs graph storage's read, write, delete and type registration permissions, and the settings read, in every tenant.
 
 ## Examples
 
@@ -123,11 +170,29 @@ The same record with `"role":"system"` answers `422`:
 {"type":"gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~","title":"Invalid Argument","status":422,"detail":"Request validation failed","instance":"/construct/v1/records","context":{"field_violations":[{"field":"/payload/role","description":"enum","reason":"SCHEMA_VIOLATION"}],"resource_type":"gts.cf.connectors.core.record.v1~","resource_name":"gts.cf.connectors.core.record.v1~cf.construct.chat.message.v1~"}}
 ```
 
+### Read a profile
+
+The static AuthZ plugin of this example does not check who may name a tenant: any caller reads the profiles of the tenant it names in `tenant`. A real host needs a policy plugin that authorizes the caller for that tenant.
+
+```bash
+curl -s "http://127.0.0.1:8087/cf/construct/v1/subjects/5d1f2c3a-8b4e-4c6d-9a1b-2c3d4e5f6a7b/profile?tenant=00000000-df51-5b42-9538-d2b56b7ee953"
+```
+
+Response `200`, once a record was processed:
+
+```json
+{"subject_id":"5d1f2c3a-8b4e-4c6d-9a1b-2c3d4e5f6a7b","categories":[{"entity_kind":"skill","facts":[{"fact_id":"construct:00000000-df51-5b42-9538-d2b56b7ee953:0b7c...","property":"skills","value":{"name":"Rust"},"origin":{"kind":"connector"},"stored_at":"2026-09-10T09:13:07Z","produced_at":"2026-09-10T09:13:05Z"}]}]}
+```
+
+A subject without facts answers `{"subject_id":"…","categories":[]}`; a subject the caller may not act for answers `404`.
+
 ## Troubleshooting
 
 | Issue | Solution |
 |-------|----------|
 | The gear does not start | Check that the config has no unknown key and that every entry in `connectors_off` is a UUID. |
-| A received record changes nothing | Expected until the Planner exists: every received record is dropped, with a drop event in the log. |
+| A received record changes nothing | Without `processing_identity`, `model` and `processing.run_without_sensitive_data_checks: true`, every received record is dropped, with a drop event in the log and a start-up warning naming what is missing. With them, look for a drop event naming the stage and the reason. |
+| The profile read answers `501` | No `processing_identity` is configured. |
+| The profile read answers `503` | Graph storage, the settings service or the policy service cannot answer. |
 | `404` on `/cf/construct/...` | The example server was started without `--features construct`. |
 | Every record is `UNKNOWN_TYPE` | The record's `type` is not one of the registered connector record types; the SDK registers the base and four derived types. |

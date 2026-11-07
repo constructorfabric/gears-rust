@@ -968,6 +968,7 @@ ignored = [
     "authn-resolver",
     "authz-resolver",
     "credstore",
+    "graph-storage",
     "grpc_hub",
     "oagw",
     "resource-group",

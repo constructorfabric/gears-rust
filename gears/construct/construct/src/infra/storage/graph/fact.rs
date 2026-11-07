@@ -6,6 +6,7 @@ use time::{OffsetDateTime, UtcOffset};
 use crate::domain::error::DomainError;
 use crate::domain::plan::{Change, NodeKey, Origin, Plan, Property, Step};
 use crate::domain::profile::{Category, Fact};
+use crate::domain::profile_read::{OriginKind, StoredFact};
 
 /// What each source puts in a fact's origin: who produced it, how, and the
 /// model when an agent did.
@@ -191,4 +192,78 @@ pub fn fact_of(node: &NodeView) -> Result<Fact, DomainError> {
         property: property.clone(),
         value: value.clone(),
     })
+}
+
+/// Who a stored fact came from, from its payload: a record's fact names its
+/// record, and the other sources name their method. `None` for a payload that
+/// names neither, which only a defect writes.
+fn origin_kind(payload: &Map<String, Value>) -> Option<OriginKind> {
+    if payload.contains_key(RECORD) {
+        return Some(OriginKind::Connector);
+    }
+    match payload
+        .get(ORIGIN)
+        .and_then(|origin| origin.get("method"))
+        .and_then(Value::as_str)
+    {
+        Some(METHOD_MCP) => Some(OriginKind::Agent),
+        Some(METHOD_REVIEW) => Some(OriginKind::Reviewer),
+        Some(METHOD_ADMIN) => Some(OriginKind::Administrator),
+        _ => None,
+    }
+}
+
+/// The fact a stored node holds, as [`fact_of`] reads it, with its origin
+/// kind, when graph storage stored it, and when its source asserted it. A
+/// `produced_at` that does not parse is read as absent and logged.
+///
+/// # Errors
+///
+/// Every defect [`fact_of`] reports, and an origin that names no known
+/// source; each names the node's key and never a value.
+pub fn stored_fact_of(node: &NodeView) -> Result<StoredFact, DomainError> {
+    let Fact {
+        node_key,
+        category,
+        property,
+        value,
+    } = fact_of(node)?;
+    let payload = node
+        .payload
+        .as_ref()
+        .and_then(Value::as_object)
+        .ok_or_else(|| DomainError::internal(format!("fact {} has no payload", node.node_key)))?;
+    let origin = origin_kind(payload).ok_or_else(|| {
+        DomainError::internal(format!(
+            "fact {} has an origin of no known source",
+            node.node_key
+        ))
+    })?;
+    let produced_at = payload
+        .get(ORIGIN)
+        .and_then(|origin| origin.get("produced_at"))
+        .and_then(|at| produced_at(&node.node_key, at));
+    Ok(StoredFact {
+        node_key,
+        category,
+        property,
+        value,
+        origin,
+        stored_at: node.envelope.created_at,
+        produced_at,
+    })
+}
+
+/// A stored `produced_at`, none when it is not an RFC 3339 string; that is
+/// logged with why, as only a defect writes it.
+fn produced_at(node_key: &str, at: &Value) -> Option<OffsetDateTime> {
+    let Some(text) = at.as_str() else {
+        tracing::warn!(%node_key, "a stored fact's produced_at is not a string; it is served without it");
+        return None;
+    };
+    OffsetDateTime::parse(text, &Rfc3339)
+        .inspect_err(|error| {
+            tracing::warn!(%node_key, %error, "a stored fact's produced_at is not RFC 3339; it is served without it");
+        })
+        .ok()
 }

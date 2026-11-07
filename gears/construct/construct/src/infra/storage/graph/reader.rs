@@ -10,13 +10,14 @@ use toolkit_canonical_errors::CanonicalError;
 use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
-use super::fact::fact_of;
+use super::fact::{fact_of, stored_fact_of};
 use super::root::{ProfileVersion, Root, root_key};
 use super::{ContextSubject, DEFAULT_CALL_TIMEOUT, graph_error, subject_in_context, unanswered};
 use crate::domain::error::DomainError;
 use crate::domain::plan::NodeKey;
 use crate::domain::planner::processing::ProfileSource;
 use crate::domain::profile::{FactCount, FullProfile, Profile};
+use crate::domain::profile_read::{StoredFact, StoredProfiles};
 use crate::domain::subject_settings::SubjectKey;
 
 /// The most nodes one profile read takes: the root and its facts. Graph
@@ -147,9 +148,9 @@ pub(crate) async fn read_stored(
     })
 }
 
-/// [`ProfileSource`] over graph storage: the root and every fact one has-fact
-/// edge away from it, in one traversal. A fact listed for removal on the root
-/// is left out, also before its soft delete has run.
+/// [`ProfileSource`] and [`StoredProfiles`] over graph storage: the root and
+/// every fact one has-fact edge away from it, in one traversal. A fact listed
+/// for removal on the root is left out, also before its soft delete has run.
 ///
 /// @cpt-dod:cpt-cf-construct-dod-profile-writer-read:p1
 pub struct GraphProfileSource {
@@ -214,5 +215,46 @@ impl ProfileSource for GraphProfileSource {
             facts,
         })
         // @cpt-end:cpt-cf-construct-algo-profile-writer-read:p1:inst-read-facts
+    }
+}
+
+/// @cpt-dod:cpt-cf-construct-dod-profile-reader-stored:p1
+#[async_trait]
+impl StoredProfiles for GraphProfileSource {
+    #[tracing::instrument(skip_all, fields(tenant_id = %key.tenant_id, subject_id = %key.subject_id))]
+    async fn stored(
+        &self,
+        ctx: &SecurityContext,
+        key: SubjectKey,
+    ) -> Result<Vec<StoredFact>, DomainError> {
+        // @cpt-begin:cpt-cf-construct-algo-profile-reader-read:p1:inst-read-stored
+        let subject = subject_in_context(ctx, key)?;
+        let stored = read_stored(
+            self.client.as_ref(),
+            self.version.as_ref(),
+            self.timeout,
+            ctx,
+            &subject,
+        )
+        .await?;
+        // A malformed fact is left out here, while the planner's read fails
+        // on it: an application is better served by the rest of the profile,
+        // whereas a plan built on a partial profile could add what is stored.
+        let listed = &stored.root.removals;
+        Ok(stored
+            .facts
+            .iter()
+            .filter(|node| !listed.contains(node.node_key.as_str()))
+            .filter_map(|node| {
+                stored_fact_of(node)
+                    .inspect_err(|defect| {
+                        // Only Construct writes these nodes, so this is a
+                        // defect, not a state a reader should see in silence.
+                        tracing::error!(%defect, "a stored fact cannot be read; it is not served");
+                    })
+                    .ok()
+            })
+            .collect())
+        // @cpt-end:cpt-cf-construct-algo-profile-reader-read:p1:inst-read-stored
     }
 }
