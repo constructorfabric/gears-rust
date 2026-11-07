@@ -26,8 +26,8 @@ use crate::domain::record_intake::{IntakeEvents, ReceivedRecord};
 use crate::domain::sensitive_data::{SensitiveDataCheck, SensitiveDataChecks};
 use crate::domain::subject_settings::SubjectSettings;
 use crate::test_support::{
-    FixedRules, FixedSubjectSettings, RecordingAdmissionEvents, RecordingEvents, open_rules,
-    processing_context,
+    FixedRules, FixedSubjectSettings, RecordingAdmissionEvents, RecordingEvents, context_of,
+    open_rules, processing_context,
 };
 
 pub(super) const TENANT: Uuid = Uuid::from_u128(0x6b1f_0c2a_93d4_4e8f_a1b2_c3d4_e5f6_0718);
@@ -188,6 +188,9 @@ pub(super) fn done(input_tokens: u64) -> ModelResponse {
     }
 }
 
+/// The processing identity [`Contexts`] gives in every tenant.
+pub(super) const CONSTRUCT: Uuid = Uuid::from_u128(0xc0c0);
+
 pub(super) struct Contexts(pub(super) bool);
 
 #[async_trait]
@@ -197,30 +200,36 @@ impl ProcessingContexts for Contexts {
         tenant_id: Uuid,
     ) -> Result<(SecurityContext, AccessScope), DomainError> {
         if self.0 {
-            Ok(processing_context(tenant_id))
+            Ok((
+                context_of(CONSTRUCT, tenant_id),
+                AccessScope::for_tenant(tenant_id),
+            ))
         } else {
-            Err(DomainError::Unavailable("no token".to_owned()))
+            Err(DomainError::NotConfigured(
+                "no processing identity".to_owned(),
+            ))
         }
     }
 }
 
+/// The profile of [`profile`], for the test's subject. It keeps the subject of the context of each read.
 #[derive(Default)]
 pub(super) struct Profiles {
     pub(super) failing: bool,
     pub(super) hanging: bool,
-    pub(super) reads: Mutex<usize>,
+    pub(super) readers: Mutex<Vec<Uuid>>,
 }
 
 #[async_trait]
 impl ProfileSource for Profiles {
     async fn read(
         &self,
-        _: &SecurityContext,
+        ctx: &SecurityContext,
         tenant_id: Uuid,
         subject_id: Uuid,
     ) -> Result<Profile, DomainError> {
         assert_eq!((tenant_id, subject_id), (TENANT, SUBJECT));
-        *self.reads.lock().expect("lock") += 1;
+        self.readers.lock().expect("lock").push(ctx.subject_id());
         if self.hanging {
             std::future::pending::<()>().await;
         }
@@ -232,9 +241,12 @@ impl ProfileSource for Profiles {
     }
 }
 
+/// Answers each write in turn, the last answer for every write past them. It keeps each plan and the subject of the
+/// context it was written as.
 pub(super) struct Writer {
     pub(super) answers: Mutex<VecDeque<Result<Written, ()>>>,
     pub(super) plans: Mutex<Vec<Plan>>,
+    pub(super) writers: Mutex<Vec<Uuid>>,
     pub(super) takes: Duration,
 }
 
@@ -243,6 +255,7 @@ impl Writer {
         Arc::new(Self {
             answers: Mutex::new(answers.iter().copied().collect()),
             plans: Mutex::default(),
+            writers: Mutex::default(),
             takes: Duration::ZERO,
         })
     }
@@ -250,13 +263,18 @@ impl Writer {
     pub(super) fn plans(&self) -> Vec<Plan> {
         self.plans.lock().expect("lock").clone()
     }
+
+    pub(super) fn writers(&self) -> Vec<Uuid> {
+        self.writers.lock().expect("lock").clone()
+    }
 }
 
 #[async_trait]
 impl PlanWriter for Writer {
-    async fn write(&self, _: &SecurityContext, plan: &Plan) -> Result<Written, DomainError> {
+    async fn write(&self, ctx: &SecurityContext, plan: &Plan) -> Result<Written, DomainError> {
         tokio::time::sleep(self.takes).await;
         self.plans.lock().expect("lock").push(plan.clone());
+        self.writers.lock().expect("lock").push(ctx.subject_id());
         let mut answers = self.answers.lock().expect("lock");
         let answer = if answers.len() > 1 {
             answers.pop_front()
@@ -336,7 +354,11 @@ impl Chain {
     }
 
     pub(super) fn reads(&self) -> usize {
-        *self.profiles.reads.lock().expect("lock")
+        self.profiles.readers.lock().expect("lock").len()
+    }
+
+    pub(super) fn readers(&self) -> Vec<Uuid> {
+        self.profiles.readers.lock().expect("lock").clone()
     }
 }
 
