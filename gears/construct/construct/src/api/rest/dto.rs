@@ -6,6 +6,7 @@ use crate::domain::planner::processing::{Changes, Managed};
 use crate::domain::profile::Category;
 use crate::domain::profile_read::{OriginKind, ProfileView, StoredFact};
 use crate::domain::record_intake::IntakeOutcome;
+use crate::domain::subject_control::{SubjectExport, SubjectFactsPage};
 use crate::domain::subject_settings::SubjectSettings;
 
 /// One connector record, as JSON. Intake checks it against its GTS type, so
@@ -302,6 +303,77 @@ impl From<ProfileView> for ProfileDto {
                     facts: group.facts.into_iter().map(Into::into).collect(),
                 })
                 .collect(),
+        }
+    }
+}
+
+/// One of the subject's facts: the profile read's fact with its category.
+///
+/// @cpt-dod:cpt-cf-construct-dod-subject-control-view:p1
+#[derive(Debug)]
+#[toolkit_macros::api_dto(response)]
+pub struct SubjectFactDto {
+    pub entity_kind: EntityKindDto,
+    #[serde(flatten)]
+    pub fact: ProfileFactDto,
+}
+
+impl From<StoredFact> for SubjectFactDto {
+    fn from(fact: StoredFact) -> Self {
+        Self {
+            entity_kind: fact.category.into(),
+            fact: fact.into(),
+        }
+    }
+}
+
+/// A page of the subject's facts, and the version of the profile it was
+/// cut from: a client polls the version to see whether anything changed.
+#[derive(Debug)]
+#[toolkit_macros::api_dto(response)]
+pub struct SubjectFactsPageDto {
+    pub items: Vec<SubjectFactDto>,
+    pub page_info: toolkit_odata::PageInfo,
+    /// The profile's version; none for a subject without a profile.
+    pub version: Option<u64>,
+}
+
+impl From<SubjectFactsPage> for SubjectFactsPageDto {
+    fn from(page: SubjectFactsPage) -> Self {
+        Self {
+            items: page.page.items.into_iter().map(Into::into).collect(),
+            page_info: page.page.page_info,
+            version: page.version,
+        }
+    }
+}
+
+/// All of a subject's data, as the export file holds it.
+///
+/// @cpt-dod:cpt-cf-construct-dod-subject-control-export:p1
+#[derive(Debug)]
+#[toolkit_macros::api_dto(response)]
+pub struct SubjectExportDto {
+    #[schema(value_type = String)]
+    pub tenant_id: Uuid,
+    #[schema(value_type = String)]
+    pub subject_id: Uuid,
+    #[serde(with = "time::serde::rfc3339")]
+    #[schema(value_type = String, format = DateTime)]
+    pub exported_at: OffsetDateTime,
+    pub settings: SubjectSettingsDto,
+    pub facts: Vec<SubjectFactDto>,
+}
+
+impl SubjectExportDto {
+    #[must_use]
+    pub fn new(export: SubjectExport, exported_at: OffsetDateTime) -> Self {
+        Self {
+            tenant_id: export.tenant_id,
+            subject_id: export.subject_id,
+            exported_at,
+            settings: SubjectSettingsDto::new(export.subject_id, export.settings),
+            facts: export.facts.into_iter().map(Into::into).collect(),
         }
     }
 }

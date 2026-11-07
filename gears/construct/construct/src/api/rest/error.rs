@@ -2,6 +2,7 @@ use toolkit_canonical_errors::{CanonicalError, Http, resource_error};
 use uuid::Uuid;
 
 use crate::domain::error::DomainError;
+use crate::domain::pagination::QueryError;
 use crate::domain::record_intake::Refusal;
 use crate::domain::settings_scope::SettingsOutOfScope;
 
@@ -115,6 +116,8 @@ pub fn for_settings(e: DomainError) -> CanonicalError {
         // any other error.
         e @ (DomainError::Refused(_)
         | DomainError::Unavailable(_)
+        | DomainError::NoSuchFact(_)
+        | DomainError::InvalidQuery(_)
         | DomainError::Internal(_)
         | DomainError::ProfileFull(_)
         | DomainError::Database(_)) => e.into(),
@@ -125,12 +128,54 @@ pub fn for_settings(e: DomainError) -> CanonicalError {
 #[resource_error(gts_id!("cf.construct.subject.fact.v1~"))]
 pub struct SubjectFactsError;
 
+/// A fact the subject does not have, answered like a subject that does not
+/// exist.
+#[must_use]
+pub fn no_such_fact(subject_id: Uuid) -> CanonicalError {
+    SubjectFactsError::not_found("no such fact")
+        .with_resource(subject_id.to_string())
+        .create()
+}
+
 /// A manage-facts field longer than its limit, as an invalid-argument problem that names the field.
 #[must_use]
 pub fn too_long(field: &str, limit: usize) -> CanonicalError {
     SubjectFactsError::invalid_argument()
         .with_field_violation(field, format!("at most {limit} characters"), "too_long")
         .create()
+}
+
+/// The REST answer for a domain error on the export. The data protection
+/// officer is told a refusal as such, 403, since the export is not the
+/// subject's own data; a subject without data in the tenant exports empty
+/// and never reaches here.
+///
+/// @cpt-dod:cpt-cf-construct-dod-subject-control-export:p1
+#[must_use]
+pub fn for_export(e: DomainError) -> CanonicalError {
+    match e {
+        DomainError::Forbidden(msg) => {
+            tracing::warn!(msg = %msg, "construct subject export refused");
+            SubjectFactsError::permission_denied()
+                .with_reason("ACCESS_DENIED")
+                .create()
+        }
+        DomainError::OutOfScope(refused) => {
+            log_out_of_scope(&refused);
+            SubjectFactsError::permission_denied()
+                .with_reason("ACCESS_DENIED")
+                .create()
+        }
+        e @ (DomainError::Refused(_)
+        | DomainError::Unavailable(_)
+        | DomainError::NotConfigured(_)
+        | DomainError::NoSuchFact(_)
+        | DomainError::InvalidQuery(_)
+        | DomainError::Internal(_)
+        | DomainError::ProfileFull(_)
+        | DomainError::NotVisible(_)
+        | DomainError::Database(_)) => e.into(),
+    }
 }
 
 /// The REST answer for a domain error on the manage-facts route. A subject the caller may not act for, or whose
@@ -157,6 +202,12 @@ pub fn for_facts(e: DomainError, subject_id: Uuid) -> CanonicalError {
                 .with_resource(subject_id.to_string())
                 .create()
         }
+        // A fact the subject does not have answers like a subject that
+        // does not exist.
+        DomainError::NoSuchFact(msg) => {
+            tracing::warn!(msg = %msg, "construct subject fact not found");
+            no_such_fact(subject_id)
+        }
         // Answered on the subject facts resource, not as a profile's.
         DomainError::NotVisible(msg) => {
             tracing::warn!(msg = %msg, "construct subject facts not visible");
@@ -170,6 +221,7 @@ pub fn for_facts(e: DomainError, subject_id: Uuid) -> CanonicalError {
         }
         e @ (DomainError::Refused(_)
         | DomainError::Unavailable(_)
+        | DomainError::InvalidQuery(_)
         | DomainError::Internal(_)
         | DomainError::ProfileFull(_)
         | DomainError::Database(_)) => e.into(),
@@ -224,6 +276,25 @@ impl From<DomainError> for CanonicalError {
             DomainError::NotConfigured(msg) => {
                 tracing::error!(msg = %msg, "construct is not configured for this call");
                 ProfileError::unimplemented("this deployment does not provide this call").create()
+            }
+            DomainError::NoSuchFact(msg) => {
+                tracing::warn!(msg = %msg, "construct subject fact not found");
+                SubjectFactsError::not_found("no such fact")
+                    .with_resource("fact")
+                    .create()
+            }
+            // The caller's query does not fit the list; the field violation
+            // says which part, so a client can tell them apart.
+            DomainError::InvalidQuery(err) => {
+                let (field, detail, reason) = match err {
+                    QueryError::Filter(detail) => ("$filter", detail, "invalid_filter"),
+                    QueryError::Order(detail) => ("$orderby", detail, "invalid_order"),
+                    QueryError::Cursor(detail) => ("cursor", detail, "invalid_cursor"),
+                    QueryError::Select(detail) => ("$select", detail, "unsupported_select"),
+                };
+                SubjectFactsError::invalid_argument()
+                    .with_field_violation(field, detail, reason)
+                    .create()
             }
             // A full profile takes no new fact until facts are removed: the
             // caller's state, not the gear's failure. The subject stays in the

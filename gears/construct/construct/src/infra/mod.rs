@@ -21,6 +21,7 @@ pub mod record_types;
 #[cfg(test)]
 mod record_types_test;
 pub mod storage;
+pub mod subject_control_events;
 pub mod tenant_defaults;
 #[cfg(test)]
 mod tenant_defaults_test;

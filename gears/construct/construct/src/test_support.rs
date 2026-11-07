@@ -128,6 +128,22 @@ impl AuthZResolverApi for DenyResolver {
     }
 }
 
+/// Answers as [`AllowResolver`] once `delay` has passed: a stalled policy
+/// service.
+pub struct SlowResolver(pub std::time::Duration);
+
+#[async_trait]
+impl AuthZResolverApi for SlowResolver {
+    async fn evaluate(
+        &self,
+        ctx: PlatformSecurityContext,
+        request: EvaluationRequest,
+    ) -> Result<EvaluationResponse, CanonicalError> {
+        tokio::time::sleep(self.0).await;
+        AllowResolver.evaluate(ctx, request).await
+    }
+}
+
 pub async fn inmem_db() -> Db {
     use sea_orm_migration::MigratorTrait;
 
@@ -1047,3 +1063,235 @@ pub const SECURITY_HEADERS: [(&str, &str); 9] = [
     ("x-permitted-cross-domain-policies", "none"),
     ("x-dns-prefetch-control", "off"),
 ];
+
+// --- Subject control ---
+
+/// A stored fact of `category` with one property, stored at `stored_at`
+/// seconds after the epoch.
+pub fn stored_fact(
+    category: crate::domain::profile::Category,
+    property: &str,
+    value: serde_json::Value,
+    stored_at: i64,
+) -> crate::domain::profile_read::StoredFact {
+    crate::domain::profile_read::StoredFact {
+        node_key: NodeKey(format!("construct:t:{}", Uuid::new_v4())),
+        category,
+        property: property.to_owned(),
+        value,
+        origin: crate::domain::profile_read::OriginKind::Connector,
+        stored_at: time::OffsetDateTime::from_unix_timestamp(stored_at).unwrap(),
+        produced_at: None,
+    }
+}
+
+/// One subject's profile in memory: its version and live facts. It keeps
+/// each read: the subject of the context it was read with, and the key.
+/// Each read takes `delay` first, and fails as larger than one read takes
+/// while `too_large` is set.
+#[derive(Default)]
+pub struct MemoryProfile {
+    pub version: std::sync::Mutex<Option<u64>>,
+    pub facts: std::sync::Mutex<Vec<crate::domain::profile_read::StoredFact>>,
+    pub reads: std::sync::Mutex<Vec<(Uuid, SubjectKey)>>,
+    pub delay: std::sync::Mutex<std::time::Duration>,
+    pub too_large: std::sync::atomic::AtomicBool,
+}
+
+impl MemoryProfile {
+    pub fn with(facts: Vec<crate::domain::profile_read::StoredFact>) -> Arc<Self> {
+        Arc::new(Self {
+            version: std::sync::Mutex::new(Some(1)),
+            facts: std::sync::Mutex::new(facts),
+            reads: std::sync::Mutex::default(),
+            delay: std::sync::Mutex::default(),
+            too_large: std::sync::atomic::AtomicBool::new(false),
+        })
+    }
+
+    pub fn live(&self) -> Vec<crate::domain::profile_read::StoredFact> {
+        self.facts.lock().unwrap().clone()
+    }
+}
+
+#[async_trait]
+impl crate::domain::subject_control::SubjectProfiles for MemoryProfile {
+    async fn facts(
+        &self,
+        ctx: &SecurityContext,
+        key: SubjectKey,
+    ) -> Result<crate::domain::subject_control::SubjectFacts, DomainError> {
+        self.reads.lock().unwrap().push((ctx.subject_id(), key));
+        let delay = *self.delay.lock().unwrap();
+        if !delay.is_zero() {
+            tokio::time::sleep(delay).await;
+        }
+        if self.too_large.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(DomainError::ProfileFull(
+                crate::domain::profile::FullProfile {
+                    subject: key,
+                    facts: crate::domain::profile::FactCount::AtLeast(1000),
+                    limit: 999,
+                },
+            ));
+        }
+        Ok(crate::domain::subject_control::SubjectFacts {
+            version: *self.version.lock().unwrap(),
+            facts: self.live(),
+        })
+    }
+}
+
+/// A plan writer over a [`MemoryProfile`]: it answers a conflict for the
+/// first `conflicts` writes, each time as if someone else had written, and
+/// then removes the plan's facts and moves the version on. It keeps every
+/// plan and the subject of the context it was written with.
+pub struct MemoryWriter {
+    profile: Arc<MemoryProfile>,
+    conflicts: std::sync::Mutex<u32>,
+    /// Whether the write that answers a conflict also removed the plan's
+    /// facts, as another writer removing the same fact would.
+    racing: bool,
+    pub plans: std::sync::Mutex<Vec<(Uuid, Plan)>>,
+}
+
+impl MemoryWriter {
+    pub fn new(profile: Arc<MemoryProfile>, conflicts: u32) -> Arc<Self> {
+        Arc::new(Self {
+            profile,
+            conflicts: std::sync::Mutex::new(conflicts),
+            racing: false,
+            plans: std::sync::Mutex::default(),
+        })
+    }
+
+    /// A writer whose first write conflicts because another writer removed
+    /// the plan's facts just before.
+    pub fn racing(profile: Arc<MemoryProfile>) -> Arc<Self> {
+        Arc::new(Self {
+            profile,
+            conflicts: std::sync::Mutex::new(1),
+            racing: true,
+            plans: std::sync::Mutex::default(),
+        })
+    }
+
+    fn remove(&self, plan: &Plan) {
+        let removed: Vec<&NodeKey> = plan
+            .steps
+            .iter()
+            .filter_map(|step| match &step.change {
+                Change::RemoveEntity { entity } => Some(entity),
+                _ => None,
+            })
+            .collect();
+        self.profile
+            .facts
+            .lock()
+            .unwrap()
+            .retain(|fact| !removed.contains(&&fact.node_key));
+    }
+
+    pub fn plans(&self) -> Vec<Plan> {
+        self.plans
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, plan)| plan.clone())
+            .collect()
+    }
+}
+
+#[async_trait]
+impl crate::domain::planner::processing::PlanWriter for MemoryWriter {
+    async fn write(
+        &self,
+        ctx: &SecurityContext,
+        plan: &Plan,
+    ) -> Result<crate::domain::planner::processing::Written, DomainError> {
+        use crate::domain::planner::processing::Written;
+        self.plans
+            .lock()
+            .unwrap()
+            .push((ctx.subject_id(), plan.clone()));
+        let mut version = self.profile.version.lock().unwrap();
+        if *version != plan.profile_version {
+            return Ok(Written::Conflict);
+        }
+        let mut conflicts = self.conflicts.lock().unwrap();
+        *version = Some(version.unwrap_or(0) + 1);
+        if *conflicts > 0 {
+            *conflicts -= 1;
+            if self.racing {
+                self.remove(plan);
+            }
+            return Ok(Written::Conflict);
+        }
+        self.remove(plan);
+        Ok(Written::Stored)
+    }
+}
+
+/// Keeps every Subject Control event.
+#[derive(Default)]
+pub struct RecordingSubjectControlEvents {
+    pub events: std::sync::Mutex<Vec<crate::domain::subject_control::SubjectControlEvent>>,
+}
+
+impl RecordingSubjectControlEvents {
+    pub fn taken(&self) -> Vec<crate::domain::subject_control::SubjectControlEvent> {
+        self.events.lock().unwrap().clone()
+    }
+}
+
+impl crate::domain::subject_control::SubjectControlEvents for RecordingSubjectControlEvents {
+    fn record(&self, event: crate::domain::subject_control::SubjectControlEvent) {
+        self.events.lock().unwrap().push(event);
+    }
+}
+
+/// Subject Control over `profile` and `writer`, read and written as the
+/// processing identity `identity`, with the settings `settings`, the policy
+/// service `resolver`, and at most two reruns.
+pub fn subject_control(
+    resolver: Arc<dyn AuthZResolverApi>,
+    profile: Arc<MemoryProfile>,
+    writer: Arc<MemoryWriter>,
+    settings: Arc<dyn SubjectSettingsReader>,
+    events: Arc<RecordingSubjectControlEvents>,
+    identity: Option<Uuid>,
+) -> crate::domain::subject_control::SubjectControlService {
+    use crate::domain::subject_control::{SubjectControlPorts, SubjectControlService};
+    let contexts: Arc<dyn crate::domain::planner::processing::ProcessingContexts> = match identity {
+        Some(identity) => Arc::new(crate::infra::processing_contexts::ServiceIdentity::new(
+            identity,
+        )),
+        None => Arc::new(NoProcessingIdentity),
+    };
+    SubjectControlService::new(
+        SubjectControlPorts {
+            profiles: profile,
+            writer,
+            contexts,
+            settings,
+            events,
+        },
+        PolicyEnforcer::new(resolver),
+        2,
+    )
+}
+
+/// No processing identity: every tenant is not configured.
+pub struct NoProcessingIdentity;
+
+#[async_trait]
+impl crate::domain::planner::processing::ProcessingContexts for NoProcessingIdentity {
+    async fn for_tenant(
+        &self,
+        _tenant_id: Uuid,
+    ) -> Result<(SecurityContext, AccessScope), DomainError> {
+        Err(DomainError::NotConfigured(
+            "no processing identity is configured".to_owned(),
+        ))
+    }
+}

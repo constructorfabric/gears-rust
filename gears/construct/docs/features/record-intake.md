@@ -58,7 +58,7 @@ The PRD requires Construct to take records one at a time, check each against its
 - `UNKNOWN_TYPE` and `CONNECTOR_OFF` can clear: once the type is registered, or the tenant turns the connector on.
 - `PERSONALIZATION_OFF` and `ERASURE_IN_PROGRESS` are final for the record, though the state behind them can change: a connector **MUST NOT** send such a record again, so data from a time the subject opted out, or data an erasure removed, never comes back. Construct does not remember refusals, so it cannot enforce this; it is the connector's rule.
 
-**Without processing.** Where no processing identity or no model is configured, the stub takes every record and drops it, with a drop event: intake answers `202` and keeps the identity. A record received while the stub is wired in is not processed, and a resend once processing is configured is a repeat. Records the stub takes are development data: an environment that took records with the stub is reset when processing is configured.
+**Without processing.** Where no processing identity, no model or no opt-in to processing without sensitive-data checks is configured, the stub takes every record and drops it, with a drop event: intake answers `202` and keeps the identity. A record received while the stub is wired in is not processed, and a resend once processing is configured is a repeat. Records the stub takes are development data: an environment that took records with the stub is reset when processing is configured.
 
 **Out of scope**:
 
@@ -154,7 +154,7 @@ The PRD requires Construct to take records one at a time, check each against its
 **Output**: Taken, or refused with an unavailable error. The hand-off returns at once; the Planner's implementation puts the record on a bounded queue and refuses when it is full.
 
 **Steps**:
-1. [x] - `p1` - Until the Planner's entry point exists, take every record and drop it: write a drop event (stage `planner`, reason `no_planner`, `cpt-cf-construct-algo-record-intake-drop-event`) and **RETURN** taken, so intake commits the identity and answers `202` - `inst-hand-off-drop`
+1. [x] - `p1` - Where processing is not configured (no processing identity, no model or no opt-in to processing without sensitive-data checks), take every record and drop it: write a drop event (stage `planner`, reason `no_planner`, `cpt-cf-construct-algo-record-intake-drop-event`) and **RETURN** taken, so intake commits the identity and answers `202` - `inst-hand-off-drop`
 
 ### Write a Drop Event
 
@@ -162,7 +162,7 @@ The PRD requires Construct to take records one at a time, check each against its
 
 **Input**: A received record that processing drops, the stage that drops it, and the reason.
 
-**Output**: One content-free event: tenant, subject, connector, record key (never the provenance or the version), record type, stage (`planner`, `checks`, `admission`, `writer`) and reason: `no_planner` and `processing_failed`, and, from the Sensitive-Data Checks and Admission, `check_failed`, `personalization_off`, `erasure_in_progress`, `untrusted_source`, `below_confidence_floor`, `entity_kind_not_allowed` and `write_cap_exceeded`. A plan with no record behind it (an agent's, a reviewer's or an administrator's) has no drop event; its caller gets the reason in the result.
+**Output**: One content-free event: tenant, subject, connector, record key (never the provenance or the version), record type, stage (`planner`, `checks`, `admission`, `writer`, `worker`) and reason: `no_planner` and `processing_failed`, and, from the Sensitive-Data Checks and Admission, `check_failed`, `personalization_off`, `erasure_in_progress`, `untrusted_source`, `below_confidence_floor`, `entity_kind_not_allowed` and `write_cap_exceeded`. A plan with no record behind it (an agent's, a reviewer's or an administrator's) has no drop event; its caller gets the reason in the result.
 
 **Steps**:
 1. [x] - `p1` - Write the event to the structured log at warn level under the target `construct::audit`, until the Audit gear ships. The subject is a plain id, only when the record names one; no record content is written. The Planner, the Sensitive-Data Checks, Admission and the Profile Writer emit it - `inst-drop-event-log`
@@ -231,7 +231,7 @@ Intake **MUST** read whether a connector is on through one interface. Its first 
 
 - [x] `p1` - **ID**: `cpt-cf-construct-dod-record-intake-hand-off`
 
-A received record **MUST** go to processing through one interface that returns at once and can refuse. It **MUST** carry the tenant, the connector identity and the record, and **MUST NOT** carry the caller's security context or scope; processing builds its own for the tenant. Until the Planner exists, the wired-in hand-off **MUST** take every record and emit the drop event, so intake answers `202` and keeps the identity. A hand-off that refuses **MUST** leave no identity behind.
+A received record **MUST** go to processing through one interface that returns at once and can refuse. It **MUST** carry the tenant, the connector identity and the record, and **MUST NOT** carry the caller's security context or scope; processing builds its own for the tenant. Where processing is not configured, the wired-in hand-off **MUST** take every record and emit the drop event, so intake answers `202` and keeps the identity; where it is configured, the hand-off **MUST** put the record on a bounded queue and refuse when the queue is full. A hand-off that refuses **MUST** leave no identity behind.
 
 **Implements**:
 - `cpt-cf-construct-algo-record-intake-hand-off`
@@ -247,7 +247,7 @@ The system **MUST** define one content-free drop event (tenant, subject, connect
 **Implements**:
 - `cpt-cf-construct-algo-record-intake-drop-event`
 
-**Verified by**: `a_drop_event_names_the_record_its_stage_and_its_reason`, `the_drop_event_is_logged_without_record_content` (captures the log). The stub, the Sensitive-Data Checks and Admission emit it today (`a_failed_check_drops_the_record_with_a_drop_event`, `an_admission_drop_is_logged_in_the_record_drop_shape_without_content`); the Planner and the writer will.
+**Verified by**: `a_drop_event_names_the_record_its_stage_and_its_reason`, `the_drop_event_is_logged_without_record_content` (captures the log). The stub, the Sensitive-Data Checks and Admission emit it today (`a_failed_check_drops_the_record_with_a_drop_event`, `an_admission_drop_is_logged_in_the_record_drop_shape_without_content`); processing emits it for the Planner, the writer and the worker (`a_conflict_on_every_rerun_drops_the_record_at_the_writer`).
 
 ### Intake Route
 
@@ -281,7 +281,7 @@ The system **MUST** register `POST /construct/v1/records` with OperationBuilder,
 - [ ] A connector without permission for the record's tenant is refused (`a_connector_without_permission_is_refused_before_the_record_is_checked`, `a_connector_authorized_only_for_its_own_tenant_cannot_write_into_another`, `a_connector_without_permission_gets_403`).
 - [ ] Records are refused while personalization is off or an erasure is under way, and when the connector is off (`personalization_off_for_the_subject_is_refused`, `an_erasure_under_way_is_refused_even_with_personalization_on`, `a_connector_that_is_off_is_refused`).
 - [ ] A record of a registered derived type is taken with no type-specific code: one schema check covers every type (`a_valid_record_of_every_derived_type_passes`, `a_record_without_a_subject_skips_the_subject_checks`).
-- [ ] Until the Planner exists, a record is answered `202` and dropped with a drop event, and its identity is kept (`until_the_planner_exists_a_record_is_received_and_dropped_with_an_event`, `until_the_planner_exists_a_record_gets_202_and_a_resend_200`).
+- [ ] Where processing is not configured, a record is answered `202` and dropped with a drop event, and its identity is kept (`until_the_planner_exists_a_record_is_received_and_dropped_with_an_event`, `until_the_planner_exists_a_record_gets_202_and_a_resend_200`).
 - [ ] The tests named in this document pass. They run on an in-memory SQLite database.
 
 ## 7. Non-Functional Considerations

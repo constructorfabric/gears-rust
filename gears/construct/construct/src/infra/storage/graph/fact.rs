@@ -67,6 +67,12 @@ fn origin(plan: &Plan, step: &Step, now: OffsetDateTime) -> Result<Value, Domain
         Origin::Administrator { administrator } => {
             (administrator.to_string(), METHOD_ADMIN, None, now)
         }
+        // A subject's plan only removes facts, so it never stores one.
+        Origin::Subject { .. } => {
+            return Err(DomainError::internal(
+                "a subject's own plan stores no fact; it only removes",
+            ));
+        }
     };
     let mut origin = json!({
         "produced_by": { "subject_id": produced_by },

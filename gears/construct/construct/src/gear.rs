@@ -19,7 +19,9 @@ use construct_sdk::ConstructClientV1;
 use graph_storage_sdk::GraphStorageClientV1;
 
 use crate::api::rest::routes;
-use crate::api::rest::types::{ConcreteIntake, ConcreteProfile, ConcreteSettings};
+use crate::api::rest::types::{
+    ConcreteIntake, ConcreteProfile, ConcreteSettings, ConcreteSubjectControl,
+};
 use crate::config::ConstructConfig;
 use crate::domain::local_client::LocalClient;
 use crate::domain::record_intake::{IntakePorts, RecordIntakeService};
@@ -46,6 +48,7 @@ pub struct ConstructGear {
     intake: OnceLock<Arc<ConcreteIntake>>,
     settings: OnceLock<Arc<ConcreteSettings>>,
     profile: OnceLock<Arc<ConcreteProfile>>,
+    subject_control: OnceLock<Arc<ConcreteSubjectControl>>,
     /// The processing worker, until `start` takes it.
     worker: Mutex<Option<Worker>>,
     running: Mutex<Option<Running>>,
@@ -64,6 +67,7 @@ impl Default for ConstructGear {
             intake: OnceLock::new(),
             settings: OnceLock::new(),
             profile: OnceLock::new(),
+            subject_control: OnceLock::new(),
             worker: Mutex::new(None),
             running: Mutex::new(None),
         }
@@ -141,6 +145,9 @@ impl Gear for ConstructGear {
         self.profile
             .set(Arc::clone(&profile))
             .map_err(|_| anyhow::anyhow!("{} gear already initialized", Self::MODULE_NAME))?;
+        self.subject_control
+            .set(pipeline.subject_control)
+            .map_err(|_| anyhow::anyhow!("{} gear already initialized", Self::MODULE_NAME))?;
         *self.worker.lock() = pipeline.worker;
         let ports = IntakePorts {
             types,
@@ -199,7 +206,14 @@ impl toolkit::contracts::RestApiCapability for ConstructGear {
             .map(Arc::clone)
             .ok_or_else(|| anyhow::anyhow!("Profile read not initialized"))?;
 
+        let subject_control = self
+            .subject_control
+            .get()
+            .map(Arc::clone)
+            .ok_or_else(|| anyhow::anyhow!("Subject control not initialized"))?;
+
         let router = routes::register_routes(router, openapi, intake, settings, profile);
+        let router = routes::register_subject_control_routes(router, openapi, subject_control);
         info!("Construct gear: REST routes registered");
         Ok(router)
         // @cpt-end:cpt-cf-construct-algo-gear-foundation-start-gear:p1:inst-start-rest

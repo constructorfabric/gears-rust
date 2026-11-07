@@ -2593,6 +2593,7 @@ dependencies = [
  "cf-gears-toolkit-gts",
  "cf-gears-toolkit-macros",
  "cf-gears-toolkit-odata",
+ "cf-gears-toolkit-odata-macros",
  "cf-gears-toolkit-security",
  "cf-gears-toolkit-utils",
  "cf-gears-types-registry",

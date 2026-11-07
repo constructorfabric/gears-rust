@@ -47,6 +47,10 @@ pub enum Origin {
     Reviewer { reviewer: Uuid },
     /// A tenant administrator's added or edited fact.
     Administrator { administrator: Uuid },
+    /// The subject's own delete of one of its facts. Subject Control builds
+    /// the only such plan, with one removal; it never reaches Admission, and
+    /// the writer refuses to store a fact from it.
+    Subject { subject: Uuid },
 }
 
 impl Origin {
@@ -65,6 +69,7 @@ impl Origin {
             Self::Agent { .. } => "agent",
             Self::Reviewer { .. } => "reviewer",
             Self::Administrator { .. } => "administrator",
+            Self::Subject { .. } => "subject",
         }
     }
 
@@ -75,7 +80,8 @@ impl Origin {
             Self::Connector { connector, .. } => connector.clone(),
             Self::Agent { agent: id }
             | Self::Reviewer { reviewer: id }
-            | Self::Administrator { administrator: id } => id.to_string(),
+            | Self::Administrator { administrator: id }
+            | Self::Subject { subject: id } => id.to_string(),
         }
     }
 }

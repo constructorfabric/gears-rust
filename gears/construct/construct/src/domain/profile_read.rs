@@ -52,6 +52,19 @@ pub enum OriginKind {
     Administrator,
 }
 
+impl OriginKind {
+    /// The origin's name on the wire and in a list's `origin` field.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Connector => "connector",
+            Self::Agent => "agent",
+            Self::Reviewer => "reviewer",
+            Self::Administrator => "administrator",
+        }
+    }
+}
+
 /// One stored fact as a reader sees it: its key, category, property and value,
 /// who it came from, when it was stored, and when its source asserted it.
 #[domain_model]
@@ -242,8 +255,9 @@ fn granted_by(constraint: &ScopeConstraint, key: SubjectKey) -> Option<Grant> {
 }
 
 /// What a policy scope grants on a profile.
+#[domain_model]
 #[derive(Debug, PartialEq, Eq)]
-struct Grant {
+pub(crate) struct Grant {
     categories: HashSet<Category>,
     /// A constraint that reaches the profile named no category, so it grants
     /// every one. Under `one_call` that is also what a plugin that cannot
@@ -259,7 +273,7 @@ struct Grant {
 /// The read asks with constraints required, so the enforcer never answers
 /// with an unconstrained scope. One that does grants nothing: an allow
 /// without constraints is a refusal, never a grant of every profile.
-fn granted(scope: &AccessScope, key: SubjectKey) -> Option<Grant> {
+pub(crate) fn granted(scope: &AccessScope, key: SubjectKey) -> Option<Grant> {
     if scope.is_unconstrained() {
         return None;
     }
@@ -277,7 +291,7 @@ fn granted(scope: &AccessScope, key: SubjectKey) -> Option<Grant> {
 /// The scope the subject settings are read under: the profile scope's tenant
 /// filters, as the settings rows are scoped by tenant only. The scope is
 /// never unconstrained here, since [`granted`] refuses that.
-fn settings_scope(scope: &AccessScope) -> AccessScope {
+pub(crate) fn settings_scope(scope: &AccessScope) -> AccessScope {
     scope.tenant_only()
 }
 
@@ -348,7 +362,7 @@ fn not_visible(err: EnforcerError) -> DomainError {
 /// the same answer. A profile too large to read is the gear's own limit, not
 /// something the reader can change. The read answers with nothing else, so
 /// both transports map one set of errors.
-fn read_failure(err: DomainError) -> DomainError {
+pub(crate) fn read_failure(err: DomainError) -> DomainError {
     match err {
         // Logged once, where the answer is mapped: the message carries the
         // refusal with its ids, which stay out of the answer.
@@ -363,6 +377,8 @@ fn read_failure(err: DomainError) -> DomainError {
         | DomainError::NotVisible(_)
         | DomainError::Unavailable(_)
         | DomainError::NotConfigured(_)
+        | DomainError::NoSuchFact(_)
+        | DomainError::InvalidQuery(_)
         | DomainError::Internal(_)
         | DomainError::Database(_)) => err,
     }

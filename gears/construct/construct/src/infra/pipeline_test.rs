@@ -82,7 +82,7 @@ fn in_tenant(tenant: Uuid) -> SecurityContext {
 
 #[tracing_test::traced_test]
 #[tokio::test]
-async fn a_record_is_planned_checked_admitted_written_and_read_back() {
+async fn a_record_is_planned_checked_admitted_written_read_back_and_deleted_by_its_subject() {
     let db = inmem_db().await;
     let cfg = ConstructConfig {
         processing_identity: Some(Uuid::new_v4()),
@@ -135,6 +135,40 @@ async fn a_record_is_planned_checked_admitted_written_and_read_back() {
         .expect("the record is processed");
     cancel.cancel();
     running.await.unwrap();
+
+    // The subject deletes the fact through Subject Control, over the same
+    // writer and graph storage, and the profile read no longer serves it.
+    let owner = crate::test_support::context_of(subject, tenant);
+    let own = pipeline
+        .subject_control
+        .view(&owner, subject, &toolkit_odata::ODataQuery::new())
+        .await
+        .expect("the subject's view");
+    let [stored] = own.page.items.as_slice() else {
+        panic!("one fact in the subject's view, got {own:?}");
+    };
+    pipeline
+        .subject_control
+        .delete(&owner, subject, &stored.node_key)
+        .await
+        .expect("the subject deletes its fact");
+    let after = pipeline.profile.read(&reader, None, subject).await.unwrap();
+    assert!(
+        after.categories.is_empty(),
+        "deleted, so not served: {after:?}"
+    );
+    let own_after = pipeline
+        .subject_control
+        .view(&owner, subject, &toolkit_odata::ODataQuery::new())
+        .await
+        .unwrap();
+    assert!(own_after.page.items.is_empty(), "{own_after:?}");
+    assert!(
+        own_after.version > own.version,
+        "the delete moved the profile's version on: {:?} then {:?}",
+        own.version,
+        own_after.version
+    );
 
     let [skills] = view.categories.as_slice() else {
         panic!("one category, got {view:?}");
@@ -440,4 +474,80 @@ async fn without_the_opt_in_to_run_unchecked_no_worker_runs_and_it_warns() {
         "an identity and a model are not enough while no sensitive-data check exists"
     );
     assert!(logs_contain("run_without_sensitive_data_checks"));
+}
+
+#[tokio::test]
+async fn without_a_model_the_subject_still_deletes_its_facts() {
+    use crate::domain::planner::processing::{PlanWriter as _, ProcessingContexts as _, Written};
+    use crate::infra::processing_contexts::ServiceIdentity;
+    use crate::infra::storage::graph::root::PayloadCounter;
+    use crate::infra::storage::graph::types::GraphTypes;
+    use crate::infra::storage::graph::writer::{GraphPlanWriter, SoftDelete, WriterPorts};
+
+    let db = inmem_db().await;
+    let identity = Uuid::new_v4();
+    let cfg = ConstructConfig {
+        processing_identity: Some(identity),
+        profile_category_check: Some(CategoryCheckConfig::OneCall),
+        ..ConstructConfig::default()
+    }
+    .validated()
+    .unwrap();
+    let graph = fake_graph_storage();
+    let pipeline = assemble(
+        &cfg,
+        None,
+        Arc::clone(&graph),
+        Arc::new(settings_service(&db, Arc::new(AllowResolver), true)),
+        PolicyEnforcer::new(Arc::new(AllowResolver)),
+    )
+    .unwrap();
+    assert!(pipeline.worker.is_none(), "no model, no processing");
+    // A fact stored earlier, by a deployment that had a model.
+    let (tenant, subject) = (Uuid::new_v4(), Uuid::new_v4());
+    let (construct, _) = ServiceIdentity::new(identity)
+        .for_tenant(tenant)
+        .await
+        .unwrap();
+    let mut plan = crate::test_support::connector_plan(vec![crate::test_support::add_value(
+        "skill",
+        "skills",
+        json!({ "name": "Rust" }),
+    )]);
+    plan.tenant_id = tenant;
+    plan.subject_id = subject;
+    plan.profile_version = None;
+    let writer = GraphPlanWriter::new(WriterPorts {
+        client: Arc::clone(&graph),
+        types: Arc::new(GraphTypes::new(Arc::clone(&graph))),
+        version: Arc::new(PayloadCounter),
+        removal: Arc::new(SoftDelete::new(Arc::clone(&graph))),
+    });
+    assert_eq!(
+        writer.write(&construct, &plan).await.unwrap(),
+        Written::Stored
+    );
+    let owner = crate::test_support::context_of(subject, tenant);
+    let everything = toolkit_odata::ODataQuery::new();
+    let before = pipeline
+        .subject_control
+        .view(&owner, subject, &everything)
+        .await
+        .unwrap();
+    let [fact] = before.page.items.as_slice() else {
+        panic!("one fact, got {before:?}");
+    };
+
+    pipeline
+        .subject_control
+        .delete(&owner, subject, &fact.node_key)
+        .await
+        .expect("a delete needs no model");
+
+    let after = pipeline
+        .subject_control
+        .view(&owner, subject, &everything)
+        .await
+        .unwrap();
+    assert!(after.page.items.is_empty(), "{after:?}");
 }
