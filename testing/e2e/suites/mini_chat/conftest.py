@@ -1089,7 +1089,7 @@ def gear_test_env(request):
         config_path=MODULE_DIR / "config" / "base.yaml",
         config_patch=_patch_mini_chat_config,
         port=8087,
-        health_path="/cf/openapi.json",
+        health_path="/cf/readyz",
         health_timeout=90,
         env={"RUST_LOG": rust_log},
         sidecars=[mock],
