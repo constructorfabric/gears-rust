@@ -46,7 +46,7 @@ Chosen option: "Background operations with a synchronous admission phase and a r
 
 * A bounded synchronous phase makes the quick checks, with no plugin call, and either refuses or commits the operation and answers 202 with its id.
 * A supervised request task, detached from the HTTP request, runs the operation.
-* A run deadline set at acceptance ends every operation as completed or interrupted; an interrupted operation is never resumed.
+* A run deadline set at acceptance completes every operation; one still open at its deadline is completed by the expiry completion, as internal failure unless a recorded plugin outcome ranks higher, and is never resumed.
 * At the time limit the gear drops a plugin call and dispatches the next section.
 * One open operation per application.
 
@@ -58,16 +58,19 @@ The steps, states, and formulas are in [DESIGN §3.6](../DESIGN.md#36-interactio
 * The gear owns an operations table, a status guard, a supervisor, and a sweeper.
 * Plugins keep their data consistent when a call is stopped, for example by doing the work in one transaction.
 * Plugins tolerate repeated `apply` and `remove`, because callers retry with a new request.
-* The run window holds every plugin call, its outcome write, and the final transaction, and a call starts only when `plugin_call_timeout` + 2 × `storage_call_timeout` still fit before the run deadline; a plugin left without a call gets `not_dispatched`, so the operation never succeeds. Clock skew between replicas, or a remote plugin still working after the gear drops the call, can still overlap the next operation of its application; plugins tolerate it like a repeated call.
-* An operation whose replica stops blocks its application until its run deadline.
+* The run window holds every plugin call, its outcome write, and the final transaction, and a call starts only when `plugin_call_timeout` + 2 × `storage_call_timeout` still fit before the run deadline; a plugin left without a call gets `not_dispatched`, so the operation never succeeds. Every deadline guard compares with the database time, and the fit check uses a local deadline on the monotonic clock, so replica clocks do not decide the run window. A remote plugin still working after the gear drops the call can still overlap the next operation of its application; plugins tolerate it like a repeated call.
+* An operation whose replica stops blocks its application until its run deadline, then completes with `lost` for the plugin that may have been called and `not_dispatched` for every later one.
 
 ### Confirmation
 
 * Every synchronous answer comes within the synchronous time budget, and `init` fails when the budget exceeds the gateway deadline.
 * A table-driven test over the synchronous rows of the outcome table, including the 503 gate and the 202 shape.
 * A run-deadline arithmetic test for seed and uninstall.
-* An operation past its deadline ends interrupted, no call starts after it, and no replica resumes it.
-* No plugin call starts unless `plugin_call_timeout` + 2 × `storage_call_timeout` fit before the run deadline.
+* An operation past its deadline is completed by the expiry completion as internal failure, with `lost` for the first plugin without a recorded outcome and `not_dispatched` for every later one; no call starts after it, and no replica resumes it.
+* A seed that expires while `accepted` writes no application record.
+* A failed section-outcome write ends the dispatch: every later plugin gets `not_dispatched`, and the operation completes as internal failure.
+* Every guard condition compares with the database time.
+* No plugin call starts unless `plugin_call_timeout` + 2 × `storage_call_timeout` fit before the local deadline, and the fit check uses only that monotonic deadline, set from the time left that mark running returns.
 * With the smallest margin, storage calls that reach `storage_call_timeout`, and free `plugin_max_in_flight` capacity at every plugin, every plugin receives its call and the operation completes; a request task delayed past the margin marks the remaining plugins `not_dispatched` and completes as internal failure, never succeeded.
 * A timed-out call is dropped and dispatch proceeds.
 
@@ -76,8 +79,8 @@ The steps, states, and formulas are in [DESIGN §3.6](../DESIGN.md#36-interactio
 ### Background operations with a synchronous admission phase and a run window
 
 * Good, because the synchronous phase has a checked bound inside the gateway deadline.
-* Good, because every operation ends by its run deadline, even when its replica stops.
-* Bad, because callers must read the operation, and an interrupted operation can leave an application partly seeded.
+* Good, because every operation completes by its run deadline, even when its replica stops.
+* Bad, because callers must read the operation, and an operation that completes by expiry can leave an application partly seeded.
 
 ### Fully synchronous seed and uninstall within one HTTP request
 

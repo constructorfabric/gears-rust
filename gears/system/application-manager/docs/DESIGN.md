@@ -174,7 +174,7 @@ No plugin receives anything until the operation and its accepted event have comm
 
 - [ ] `p2` - **ID**: `cpt-cf-application-manager-principle-honest-outcomes`
 
-Every seed and uninstall that is not interrupted ends in exactly one category from the outcome table in [§3.3](#33-api-contracts); an interrupted operation ends with the interrupted marker and no category. The gear fails closed, and every write to an operation is guarded, so an operation has one final state.
+Every seed and uninstall ends in exactly one category from the outcome table in [§3.3](#33-api-contracts). The gear fails closed, and every write to an operation is guarded, so an operation has one final state.
 
 #### Bounded Waiting
 
@@ -266,7 +266,7 @@ The plugin-call time limit is `plugin_call_timeout`, exactly as configured, for 
 
 - [ ] `p2` - **ID**: `cpt-cf-application-manager-entity-outcome-category`
 
-**Section outcome.** `succeeded`, `rejected`, `not_permitted`, or an internal failure: `internal_failure`; `timed_out`, whose effect is unknown; `not_sent`, refused by the in-flight cap; or `not_dispatched`, when the request task failed before the call or the call no longer fit before the run deadline. Request-level categories are defined only by the outcome table in [§3.3](#33-api-contracts).
+**Section outcome.** `succeeded`, `rejected`, `not_permitted`, or an internal failure: `internal_failure`; `timed_out`, whose effect is unknown; `lost`, whose plugin may have been called when the request task stopped, so its effect is unknown; `not_sent`, refused by the in-flight cap; or `not_dispatched`, when the request task failed or stopped before the call, the call no longer fit before the run deadline, or an earlier section-outcome write failed. Request-level categories are defined only by the outcome table in [§3.3](#33-api-contracts).
 
 - [ ] `p2` - **ID**: `cpt-cf-application-manager-entity-outcome-report`
 
@@ -275,10 +275,9 @@ The plugin-call time limit is `plugin_call_timeout`, exactly as configured, for 
 | Member | Content |
 |---|---|
 | `operation_id`, `action` | The operation id; `seed` or `uninstall` |
-| `category` | Category of a completed operation; absent while open and when interrupted |
-| `interrupted` | True when the operation ended at its run deadline |
+| `category` | Category of a completed operation; absent while open |
 | `application` | Seed: `id` and `version`. Uninstall: `id`. |
-| `sections` | Per plugin with a recorded outcome, in priority order: `key`, `outcome`, `section_type` (the exact GTS id) for a validated seed section, and for `rejected` and `not_permitted` the plugin's `detail` (cut at `PLUGIN_DETAIL_MAX_BYTES`) and optional `location` |
+| `sections` | Per plugin once the operation is running, in priority order: `key`; `section_type` (the exact GTS id) for a seed section, written by mark running; `outcome` once recorded; and for `rejected` and `not_permitted` the plugin's `detail` (cut at `PLUGIN_DETAIL_MAX_BYTES`) and optional `location` |
 | `problems` | Section validation problems: `location` (JSON Pointer), `rule` (a JSON Schema keyword, `missing_section`, or `unknown_section`), `message` |
 | `unavailable` | Items with a `dependency` (`operation_storage`, `application_manager`) and a `reason` (`unreachable`, `timed_out`, `not_ready`, `at_capacity`) |
 
@@ -289,19 +288,17 @@ The plugin-call time limit is `plugin_call_timeout`, exactly as configured, for 
 ```mermaid
 stateDiagram-v2
     [*] --> Accepted: acceptance transaction with the accepted event
-    Accepted --> Running: mark running
-    Running --> Completed: final transaction with the finished event
-    Accepted --> Interrupted: interruption step after the run deadline
-    Running --> Interrupted: interruption step after the run deadline
+    Accepted --> Completed: invalid manifest, supervisor completion, or expiry completion
+    Accepted --> Running: mark running after validation
+    Running --> Completed: final transaction, supervisor completion, or expiry completion
     Completed --> [*]
-    Interrupted --> [*]
 ```
 
-- **Run deadline.** Set at acceptance ([§4.2](#42-configuration)) so that every plugin call, its outcome write, and the final transaction fit. A plugin call starts only when `plugin_call_timeout` + 2 × `storage_call_timeout` still fit before it, so the call, its outcome write, and the final transaction end by the deadline. When a call no longer fits, that plugin and every later one get `not_dispatched`, and the final transaction completes the operation as internal failure.
-- **Status guard.** Writes match only an open record before its deadline; the interruption step matches only one past it. The first final write wins.
-- **Interruption step.** One transaction sets interrupted, keeps the section outcomes so far, and inserts the finished event. The sweeper, the operation read, and the acceptance run it on an expired open operation, which covers a lost task and a failed final transaction.
-- **Supervisor completion.** When a request task fails after acceptance, the operation goes Running, then Completed as internal failure, with `not_dispatched` for plugins not yet called.
-- **Retention.** The sweeper purges a final record `operation_retention` after it finished.
+- **Run deadline.** Set at acceptance ([§4.2](#42-configuration)) so that every plugin call, its outcome write, and the final transaction fit. Mark running returns the time left before the run deadline by the database time. When the reply arrives, the request task sets a local deadline on the monotonic clock (`tokio::time::Instant`), one `storage_call_timeout` before the end of that time. A plugin call starts only when `plugin_call_timeout` + 2 × `storage_call_timeout` still fit before the local deadline, so the call, its outcome write, and the final transaction end by the run deadline. When a call no longer fits, that plugin and every later one get `not_dispatched`, and the final transaction completes the operation as internal failure.
+- **Status guard.** Every guard condition compares with the database's current time. Writes match only an open record with `run_deadline` after it; the expiry completion matches only an open record with `run_deadline` at or before it. The first final write wins. The conflict check of rank 3 and the purge use the same time, and `accepted_at`, `started_at`, `finished_at`, and the history `written_at` are written as it.
+- **Expiry completion.** One transaction sets `completed` with the category of the outcome table and the reason `expired`, keeps the section outcomes recorded so far, gives every plugin without one `not_dispatched`, or `lost` for the first such plugin when the operation was `running`, inserts the finished event, and, for a seed that was `running`, upserts the application record. The sweeper, the operation read, and the acceptance run it on an expired open operation, which covers a lost task and a failed final transaction.
+- **Supervisor completion.** When a request task fails after acceptance, the operation completes as internal failure, with `not_dispatched` for plugins not yet called. From Accepted it writes no application record; from Running, a seed also writes it.
+- **Retention.** The sweeper purges a completed record once `finished_at` + `operation_retention` is at or before the database time.
 
 - [ ] `p2` - **ID**: `cpt-cf-application-manager-entity-caller-identity`
 
@@ -318,7 +315,7 @@ stateDiagram-v2
 | Application | Seed: id and version. Uninstall: id. | As accepted | Id and version within the limits; outside them, byte length and SHA-256 digest |
 | Section keys (seed) | Keys of the key set, plus a count of other keys | No | As accepted, when `sections` is an object |
 | Caller identity and receive time | Yes | No | Yes |
-| Result | None | Category or interrupted marker; problem count and rule tokens; section outcome per key of the key set, with section types; unavailable items | Category; problem count and rule tokens; busy operation id; or unavailable items |
+| Result | None | Category, with reason `expired` for an expiry completion; problem count and rule tokens; section outcome per key of the key set, with section types; unavailable items | Category; problem count and rule tokens; busy operation id; or unavailable items |
 
 History rows carry no other manifest content: no section body, no problem location or message, and no plugin detail.
 
@@ -368,7 +365,7 @@ graph LR
 
 **Why**: Precedence, acceptance, history ordering, and dispatch must run as one sequence on every path.
 
-**Scope**: Runs each seed and uninstall as a supervised request task through [§3.6](#36-interactions--sequences), decides the category by the outcome table, and performs the supervisor completion. The task completes even when the HTTP request is dropped.
+**Scope**: Runs each seed and uninstall as a supervised request task through [§3.6](#36-interactions--sequences), validates a seed before mark running, checks every plugin call against the monotonic local deadline set from the time left that mark running returns, decides the category by the outcome table, and performs the supervisor completion. The task completes even when the HTTP request is dropped.
 
 **Boundaries**: It holds no plugin set or schema logic, writes no table itself, and never undoes or resumes work.
 
@@ -380,7 +377,7 @@ graph LR
 
 **Why**: Reads record no history event and decide no category, so they stay apart from the orchestrator.
 
-**Scope**: When the allowed callers allow `read_schema` or `read_operation`, it lists keys or returns schemas from memory, or reads one operation record, interrupting it first when expired. After a PDP permit for `read_history` or `read_applications`, it reads one page of history events, narrowed to one operation when the filter names it, or one page of application records.
+**Scope**: When the allowed callers allow `read_schema` or `read_operation`, it lists keys or returns schemas from memory, or reads one operation record, running the expiry completion on it first when expired. After a PDP permit for `read_history` or `read_applications`, it reads one page of history events, narrowed to one operation when the filter names it, or one page of application records.
 
 **Boundaries**: It makes no plugin call and returns no manifest content or caller subject.
 
@@ -452,7 +449,7 @@ graph LR
 
 **Why**: Every operation must reach a final state, and final records must not grow without bound.
 
-**Scope**: On every replica, every `SWEEP_INTERVAL` it interrupts up to `MAINTENANCE_BATCH_SIZE` expired open operations, and every `PURGE_INTERVAL` it purges final records past `operation_retention`. A failed step is logged and runs again next interval.
+**Scope**: On every replica, every `SWEEP_INTERVAL` it runs the expiry completion on up to `MAINTENANCE_BATCH_SIZE` expired open operations, and every `PURGE_INTERVAL` it purges completed records past `operation_retention`. A failed step is logged and runs again next interval.
 
 **Boundaries**: It makes no plugin call, never deletes an open record, and never purges the operation history or application records.
 
@@ -493,7 +490,7 @@ All routes are unstable and `.no_license_required()`. Platform-plane routes are 
 
 **History read.** A paged OData list on the toolkit's pager ([OData and pagination](../../../../docs/toolkit_unified_system/07_odata_pagination_select_filter.md)) that returns `Page<T>` of history events in `event_id` order. `$filter` is optional and takes only `operation_id` (Uuid, `eq` or `in`), which matches `correlation_id`; the request id of a refusal matches the same way. Without `$filter`, the read lists every history event. `limit` defaults to `HISTORY_PAGE_MAX_LIMIT` and may not exceed it; `cursor` comes from `page_info`. `$orderby`, `$select`, and any other filter field are 400. An id with no events gives an empty page. Query errors use the platform OData reason codes ([Pagination](../../../../guidelines/DNA/REST/QUERYING.md)).
 
-**Application list.** A paged OData list on the same pager that returns `Page<T>` of application records in `application_id` order: `application_id`, `version`, `operation_id`, `category` or `interrupted`, and `finished_at`. `$filter` is optional and takes only `application_id` (`eq` or `in`). `limit` defaults to `APPLICATION_PAGE_MAX_LIMIT` and may not exceed it; other query options are 400, as for the history read.
+**Application list.** A paged OData list on the same pager that returns `Page<T>` of application records in `application_id` order: `application_id`, `version`, `operation_id`, `category`, and `finished_at`. `$filter` is optional and takes only `application_id` (`eq` or `in`). `limit` defaults to `APPLICATION_PAGE_MAX_LIMIT` and may not exceed it; other query options are 400, as for the history read.
 
 **Outcome table.** The one normative statement of outcome categories, precedence, and HTTP mapping. The first matching rank decides.
 
@@ -508,10 +505,10 @@ All routes are unstable and `.no_license_required()`. Platform-plane routes are 
 | 5 | Invalid manifest: a section problem (seed) | Operation report | — | — | No; fix the named sections |
 | After dispatch 1 | Not permitted by a section plugin | Operation report | — | — | No; obtain the plugin's permission |
 | After dispatch 2 | Plugin rejected | Operation report | — | — | No; fix the named sections |
-| After dispatch 3 | Internal failure: a plugin fails or times out, a call is `not_sent`, or a plugin is `not_dispatched` (supervisor completion or a call that no longer fit) | Operation report | — | — | Yes, send again |
+| After dispatch 3 | Internal failure: a plugin fails or times out, a call is `not_sent`, a plugin is `not_dispatched` (supervisor completion, a call that no longer fit, or a failed section-outcome write), or the expiry completion (`lost` and `not_dispatched`) | Operation report | — | — | Yes, send again |
 | — | Succeeded | Operation report | — | — | Not applicable |
 
-Storage is consulted only for a permitted caller. Sections are checked only inside the operation, so a seed with envelope and section problems ends at rank 4 and lists the section problems once the envelope is valid. An interrupted operation has no category. A gear defect is not ranked: the refused event records internal failure. The seeding documentation publishes the Retriable column as the guidance of `cpt-cf-application-manager-fr-response-content`.
+Storage is consulted only for a permitted caller. Sections are checked only inside the operation, so a seed with envelope and section problems ends at rank 4 and lists the section problems once the envelope is valid. A gear defect is not ranked: the refused event records internal failure. The seeding documentation publishes the Retriable column as the guidance of `cpt-cf-application-manager-fr-response-content`.
 
 **Refusal bodies.** Canonical Problems with no extension member. The `detail` carries the request id; temporarily unavailable carries `REFUSAL_RETRY_AFTER_SECONDS`; not permitted names the action; conflict has reason `application_busy` and names the open operation; invalid manifest lists field violations (location, rule token, message). Reads end as 400 (a history or application query the read does not take), 403, 404 (unknown key, or unknown, malformed, or purged operation id), or 503. Plugin `Internal` text, PDP internals, and storage errors are only logged; plugin `Rejected` and `NotPermitted` detail is returned cut at `PLUGIN_DETAIL_MAX_BYTES`.
 
@@ -611,7 +608,7 @@ sequenceDiagram
             O ->> R: refused event
             O -->> API: refusal
         else
-            O ->> R: one transaction: interrupt an expired open operation, insert the operation and accepted event
+            O ->> R: one transaction: read the database time, run the expiry completion on an expired open operation, insert the operation and accepted event
             alt committed
                 O -->> API: accepted
             else lost index race
@@ -642,20 +639,21 @@ sequenceDiagram
     participant V as Schema validator
     participant P as Section plugins
     participant R as Repository and operation history
-    O ->> R: mark running
     O ->> V: validate the sections
     alt invalid
         O ->> R: final transaction: report (rank 5), finished event
     else valid
-        loop each plugin in priority order, while the call, its outcome write, and the final transaction fit before the run deadline
+        O ->> R: mark running with the validated section types
+        R -->> O: time left before the run deadline
+        loop each plugin in priority order, while the call, its outcome write, and the final transaction fit before the local deadline
             O ->> P: apply(identity, operation id, envelope, section)
             O ->> R: record the section outcome
         end
-        O ->> R: final transaction: report, finished event
+        O ->> R: final transaction: report, finished event, application record
     end
 ```
 
-Plugins left when the loop stops early get `not_dispatched`, so the report ranks internal failure. A re-seed takes the same path. A failed section-outcome update keeps the outcome in memory for the final transaction. Every final transaction of a seed, including the interruption step and the supervisor completion, also writes the application record, except one that ends as invalid manifest.
+Validation runs before mark running, so an invalid manifest goes from Accepted to Completed, and `running` means validated. Plugins left when the loop stops early get `not_dispatched`, so the report ranks internal failure. A re-seed takes the same path. A failed section-outcome write ends the dispatch: that plugin keeps its outcome in memory for the final transaction, and every later plugin gets `not_dispatched`. The recorded outcomes are therefore always a prefix in priority order. Every final transaction of a seed that is `running`, including the expiry completion and the supervisor completion, also writes the application record.
 
 #### Uninstall Operation
 
@@ -665,7 +663,7 @@ Plugins left when the loop stops early get `not_dispatched`, so the report ranks
 
 **Actors**: `cpt-cf-application-manager-actor-operator`, `cpt-cf-application-manager-actor-seeding-caller`, `cpt-cf-application-manager-actor-section-plugin`
 
-Like the seed dispatch loop with `remove(identity, operation id, application id)` and no validation step: every plugin receives `remove`, whether or not the application was seeded, and an empty key set gives a succeeded uninstall. A final transaction that completes the uninstall as succeeded also deletes the application record; any other final state leaves it.
+Mark running, then the seed dispatch loop with `remove(identity, operation id, application id)`, then the final transaction, with no validation step: every plugin receives `remove`, whether or not the application was seeded, and an empty key set gives a succeeded uninstall. A final transaction that completes the uninstall as succeeded also deletes the application record; any other final state leaves it.
 
 #### Read an Operation
 
@@ -673,13 +671,13 @@ Like the seed dispatch loop with `remove(identity, operation id, application id)
 
 **Actors**: `cpt-cf-application-manager-actor-seeding-caller`, `cpt-cf-application-manager-actor-operator`
 
-When the allowed callers allow `read_operation`, the read service interrupts an expired open operation, then returns the status and, once final, the report.
+When the allowed callers allow `read_operation`, the read service runs the expiry completion on an expired open operation, then returns the status and, once final, the report.
 
-#### Interrupted Sweep and Purge
+#### Expiry Sweep and Purge
 
 **ID**: `cpt-cf-application-manager-seq-operation-sweep`
 
-The sweeper interrupts expired open operations and purges old final records in guarded batches (`cpt-cf-application-manager-component-operation-sweeper`).
+The sweeper runs the expiry completion on expired open operations and purges old completed records in guarded batches (`cpt-cf-application-manager-component-operation-sweeper`).
 
 #### Discovery of Keys and Schemas
 
@@ -714,16 +712,16 @@ All three tables are created by the gear's migrations on PostgreSQL, MySQL, and 
 | `operation_id` | UUID | Time-ordered; PK |
 | `application_id` | text, at most `APPLICATION_ID_MAX_BYTES` | Exact application id |
 | `action` | enum | `seed` or `uninstall` |
-| `status` | enum | `accepted`, `running`, `completed`, `interrupted` |
+| `status` | enum | `accepted`, `running`, `completed` |
 | `category` | enum, nullable | Set exactly when `completed` |
 | `report` | JSON | The outcome report so far |
-| `accepted_at` | timestamp | Receive time |
+| `accepted_at` | timestamp | Database time of the acceptance |
 | `started_at` | timestamp, nullable | Set by mark running |
 | `finished_at` | timestamp, nullable | Set exactly when final; retention counts from it |
 | `run_deadline` | timestamp | End of the run window |
 | `finished_event_id` | UUID | Id of the finished event |
 
-A unique index on `application_id` over `accepted` and `running` rows admits one open operation per application across replicas (partial index on PostgreSQL and SQLite, stored generated column on MySQL); an expired one is interrupted by the next acceptance. Indexes on (`status`, `run_deadline`) and `finished_at` serve the sweep and purge.
+A unique index on `application_id` over `accepted` and `running` rows admits one open operation per application across replicas (partial index on PostgreSQL and SQLite, stored generated column on MySQL); an expired one is completed by the expiry completion of the next acceptance. Indexes on (`status`, `run_deadline`) and `finished_at` serve the sweep and purge.
 
 #### Table: operation_history
 
@@ -741,7 +739,7 @@ A unique index on `application_id` over `accepted` and `running` rows admits one
 The table is insert-only, unrestricted, and kept without a purge. The operation repository is its only writer, at three write points:
 
 - the accepted event, in the acceptance transaction with the operation record;
-- the finished event, in the final transaction with the report, including the interruption step and the supervisor completion;
+- the finished event, in the final transaction with the report, including the expiry completion and the supervisor completion;
 - a refused event, in its own transaction before the refusal answers.
 
 #### Table: applications
@@ -753,13 +751,12 @@ The table is insert-only, unrestricted, and kept without a purge. The operation 
 | `application_id` | text, at most `APPLICATION_ID_MAX_BYTES` | Exact application id; PK |
 | `version` | text, at most `APPLICATION_ID_MAX_BYTES` | Version of the last finished seed, as sent |
 | `operation_id` | UUID | That seed's operation |
-| `category` | enum, nullable | That seed's category; null when it was interrupted |
-| `interrupted` | boolean | True when that seed was interrupted |
+| `category` | enum | That seed's category |
 | `finished_at` | timestamp | When that seed finished |
 
 The table is unrestricted and kept without a purge. The operation repository is its only writer, in the final transactions that insert a finished event:
 
-- every final transaction of a seed upserts the row of its application, except one that ends as invalid manifest;
+- every final transaction of a seed that is `running` upserts the row of its application; a seed that completes from `accepted`, including one that ends as invalid manifest, writes none;
 - the final transaction of an uninstall that completes as succeeded deletes it.
 
 ### 3.8 Deployment Topology
@@ -774,7 +771,7 @@ flowchart LR
     R2 --> DB
 ```
 
-Replicas share only the database, and each runs its own sweeper under the status guard. An operation runs on the replica that accepted it; any replica can read or interrupt it. The healthcheck is not ready until the startup result is published. On `stop`, the gear sets the stopping flag, drains request tasks until the host's stop deadline, and stops the sweeper.
+Replicas share only the database, and each runs its own sweeper under the status guard. An operation runs on the replica that accepted it; any replica can read it or run its expiry completion. The healthcheck is not ready until the startup result is published. On `stop`, the gear sets the stopping flag, drains request tasks until the host's stop deadline, and stops the sweeper.
 
 ## 4. Additional context
 
@@ -782,9 +779,9 @@ Replicas share only the database, and each runs its own sweeper under the status
 
 **Logs** carry the correlation id, trace id, action, category, section key, and call kind, never section, manifest, or schema content. A refusal by the allowed callers logs the identity kind, namespace or trust domain, and name. For application ids and versions, logs carry only the byte length and SHA-256 digest; spans follow the same rule.
 
-**Metrics** count synchronous answers, operations by category and interruption, durations, plugin call timeouts and cap refusals, allowed-callers refusals by action, request tasks in flight, history events recorded and not recorded, unavailable dependencies, sweeps and purges, and startup failures. Section keys are labels; application and operation ids never are.
+**Metrics** count synchronous answers, operations by category, with reason `expired` for expiry completions, durations, plugin call timeouts and cap refusals, allowed-callers refusals by action, request tasks in flight, history events recorded and not recorded, unavailable dependencies, sweeps and purges, and startup failures. Section keys are labels; application and operation ids never are.
 
-**Signals** for operator thresholds: history events not recorded, rising interruptions, repeated timeouts or cap refusals per key, an unavailable dependency, failing sweeps, request tasks at the cap, and a startup failure.
+**Signals** for operator thresholds: history events not recorded, rising expired operations, repeated timeouts or cap refusals per key, an unavailable dependency, failing sweeps, request tasks at the cap, and a startup failure.
 
 **Startup failure reasons**: `types_registry_unreachable`, `plugin_properties_unreadable`, `section_type_unresolved`, `invalid_section_type`, `section_schema_unusable`, `plugin_client_unresolved`, `duplicate_section_key`, `equal_priority`, `invalid_setting`.
 
@@ -818,7 +815,7 @@ allowed_callers:
 
 **Synchronous time budget.** At most 3 × `storage_call_timeout` (storage step, acceptance, and refusal or lost-race transaction); `init` fails when this exceeds `GATEWAY_REQUEST_DEADLINE`.
 
-**Run window.** The run deadline is the acceptance commit time plus N × (`plugin_call_timeout` + `storage_call_timeout`) for the plugin calls and their outcome writes, plus 2 × `storage_call_timeout` for mark running and the final transaction, plus `run_window_margin`, with N the number of plugins, for a seed or an uninstall. The window therefore leaves time to start every plugin call unless the request task is delayed by more than the margin; a call can still be refused as `not_sent` when its plugin has no free `plugin_max_in_flight` capacity.
+**Run window.** The gear computes the run deadline as the database time read in the acceptance transaction plus N × (`plugin_call_timeout` + `storage_call_timeout`) for the plugin calls and their outcome writes, plus 2 × `storage_call_timeout` for mark running and the final transaction, plus `run_window_margin`, with N the number of plugins, for a seed or an uninstall. The window therefore leaves time to start every plugin call unless the request task is delayed by more than the margin; a call can still be refused as `not_sent` when its plugin has no free `plugin_max_in_flight` capacity.
 
 ### 4.3 Platform Deviations
 

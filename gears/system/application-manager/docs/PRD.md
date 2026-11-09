@@ -127,12 +127,12 @@ There is no formal user-satisfaction metric, because the user group is small, kn
 | Priority | A value that each section plugin registers. It fixes the order of dispatch on seed and of removal on uninstall. No two section plugins share one. |
 | Seed | Submitting a manifest for an application. The system checks it and dispatches each section to its section plugin. |
 | Uninstall | Asking every section plugin to remove an application by its id. |
-| Operation | The background run of one accepted seed or uninstall request. It has a status (accepted, running, completed, or interrupted) and, once final, a report. A request that fails a quick check is a refusal: it gets an answer at once and no operation. |
-| Outcome category | The single overall result of a seed or uninstall request that is not interrupted, such as succeeded or invalid manifest (`cpt-cf-application-manager-fr-outcome-categories`). |
-| Run window | The time an operation may run before it is interrupted. It is bounded and follows from the operator-set section-plugin time limit and the number of section plugins. |
+| Operation | The background run of one accepted seed or uninstall request. It has a status (accepted, running, or completed) and, once completed, a report. A request that fails a quick check is a refusal: it gets an answer at once and no operation. |
+| Outcome category | The single overall result of a seed or uninstall request, such as succeeded or invalid manifest (`cpt-cf-application-manager-fr-outcome-categories`). |
+| Run window | The time an operation may run before it is completed as internal failure. It is bounded and follows from the operator-set section-plugin time limit and the number of section plugins. |
 | Request id | The id that links a refusal or an operation report to its history events; for an accepted request it is the operation id. |
 | Allowed callers | The configured list of platform workload identities, each with the actions it may take: seed, uninstall, read schemas, and read operations. |
-| Installed application | An application with a record in the system: its last seed that did not end as invalid manifest reached a final state, including interrupted, and no uninstall of it has succeeded since. |
+| Installed application | An application with a record in the system: its last seed that passed validation completed, and no uninstall of it has succeeded since. |
 | Operation history | The append-only table that holds the history events of every seed and uninstall request (`cpt-cf-application-manager-fr-history-event`). Reads are not recorded. |
 
 ## 2. Actors
@@ -216,7 +216,7 @@ flowchart LR
 - Replaying or driving re-seeds. Each application's seeding caller is responsible.
 - Rollback across several section plugins.
 - Idempotency keys on seed and uninstall requests.
-- Retry rules after a failed, partly failed, or interrupted request.
+- Retry rules after a failed or partly failed request.
 - Validation rules for adding or removing a section plugin.
 - Reconciliation of section-plugin state with what is seeded.
 - Deciding who may read history events or list installed applications; platform access control owns that.
@@ -326,7 +326,7 @@ The system **MUST** let a kind of seeded data be added or removed only by adding
 
 - [ ] `p1` - **ID**: `cpt-cf-application-manager-fr-async-operations`
 
-The system **MUST** run every accepted seed and uninstall request as an operation. It **MUST** first make quick checks and refuse a request that fails one at once, with its outcome category, without creating an operation and without calling any section plugin. An accepted request **MUST** get an operation id, and the system **MUST** answer with it before any section-plugin call. An operation **MUST** be in one of four states: accepted, running, completed, or interrupted. Every operation **MUST** reach a final state, completed or interrupted, within a bounded run window. The system **MUST NOT** resume an interrupted operation.
+The system **MUST** run every accepted seed and uninstall request as an operation. It **MUST** first make quick checks and refuse a request that fails one at once, with its outcome category, without creating an operation and without calling any section plugin. An accepted request **MUST** get an operation id, and the system **MUST** answer with it before any section-plugin call. An operation **MUST** be in one of three states: accepted, running, or completed. Every operation **MUST** reach completed within a bounded run window. The system **MUST NOT** resume an operation that did not complete before the end of its run window.
 
 - **Rationale**: A seed calls every section plugin in turn, so it can take longer than the platform request deadline. Quick checks still answer at once, and the run window gives every operation a known end.
 - **Actors**: `cpt-cf-application-manager-actor-seeding-caller`, `cpt-cf-application-manager-actor-operator`
@@ -371,14 +371,14 @@ The system **MUST** leave rollback, replace-or-update behaviour, idempotency, an
 
 - [ ] `p1` - **ID**: `cpt-cf-application-manager-fr-outcome-categories`
 
-The system **MUST** report every seed and uninstall request that is not interrupted as exactly one of these outcome categories. An interrupted operation has no outcome category.
+The system **MUST** report every seed and uninstall request as exactly one of these outcome categories.
 
 - succeeded: every section, or every section plugin for uninstall, succeeded;
 - invalid manifest: the manifest failed validation, and nothing is dispatched;
 - plugin rejected: a section plugin refused its section as unacceptable;
 - not permitted: the caller is not allowed for the action, or a section plugin refuses it for an extra permission of its own;
 - conflict: another operation for the same application is accepted or running;
-- internal failure: a section plugin failed unexpectedly or exceeded the time limit, or the system itself failed unexpectedly;
+- internal failure: a section plugin failed unexpectedly or exceeded the time limit, the operation did not complete within its run window, or the system itself failed unexpectedly;
 - temporarily unavailable: a needed dependency could not answer, nothing is dispatched, and the caller can retry.
 
 - **Rationale**: Callers need to tell "fix my manifest" from "try again later" from "ask for access".
@@ -397,7 +397,7 @@ When several outcome categories apply, the system **MUST** pick one by a fixed p
 
 - [ ] `p1` - **ID**: `cpt-cf-application-manager-fr-response-content`
 
-Every refusal and every report of a completed operation **MUST** carry the outcome category, what to fix, retry, or request, and the request id. A refusal for conflict **MUST** name the running operation. A report **MUST** give the outcome of each section, or of each section plugin for uninstall, and every problem with its location for invalid manifest. The report of an interrupted operation **MUST** say so and give the section outcomes recorded so far.
+Every refusal and every report of a completed operation **MUST** carry the outcome category, what to fix, retry, or request, and the request id. A refusal for conflict **MUST** name the running operation. A report **MUST** give the outcome of each section, or of each section plugin for uninstall, and every problem with its location for invalid manifest.
 
 - **Rationale**: Per-section results let callers act on partial failures, and the link to the history events supports investigation.
 - **Actors**: `cpt-cf-application-manager-actor-seeding-caller`, `cpt-cf-application-manager-actor-operator`
@@ -456,7 +456,7 @@ The system **MUST** let a caller with the read operations permission read an ope
 
 - [ ] `p1` - **ID**: `cpt-cf-application-manager-fr-list-applications`
 
-The system **MUST** keep one record per installed application. A seed operation that reaches a final state, other than one that ends as invalid manifest, **MUST** record its application, or update the record, with the version, the operation id, the outcome category or the interrupted marker, and the finish time, in the same change that finishes the operation. A seed that ends as invalid manifest **MUST NOT** create or update a record. A seed in which some sections failed is recorded with its outcome category, and an interrupted seed with the interrupted marker. An uninstall that completes as succeeded **MUST** remove the record in the same change; any other uninstall outcome **MUST** leave it unchanged. The system **MUST** let a caller with the read applications permission list the records page by page, and **MUST** give them no meaning beyond this rule. A list **MUST NOT** call any section plugin. Lists end as invalid query, not permitted, or temporarily unavailable.
+The system **MUST** keep one record per installed application. A seed operation that completes after its manifest passed validation **MUST** record its application, or update the record, with the version, the operation id, the outcome category, and the finish time, in the same change that finishes the operation. A seed that ends as invalid manifest, or completes before its manifest passed validation, **MUST NOT** create or update a record. A seed in which some sections failed is recorded with its outcome category. An uninstall that completes as succeeded **MUST** remove the record in the same change; any other uninstall outcome **MUST** leave it unchanged. The system **MUST** let a caller with the read applications permission list the records page by page, and **MUST** give them no meaning beyond this rule. A list **MUST NOT** call any section plugin. Lists end as invalid query, not permitted, or temporarily unavailable.
 
 - **Rationale**: Services such as a navigation menu need one trusted answer to which applications are installed.
 - **Actors**: `cpt-cf-application-manager-actor-operator`
@@ -562,7 +562,7 @@ The system **MUST** stop waiting for any section-plugin call once the time limit
 
 The system **MUST** answer every seed and uninstall request within the platform request deadline, with a refusal or with an operation id, and **MUST** bring every operation to a final state within its run window.
 
-- **Threshold**: With test plugins that always reach the time limit, every immediate answer comes within the platform request deadline, and every operation is completed or interrupted by the end of its run window.
+- **Threshold**: With test plugins that always reach the time limit, every immediate answer comes within the platform request deadline, and every operation is completed by the end of its run window.
 - **Rationale**: Deployment pipelines need a predictable upper bound for a seed, and the platform ends any request that runs past its deadline.
 
 #### No Dispatch on Invalid, Unavailable, or Conflicting Requests
@@ -587,7 +587,7 @@ The system **MUST** meet the platform availability baseline. Seeding is unavaila
 
 - [ ] `p2` - **ID**: `cpt-cf-application-manager-nfr-operational-signals`
 
-The system **MUST** give operators a visible signal for history events that failed to record, for startup failures, and for section-plugin timeouts that reach an operator-set count. It **MUST** make counts of each outcome category, of section-plugin-call timeouts, and of interrupted operations observable.
+The system **MUST** give operators a visible signal for history events that failed to record, for startup failures, and for section-plugin timeouts that reach an operator-set count. It **MUST** make counts of each outcome category, of section-plugin-call timeouts, and of operations that did not complete within their run window observable.
 
 - **Threshold**: Each signal condition raises an operator-visible signal in tests, and the counts can be read by operators.
 - **Rationale**: Operators must notice failures early.
@@ -783,7 +783,7 @@ The system **MUST** give operators a visible signal for history events that fail
 - [ ] A second request for an application with an accepted or running operation is refused as conflict naming that operation, while other applications proceed.
 - [ ] Reading an operation returns its status and, once final, its report, ends as not found for an unknown or purged id, and makes no section-plugin call.
 - [ ] Listing history events returns them page by page, narrowing by an operation id or a refusal's request id returns only that request's events, an id with no events gives an empty list, and no read makes a section-plugin call (`cpt-cf-application-manager-fr-history-read`).
-- [ ] An operation that is not final at the end of its run window is reported as interrupted and is not resumed.
+- [ ] An operation that is not completed at the end of its run window is completed with the section outcomes recorded so far, as internal failure unless a recorded plugin outcome ranks higher, and is not resumed.
 - [ ] When storage cannot answer, the request is refused as temporarily unavailable and nothing is dispatched; when platform access control cannot answer, a history read or an application list is refused as temporarily unavailable.
 - [ ] Every seed and uninstall request that reaches the system, including a refused one, has its history events in the operation history (except a refusal whose history event could not be recorded), and no history event exists for a change that did not commit (`cpt-cf-application-manager-nfr-history-completeness`).
 - [ ] History events are only ever appended to the operation history, and no other place keeps them (`cpt-cf-application-manager-fr-history-event`).
@@ -828,7 +828,7 @@ The system **MUST** give operators a visible signal for history events that fail
 | Partial success leaves section plugins out of step | Some services see the application and others do not | Section-plugin-owned rollback, per-section results, and retry |
 | A priority change reorders dispatch | A section plugin that relies on another's data sees a different order | Order changes are intentional, and section-plugin authors document how they choose a priority |
 | A manifest carries a secret | The secret could reach the system's logs, diagnostics, or error text | The seeding callers' responsibility to keep secrets out of manifests (see Assumptions), and the rule that the system does not write manifest content into its own logs |
-| An operation is interrupted | The application is left partly seeded or removed | The report shows the section outcomes so far, the caller seeds or uninstalls again, and operators see a count of interrupted operations |
+| An operation does not complete within its run window | The application is left partly seeded or removed | The report shows the category and the section outcomes so far, the caller seeds or uninstalls again, and operators see a count of expired operations |
 | The platform error format cannot carry the added refusal content | A caller refused as conflict cannot tell which operation to wait for | The format is raised with the platform owners, and operation reports still carry the full result |
 
 ## 13. Open Questions
