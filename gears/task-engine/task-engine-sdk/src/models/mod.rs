@@ -31,8 +31,8 @@ pub mod worker;
 pub use admin::{
     BulkCancelRequest, BulkMoveRequest, BulkOutcome, BulkReprioritizeRequest, BulkResult,
     BulkTaskIdsRequest, BulkTaskResult, DomainApplyStatus, QueueSettingsOverride, ReassignRequest,
-    ReenqueueRequest, RuntimeConfigAccepted, RuntimeConfigRequest, RuntimeConfigStatus,
-    TypeSettingsOverride,
+    ReenqueueRequest, RetentionOverride, RuntimeConfigAccepted, RuntimeConfigRequest,
+    RuntimeConfigStatus, TenantRetention, TypeSettingsOverride,
 };
 pub use common::{
     CancelMode, DependencyMode, ErrorFault, OnPredecessorFailure, OnTimeout, OperatedBy, PageInfo,

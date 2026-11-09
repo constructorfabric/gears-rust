@@ -326,6 +326,9 @@ pub struct RuntimeConfigRequest {
     /// Overrides by task-type ID or pattern.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub types: BTreeMap<String, TypeSettingsOverride>,
+    /// Retention overrides, such as a per-tenant retention or legal hold.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retention: Option<RetentionOverride>,
 }
 
 impl RuntimeConfigRequest {
@@ -335,7 +338,60 @@ impl RuntimeConfigRequest {
         queues: BTreeMap<String, QueueSettingsOverride>,
         types: BTreeMap<String, TypeSettingsOverride>,
     ) -> Self {
-        Self { queues, types }
+        Self {
+            queues,
+            types,
+            retention: None,
+        }
+    }
+
+    /// Add retention overrides to this version.
+    #[must_use]
+    pub fn with_retention(mut self, retention: RetentionOverride) -> Self {
+        self.retention = Some(retention);
+        self
+    }
+}
+
+/// Retention overrides of a runtime configuration version. A legal hold is a long
+/// per-tenant retention.
+#[derive(
+    Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, utoipa::ToSchema,
+)]
+#[serde(deny_unknown_fields)]
+#[non_exhaustive]
+pub struct RetentionOverride {
+    /// Retention by owner tenant ID. A policy applies to that tenant only, not to its
+    /// subtree, and reaches every row not yet removed. A value above
+    /// `trust_limits.global.max_retention_days` is refused (`400`, `OUT_OF_RANGE`).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub per_tenant: BTreeMap<Uuid, TenantRetention>,
+}
+
+impl RetentionOverride {
+    /// Build retention overrides from per-tenant policies.
+    #[must_use]
+    pub const fn new(per_tenant: BTreeMap<Uuid, TenantRetention>) -> Self {
+        Self { per_tenant }
+    }
+}
+
+/// One tenant's retention policy.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, utoipa::ToSchema,
+)]
+#[serde(deny_unknown_fields)]
+#[non_exhaustive]
+pub struct TenantRetention {
+    /// Days a finished task of this tenant is kept, at least 1.
+    pub retention_days: u32,
+}
+
+impl TenantRetention {
+    /// Build a tenant retention policy.
+    #[must_use]
+    pub const fn new(retention_days: u32) -> Self {
+        Self { retention_days }
     }
 }
 
