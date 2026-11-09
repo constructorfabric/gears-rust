@@ -769,7 +769,7 @@ The system **MUST** give operators a visible signal for history events that fail
 
 - [ ] An accepted seed or uninstall returns an operation id before any section-plugin call (`cpt-cf-application-manager-fr-async-operations`).
 - [ ] A request that fails a quick check gets its outcome category at once, creates no operation, calls no section plugin, and has a refused event in the operation history.
-- [ ] A valid manifest with every required section completes as succeeded, and sections are dispatched in priority order.
+- [ ] A valid manifest with every required section, whose section plugins all succeed, completes as succeeded, and sections are dispatched in priority order.
 - [ ] A manifest with a missing, unknown, or invalid section, or with an invalid id or version, reports invalid manifest, dispatches nothing, and lists each problem with its location.
 - [ ] When one section plugin fails, the others still receive their sections, and the report shows each section outcome.
 - [ ] A section plugin that exceeds the time limit is an internal failure and does not block the remaining sections.

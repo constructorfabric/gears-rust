@@ -56,7 +56,7 @@ Chosen option: "Discovery at startup into a fixed set", because it gives one plu
 * The key map, priority order, and compiled section schemas stay fixed until the next start; an empty set is a valid start.
 * Seed validation and discovery read the compiled schemas from memory.
 * Startup fails with no retry on any condition of `cpt-cf-application-manager-fr-startup-checks`, naming a reason from [DESIGN §4.1](../DESIGN.md#41-observability).
-* Seed calls `apply` and uninstall calls `remove` on every plugin, one at a time in priority order.
+* Seed calls `apply` and uninstall calls `remove` on every plugin, one at a time in priority order, within the run window of [ADR-0002](0002-cpt-cf-application-manager-adr-async-operations.md); a plugin left without a call gets `not_dispatched`.
 
 ### Consequences
 

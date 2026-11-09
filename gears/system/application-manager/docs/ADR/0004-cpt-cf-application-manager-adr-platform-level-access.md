@@ -18,6 +18,7 @@ description: Seed, uninstall, schema reads, and operation reads run on the platf
   - [Allowed callers for seeding actions, PDP for operator reads](#allowed-callers-for-seeding-actions-pdp-for-operator-reads)
   - [Tenant-free PDP decisions for every action](#tenant-free-pdp-decisions-for-every-action)
   - [Allowed callers for every action](#allowed-callers-for-every-action)
+  - [Allowed callers from a reloadable configuration source](#allowed-callers-from-a-reloadable-configuration-source)
   - [A platform tenant from the tenant directory or from configuration](#a-platform-tenant-from-the-tenant-directory-or-from-configuration)
 
 <!-- /toc -->
@@ -40,6 +41,7 @@ The gear manages applications installed into the whole environment, so its recor
 * Allowed callers for seeding actions, PDP for operator reads
 * Tenant-free PDP decisions for every action
 * Allowed callers for every action
+* Allowed callers from a reloadable configuration source
 * A platform tenant from the tenant directory or from configuration
 
 ## Decision Outcome
@@ -87,6 +89,12 @@ Chosen option: "Allowed callers for seeding actions, PDP for operator reads", be
 
 * Good, because the gear has no PDP dependency at all.
 * Bad, because operators would need platform credentials to read history or list applications, and operator access would bypass the platform's access policy.
+
+### Allowed callers from a reloadable configuration source
+
+* Good, because seeding grants change without a restart, and seeding still needs no PDP.
+* Bad, because the gear watches a second source, must define which list a request in progress is checked against, and gains a failure mode for a check that otherwise cannot be unavailable.
+* Bad, because the gain is small: identities match without pod or version, so only a new or renamed workload identity needs a change, and that change is reviewed with the deployment.
 
 ### A platform tenant from the tenant directory or from configuration
 
