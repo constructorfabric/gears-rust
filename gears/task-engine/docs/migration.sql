@@ -18,12 +18,14 @@
 -- row-value keysets `(a, b) > ($1, $2)`.
 --
 -- Domains (P05, ADR-0010): one database per task domain, each with this whole schema;
--- te_runtime_config* and the SDK offset tables are used only in `default`. Task, entry,
+-- te_runtime_config and the SDK offset tables are used only in `default`; te_runtime_config_applied
+-- exists in every domain. Task, entry,
 -- event and wait IDs are UUID v7; types, queues, entry and resource types are Registry
 -- References (G-WIRE-16); subjects are UUID. No FKs between task tables (ADR-0009).
 -- vs DESIGN §3.7: removed te_dependency_locks (P01), te_tenant_queue_backlog and
 -- backlog_shard (P04), authz_scope (P08); added te_wait_condition_history (P07),
--- te_task_predecessors (P09), te_queue_holds (P06), the depth sample tables (P04).
+-- te_task_predecessors (P09), te_queue_holds (P06), the depth sample tables (P04),
+-- te_runtime_config_applied (G-OPS-11).
 --
 -- ── Enum codes (SMALLINT; only urgency is fixed by DESIGN, G-WIRE-20) ────────
 --   task state        1 scheduled 2 queued 3 blocked 4 claimed 5 running 6 waiting 7 completed 8 failed 9 cancelled 10 dead_lettered
@@ -42,6 +44,7 @@
 --   counter dim       1 queue_global 2 type_global 3 queue_tenant 4 type_tenant
 --   wait-counter dim  1 tenant_event_waits 2 tenant_event_waits_per_type 3 tenant_unkeyed_event_waits_per_type
 --   dedup window      1 active 2 active_or_succeeded 3 caller_key
+--   cancel mode       1 requested 2 graceful (forced never pends)
 --   session status    1 active 2 expired
 --   ring status       1 active 2 recycling (no `free`: truncate sets the slot active for B + N, G-OPS-44)
 --   depth dimension   1 tenant (tenant + queue) 2 deferred (tenant); the 429 names (G-CLM-30)
@@ -62,10 +65,10 @@ CREATE DOMAIN gts_type_path AS TEXT
 -- Twins hold rescued rows and new rows of retained tasks; each sits next to its ring table.
 -- MySQL/SQLite: plain CREATE TABLE. Partitions are created at the end of this file.
 
--- Ring state: one row per slot, the fence between old-bucket writers (FENCE) and the
+-- Ring state: one row per slot, the fence between writers of old buckets and the
 -- retention Mark step (DESIGN §3.7). Written by the retention leader. Unrestricted.
 CREATE TABLE te_ring_state (
-    ring_slot    SMALLINT     NOT NULL CHECK (ring_slot >= 0),
+    ring_slot    SMALLINT     NOT NULL CHECK (ring_slot BETWEEN 0 AND 16),  -- the 17 partitions below
     bucket       INTEGER      NOT NULL,     -- floor(days_since_epoch / bucket_days) the slot holds
     status_code  SMALLINT     NOT NULL CHECK (status_code BETWEEN 1 AND 2),  -- active | recycling
     changed_at   TIMESTAMPTZ  NOT NULL,
@@ -74,7 +77,9 @@ CREATE TABLE te_ring_state (
 );
 
 -- ── Immutable task data ──────────────────────────────────────────────────────
--- Written once by create. Ring table. queue_id is the queue at creation (audit); the
+-- Written by create. Two admin actions rewrite it in place (under the ring fence for old rows):
+-- a move re-resolves retry_policy_json and timeouts_json (G-OPS-20), and re-enqueue clears a
+-- passed sla_deadline (G-RTY-12). Ring table. queue_id is the queue at creation (audit); the
 -- current queue, urgency and priority live in te_task_state / te_task_results.
 CREATE TABLE te_tasks (
     id                 UUID          NOT NULL,                 -- UUID v7
@@ -85,7 +90,7 @@ CREATE TABLE te_tasks (
     queue_id           UUID          NOT NULL,
     owner_id           UUID,                                   -- subject the task is done for
     created_by         UUID          NOT NULL,                 -- server-set
-    idempotency_key    VARCHAR(256),                           -- caller key, reference only; NULL for derived dedup
+    idempotency_key    VARCHAR(255)  CHECK (idempotency_key ~ '^[!-~]{1,255}$'),  -- caller key, reference only; NULL for derived dedup (G-CRT-09)
     cancellable        BOOLEAN       NOT NULL DEFAULT TRUE,
     parent_task_id     UUID,                                   -- p2; same tenant and domain
     hierarchy_depth    SMALLINT      NOT NULL DEFAULT 0 CHECK (hierarchy_depth >= 0),  -- parent's + 1; ≤ max_hierarchy_depth (G-WAI-39)
@@ -99,7 +104,8 @@ CREATE TABLE te_tasks (
     authority_json     JSONB         NOT NULL,                 -- {mode, checks[{source,resource_type,action,verdict}], checked_at}
     created_at         TIMESTAMPTZ   NOT NULL,
 
-    PRIMARY KEY (id, ring_slot)                                -- task read by id (+ slot_of(id))
+    PRIMARY KEY (id, ring_slot),                               -- task read by id (+ slot_of(id))
+    CHECK ((parent_task_id IS NULL) = (hierarchy_depth = 0))   -- a root task has depth 0 (G-WAI-39)
 ) PARTITION BY LIST (ring_slot);
 
 -- Terminal children; id appended (G-WIRE-20). MySQL: rule 1.
@@ -140,7 +146,6 @@ CREATE TABLE te_task_state (
     payload_bytes            INTEGER       NOT NULL CHECK (payload_bytes >= 0),  -- input+context+output, uncompressed canonical JSON
     context                  BYTEA,                            -- compressed JSON
     output                   BYTEA,                            -- compressed JSON
-    result_code              SMALLINT      CHECK (result_code BETWEEN 1 AND 8),  -- set only by finalize(); NULL here
     error_json               BYTEA,                            -- compressed JSON (last reported error)
     warnings_json            BYTEA,                            -- compressed JSON
     assignee_subject         UUID,                             -- lease holder / reassignment target
@@ -154,10 +159,9 @@ CREATE TABLE te_task_state (
     lease_epoch              BIGINT        NOT NULL DEFAULT 0 CHECK (lease_epoch >= 0),  -- +1 per claim / reassignment
     bg_slot                  SMALLINT      NOT NULL CHECK (bg_slot BETWEEN 0 AND 1023),  -- murmur3(task_id) mod 1024
     assignment_deadline      TIMESTAMPTZ,                      -- claimed only
-    execution_deadline       TIMESTAMPTZ,                      -- set by the claim; always set while claimed or running (G-EXE-10)
+    execution_deadline       TIMESTAMPTZ,                      -- set by the claim (and accept); NULL outside claimed/running (G-EXE-10)
     superseded_by            UUID,                             -- p2 supersession
-    run_after                TIMESTAMPTZ,                      -- scheduled only
-    dead_lettered_from       UUID,                             -- always NULL on a live row (re-enqueue clears it)
+    run_after                TIMESTAMPTZ,                      -- scheduled; or queued with a past run_after kept as sent (G-CRT-22)
     progress_json            JSONB,                            -- {percent, milestone, completed_units, total_units, current_stage, eta}
     entry_count              INTEGER       NOT NULL DEFAULT 0 CHECK (entry_count >= 0),  -- ≤ max_entries_per_task; entry writes lock this row (G-EXE-21)
     queue_slot_shard         SMALLINT,                         -- recorded te_concurrency_slots shard (queue_global)
@@ -167,10 +171,11 @@ CREATE TABLE te_task_state (
     updated_at               TIMESTAMPTZ   NOT NULL,
 
     PRIMARY KEY (task_id),                                     -- every by-id read and guarded update
-    CHECK (run_after IS NULL OR state_code = 1),
+    CHECK (run_after IS NULL OR state_code IN (1, 2)),
     CHECK (cancel_requested = (cancel_requested_at IS NOT NULL)),
     CHECK (cancel_requested_at IS NULL OR (cancel_mode_code IS NOT NULL AND cancel_requested_by IS NOT NULL)),
-    CHECK (execution_deadline IS NOT NULL OR state_code NOT IN (4, 5)),
+    CHECK (cancel_requested OR (cancel_mode_code IS NULL AND cancel_requested_by IS NULL AND cancel_reason IS NULL)),
+    CHECK ((execution_deadline IS NOT NULL) = (state_code IN (4, 5))),
     CHECK (assignment_deadline IS NULL OR state_code = 4),
     CHECK (state_code IN (4, 5) OR (lease_token IS NULL AND session_id IS NULL AND handoff_until IS NULL
                                     AND queue_slot_shard IS NULL AND type_slot_shard IS NULL
@@ -193,15 +198,16 @@ CREATE INDEX ix_te_task_state_session ON te_task_state (session_id) WHERE sessio
 CREATE INDEX ix_te_task_state_handoff ON te_task_state (handoff_until, bg_slot) WHERE handoff_until IS NOT NULL;
 -- Deadline scan, assignment arm. MySQL: same columns, rule 1.
 CREATE INDEX ix_te_task_state_assignment_deadline ON te_task_state (assignment_deadline, bg_slot) WHERE state_code = 4;
--- Deadline scan, execution arm. MySQL: same columns, rule 1.
-CREATE INDEX ix_te_task_state_execution_deadline ON te_task_state (execution_deadline, bg_slot) WHERE state_code = 5;
+-- Deadline scan, execution arm: claimed or running (G-EXE-10). MySQL: same columns, rule 1.
+CREATE INDEX ix_te_task_state_execution_deadline ON te_task_state (execution_deadline, bg_slot) WHERE execution_deadline IS NOT NULL;
 -- DESIGN's ix_te_task_state_run_after and ix_te_task_state_assignee are not created: no query
 -- uses them (G-OPS-46).
 -- Live children; task_id appended (G-WIRE-20). MySQL: rule 1.
 CREATE INDEX ix_te_task_state_parent ON te_task_state (parent_task_id, task_id) WHERE parent_task_id IS NOT NULL;
 
 -- ── Terminal task state ──────────────────────────────────────────────────────
--- Terminal tasks: inserted by finalize(), deleted by retention or moved back by
+-- Terminal tasks: inserted by finalize(); updated only by entry writes (entry_count) and the
+-- tag-patch row lock; deleted by retention or moved back by
 -- re-enqueue. Ring table. te_task_state minus live-only columns, plus terminal_at, predecessors.
 CREATE TABLE te_task_results (
     task_id             UUID          NOT NULL,
@@ -214,6 +220,10 @@ CREATE TABLE te_task_results (
     created_at          TIMESTAMPTZ   NOT NULL,
     state_code          SMALLINT      NOT NULL CHECK (state_code BETWEEN 7 AND 10),
     cancel_requested    BOOLEAN       NOT NULL,
+    cancel_mode_code    SMALLINT      CHECK (cancel_mode_code IN (1, 2)),  -- kept from the live row, so a finished task still shows its cancel request
+    cancel_requested_by UUID,
+    cancel_requested_at TIMESTAMPTZ,
+    cancel_reason       VARCHAR(1024),
     attempt             INTEGER       NOT NULL,
     retry_count         INTEGER       NOT NULL,
     liveness_requeues   INTEGER       NOT NULL,
@@ -244,7 +254,11 @@ CREATE TABLE te_task_results (
     CHECK (   (state_code = 7  AND result_code IN (1, 2))
            OR (state_code IN (8, 10) AND result_code IN (3, 5))
            OR (state_code = 9  AND result_code IN (4, 6, 7, 8))),
-    CHECK (dead_lettered_from IS NULL OR state_code = 10)
+    CHECK ((dead_lettered_from IS NOT NULL) = (state_code = 10)),
+    CHECK (cancel_requested = (cancel_requested_at IS NOT NULL)),
+    CHECK (result_code <> 7 OR superseded_by IS NOT NULL),
+    CHECK (attempt >= 0 AND retry_count >= 0 AND liveness_requeues >= 0),
+    CHECK (assignee IS NULL OR assignee ~ '^[A-Za-z0-9._:-]{1,128}$')
 ) PARTITION BY LIST (ring_slot);
 
 -- Terminal search in creation order.
@@ -268,6 +282,8 @@ CREATE INDEX ix_te_task_results_tenant_dlq_from ON te_task_results (owner_tenant
 -- Retained twin (see Ring tables).
 CREATE TABLE te_task_results_retained (LIKE te_task_results INCLUDING DEFAULTS INCLUDING CONSTRAINTS, PRIMARY KEY (task_id));
 CREATE INDEX ix_te_task_results_retained_tenant_id ON te_task_results_retained (owner_tenant_id, task_id);
+-- Tenant DLQ listing on rescued rows (G-RTY-10, G-OPS-34).
+CREATE INDEX ix_te_task_results_retained_tenant_state ON te_task_results_retained (owner_tenant_id, state_code, task_id);
 CREATE INDEX ix_te_task_results_retained_terminal ON te_task_results_retained (terminal_at);   -- expiry
 CREATE INDEX ix_te_task_results_retained_dlq ON te_task_results_retained (queue_id, task_id) WHERE state_code = 10;
 CREATE INDEX ix_te_task_results_retained_tenant_dlq_from ON te_task_results_retained (owner_tenant_id, dead_lettered_from, task_id) WHERE state_code = 10;
@@ -275,6 +291,8 @@ CREATE INDEX ix_te_task_results_retained_tenant_dlq_from ON te_task_results_reta
 -- ── Concurrency counters ─────────────────────────────────────────────────────
 -- Exact concurrency limits (P04 "Unchanged"): guarded reserve `used + k <= limit_value`,
 -- release on the recorded shard; no row = unlimited. Lock order 1 (ADR-0008). Unrestricted.
+-- Reconciliation (every slot_reconcile_interval_secs) recounts `used` with one grouped scan of
+-- te_task_state per pass rather than an index per dimension: the live table is small and hot.
 CREATE TABLE te_concurrency_slots (
     dimension_code  SMALLINT     NOT NULL CHECK (dimension_code IN (1, 2)),  -- queue_global | type_global
     scope_id        UUID         NOT NULL,                     -- queue id or task type id
@@ -328,7 +346,7 @@ CREATE TABLE te_queue_depth_samples (
 -- Per-tenant refusal list: only keys whose sampled count is ≥ the limit. Scopable.
 CREATE TABLE te_tenant_depth_samples (
     owner_tenant_id  UUID         NOT NULL,
-    dimension_code   SMALLINT     NOT NULL CHECK (dimension_code IN (1, 2)),  -- tenant_queued | tenant_deferred
+    dimension_code   SMALLINT     NOT NULL CHECK (dimension_code IN (1, 2)),  -- tenant | deferred (the 429 names, G-CLM-30)
     queue_id         UUID         NOT NULL,                    -- nil UUID for tenant_deferred (whole domain)
     task_count       BIGINT       NOT NULL CHECK (task_count >= 0),
     limit_value      BIGINT       NOT NULL CHECK (limit_value > 0),  -- the limit the count was compared with
@@ -386,7 +404,7 @@ CREATE TABLE te_task_entries (
     task_id          UUID          NOT NULL,
     owner_tenant_id  UUID          NOT NULL,
     type_id          UUID          NOT NULL,                   -- entry type (Registry Reference)
-    creator          VARCHAR(256)  NOT NULL,                   -- subject id (worker or user)
+    creator          UUID          NOT NULL,                   -- subject id (worker or user)
     payload          BYTEA         NOT NULL,                   -- compressed JSON, ≤ 64 KiB uncompressed
     created_at       TIMESTAMPTZ   NOT NULL,
 
@@ -407,12 +425,12 @@ CREATE TABLE te_wait_conditions (
     id                      UUID          NOT NULL,            -- UUID v7
     task_id                 UUID          NOT NULL,
     owner_tenant_id         UUID          NOT NULL,
-    -- openapi WaitGroup.id (G-WIRE-19)
+    -- openapi WaitGroup.id (G-WIRE-09)
     wait_group_id           UUID          NOT NULL,
     kind_code               SMALLINT      NOT NULL CHECK (kind_code BETWEEN 1 AND 4),
     state_code              SMALLINT      NOT NULL CHECK (state_code BETWEEN 1 AND 4),
     mode_code               SMALLINT      NOT NULL CHECK (mode_code IN (1, 2)),
-    on_timeout_code         SMALLINT      CHECK (on_timeout_code IN (1, 2)),  -- NULL = no timeout (G-WAI-32)
+    on_timeout_code         SMALLINT      CHECK (on_timeout_code IN (1, 2)),  -- NULL = no timeout (input/children only; never timer, always set for event; G-WAI-09, G-WAI-32)
     -- duration kept while armed (G-WIRE-20)
     timeout_secs            INTEGER       CHECK (timeout_secs > 0),
     timeout_at              TIMESTAMPTZ,                        -- parked_at + timeout_secs; NULL while armed
@@ -440,7 +458,10 @@ CREATE TABLE te_wait_conditions (
     CHECK (resolved_by IS NULL OR kind_code = 2),
     CHECK ((state_code = 1) = (resolved_at IS NULL)),
     CHECK ((timeout_secs IS NULL) = (on_timeout_code IS NULL)),
-    CHECK (timeout_at IS NULL OR parked_at IS NOT NULL)
+    CHECK (timeout_at IS NULL OR parked_at IS NOT NULL),
+    CHECK (state_code <> 1 OR parked_at IS NULL OR timeout_secs IS NULL OR timeout_at IS NOT NULL),
+    CHECK (kind_code <> 1 OR timeout_secs IS NULL),            -- a timer condition has no timeout (G-WAI-09)
+    CHECK (kind_code <> 4 OR timeout_secs IS NOT NULL)         -- event: always bounded, max_wait_secs by default (G-WAI-32)
 );
 
 -- Per task: active group, resolution, page, finalize move.
@@ -491,7 +512,8 @@ CREATE TABLE te_timers (
 
     PRIMARY KEY (id),
     CHECK ((timer_type_code = 10) = (cascade_kind_code IS NOT NULL)),
-    CHECK ((status_code = 2) = (claimed_by IS NOT NULL AND claim_until IS NOT NULL))
+    CHECK ((status_code = 2) = (claimed_by IS NOT NULL AND claim_until IS NOT NULL)),
+    CHECK (expected_state_code IS NULL OR timer_type_code IN (1, 7, 8, 9))
 );
 
 -- Due-timer claim scan with the shard range inside the index.
@@ -508,22 +530,29 @@ CREATE TABLE te_events (
     id               UUID          NOT NULL,                   -- UUID v7, stable event id
     ring_slot        SMALLINT      NOT NULL CHECK (ring_slot >= 0),
     task_id          UUID,                                     -- NULL for engine/queue-scoped events
-    owner_tenant_id  UUID          NOT NULL,                   -- engine-scoped events: the actor's tenant
+    queue_id         UUID,                                     -- queue-scoped events (queueHeld, queueReleased, configUpdated, workerBlacklisted; G-OPS-05); NULL for task events
+    owner_tenant_id  UUID          NOT NULL,                   -- tasks: the owner; configUpdated/workerBlacklisted: the actor's tenant; queueHeld/queueReleased: root (G-OPS-04)
     event_type_code  SMALLINT      NOT NULL CHECK (event_type_code BETWEEN 1 AND 26),
     -- NULL for engine-caused events (G-WIRE-20)
-    actor_identity   VARCHAR(256),
+    actor_identity   UUID,
     payload          BYTEA         NOT NULL,                   -- compressed JSON = the broker event's `data`, plus history-only fields (taskRetrying's full error, G-RTY-03)
     -- wire `timestamp` (G-WIRE-20)
     occurred_at      TIMESTAMPTZ   NOT NULL,
 
-    PRIMARY KEY (id, ring_slot)
+    PRIMARY KEY (id, ring_slot),
+    CHECK ((task_id IS NULL) = (event_type_code IN (21, 22, 23, 24))),
+    CHECK (task_id IS NULL OR queue_id IS NULL)
 ) PARTITION BY LIST (ring_slot);
 -- Task history. MySQL: (task_id, id), rule 1.
 CREATE INDEX ix_te_events_task ON te_events (task_id, id) WHERE task_id IS NOT NULL;
+-- GET /queues/{id}/events (G-OPS-05); configUpdated lives in the `default` domain (DESIGN.md:1129),
+-- so a queue's history spans two domains. MySQL: (queue_id, id), rule 1.
+CREATE INDEX ix_te_events_queue ON te_events (queue_id, id) WHERE queue_id IS NOT NULL;
 
 -- Retained twin (see Ring tables).
 CREATE TABLE te_events_retained (LIKE te_events INCLUDING DEFAULTS INCLUDING CONSTRAINTS, PRIMARY KEY (id));
 CREATE INDEX ix_te_events_retained_task ON te_events_retained (task_id, id);
+CREATE INDEX ix_te_events_retained_queue ON te_events_retained (queue_id, id) WHERE queue_id IS NOT NULL;
 
 -- ── Event inbox ──────────────────────────────────────────────────────────────
 -- Inbound broker events already applied in this domain (§3.2), pruned after inbox_retention_days.
@@ -552,7 +581,9 @@ CREATE TABLE te_dependencies (
     outcome_code                 SMALLINT  NOT NULL DEFAULT 0 CHECK (outcome_code BETWEEN 0 AND 3),
 
     PRIMARY KEY (task_id, predecessor_id),                     -- successor's set (unblock check, finalize copy)
-    CHECK (outcome_code <> 2 OR on_predecessor_failure_code = 2)
+    CHECK (outcome_code <> 2 OR on_predecessor_failure_code = 2),
+    CHECK (outcome_code <> 3 OR on_predecessor_failure_code = 1),  -- `failed` only on a cancel link (G-WAI-37)
+    CHECK (task_id <> predecessor_id)
 );
 -- Successor cascade, live `predecessor_id` search; task_id appended (G-WIRE-20).
 CREATE INDEX ix_te_deps_predecessor ON te_dependencies (owner_tenant_id, predecessor_id, task_id);
@@ -641,7 +672,7 @@ CREATE INDEX ix_te_sessions_expiry ON te_worker_sessions (status_code, lease_unt
 -- Consecutive worker-attributed failures per (worker, queue) (PRD §5.6). Unrestricted.
 CREATE TABLE te_worker_blacklist (
     worker_subject            UUID          NOT NULL,
-    worker_id                 VARCHAR(128)  NOT NULL,          -- MySQL ascii
+    worker_id                 VARCHAR(128)  NOT NULL CHECK (worker_id ~ '^[A-Za-z0-9._:-]{1,128}$'),  -- MySQL ascii
     queue_id                  UUID          NOT NULL,
     consecutive_failures      INTEGER       NOT NULL DEFAULT 0 CHECK (consecutive_failures >= 0),  -- reset to 0 when a blacklisting starts (G-OPS-31)
     last_liveness_failure_at  TIMESTAMPTZ,                     -- coalescing anchor
@@ -653,6 +684,8 @@ CREATE TABLE te_worker_blacklist (
 );
 -- Node reload, cleanup (G-WIRE-20). MySQL: rule 1.
 CREATE INDEX ix_te_worker_blacklist_until ON te_worker_blacklist (blacklisted_until) WHERE blacklisted_until IS NOT NULL;
+-- Cleanup: rows never blacklisted are deleted once updated_at is older than the blacklist window.
+CREATE INDEX ix_te_worker_blacklist_updated ON te_worker_blacklist (updated_at);
 
 -- ── Queue holds (P06) ────────────────────────────────────────────────────────
 -- Admin hold (P06): claims skip the queue, everything else goes on. One row per held queue
@@ -671,11 +704,11 @@ CREATE TABLE te_queue_holds (
 CREATE INDEX ix_te_queue_holds_until ON te_queue_holds (hold_until) WHERE hold_until IS NOT NULL;
 
 -- ── Runtime configuration ────────────────────────────────────────────────────
--- Saved runtime config versions, `default` domain only (§3.8); each save merges into the
--- previous one. Columns: G-OPS-11. Unrestricted.
+-- Saved runtime config versions, `default` domain only (§3.8); each save is the complete override
+-- set, and a key it omits reverts to the registration or default (G-OPS-11). Columns: G-OPS-11. Unrestricted.
 CREATE TABLE te_runtime_config (
     config_version  BIGINT        NOT NULL CHECK (config_version >= 1),
-    overrides       JSONB         NOT NULL,                    -- merged {queues: {...}, types: {...}} after this save
+    overrides       JSONB         NOT NULL,                    -- {queues: {...}, types: {...}, retention: {per_tenant: {...}}} (G-OPS-34)
     saved_by        UUID          NOT NULL,
     saved_at        TIMESTAMPTZ   NOT NULL,
 

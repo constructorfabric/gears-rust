@@ -4708,9 +4708,9 @@ components:
         then the longest literal prefix before the first wildcard; two patterns of equal
         specificity matching the same queue are refused (`NOT_ALLOWED` on the later
         pattern).
-      x-gaps: [G-OPS-11, G-OPS-12, G-CLM-21]
+      x-gaps: [G-OPS-11, G-OPS-12, G-CLM-21, G-OPS-34]
       x-review: >-
-        A (G-OPS-11, G-OPS-12, G-CLM-21).
+        A (G-OPS-11, G-OPS-12, G-CLM-21, G-OPS-34).
       minProperties: 1
       additionalProperties: false
       properties:
@@ -4722,6 +4722,34 @@ components:
           type: object
           additionalProperties:
             $ref: "#/components/schemas/TypeSettingsOverride"
+        retention:
+          $ref: "#/components/schemas/RetentionOverride"
+
+    RetentionOverride:
+      type: object
+      x-source: A
+      description: >-
+        Retention overrides. A legal hold is a long per-tenant retention.
+      x-gaps: [G-OPS-34]
+      minProperties: 1
+      additionalProperties: false
+      properties:
+        per_tenant:
+          type: object
+          description: >-
+            Retention by owner tenant ID. A policy applies to that tenant only, not to its
+            subtree, and reaches every row not yet removed. A value above
+            `trust_limits.global.max_retention_days` is refused (`400`, `OUT_OF_RANGE`).
+          propertyNames:
+            format: uuid
+          additionalProperties:
+            type: object
+            additionalProperties: false
+            required: [retention_days]
+            properties:
+              retention_days:
+                type: integer
+                minimum: 1
 
     QueueSettingsOverride:
       type: object
