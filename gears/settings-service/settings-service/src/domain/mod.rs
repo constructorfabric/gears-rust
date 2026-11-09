@@ -5,6 +5,7 @@ pub mod category;
 pub mod contribution;
 pub mod declaration;
 pub mod error;
+pub mod metric_labels;
 pub mod odata;
 pub mod platform_scope;
 pub mod ports;

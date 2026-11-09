@@ -1195,7 +1195,7 @@ async fn a_module_upgrade_copies_each_value_with_its_original_setter_and_records
         )),
         Arc::new(crate::test_support::RecordingRegistrar::default())
             as Arc<dyn crate::domain::contribution::SettingTypeRegistrar>,
-        crate::infra::storage::audit_store::AuditStore,
+        crate::infra::storage::audit_store::AuditStore::default(),
     ));
     let client = crate::infra::contribution_client::ContributionClient::new(
         Arc::clone(&h.inner.db),

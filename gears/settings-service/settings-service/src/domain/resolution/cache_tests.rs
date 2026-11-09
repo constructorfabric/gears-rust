@@ -8,6 +8,7 @@ use settings_service_sdk::EffectiveSource;
 use uuid::Uuid;
 
 use super::{EffectiveCache, tests_entry};
+use crate::domain::metric_labels::ScopeClass;
 use crate::domain::resolution::{EffectiveValue, scope_class};
 
 fn entry(key: &str, tenant: Uuid) -> Arc<EffectiveValue> {
@@ -24,6 +25,7 @@ fn entry(key: &str, tenant: Uuid) -> Arc<EffectiveValue> {
         fallback_scope: None,
         traits: json!({}),
         trail: Vec::new(),
+        scope_class: ScopeClass::Cascading,
         data_classification: "public".to_owned(),
         domain_affinity: None,
         secret_backed: false,

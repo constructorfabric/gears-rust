@@ -23,6 +23,8 @@ use toolkit_db::{DBProvider, DbError};
 use tracing::info;
 use types_registry_sdk::TypesRegistryClient;
 
+use crate::domain::declaration::DeclarationStatus;
+use crate::domain::metric_labels::{DeclarationSource, ScopeClass, ScopeKind};
 use crate::domain::platform_scope::PlatformScope;
 use crate::domain::validation::TypeValidator;
 use settings_service_sdk::api::{SettingsContributionClient, SettingsReaderClient};
@@ -64,6 +66,7 @@ pub struct SettingsService {
     db: OnceLock<Arc<DBProvider<DbError>>>,
     enforcer: OnceLock<Arc<PolicyEnforcer>>,
     names: OnceLock<Arc<crate::infra::actor_names::ActorNameResolver>>,
+    security: OnceLock<Arc<dyn crate::domain::ports::SecurityMetrics>>,
     types: OnceLock<Arc<dyn TypesRegistryClient>>,
     validator: OnceLock<Arc<dyn TypeValidator>>,
     categories: OnceLock<
@@ -96,6 +99,7 @@ impl Default for SettingsService {
             db: OnceLock::new(),
             enforcer: OnceLock::new(),
             names: OnceLock::new(),
+            security: OnceLock::new(),
             types: OnceLock::new(),
             validator: OnceLock::new(),
             categories: OnceLock::new(),
@@ -140,9 +144,31 @@ const PRUNE_BATCHES: PruneBatches = PruneBatches {
     per_tick: 100,
 };
 
-/// How often the managed lifecycle refreshes the needs-review gauge: two
-/// indexed counts, cheap enough for a minute's resolution on a dashboard.
+/// The inventory gauges' samples: declarations by `(source, status)` and values
+/// by `(scope_class, scope_kind)`, each with its count.
+type InventoryCounts = (
+    Vec<(DeclarationSource, DeclarationStatus, u64)>,
+    Vec<(ScopeClass, ScopeKind, u64)>,
+);
+
+/// How often the managed lifecycle refreshes the gauges: the needs-review
+/// counts and the two grouped inventory counts (declarations by source and
+/// status; values by scope class, one query per scope kind), each bounded by
+/// the catalogue size, cheap enough for a minute's resolution on a dashboard.
+/// The tick also re-records `settings_service_ready` as a heartbeat.
 const REVIEW_TICK: Duration = Duration::from_mins(1);
+
+/// Publishes `settings_service_ready` 0 when the lifecycle future is left by any
+/// path: a clean stop, a panic, or the future being dropped.
+struct ServiceDownGuard(Arc<dyn crate::domain::ports::LifecycleMetrics>);
+
+impl Drop for ServiceDownGuard {
+    fn drop(&mut self) {
+        // @cpt-begin:cpt-cf-settings-service-algo-gear-foundation-gear-init:p1:inst-gf-init-13
+        self.0.service_up(false);
+        // @cpt-end:cpt-cf-settings-service-algo-gear-foundation-gear-init:p1:inst-gf-init-13
+    }
+}
 
 impl SettingsService {
     /// The managed lifecycle: the pending-secret sweep and the needs-review
@@ -161,15 +187,113 @@ impl SettingsService {
         let writes = self.writes()?;
         let db = self.db()?;
         let retention = Duration::from_hours(u64::from(self.config()?.audit_retention_days) * 24);
+        let metrics: Arc<dyn crate::domain::ports::LifecycleMetrics> =
+            Arc::new(crate::infra::lifecycle_metrics::OtelLifecycleMetrics::new());
+        Self::run_lifecycle(&writes, &db, retention, metrics, ready, &cancel).await;
+        Ok(())
+    }
+
+    /// The lifecycle from the ready signal to the cancellation, over the ports
+    /// it reports to.
+    async fn run_lifecycle(
+        writes: &crate::infra::value_writes::WriteCoordinator,
+        db: &DBProvider<DbError>,
+        retention: Duration,
+        metrics: Arc<dyn crate::domain::ports::LifecycleMetrics>,
+        ready: ReadySignal,
+        cancel: &CancellationToken,
+    ) {
+        // @cpt-begin:cpt-cf-settings-service-algo-gear-foundation-gear-init:p1:inst-gf-init-13
+        // Up before the signal: the gauge is 1 when the lifecycle starts. The
+        // guard publishes 0 on every way out, a panic or an abort of this
+        // future included; a clean stop publishes it once, from the guard.
+        metrics.service_up(true);
+        let _down = ServiceDownGuard(Arc::clone(&metrics));
+        // @cpt-end:cpt-cf-settings-service-algo-gear-foundation-gear-init:p1:inst-gf-init-13
         ready.notify();
         info!(
             tick_secs = SWEEP_TICK.as_secs(),
             "pending-secret sweep and audit retention started"
         );
-        let metrics = crate::infra::lifecycle_metrics::OtelLifecycleMetrics::new();
-        Self::tick_until_cancelled(&writes, &db, retention, &metrics, &cancel).await;
+        Self::tick_until_cancelled(writes, db, retention, metrics.as_ref(), cancel).await;
         info!("pending-secret sweep and audit retention stopped");
-        Ok(())
+    }
+
+    /// One refresh of the two inventory gauges, logged and never fatal: the
+    /// declarations by source and status, and the values by scope class and
+    /// kind, one grouped count each. Every combination is published, zero
+    /// included, so an emptied bucket reads zero rather than its last count; a
+    /// failed refresh publishes nothing and the gauges keep their last values
+    /// until the next tick.
+    async fn inventory_once(
+        db: &DBProvider<DbError>,
+        root: uuid::Uuid,
+        metrics: &dyn crate::domain::ports::LifecycleMetrics,
+    ) {
+        // @cpt-begin:cpt-cf-settings-service-algo-gear-foundation-gear-init:p1:inst-gf-init-14
+        match Self::count_inventory(db, root).await {
+            Ok((declarations, values)) => {
+                for (source, status, count) in declarations {
+                    metrics.declarations(source, status, count);
+                }
+                for (scope_class, scope_kind, count) in values {
+                    metrics.values(scope_class, scope_kind, count);
+                }
+            }
+            Err(err) => tracing::warn!(
+                err = %LogSafe(&err),
+                "inventory gauge refresh failed; retried next tick"
+            ),
+        }
+        // @cpt-end:cpt-cf-settings-service-algo-gear-foundation-gear-init:p1:inst-gf-init-14
+    }
+
+    /// Both inventory counts, zero-filled over their finite label sets, or the
+    /// failure of either.
+    async fn count_inventory(
+        db: &DBProvider<DbError>,
+        root: uuid::Uuid,
+    ) -> Result<InventoryCounts, crate::domain::error::DomainError> {
+        use crate::domain::declaration::DeclarationRepository as _;
+        use crate::domain::value::ValueRepository as _;
+        let conn = db.conn().map_err(|err| {
+            crate::domain::error::DomainError::dependency_unavailable(
+                "database",
+                "open a connection",
+                err,
+            )
+        })?;
+        let scope = toolkit_security::AccessScope::allow_all();
+        // @cpt-begin:cpt-cf-settings-service-algo-gear-foundation-gear-init:p1:inst-gf-init-14
+        let declared = crate::infra::storage::declaration_repo::DeclarationRepo
+            .count_by_source_status(&conn, &scope)
+            .await?;
+        let stored = crate::infra::storage::value_repo::ValueRepo
+            .count_by_scope_kind(&conn, &scope, root)
+            .await?;
+        let mut declarations =
+            Vec::with_capacity(DeclarationSource::ALL.len() * DeclarationStatus::ALL.len());
+        for source in DeclarationSource::ALL {
+            for status in DeclarationStatus::ALL {
+                let count = declared
+                    .get(&(source.as_str().to_owned(), status.as_str().to_owned()))
+                    .copied()
+                    .unwrap_or(0);
+                declarations.push((*source, *status, count));
+            }
+        }
+        let mut values = Vec::new();
+        for class in ScopeClass::ALL {
+            for kind in ScopeKind::ALL {
+                let count = stored
+                    .get(&(class.as_str().to_owned(), kind.as_str()))
+                    .copied()
+                    .unwrap_or(0);
+                values.push((*class, *kind, count));
+            }
+        }
+        // @cpt-end:cpt-cf-settings-service-algo-gear-foundation-gear-init:p1:inst-gf-init-14
+        Ok((declarations, values))
     }
 
     /// The periodic passes, until the lifecycle is cancelled.
@@ -189,8 +313,29 @@ impl SettingsService {
                 () = cancel.cancelled() => break,
                 _ = interval.tick() => Self::sweep_once(writes, cancel).await,
                 _ = retention_interval.tick() => Self::retention_tick(db, retention, cancel, metrics).await,
-                _ = review_interval.tick() => Self::review_once(db, metrics).await,
+                _ = review_interval.tick() => Self::review_tick(writes, db, metrics).await,
             }
+        }
+    }
+
+    /// The review tick: the needs-review gauge and the inventory gauges, each
+    /// refreshed on its own and none fatal to the other.
+    async fn review_tick(
+        writes: &crate::infra::value_writes::WriteCoordinator,
+        db: &DBProvider<DbError>,
+        metrics: &dyn crate::domain::ports::LifecycleMetrics,
+    ) {
+        // @cpt-begin:cpt-cf-settings-service-algo-gear-foundation-gear-init:p1:inst-gf-init-13
+        // A heartbeat: a reader of delta temporality keeps exporting the series.
+        metrics.service_up(true);
+        // @cpt-end:cpt-cf-settings-service-algo-gear-foundation-gear-init:p1:inst-gf-init-13
+        Self::review_once(db, metrics).await;
+        match writes.writer().resolver().root_tenant().await {
+            Ok(root) => Self::inventory_once(db, root, metrics).await,
+            Err(err) => tracing::warn!(
+                err = %LogSafe(&err),
+                "inventory gauge refresh skipped: the root tenant is unknown; retried next tick"
+            ),
         }
     }
 
@@ -218,7 +363,7 @@ impl SettingsService {
     /// The flagged overrides per declaration source, across every tenant.
     async fn count_needs_review(
         db: &DBProvider<DbError>,
-    ) -> Result<Vec<(&'static str, u64)>, crate::domain::error::DomainError> {
+    ) -> Result<Vec<(DeclarationSource, u64)>, crate::domain::error::DomainError> {
         use crate::domain::value::ValueRepository as _;
         let conn = db.conn().map_err(|err| {
             crate::domain::error::DomainError::dependency_unavailable(
@@ -228,12 +373,12 @@ impl SettingsService {
             )
         })?;
         let scope = toolkit_security::AccessScope::allow_all();
-        let mut counts = Vec::with_capacity(crate::domain::declaration::SOURCES.len());
-        for source in crate::domain::declaration::SOURCES {
+        let mut counts = Vec::with_capacity(DeclarationSource::ALL.len());
+        for source in DeclarationSource::ALL {
             let count = crate::infra::storage::value_repo::ValueRepo
-                .count_flagged(&conn, &scope, source)
+                .count_flagged(&conn, &scope, source.as_str())
                 .await?;
-            counts.push((source, count));
+            counts.push((*source, count));
         }
         Ok(counts)
     }
@@ -273,7 +418,14 @@ impl SettingsService {
         let (pruned, failure) = Self::prune(db, default_retention, now, batches, cancel).await;
         // Reported whatever happened: a failed pass and one with nothing to
         // prune both return zero, and only this tells them apart.
-        metrics.retention_pass(if failure.is_some() { "failed" } else { "ok" }, pruned);
+        metrics.retention_pass(
+            if failure.is_some() {
+                crate::domain::metric_labels::RetentionResult::Failed
+            } else {
+                crate::domain::metric_labels::RetentionResult::Ok
+            },
+            pruned,
+        );
         if pruned > 0 {
             info!(pruned, "audit records past their retention horizon pruned");
         }
@@ -344,9 +496,9 @@ impl SettingsService {
         // write that fails fails the pass, which the pass metric reports.
         let days =
             u32::try_from(default_retention.as_secs().div_euclid(86_400)).unwrap_or(u32::MAX);
-        if let Err(err) = crate::infra::storage::audit_store::AuditStore
-            .record_retention(&conn, &scope, days)
-            .await
+        if let Err(err) =
+            crate::infra::storage::audit_store::AuditStore::record_retention(&conn, &scope, days)
+                .await
         {
             return (0, Some(err));
         }
@@ -355,9 +507,14 @@ impl SettingsService {
             if cancel.is_cancelled() {
                 break;
             }
-            match crate::infra::storage::audit_store::AuditStore
-                .prune_expired(&conn, &scope, now, retention, batches.size)
-                .await
+            match crate::infra::storage::audit_store::AuditStore::prune_expired(
+                &conn,
+                &scope,
+                now,
+                retention,
+                batches.size,
+            )
+            .await
             {
                 Ok(batch) => {
                     pruned += batch;
@@ -417,6 +574,17 @@ impl SettingsService {
     /// Returns an error when called before [`Gear::init`].
     pub fn names(&self) -> anyhow::Result<Arc<crate::infra::actor_names::ActorNameResolver>> {
         self.names
+            .get()
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("{} gear not initialized", Self::MODULE_NAME))
+    }
+
+    /// The security metrics port, once initialization has run.
+    ///
+    /// # Errors
+    /// Returns an error when called before [`Gear::init`].
+    pub fn security(&self) -> anyhow::Result<Arc<dyn crate::domain::ports::SecurityMetrics>> {
+        self.security
             .get()
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("{} gear not initialized", Self::MODULE_NAME))
@@ -500,6 +668,26 @@ impl SettingsService {
     }
 }
 
+impl SettingsService {
+    /// Refuse a configuration the gear cannot run under.
+    fn check_config(ctx: &GearCtx, config: &SettingsServiceConfig) -> anyhow::Result<()> {
+        // The two SDK traits are bound in process and have no remote contract
+        // to reach, so a deployment that wires one remotely is refused here
+        // rather than left with a binding that resolves to nothing.
+        crate::config::check_in_process_bindings(ctx.config_provider(), ctx.gear_name())
+            .map_err(|reason| anyhow::anyhow!("{}: {reason}", Self::MODULE_NAME))?;
+        if config.audit_retention_days < crate::audit::MIN_RETENTION_DAYS {
+            anyhow::bail!(
+                "{}: audit_retention_days is {} but must not be below {}",
+                Self::MODULE_NAME,
+                config.audit_retention_days,
+                crate::audit::MIN_RETENTION_DAYS
+            );
+        }
+        Ok(())
+    }
+}
+
 #[async_trait]
 impl Gear for SettingsService {
     async fn init(&self, ctx: &GearCtx) -> anyhow::Result<()> {
@@ -567,6 +755,15 @@ impl Gear for SettingsService {
                 ),
             ))
             .map_err(|_| anyhow::anyhow!("{} gear already initialized", Self::MODULE_NAME))?;
+        // The metrics ports the REST surface, the secret path and the audit
+        // sink report to, each bound once and shared.
+        let security: Arc<dyn crate::domain::ports::SecurityMetrics> =
+            Arc::new(crate::infra::security_metrics::OtelSecurityMetrics::new());
+        self.security
+            .set(Arc::clone(&security))
+            .map_err(|_| anyhow::anyhow!("{} gear already initialized", Self::MODULE_NAME))?;
+        let read_metrics: Arc<dyn crate::domain::ports::ReadMetrics> =
+            Arc::new(crate::infra::read_metrics::OtelReadMetrics::new());
         let platform_scope: Arc<dyn PlatformScope> =
             Arc::new(crate::infra::platform_scope::HubPlatformScope::new(hub));
         // @cpt-end:cpt-cf-settings-service-algo-gear-foundation-gear-init:p1:inst-gf-init-6
@@ -574,25 +771,12 @@ impl Gear for SettingsService {
         // The audit sink: the gear's own table, written in each mutation's
         // transaction. The retention default is validated here because a store
         // configured below twelve months would prune what the platform must keep.
-        let config = self.config()?;
-        // The two SDK traits are bound in process and have no remote contract
-        // to reach, so a deployment that wires one remotely is refused here
-        // rather than left with a binding that resolves to nothing.
-        crate::config::check_in_process_bindings(ctx.config_provider(), ctx.gear_name())
-            .map_err(|reason| anyhow::anyhow!("{}: {reason}", Self::MODULE_NAME))?;
-        if config.audit_retention_days < crate::audit::MIN_RETENTION_DAYS {
-            anyhow::bail!(
-                "{}: audit_retention_days is {} but must not be below {}",
-                Self::MODULE_NAME,
-                config.audit_retention_days,
-                crate::audit::MIN_RETENTION_DAYS
-            );
-        }
-        let audit = crate::infra::storage::audit_store::AuditStore;
+        Self::check_config(ctx, self.config()?.as_ref())?;
+        let audit = crate::infra::storage::audit_store::AuditStore::new(Arc::clone(&security));
         self.categories
             .set(Arc::new(crate::domain::category::CategoryService::new(
                 crate::infra::storage::category_repo::CategoryRepo,
-                audit,
+                audit.clone(),
             )))
             .map_err(|_| anyhow::anyhow!("{} gear already initialized", Self::MODULE_NAME))?;
 
@@ -653,7 +837,7 @@ impl Gear for SettingsService {
             .set(Arc::new(crate::domain::access::AccessService::new(
                 crate::infra::storage::declaration_repo::DeclarationRepo,
                 crate::infra::storage::access_repo::AccessRepo,
-                crate::infra::storage::audit_store::AuditStore,
+                audit.clone(),
                 Arc::clone(&hierarchy_for_access),
                 Arc::clone(&platform_scope),
                 Arc::clone(&cache),
@@ -688,7 +872,7 @@ impl Gear for SettingsService {
             crate::infra::storage::value_repo::ValueRepo,
             Arc::clone(&resolver),
             self.validator()?,
-            crate::infra::storage::audit_store::AuditStore,
+            audit.clone(),
             step_up,
             Arc::clone(&secrets),
             crate::infra::storage::pending_secret_repo::PendingSecretRepo,
@@ -699,6 +883,7 @@ impl Gear for SettingsService {
             .set(Arc::new(crate::infra::value_writes::WriteCoordinator::new(
                 self.db()?,
                 writer,
+                audit.clone(),
             )))
             .map_err(|_| anyhow::anyhow!("{} gear already initialized", Self::MODULE_NAME))?;
 
@@ -710,14 +895,17 @@ impl Gear for SettingsService {
             Arc::clone(&secrets),
             Arc::new(crate::infra::secret_manager::PepSecretGate::new(
                 self.enforcer()?,
+                Arc::clone(&security),
             )),
-            crate::infra::storage::audit_store::AuditStore,
+            audit.clone(),
+            Arc::clone(&security),
         ));
         let reader: Arc<dyn SettingsReaderClient> =
             Arc::new(crate::infra::reader_client::ReaderClient::new(
                 self.db()?,
                 Arc::clone(&resolver),
                 secret_resolver,
+                read_metrics,
             ));
         ctx.client_hub()
             .register::<dyn SettingsReaderClient>(reader);
@@ -730,7 +918,7 @@ impl Gear for SettingsService {
             Arc::new(
                 crate::infra::setting_type_registrar::TypesRegistryRegistrar::new(self.types()?),
             ),
-            audit,
+            audit.clone(),
         ));
         let contribution_client: Arc<dyn SettingsContributionClient> =
             Arc::new(crate::infra::contribution_client::ContributionClient::new(
@@ -767,7 +955,7 @@ impl Gear for SettingsService {
                     ),
                 ),
                 Arc::clone(&step_up_for_admin),
-                crate::infra::storage::audit_store::AuditStore,
+                audit,
                 Arc::clone(&cache),
                 crate::infra::storage::pending_secret_repo::PendingSecretRepo,
                 secrets_for_admin,
@@ -849,14 +1037,17 @@ impl RestApiCapability for SettingsService {
         let search = Arc::new(crate::domain::search::service::SearchService::new(
             crate::infra::storage::search_repo::SearchRepo::new(db.db().backend()),
         ));
-        Ok(crate::api::rest::search_routes::register_routes(
+        let router = crate::api::rest::search_routes::register_routes(
             router,
             openapi,
             search,
             self.resolver()?,
             db,
             self.enforcer()?,
-        ))
+        );
+        // The security-metrics port, beside the enforcer every route carries:
+        // each handler that asks for an access scope counts its refusals on it.
+        Ok(router.layer(axum::Extension(self.security()?)))
     }
 }
 

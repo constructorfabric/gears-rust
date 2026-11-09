@@ -28,6 +28,7 @@ use crate::domain::error::DomainError;
 use crate::domain::odata::Listing;
 use crate::domain::search::{Corpus, Needle, SearchRepository, SearchRequest};
 use crate::domain::value::StoredValue;
+use crate::infra::storage::db_error::db_error;
 use crate::infra::storage::declaration_odata_mapper::DeclarationODataMapper;
 use crate::infra::storage::entity::category::{self, Entity as CategoryEntity};
 use crate::infra::storage::entity::declaration::{self, Entity as DeclarationEntity};
@@ -82,12 +83,6 @@ impl SearchRepo {
                 self.text
                     .json_text_contains("setting_values.value", pattern),
             )
-    }
-}
-
-fn db_error(err: impl std::fmt::Display) -> DomainError {
-    DomainError::Internal {
-        diagnostic: err.to_string(),
     }
 }
 

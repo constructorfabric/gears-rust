@@ -24,6 +24,8 @@ use authz_resolver_sdk::pep::{AccessRequest, ResourceType};
 use toolkit_security::AccessScope;
 
 use crate::domain::error::DomainError;
+use crate::domain::metric_labels::AuthzReason;
+use crate::domain::ports::SecurityMetrics;
 
 /// The settings resources authorization decisions are made against.
 ///
@@ -46,6 +48,18 @@ pub mod resource {
     pub const CATEGORY: ResourceType =
         ResourceType::from_static(toolkit_gts::gts_id!("cf.core.settings.category.v1~"), &[]);
 }
+
+/// The actions the enforcement point asks a decision for — the `operation`
+/// a refusal is counted under (`settings_authz_denial_total`).
+///
+/// The unmasked-read entitlement is not one of them: it is a probe answered
+/// by masking, asked through [`may_read_unmasked`] and never counted, and the
+/// type keeps it off the counted path.
+pub use crate::domain::metric_labels::Operation;
+
+/// The entitlement that unmasks `pii` values on the administrative surface.
+/// Private: it is asked only through [`may_read_unmasked`].
+const READ_UNMASKED: &str = "read_unmasked";
 
 /// Project an enforcement failure into the gear's error vocabulary.
 ///
@@ -80,6 +94,19 @@ pub fn deny(resource: &ResourceType, err: &EnforcerError) -> DomainError {
     }
 }
 
+/// Why the enforcement point refused, as the `reason` label spells it; `None`
+/// for an outcome class this gear does not know. `EnforcerError` is
+/// `#[non_exhaustive]`, and an unknown outcome is an internal failure
+/// ([`deny`]), not a refusal, so it is not counted as one.
+fn refusal_reason(err: &EnforcerError) -> Option<AuthzReason> {
+    match err {
+        EnforcerError::AccessDenied(_) => Some(AuthzReason::Denied),
+        EnforcerError::EvaluationFailed { .. } => Some(AuthzReason::Unavailable),
+        EnforcerError::CompileFailed { .. } => Some(AuthzReason::Constraints),
+        _ => None,
+    }
+}
+
 /// The GTS type id a resource is known by, as a `'static` string.
 ///
 /// `ResourceType::name` borrows; the error variant holds `&'static str` so it
@@ -96,21 +123,49 @@ fn resource_kind(resource: &ResourceType) -> &'static str {
     }
 }
 
-/// Ask an optional decision: the caller's scope, or `None` when the decision
-/// is a known refusal ([`DomainError::Unauthorized`]). Any other failure, such
-/// as the internal failure an unknown enforcer outcome maps to, propagates and
-/// never reads as a refusal.
+/// Obtain the caller's access scope for an operation on a settings resource.
+///
+/// A refusal fails the request and is counted on `metrics`.
 ///
 /// # Errors
 ///
-/// Every [`access_scope`] failure other than [`DomainError::Unauthorized`].
+/// [`DomainError::Unauthorized`] for every enforcement failure — see [`deny`].
+pub async fn access_scope(
+    enforcer: &authz_resolver_sdk::PolicyEnforcer,
+    metrics: &dyn SecurityMetrics,
+    ctx: &toolkit_security::SecurityContext,
+    resource: &ResourceType,
+    operation: Operation,
+    resource_id: Option<uuid::Uuid>,
+) -> Result<AccessScope, DomainError> {
+    enforce(
+        enforcer,
+        ctx,
+        resource,
+        operation.as_str(),
+        Some((metrics, operation)),
+        resource_id,
+    )
+    .await
+}
+
+/// The same decision as [`access_scope`], for a probe whose refusal does not
+/// fail the request: the category tallies, answered by omitting the counts.
+/// The scope, or `None` when the decision is a known refusal
+/// ([`DomainError::Unauthorized`]); any other failure, such as the internal
+/// failure an unknown enforcer outcome maps to, propagates and never reads as a
+/// refusal. Nothing is counted.
+///
+/// # Errors
+///
+/// Every enforcement failure other than [`DomainError::Unauthorized`].
 pub async fn optional_scope(
     enforcer: &authz_resolver_sdk::PolicyEnforcer,
     ctx: &toolkit_security::SecurityContext,
     resource: &ResourceType,
-    action: &str,
+    operation: Operation,
 ) -> Result<Option<AccessScope>, DomainError> {
-    optional(access_scope(enforcer, ctx, resource, action, None).await)
+    optional(enforce(enforcer, ctx, resource, operation.as_str(), None, None).await)
 }
 
 /// A known refusal is an absent scope; any other failure stays an error.
@@ -124,16 +179,33 @@ fn optional(
     }
 }
 
-/// Obtain the caller's access scope for an action on a settings resource.
+/// Whether the caller may see `pii` values unmasked: a separate decision on
+/// the value resource, answered by masking when it is a known refusal. A probe,
+/// so nothing is counted; any other failure is an error, never a mask.
 ///
 /// # Errors
 ///
-/// [`DomainError::Unauthorized`] for every enforcement failure — see [`deny`].
-pub async fn access_scope(
+/// Every enforcement failure other than [`DomainError::Unauthorized`].
+pub async fn may_read_unmasked(
+    enforcer: &authz_resolver_sdk::PolicyEnforcer,
+    ctx: &toolkit_security::SecurityContext,
+) -> Result<bool, DomainError> {
+    Ok(
+        optional(enforce(enforcer, ctx, &resource::VALUE, READ_UNMASKED, None, None).await)?
+            .is_some(),
+    )
+}
+
+/// The one decision behind [`access_scope`], [`optional_scope`] and
+/// [`may_read_unmasked`]: `counted` carries the metrics port and the typed
+/// operation a refusal is counted under, and is `None` for a probe, whose
+/// action is therefore never a label.
+async fn enforce(
     enforcer: &authz_resolver_sdk::PolicyEnforcer,
     ctx: &toolkit_security::SecurityContext,
     resource: &ResourceType,
-    action: &str,
+    action: &'static str,
+    counted: Option<(&dyn SecurityMetrics, Operation)>,
     resource_id: Option<uuid::Uuid>,
 ) -> Result<AccessScope, DomainError> {
     // @cpt-begin:cpt-cf-settings-service-algo-gear-foundation-authz-stepup:p1:inst-gf-authz-3
@@ -175,7 +247,17 @@ pub async fn access_scope(
         .await
         // @cpt-begin:cpt-cf-settings-service-algo-gear-foundation-authz-stepup:p1:inst-gf-authz-4
         // @cpt-begin:cpt-cf-settings-service-algo-gear-foundation-authz-stepup:p1:inst-gf-authz-5
-        .map_err(|err| deny(resource, &err))?;
+        .map_err(|err| {
+            // @cpt-begin:cpt-cf-settings-service-algo-gear-foundation-authz-stepup:p1:inst-gf-authz-10
+            // Counted before the refusal is collapsed into the one answer
+            // every shape gets: the reason is the operator's, never the
+            // caller's.
+            if let (Some((metrics, operation)), Some(reason)) = (counted, refusal_reason(&err)) {
+                metrics.authz_denial(operation, reason);
+            }
+            // @cpt-end:cpt-cf-settings-service-algo-gear-foundation-authz-stepup:p1:inst-gf-authz-10
+            deny(resource, &err)
+        })?;
     // @cpt-end:cpt-cf-settings-service-algo-gear-foundation-authz-stepup:p1:inst-gf-authz-5
     // @cpt-end:cpt-cf-settings-service-algo-gear-foundation-authz-stepup:p1:inst-gf-authz-4
     // @cpt-end:cpt-cf-settings-service-algo-gear-foundation-authz-stepup:p1:inst-gf-authz-9

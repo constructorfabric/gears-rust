@@ -21,6 +21,7 @@ use crate::domain::error::DomainError;
 use crate::domain::odata::Listing;
 use crate::domain::precondition;
 use crate::infra::storage::clock::{now, stamp_after};
+use crate::infra::storage::db_error::db_error;
 use crate::infra::storage::declaration_odata_mapper::DeclarationODataMapper;
 use crate::infra::storage::entity::declaration::{self, Entity as DeclarationEntity};
 use crate::infra::storage::entity::tenant_permission;
@@ -92,15 +93,7 @@ fn map_write_error(err: &toolkit_db::secure::ScopeError) -> DomainError {
                     .to_owned(),
         }
     } else {
-        DomainError::Internal {
-            diagnostic: err.to_string(),
-        }
-    }
-}
-
-fn db_error(err: impl std::fmt::Display) -> DomainError {
-    DomainError::Internal {
-        diagnostic: err.to_string(),
+        db_error(err)
     }
 }
 
@@ -473,9 +466,7 @@ impl DeclarationRepository for DeclarationRepo {
             .scope_with(scope)
             .one(conn)
             .await
-            .map_err(|err| DomainError::Internal {
-                diagnostic: err.to_string(),
-            })?;
+            .map_err(db_error)?;
         // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-read:p1:inst-decl-read-6
         Ok(found.map(to_domain))
     }
@@ -744,6 +735,45 @@ impl DeclarationRepository for DeclarationRepo {
         }
         Ok(tallies)
     }
+
+    async fn count_by_source_status<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+    ) -> Result<HashMap<(String, String), u64>, DomainError> {
+        let rows = DeclarationEntity::find()
+            .secure()
+            .scope_with(scope)
+            .project_all(conn, |q| {
+                q.select_only()
+                    .column(declaration::Column::Source)
+                    .column(declaration::Column::Status)
+                    .column_as(Expr::col(declaration::Column::Id).count(), "n")
+                    .group_by(declaration::Column::Source)
+                    .group_by(declaration::Column::Status)
+                    .into_model::<SourceStatusRow>()
+            })
+            .await
+            .map_err(db_error)?;
+        Ok(rows
+            .into_iter()
+            .map(|row| {
+                (
+                    (row.source, row.status),
+                    u64::try_from(row.n).unwrap_or_default(),
+                )
+            })
+            .collect())
+    }
+}
+
+/// One group of the inventory: the declarations sharing a source and a status,
+/// and how many there are.
+#[derive(Debug, sea_orm::FromQueryResult)]
+struct SourceStatusRow {
+    source: String,
+    status: String,
+    n: i64,
 }
 
 /// One group of the tally: the declarations of a category sharing a mode and
