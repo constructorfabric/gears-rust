@@ -17,6 +17,7 @@
 -- event_type, event_subject_id, event_subject_type, worker_id, assignee. MySQL expands
 -- row-value keysets `(a, b) > ($1, $2)`.
 --
+-- Guide: DATABASE.md (table groups, query flows, locking rules, verified behaviour).
 -- Domains (P05, ADR-0010): one database per task domain, each with this whole schema;
 -- te_runtime_config and the SDK offset tables are used only in `default`; te_runtime_config_applied
 -- exists in every domain. Task, entry,
