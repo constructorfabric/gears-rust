@@ -16,7 +16,7 @@
 //! - [`test_support`] — [`UnimplementedTaskEngine`], a placeholder impl whose
 //!   every method fails `unimplemented`.
 //! - [`error`] — resource-error constructors; [`reason`] — the Task Engine
-//!   reason codes.
+//!   error codes, by the slot that carries them.
 //!   Every method fails with a platform [`CanonicalError`]; the Task Engine
 //!   defines no error types of its own.
 //!

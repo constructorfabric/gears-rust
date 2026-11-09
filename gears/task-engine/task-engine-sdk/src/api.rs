@@ -10,6 +10,21 @@
 //! the error categories are the document's; every method fails with a
 //! [`CanonicalError`]. Requests about a task the caller may not `read` fail
 //! exactly like a missing task (`not_found`).
+//!
+//! **Worker calls** (the lease-fenced `start`, `progress`, `checkpoint`,
+//! `complete`, `release`, set-wait, park, and the worker path of
+//! `create_entry`) never fail `not_found`: a caller that is not the current
+//! holder with that token — stale or unknown token, unknown task, a task of
+//! another tenant — gets `aborted` `LEASE_LOST`. `permission_denied`
+//! `CLAIM_REVOKED` means the caller's scope no longer covers the task and the
+//! task was released; drop it. `progress`, `complete`, `release` and set-wait
+//! are allowed from `claimed` as well as `running` (`start` is optional).
+//!
+//! **Retry hints.** Every `resource_exhausted` (429) and `service_unavailable`
+//! (503) carries `Retry-After`. `service_unavailable` covers an unreachable
+//! PDP (fail closed: nothing written, leases kept), an unreachable GTS
+//! registry for an uncached type, and node overload — overload is never
+//! `resource_exhausted`. See [`crate::reason`] for where each code travels.
 
 use gts::GtsInstanceId;
 use toolkit_canonical_errors::CanonicalError;
@@ -22,10 +37,10 @@ use crate::models::{
     ClaimRequest, ClaimResponse, CompleteRequest, CountTasksQuery, CreateEntryRequest,
     CreateTaskRequest, Entry, EntryPage, HeartbeatRequest, HeartbeatResponse, HistoryEventPage,
     HoldRequest, LeaseTokenRequest, PageQuery, ParkRequest, ParkResponse, ProgressRequest, Queue,
-    QueueList, ReassignRequest, ReleaseRequest, ResolveRequest, ResolveResponse,
-    RuntimeConfigAccepted, RuntimeConfigRequest, RuntimeConfigStatus, SearchTasksQuery,
-    SetWaitRequest, SetWaitResponse, TagsPatchRequest, Task, TaskCount, TaskSearchPage,
-    WaitConditionPage,
+    QueueHistoryEventPage, QueueList, ReassignRequest, ReenqueueRequest, ReleaseRequest,
+    ResolveRequest, ResolveResponse, RuntimeConfigAccepted, RuntimeConfigRequest,
+    RuntimeConfigStatus, SearchTasksQuery, SetWaitOutcome, SetWaitRequest, TagsPatchRequest, Task,
+    TaskCount, TaskSearchPage, WaitConditionPage,
 };
 
 /// Task Engine API — the same trait for in-process and remote consumption.
@@ -41,15 +56,22 @@ pub trait TaskEngineApi: Send + Sync {
     ///
     /// Initial state: `blocked` with unmet predecessors, else `waiting` with an
     /// initial wait group, else `scheduled` with a future `run_after`, else
-    /// `queued`. A replay of an equal request under the same idempotency key
-    /// fails `already_exists` naming the existing task, so this is not retried
-    /// automatically.
+    /// `queued` (also for a past `run_after`). `owner_tenant_id` defaults to
+    /// the caller's tenant. A replay of an equal request under the same
+    /// idempotency key fails `already_exists` naming the existing task (never
+    /// refused as full), so this is not retried automatically.
     ///
     /// # Errors
-    /// `invalid_argument` (schema, unknown type/queue, trust limits,
-    /// `FEATURE_NOT_AVAILABLE`, …; missing idempotency key), `permission_denied`,
-    /// `not_found` (parent/predecessor), `already_exists`, `resource_exhausted`
-    /// (`QUEUE_DEPTH_LIMIT`), `service_unavailable`.
+    /// `invalid_argument` (field violations: `SCHEMA_VIOLATION`,
+    /// `UNKNOWN_TASK_TYPE`, `DEAD_LETTER_QUEUE`, `TASK_DOMAIN_MISMATCH`,
+    /// `TRUST_LIMIT`, `KEY_REUSED`, `FEATURE_NOT_AVAILABLE`, …; missing
+    /// idempotency key is `428`), `failed_precondition` (`STALE_ORDER`,
+    /// `DEPENDENCY_UNSATISFIABLE`, p2), `permission_denied` (`ACTION_DENIED`,
+    /// `EXPEDITE_REQUIRED`, `CREATOR_AUTHORITY`,
+    /// `CREATOR_AUTHORITY_UNVERIFIABLE`, `DUPLICATE_NOT_READABLE`,
+    /// `SUPERSEDE_CANCEL_DENIED`), `not_found` (queue, parent, predecessor),
+    /// `already_exists`, `aborted` (`STATE_CHANGED`, p2), `resource_exhausted`
+    /// (`queue_depth.*`), `service_unavailable`.
     #[idempotency(NonIdempotentWrite)]
     async fn create_task(
         &self,
@@ -62,7 +84,8 @@ pub trait TaskEngineApi: Send + Sync {
     ///
     /// # Errors
     /// `invalid_argument` (query options, window, cursor binding),
-    /// `permission_denied` (no `read` grant at all), `service_unavailable`.
+    /// `permission_denied` (`ACTION_DENIED`: the PDP denies `read` outright; a
+    /// scope that matches nothing is an empty page), `service_unavailable`.
     #[idempotency(SafeRead)]
     async fn search_tasks(
         &self,
@@ -91,13 +114,17 @@ pub trait TaskEngineApi: Send + Sync {
 
     /// Cancel a task (`cancelTask`). Action `cancel`.
     ///
-    /// An unleased task, or `forced`, ends at once (`cancelled`); `requested` /
-    /// `graceful` on a leased task only sets `cancel_requested` (HTTP `202`).
-    /// Either way the returned task shows which happened.
+    /// The body is optional on the wire (`CancelRequest::default()`); `mode`
+    /// defaults to `requested`. An unleased task, or `forced`, ends at once
+    /// (`cancelled`); `requested` / `graceful` on a leased task only sets
+    /// `cancel_requested` (HTTP `202`), and modes only move forward (a repeat
+    /// is a no-op `202`). A task already ended in the cancelled family is
+    /// returned unchanged. Either way the returned task shows which happened.
     ///
     /// # Errors
-    /// `invalid_argument`, `failed_precondition` (`STATE`), `permission_denied`,
-    /// `not_found`, `service_unavailable`.
+    /// `invalid_argument`, `failed_precondition` (`TASK_FINISHED`,
+    /// `NOT_CANCELLABLE`), `permission_denied`, `not_found`, `aborted`
+    /// (`STATE_CHANGED`), `service_unavailable`.
     #[idempotency(NonIdempotentWrite)]
     async fn cancel_task(
         &self,
@@ -107,9 +134,11 @@ pub trait TaskEngineApi: Send + Sync {
     ) -> Result<Task, CanonicalError>;
 
     /// Add, replace or remove tags (`updateTaskTags`). Action `update`. p2.
+    /// Records one `taskTagsUpdated` history event.
     ///
     /// # Errors
-    /// `invalid_argument`, `permission_denied`, `not_found`, `service_unavailable`.
+    /// `invalid_argument` (`DUPLICATE`, `TOO_LONG`, `REQUIRED`,
+    /// `TOO_MANY_TAGS`), `permission_denied`, `not_found`, `service_unavailable`.
     #[idempotency(IdempotentWrite)]
     async fn update_task_tags(
         &self,
@@ -123,12 +152,16 @@ pub trait TaskEngineApi: Send + Sync {
     /// Claim up to `max_tasks` tasks, long-polling up to `timeout_secs`
     /// (`claimTasks`). Action `claim`.
     ///
-    /// `Ok(None)` when nothing became eligible before the timeout (HTTP `204`).
+    /// `Ok(None)` when nothing became eligible before the timeout (HTTP `204`),
+    /// also when every named queue is held or the worker is blacklisted on it;
+    /// no session is opened, renewed or returned then.
     ///
     /// # Errors
-    /// `invalid_argument`, `failed_precondition` (blacklisted, p3), `not_found`
-    /// (unknown queue), `permission_denied`, `resource_exhausted`
-    /// (`CONCURRENCY_LIMIT`), `service_unavailable`.
+    /// `invalid_argument` (`REQUIRED`, `INVALID_FORMAT`, `OUT_OF_RANGE`,
+    /// `TOO_MANY_QUEUES`, `DEAD_LETTER_QUEUE`, `CROSS_DOMAIN`), `not_found`
+    /// (unregistered queue), `permission_denied` (`ACTION_DENIED`,
+    /// `QUEUE_NOT_PERMITTED`), `resource_exhausted` (`concurrency`),
+    /// `service_unavailable`.
     #[idempotency(NonIdempotentWrite)]
     async fn claim_tasks(
         &self,
@@ -137,10 +170,13 @@ pub trait TaskEngineApi: Send + Sync {
     ) -> Result<Option<ClaimResponse>, CanonicalError>;
 
     /// Renew the worker session and check every listed lease (`heartbeatTasks`).
-    /// No PDP action; an unknown session answers every lease `lease_lost`.
+    /// No PDP action; an unknown, expired or foreign session answers every
+    /// lease `lease_lost` and is not revived. A pending cancel is reported per
+    /// lease (with `superseded_by` when a supersession caused it).
     ///
     /// # Errors
-    /// `invalid_argument` (too many leases), `service_unavailable` (shed).
+    /// `invalid_argument` (`TOO_MANY` on `/leases`; session not renewed),
+    /// `service_unavailable` (node overloaded).
     #[idempotency(IdempotentWrite)]
     async fn heartbeat_tasks(
         &self,
@@ -148,11 +184,13 @@ pub trait TaskEngineApi: Send + Sync {
         req: HeartbeatRequest,
     ) -> Result<HeartbeatResponse, CanonicalError>;
 
-    /// `claimed` → `running` (`startTask`). Action `claim`, lease-fenced.
+    /// Optional `claimed` → `running` (`startTask`). Action `claim`,
+    /// lease-fenced. A repeated start by the holder on a `running` task is a
+    /// no-op; `start` never moves the execution deadline the claim set.
     ///
     /// # Errors
-    /// `failed_precondition` (`STATE`), `permission_denied` (revoked; task
-    /// released), `not_found`, `aborted` (`LEASE_LOST`), `service_unavailable`.
+    /// `invalid_argument` (`REQUIRED`), `permission_denied` (`CLAIM_REVOKED`;
+    /// task released), `aborted` (`LEASE_LOST`), `service_unavailable`.
     #[idempotency(NonIdempotentWrite)]
     async fn start_task(
         &self,
@@ -161,12 +199,12 @@ pub trait TaskEngineApi: Send + Sync {
         req: LeaseTokenRequest,
     ) -> Result<Task, CanonicalError>;
 
-    /// Buffer a progress update, saved at the next flush (`reportProgress`).
-    /// Action `claim`, lease-fenced.
+    /// Buffer a progress update from `claimed` or `running`, saved at the next
+    /// flush (`reportProgress`). Action `claim`, lease-fenced.
     ///
     /// # Errors
-    /// `invalid_argument`, `permission_denied`, `not_found`, `aborted`
-    /// (`LEASE_LOST`), `service_unavailable`.
+    /// `invalid_argument` (`OUT_OF_RANGE`), `permission_denied`
+    /// (`CLAIM_REVOKED`), `aborted` (`LEASE_LOST`), `service_unavailable`.
     #[idempotency(IdempotentWrite)]
     async fn report_progress(
         &self,
@@ -175,11 +213,11 @@ pub trait TaskEngineApi: Send + Sync {
         req: ProgressRequest,
     ) -> Result<(), CanonicalError>;
 
-    /// Merge a checkpoint into the task `context` (`saveCheckpoint`). Action
-    /// `claim`, lease-fenced. p3.
+    /// Merge a checkpoint into the task `context` as an RFC 7386 JSON Merge
+    /// Patch (`saveCheckpoint`). Action `claim`, lease-fenced. p3.
     ///
     /// # Errors
-    /// `invalid_argument` (incl. size), `permission_denied`, `not_found`,
+    /// `invalid_argument` (incl. size), `permission_denied` (`CLAIM_REVOKED`),
     /// `aborted` (`LEASE_LOST`, `CONCURRENT_MODIFICATION`), `service_unavailable`.
     #[idempotency(IdempotentWrite)]
     async fn save_checkpoint(
@@ -189,14 +227,15 @@ pub trait TaskEngineApi: Send + Sync {
         req: CheckpointRequest,
     ) -> Result<CheckpointResponse, CanonicalError>;
 
-    /// Report the result (`completeTask`). Action `claim`, lease-fenced.
-    /// Repeating the same completion with the same token returns the stored
-    /// outcome.
+    /// Report the result from `claimed` or `running` (`completeTask`). Action
+    /// `claim`, lease-fenced. Repeating a terminal completion with the same
+    /// token returns the stored outcome; a repeated retryable failure after a
+    /// lost response gets `LEASE_LOST` (the first report was applied).
     ///
     /// # Errors
-    /// `invalid_argument`, `failed_precondition` (`STATE`, `CHILDREN_PENDING`),
-    /// `permission_denied`, `not_found`, `aborted` (`LEASE_LOST`),
-    /// `service_unavailable`.
+    /// `invalid_argument` (lease kept), `failed_precondition` (`STATE`,
+    /// `CHILDREN_PENDING`), `permission_denied` (`CLAIM_REVOKED`), `aborted`
+    /// (`LEASE_LOST`; checked before validation), `service_unavailable`.
     #[idempotency(IdempotentWrite)]
     async fn complete_task(
         &self,
@@ -205,13 +244,15 @@ pub trait TaskEngineApi: Send + Sync {
         req: CompleteRequest,
     ) -> Result<Task, CanonicalError>;
 
-    /// Give the task back without failing it (`releaseTask`). Action `claim`,
-    /// lease-fenced.
+    /// Give the task back without failing it, from `claimed` or `running`
+    /// (`releaseTask`). Action `claim`, lease-fenced. A repeated release after
+    /// a lost response gets `LEASE_LOST` (the first one was applied).
     ///
     /// # Errors
-    /// `invalid_argument`, `permission_denied`, `not_found`, `aborted`
-    /// (`LEASE_LOST`), `resource_exhausted` (deferred limit),
-    /// `service_unavailable`.
+    /// `invalid_argument` (`OUT_OF_RANGE` on `/delay_secs`), `permission_denied`
+    /// (`CLAIM_REVOKED`), `aborted` (`LEASE_LOST`, `CONCURRENT_MODIFICATION`),
+    /// `resource_exhausted` (`queue_depth.deferred`, delayed release only;
+    /// lease kept), `service_unavailable`.
     #[idempotency(NonIdempotentWrite)]
     async fn release_task(
         &self,
@@ -221,10 +262,11 @@ pub trait TaskEngineApi: Send + Sync {
     ) -> Result<Task, CanonicalError>;
 
     /// Take over a task reassigned to the caller (`acceptReassignedTask`).
-    /// Action `claim`. p3.
+    /// Action `claim`, checked with the accepting worker's own scope. p3.
     ///
     /// # Errors
-    /// `invalid_argument`, `not_found` (nothing to accept), `service_unavailable`.
+    /// `invalid_argument`, `permission_denied` (`ACTION_DENIED`), `not_found`
+    /// (nothing to accept), `service_unavailable`.
     #[idempotency(NonIdempotentWrite)]
     async fn accept_reassigned_task(
         &self,
@@ -236,11 +278,14 @@ pub trait TaskEngineApi: Send + Sync {
     // ------------------------------------------------------------- entries
 
     /// Add an immutable entry (`createEntry`). Action `claim` with a lease
-    /// token, else `create`.
+    /// token (lease-fenced), else `create` (any task state, terminal
+    /// included). At most `max_entries_per_task` (1000) entries per task.
     ///
     /// # Errors
-    /// `invalid_argument` (incl. size), `permission_denied`, `not_found`,
-    /// `aborted` (`LEASE_LOST`, worker path), `service_unavailable`.
+    /// `invalid_argument` (`UNKNOWN_ENTRY_TYPE`, `SCHEMA_VIOLATION`; incl.
+    /// size), `failed_precondition` (`TOO_MANY_ENTRIES`), `permission_denied`
+    /// (`ACTION_DENIED`; worker path `CLAIM_REVOKED`), `not_found` (API-consumer
+    /// path only), `aborted` (`LEASE_LOST`, worker path), `service_unavailable`.
     #[idempotency(NonIdempotentWrite)]
     async fn create_entry(
         &self,
@@ -276,20 +321,26 @@ pub trait TaskEngineApi: Send + Sync {
 
     // ------------------------------------------------------------- waits
 
-    /// Set (arm or park) the task's wait group (`setWaitConditions`). Action
-    /// `claim`, lease-fenced. Parking releases the lease.
+    /// Set (arm or park) the task's wait group from `claimed` or `running`
+    /// (`setWaitConditions`). Action `claim`, lease-fenced. Parking releases
+    /// the lease. A group satisfied at once is not parked: the result is
+    /// [`SetWaitOutcome::Satisfied`] (`parked: false` with the `result`), the
+    /// lease is kept and the task stays as it was.
     ///
     /// # Errors
-    /// `invalid_argument`, `failed_precondition` (`STATE`), `permission_denied`
-    /// (event `consume` checks, revoked `claim`), `not_found`, `aborted`,
-    /// `resource_exhausted`, `service_unavailable`.
+    /// `invalid_argument`, `failed_precondition` (`STATE`: the task already has
+    /// a group), `permission_denied` (`EVENT_CONSUME_DENIED`,
+    /// `EVENT_CONSUME_UNVERIFIABLE`, lease kept; `CLAIM_REVOKED`), `aborted`
+    /// (`LEASE_LOST`, `CONCURRENT_MODIFICATION`), `resource_exhausted`
+    /// (`queue_depth.deferred`, `event_waits.*`; lease kept),
+    /// `service_unavailable`.
     #[idempotency(NonIdempotentWrite)]
     async fn set_wait_conditions(
         &self,
         ctx: SecurityContext,
         task_id: Uuid,
         req: SetWaitRequest,
-    ) -> Result<SetWaitResponse, CanonicalError>;
+    ) -> Result<SetWaitOutcome, CanonicalError>;
 
     /// List every wait condition of the task, oldest first
     /// (`listWaitConditions`). Action `read`. Filter on `wait_group_id`,
@@ -306,11 +357,14 @@ pub trait TaskEngineApi: Send + Sync {
     ) -> Result<WaitConditionPage, CanonicalError>;
 
     /// Park the armed wait group (`parkWaitGroup`). Action `claim`,
-    /// lease-fenced.
+    /// lease-fenced. An already satisfied group is not parked; the task keeps
+    /// running under the same lease.
     ///
     /// # Errors
-    /// `failed_precondition` (no armed group), `permission_denied`, `not_found`,
-    /// `aborted`, `resource_exhausted`, `service_unavailable`.
+    /// `invalid_argument` (`REQUIRED`), `failed_precondition`
+    /// (`NO_ARMED_WAIT`, lease kept), `permission_denied` (`CLAIM_REVOKED`),
+    /// `aborted` (`LEASE_LOST`, `CONCURRENT_MODIFICATION`), `resource_exhausted`
+    /// (`queue_depth.deferred`), `service_unavailable`.
     #[idempotency(NonIdempotentWrite)]
     async fn park_wait_group(
         &self,
@@ -319,13 +373,16 @@ pub trait TaskEngineApi: Send + Sync {
         req: ParkRequest,
     ) -> Result<ParkResponse, CanonicalError>;
 
-    /// Provide the value of a pending input condition (`resolveWaitCondition`).
-    /// Action `resolve`. p2. Repeating the same value as the same subject is a
-    /// no-op that returns the same body.
+    /// Provide the value of a pending input condition, parked or armed
+    /// (`resolveWaitCondition`). Action `resolve` only (no `read` needed). p2.
+    /// Repeating the same value as the same subject is a no-op that returns
+    /// the same body.
     ///
     /// # Errors
-    /// `invalid_argument`, `failed_precondition`, `permission_denied`,
-    /// `not_found`, `aborted` (`ALREADY_RESOLVED`), `service_unavailable`.
+    /// `invalid_argument` (`SCHEMA_VIOLATION`), `failed_precondition`
+    /// (`ALREADY_RESOLVED`: another value or subject; `NOT_RESOLVABLE`; `STATE`),
+    /// `permission_denied` (`ACTION_DENIED`), `not_found`, `aborted`
+    /// (`STATE_CHANGED`), `service_unavailable`.
     #[idempotency(IdempotentWrite)]
     async fn resolve_wait_condition(
         &self,
@@ -351,15 +408,17 @@ pub trait TaskEngineApi: Send + Sync {
 
     // ------------------------------------------------------------- queues
 
-    /// Every registered queue with limits, counts, domains and hold state
-    /// (`listQueues`). Action `queue_read`.
+    /// Every registered queue with limits, settings, domains and hold state
+    /// (`listQueues`). Action `queue_read`. `counts` and `sampled_at` only for
+    /// a caller that also holds `configure` on queues.
     ///
     /// # Errors
     /// `permission_denied`, `service_unavailable`.
     #[idempotency(SafeRead)]
     async fn list_queues(&self, ctx: SecurityContext) -> Result<QueueList, CanonicalError>;
 
-    /// Get one queue (`getQueue`). Action `queue_read`.
+    /// Get one queue (`getQueue`). Action `queue_read`. `counts` and
+    /// `sampled_at` only for a caller that also holds `configure` on queues.
     ///
     /// # Errors
     /// `permission_denied`, `not_found`, `service_unavailable`.
@@ -370,12 +429,32 @@ pub trait TaskEngineApi: Send + Sync {
         queue_id: GtsInstanceId,
     ) -> Result<Queue, CanonicalError>;
 
+    /// The queue-scoped history of one queue (`queueHeld`, `queueReleased`,
+    /// `configUpdated`, `workerBlacklisted`), oldest first, cursor-paged like
+    /// the task history (`listQueueEvents`). Action `queue_read`. Filter on
+    /// `event_type` (`eq`, `in`) and `timestamp`.
+    ///
+    /// # Errors
+    /// `invalid_argument`, `permission_denied`, `not_found`,
+    /// `service_unavailable`.
+    #[idempotency(SafeRead)]
+    async fn list_queue_events(
+        &self,
+        ctx: SecurityContext,
+        queue_id: GtsInstanceId,
+        query: PageQuery,
+    ) -> Result<QueueHistoryEventPage, CanonicalError>;
+
     // ------------------------------------------------------------- bulk (p2)
 
     /// Cancel many tasks (`bulkCancel`). Action `cancel`, per task.
     ///
+    /// `mode` defaults to `requested`; a leased task only flagged reports
+    /// `cancel_requested`.
+    ///
     /// # Errors
-    /// `invalid_argument` (`BATCH_TOO_LARGE`), `service_unavailable`. Per-task
+    /// `invalid_argument` (`BATCH_TOO_LARGE`), `permission_denied`
+    /// (`ACTION_DENIED`: denied outright), `service_unavailable`. Per-task
     /// failures are outcomes in the result.
     #[idempotency(NonIdempotentWrite)]
     async fn bulk_cancel(
@@ -388,7 +467,8 @@ pub trait TaskEngineApi: Send + Sync {
     /// Action `admin`, per task.
     ///
     /// # Errors
-    /// `invalid_argument`, `service_unavailable`.
+    /// `invalid_argument` (`BATCH_TOO_LARGE`), `permission_denied`
+    /// (`ACTION_DENIED`: denied outright), `service_unavailable`.
     #[idempotency(IdempotentWrite)]
     async fn bulk_reprioritize(
         &self,
@@ -396,11 +476,13 @@ pub trait TaskEngineApi: Send + Sync {
         req: BulkReprioritizeRequest,
     ) -> Result<BulkResult, CanonicalError>;
 
-    /// Re-enqueue many dead-lettered or failed tasks (`bulkRetry`). Action
-    /// `admin`, per task.
+    /// Re-enqueue many dead-lettered or failed tasks into their source queues
+    /// (`bulkRetry`). Action `admin`, per task. Depth refusals report
+    /// `limit_exceeded`, precondition refusals `invalid_state`.
     ///
     /// # Errors
-    /// `invalid_argument`, `service_unavailable`.
+    /// `invalid_argument` (`BATCH_TOO_LARGE`), `permission_denied`
+    /// (`ACTION_DENIED`: denied outright), `service_unavailable`.
     #[idempotency(NonIdempotentWrite)]
     async fn bulk_retry(
         &self,
@@ -409,9 +491,13 @@ pub trait TaskEngineApi: Send + Sync {
     ) -> Result<BulkResult, CanonicalError>;
 
     /// Move many tasks to another queue (`bulkMove`). Action `admin`, per task.
+    /// Per task: another domain → `domain_mismatch`, a depth refusal →
+    /// `limit_exceeded`.
     ///
     /// # Errors
-    /// `invalid_argument`, `service_unavailable`.
+    /// `invalid_argument` (`BATCH_TOO_LARGE`, `DEAD_LETTER_QUEUE`),
+    /// `permission_denied` (`ACTION_DENIED`: denied outright), `not_found`
+    /// (unregistered destination), `service_unavailable`.
     #[idempotency(IdempotentWrite)]
     async fn bulk_move(
         &self,
@@ -422,11 +508,13 @@ pub trait TaskEngineApi: Send + Sync {
     // ------------------------------------------------------------- admin
 
     /// Hand a claimed or running task to another identity (`reassignTask`).
-    /// Action `admin`. p3.
+    /// Action `admin`. p3. An optional `reason` is recorded in
+    /// `taskReassigned`.
     ///
     /// # Errors
-    /// `failed_precondition` (`STATE`), `permission_denied`, `not_found`,
-    /// `service_unavailable`.
+    /// `invalid_argument` (`TOO_LONG`), `failed_precondition` (`STATE`,
+    /// `TARGET_BLACKLISTED`), `permission_denied`, `not_found`, `aborted`
+    /// (`STATE_CHANGED`), `service_unavailable`.
     #[idempotency(NonIdempotentWrite)]
     async fn reassign_task(
         &self,
@@ -436,21 +524,27 @@ pub trait TaskEngineApi: Send + Sync {
     ) -> Result<Task, CanonicalError>;
 
     /// `dead_lettered` or `failed` → `queued` (`reenqueueTask`). Action `admin`.
-    /// p2.
+    /// p2. The task returns to its source queue unless `req.queue` names
+    /// another dispatch queue (`ReenqueueRequest::default()` sends `{}`).
     ///
     /// # Errors
-    /// `failed_precondition`, `invalid_argument`, `permission_denied`,
-    /// `not_found`, `already_exists` (dedup identity taken),
-    /// `resource_exhausted`, `service_unavailable`.
+    /// `failed_precondition` (`STATE`, `STALE_ORDER`, `PARENT_FINISHED`),
+    /// `invalid_argument` (`TASK_DOMAIN_MISMATCH`, `DEAD_LETTER_QUEUE`,
+    /// `NOT_ALLOWED` on `/queue`), `permission_denied`, `not_found` (task, or
+    /// an unregistered queue), `already_exists` (dedup identity taken),
+    /// `aborted` (`STATE_CHANGED`), `resource_exhausted` (`queue_depth.*`),
+    /// `service_unavailable`.
     #[idempotency(NonIdempotentWrite)]
     async fn reenqueue_task(
         &self,
         ctx: SecurityContext,
         task_id: Uuid,
+        req: ReenqueueRequest,
     ) -> Result<Task, CanonicalError>;
 
     /// Save a new runtime configuration version, applied asynchronously per
-    /// domain (`saveRuntimeConfig`). Action `queue_configure`. p3.
+    /// domain (`saveRuntimeConfig`). Action `queue_configure` on the queue base
+    /// type (one check; all-or-nothing). p3.
     ///
     /// # Errors
     /// `invalid_argument`, `permission_denied`, `service_unavailable`.
@@ -474,10 +568,12 @@ pub trait TaskEngineApi: Send + Sync {
     ) -> Result<RuntimeConfigStatus, CanonicalError>;
 
     /// Hold a queue: claims skip it, creates continue (`holdQueue`). Action
-    /// `queue_configure`.
+    /// `queue_configure`. Holding a held queue replaces `reason` and `until`.
     ///
     /// # Errors
-    /// `invalid_argument`, `permission_denied`, `not_found`, `service_unavailable`.
+    /// `invalid_argument` (`OUT_OF_RANGE` on `/until`, `TOO_LONG`),
+    /// `failed_precondition` (`DEAD_LETTER_QUEUE`), `permission_denied`,
+    /// `not_found`, `service_unavailable`.
     #[idempotency(IdempotentWrite)]
     async fn hold_queue(
         &self,
@@ -486,7 +582,9 @@ pub trait TaskEngineApi: Send + Sync {
         req: HoldRequest,
     ) -> Result<Queue, CanonicalError>;
 
-    /// End a queue hold (`releaseQueue`). Action `queue_configure`.
+    /// End a queue hold (`releaseQueue`). Action `queue_configure`. Releasing
+    /// a queue that is not held returns it with `hold: None` and records
+    /// nothing.
     ///
     /// # Errors
     /// `permission_denied`, `not_found`, `service_unavailable`.

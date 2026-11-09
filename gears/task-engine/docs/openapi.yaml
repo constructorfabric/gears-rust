@@ -16,9 +16,11 @@ info:
     `403` means the caller may read the target but not perform the action.
 
     **Phases.** Operations and fields are available from p1 unless the description says p2
-    or p3. Some p2 features are already in the p1 schema but refused in p1 (input and
-    children wait kinds, `parent_task_id` on create): the request is rejected `400`
-    `invalid_argument` with a field violation whose `reason` is `FEATURE_NOT_AVAILABLE`.
+    or p3. Some p2 features are already in the p1 schema but refused in p1 (input,
+    children and event wait kinds, `parent_task_id` on create): the request is rejected
+    `400` `invalid_argument` with a field violation whose `reason` is
+    `FEATURE_NOT_AVAILABLE` on the exact field (`/wait/conditions/0/kind`,
+    `/parent_task_id`).
 
     **Paging.** Every list that can grow is cursor-paged: query parameters `limit` and
     `cursor` (the OData spellings `$top` and `$skiptoken` are accepted as aliases; sending
@@ -34,9 +36,18 @@ info:
 
     **Conventions.** JSON bodies; errors are `application/problem+json` (RFC 9457, see
     `Problem`). Enum values are snake_case names and every enum is an open set: clients must
-    show an unknown value as Unknown. Times are RFC 3339 UTC. Durations are integer seconds
-    with a `_secs` suffix. Any operation may also answer `500` `internal` with only a
-    `trace_id`.
+    show an unknown value as Unknown. Times are RFC 3339 UTC with an `_at` suffix.
+    Durations are integer seconds with a `_secs` suffix. Any operation may also answer
+    `500` `internal` with only a `trace_id`.
+
+    **Errors.** Every `429` and every `503` carries `Retry-After`. `503`
+    `service_unavailable` means the PDP is unreachable (every operation fails closed:
+    nothing is written, leases are kept), the GTS registry is unreachable for a type that
+    is not cached, or the node is overloaded; overload is never `429`. Field violations
+    name a field by an RFC 6901 JSON Pointer from the request body root (`/queues/1`); a
+    header or query parameter is named as sent (`Idempotency-Key`, `cursor`). A route
+    outside this contract answers `404` (the removed dependency-change routes, the
+    single-task heartbeat and `GET /admin/dlq` included).
 servers:
   - url: https://api.example.com/api/task_engine/v1
     description: >-
@@ -57,7 +68,7 @@ tags:
   - name: search
     description: Task search, capped count and per-task event history.
   - name: queues
-    description: Queue introspection.
+    description: Queue introspection and queue-scoped history.
   - name: bulk
     description: Per-task-authorized bulk operations on explicit task ID lists (p2).
   - name: admin
@@ -76,16 +87,29 @@ paths:
         Creates one task. Action **`create`**. `urgency: critical` also needs
         **`expedite`**. Each predecessor needs `read` on it (p2). A child
         (`parent_task_id`, p2) needs `parent_lease_token`, the lease token of the parent
-        held by the calling worker.
+        held by the calling worker. `owner_tenant_id` defaults to the caller's tenant; the
+        PDP decides whether the caller may create in another tenant (a tenant barrier is
+        crossed only for a queue that is `operated_by: platform`).
 
         Initial state: `blocked` with unmet predecessors, else `waiting` with an initial
-        `wait` group, else `scheduled` with a future `run_after`, else `queued`.
+        `wait` group, else `scheduled` with a future `run_after`, else `queued`. A
+        `run_after` in the past is stored as sent and the task is `queued`. The history
+        records only `taskCreated` with that `initial_state` (plus the wait events for
+        `waiting`).
 
         `Idempotency-Key` is required, except for task types that declare a derived
         dedup identity (`dedup` trait, p2), where it is optional and ignored. A replay
-        of an equal request answers `409` `already_exists` naming the existing task; the
-        same key with a different request answers `400` (field violation on
-        `idempotency_key`).
+        of an equal request answers `409` `already_exists` naming the existing task and
+        is never refused as full; the same key with a different request answers `400`
+        (`KEY_REUSED` on `Idempotency-Key`). A retry that omits `queue`, or names the
+        queue resolved at create, is equal. The key is never returned.
+
+        Checks run in this order, and the first failure answers: body size (`413`) → JSON
+        syntax (`400`) → task type (`400` `UNKNOWN_TASK_TYPE` / `503`) → queue (`404`
+        unknown, `400` `DEAD_LETTER_QUEUE`) → `create` (`403` / `503`) → `expedite`
+        (`403`) → missing `Idempotency-Key` (`428`) → trust limits and domain (`400`) →
+        schemas and the 64 KiB payload (`400` / `413`) → dedup and idempotency (`409`) →
+        sampled queue depth (`429`).
       parameters:
         - $ref: "#/components/parameters/IdempotencyKey"
       requestBody:
@@ -102,7 +126,7 @@ paths:
                   queue: gts.cf.core.tasks.queue.v1~acme.reports._.render.v1
                   priority: 100
                   input: { report_id: r-42, format: pdf }
-                  tags: { project: q4 }
+                  tags: [{ key: project, value: q4 }]
       responses:
         "201":
           description: >-
@@ -118,34 +142,51 @@ paths:
         "400":
           $ref: "#/components/responses/BadRequest"
           description: >-
-            `invalid_argument`: input fails the type's input schema;
-            `UNKNOWN_TASK_TYPE`; type or queue outside `trust_limits`, tenant-owned
-            type on an `operated_by: platform` queue, type not in `accepted_types`,
-            unknown queue; `TASK_DOMAIN_MISMATCH`; `DEPENDENCY_GRAPH_TOO_LARGE`;
-            field limits (tags, resource refs, priority); same `Idempotency-Key`
-            with a different request; `FEATURE_NOT_AVAILABLE` (p1: `parent_task_id`,
-            input or children condition in `wait`); `cancellable: false` on a
-            supersede type. `failed_precondition` `STALE_ORDER` (supersession, p2).
+            `invalid_argument`, each code on its field: input fails the type's input
+            schema (`SCHEMA_VIOLATION`); `UNKNOWN_TASK_TYPE` or `INVALID_TYPE_POLICY` on
+            `/type`; `DEAD_LETTER_QUEUE` or `TASK_DOMAIN_MISMATCH` on `/queue`; a request
+            value outside `trust_limits` (`TRUST_LIMIT`), a tenant-owned type on an
+            `operated_by: platform` queue or a type not in `accepted_types`
+            (`NOT_ALLOWED`); `Idempotency-Key` empty or malformed (`INVALID_FORMAT`) or
+            reused with a different request (`KEY_REUSED`); tags (`TOO_MANY_TAGS` on
+            `/tags`, `TOO_LONG`, `REQUIRED` for an empty key); `resource_id` over 256
+            characters or a dedup key-field value over 4 KiB (`TOO_LONG`); `run_after`
+            after the lifetime deadline (`OUT_OF_RANGE`); `wait` with predecessors or a
+            future `run_after` (`NOT_ALLOWED` on `/wait`), or a `children` condition in it
+            (`NOT_ALLOWED` on its `kind`, in every phase, before the p1 check); an empty or oversized `wait` group (`REQUIRED`, `TOO_MANY`);
+            `parent_task_id` without `parent_lease_token` (`REQUIRED`); hierarchy deeper
+            than `max_hierarchy_depth` (`TOO_DEEP` on `/parent_task_id`); the same
+            predecessor twice (`DUPLICATE`); more than `max_predecessors_per_task`
+            (`DEPENDENCY_GRAPH_TOO_LARGE`); `FEATURE_NOT_AVAILABLE` (p1: `parent_task_id`,
+            an input, children or event condition in `wait`); `cancellable: false` on a
+            supersede type. `failed_precondition`: `STALE_ORDER` (supersession, p2; names
+            no task), `DEPENDENCY_UNSATISFIABLE` (p2).
         "401":
           $ref: "#/components/responses/Unauthenticated"
         "403":
           $ref: "#/components/responses/Forbidden"
           description: >-
-            `create` denied for the type or queue; `critical` without `expedite`; creator check
-            denied (`CREATOR_AUTHORITY`) or not decidable (`CREATOR_AUTHORITY_UNVERIFIABLE`);
-            dedup hit on a task the caller cannot read (no task ID disclosed); supersession
-            without `cancel` on the replaced task.
+            `ACTION_DENIED`: `create` denied for the type, queue or owner tenant;
+            `EXPEDITE_REQUIRED`: `critical` without `expedite`; `CREATOR_AUTHORITY` /
+            `CREATOR_AUTHORITY_UNVERIFIABLE`: creator check denied or not decidable (the
+            check index only in `detail`); `DUPLICATE_NOT_READABLE`: dedup hit on a task
+            the caller cannot read (no task ID disclosed); `SUPERSEDE_CANCEL_DENIED`:
+            supersession without `cancel` on the replaced task.
         "404":
           $ref: "#/components/responses/NotFound"
           description: >-
-            Parent or predecessor missing, foreign or not usable by the caller (p2), or
-            `parent_lease_token` not held by the caller.
+            The queue is not registered (`resource_type` = the queue base type); or a
+            parent or predecessor is missing, foreign, in another task domain, or not
+            usable by the caller, or `parent_lease_token` is not held by the caller
+            (p2).
         "409":
           $ref: "#/components/responses/AlreadyExists"
           description: >-
-            `already_exists`: replay of an `Idempotency-Key` with an equal request, or a duplicate
-            derived dedup identity. `context.resource_name` is the existing task ID. A replay
-            is never refused as full.
+            `already_exists`: replay of an `Idempotency-Key` with an equal request, or a
+            duplicate derived dedup identity; `resource_type` is the task base type
+            (`gts.cf.core.tasks.task.v1~`) and `resource_name` the existing task ID. A
+            replay is never refused as full. `aborted` `STATE_CHANGED`: a supersession
+            lost its race three times (p2).
         "413":
           $ref: "#/components/responses/ContentTooLarge"
         "428":
@@ -153,14 +194,15 @@ paths:
         "429":
           $ref: "#/components/responses/TooManyRequests"
           description: >-
-            `QUEUE_DEPTH_LIMIT` (dimension `queue`, `tenant`, `domain_global`, or
-            `deferred` for a create into `scheduled`, `blocked` or `waiting`).
-            Per-tenant limits are checked against a sampled count.
+            Queue depth full: `queue_depth.queue`, `queue_depth.tenant`,
+            `queue_depth.domain_global`, or `queue_depth.deferred` for a create into
+            `scheduled`, `blocked` or `waiting`. Depth is checked against a sampled count,
+            after the dedup and idempotency lookup.
         "503":
           $ref: "#/components/responses/ServiceUnavailable"
           description: >-
-            GTS registry unreachable and the type not cached; PDP unreachable (creator checks,
-            event-wait checks of an initial `wait`). Nothing is stored.
+            GTS registry unreachable and the type not cached; PDP unreachable (the create
+            check, creator checks). Nothing is stored.
 
     get:
       tags: [search]
@@ -168,26 +210,34 @@ paths:
       summary: Search tasks
       description: |
         Keyset-paged search over the caller's visible tasks. Action **`read`** (resource
-        `gts.cf.core.tasks.task.v1~`, no ID).
+        `gts.cf.core.tasks.task.v1~`, no ID). A caller the PDP denies `read` outright gets
+        `403`; a scope that matches nothing gives an empty page.
 
         * **Filter** (`$filter`): `state`, `assignee`, `queue`, `type`, `urgency`,
-          `priority`, `created_at`, `tags`, `resource_refs`, `dependencies`,
-          `parent_task_id`, `predecessor_id`. Collection filters use `any`: `tags/any(t:
-          t/key eq '<key>' and t/value eq '<value>')`, `resource_refs/any(r:
-          r/resource_type eq '…' and r/resource_id eq '…')`.
+          `priority`, `created_at`, `dependencies`, `parent_task_id`, `predecessor_id`,
+          `dead_lettered_from`, and the filter functions `has_tag('<key>')`,
+          `has_tag('<key>', '<value>')` and `has_resource_ref('<resource_type>',
+          '<resource_id>')`. Every search is bounded by the caller's tenant scope and the
+          `created_at` window, so fields without an index of their own narrow the range
+          an indexed filter selects.
         * **Window**: a search that can return terminal tasks covers at most
           `search_max_window_days` (31) of `created_at`; without a range the engine adds
-          `created_at ge now − search_default_window_days` (7). A `state` filter that
-          allows only non-terminal states has no window.
+          `created_at ge now − search_default_window_days` (7); a range over the window
+          → `400` `OUT_OF_RANGE` on `$filter`. A `state` filter that allows only
+          non-terminal states has no window, and neither has a search whose `state`
+          filter restricts it to `dead_lettered`, whatever its other filters (`queue`,
+          `dead_lettered_from`, `type`).
         * **Order** (`$orderby`): `created_at desc` (default) or `asc`; `terminal_at
           desc|asc` only when `$filter` limits `state` to terminal states. `id` is
-          appended as tiebreaker. Other keys → `400`.
+          appended as tiebreaker. Other keys → `400` `NOT_ALLOWED` on `$orderby`.
         * **Paging**: `limit` default 25, clamped to `search_max_top` (100), or
           `search_max_top_full` (20) at `view=full`; `limit=0` → `400`. Pass
           `page_info.next_cursor` back as `cursor`. The cursor also binds `view` and
-          `$select`.
+          `$select` (`FIELD_SELECTION_MISMATCH`).
         * `$count`, `$skip`, `$expand`, `$search` → `400` `UNSUPPORTED_QUERY_PARAM`.
-        * Dead-lettered tasks: `$filter=state eq 'dead_lettered'`.
+        * Dead-lettered tasks: `$filter=state eq 'dead_lettered'`, optionally with
+          `dead_lettered_from eq '<queue>'`; `read` is enough to list them. A `queue`
+          filter on a dead-letter queue searches every task domain.
       parameters:
         - $ref: "#/components/parameters/Filter"
         - $ref: "#/components/parameters/OrderBy"
@@ -204,11 +254,12 @@ paths:
           urgency: [eq, in]
           priority: [eq, ne, gt, ge, lt, le]
           created_at: [ge, gt, le, lt]
-          "tags/any(t: t/key, t/value)": [eq]
-          "resource_refs/any(resource_type, resource_id)": [eq]
+          "has_tag(key[, value])": [call]
+          "has_resource_ref(resource_type, resource_id)": [call]
           dependencies: [eq]
           parent_task_id: [eq]
           predecessor_id: [eq]
+          dead_lettered_from: [eq]
       x-odata-orderby:
         allowedFields:
           - created_at desc
@@ -216,11 +267,11 @@ paths:
           - terminal_at desc
           - terminal_at asc
       x-odata-select:
-        defaultFields: [id, state, type, urgency, priority, queue, assignment, created_at, updated_at]
-        allowedFields: [id, state, type, urgency, priority, queue, assignment, created_at, updated_at, input, result, context, progress, tags, resource_refs, events, events_truncated, wait_conditions, entries, entries_truncated, dependencies]
+        defaultFields: [id, state, type, urgency, priority, queue, assignment, dead_lettered_from, created_at, updated_at]
+        allowedFields: [id, state, type, urgency, priority, queue, assignment, dead_lettered_from, created_at, updated_at, input, result, context, progress, tags, resource_refs, events, events_truncated, wait_conditions, entries, entries_truncated, dependencies]
       responses:
         "200":
-          description: One page of tasks, narrowed by `view` and `$select`.
+          description: One page of tasks, narrowed by `view` and `$select`; empty when the caller's scope matches nothing.
           content:
             application/json:
               schema:
@@ -228,9 +279,11 @@ paths:
         "400":
           $ref: "#/components/responses/BadRequest"
           description: >-
-            Unsupported `$orderby` key, unknown `view`, `$select` field outside the view,
-            `created_at` range over `search_max_window_days`, `limit=0` (`INVALID_LIMIT`), an
-            unsupported `$` option (`UNSUPPORTED_QUERY_PARAM`), or a cursor error
+            Unsupported `$filter` field or function; unsupported `$orderby` key, unknown
+            `view` or `$select` field outside the view (`NOT_ALLOWED` on that
+            parameter); `created_at` range over `search_max_window_days` (`OUT_OF_RANGE`
+            on `$filter`); `limit=0` (`INVALID_LIMIT`); an unsupported `$`
+            option (`UNSUPPORTED_QUERY_PARAM`), or a cursor error on `cursor`
             (`INVALID_CURSOR`, `FILTER_MISMATCH`, `ORDER_WITH_CURSOR`,
             `FIELD_SELECTION_MISMATCH`).
         "401":
@@ -238,7 +291,7 @@ paths:
         "403":
           $ref: "#/components/responses/Forbidden"
           description: >-
-            The caller holds no task `read` grant at all.
+            `ACTION_DENIED`: the PDP denies task `read` outright.
         "503":
           $ref: "#/components/responses/ServiceUnavailable"
 
@@ -302,37 +355,48 @@ paths:
       operationId: cancelTask
       summary: Cancel a task
       description: |
-        Action **`cancel`**. Modes:
+        Action **`cancel`**. The body is optional; `mode` defaults to `requested`.
 
         * a task that holds no lease (not `claimed`/`running`): any mode ends it at once
           → `200`, `cancelled` with result `cancelled` (`forcibly_cancelled` for
           `forced`);
-        * a leased task, `requested` or `graceful`: only `cancel_requested` is set (the
-          worker learns it on its next heartbeat; `graceful` also arms the grace timer)
-          → `202`;
-        * a leased task, `forced`: ends at once → `200`, `forcibly_cancelled`.
+        * a leased task, `requested` or `graceful`: only `cancel_requested` and
+          `cancel_request` are set (the worker learns it on its next heartbeat;
+          `graceful` also arms the grace timer, `cancel_grace_period_secs`) → `202`;
+        * a leased task already flagged: modes only move forward. `requested` →
+          `graceful` arms the grace timer; the same mode again, or `requested` after
+          `graceful`, is a no-op `202` (first deadline kept, no event);
+        * a leased task, `forced`: ends at once → `200`, `forcibly_cancelled`;
+        * a task that already ended `cancelled`, `forcibly_cancelled`, `superseded` or
+          `dependency_failed` → `200` with the task unchanged, no event; any other
+          terminal state → `400` `failed_precondition` `TASK_FINISHED`.
 
-        `cancellable: false` refuses `requested` and `graceful`; `forced` always works.
-        Cancellation reaches children unless the parent opted out (p2).
+        `cancellable: false` refuses `requested` and `graceful` (`400`
+        `failed_precondition` `NOT_CANCELLABLE`); `forced` always works. The history
+        records `taskCancelRequested` only when a leased task is flagged or escalated; an
+        immediate or forced cancel records only `taskCancelled`. Cancellation reaches
+        unfinished children in the same mode unless the parent opted out (p2).
       parameters:
         - $ref: "#/components/parameters/TaskId"
       requestBody:
-        required: true
+        required: false
         content:
           application/json:
             schema:
               $ref: "#/components/schemas/CancelRequest"
       responses:
         "200":
-          description: The task ended; body is the cancelled task.
+          description: >-
+            The task ended (body is the cancelled task), or it had already ended in the
+            cancelled family (body is the unchanged task).
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/Task"
         "202":
           description: >-
-            Cancel requested on a leased task; body is the task, unchanged except
-            `cancel_requested: true` and `cancel_request`.
+            Cancel requested on a leased task, or a no-op repeat; body is the task,
+            unchanged except `cancel_requested: true` and `cancel_request`.
           content:
             application/json:
               schema:
@@ -340,15 +404,20 @@ paths:
         "400":
           $ref: "#/components/responses/BadRequest"
           description: >-
-            Unknown `mode` (`invalid_argument`); task already terminal, or
-            `requested`/`graceful` on a `cancellable: false` task
-            (`failed_precondition` `STATE`).
+            `invalid_argument`: unknown `mode`; `reason` over 1024 characters (`TOO_LONG`
+            on `/reason`). `failed_precondition`: `TASK_FINISHED` (the task ended other
+            than cancelled), `NOT_CANCELLABLE` (`requested`/`graceful` on a
+            `cancellable: false` task).
         "401":
           $ref: "#/components/responses/Unauthenticated"
         "403":
           $ref: "#/components/responses/Forbidden"
+          description: "`ACTION_DENIED`: the caller may read the task but not `cancel` it."
         "404":
           $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+          description: "`aborted` `STATE_CHANGED`: the task changed state while the cancel ran; read it and retry."
         "503":
           $ref: "#/components/responses/ServiceUnavailable"
 
@@ -359,8 +428,10 @@ paths:
       summary: Change a task's tags
       description: >-
         Adds, replaces or removes tags; keys not listed are unchanged. Action
-        **`update`**. p2. A key in both `set` and `remove` → `400`; more tags than the
-        per-task limit → `400`.
+        **`update`**. p2. A key in both `set` and `remove` → `400`; a result with more
+        than `max_tags_per_task` (16) tags → `400` `TOO_MANY_TAGS` on `/set`. Records
+        one `taskTagsUpdated` history event (`actor`, the keys set with their new values,
+        the keys removed).
       parameters:
         - $ref: "#/components/parameters/TaskId"
       requestBody:
@@ -378,10 +449,15 @@ paths:
                 $ref: "#/components/schemas/Task"
         "400":
           $ref: "#/components/responses/BadRequest"
+          description: >-
+            A key in both `set` and `remove`; a key twice in `set` (`DUPLICATE`); key or
+            value too long (`TOO_LONG`) or an empty key (`REQUIRED`); too many tags
+            (`TOO_MANY_TAGS`).
         "401":
           $ref: "#/components/responses/Unauthenticated"
         "403":
           $ref: "#/components/responses/Forbidden"
+          description: "`ACTION_DENIED`: the caller may read the task but not `update` it."
         "404":
           $ref: "#/components/responses/NotFound"
         "503":
@@ -395,16 +471,26 @@ paths:
       operationId: claimTasks
       summary: Claim tasks (long-poll)
       description: |
-        Claims up to `max_tasks` tasks from the named queues and opens or renews the
-        worker session. Action **`claim`**. Long-polls up to `timeout_secs` seconds
-        (clamped to `claim_max_wait_secs`, default 50) when nothing is eligible.
+        Claims up to `max_tasks` tasks from the named queues. Action **`claim`**.
+        Long-polls up to `timeout_secs` seconds (clamped to `claim_max_wait_secs`,
+        default 50) when nothing is eligible. A session is opened or renewed only by a
+        claim that takes a task; a `204` or `429` touches no session and returns none. A
+        `session_id` that is unknown, expired, or stored with another `worker_id` opens
+        a new session.
 
-        One claim names queues of one task domain only. Ordering: `critical` tasks first
-        across the named queues (oldest first), then rotation between the queues
-        starting after the previous claim's start queue; order inside a queue is
-        unchanged. Held queues are skipped. Each claimed task gets a fresh
-        `lease_token`, `lease_epoch` and `attempt`. A task resumed from a wait carries
-        the wait result in `resumed`.
+        One claim names queues of one task domain only. Ordering: each named queue
+        offers its next `critical` task in its own order and the oldest offer wins; then
+        rotation between the queues (sorted by queue ID, one step per claim round); order
+        inside a queue is unchanged, and exact only for one uncontended claimer. Held
+        queues, and queues the worker is blacklisted on, are skipped. Each claimed task
+        gets a fresh `lease_token`, `lease_epoch` and `attempt`, and an execution
+        deadline of the full execution timeout from the claim. A task resumed from a wait
+        carries the wait result in `resumed`.
+
+        Validation runs before any session or PDP work: `400` (`REQUIRED`,
+        `INVALID_FORMAT`, `OUT_OF_RANGE`, `TOO_MANY_QUEUES`, `DEAD_LETTER_QUEUE`,
+        `CROSS_DOMAIN`, each on its JSON Pointer), then `404` for an unregistered queue,
+        then the PDP (`403` `QUEUE_NOT_PERMITTED` / `503`).
       requestBody:
         required: true
         content:
@@ -420,16 +506,18 @@ paths:
                 $ref: "#/components/schemas/ClaimResponse"
         "204":
           description: >-
-            Nothing eligible before the long-poll timeout. Carries no `session_id`,
-            even if the claim opened one.
+            Nothing eligible before the long-poll timeout, also when every named queue is
+            held or the worker is blacklisted on it. No session is opened, renewed or
+            returned.
         "400":
           $ref: "#/components/responses/BadRequest"
           description: >-
-            Missing or malformed `worker_id`; `max_tasks` outside
-            1..`claim_max_batch`; more than `claim_max_queues` queues; a
-            `dead_letter` queue; queues of two domains, or a `domain` that a named
-            queue is not in. Worker blacklisted for the queue: `failed_precondition`
-            `STATE` (p3).
+            `REQUIRED` (missing `worker_id`, missing or empty `queues`); `INVALID_FORMAT`
+            (`worker_id`); `OUT_OF_RANGE` (`max_tasks` outside 1..`claim_max_batch`, a
+            negative `timeout_secs`); `TOO_MANY_QUEUES` (more than `claim_max_queues`
+            distinct queues); `DEAD_LETTER_QUEUE` on `/queues/i`; `CROSS_DOMAIN` (queues
+            of two domains, or a `domain` that a named queue is not in). No session is
+            touched.
         "404":
           $ref: "#/components/responses/NotFound"
           description: >-
@@ -441,14 +529,18 @@ paths:
         "403":
           $ref: "#/components/responses/Forbidden"
           description: >-
-            The caller may not claim at all, or names only queues its policy
-            excludes.
+            `ACTION_DENIED`: the caller may not `claim` at all. `QUEUE_NOT_PERMITTED`: a
+            named queue is provably outside the caller's policy (`detail` names it); no
+            session opened.
         "429":
           $ref: "#/components/responses/TooManyRequests"
           description: >-
-            `CONCURRENCY_LIMIT`: nothing was assigned and at least one eligible task was skipped
-            because a concurrency dimension (`queue_global`, `queue_tenant`, `type_global`,
-            `type_tenant`) was full. No `session_id`.
+            `concurrency`: nothing was assigned and at least one eligible task was
+            skipped because a concurrency dimension (`queue_global`, `queue_tenant`,
+            `type_global`, `type_tenant`) was full. `resource_type` is the queue base
+            type; for a claim naming several queues there is no `resource_name`.
+            `Retry-After` is the claim poll interval (1 s). No session is opened, renewed
+            or returned.
         "503":
           $ref: "#/components/responses/ServiceUnavailable"
 
@@ -460,8 +552,12 @@ paths:
       description: >-
         Renews the worker session and checks every listed lease; answers per lease. No
         PDP action is checked; the session's subject and each lease's token, holder and
-        state are. Up to `heartbeat_batch_max` (default 500) leases. A heartbeat never
-        extends a per-task deadline.
+        state are. Up to `heartbeat_batch_max` (default 500) leases; more → `400`
+        `TOO_MANY` on `/leases` and the session is not renewed. A heartbeat never
+        extends a per-task deadline. An unknown, expired or foreign session answers
+        `200` with every lease `lease_lost` (the same body in all three cases) and is not
+        revived. A pending cancel is reported per lease in `cancel_requested` and
+        `cancel_request` (with `superseded_by` when a supersession caused it).
       requestBody:
         required: true
         content:
@@ -480,12 +576,13 @@ paths:
         "400":
           $ref: "#/components/responses/BadRequest"
           description: >-
-            More than `heartbeat_batch_max` leases.
+            More than `heartbeat_batch_max` leases (`TOO_MANY` on `/leases`); the session
+            is not renewed.
         "401":
           $ref: "#/components/responses/Unauthenticated"
         "503":
           $ref: "#/components/responses/ServiceUnavailable"
-          description: Admission shed under overload (reserved execution-path permits exhausted).
+          description: Node overloaded and the reserved execution-path permits exhausted.
 
   /tasks/{task_id}/start:
     post:
@@ -493,8 +590,11 @@ paths:
       operationId: startTask
       summary: Start a claimed task
       description: |
-        `claimed` → `running`; clears the assignment deadline and arms the execution deadline.
-        Action **`claim`**, lease-fenced.
+        Optional: `claimed` → `running`. A worker may also complete, release or set a
+        wait straight from `claimed`. A repeated `start` by the holder on a `running`
+        task is a no-op `200`. `start` never moves the execution deadline, which the
+        claim set. Action **`claim`**, lease-fenced: a call from anyone but the current
+        holder with that token gets `409` `LEASE_LOST`, never `404`.
       parameters:
         - $ref: "#/components/parameters/TaskId"
       requestBody:
@@ -514,13 +614,11 @@ paths:
         "400":
           $ref: "#/components/responses/BadRequest"
           description: >-
-            Task not `claimed` (`failed_precondition` `STATE`).
+            Missing `lease_token` (`REQUIRED`).
         "401":
           $ref: "#/components/responses/Unauthenticated"
         "403":
           $ref: "#/components/responses/WorkerRevoked"
-        "404":
-          $ref: "#/components/responses/NotFound"
         "409":
           $ref: "#/components/responses/LeaseLost"
         "503":
@@ -532,9 +630,10 @@ paths:
       operationId: reportProgress
       summary: Report progress
       description: |
-        Buffers a progress update; it is saved at the next flush (at most one flush interval
-        old when read). A buffered update under a lease that is then lost is never saved.
-        Action **`claim`**, lease-fenced.
+        Buffers a progress update from `claimed` or `running`; it is saved at the next
+        flush (at most one flush interval old when read). A buffered update under a lease that is then lost is never saved.
+        Action **`claim`**, lease-fenced: a call from anyone but the current holder with
+        that token gets `409` `LEASE_LOST`, never `404`.
       parameters:
         - $ref: "#/components/parameters/TaskId"
       requestBody:
@@ -549,13 +648,11 @@ paths:
             Accepted into the buffer; empty body.
         "400":
           $ref: "#/components/responses/BadRequest"
-          description: "`percent` outside 0..100, or the task is not `running`."
+          description: "`percent` outside 0..100 (`OUT_OF_RANGE`)."
         "401":
           $ref: "#/components/responses/Unauthenticated"
         "403":
           $ref: "#/components/responses/WorkerRevoked"
-        "404":
-          $ref: "#/components/responses/NotFound"
         "409":
           $ref: "#/components/responses/LeaseLost"
         "503":
@@ -567,8 +664,11 @@ paths:
       operationId: saveCheckpoint
       summary: Save a checkpoint
       description: >-
-        Merges `checkpoint` into the task `context` key by key, under the optimistic
-        `revision` guard. Action **`claim`**, lease-fenced. p3.
+        Merges `checkpoint` into the task `context` as an RFC 7386 JSON Merge Patch
+        (nested objects merge, `null` deletes a key, arrays are replaced whole), under the
+        optimistic `revision` guard; the 64 KiB payload limit applies to the result.
+        Records `taskCheckpointed`. Action **`claim`**, lease-fenced: a call from anyone
+        but the current holder with that token gets `409` `LEASE_LOST`, never `404`.
       parameters:
         - $ref: "#/components/parameters/TaskId"
       requestBody:
@@ -591,8 +691,6 @@ paths:
           $ref: "#/components/responses/Unauthenticated"
         "403":
           $ref: "#/components/responses/WorkerRevoked"
-        "404":
-          $ref: "#/components/responses/NotFound"
         "409":
           $ref: "#/components/responses/LeaseLost"
           description: "`LEASE_LOST`, or `CONCURRENT_MODIFICATION` (lost the `revision` guard; retry)."
@@ -606,14 +704,22 @@ paths:
       tags: [worker]
       operationId: completeTask
       summary: Complete a task (success, warning, error or cancelled)
-      description: >-
-        Reports the result; the body is flat. A failure is this call with `result_code:
-        error`. A worker may report only `success`, `warning`, `error`, or `cancelled`
-        (the last only after a cancel request). A retryable `error` with budget left
-        schedules a retry (`scheduled`); otherwise the task ends `failed` or
-        `dead_lettered`. Repeating the same completion with the same token answers `200`
-        with the stored outcome; a different result answers `400`. Action **`claim`**,
-        lease-fenced.
+      description: |
+        Reports the result from `claimed` or `running`; the body is flat. There is no
+        separate fail call: a failure is this call with `result_code: error`. A worker
+        may report only `success`, `warning`, `error`, or `cancelled` (the last only
+        after a cancel request). A retryable `error` with budget left schedules a retry
+        (`scheduled`); otherwise the task ends `failed` or `dead_lettered`. After a
+        cancel request `success`/`warning` still end the task `completed`, while any
+        `error` ends it `cancelled` with no retry. Output is validated against the type
+        revision stored at create.
+
+        Repeating a terminal completion with the same token answers `200` with the stored
+        outcome; a different result answers `400`. A repeated retryable failure after a
+        lost response gets `409` `LEASE_LOST`: the first report was applied. Action
+        **`claim`**, lease-fenced: a call from anyone but the current holder with that
+        token gets `409` `LEASE_LOST`, never `404`; a result that fails validation is
+        checked against the fence first, so a lost lease wins over `400`.
       parameters:
         - $ref: "#/components/parameters/TaskId"
       requestBody:
@@ -633,19 +739,19 @@ paths:
         "400":
           $ref: "#/components/responses/BadRequest"
           description: >-
-            Output fails the type's output schema, `error`/`warnings` break the `TaskError`
-            contract, or an engine-only result code (`invalid_argument`; task unchanged, lease
-            kept). `failed_precondition`: `CHILDREN_PENDING` (successful completion of a
-            `wait_for_children` parent with unfinished children, p2); `STATE` (wrong state, or a
-            repeated completion with a different result).
+            `invalid_argument` (task unchanged, lease kept): output fails the type's output
+            schema (`SCHEMA_VIOLATION` on `/output/…`), `error`/`warnings` break the
+            `TaskError` contract, an engine-only result code on `/result_code`, or
+            `cancelled` without a cancel request. `failed_precondition`: `CHILDREN_PENDING`
+            (successful completion of a `wait_for_children` parent with unfinished
+            children, p2); `STATE` (a repeated completion with a different result).
         "401":
           $ref: "#/components/responses/Unauthenticated"
         "403":
           $ref: "#/components/responses/WorkerRevoked"
-        "404":
-          $ref: "#/components/responses/NotFound"
         "409":
           $ref: "#/components/responses/LeaseLost"
+          description: "`LEASE_LOST`, also for a repeated non-terminal report whose first response was lost (treat it as applied)."
         "413":
           $ref: "#/components/responses/ContentTooLarge"
         "503":
@@ -657,9 +763,15 @@ paths:
       operationId: releaseTask
       summary: Release a task voluntarily
       description: |
-        Gives the task back without failing it: `queued`, or `scheduled` after `delay_secs`.
-        No retry-budget, `attempt` or blacklist effect. Drops an armed wait group. Action
-        **`claim`**, lease-fenced.
+        Gives the task back without failing it, from `claimed` or `running`: `queued`, or
+        `scheduled` after `delay_secs` (0 to `release_max_delay_secs`, 86,400; `0` is an
+        immediate release). No retry-budget, `attempt` or blacklist effect. Drops an armed
+        wait group. A `checkpoint` is merged into `context` first (records
+        `taskCheckpointed`). The history records `taskQueued { reason: released }`, with
+        `run_after` for a delayed release. Repeating a release after a lost response gets
+        `409` `LEASE_LOST`: the first one was applied. Action **`claim`**, lease-fenced: a
+        call from anyone but the current holder with that token gets `409` `LEASE_LOST`,
+        never `404`.
       parameters:
         - $ref: "#/components/parameters/TaskId"
       requestBody:
@@ -678,21 +790,22 @@ paths:
                 $ref: "#/components/schemas/Task"
         "400":
           $ref: "#/components/responses/BadRequest"
+          description: "`delay_secs` negative or above `release_max_delay_secs` (`OUT_OF_RANGE` on `/delay_secs`)."
         "401":
           $ref: "#/components/responses/Unauthenticated"
         "403":
           $ref: "#/components/responses/WorkerRevoked"
-        "404":
-          $ref: "#/components/responses/NotFound"
         "409":
           $ref: "#/components/responses/LeaseLost"
+          description: "`LEASE_LOST`, also for a repeated release whose first response was lost (treat it as applied); or `CONCURRENT_MODIFICATION` when a `checkpoint` lost the `revision` guard."
         "413":
           $ref: "#/components/responses/ContentTooLarge"
         "429":
           $ref: "#/components/responses/TooManyRequests"
           description: >-
-            Release with `delay_secs` refused by the deferred limit (`QUEUE_DEPTH_LIMIT`,
-            dimension `deferred`); a release without delay is never refused.
+            A release with `delay_secs` refused by the deferred limit
+            (`queue_depth.deferred`): nothing changes, the lease is kept and the task
+            stays as it was. A release without delay is never refused.
         "503":
           $ref: "#/components/responses/ServiceUnavailable"
 
@@ -704,7 +817,9 @@ paths:
       description: |
         The identity named by a reassignment (`subject_id` + `worker_id`) takes the task over
         and gets a new lease in its session. Anyone else, or nothing to accept → `404`.
-        Action **`claim`**. Takes no lease token. p3 (reassignment).
+        Action **`claim`**, checked with the accepting worker's own scope (the
+        reassignment did not check it). Records `taskClaimed` with `handoff: true`. Takes
+        no lease token. p3 (reassignment).
       parameters:
         - $ref: "#/components/parameters/TaskId"
       requestBody:
@@ -725,6 +840,9 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthenticated"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+          description: "`ACTION_DENIED`: the named worker's own scope does not allow `claim` on the task."
         "404":
           $ref: "#/components/responses/NotFound"
         "503":
@@ -740,11 +858,17 @@ paths:
       description: |
         Adds an immutable entry. Two callers:
 
-        * the worker holding the lease: action **`claim`**, with `lease_token`;
-        * an API consumer: action **`create`**, no token.
+        * the worker holding the lease: action **`claim`**, with `lease_token`,
+          lease-fenced (a stale or foreign token gets `409` `LEASE_LOST`, never `404`);
+        * an API consumer: action **`create`**, no token, in any task state, terminal
+          included, until the task is removed by retention.
 
-        The payload is validated against the entry type's schema and is at most 64 KiB.
-        Entries are never changed or deleted by a client (no `PUT`/`PATCH`/`DELETE`).
+        The entry type resolves with the caller's context, as task types do. The payload
+        is validated against the entry type's schema and is at most 64 KiB. A task holds
+        at most `max_entries_per_task` (1000) entries; one more → `400`
+        `failed_precondition` `TOO_MANY_ENTRIES`. Entries are never changed or
+        deleted by a client: `PUT`, `PATCH` and `DELETE` on an entry answer `405` with an
+        `Allow` header and no body.
       parameters:
         - $ref: "#/components/parameters/TaskId"
       requestBody:
@@ -767,20 +891,29 @@ paths:
         "400":
           $ref: "#/components/responses/BadRequest"
           description: >-
-            Unknown or invisible entry type, or payload fails its schema.
+            Unknown, hidden or non-entry type (`UNKNOWN_ENTRY_TYPE` on `/type`); payload
+            fails its schema (`SCHEMA_VIOLATION`). `failed_precondition`
+            `TOO_MANY_ENTRIES` (`resource_name` = the task): the task already has
+            `max_entries_per_task` entries.
         "401":
           $ref: "#/components/responses/Unauthenticated"
         "403":
           $ref: "#/components/responses/Forbidden"
+          description: >-
+            API-consumer path: `ACTION_DENIED` (may read the task but not `create`).
+            Worker path: `CLAIM_REVOKED` (the caller's scope no longer covers the task;
+            it was released).
         "404":
           $ref: "#/components/responses/NotFound"
+          description: API-consumer path only; the worker path never answers `404`.
         "409":
           $ref: "#/components/responses/LeaseLost"
-          description: Worker path only, stale or foreign `lease_token`.
+          description: Worker path only, stale or foreign `lease_token`, or an unknown task.
         "413":
           $ref: "#/components/responses/ContentTooLarge"
         "503":
           $ref: "#/components/responses/ServiceUnavailable"
+          description: PDP unreachable, or the GTS registry unreachable and the entry type not cached.
 
     get:
       tags: [entries]
@@ -821,7 +954,9 @@ paths:
       tags: [entries]
       operationId: getEntry
       summary: Get one entry
-      description: Action **`read`** on the task.
+      description: >-
+        Action **`read`** on the task. Entries are append-only: `PUT`, `PATCH` and
+        `DELETE` here answer `405` with an `Allow` header and no body.
       parameters:
         - $ref: "#/components/parameters/TaskId"
         - $ref: "#/components/parameters/EntryId"
@@ -847,19 +982,32 @@ paths:
       operationId: setWaitConditions
       summary: Set (arm or park) the task's wait group
       description: |
-        Worker only: action **`claim`**, lease-fenced. A request without `lease_token`
-        is `400`.
+        Worker only: action **`claim`**, lease-fenced, from `claimed` or `running`. A
+        request without `lease_token` is `400` `REQUIRED` before any lookup; a token the
+        caller does not hold gets `409` `LEASE_LOST`, never `404`.
 
-        One request carries the whole group (`conditions[]` + `mode`). With `park: true`
-        (default) the task is parked: it moves to `waiting`, its lease, session link and
-        slots are released, and a later call with the old token gets `LEASE_LOST`. With
-        `park: false` the group is **armed**: it matches while the task keeps running
-        under the same lease; park it later with `/wait-conditions/park`. A task has at
-        most one wait group; conditions cannot be added later.
+        One request carries the whole group (`conditions[]` + `mode`), at most
+        `wait.max_conditions_per_group` (16) conditions. With `park: true` (default) the
+        task is parked: it moves to `waiting`, its lease, session link and slots are
+        released, the execution deadline is cleared, and a later call with the old token
+        gets `LEASE_LOST`. With `park: false` the group is **armed**: it matches while the
+        task keeps running under the same lease; park it later with
+        `/wait-conditions/park`. A task has one wait group at a time; conditions cannot be
+        added later. A `checkpoint` is merged into `context` in the same write (records
+        `taskCheckpointed`).
 
-        Phases: timer conditions p1; event conditions p2; input and children conditions
-        p2, refused in p1 with `FEATURE_NOT_AVAILABLE`. The number of conditions per
-        group is limited.
+        A group that is satisfied at once (a `resume_at` already past) is not parked: the
+        call answers `200` with `parked: false` and the `result`, the lease is kept and the
+        task stays as it was. The group is consumed: its conditions stay listed as
+        `satisfied`, but it is no longer the task's current group and no claim returns
+        it.
+
+        A condition with a timeout and no `on_timeout` gets `fail`. An event condition
+        without a timeout gets `event_waits.max_wait_secs`, so `on_timeout` alone is valid
+        there; for input and children conditions `on_timeout` without a timeout is `400`
+        `NOT_ALLOWED`. A timer condition takes no timeout. Phases: timer conditions p1;
+        input, children and event conditions p2, refused in p1 with
+        `FEATURE_NOT_AVAILABLE` on `/conditions/i/kind`.
       parameters:
         - $ref: "#/components/parameters/TaskId"
       requestBody:
@@ -871,32 +1019,36 @@ paths:
       responses:
         "200":
           description: >-
-            The group as stored, and the task state.
+            The group as stored and the task state; or, when the group is satisfied at
+            once, `parked: false` with the `result` (the shape of `ParkResponse`).
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/SetWaitResponse"
+                oneOf:
+                  - $ref: "#/components/schemas/SetWaitResponse"
+                  - $ref: "#/components/schemas/ParkResponse"
         "400":
           $ref: "#/components/responses/BadRequest"
           description: >-
-            Missing `lease_token`; bad condition (timer without `resume_at`; event:
-            unknown type `UNKNOWN_EVENT_TYPE`, topic not waitable
-            `EVENT_TOPIC_NOT_WAITABLE`, subject type
-            `EVENT_SUBJECT_TYPE_REQUIRED`/`EVENT_SUBJECT_TYPE_NOT_ALLOWED`, timeout
-            over `event_waits.max_wait_secs`, bad `match_expression`; input:
-            `input_schema` too large, too deep, remote `$ref` or non-linear regex);
-            too many or no conditions; `FEATURE_NOT_AVAILABLE` (p1); task already
-            has a group or is not `running` (`failed_precondition` `STATE`).
+            `invalid_argument`: missing `lease_token` (`REQUIRED`); no conditions
+            (`REQUIRED` on `/conditions`) or more than 16 (`TOO_MANY`); a timeout on a
+            timer condition, or `on_timeout` without a timeout on an input or children
+            condition (`NOT_ALLOWED`); timer
+            without `resume_at`; event: unknown or hidden type (`UNKNOWN_EVENT_TYPE`),
+            topic not waitable (`EVENT_TOPIC_NOT_WAITABLE`), subject type
+            (`EVENT_SUBJECT_TYPE_REQUIRED`/`EVENT_SUBJECT_TYPE_NOT_ALLOWED`), timeout over
+            `event_waits.max_wait_secs`, bad `match_expression`
+            (`INVALID_MATCH_EXPRESSION`); input: `input_schema` too large, too deep,
+            remote `$ref` or non-linear regex; `FEATURE_NOT_AVAILABLE` (p1).
+            `failed_precondition` `STATE`: the task already has a group.
         "401":
           $ref: "#/components/responses/Unauthenticated"
         "403":
           $ref: "#/components/responses/WorkerRevoked"
           description: >-
-            Event condition whose `consume` check is denied (`EVENT_CONSUME_DENIED`)
-            or not enforceable (`EVENT_CONSUME_UNVERIFIABLE`), lease kept; or
-            `claim` revoked (task released).
-        "404":
-          $ref: "#/components/responses/NotFound"
+            `EVENT_CONSUME_DENIED` or `EVENT_CONSUME_UNVERIFIABLE`: an event condition's
+            `consume` check is denied or not enforceable (the condition index only in
+            `detail`), lease kept; or `CLAIM_REVOKED` (task released).
         "409":
           $ref: "#/components/responses/LeaseLost"
           description: "`LEASE_LOST`, or `CONCURRENT_MODIFICATION` when a `checkpoint` lost the `revision` guard."
@@ -905,12 +1057,12 @@ paths:
         "429":
           $ref: "#/components/responses/TooManyRequests"
           description: >-
-            Parking refused by the deferred limit (`QUEUE_DEPTH_LIMIT`, dimension `deferred`),
-            or `EVENT_WAIT_LIMIT` (dimension `tenant`, `event_type` or `unkeyed`). Nothing
-            changes and the worker keeps its lease.
+            Parking refused by the deferred limit (`queue_depth.deferred`), or an event-wait
+            limit (`event_waits.tenant`, `event_waits.event_type` or
+            `event_waits.unkeyed`). Nothing changes and the worker keeps its lease.
         "503":
           $ref: "#/components/responses/ServiceUnavailable"
-          description: PDP unreachable during event-wait checks; nothing stored.
+          description: PDP unreachable during event-wait checks; nothing stored, lease kept.
 
     get:
       tags: [wait-conditions]
@@ -921,7 +1073,8 @@ paths:
         (resolved conditions are kept until the task is deleted at retention),
         cursor-paged. Sort `created_at asc, id asc`; no `$orderby`. Filter on
         `wait_group_id` or `state` to get the current group. Default page size 25,
-        maximum 100. Action **`read`**.
+        maximum 100. Action **`read`**. Conditions of an initial `wait` group set at
+        create are listed here too.
       parameters:
         - $ref: "#/components/parameters/TaskId"
         - $ref: "#/components/parameters/Filter"
@@ -952,10 +1105,16 @@ paths:
       operationId: parkWaitGroup
       summary: Park the armed wait group
       description: |
-        Parks the group armed with `park: false`. If it is already satisfied the task is not
-        parked: the call returns the result and the task keeps running under the same lease.
-        Otherwise the task moves to `waiting`. Wait timeouts start at park time. Action
-        **`claim`**, lease-fenced.
+        Parks the group armed with `park: false`. If it is already satisfied (an armed
+        timer whose `resume_at` has passed, an armed input already resolved, an armed
+        children condition with no unfinished children) the task is not parked: the call
+        returns the result and the task keeps running under the same lease; the group is
+        consumed (its conditions stay listed as `satisfied`, but it is no longer current
+        and no claim returns it). Otherwise the task moves to `waiting`. Wait timeouts start at park time. With nothing armed →
+        `400` `failed_precondition` `NO_ARMED_WAIT`, lease kept. A `checkpoint` is merged
+        into `context` in the same write. Action **`claim`**, lease-fenced: a call from
+        anyone but the current holder with that token gets `409` `LEASE_LOST`, never
+        `404`.
       parameters:
         - $ref: "#/components/parameters/TaskId"
       requestBody:
@@ -976,20 +1135,20 @@ paths:
         "400":
           $ref: "#/components/responses/BadRequest"
           description: >-
-            No armed group (`failed_precondition` `STATE`).
+            Missing `lease_token` (`REQUIRED`); no armed group (`failed_precondition`
+            `NO_ARMED_WAIT`, lease kept).
         "401":
           $ref: "#/components/responses/Unauthenticated"
         "403":
           $ref: "#/components/responses/WorkerRevoked"
-        "404":
-          $ref: "#/components/responses/NotFound"
         "409":
           $ref: "#/components/responses/LeaseLost"
+          description: "`LEASE_LOST`, or `CONCURRENT_MODIFICATION` when a `checkpoint` lost the `revision` guard."
         "413":
           $ref: "#/components/responses/ContentTooLarge"
         "429":
           $ref: "#/components/responses/TooManyRequests"
-          description: Parking refused by the deferred limit; the worker keeps its lease.
+          description: Parking refused by the deferred limit (`queue_depth.deferred`); the worker keeps its lease.
         "503":
           $ref: "#/components/responses/ServiceUnavailable"
 
@@ -999,15 +1158,21 @@ paths:
       operationId: resolveWaitCondition
       summary: Provide the input for an input wait condition
       description: |
-        Satisfies a `pending` **input** condition with a value valid against its
-        `input_schema`. Action **`resolve`** (permission `…task_resolve.v1`); it grants
-        nothing else on the task. p2.
+        Satisfies a `pending` **input** condition, parked or armed, with a value valid
+        against its `input_schema`. Action **`resolve`** (permission
+        `…task_resolve.v1`) only: the caller needs no `read` on the task, and the grant
+        allows nothing else on it. Resolving an armed condition does not change the task
+        state. The value is measured alone against the 64 KiB payload limit. p2.
 
         Safe to repeat; the condition stores `resolved_by`:
         * same value (canonical JSON) from the same subject → `200`, same body,
           `Idempotency-Replayed: true`, no write;
-        * a different value, or the same value from another subject → `409`;
-        * a `cancelled` or `timed_out` condition → `400` `failed_precondition`.
+        * a different value, or the same value from another subject → `400`
+          `failed_precondition` `ALREADY_RESOLVED`;
+        * a `cancelled` or `timed_out` condition → `400` `failed_precondition`
+          `STATE`;
+        * a timer, event or children condition → `400` `failed_precondition`
+          `NOT_RESOLVABLE`.
 
         A resolved condition is kept until its task is deleted at retention.
       parameters:
@@ -1032,24 +1197,27 @@ paths:
         "400":
           $ref: "#/components/responses/BadRequest"
           description: >-
-            Value fails `input_schema` (`invalid_argument`, no value echoed);
-            condition `cancelled` or `timed_out`, or not of kind `input`
-            (`failed_precondition`).
+            `invalid_argument`: value fails `input_schema` (`SCHEMA_VIOLATION`, no value
+            echoed). `failed_precondition`: `ALREADY_RESOLVED` (another value or another
+            subject), `NOT_RESOLVABLE` (not an input condition), `STATE` (condition
+            `cancelled` or `timed_out`).
         "401":
           $ref: "#/components/responses/Unauthenticated"
         "403":
           $ref: "#/components/responses/Forbidden"
           description: >-
-            The caller may read the task but not `resolve`.
+            `ACTION_DENIED`: the caller may read the task but not `resolve`.
         "404":
           $ref: "#/components/responses/NotFound"
+          description: The condition is missing, or the caller has neither `resolve` nor `read` on its task.
         "409":
           $ref: "#/components/responses/Conflict"
           description: >-
-            Already resolved with a different value or by another subject. Category
-            `aborted` with reason `ALREADY_RESOLVED`.
+            `aborted` `STATE_CHANGED`: the condition changed state while the call ran;
+            read it and retry.
         "413":
           $ref: "#/components/responses/ContentTooLarge"
+          description: The value alone is over `max_payload_size_bytes` (64 KiB).
         "503":
           $ref: "#/components/responses/ServiceUnavailable"
 
@@ -1065,7 +1233,8 @@ paths:
         Works for every stored task. Sort: oldest first (`timestamp asc, id asc`); no
         `$orderby`. Filter through `$filter` on `event_type` (camelCase names) and
         `timestamp`, for example `$filter=event_type in ('taskRetrying','taskFailed')`.
-        Default page size 25, maximum 100.
+        Default page size 25, maximum 100. A `taskRetrying` item carries the full
+        `error` of the failed attempt (the published broker event keeps only a summary).
       parameters:
         - $ref: "#/components/parameters/TaskId"
         - $ref: "#/components/parameters/Filter"
@@ -1099,9 +1268,11 @@ paths:
       operationId: listQueues
       summary: List queues with stats
       description: >-
-        Every registered queue with effective limits, per-state counts, its domain set
-        and hold state. Action **`read`** on queues (`queue_read`); grants no task data.
-        Queues are platform-owned, so the list holds no tenant data.
+        Every registered queue with effective limits and settings, its domain set and
+        hold state. Action **`read`** on queues (`queue_read`); grants no task data.
+        Queues are platform-owned, so the list holds no tenant data. Per-state `counts`
+        and `sampled_at` are included only for a caller that also holds `configure` on
+        queues; others get the queue without them.
       responses:
         "200":
           description: >-
@@ -1122,7 +1293,9 @@ paths:
       tags: [queues]
       operationId: getQueue
       summary: Get one queue
-      description: Action **`read`** on queues (`queue_read`).
+      description: >-
+        Action **`read`** on queues (`queue_read`). `counts` and `sampled_at` only for a
+        caller that also holds `configure` on queues (queues have no `admin` action).
       parameters:
         - $ref: "#/components/parameters/QueueId"
       responses:
@@ -1141,6 +1314,44 @@ paths:
         "503":
           $ref: "#/components/responses/ServiceUnavailable"
 
+  /queues/{queue_id}/events:
+    get:
+      tags: [queues]
+      operationId: listQueueEvents
+      summary: Queue event history
+      description: >-
+        The queue-scoped history of one queue (`queueHeld`, `queueReleased`,
+        `configUpdated`, `workerBlacklisted`), cursor-paged like the task history. Action
+        **`read`** on queues (`queue_read`). Sort: oldest first (`timestamp asc, id
+        asc`); no `$orderby`. Filter through `$filter` on `event_type` (`eq`, `in`) and
+        `timestamp`. Default page size 25, maximum 100.
+      parameters:
+        - $ref: "#/components/parameters/QueueId"
+        - $ref: "#/components/parameters/Filter"
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Cursor"
+      x-odata-filter:
+        allowedFields:
+          event_type: [eq, in]
+          timestamp: [ge, gt, le, lt]
+      responses:
+        "200":
+          description: One page of queue events.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/QueueHistoryEventPage"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthenticated"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
   # ---------------------------------------------------------------- bulk
 
   /tasks/bulk/cancel:
@@ -1149,10 +1360,10 @@ paths:
       operationId: bulkCancel
       summary: Cancel many tasks
       description: >-
-        Action **`cancel`**, evaluated per task. p2. At most the configured number of
-        IDs (default 1,000; `BATCH_TOO_LARGE`). Each task follows the single-cancel
-        rules; a leased task under `requested`/`graceful` only gets `cancel_requested`
-        and reports `succeeded`.
+        Action **`cancel`**, evaluated per task. p2. Each task follows the single-cancel
+        rules (`mode` defaults to `requested`): `succeeded` means the task ended (or had
+        already ended in the cancelled family); a leased task under
+        `requested`/`graceful` is only flagged and reports `cancel_requested`.
       requestBody:
         required: true
         content:
@@ -1164,9 +1375,12 @@ paths:
           $ref: "#/components/responses/BulkResult"
         "400":
           $ref: "#/components/responses/BadRequest"
-          description: Over the size limit (`BATCH_TOO_LARGE`), or a malformed body.
+          description: More than `bulk_max_ids` (1000) IDs (`BATCH_TOO_LARGE` on `/task_ids`), or a malformed body.
         "401":
           $ref: "#/components/responses/Unauthenticated"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+          description: "`ACTION_DENIED`: the PDP denies the action outright; otherwise denials are per task (`unauthorized`)."
         "503":
           $ref: "#/components/responses/ServiceUnavailable"
 
@@ -1177,7 +1391,7 @@ paths:
       summary: Change priority and/or urgency of many tasks
       description: |
         Action **`admin`**, per task; raising to `critical` also needs `expedite` per task
-        (else `unauthorized`). p2.
+        (else `unauthorized`). Each change records `taskUpdated { actor, changes }`. p2.
       requestBody:
         required: true
         content:
@@ -1189,8 +1403,12 @@ paths:
           $ref: "#/components/responses/BulkResult"
         "400":
           $ref: "#/components/responses/BadRequest"
+          description: More than `bulk_max_ids` (1000) IDs (`BATCH_TOO_LARGE` on `/task_ids`), or a malformed body.
         "401":
           $ref: "#/components/responses/Unauthenticated"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+          description: "`ACTION_DENIED`: the PDP denies the action outright; otherwise denials are per task (`unauthorized`)."
         "503":
           $ref: "#/components/responses/ServiceUnavailable"
 
@@ -1201,7 +1419,10 @@ paths:
       summary: Re-enqueue many dead-lettered or failed tasks
       description: >-
         Action **`admin`**, per task. Each task follows the re-enqueue rules of `POST
-        /admin/tasks/{task_id}/reenqueue`. p2.
+        /admin/tasks/{task_id}/reenqueue` (into its source queue). A task refused by a
+        queue-depth limit reports `limit_exceeded` (no usage figures); one refused by a
+        precondition (`TASK_DOMAIN_MISMATCH`, `PARENT_FINISHED`, `STALE_ORDER`) reports
+        `invalid_state`; the others proceed. p2.
       requestBody:
         required: true
         content:
@@ -1213,8 +1434,12 @@ paths:
           $ref: "#/components/responses/BulkResult"
         "400":
           $ref: "#/components/responses/BadRequest"
+          description: More than `bulk_max_ids` (1000) IDs (`BATCH_TOO_LARGE` on `/task_ids`), or a malformed body.
         "401":
           $ref: "#/components/responses/Unauthenticated"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+          description: "`ACTION_DENIED`: the PDP denies the action outright; otherwise denials are per task (`unauthorized`)."
         "503":
           $ref: "#/components/responses/ServiceUnavailable"
 
@@ -1225,8 +1450,13 @@ paths:
       summary: Move many tasks to another queue
       description: |
         Action **`admin`**, per task. Only `queued`, `scheduled` or `blocked` tasks move; a
-        leased task is `invalid_state`. A moved task takes the destination's settings at once.
-        Source and destination must be in the same task domain. p2.
+        leased task is `invalid_state`. A move re-resolves the queue-level settings with
+        the destination, keeps request- and type-level values, and re-arms the queue
+        timeout from the move; each move records `taskUpdated { actor, changes }`. Per-task
+        outcomes: a destination in another task domain → `domain_mismatch`; a depth
+        refusal → `limit_exceeded`. One destination serves every task, so an
+        unregistered destination refuses the whole request (`404`) and a dead-letter
+        one too (`400` `DEAD_LETTER_QUEUE` on `/queue`). p2.
       requestBody:
         required: true
         content:
@@ -1238,8 +1468,18 @@ paths:
           $ref: "#/components/responses/BulkResult"
         "400":
           $ref: "#/components/responses/BadRequest"
+          description: >-
+            More than `bulk_max_ids` (1000) IDs (`BATCH_TOO_LARGE` on `/task_ids`); a
+            dead-letter destination (`DEAD_LETTER_QUEUE` on `/queue`); or a malformed
+            body.
         "401":
           $ref: "#/components/responses/Unauthenticated"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+          description: "`ACTION_DENIED`: the PDP denies the action outright; otherwise denials are per task (`unauthorized`)."
+        "404":
+          $ref: "#/components/responses/NotFound"
+          description: The destination queue is not registered (`resource_type` = the queue base type).
         "503":
           $ref: "#/components/responses/ServiceUnavailable"
 
@@ -1252,8 +1492,12 @@ paths:
       summary: Hand a claimed or running task to another identity
       description: |
         Sets the new assignee (`subject_id`, `worker_id`), clears the lease token, increments
-        `lease_epoch` and opens an accept window; the old holder gets `LEASE_LOST`. Returns the
-        task, never a lease token. Action **`admin`**. p3 (reassignment).
+        `lease_epoch` and opens an accept window; the old holder gets `LEASE_LOST`. Only a
+        `claimed` or `running` task; a pending hand-off may be reassigned again (new epoch,
+        new window). The target's rights are not checked here: its accept is authorized
+        with its own scope. An optional `reason` (at most 1024 characters) is recorded in
+        `taskReassigned`. Returns the task, never a lease token. Action **`admin`**. p3
+        (reassignment).
       parameters:
         - $ref: "#/components/parameters/TaskId"
       requestBody:
@@ -1273,13 +1517,19 @@ paths:
         "400":
           $ref: "#/components/responses/BadRequest"
           description: >-
-            Task not `claimed`/`running` (`failed_precondition` `STATE`).
+            `failed_precondition`: `STATE` (task not `claimed`/`running`),
+            `TARGET_BLACKLISTED` (the target worker is blacklisted on the task's queue).
+            `invalid_argument`: `reason` over 1024 characters (`TOO_LONG`).
         "401":
           $ref: "#/components/responses/Unauthenticated"
         "403":
           $ref: "#/components/responses/Forbidden"
+          description: "`ACTION_DENIED`: the caller may read the task but not `admin` it."
         "404":
           $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+          description: "`aborted` `STATE_CHANGED`: the task changed state while the call ran."
         "503":
           $ref: "#/components/responses/ServiceUnavailable"
 
@@ -1289,13 +1539,23 @@ paths:
       operationId: reenqueueTask
       summary: Re-enqueue a dead-lettered or failed task
       description: >-
-        `dead_lettered` or `failed` → `queued`: retry budgets reset, previous result
-        cleared (`context` kept), lifetime restarted, dedup identity re-taken,
-        queue-depth admission applied. A dead-lettered task returns to
-        `dead_lettered_from`. Successors cancelled with `dependency_failed` are not
-        revived. Action **`admin`**. p2. No body.
+        `dead_lettered` or `failed` → `queued`: retry budgets reset; the previous result,
+        `terminal_at`, `dead_lettered_from` and a passed `sla_deadline` cleared (`context`
+        kept; a future `sla_deadline` keeps its timer); lifetime restarted; dedup identity
+        re-taken; queue-depth admission applied. The task returns to
+        `dead_lettered_from` (or its own queue for a failed task) unless the optional body
+        names another `queue`: a dispatch queue routed to the task's domain that accepts
+        its type; a different queue re-resolves the queue-level settings, as a move does. A child whose parent has ended cannot be re-enqueued. Successors
+        cancelled with `dependency_failed` are not revived. Records `taskQueued { reason:
+        reenqueued }`. Action **`admin`**. p2.
       parameters:
         - $ref: "#/components/parameters/TaskId"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ReenqueueRequest"
       responses:
         "200":
           description: >-
@@ -1307,20 +1567,29 @@ paths:
         "400":
           $ref: "#/components/responses/BadRequest"
           description: >-
-            Task not `dead_lettered`/`failed` (`failed_precondition` `STATE`); `STALE_ORDER`;
-            `TASK_DOMAIN_MISMATCH`.
+            `failed_precondition`: `STATE` (task not `dead_lettered`/`failed`),
+            `STALE_ORDER` (a newer task of its supersession group exists, p2),
+            `PARENT_FINISHED` (a child whose parent has ended). `invalid_argument`:
+            `TASK_DOMAIN_MISMATCH` on `/queue` (the target queue is not routed to the
+            task's domain, also when the source queue has moved), `DEAD_LETTER_QUEUE` on
+            `/queue`, `NOT_ALLOWED` on `/queue` (the queue does not accept the type).
         "401":
           $ref: "#/components/responses/Unauthenticated"
         "403":
           $ref: "#/components/responses/Forbidden"
+          description: "`ACTION_DENIED`: the caller may read the task but not `admin` it."
         "404":
           $ref: "#/components/responses/NotFound"
+          description: The task is missing or not readable, or the body names an unregistered queue.
         "409":
-          $ref: "#/components/responses/AlreadyExists"
-          description: Another task now holds the task's dedup identity.
+          $ref: "#/components/responses/Conflict"
+          description: >-
+            `already_exists`: another task now holds the task's dedup identity
+            (`resource_name` is that task). `aborted` `STATE_CHANGED`: the task changed
+            state while the call ran.
         "429":
           $ref: "#/components/responses/TooManyRequests"
-          description: "`QUEUE_DEPTH_LIMIT` on the target queue."
+          description: Queue depth full on the target queue (`queue_depth.queue`, `queue_depth.tenant` or `queue_depth.domain_global`).
         "503":
           $ref: "#/components/responses/ServiceUnavailable"
 
@@ -1332,11 +1601,18 @@ paths:
       description: |
         Saves a new runtime configuration version and records `configUpdated` (one per
         queue whose effective settings change). Each task domain applies the version in
-        its maintenance pass. Action **`configure`** on queues (`queue_configure`). p3.
+        its maintenance pass; tasks already created keep the settings resolved at their
+        create. Action **`configure`** on the queue base type (one check, no queue ID):
+        the save is all-or-nothing, and a caller without it gets `403` with nothing
+        saved. p3.
 
         The body is the complete override set of the new version (see
         `RuntimeConfigRequest`): overrides keyed by queue ID or GTS pattern, and by
-        task-type ID or pattern.
+        task-type ID or pattern. An exact ID beats any pattern; among patterns the
+        longest literal prefix before the first wildcard wins; two patterns of equal
+        specificity matching the same queue are refused (`NOT_ALLOWED` on the later
+        pattern). A runtime override beats a
+        static one for the same pattern.
       requestBody:
         required: true
         content:
@@ -1353,11 +1629,15 @@ paths:
         "400":
           $ref: "#/components/responses/BadRequest"
           description: >-
-            A value outside the trust limits, or an unknown key.
+            A value outside the trust limits (a per-tenant retention above
+            `trust_limits.global.max_retention_days` → `OUT_OF_RANGE`), an unknown key,
+            or two patterns of equal specificity matching the same queue (`NOT_ALLOWED`
+            on the later pattern). Nothing is saved.
         "401":
           $ref: "#/components/responses/Unauthenticated"
         "403":
           $ref: "#/components/responses/Forbidden"
+          description: "`ACTION_DENIED`: no `configure` on the queue base type; nothing is saved."
         "503":
           $ref: "#/components/responses/ServiceUnavailable"
 
@@ -1394,10 +1674,14 @@ paths:
       summary: Hold a queue (stop claims, keep creates)
       description: >-
         While held, creates are accepted and admitted as usual (depth limits apply),
-        claims skip the queue's tasks, claimed and running tasks keep their leases and
-        finish, and timers keep running. Optional `until` releases the hold
-        automatically. Recorded as the queue-scoped event `queueHeld`. Action
-        **`configure`** on queues.
+        claims skip the queue's tasks (a claim naming only held queues ends `204`),
+        claimed and running tasks keep their leases and finish, and timers keep running
+        (held time counts toward the queue timeout). A hold reaches every node within
+        `runtime_config_poll_secs`. Optional `until` (in the future) ends the hold
+        automatically once each node's clock passes it. Holding a held queue replaces
+        `reason` and `until`, keeps `since`, sets `by` to the caller and records another
+        `queueHeld`. A dead-letter queue cannot be held. Recorded as the queue-scoped
+        event `queueHeld`. Action **`configure`** on queues.
       parameters:
         - $ref: "#/components/parameters/QueueId"
       requestBody:
@@ -1416,10 +1700,16 @@ paths:
                 $ref: "#/components/schemas/Queue"
         "400":
           $ref: "#/components/responses/BadRequest"
+          description: >-
+            `invalid_argument`: `until` not in the future (`OUT_OF_RANGE` on `/until`);
+            `reason` over 1024 characters (`TOO_LONG` on `/reason`).
+            `failed_precondition` `DEAD_LETTER_QUEUE`: the queue is a dead-letter queue
+            (`resource_name` = the queue).
         "401":
           $ref: "#/components/responses/Unauthenticated"
         "403":
           $ref: "#/components/responses/Forbidden"
+          description: "`ACTION_DENIED`: no `configure` on queues."
         "404":
           $ref: "#/components/responses/NotFound"
         "503":
@@ -1431,8 +1721,10 @@ paths:
       operationId: releaseQueue
       summary: Release a held queue
       description: >-
-        Ends the hold; claims resume. Recorded as `queueReleased`. Action
-        **`configure`** on queues. No body.
+        Ends the hold; claims resume (the serving node at once, others within one config
+        refresh plus one claim poll interval). Recorded as `queueReleased`. Releasing a
+        queue that is not held answers `200` with `hold: null` and records nothing.
+        Action **`configure`** on queues. No body.
       parameters:
         - $ref: "#/components/parameters/QueueId"
       responses:
@@ -1447,6 +1739,7 @@ paths:
           $ref: "#/components/responses/Unauthenticated"
         "403":
           $ref: "#/components/responses/Forbidden"
+          description: "`ACTION_DENIED`: no `configure` on queues."
         "404":
           $ref: "#/components/responses/NotFound"
         "503":
@@ -1507,12 +1800,16 @@ components:
       in: header
       required: false
       description: >-
-        Platform idempotency key, unique per tenant and creating subject. **Required**
-        for every task type without a derived dedup identity (missing → `428`); optional
-        and ignored for types that declare the `dedup` trait.
+        Platform idempotency key, unique per tenant and creating subject: 1–255 printable
+        ASCII characters without spaces (`!`–`~`), case-sensitive. **Required** for every
+        task type without a derived dedup identity (missing → `428`); optional and
+        ignored for types that declare the `dedup` trait. Empty or malformed → `400`
+        `INVALID_FORMAT` on `Idempotency-Key`. Never returned on the task resource.
       schema:
         type: string
         minLength: 1
+        maxLength: 255
+        pattern: '^[!-~]{1,255}$'
     Filter:
       name: $filter
       in: query
@@ -1533,7 +1830,7 @@ components:
       name: $select
       in: query
       required: false
-      description: Comma-separated top-level fields, narrowing the item within the chosen `view`; a field outside the view → `400`.
+      description: Comma-separated top-level fields, narrowing the item within the chosen `view`; a field outside the view → `400` `NOT_ALLOWED` on `$select`.
       schema:
         type: string
     Limit:
@@ -1562,12 +1859,14 @@ components:
       in: query
       required: false
       description: >-
-        Detail level (a plain parameter, not a `$` option); any other value → `400`.
+        Detail level (a plain parameter, not a `$` option); any other value → `400`
+        `NOT_ALLOWED` on `view`.
         `tiny`: `id`, `state`, `type`. `short` (default): + `urgency`, `priority`,
-        `queue`, `assignment`, `created_at`, `updated_at`. `long`: + `input`, `result`,
-        `context`, `progress`, `tags`, `resource_refs`. `full`: + `events` (newest 50),
-        the current group's `wait_conditions`, `entries` (newest 20), `dependencies`,
-        and the two `*_truncated` flags.
+        `queue`, `assignment`, `dead_lettered_from`, `created_at`, `updated_at`. `long`:
+        + `input`, `result`, `context`, `progress`, `tags`, `resource_refs`. `full`: +
+        `events` (newest 50), the current group's `wait_conditions`, `entries` (newest
+        20), `dependencies`, and the two `*_truncated` flags. A cursor is bound to the
+        `view` it was issued for.
       schema:
         type: string
         enum: [tiny, short, long, full]
@@ -1583,10 +1882,13 @@ components:
         format: uri-reference
     RetryAfter:
       description: >-
-        Seconds after which the request may be retried.
+        Seconds after which the request may be retried; sent on every `429` and `503`.
+        `concurrency`: the claim poll interval rounded up (1 s). Queue-depth and
+        event-wait limits: `retry_after_secs` (30) jittered uniformly in [15, 30]. `503`:
+        `unavailable_retry_after_secs` (5).
       schema:
         type: integer
-        minimum: 0
+        minimum: 1
     IdempotencyReplayed:
       description: >-
         `true` when the response replays an earlier identical resolve.
@@ -1599,9 +1901,11 @@ components:
   responses:
     BadRequest:
       description: >-
-        `invalid_argument` (field violations, a `format`, or a `constraint`) or
-        `failed_precondition` (`violations[]`, type `STATE`, or `STALE_ORDER`,
-        `CHILDREN_PENDING`). In the Task Engine `failed_precondition` is `400`, not `409`.
+        `invalid_argument` (field violations, a `format`, or a `constraint`; the code is
+        in `field_violations[].reason`) or `failed_precondition` (the code is in
+        `violations[{type: STATE, subject: <code>}]`, `resource_name` = the task or
+        queue). Neither carries `context.reason`. In the Task Engine
+        `failed_precondition` is `400`, not `409`.
       content:
         application/problem+json:
           schema:
@@ -1615,16 +1919,22 @@ components:
     Forbidden:
       description: >-
         `permission_denied`: the caller may read the target but not perform the action.
-        `context.reason` says why.
+        `context.reason` says why, from a closed list: `ACTION_DENIED`,
+        `EXPEDITE_REQUIRED`, `QUEUE_NOT_PERMITTED`, `CREATOR_AUTHORITY`,
+        `CREATOR_AUTHORITY_UNVERIFIABLE`, `EVENT_CONSUME_DENIED`,
+        `EVENT_CONSUME_UNVERIFIABLE`, `DUPLICATE_NOT_READABLE`, `SUPERSEDE_CANCEL_DENIED`,
+        `CLAIM_REVOKED`. No field violations; a check or condition index is only in
+        `detail`.
       content:
         application/problem+json:
           schema:
             $ref: "#/components/schemas/Problem"
     WorkerRevoked:
       description: >-
-        `permission_denied` on a lease-fenced worker call: `claim` was denied, or the
-        caller's scope no longer covers the task. The task is released (no budget,
-        attempt or blacklist change).
+        `permission_denied` with `context.reason = "CLAIM_REVOKED"` on a lease-fenced
+        worker call: the caller holds the lease, but its scope no longer covers the task.
+        The task is released (no budget, attempt or blacklist change; history
+        `taskQueued { reason: revoked }`); the worker drops it.
       content:
         application/problem+json:
           schema:
@@ -1632,28 +1942,36 @@ components:
     NotFound:
       description: >-
         `not_found`: missing, or not readable by the caller (no existence oracle). `context` has
-        only `resource_type` and `resource_name`.
+        only `resource_type` and `resource_name`, never a field violation. Lease-fenced
+        worker calls never answer `404`.
       content:
         application/problem+json:
           schema:
             $ref: "#/components/schemas/Problem"
     AlreadyExists:
-      description: "`already_exists`; `context.resource_name` is the existing task ID."
+      description: >-
+        `already_exists`; `context.resource_type` is the task base type
+        (`gts.cf.core.tasks.task.v1~`) and `context.resource_name` the existing task ID.
       content:
         application/problem+json:
           schema:
             $ref: "#/components/schemas/Problem"
     LeaseLost:
       description: >-
-        `aborted` with `context.reason = "LEASE_LOST"`: stale or unknown lease token, or a call
-        not from the lease holder. Final: the task is no longer the caller's. The body never
-        echoes the token.
+        `aborted` with `context.reason = "LEASE_LOST"`: the caller is not the current holder
+        with that token (stale or unknown token, unknown task, a task of another tenant).
+        Final: the task is no longer the caller's. Worker calls answer this instead of
+        `404`. The body never echoes the token.
       content:
         application/problem+json:
           schema:
             $ref: "#/components/schemas/Problem"
     Conflict:
-      description: "`aborted`: another writer got there first; `context.reason` names the case."
+      description: >-
+        `already_exists` (see `AlreadyExists`) or `aborted`: another writer got there
+        first; `context.reason` is `LEASE_LOST` (worker writes), `CONCURRENT_MODIFICATION`
+        (payload revision) or `STATE_CHANGED` (a non-worker write whose state guard lost;
+        read the target and retry).
       content:
         application/problem+json:
           schema:
@@ -1675,9 +1993,14 @@ components:
             $ref: "#/components/schemas/Problem"
     TooManyRequests:
       description: >-
-        `resource_exhausted`. Names only the full dimension (in `violations[].subject`),
-        never usage figures. Codes `QUEUE_DEPTH_LIMIT`, `CONCURRENCY_LIMIT`,
-        `EVENT_WAIT_LIMIT`, or a rate limit (p2).
+        `resource_exhausted`. Names only the full quota in `violations[].subject`, never
+        usage figures and never `context.reason`: `queue_depth.queue`,
+        `queue_depth.tenant`, `queue_depth.domain_global`, `queue_depth.deferred`,
+        `concurrency`, `event_waits.tenant`, `event_waits.event_type`,
+        `event_waits.unkeyed`, or a rate limit (p2). `resource_type`/`resource_name` name
+        the queue, except for `queue_depth.deferred` (the task base type, no name), a
+        `concurrency` refusal of a claim naming several queues (the queue base type, no
+        name) and the event-wait limits. Always carries `Retry-After`.
       headers:
         Retry-After:
           $ref: "#/components/headers/RetryAfter"
@@ -1687,8 +2010,10 @@ components:
             $ref: "#/components/schemas/Problem"
     ServiceUnavailable:
       description: >-
-        `service_unavailable`: a dependency the decision needs is down (PDP, GTS
-        registry), or admission shed the request. Nothing changed; retrying is safe.
+        `service_unavailable`: the PDP is unreachable (every operation fails closed),
+        the GTS registry is unreachable for a type that is not cached, or the node is
+        overloaded (admission shed the request). Nothing changed, leases are kept;
+        retrying is safe. Always carries `Retry-After`.
       headers:
         Retry-After:
           $ref: "#/components/headers/RetryAfter"
@@ -1785,7 +2110,7 @@ components:
       enum: [all, any]
     WaitConditionKind:
       type: string
-      description: Open set; `input` and `children` are p2 (refused in p1), `event` is p2.
+      description: Open set; p1 accepts only `timer`. `input`, `children` and `event` are p2 (refused in p1 with `FEATURE_NOT_AVAILABLE`).
       enum: [timer, input, children, event]
     WaitConditionState:
       type: string
@@ -1795,8 +2120,10 @@ components:
     OnTimeout:
       type: string
       description: >-
-        `fail` ends the task `timed_out`; `resume` resumes it with a timeout note.
+        `fail` ends the task `timed_out`; `resume` resumes it with a timeout note. A
+        condition with a timeout and no `on_timeout` gets `fail`.
       enum: [fail, resume]
+      default: fail
     ErrorFault:
       type: string
       description: Who caused a reported error; affects only worker blacklisting.
@@ -1812,9 +2139,12 @@ components:
       type: array
       description: >-
         Tenant-local labels, an array of `{key, value}`; each key at most once per task
-        (a repeated key → `400`). Keys up to 128 and values up to 256 characters; a tag
-        with an empty `value` works as a plain label. Order is not significant; the
-        engine returns them sorted by key. The number of tags per task is limited.
+        (a repeated key → `400` `DUPLICATE`). Keys 1–128 and values 0–256 Unicode
+        characters (`TOO_LONG` on `/tags/i/key` or `/tags/i/value`, `REQUIRED` for an
+        empty key); a tag with an empty `value` works as a plain label. At most
+        `max_tags_per_task` (16) tags per task (`TOO_MANY_TAGS` on `/tags`). Order is
+        not significant; the engine returns them sorted by key.
+      maxItems: 16
       items:
         $ref: "#/components/schemas/Tag"
     Tag:
@@ -1841,7 +2171,8 @@ components:
         resource_id:
           type: string
           description: >-
-            Resource ID.
+            Resource ID, at most 256 characters (`TOO_LONG` on
+            `/resource_refs/i/resource_id`).
           maxLength: 256
     ResourceRef:
       allOf:
@@ -1861,32 +2192,46 @@ components:
         task_id:
           type: string
           format: uuid
-          description: Predecessor task; the caller needs `read` on it. Same tenant and task domain.
+          description: >-
+            Predecessor task; the caller needs `read` on it. Looked up only in the new
+            task's domain: one that is missing, unreadable or in another domain → `404`.
+            Listing the same task twice → `400` `DUPLICATE` on the second.
         on_predecessor_failure:
           $ref: "#/components/schemas/OnPredecessorFailure"
     Predecessor:
       type: object
-      required: [task_id, on_predecessor_failure]
+      required: [task_id, on_predecessor_failure, outcome]
       properties:
         task_id:
           type: string
           format: uuid
         on_predecessor_failure:
           $ref: "#/components/schemas/OnPredecessorFailure"
-        satisfied:
-          type: boolean
-          description: Whether this predecessor no longer blocks the task.
+        outcome:
+          type: string
+          enum: [pending, succeeded, failed_ignored, failed]
+          description: >-
+            What this predecessor did for the task: `pending` (not ended), `succeeded`,
+            `failed_ignored` (ended failed, cancelled or dead-lettered with
+            `on_predecessor_failure: ignore`, so it counts as satisfied), `failed` (ended
+            so, with `cancel`).
     Timeouts:
       description: >-
         Timeout settings in seconds (`queue_timeout_secs`, `assignment_timeout_secs`,
         `execution_timeout_secs`, `heartbeat_timeout_secs`, `lifetime_timeout_secs`).
-        Same shape as the queue registration. On create any subset may be given; on the
-        task resource these are the effective (resolved) values.
+        Same shape as the queue registration. On create any subset may be given; a value
+        above the type's trust limit → `400`. On the task resource these are the
+        effective values, resolved and stored at create (an inherited value above a trust
+        limit is clamped); `heartbeat_timeout_secs` is never `null`. Later configuration
+        changes do not reach an existing task.
       $ref: "./schemas/types/gts.cf.core.tasks.queue.v1~.schema.json#/properties/timeouts"
     RetryPolicy:
       description: >-
-        Retry policy, same shape as the queue registration. A policy on create is taken
-        whole, not merged per field. On the task resource: the effective policy.
+        Retry policy, same shape as the queue registration. A policy on create must carry
+        the schema's required fields (`max_retries`, `strategy`, `base_interval_secs`,
+        `max_interval_secs`); omitted optional fields take the schema defaults; it is
+        not merged with other levels. On the task resource: the effective policy,
+        resolved and stored at create.
       $ref: "./schemas/types/gts.cf.core.tasks.queue.v1~.schema.json#/properties/retry_policy"
     TaskError:
       type: object
@@ -1963,14 +2308,16 @@ components:
           type: [string, "null"]
           format: date-time
           description: >-
-            The running attempt ends `timed_out` then; `null` while `claimed`.
+            Set by the claim (claim time + effective execution timeout) and never moved by
+            `start`; the attempt ends `timed_out` then, whether `claimed` or `running`.
+
     # ---------------------------------------------------------- task resource
 
     Task:
       type: object
       description: >-
         The task resource, returned by create, read, claim and the worker and admin
-        calls.
+        calls. It never carries the `Idempotency-Key` or a lease token.
       required: [id, type, queue, owner_tenant_id, created_by, state, urgency, priority, attempt, created_at, updated_at]
       properties:
         id:
@@ -2047,10 +2394,13 @@ components:
           type: boolean
         propagate_cancel:
           type: boolean
+          description: >-
+            When `true`, a cancel reaches the unfinished children in the same mode, and a
+            parent that ends in any other non-success state cancels them `graceful`.
         predecessors:
           type: array
           description: >-
-            Bounded by `max_predecessors_per_task` (64). `on_predecessor_failure` is P. p2.
+            Bounded by `max_predecessors_per_task` (64); each with its `outcome`. p2.
           items:
             $ref: "#/components/schemas/Predecessor"
         dependency_mode:
@@ -2059,16 +2409,17 @@ components:
             - type: "null"
         timeouts:
           $ref: "#/components/schemas/Timeouts"
+          description: Effective timeouts, resolved and stored at create.
         retry_policy:
-          anyOf:
-            - $ref: "#/components/schemas/RetryPolicy"
-            - type: "null"
+          $ref: "#/components/schemas/RetryPolicy"
+          description: Effective retry policy, resolved and stored at create.
         run_after:
           type: [string, "null"]
           format: date-time
         sla_deadline:
           type: [string, "null"]
           format: date-time
+          description: A passed deadline is cleared by re-enqueue.
         assignment:
           anyOf:
             - $ref: "#/components/schemas/Assignment"
@@ -2078,7 +2429,8 @@ components:
             - $ref: "#/components/schemas/QueueRef"
             - type: "null"
           description: >-
-            Source queue of a dead-lettered task.
+            Source queue of a dead-lettered task; cleared by re-enqueue. Filterable in
+            search and part of the `short` view.
         superseded_by:
           type: [string, "null"]
           format: uuid
@@ -2092,6 +2444,7 @@ components:
         terminal_at:
           type: [string, "null"]
           format: date-time
+          description: Cleared by re-enqueue.
         domain:
           $ref: "#/components/schemas/Domain"
           description: >-
@@ -2117,6 +2470,7 @@ components:
           format: date-time
         reason:
           type: [string, "null"]
+          maxLength: 1024
         grace_until:
           type: [string, "null"]
           format: date-time
@@ -2125,7 +2479,7 @@ components:
           type: [string, "null"]
           format: uuid
           description: >-
-            Set when the request comes from supersession.
+            Set when the request comes from supersession (p2); the heartbeat passes it on.
 
     # ---------------------------------------------------------- create
 
@@ -2158,6 +2512,13 @@ components:
           description: Validated against the type's input schema.
         context:
           description: Initial context (part of the 64 KiB payload).
+        owner_tenant_id:
+          type: string
+          format: uuid
+          description: >-
+            Tenant that owns the task; default the caller's tenant. The `create` check
+            carries it and the PDP decides (subtree and barrier rules); a tenant barrier
+            is crossed only for a queue that is `operated_by: platform`.
         owner_id:
           type: string
           description: Subject the task is done for.
@@ -2168,6 +2529,11 @@ components:
         run_after:
           type: string
           format: date-time
+          description: >-
+            Earliest claim time. A past value is stored as sent and the task is `queued`;
+            a value later than `created_at` + the lifetime timeout → `400`
+            `OUT_OF_RANGE` on `/run_after`. Not with an initial `wait` group when in the
+            future.
         sla_deadline:
           type: string
           format: date-time
@@ -2186,14 +2552,18 @@ components:
           type: string
           format: uuid
           description: >-
-            Parent task (p2; refused in p1 with `FEATURE_NOT_AVAILABLE`). Requires
-            `parent_lease_token`.
+            Parent task (p2; refused in p1 with `FEATURE_NOT_AVAILABLE` on
+            `/parent_task_id`). Requires `parent_lease_token`. Looked up only in the new
+            task's domain (another domain → `404`). The hierarchy may be at most
+            `max_hierarchy_depth` (10) deep; deeper → `400` `TOO_DEEP` on
+            `/parent_task_id`.
         parent_lease_token:
           type: string
           format: uuid
           description: >-
             The parent's lease token held by the calling worker. Required with
-            `parent_task_id`.
+            `parent_task_id` (missing → `400` `REQUIRED` on `/parent_lease_token`); a
+            wrong, stale or foreign token → the same `404` as a missing parent.
         wait_for_children:
           type: boolean
           default: false
@@ -2205,7 +2575,9 @@ components:
           description: >-
             `[{task_id, on_predecessor_failure}]`; the mode is per task
             (`dependency_mode`). p2. At most `max_predecessors_per_task` (64), else
-            `DEPENDENCY_GRAPH_TOO_LARGE`. Fixed after creation.
+            `DEPENDENCY_GRAPH_TOO_LARGE`; the same task twice → `DUPLICATE` on
+            `/predecessors/i`. Not with an initial `wait` group. Fixed after creation.
+          maxItems: 64
           items:
             $ref: "#/components/schemas/PredecessorInput"
         dependency_mode:
@@ -2222,7 +2594,15 @@ components:
       description: >-
         Optional initial wait group: the task starts in `waiting`. Same shape as a
         worker's set-wait without `lease_token`, `park` and `checkpoint` (use
-        `context`). Input and children kinds are refused in p1.
+        `context`). Not allowed with `predecessors` or a future `run_after` (`400`
+        `NOT_ALLOWED` on `/wait`). Kinds: those a worker may set in the phase, never
+        `children` (`NOT_ALLOWED` on `/wait/conditions/i/kind` in every phase, checked
+        before the phase check); p1 accepts only `timer` (`FEATURE_NOT_AVAILABLE` on
+        `/wait/conditions/i/kind`). At most `wait.max_conditions_per_group` (16)
+        conditions. Condition timeouts and `resume_at` count from the create. A deferred
+        admission (`429` `queue_depth.deferred` when full). The condition IDs are read
+        with `GET /tasks/{task_id}/wait-conditions`; a task resumed from this group is
+        claimed with `attempt` 1.
       required: [mode, conditions]
       additionalProperties: false
       properties:
@@ -2231,6 +2611,7 @@ components:
         conditions:
           type: array
           minItems: 1
+          maxItems: 16
           items:
             $ref: "#/components/schemas/WaitConditionSpec"
 
@@ -2247,27 +2628,32 @@ components:
           type: [string, "null"]
           format: uuid
           description: >-
-            The worker's live session to reuse. `null`, or a session that is no
-            longer live, opens a new one.
+            The worker's live session to reuse. `null`, a session that is no longer
+            live, or one stored with another `worker_id` opens a new one (only when the
+            claim takes a task).
         queues:
           type: array
           minItems: 1
           uniqueItems: true
-          description: Queues of one task domain; at most `claim_max_queues` (16). Never a `dead_letter` queue.
+          description: >-
+            Queues of one task domain (`CROSS_DOMAIN`); at most `claim_max_queues` (16)
+            distinct queues (`TOO_MANY_QUEUES`); missing or empty → `REQUIRED`. A
+            `dead_letter` queue → `DEAD_LETTER_QUEUE` on `/queues/i`; an unregistered one
+            → `404`.
           items:
             $ref: "#/components/schemas/QueueRef"
         max_tasks:
           type: integer
           minimum: 1
           default: 1
-          description: At most `claim_max_batch` (32); larger → `400` (not clamped).
+          description: At most `claim_max_batch` (32); larger → `400` `OUT_OF_RANGE` (not clamped).
         timeout_secs:
           type: integer
           minimum: 0
           default: 0
           description: >-
             Long-poll wait in seconds, clamped to `claim_max_wait_secs` (50). `0`
-            (the default) is one attempt without waiting.
+            (the default) is one attempt without waiting; negative → `400`.
         domain:
           $ref: "#/components/schemas/Domain"
           description: >-
@@ -2319,7 +2705,8 @@ components:
         resumed:
           description: >-
             The wait result when the task resumes from a wait; `null` for a fresh
-            claim.
+            claim. Returned on every claim while the task's current wait group is a
+            resolved parked group, so a lost claim response does not lose it.
           anyOf:
             - $ref: "#/components/schemas/WaitResult"
             - type: "null"
@@ -2390,7 +2777,7 @@ components:
           format: uuid
         leases:
           type: array
-          description: At most `heartbeat_batch_max` (500).
+          description: At most `heartbeat_batch_max` (default 500); more → `400` `TOO_MANY` on `/leases`.
           items:
             type: object
             required: [task_id, lease_token]
@@ -2441,8 +2828,10 @@ components:
             - $ref: "#/components/schemas/CancelRequestInfo"
             - type: "null"
           description: >-
-            Present when `outcome` is `ok` and a cancel is pending: its mode and,
-            for `graceful`, `grace_until`.
+            Present when `outcome` is `ok` and a cancel is pending: its mode, for
+            `graceful` its `grace_until`, and `superseded_by` when a supersession caused
+            it.
+
     LeaseTokenRequest:
       type: object
       required: [lease_token]
@@ -2488,7 +2877,9 @@ components:
           format: uuid
         checkpoint:
           type: object
-          description: Merged into `context` key by key.
+          description: >-
+            Merged into `context` as an RFC 7386 JSON Merge Patch: nested objects merge,
+            `null` deletes a key, arrays are replaced whole.
 
     CheckpointResponse:
       type: object
@@ -2529,12 +2920,15 @@ components:
           format: uuid
         delay_secs:
           type: integer
-          minimum: 1
+          minimum: 0
+          maximum: 86400
+          default: 0
           description: >-
-            Release to `scheduled` after this delay.
+            Release to `scheduled` after this delay; `0` is an immediate release. At most
+            `release_max_delay_secs` (86,400); outside 0..max → `400` `OUT_OF_RANGE`.
         checkpoint:
           type: object
-          description: Merged into `context` as by `/checkpoint`.
+          description: Merged into `context` as by `/checkpoint` (RFC 7386).
 
     CancelRequest:
       type: object
@@ -2547,13 +2941,17 @@ components:
           default: requested
         reason:
           type: string
+          maxLength: 1024
           description: >-
-            Free text, stored on the task as `cancel_request.reason`.
+            Free text, at most 1024 characters (`TOO_LONG` on `/reason`), stored on the
+            task as `cancel_request.reason`.
+
     TagsPatchRequest:
       type: object
       description: >-
         `set` adds or replaces tags by key (`[{key, value}]`); `remove` deletes keys. A key in
-        both, or twice in `set` → `400`. Keys not named are left unchanged.
+        both, or twice in `set` → `400`; a result over `max_tags_per_task` (16) → `400`
+        `TOO_MANY_TAGS`. Keys not named are left unchanged.
       minProperties: 1
       additionalProperties: false
       properties:
@@ -2575,6 +2973,23 @@ components:
           $ref: "#/components/schemas/SubjectId"
         worker_id:
           $ref: "#/components/schemas/WorkerId"
+        reason:
+          type: string
+          maxLength: 1024
+          description: Free text, at most 1024 characters, recorded in `taskReassigned`.
+
+    ReenqueueRequest:
+      type: object
+      description: >-
+        Optional re-enqueue body. Without `queue` the task returns to its source queue
+        (`dead_lettered_from`, or its own queue for a failed task).
+      additionalProperties: false
+      properties:
+        queue:
+          $ref: "#/components/schemas/QueueRef"
+          description: >-
+            Dispatch queue to re-enqueue into: routed to the task's current domain and
+            accepting its type.
 
     AcceptRequest:
       type: object
@@ -2673,29 +3088,39 @@ components:
 
     ConditionTimeoutFields:
       type: object
-      description: Optional per-condition timeout, common to every kind.
+      description: >-
+        Optional per-condition timeout of the input, children and event kinds (a timer
+        condition takes none). `timeout_secs` without `on_timeout` means `fail`. For
+        input and children conditions `on_timeout` without `timeout_secs` → `400`
+        `NOT_ALLOWED`; an event condition without `timeout_secs` gets
+        `event_waits.max_wait_secs`, so `on_timeout` alone is valid there.
       properties:
         timeout_secs:
           type: integer
           minimum: 1
           description: >-
-            Timeout in seconds; starts at park time.
+            Timeout in seconds; starts at park time (at create for an initial `wait`
+            group).
         on_timeout:
           $ref: "#/components/schemas/OnTimeout"
 
     TimerConditionSpec:
-      allOf:
-        - $ref: "#/components/schemas/ConditionTimeoutFields"
-        - type: object
-          required: [kind, resume_at]
-          properties:
-            kind:
-              const: timer
-            resume_at:
-              type: string
-              format: date-time
-              description: >-
-                Satisfied when reached.
+      type: object
+      description: >-
+        Satisfied once `resume_at` passes. Takes no timeout: `timeout_secs` or
+        `on_timeout` on a timer condition → `400` `NOT_ALLOWED`. p1.
+      required: [kind, resume_at]
+      additionalProperties: false
+      properties:
+        kind:
+          const: timer
+        resume_at:
+          type: string
+          format: date-time
+          description: >-
+            Satisfied when reached. A time already past is satisfied at once (a set
+            answers `parked: false` with the result).
+
     InputConditionSpec:
       description: >-
         p2; refused in p1 with `FEATURE_NOT_AVAILABLE`.
@@ -2739,17 +3164,23 @@ components:
               const: event
             event_type:
               type: string
-              description: GTS event type ID on a waitable topic.
+              description: >-
+                GTS event type ID on a waitable topic, resolved with the caller's GTS
+                visibility: an unregistered or hidden type → `UNKNOWN_EVENT_TYPE`.
             subject_type:
               type: string
               description: >-
-                Required unless the event type allows exactly one subject type.
+                Required unless the event type's `allowed_subject_types` is a single
+                entry that is not a wildcard pattern (`EVENT_SUBJECT_TYPE_REQUIRED`); a
+                type outside the allowed ones → `EVENT_SUBJECT_TYPE_NOT_ALLOWED`.
             subject_id:
               type: string
             match_expression:
               type: string
               description: >-
-                CEL expression checked after the field match (p3).
+                CEL expression checked after the field match (p3). A parse error or a
+                breach of a CEL limit → `INVALID_MATCH_EXPRESSION` (checked before the
+                `consume` checks).
 
     SetWaitRequest:
       type: object
@@ -2760,7 +3191,7 @@ components:
           type: string
           format: uuid
           description: >-
-            Required.
+            Required; missing → `400` `REQUIRED` on `/lease_token` before any lookup.
         mode:
           $ref: "#/components/schemas/WaitMode"
         park:
@@ -2769,12 +3200,14 @@ components:
           description: "`false` arms the group (it matches while the task keeps running)."
         checkpoint:
           type: object
-          description: Merged into `context` in the same guarded write.
+          description: Merged into `context` (RFC 7386) in the same guarded write; records `taskCheckpointed`.
         conditions:
           type: array
           minItems: 1
+          maxItems: 16
           description: >-
-            Limited per group.
+            At most `wait.max_conditions_per_group` (16): empty → `REQUIRED`, more →
+            `TOO_MANY`, both on `/conditions`.
           items:
             $ref: "#/components/schemas/WaitConditionSpec"
 
@@ -3071,8 +3504,9 @@ components:
       properties:
         value:
           description: >-
-            Must be valid against the condition's `input_schema`; counts against the
-            payload limit.
+            Must be valid against the condition's `input_schema`. Measured alone against
+            the 64 KiB payload limit (`413`); stored on the condition, not in the task's
+            payload.
 
     ResolveResponse:
       type: object
@@ -3127,6 +3561,12 @@ components:
             - type: "null"
           description: >-
             From `short`.
+        dead_lettered_from:
+          anyOf:
+            - $ref: "#/components/schemas/QueueRef"
+            - type: "null"
+          description: >-
+            From `short`: source queue of a dead-lettered task.
         created_at:
           type: string
           format: date-time
@@ -3247,7 +3687,7 @@ components:
             `waitConditionSatisfied`, `waitTimedOut`, `taskResumed`, `taskRetrying`,
             `taskReassigned`, `taskCancelRequested`, `taskCancelled`,
             `taskCompleted`, `taskFailed`, `taskTimedOut`, `taskDeadLettered`,
-            `slaBreached`. The broker event type is
+            `slaBreached`, `taskTagsUpdated`, `taskUpdated`. The broker event type is
             `gts.cf.core.events.event.v1~cf.core.tasks.<snake_name>.v1~`.
         actor:
           anyOf:
@@ -3294,6 +3734,74 @@ components:
         page_info:
           $ref: "#/components/schemas/PageInfo"
 
+    QueueHistoryEvent:
+      type: object
+      description: >-
+        One queue-scoped event: same item shape as a task's history.
+      required: [id, event_type, timestamp, payload]
+      properties:
+        id:
+          type: string
+          format: uuid
+        event_type:
+          type: string
+          description: >-
+            camelCase event name, an open set: `queueHeld`, `queueReleased`,
+            `configUpdated`, `workerBlacklisted`.
+        actor:
+          anyOf:
+            - $ref: "#/components/schemas/SubjectId"
+            - type: "null"
+          description: Subject that caused the event; `null` for an automatic release.
+        timestamp:
+          type: string
+          format: date-time
+        payload:
+          description: The event data; which shape is chosen by `event_type`.
+          anyOf:
+            - $ref: "#/components/schemas/QueueHeldData"
+            - $ref: "#/components/schemas/QueueReleasedData"
+            - $ref: "./schemas/types/gts.cf.core.events.event.v1~cf.core.tasks.config_updated.v1~.schema.json#/allOf/1/properties/data"
+            - $ref: "./schemas/types/gts.cf.core.events.event.v1~cf.core.tasks.worker_blacklisted.v1~.schema.json#/allOf/1/properties/data"
+
+    QueueHeldData:
+      type: object
+      required: [queue, actor]
+      properties:
+        queue:
+          $ref: "#/components/schemas/QueueRef"
+        actor:
+          $ref: "#/components/schemas/SubjectId"
+        reason:
+          type: [string, "null"]
+        until:
+          type: string
+          format: date-time
+
+    QueueReleasedData:
+      type: object
+      required: [queue, automatic]
+      properties:
+        queue:
+          $ref: "#/components/schemas/QueueRef"
+        actor:
+          $ref: "#/components/schemas/SubjectId"
+          description: Absent for an automatic release.
+        automatic:
+          type: boolean
+          description: "`true` when `until` ended the hold."
+
+    QueueHistoryEventPage:
+      type: object
+      required: [items, page_info]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/QueueHistoryEvent"
+        page_info:
+          $ref: "#/components/schemas/PageInfo"
+
     # ---------------------------------------------------------- queues
 
     Queue:
@@ -3301,7 +3809,7 @@ components:
       description: >-
         Queue resource. `limits` are effective values after config overrides.
         Registration fields are defined by the queue type `gts.cf.core.tasks.queue.v1~`.
-      required: [id, kind, domains, counts, hold]
+      required: [id, kind, domains, hold]
       properties:
         id:
           $ref: "#/components/schemas/QueueRef"
@@ -3314,17 +3822,19 @@ components:
           description: "`null` for a `dead_letter` queue."
         domains:
           type: array
-          minItems: 1
           description: >-
             The queue's domain set: primary first, plus the source domain while a
-            move lasts. `["default"]` on a single-domain deployment.
+            move lasts. `["default"]` on a single-domain deployment; empty for a
+            `dead_letter` queue (not routed).
           items:
             $ref: "#/components/schemas/Domain"
         counts:
           type: object
           description: >-
             Tasks per state: the live states for a dispatch queue, `dead_lettered`
-            for a dead-letter queue.
+            for a dead-letter queue. Sampled by the maintenance leader every
+            `queue_depth.sample_secs`, not exact. Present only for a caller that holds
+            `configure` on queues.
           additionalProperties:
             type: integer
             minimum: 0
@@ -3334,7 +3844,8 @@ components:
           type: string
           format: date-time
           description: >-
-            When `counts` were taken.
+            When `counts` and the depth samples were taken (one pass). Present only with
+            `counts`.
         hold:
           anyOf:
             - $ref: "#/components/schemas/QueueHold"
@@ -3414,7 +3925,7 @@ components:
     QueueHold:
       type: object
       description: >-
-        Since when, by whom, why and until when.
+        Since when, by whom (the latest actor that held it), why and until when.
       required: [since, by]
       properties:
         since:
@@ -3428,7 +3939,9 @@ components:
           type: [string, "null"]
           format: date-time
           description: >-
-            Automatic release time.
+            Automatic release time: each node treats the hold as over once its clock
+            passes it; one `queueReleased { automatic: true }` is recorded.
+
     QueueList:
       type: object
       required: [items]
@@ -3444,9 +3957,12 @@ components:
       properties:
         reason:
           type: string
+          maxLength: 1024
+          description: Free text, at most 1024 characters (`TOO_LONG` on `/reason`).
         until:
           type: string
           format: date-time
+          description: Must be in the future (`400` `OUT_OF_RANGE` on `/until`).
 
     # ---------------------------------------------------------- bulk
 
@@ -3454,7 +3970,7 @@ components:
       type: array
       minItems: 1
       uniqueItems: true
-      description: At most the configured bulk size (default 1,000); more → `400` `BATCH_TOO_LARGE`.
+      description: At most `bulk_max_ids` (default 1000); more → `400` `BATCH_TOO_LARGE` on `/task_ids`.
       items:
         type: string
         format: uuid
@@ -3469,15 +3985,17 @@ components:
 
     BulkCancelRequest:
       type: object
-      required: [task_ids, mode]
+      required: [task_ids]
       additionalProperties: false
       properties:
         task_ids:
           $ref: "#/components/schemas/BulkTaskIds"
         mode:
           $ref: "#/components/schemas/CancelMode"
+          default: requested
         reason:
           type: string
+          maxLength: 1024
 
     BulkReprioritizeRequest:
       type: object
@@ -3521,7 +4039,13 @@ components:
                 format: uuid
               outcome:
                 type: string
-                enum: [succeeded, unauthorized, not_found, invalid_state]
+                description: >-
+                  `succeeded` (done; for cancel, the task ended), `unauthorized`,
+                  `not_found`, `invalid_state`, `cancel_requested` (cancel: a leased task
+                  only flagged), `limit_exceeded` (retry, move: refused by a queue-depth
+                  limit, no usage figures), `domain_mismatch` (move: destination in
+                  another task domain). Open set.
+                enum: [succeeded, unauthorized, not_found, invalid_state, cancel_requested, limit_exceeded, domain_mismatch]
 
     # ---------------------------------------------------------- runtime config
 
@@ -3531,7 +4055,10 @@ components:
         The complete override set of the new version: a key not present reverts to the
         registration or engine default, so removing an override is saving a version
         without it. Overrides are keyed by exact ID or GTS pattern
-        (`gts.cf.core.tasks.queue.v1~acme.reports.*`); the most specific pattern wins.
+        (`gts.cf.core.tasks.queue.v1~acme.reports.*`): an exact ID beats any pattern,
+        then the longest literal prefix before the first wildcard; two patterns of equal
+        specificity matching the same queue are refused (`NOT_ALLOWED` on the later
+        pattern).
       minProperties: 1
       additionalProperties: false
       properties:
@@ -3642,7 +4169,8 @@ components:
         `already_exists` 409, `aborted` 409, `failed_precondition` 400,
         `resource_exhausted` 429, `service_unavailable` 503, `internal` 500.
 
-        Error bodies never contain payload values, lease tokens, or PDP internals.
+        Error bodies never contain payload values, lease tokens, or PDP internals. Every
+        `429` and `503` response carries a `Retry-After` header.
       properties:
         type:
           type: string
@@ -3673,10 +4201,23 @@ components:
         dimension, `retry_after_seconds?`); `permission_denied` and `aborted` `reason`;
         `unauthenticated` `reason?`; `service_unavailable` `retry_after_seconds?`.
 
-        **Reason codes.** Task Engine codes (`QUEUE_DEPTH_LIMIT`, `STALE_ORDER`,
-        `UNKNOWN_TASK_TYPE`, `TASK_DOMAIN_MISMATCH`, …) are sent in `context.reason` and
-        repeated in `field_violations[].reason`, `violations[].type`, or (dimension)
-        `violations[].subject`.
+        **Where the code goes.** Only `permission_denied`, `aborted` and
+        `unauthenticated` carry `context.reason`. The other categories carry their code in
+        the slot the library builds, never in `context.reason`: `invalid_argument` in
+        `field_violations[].reason` (every code names a field); `failed_precondition` in
+        `violations[{type: "STATE", subject: <code>}]` with `resource_name` = the task or
+        queue (a plain state conflict has `subject: "STATE"`); `resource_exhausted` in
+        `violations[].subject`, the full quota (`queue_depth.queue`,
+        `queue_depth.tenant`, `queue_depth.domain_global`, `queue_depth.deferred`,
+        `concurrency`, `event_waits.<dimension>`). A `404` carries only `resource_type`
+        and `resource_name`; a `403` only its reason.
+
+        `failed_precondition` subjects: `STATE`, `STALE_ORDER`, `CHILDREN_PENDING`,
+        `TASK_FINISHED`, `NOT_CANCELLABLE`, `NO_ARMED_WAIT`, `ALREADY_RESOLVED`,
+        `NOT_RESOLVABLE`, `DEPENDENCY_UNSATISFIABLE`, `PARENT_FINISHED`,
+        `TARGET_BLACKLISTED`, `DEAD_LETTER_QUEUE`, `TOO_MANY_ENTRIES`. `aborted` reasons: `LEASE_LOST`,
+        `CONCURRENT_MODIFICATION`, `STATE_CHANGED`. `permission_denied` reasons: see the
+        `Forbidden` response.
       properties:
         resource_type:
           type: string
@@ -3684,6 +4225,7 @@ components:
           type: string
         reason:
           type: string
+          description: "`permission_denied`, `aborted` and `unauthenticated` only."
         field_violations:
           type: array
           items:
@@ -3699,6 +4241,7 @@ components:
         retry_after_seconds:
           type: integer
           minimum: 0
+          description: "`service_unavailable` only; a `429` carries it per violation."
 
     FieldViolation:
       type: object
@@ -3707,35 +4250,46 @@ components:
         field:
           type: string
           description: >-
-            Request JSON path (`input.report_id`, `conditions[0].event_type`) or
-            header name.
+            RFC 6901 JSON Pointer from the request body root (`/input/report_id`,
+            `/conditions/0/event_type`, `/queues/1`); a header or query parameter is named
+            as sent (`Idempotency-Key`, `cursor`).
         description:
           type: string
-          description: The rule broken, never the value sent.
+          description: >-
+            The rule broken, never the value sent; for `SCHEMA_VIOLATION` the failed
+            schema keyword.
         reason:
           type: string
           description: >-
             The documented set; clients treat it as open. Generic: `REQUIRED`,
-            `OUT_OF_RANGE`, `TOO_LONG`, `TOO_MANY`, `PAYLOAD_TOO_LARGE`,
-            `INVALID_ENUM_VALUE`, `NOT_ALLOWED`, `SCHEMA_VIOLATION`,
-            `SCHEMA_TOO_LARGE`, `NOT_FOUND`, `UNSUPPORTED_QUERY_PARAM`,
-            `FEATURE_NOT_AVAILABLE`, `TRUST_LIMIT`, `QUEUE_KIND`, `KEY_REUSED`,
-            `INVALID_TYPE_POLICY`, `UNKNOWN_TYPE`, `INVALID_LIMIT`,
-            `INVALID_CURSOR`, `FILTER_MISMATCH`, `ORDER_WITH_CURSOR`,
-            `FIELD_SELECTION_MISMATCH`; plus the Task Engine codes repeated from
-            `context.reason` (`UNKNOWN_TASK_TYPE`, `TASK_DOMAIN_MISMATCH`,
+            `INVALID_FORMAT`, `OUT_OF_RANGE`, `TOO_LONG`, `TOO_MANY`, `DUPLICATE`,
+            `PAYLOAD_TOO_LARGE`, `INVALID_ENUM_VALUE`, `NOT_ALLOWED`,
+            `SCHEMA_VIOLATION`, `SCHEMA_TOO_LARGE`, `NOT_FOUND`,
+            `UNSUPPORTED_QUERY_PARAM`. Task Engine: `UNKNOWN_TASK_TYPE`,
+            `UNKNOWN_ENTRY_TYPE`, `UNKNOWN_EVENT_TYPE`, `TASK_DOMAIN_MISMATCH`,
             `DEPENDENCY_GRAPH_TOO_LARGE`, `EVENT_TOPIC_NOT_WAITABLE`,
-            `BATCH_TOO_LARGE`, …).
+            `EVENT_SUBJECT_TYPE_REQUIRED`, `EVENT_SUBJECT_TYPE_NOT_ALLOWED`,
+            `INVALID_MATCH_EXPRESSION`, `BATCH_TOO_LARGE`, `TOO_MANY_TAGS`,
+            `TOO_MANY_QUEUES`, `TOO_DEEP`, `DEAD_LETTER_QUEUE`, `CROSS_DOMAIN`,
+            `TRUST_LIMIT`, `QUEUE_KIND`, `KEY_REUSED`, `INVALID_TYPE_POLICY`,
+            `FEATURE_NOT_AVAILABLE`. Cursor and paging: `INVALID_CURSOR`,
+            `FILTER_MISMATCH`, `ORDER_WITH_CURSOR`, `FIELD_SELECTION_MISMATCH`,
+            `INVALID_LIMIT`.
+
     Violation:
       type: object
       required: [description]
       properties:
         type:
           type: string
-          description: "`failed_precondition`: for example `STATE`, `STALE_ORDER`, `CHILDREN_PENDING`."
+          description: "`failed_precondition`: always `STATE`."
         subject:
           type: string
-          description: "`resource_exhausted`: the full dimension (`tenant`, `queue`, `domain_global`, `deferred`, `queue_global`, …)."
+          description: >-
+            `failed_precondition`: the code (`STATE`, `STALE_ORDER`, `TASK_FINISHED`, …).
+            `resource_exhausted`: the full quota (`queue_depth.queue`,
+            `queue_depth.tenant`, `queue_depth.domain_global`, `queue_depth.deferred`,
+            `concurrency`, `event_waits.<dimension>`).
         description:
           type: string
         retry_after_seconds:

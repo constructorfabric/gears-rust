@@ -31,19 +31,21 @@ pub mod worker;
 pub use admin::{
     BulkCancelRequest, BulkMoveRequest, BulkOutcome, BulkReprioritizeRequest, BulkResult,
     BulkTaskIdsRequest, BulkTaskResult, DomainApplyStatus, QueueSettingsOverride, ReassignRequest,
-    RuntimeConfigAccepted, RuntimeConfigRequest, RuntimeConfigStatus, TypeSettingsOverride,
+    ReenqueueRequest, RuntimeConfigAccepted, RuntimeConfigRequest, RuntimeConfigStatus,
+    TypeSettingsOverride,
 };
 pub use common::{
     CancelMode, DependencyMode, ErrorFault, OnPredecessorFailure, OnTimeout, OperatedBy, PageInfo,
-    ProgressEvents, QueueKind, ResultCode, RetryPolicy, RetryStrategy, Tag, TaskState,
-    TenantFairness, Timeouts, Urgency, WaitConditionKind, WaitConditionState, WaitMode,
+    PredecessorOutcome, ProgressEvents, QueueKind, ResultCode, RetryPolicy, RetryStrategy, Tag,
+    TaskState, TenantFairness, Timeouts, Urgency, WaitConditionKind, WaitConditionState, WaitMode,
     WorkerResultCode,
 };
 pub use entry::{CreateEntryRequest, Entry, EntryPage, EntryPayload};
 pub use queue::{HoldRequest, Queue, QueueEffectiveSettings, QueueHold, QueueLimits, QueueList};
 pub use search::{
-    CountTasksQuery, HistoryEvent, HistoryEventPage, PageQuery, SearchTasksQuery, TaskCount,
-    TaskOrderBy, TaskSearchItem, TaskSearchPage, TaskView,
+    CountTasksQuery, HistoryEvent, HistoryEventPage, PageQuery, QueueHeldData, QueueHistoryEvent,
+    QueueHistoryEventPage, QueueReleasedData, SearchTasksQuery, TaskCount, TaskOrderBy,
+    TaskSearchItem, TaskSearchPage, TaskView,
 };
 pub use task::{
     Assignment, CancelRequest, CancelRequestInfo, CreateTaskRequest, Predecessor, PredecessorInput,
@@ -51,10 +53,10 @@ pub use task::{
 };
 pub use wait::{
     ChildrenCounts, ChildrenWaitResult, ConditionResult, EventWaitResult, InitialWaitGroup,
-    InputWaitResult, ParkRequest, ParkResponse, ResolveRequest, ResolveResponse, SetWaitRequest,
-    SetWaitResponse, TimedOutReason, TimedOutWaitResult, TimerWaitResult, WaitCondition,
-    WaitConditionDetails, WaitConditionPage, WaitConditionSpec, WaitEventHeader, WaitGroup,
-    WaitOutcome, WaitResult, WaitResultCondition,
+    InputWaitResult, ParkRequest, ParkResponse, ResolveRequest, ResolveResponse, SetWaitOutcome,
+    SetWaitRequest, SetWaitResponse, TimedOutReason, TimedOutWaitResult, TimerWaitResult,
+    WaitCondition, WaitConditionDetails, WaitConditionPage, WaitConditionSpec, WaitEventHeader,
+    WaitGroup, WaitOutcome, WaitResult, WaitResultCondition,
 };
 pub use worker::{
     AcceptRequest, AcceptResponse, Authority, AuthorityCheck, AuthorityMode, AuthorityVerdict,
@@ -74,10 +76,11 @@ mod api_dto_markers {
         BulkResult, BulkTaskIdsRequest, CancelRequest, CheckpointRequest, CheckpointResponse,
         ClaimRequest, ClaimResponse, CompleteRequest, CreateEntryRequest, CreateTaskRequest, Entry,
         EntryPage, HeartbeatRequest, HeartbeatResponse, HistoryEventPage, HoldRequest,
-        LeaseTokenRequest, ParkRequest, ParkResponse, ProgressRequest, Queue, QueueList,
-        ReassignRequest, ReleaseRequest, ResolveRequest, ResolveResponse, RuntimeConfigAccepted,
-        RuntimeConfigRequest, RuntimeConfigStatus, SetWaitRequest, SetWaitResponse,
-        TagsPatchRequest, Task, TaskCount, TaskSearchPage, WaitConditionPage,
+        LeaseTokenRequest, ParkRequest, ParkResponse, ProgressRequest, Queue,
+        QueueHistoryEventPage, QueueList, ReassignRequest, ReenqueueRequest, ReleaseRequest,
+        ResolveRequest, ResolveResponse, RuntimeConfigAccepted, RuntimeConfigRequest,
+        RuntimeConfigStatus, SetWaitOutcome, SetWaitRequest, SetWaitResponse, TagsPatchRequest,
+        Task, TaskCount, TaskSearchPage, WaitConditionPage,
     };
 
     macro_rules! markers {
@@ -89,12 +92,12 @@ mod api_dto_markers {
         LeaseTokenRequest, ProgressRequest, CheckpointRequest, CompleteRequest, ReleaseRequest,
         AcceptRequest, CreateEntryRequest, SetWaitRequest, ParkRequest, ResolveRequest,
         BulkCancelRequest, BulkReprioritizeRequest, BulkTaskIdsRequest, BulkMoveRequest,
-        ReassignRequest, RuntimeConfigRequest, HoldRequest,
+        ReassignRequest, ReenqueueRequest, RuntimeConfigRequest, HoldRequest,
     );
     markers!(ResponseApiDto:
         Task, TaskSearchPage, TaskCount, ClaimResponse, HeartbeatResponse, CheckpointResponse,
-        AcceptResponse, Entry, EntryPage, SetWaitResponse, WaitConditionPage, ParkResponse,
-        ResolveResponse, HistoryEventPage, QueueList, Queue, BulkResult, RuntimeConfigAccepted,
-        RuntimeConfigStatus,
+        AcceptResponse, Entry, EntryPage, SetWaitResponse, SetWaitOutcome, WaitConditionPage,
+        ParkResponse, ResolveResponse, HistoryEventPage, QueueList, Queue, QueueHistoryEventPage,
+        BulkResult, RuntimeConfigAccepted, RuntimeConfigStatus,
     );
 }

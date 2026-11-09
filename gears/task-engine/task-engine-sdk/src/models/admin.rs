@@ -13,8 +13,8 @@ use super::common::{CancelMode, ProgressEvents, RetryPolicy, Timeouts, Urgency};
 // Bulk
 // ---------------------------------------------------------------------------
 
-/// Re-enqueue many tasks. At most the configured bulk size (default 1,000);
-/// more → `400` `BATCH_TOO_LARGE`.
+/// Re-enqueue many tasks. At most `bulk_max_ids` (default 1000); more → `400`
+/// `BATCH_TOO_LARGE` on `/task_ids`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 #[non_exhaustive]
@@ -31,27 +31,38 @@ impl BulkTaskIdsRequest {
     }
 }
 
-/// Cancel many tasks.
+/// Cancel many tasks. Each task follows the single-cancel rules.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 #[non_exhaustive]
 pub struct BulkCancelRequest {
-    /// Unique task IDs.
+    /// Unique task IDs, at most `bulk_max_ids` (default 1000).
     pub task_ids: Vec<Uuid>,
-    /// Cancellation mode.
-    pub mode: CancelMode,
-    /// Free-text reason.
+    /// Cancellation mode (default `requested`, server-side).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<CancelMode>,
+    /// Free text, at most 1024 characters.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
 }
 
 impl BulkCancelRequest {
-    /// Build the request.
+    /// Build the request with the default mode (`requested`).
     #[must_use]
-    pub const fn new(task_ids: Vec<Uuid>, mode: CancelMode) -> Self {
+    pub const fn new(task_ids: Vec<Uuid>) -> Self {
         Self {
             task_ids,
-            mode,
+            mode: None,
+            reason: None,
+        }
+    }
+
+    /// Build the request with an explicit mode.
+    #[must_use]
+    pub const fn with_mode(task_ids: Vec<Uuid>, mode: CancelMode) -> Self {
+        Self {
+            task_ids,
+            mode: Some(mode),
             reason: None,
         }
     }
@@ -84,7 +95,9 @@ impl BulkReprioritizeRequest {
     }
 }
 
-/// Move many tasks to another queue of the same task domain.
+/// Move many tasks to another queue of the same task domain. One destination
+/// serves every task: an unregistered destination refuses the whole request
+/// (`404`), a dead-letter one too (`400` `DEAD_LETTER_QUEUE` on `/queue`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 #[non_exhaustive]
@@ -104,21 +117,30 @@ impl BulkMoveRequest {
     }
 }
 
-/// Per-task outcome of a bulk operation.
+/// Per-task outcome of a bulk operation. Open set.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema, utoipa::ToSchema,
 )]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum BulkOutcome {
-    /// Applied.
+    /// Applied; for cancel, the task ended (or had already ended in the
+    /// cancelled family).
     Succeeded,
     /// The caller may read the task but not perform the action.
     Unauthorized,
     /// Missing, or not readable by the caller.
     NotFound,
-    /// The task's state does not allow the action.
+    /// The task's state does not allow the action (for retry also a
+    /// precondition refusal: `TASK_DOMAIN_MISMATCH`, `PARENT_FINISHED`,
+    /// `STALE_ORDER`).
     InvalidState,
+    /// Cancel: a leased task was only flagged (`requested`/`graceful`).
+    CancelRequested,
+    /// Retry, move: refused by a queue-depth limit (no usage figures).
+    LimitExceeded,
+    /// Move: the destination is in another task domain.
+    DomainMismatch,
     /// A value this SDK version does not know (the set is open).
     #[serde(other)]
     Unknown,
@@ -162,7 +184,8 @@ impl BulkResult {
 // Reassignment (p3)
 // ---------------------------------------------------------------------------
 
-/// Hand a claimed or running task to another identity.
+/// Hand a claimed or running task to another identity. The target's rights
+/// are not checked here: its accept is authorized with its own scope.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 #[non_exhaustive]
@@ -171,6 +194,10 @@ pub struct ReassignRequest {
     pub subject_id: String,
     /// New assignee worker.
     pub worker_id: String,
+    /// Free text, at most 1024 characters (`TOO_LONG`), recorded in
+    /// `taskReassigned`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 impl ReassignRequest {
@@ -180,7 +207,37 @@ impl ReassignRequest {
         Self {
             subject_id: subject_id.into(),
             worker_id: worker_id.into(),
+            reason: None,
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Re-enqueue (p2)
+// ---------------------------------------------------------------------------
+
+/// Optional re-enqueue body. Without `queue` the task returns to its source
+/// queue (`dead_lettered_from`, or its own queue for a failed task);
+/// `ReenqueueRequest::default()` sends `{}`.
+#[derive(
+    Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, utoipa::ToSchema,
+)]
+#[serde(deny_unknown_fields)]
+#[non_exhaustive]
+pub struct ReenqueueRequest {
+    /// Dispatch queue to re-enqueue into: routed to the task's current domain
+    /// and accepting its type. A different queue re-resolves the queue-level
+    /// settings, as a move does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<String>)]
+    pub queue: Option<GtsInstanceId>,
+}
+
+impl ReenqueueRequest {
+    /// Build the request.
+    #[must_use]
+    pub const fn new(queue: Option<GtsInstanceId>) -> Self {
+        Self { queue }
     }
 }
 
@@ -253,8 +310,10 @@ pub struct TypeSettingsOverride {
 
 /// The complete override set of a new runtime configuration version: a key not
 /// present reverts to the registration or engine default. Keys are exact IDs or
-/// GTS patterns (`gts.cf.core.tasks.queue.v1~acme.reports.*`); the most
-/// specific pattern wins.
+/// GTS patterns (`gts.cf.core.tasks.queue.v1~acme.reports.*`): an exact ID
+/// beats any pattern, then the longest literal prefix before the first
+/// wildcard; two patterns of equal specificity matching the same queue are
+/// refused (`NOT_ALLOWED` on the later pattern).
 #[derive(
     Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema, utoipa::ToSchema,
 )]

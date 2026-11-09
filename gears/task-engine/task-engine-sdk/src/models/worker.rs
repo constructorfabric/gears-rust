@@ -10,28 +10,34 @@ use super::common::{TaskState, WorkerResultCode};
 use super::task::{CancelRequestInfo, Task, TaskError};
 use super::wait::WaitResult;
 
-/// JSON object merged into a task's `context` key by key.
+/// JSON object merged into a task's `context` as an RFC 7386 JSON Merge Patch.
 pub type Checkpoint = serde_json::Map<String, serde_json::Value>;
 
 // ---------------------------------------------------------------------------
 // Claim
 // ---------------------------------------------------------------------------
 
-/// Claim tasks (long-poll) and open or renew the worker session.
+/// Claim tasks (long-poll). A claim that takes a task opens or renews the
+/// worker session; a `204` or `429` touches no session.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 #[non_exhaustive]
 pub struct ClaimRequest {
     /// Worker process identity within its subject (`[A-Za-z0-9._:-]{1,128}`).
     pub worker_id: String,
-    /// The worker's live session to reuse; `None` or a dead session opens a new one.
+    /// The worker's live session to reuse; `None`, a session that is no longer
+    /// live, or one stored with another `worker_id` opens a new one (only when
+    /// the claim takes a task).
     #[serde(default)]
     pub session_id: Option<Uuid>,
-    /// Queues of one task domain; at most `claim_max_queues` (16). Never a
-    /// `dead_letter` queue.
+    /// Queues of one task domain (`CROSS_DOMAIN`); at most `claim_max_queues`
+    /// (16) distinct queues (`TOO_MANY_QUEUES`); missing or empty →
+    /// `REQUIRED`. A `dead_letter` queue → `DEAD_LETTER_QUEUE`; an
+    /// unregistered one → `404`.
     #[schema(value_type = Vec<String>)]
     pub queues: Vec<GtsInstanceId>,
-    /// At most `claim_max_batch` (32); larger → `400`. Default 1.
+    /// At most `claim_max_batch` (32); larger → `400` `OUT_OF_RANGE` (not
+    /// clamped). Default 1.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_tasks: Option<u32>,
     /// Long-poll wait in seconds, clamped to `claim_max_wait_secs` (50).
@@ -182,7 +188,9 @@ pub struct Claim {
     pub lease: Lease,
     /// Creator authority.
     pub authority: Authority,
-    /// The wait result when the task resumes from a wait; `None` for a fresh claim.
+    /// The wait result when the task resumes from a wait; `None` for a fresh
+    /// claim. Returned on every claim while the task's current wait group is a
+    /// resolved parked group, so a lost claim response does not lose it.
     #[serde(default)]
     pub resumed: Option<WaitResult>,
 }
@@ -261,7 +269,8 @@ impl HeartbeatLease {
 pub struct HeartbeatRequest {
     /// The worker session.
     pub session_id: Uuid,
-    /// At most `heartbeat_batch_max` (500).
+    /// At most `heartbeat_batch_max` (default 500); more → `400` `TOO_MANY` on
+    /// `/leases` and the session is not renewed.
     pub leases: Vec<HeartbeatLease>,
 }
 
@@ -303,7 +312,9 @@ pub struct HeartbeatResult {
     /// Present when `outcome` is `ok`; how the worker learns of a cancel request.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cancel_requested: Option<bool>,
-    /// Present when a cancel is pending: its mode and, for `graceful`, `grace_until`.
+    /// Present when `outcome` is `ok` and a cancel is pending: its mode, for
+    /// `graceful` its `grace_until`, and `superseded_by` when a supersession
+    /// caused it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cancel_request: Option<CancelRequestInfo>,
 }
@@ -432,7 +443,8 @@ impl ProgressRequest {
 pub struct CheckpointRequest {
     /// The caller's lease token.
     pub lease_token: Uuid,
-    /// Merged into `context` key by key.
+    /// Merged into `context` as an RFC 7386 JSON Merge Patch: nested objects
+    /// merge, `null` deletes a key, arrays are replaced whole.
     #[schema(value_type = Object)]
     pub checkpoint: Checkpoint,
 }
@@ -512,17 +524,19 @@ impl CompleteRequest {
     }
 }
 
-/// Give the task back without failing it.
+/// Give the task back without failing it, from `claimed` or `running`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 #[non_exhaustive]
 pub struct ReleaseRequest {
     /// The caller's lease token.
     pub lease_token: Uuid,
-    /// Release to `scheduled` after this delay (at least 1).
+    /// Release to `scheduled` after this delay, 0 to `release_max_delay_secs`
+    /// (86,400); `0` (the server default) is an immediate release, outside
+    /// the range → `400` `OUT_OF_RANGE`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delay_secs: Option<u64>,
-    /// Merged into `context` as by checkpoint.
+    /// Merged into `context` first, as by checkpoint (RFC 7386).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(value_type = Option<Object>)]
     pub checkpoint: Option<Checkpoint>,

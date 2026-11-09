@@ -7,8 +7,8 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use super::common::{
-    CancelMode, DependencyMode, ErrorFault, OnPredecessorFailure, ResultCode, RetryPolicy, Tag,
-    TaskState, Timeouts, Urgency,
+    CancelMode, DependencyMode, ErrorFault, OnPredecessorFailure, PredecessorOutcome, ResultCode,
+    RetryPolicy, Tag, TaskState, Timeouts, Urgency,
 };
 use super::wait::InitialWaitGroup;
 
@@ -24,7 +24,8 @@ pub struct ResourceRefInput {
     /// GTS type ID of the resource.
     #[schema(value_type = String)]
     pub resource_type: GtsTypeId,
-    /// Resource ID (at most 256 characters).
+    /// Resource ID, at most 256 characters (`TOO_LONG` on
+    /// `/resource_refs/i/resource_id`).
     pub resource_id: String,
 }
 
@@ -69,7 +70,9 @@ impl ResourceRef {
 #[serde(deny_unknown_fields)]
 #[non_exhaustive]
 pub struct PredecessorInput {
-    /// Predecessor task; the caller needs `read` on it. Same tenant and task domain.
+    /// Predecessor task; the caller needs `read` on it. Looked up only in the
+    /// new task's domain: one that is missing, unreadable or in another domain
+    /// → `404`. Listing the same task twice → `400` `DUPLICATE` on the second.
     pub task_id: Uuid,
     /// What the predecessor failing does to this task (default `cancel`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -95,19 +98,23 @@ pub struct Predecessor {
     pub task_id: Uuid,
     /// What the predecessor failing does to this task.
     pub on_predecessor_failure: OnPredecessorFailure,
-    /// Whether this predecessor no longer blocks the task.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub satisfied: Option<bool>,
+    /// What this predecessor did for the task; see
+    /// [`PredecessorOutcome::is_satisfied`].
+    pub outcome: PredecessorOutcome,
 }
 
 impl Predecessor {
     /// Build a stored predecessor.
     #[must_use]
-    pub const fn new(task_id: Uuid, on_predecessor_failure: OnPredecessorFailure) -> Self {
+    pub const fn new(
+        task_id: Uuid,
+        on_predecessor_failure: OnPredecessorFailure,
+        outcome: PredecessorOutcome,
+    ) -> Self {
         Self {
             task_id,
             on_predecessor_failure,
-            satisfied: None,
+            outcome,
         }
     }
 }
@@ -223,7 +230,9 @@ pub struct Assignment {
     pub attempt: u32,
     /// Lease epoch (from 1).
     pub lease_epoch: u64,
-    /// The running attempt ends `timed_out` then; `None` while `claimed`.
+    /// Set by the claim (claim time + effective execution timeout) and never
+    /// moved by `start`; the attempt ends `timed_out` then, whether `claimed` or
+    /// `running`.
     #[serde(default)]
     pub execution_deadline: Option<DateTime<Utc>>,
 }
@@ -258,13 +267,14 @@ pub struct CancelRequestInfo {
     pub requested_by: String,
     /// When it was requested.
     pub requested_at: DateTime<Utc>,
-    /// Free-text reason.
+    /// Free-text reason, at most 1024 characters.
     #[serde(default)]
     pub reason: Option<String>,
     /// `graceful` only: when the cancel becomes forced.
     #[serde(default)]
     pub grace_until: Option<DateTime<Utc>>,
-    /// Set when the request comes from supersession.
+    /// Set when the request comes from supersession (p2); the heartbeat passes
+    /// it on in [`HeartbeatResult::cancel_request`](super::HeartbeatResult::cancel_request).
     #[serde(default)]
     pub superseded_by: Option<Uuid>,
 }
@@ -293,7 +303,7 @@ impl CancelRequestInfo {
 // ---------------------------------------------------------------------------
 
 /// The task resource, returned by create, read, claim and the worker and admin
-/// calls.
+/// calls. It never carries the `Idempotency-Key` or a lease token.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, utoipa::ToSchema)]
 #[allow(
     clippy::struct_field_names,
@@ -361,31 +371,37 @@ pub struct Task {
     /// Whether successful completion waits for children (p2).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wait_for_children: Option<bool>,
-    /// Whether cancellation reaches children (p2).
+    /// When `true`, a cancel reaches the unfinished children in the same mode,
+    /// and a parent that ends in any other non-success state cancels them
+    /// `graceful` (p2).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub propagate_cancel: Option<bool>,
-    /// Predecessors (p2), at most `max_predecessors_per_task`.
+    /// Predecessors (p2), at most `max_predecessors_per_task` (64); each with
+    /// its `outcome`.
     #[serde(default)]
     pub predecessors: Vec<Predecessor>,
     /// Dependency mode (p2).
     #[serde(default)]
     pub dependency_mode: Option<DependencyMode>,
-    /// Effective timeouts.
+    /// Effective timeouts, resolved and stored at create.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeouts: Option<Timeouts>,
-    /// Effective retry policy.
-    #[serde(default)]
+    /// Effective retry policy, resolved and stored at create. Not nullable:
+    /// the engine always sends it on the full resource; `None` only when an
+    /// abbreviated body omits it (the schema does not list it as required).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retry_policy: Option<RetryPolicy>,
     /// Earliest run time.
     #[serde(default)]
     pub run_after: Option<DateTime<Utc>>,
-    /// SLA deadline.
+    /// SLA deadline. A passed deadline is cleared by re-enqueue.
     #[serde(default)]
     pub sla_deadline: Option<DateTime<Utc>>,
     /// Current holder of a `claimed`/`running` task.
     #[serde(default)]
     pub assignment: Option<Assignment>,
-    /// Source queue of a dead-lettered task.
+    /// Source queue of a dead-lettered task; cleared by re-enqueue. Filterable
+    /// in search and part of the `short` view.
     #[serde(default)]
     #[schema(value_type = Option<String>)]
     pub dead_lettered_from: Option<GtsInstanceId>,
@@ -396,7 +412,7 @@ pub struct Task {
     pub created_at: DateTime<Utc>,
     /// Last change.
     pub updated_at: DateTime<Utc>,
-    /// When the task reached a terminal state.
+    /// When the task reached a terminal state. Cleared by re-enqueue.
     #[serde(default)]
     pub terminal_at: Option<DateTime<Utc>>,
     /// Task domain the task was created in; fixed for its life.
@@ -489,9 +505,12 @@ impl Task {
 #[serde(deny_unknown_fields)]
 #[non_exhaustive]
 pub struct CreateTaskRequest {
-    /// Platform idempotency key, unique per tenant and creating subject.
-    /// Required for every task type without a derived dedup identity (missing →
-    /// `428`); ignored for types that declare the `dedup` trait (p2).
+    /// Platform idempotency key, unique per tenant and creating subject: 1–255
+    /// printable ASCII characters without spaces (`!`–`~`), case-sensitive
+    /// (empty or malformed → `400` `INVALID_FORMAT` on `Idempotency-Key`; the
+    /// SDK does not validate it). Required for every task type without a
+    /// derived dedup identity (missing → `428`); ignored for types that declare
+    /// the `dedup` trait (p2). Never returned on the task resource.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idempotency_key: Option<String>,
     /// GTS type ID of the task type.
@@ -513,16 +532,25 @@ pub struct CreateTaskRequest {
     /// Initial context (part of the 64 KiB payload).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context: Option<serde_json::Value>,
+    /// Tenant that owns the task; default the caller's tenant. The `create`
+    /// check carries it and the PDP decides (subtree and barrier rules); a
+    /// tenant barrier is crossed only for a queue that is `operated_by:
+    /// platform`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_tenant_id: Option<Uuid>,
     /// Subject the task is done for.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner_id: Option<String>,
-    /// Timeouts (any subset).
+    /// Timeouts (any subset; a value above the type's trust limit → `400`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeouts: Option<Timeouts>,
-    /// Retry policy (taken whole).
+    /// Retry policy (required fields required, not merged with other levels).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retry_policy: Option<RetryPolicy>,
-    /// Earliest run time; a future value creates the task `scheduled`.
+    /// Earliest claim time; a future value creates the task `scheduled`. A past
+    /// value is stored as sent and the task is `queued`; a value later than
+    /// `created_at` + the lifetime timeout → `400` `OUT_OF_RANGE`. Not with an
+    /// initial `wait` group when in the future.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run_after: Option<DateTime<Utc>>,
     /// SLA deadline.
@@ -531,16 +559,21 @@ pub struct CreateTaskRequest {
     /// Whether `requested`/`graceful` cancels are accepted (default `true`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cancellable: Option<bool>,
-    /// Tags.
+    /// Tags, at most `max_tags_per_task` (16; more → `TOO_MANY_TAGS`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<Tag>,
     /// Resources the task works on (p2), at most 16.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub resource_refs: Vec<ResourceRefInput>,
-    /// Parent task (p2; refused in p1). Requires `parent_lease_token`.
+    /// Parent task (p2; refused in p1 with `FEATURE_NOT_AVAILABLE` on
+    /// `/parent_task_id`). Requires `parent_lease_token`. Looked up only in
+    /// the new task's domain (another domain → `404`); the hierarchy may be at
+    /// most `max_hierarchy_depth` (10) deep (deeper → `TOO_DEEP`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_task_id: Option<Uuid>,
-    /// The parent's lease token held by the calling worker.
+    /// The parent's lease token held by the calling worker. Required with
+    /// `parent_task_id` (missing → `REQUIRED`); a wrong, stale or foreign token
+    /// → the same `404` as a missing parent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_lease_token: Option<Uuid>,
     /// Whether successful completion waits for children (default `false`).
@@ -549,13 +582,16 @@ pub struct CreateTaskRequest {
     /// Whether cancellation reaches children (default `true`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub propagate_cancel: Option<bool>,
-    /// Predecessors (p2), at most 64; fixed after creation.
+    /// Predecessors (p2), at most `max_predecessors_per_task` (64; more →
+    /// `DEPENDENCY_GRAPH_TOO_LARGE`); the same task twice → `DUPLICATE`. Not
+    /// with an initial `wait` group. Fixed after creation.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub predecessors: Vec<PredecessorInput>,
     /// Dependency mode (default `all`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dependency_mode: Option<DependencyMode>,
-    /// Initial wait group: the task starts `waiting`.
+    /// Initial wait group: the task starts `waiting`. Not with `predecessors`
+    /// or a future `run_after`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wait: Option<InitialWaitGroup>,
 }
@@ -576,6 +612,7 @@ impl CreateTaskRequest {
             urgency: None,
             input,
             context: None,
+            owner_tenant_id: None,
             owner_id: None,
             timeouts: None,
             retry_policy: None,
@@ -595,7 +632,8 @@ impl CreateTaskRequest {
     }
 }
 
-/// Cancel a task. `mode` defaults to `requested`.
+/// Cancel a task. The body is optional on the wire (`CancelRequest::default()`
+/// sends `{}`); `mode` defaults to `requested` server-side.
 #[derive(
     Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, utoipa::ToSchema,
 )]
@@ -605,7 +643,8 @@ pub struct CancelRequest {
     /// Cancellation mode (default `requested`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode: Option<CancelMode>,
-    /// Free text, stored as `cancel_request.reason`.
+    /// Free text, at most 1024 characters (`TOO_LONG` on `/reason`), stored as
+    /// `cancel_request.reason`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
 }
@@ -622,7 +661,8 @@ impl CancelRequest {
 }
 
 /// Change a task's tags (p2). `set` adds or replaces by key, `remove` deletes
-/// keys; keys not named are unchanged. A key in both → `400`.
+/// keys; keys not named are unchanged. A key in both, or twice in `set` →
+/// `400`; a result over `max_tags_per_task` (16) → `400` `TOO_MANY_TAGS`.
 #[derive(
     Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, utoipa::ToSchema,
 )]

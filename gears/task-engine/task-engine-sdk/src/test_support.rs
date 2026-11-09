@@ -18,10 +18,10 @@ use crate::models::{
     ClaimRequest, ClaimResponse, CompleteRequest, CountTasksQuery, CreateEntryRequest,
     CreateTaskRequest, Entry, EntryPage, HeartbeatRequest, HeartbeatResponse, HistoryEventPage,
     HoldRequest, LeaseTokenRequest, PageQuery, ParkRequest, ParkResponse, ProgressRequest, Queue,
-    QueueList, ReassignRequest, ReleaseRequest, ResolveRequest, ResolveResponse,
-    RuntimeConfigAccepted, RuntimeConfigRequest, RuntimeConfigStatus, SearchTasksQuery,
-    SetWaitRequest, SetWaitResponse, TagsPatchRequest, Task, TaskCount, TaskSearchPage,
-    WaitConditionPage,
+    QueueHistoryEventPage, QueueList, ReassignRequest, ReenqueueRequest, ReleaseRequest,
+    ResolveRequest, ResolveResponse, RuntimeConfigAccepted, RuntimeConfigRequest,
+    RuntimeConfigStatus, SearchTasksQuery, SetWaitOutcome, SetWaitRequest, TagsPatchRequest, Task,
+    TaskCount, TaskSearchPage, WaitConditionPage,
 };
 
 /// A [`TaskEngineApi`] whose every method fails with `unimplemented`.
@@ -191,7 +191,7 @@ impl TaskEngineApi for UnimplementedTaskEngine {
         _ctx: SecurityContext,
         _task_id: Uuid,
         _req: SetWaitRequest,
-    ) -> Result<SetWaitResponse, CanonicalError> {
+    ) -> Result<SetWaitOutcome, CanonicalError> {
         Err(not_implemented("set_wait_conditions"))
     }
 
@@ -243,6 +243,15 @@ impl TaskEngineApi for UnimplementedTaskEngine {
         Err(not_implemented("get_queue"))
     }
 
+    async fn list_queue_events(
+        &self,
+        _ctx: SecurityContext,
+        _queue_id: GtsInstanceId,
+        _query: PageQuery,
+    ) -> Result<QueueHistoryEventPage, CanonicalError> {
+        Err(not_implemented("list_queue_events"))
+    }
+
     async fn bulk_cancel(
         &self,
         _ctx: SecurityContext,
@@ -288,6 +297,7 @@ impl TaskEngineApi for UnimplementedTaskEngine {
         &self,
         _ctx: SecurityContext,
         _task_id: Uuid,
+        _req: ReenqueueRequest,
     ) -> Result<Task, CanonicalError> {
         Err(not_implemented("reenqueue_task"))
     }

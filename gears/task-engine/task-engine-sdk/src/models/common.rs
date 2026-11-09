@@ -215,6 +215,36 @@ pub enum OnPredecessorFailure {
     Unknown,
 }
 
+/// What a stored predecessor did for the task (p2).
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema, utoipa::ToSchema,
+)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum PredecessorOutcome {
+    /// The predecessor has not ended.
+    Pending,
+    /// The predecessor succeeded.
+    Succeeded,
+    /// The predecessor ended `failed`, `cancelled` or `dead_lettered` with
+    /// `on_predecessor_failure: ignore`, so it counts as satisfied.
+    FailedIgnored,
+    /// The predecessor ended so with `on_predecessor_failure: cancel`.
+    Failed,
+    /// A value this SDK version does not know (the set is open).
+    #[serde(other)]
+    Unknown,
+}
+
+impl PredecessorOutcome {
+    /// Whether this predecessor no longer blocks the task (`succeeded` or
+    /// `failed_ignored`). `Unknown` is treated as blocking.
+    #[must_use]
+    pub const fn is_satisfied(self) -> bool {
+        matches!(self, Self::Succeeded | Self::FailedIgnored)
+    }
+}
+
 /// Wait-group mode.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema, utoipa::ToSchema,
@@ -231,7 +261,8 @@ pub enum WaitMode {
     Unknown,
 }
 
-/// Kind of a wait condition. `input`, `children` and `event` are p2.
+/// Kind of a wait condition. p1 accepts only `timer`; `input`, `children` and
+/// `event` are p2 (refused in p1 with `FEATURE_NOT_AVAILABLE`).
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema, utoipa::ToSchema,
 )]
@@ -271,7 +302,8 @@ pub enum WaitConditionState {
     Unknown,
 }
 
-/// What a condition timeout does.
+/// What a condition timeout does. A condition with a timeout and no
+/// `on_timeout` gets `fail` (the server-side default).
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema, utoipa::ToSchema,
 )]
@@ -424,8 +456,10 @@ impl PageInfo {
     }
 }
 
-/// A tenant-local label. Keys up to 128 and values up to 256 characters; an
-/// empty `value` works as a plain label.
+/// A tenant-local label. Keys 1–128 and values 0–256 Unicode characters
+/// (`TOO_LONG`, `REQUIRED` for an empty key); an empty `value` works as a plain
+/// label. Each key at most once per task (`DUPLICATE`), at most
+/// `max_tags_per_task` (16) tags per task (`TOO_MANY_TAGS`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 #[non_exhaustive]
@@ -447,10 +481,13 @@ impl Tag {
     }
 }
 
-/// Timeout settings in seconds. On create any subset may be given; on the task
-/// resource these are the effective (resolved) values. `None` means "no
-/// timeout of that kind", except for `heartbeat_timeout_secs` and
-/// `execution_timeout_secs`, where it means "the engine default".
+/// Timeout settings in seconds. On create any subset may be given; a value
+/// above the type's trust limit → `400`. On the task resource these are the
+/// effective values, resolved and stored at create (an inherited value above a
+/// trust limit is clamped; later configuration changes do not reach an
+/// existing task), and `heartbeat_timeout_secs` is never `None`. Otherwise
+/// `None` means "no timeout of that kind", except for `heartbeat_timeout_secs`
+/// and `execution_timeout_secs`, where it means "the engine default".
 #[derive(
     Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, utoipa::ToSchema,
 )]
@@ -478,8 +515,11 @@ pub struct Timeouts {
     pub lifetime_timeout_secs: Option<u64>,
 }
 
-/// Retry policy, same shape as the queue registration. A policy on create is
-/// taken whole, not merged per field.
+/// Retry policy, same shape as the queue registration. A policy on create must
+/// carry the required fields (`max_retries`, `strategy`, `base_interval_secs`,
+/// `max_interval_secs`); omitted optional fields take the schema defaults, and
+/// it is not merged with other levels. On the task resource: the effective
+/// policy, resolved and stored at create.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 #[non_exhaustive]

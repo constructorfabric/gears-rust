@@ -20,7 +20,9 @@ use super::wait::WaitCondition;
 // Query parameters
 // ---------------------------------------------------------------------------
 
-/// Detail level of a task search item (`view`). Default `short`.
+/// Detail level of a task search item (`view`). Default `short`; any other
+/// value → `400` `NOT_ALLOWED` on `view`. A cursor is bound to the `view` it
+/// was issued for.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema, utoipa::ToSchema,
 )]
@@ -28,7 +30,8 @@ use super::wait::WaitCondition;
 pub enum TaskView {
     /// `id`, `state`, `type`.
     Tiny,
-    /// + `urgency`, `priority`, `queue`, `assignment`, `created_at`, `updated_at`.
+    /// + `urgency`, `priority`, `queue`, `assignment`, `dead_lettered_from`,
+    ///   `created_at`, `updated_at`.
     Short,
     /// + `input`, `result`, `context`, `progress`, `tags`, `resource_refs`.
     Long,
@@ -39,7 +42,8 @@ pub enum TaskView {
 
 impl toolkit_contract::query::QueryScalar for TaskView {}
 
-/// Sort order of a task search (`$orderby`). `id` is always the tiebreaker.
+/// Sort order of a task search (`$orderby`). `id` is always the tiebreaker;
+/// other keys → `400` `NOT_ALLOWED` on `$orderby`.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema, utoipa::ToSchema,
 )]
@@ -60,7 +64,16 @@ pub enum TaskOrderBy {
 
 impl toolkit_contract::query::QueryScalar for TaskOrderBy {}
 
-/// Query of `GET /tasks`.
+/// Query of `GET /tasks`: keyset-paged search over the caller's visible tasks.
+///
+/// A search that can return terminal tasks covers at most
+/// `search_max_window_days` (31) of `created_at`; without a range the engine
+/// adds `created_at ge now − search_default_window_days` (7), and a range over
+/// the window → `400` `OUT_OF_RANGE` on `$filter`. A `state` filter that allows
+/// only non-terminal states has no window, and neither has one restricted to
+/// `dead_lettered` (`read` is enough to list those; a `queue` filter on a
+/// dead-letter queue searches every task domain). A scope that matches nothing
+/// gives an empty page.
 #[derive(
     Debug,
     Clone,
@@ -76,14 +89,18 @@ impl toolkit_contract::query::QueryScalar for TaskOrderBy {}
 #[non_exhaustive]
 pub struct SearchTasksQuery {
     /// `OData` filter over `state`, `assignee`, `queue`, `type`, `urgency`,
-    /// `priority`, `created_at`, `tags`, `resource_refs`, `dependencies`,
-    /// `parent_task_id`, `predecessor_id`.
+    /// `priority`, `created_at`, `dependencies`, `parent_task_id`,
+    /// `predecessor_id`, `dead_lettered_from`, and the filter functions
+    /// `has_tag('<key>')`, `has_tag('<key>', '<value>')` and
+    /// `has_resource_ref('<resource_type>', '<resource_id>')` (see
+    /// [`has_tag`](Self::has_tag), [`has_resource_ref`](Self::has_resource_ref)).
     #[serde(rename = "$filter")]
     pub filter: Option<String>,
     /// Sort order.
     #[serde(rename = "$orderby")]
     pub order_by: Option<TaskOrderBy>,
-    /// Comma-separated top-level fields, narrowing the item within `view`.
+    /// Comma-separated top-level fields, narrowing the item within `view`; a
+    /// field outside the view → `400` `NOT_ALLOWED` on `$select`.
     #[serde(rename = "$select")]
     pub select: Option<String>,
     /// Page size (default 25; clamped to 100, or 20 at `view=full`).
@@ -104,6 +121,30 @@ impl SearchTasksQuery {
         }
     }
 
+    /// `$filter` term `has_tag('<key>')`: the task has a tag with this key.
+    /// Single quotes in `key` are doubled, as `OData` string literals require.
+    #[must_use]
+    pub fn has_tag(key: &str) -> String {
+        format!("has_tag({})", odata_string(key))
+    }
+
+    /// `$filter` term `has_tag('<key>', '<value>')`: the task has this tag.
+    #[must_use]
+    pub fn has_tag_value(key: &str, value: &str) -> String {
+        format!("has_tag({}, {})", odata_string(key), odata_string(value))
+    }
+
+    /// `$filter` term `has_resource_ref('<resource_type>', '<resource_id>')`:
+    /// the task works on this resource.
+    #[must_use]
+    pub fn has_resource_ref(resource_type: &str, resource_id: &str) -> String {
+        format!(
+            "has_resource_ref({}, {})",
+            odata_string(resource_type),
+            odata_string(resource_id)
+        )
+    }
+
     /// The next page of a previous search: the cursor, plus the `view` and
     /// `$select` it is bound to.
     #[must_use]
@@ -117,6 +158,11 @@ impl SearchTasksQuery {
             view: previous.view,
         }
     }
+}
+
+/// An `OData` string literal: `value` in single quotes, inner quotes doubled.
+fn odata_string(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
 }
 
 /// Query of `GET /tasks/count`: the filter only.
@@ -147,8 +193,9 @@ impl CountTasksQuery {
     }
 }
 
-/// Query of a per-task list (entries, wait conditions, history): filter and
-/// paging. Sort is fixed (oldest first, then `id`); maximum page size 100.
+/// Query of a per-task or per-queue list (entries, wait conditions, task and
+/// queue history): filter and paging. Sort is fixed (oldest first, then `id`);
+/// maximum page size 100.
 #[derive(
     Debug,
     Clone,
@@ -214,6 +261,10 @@ pub struct TaskSearchItem {
     /// From `short`; `None` when not leased (or not selected).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub assignment: Option<Assignment>,
+    /// From `short`: source queue of a dead-lettered task.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<String>)]
+    pub dead_lettered_from: Option<GtsInstanceId>,
     /// From `short`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created_at: Option<DateTime<Utc>>,
@@ -270,6 +321,7 @@ impl TaskSearchItem {
             priority: None,
             queue: None,
             assignment: None,
+            dead_lettered_from: None,
             created_at: None,
             updated_at: None,
             input: None,
@@ -333,7 +385,14 @@ impl TaskCount {
 pub struct HistoryEvent {
     /// Event ID.
     pub id: Uuid,
-    /// camelCase lifecycle event name (`taskCreated`, `taskClaimed`, …), an open set.
+    /// camelCase lifecycle event name, an open set: `taskCreated`,
+    /// `taskQueued`, `taskClaimed`, `taskStarted`, `taskProgressed`,
+    /// `taskCheckpointed`, `taskWaiting`, `waitConditionSet`,
+    /// `waitConditionSatisfied`, `waitTimedOut`, `taskResumed`,
+    /// `taskRetrying` (with the full `error` of the failed attempt),
+    /// `taskReassigned`, `taskCancelRequested`, `taskCancelled`,
+    /// `taskCompleted`, `taskFailed`, `taskTimedOut`, `taskDeadLettered`,
+    /// `slaBreached`, `taskTagsUpdated`, `taskUpdated`.
     pub event_type: String,
     /// Subject that caused the event; `None` for engine-caused events.
     #[serde(default)]
@@ -378,6 +437,121 @@ impl HistoryEventPage {
     /// Build a page.
     #[must_use]
     pub const fn new(items: Vec<HistoryEvent>, page_info: PageInfo) -> Self {
+        Self { items, page_info }
+    }
+}
+
+/// One queue-scoped event (`queueHeld`, `queueReleased`, `configUpdated`,
+/// `workerBlacklisted`): same item shape as a task's [`HistoryEvent`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, utoipa::ToSchema)]
+#[non_exhaustive]
+pub struct QueueHistoryEvent {
+    /// Event ID.
+    pub id: Uuid,
+    /// camelCase event name, an open set: `queueHeld`, `queueReleased`,
+    /// `configUpdated`, `workerBlacklisted`.
+    pub event_type: String,
+    /// Subject that caused the event; `None` for an automatic release.
+    #[serde(default)]
+    pub actor: Option<String>,
+    /// When it happened.
+    pub timestamp: DateTime<Utc>,
+    /// The event data; its shape is chosen by `event_type`:
+    /// [`QueueHeldData`], [`QueueReleasedData`], or the `data` member of the
+    /// `config_updated` / `worker_blacklisted` broker event types. Decode it
+    /// with `serde_json::from_value` after matching `event_type`.
+    pub payload: serde_json::Value,
+}
+
+impl QueueHistoryEvent {
+    /// Build a queue history event.
+    #[must_use]
+    pub fn new(
+        id: Uuid,
+        event_type: impl Into<String>,
+        timestamp: DateTime<Utc>,
+        payload: serde_json::Value,
+    ) -> Self {
+        Self {
+            id,
+            event_type: event_type.into(),
+            actor: None,
+            timestamp,
+            payload,
+        }
+    }
+}
+
+/// Payload of a `queueHeld` event.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, utoipa::ToSchema)]
+#[non_exhaustive]
+pub struct QueueHeldData {
+    /// The held queue.
+    #[schema(value_type = String)]
+    pub queue: GtsInstanceId,
+    /// Subject that held it.
+    pub actor: String,
+    /// Reason.
+    #[serde(default)]
+    pub reason: Option<String>,
+    /// Automatic release time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub until: Option<DateTime<Utc>>,
+}
+
+impl QueueHeldData {
+    /// Build a `queueHeld` payload.
+    #[must_use]
+    pub fn new(queue: GtsInstanceId, actor: impl Into<String>) -> Self {
+        Self {
+            queue,
+            actor: actor.into(),
+            reason: None,
+            until: None,
+        }
+    }
+}
+
+/// Payload of a `queueReleased` event.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, utoipa::ToSchema)]
+#[non_exhaustive]
+pub struct QueueReleasedData {
+    /// The released queue.
+    #[schema(value_type = String)]
+    pub queue: GtsInstanceId,
+    /// Subject that released it; absent for an automatic release.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor: Option<String>,
+    /// `true` when `until` ended the hold.
+    pub automatic: bool,
+}
+
+impl QueueReleasedData {
+    /// Build a `queueReleased` payload.
+    #[must_use]
+    pub const fn new(queue: GtsInstanceId, actor: Option<String>, automatic: bool) -> Self {
+        Self {
+            queue,
+            actor,
+            automatic,
+        }
+    }
+}
+
+/// One page of queue history events.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, utoipa::ToSchema)]
+#[non_exhaustive]
+pub struct QueueHistoryEventPage {
+    /// The events, oldest first.
+    pub items: Vec<QueueHistoryEvent>,
+    /// Paging cursors.
+    pub page_info: PageInfo,
+}
+
+impl QueueHistoryEventPage {
+    /// Build a page.
+    #[must_use]
+    pub const fn new(items: Vec<QueueHistoryEvent>, page_info: PageInfo) -> Self {
         Self { items, page_info }
     }
 }

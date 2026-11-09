@@ -77,7 +77,8 @@ pub struct QueueEffectiveSettings {
     pub blacklist_duration_minutes: Option<u32>,
 }
 
-/// Hold state of a queue: since when, by whom, why and until when.
+/// Hold state of a queue: since when, by whom (the latest actor that held
+/// it), why and until when.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, utoipa::ToSchema)]
 #[non_exhaustive]
 pub struct QueueHold {
@@ -88,7 +89,8 @@ pub struct QueueHold {
     /// Reason.
     #[serde(default)]
     pub reason: Option<String>,
-    /// Automatic release time.
+    /// Automatic release time: each node treats the hold as over once its
+    /// clock passes it; one `queueReleased { automatic: true }` is recorded.
     #[serde(default)]
     pub until: Option<DateTime<Utc>>,
 }
@@ -118,12 +120,18 @@ pub struct Queue {
     /// Effective limits; `None` for a `dead_letter` queue.
     #[serde(default)]
     pub limits: Option<QueueLimits>,
-    /// Domain set: primary first, plus the source domain while a move lasts.
+    /// Domain set: primary first, plus the source domain while a move lasts;
+    /// `["default"]` on a single-domain deployment, empty for a `dead_letter`
+    /// queue (not routed).
     pub domains: Vec<String>,
     /// Tasks per state: the live states for a dispatch queue, `dead_lettered`
-    /// for a dead-letter queue.
-    pub counts: BTreeMap<TaskState, u64>,
-    /// When `counts` were taken.
+    /// for a dead-letter queue. Sampled by the maintenance leader every
+    /// `queue_depth.sample_secs`, not exact. Present only for a caller that
+    /// also holds `configure` on queues; `None` otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub counts: Option<BTreeMap<TaskState, u64>>,
+    /// When `counts` and the depth samples were taken (one pass). Present only
+    /// with `counts`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sampled_at: Option<DateTime<Utc>>,
     /// Hold state; `None` when not held.
@@ -137,20 +145,16 @@ pub struct Queue {
 }
 
 impl Queue {
-    /// Build a queue resource.
+    /// Build a queue resource without `counts` (as a caller without
+    /// `configure` sees it).
     #[must_use]
-    pub fn new(
-        id: GtsInstanceId,
-        kind: QueueKind,
-        domains: Vec<String>,
-        counts: BTreeMap<TaskState, u64>,
-    ) -> Self {
+    pub const fn new(id: GtsInstanceId, kind: QueueKind, domains: Vec<String>) -> Self {
         Self {
             id,
             kind,
             limits: None,
             domains,
-            counts,
+            counts: None,
             sampled_at: None,
             hold: None,
             settings: None,
@@ -175,17 +179,19 @@ impl QueueList {
     }
 }
 
-/// Hold a queue. Both fields are optional.
+/// Hold a queue. Both fields are optional. Holding a held queue replaces
+/// `reason` and `until`, keeps `since` and sets `by` to the caller.
 #[derive(
     Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, utoipa::ToSchema,
 )]
 #[serde(deny_unknown_fields)]
 #[non_exhaustive]
 pub struct HoldRequest {
-    /// Reason.
+    /// Free text, at most 1024 characters (`TOO_LONG` on `/reason`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
-    /// Automatic release time.
+    /// Automatic release time; must be in the future (`400` `OUT_OF_RANGE` on
+    /// `/until`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub until: Option<DateTime<Utc>>,
 }

@@ -23,6 +23,16 @@
 //! | `resolve_wait_condition` | `Idempotency-Replayed` response header           |
 //! | `save_runtime_config`    | `202`                                            |
 //!
+//! **Optional bodies.** `cancel_task` and `reenqueue_task` take an optional
+//! body in the document; the generated client always sends one
+//! (`CancelRequest::default()` / `ReenqueueRequest::default()` encode as `{}`,
+//! which the server reads as "no body").
+//!
+//! **Errors.** No Task Engine specific status mapping lives here; see
+//! [`crate::error`]. On the wire every `429` and `503` carries `Retry-After`,
+//! node overload is `503` (never `429`), and lease-fenced worker calls never
+//! answer `404` (`409` `LEASE_LOST` instead).
+//!
 //! **Known wire gap.** `Idempotency-Key` is a request header in the document,
 //! but the macro cannot bind headers yet, so the generated client sends
 //! [`CreateTaskRequest::idempotency_key`](crate::models::CreateTaskRequest::idempotency_key) in the
@@ -40,10 +50,10 @@ use crate::models::{
     ClaimRequest, ClaimResponse, CompleteRequest, CountTasksQuery, CreateEntryRequest,
     CreateTaskRequest, Entry, EntryPage, HeartbeatRequest, HeartbeatResponse, HistoryEventPage,
     HoldRequest, LeaseTokenRequest, PageQuery, ParkRequest, ParkResponse, ProgressRequest, Queue,
-    QueueList, ReassignRequest, ReleaseRequest, ResolveRequest, ResolveResponse,
-    RuntimeConfigAccepted, RuntimeConfigRequest, RuntimeConfigStatus, SearchTasksQuery,
-    SetWaitRequest, SetWaitResponse, TagsPatchRequest, Task, TaskCount, TaskSearchPage,
-    WaitConditionPage,
+    QueueHistoryEventPage, QueueList, ReassignRequest, ReenqueueRequest, ReleaseRequest,
+    ResolveRequest, ResolveResponse, RuntimeConfigAccepted, RuntimeConfigRequest,
+    RuntimeConfigStatus, SearchTasksQuery, SetWaitOutcome, SetWaitRequest, TagsPatchRequest, Task,
+    TaskCount, TaskSearchPage, WaitConditionPage,
 };
 
 /// HTTP projection of [`TaskEngineApi`].
@@ -208,7 +218,7 @@ pub trait TaskEngineApiRest: TaskEngineApi {
         ctx: SecurityContext,
         task_id: Uuid,
         req: SetWaitRequest,
-    ) -> Result<SetWaitResponse, CanonicalError>;
+    ) -> Result<SetWaitOutcome, CanonicalError>;
 
     #[get("/tasks/{task_id}/wait-conditions")]
     #[retryable]
@@ -262,6 +272,15 @@ pub trait TaskEngineApiRest: TaskEngineApi {
         queue_id: GtsInstanceId,
     ) -> Result<Queue, CanonicalError>;
 
+    #[get("/queues/{queue_id}/events")]
+    #[retryable]
+    async fn list_queue_events(
+        &self,
+        ctx: SecurityContext,
+        queue_id: GtsInstanceId,
+        query: PageQuery,
+    ) -> Result<QueueHistoryEventPage, CanonicalError>;
+
     // ------------------------------------------------------------- bulk
 
     #[post("/tasks/bulk/cancel")]
@@ -309,6 +328,7 @@ pub trait TaskEngineApiRest: TaskEngineApi {
         &self,
         ctx: SecurityContext,
         task_id: Uuid,
+        req: ReenqueueRequest,
     ) -> Result<Task, CanonicalError>;
 
     #[post("/admin/config")]

@@ -16,23 +16,26 @@ use super::common::{
 
 /// One condition of a set-wait request or an initial wait group, by `kind`.
 ///
-/// Phases: `timer` p1; `event` p2; `input` and `children` p2, refused in p1 with
-/// `FEATURE_NOT_AVAILABLE`. Every kind may carry a timeout, which starts at park
-/// time.
+/// Phases: `timer` p1; `input`, `children` and `event` p2, refused in p1 with
+/// `FEATURE_NOT_AVAILABLE` on `/conditions/i/kind`.
+///
+/// Timeouts: the input, children and event kinds may carry `timeout_secs` and
+/// `on_timeout`; the timeout starts at park time (at create for an initial
+/// wait group). `timeout_secs` without `on_timeout` means `fail`. For input and
+/// children conditions `on_timeout` without `timeout_secs` → `400`
+/// `NOT_ALLOWED`; an event condition without `timeout_secs` gets
+/// `event_waits.max_wait_secs`, so `on_timeout` alone is valid there. A timer
+/// condition takes no timeout.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, utoipa::ToSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum WaitConditionSpec {
-    /// Satisfied at `resume_at`.
+    /// Satisfied once `resume_at` passes. Takes no timeout (`timeout_secs` or
+    /// `on_timeout` → `400` `NOT_ALLOWED`). p1.
     Timer {
-        /// Satisfied when reached.
+        /// Satisfied when reached. A time already past is satisfied at once (a
+        /// set answers `parked: false` with the result).
         resume_at: DateTime<Utc>,
-        /// Timeout in seconds.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        timeout_secs: Option<u64>,
-        /// What the timeout does.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        on_timeout: Option<OnTimeout>,
     },
     /// Satisfied by a resolve call with a value valid against `input_schema` (p2).
     Input {
@@ -60,19 +63,24 @@ pub enum WaitConditionSpec {
         on_timeout: Option<OnTimeout>,
     },
     /// Satisfied by a matching broker event (p2). Needs the caller's own Event
-    /// Broker `consume` permission; timeout at most `event_waits.max_wait_secs`.
+    /// Broker `consume` permission; timeout at most `event_waits.max_wait_secs`
+    /// (7 days), which also applies when none is given.
     Event {
-        /// GTS event type ID on a waitable topic.
+        /// GTS event type ID on a waitable topic, resolved with the caller's GTS
+        /// visibility (unregistered or hidden → `UNKNOWN_EVENT_TYPE`).
         #[schema(value_type = String)]
         event_type: GtsTypeId,
-        /// Required unless the event type allows exactly one subject type.
+        /// Required unless the event type's `allowed_subject_types` is a single
+        /// entry that is not a wildcard pattern (`EVENT_SUBJECT_TYPE_REQUIRED`);
+        /// a type outside the allowed ones → `EVENT_SUBJECT_TYPE_NOT_ALLOWED`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[schema(value_type = Option<String>)]
         subject_type: Option<GtsTypeId>,
         /// Subject to match.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         subject_id: Option<String>,
-        /// CEL expression checked after the field match (p3).
+        /// CEL expression checked after the field match (p3); a parse error or a
+        /// breach of a CEL limit → `INVALID_MATCH_EXPRESSION`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         match_expression: Option<String>,
         /// Timeout in seconds.
@@ -85,26 +93,27 @@ pub enum WaitConditionSpec {
 }
 
 impl WaitConditionSpec {
-    /// A timer condition without a timeout.
+    /// A timer condition.
     #[must_use]
     pub const fn timer(resume_at: DateTime<Utc>) -> Self {
-        Self::Timer {
-            resume_at,
-            timeout_secs: None,
-            on_timeout: None,
-        }
+        Self::Timer { resume_at }
     }
 }
 
 /// Initial wait group on create: the task starts `waiting`. Same shape as a
 /// worker's set-wait without `lease_token`, `park` and `checkpoint`.
+///
+/// Not allowed with `predecessors` or a future `run_after` (`NOT_ALLOWED` on
+/// `/wait`). Never a `children` condition (`NOT_ALLOWED`, every phase); p1
+/// accepts only `timer`. Condition timeouts and `resume_at` count from the
+/// create. A deferred admission (`429` `queue_depth.deferred` when full).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 #[non_exhaustive]
 pub struct InitialWaitGroup {
     /// Group mode.
     pub mode: WaitMode,
-    /// At least one condition.
+    /// 1 to `wait.max_conditions_per_group` (16) conditions.
     pub conditions: Vec<WaitConditionSpec>,
 }
 
@@ -116,12 +125,13 @@ impl InitialWaitGroup {
     }
 }
 
-/// Set (arm or park) the task's wait group. Worker only, lease-fenced.
+/// Set (arm or park) the task's wait group. Worker only, lease-fenced, from
+/// `claimed` or `running`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 #[non_exhaustive]
 pub struct SetWaitRequest {
-    /// The caller's lease token.
+    /// The caller's lease token (missing → `400` `REQUIRED` before any lookup).
     pub lease_token: Uuid,
     /// Group mode.
     pub mode: WaitMode,
@@ -129,11 +139,13 @@ pub struct SetWaitRequest {
     /// default `true` parks the task.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub park: Option<bool>,
-    /// Merged into `context` in the same guarded write.
+    /// Merged into `context` (RFC 7386 JSON Merge Patch) in the same guarded
+    /// write; records `taskCheckpointed`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(value_type = Option<Object>)]
     pub checkpoint: Option<serde_json::Map<String, serde_json::Value>>,
-    /// At least one condition; limited per group.
+    /// 1 to `wait.max_conditions_per_group` (16) conditions: empty →
+    /// `REQUIRED`, more → `TOO_MANY`, both on `/conditions`.
     pub conditions: Vec<WaitConditionSpec>,
 }
 
@@ -155,14 +167,15 @@ impl SetWaitRequest {
     }
 }
 
-/// Park the armed wait group. Worker only, lease-fenced.
+/// Park the armed wait group. Worker only, lease-fenced. With nothing armed →
+/// `400` `failed_precondition` `NO_ARMED_WAIT`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 #[non_exhaustive]
 pub struct ParkRequest {
     /// The caller's lease token.
     pub lease_token: Uuid,
-    /// Merged into `context`.
+    /// Merged into `context` (RFC 7386 JSON Merge Patch) in the same write.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(value_type = Option<Object>)]
     pub checkpoint: Option<serde_json::Map<String, serde_json::Value>>,
@@ -184,7 +197,9 @@ impl ParkRequest {
 #[serde(deny_unknown_fields)]
 #[non_exhaustive]
 pub struct ResolveRequest {
-    /// Must be valid against the condition's `input_schema`.
+    /// Must be valid against the condition's `input_schema`. Measured alone
+    /// against the 64 KiB payload limit (`413`); stored on the condition, not
+    /// in the task's payload.
     pub value: serde_json::Value,
 }
 
@@ -358,7 +373,8 @@ impl WaitGroup {
     }
 }
 
-/// Response of set-wait: the group as stored, and the task state.
+/// Response of set-wait when the group was stored: the group, and the task
+/// state. See [`SetWaitOutcome`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, utoipa::ToSchema)]
 #[non_exhaustive]
 pub struct SetWaitResponse {
@@ -376,6 +392,59 @@ impl SetWaitResponse {
             wait_group,
             task_state,
         }
+    }
+}
+
+/// The `200` body of set-wait: `oneOf` [`SetWaitResponse`] /
+/// [`ParkResponse`].
+///
+/// A group that is satisfied at once (a timer whose `resume_at` already
+/// passed) is not parked: the call answers `parked: false` with the `result`,
+/// the lease is kept and the task stays as it was. The group is consumed: its
+/// conditions stay listed as `satisfied`, but it is no longer the task's
+/// current group and no claim returns it.
+///
+/// Untagged on the wire: a body with `wait_group` decodes as
+/// [`Stored`](Self::Stored), anything else as [`Satisfied`](Self::Satisfied).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, utoipa::ToSchema)]
+#[serde(untagged)]
+#[non_exhaustive]
+pub enum SetWaitOutcome {
+    /// The group was stored: parked (`task_state: waiting`) or armed.
+    Stored(SetWaitResponse),
+    /// The group was satisfied at once (`parked: false` with `result`).
+    Satisfied(ParkResponse),
+}
+
+impl SetWaitOutcome {
+    /// The stored group, unless it was satisfied at once.
+    #[must_use]
+    pub const fn stored(&self) -> Option<&SetWaitResponse> {
+        match self {
+            Self::Stored(stored) => Some(stored),
+            Self::Satisfied(_) => None,
+        }
+    }
+
+    /// The wait result, when the group was satisfied at once.
+    #[must_use]
+    pub const fn satisfied_result(&self) -> Option<&WaitResult> {
+        match self {
+            Self::Stored(_) => None,
+            Self::Satisfied(park) => park.result.as_ref(),
+        }
+    }
+}
+
+impl From<SetWaitResponse> for SetWaitOutcome {
+    fn from(stored: SetWaitResponse) -> Self {
+        Self::Stored(stored)
+    }
+}
+
+impl From<ParkResponse> for SetWaitOutcome {
+    fn from(park: ParkResponse) -> Self {
+        Self::Satisfied(park)
     }
 }
 
@@ -627,7 +696,13 @@ impl WaitResult {
 }
 
 /// Response of park: `parked: false` with `result` when already satisfied,
-/// else `parked: true` with `task_state: waiting`.
+/// else `parked: true` with `task_state: waiting`. Also the shape of a set-wait
+/// whose group was satisfied at once ([`SetWaitOutcome::Satisfied`]).
+///
+/// Already satisfied means an armed timer whose `resume_at` has passed, an
+/// armed input already resolved, or an armed children condition with no
+/// unfinished children; the group is then consumed (its conditions stay listed
+/// as `satisfied`, but it is no longer current and no claim returns it).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, utoipa::ToSchema)]
 #[non_exhaustive]
 pub struct ParkResponse {
