@@ -67,10 +67,16 @@ enum Commands {
         /// Base URI of the remote types-registry
         #[arg(long)]
         registry: String,
-        /// Overall deadline in seconds; a nonzero exit when it passes
-        #[arg(long, default_value_t = 300)]
-        deadline_secs: u64,
+        /// Overall timeout, such as `30s`, `2m` or `10m` (at most 10m); a nonzero exit when it passes
+        #[arg(long, default_value = "2m", value_parser = parse_timeout)]
+        timeout: std::time::Duration,
     },
+}
+
+/// `publish-gts --timeout`: the `gts_publication.timeout` format, held to the shared maximum.
+fn parse_timeout(text: &str) -> Result<std::time::Duration, String> {
+    toolkit::gts_publication::parse_publication_budget("--timeout", text)
+        .map_err(|e| format!("{e:#}"))
 }
 
 fn apply_port_override(config: &mut AppConfig, port: u16) -> Result<()> {
@@ -153,15 +159,12 @@ async fn main() -> Result<()> {
     match cli.command.unwrap_or(Commands::Run) {
         Commands::Run => run_server(config).await,
         Commands::Migrate => run_migrate(config).await,
-        Commands::PublishGts {
-            registry,
-            deadline_secs,
-        } => {
+        Commands::PublishGts { registry, timeout } => {
             run_publish_gts(
                 config,
                 PublishGtsOptions {
                     registry_endpoint: registry,
-                    deadline: std::time::Duration::from_secs(deadline_secs),
+                    deadline: timeout,
                 },
             )
             .await

@@ -113,41 +113,56 @@ fn config_with_publish_wait(mode: &str, max_wait_secs: u32) -> EventBrokerConfig
     .expect("test configuration deserializes")
 }
 
-/// B2: a shared ingest tier refuses a synchronous-publish hold above the cap,
-/// so one slow backend cannot be made to pin every connection open.
+/// B2: every ingest-serving mode refuses a synchronous-publish hold above the
+/// cap, so a publish cannot be made to hold its response head past the
+/// api-gateway deadline (which would answer `504` after the event committed).
 #[test]
-fn cluster_ingest_refuses_a_publish_wait_above_the_cap() {
-    let cfg = config_with_publish_wait("cluster_ingest", super::MAX_CLUSTER_INGEST_WAIT_SECS + 1);
+fn an_ingest_mode_refuses_a_publish_wait_above_the_cap() {
+    for (mode_str, mode) in [
+        ("standalone", DeploymentMode::Standalone),
+        ("cluster_ingest", DeploymentMode::ClusterIngest),
+    ] {
+        let cfg = config_with_publish_wait(mode_str, super::MAX_PUBLISH_WAIT_SECS + 1);
 
-    assert_eq!(
-        check(&cfg, DeploymentMode::ClusterIngest).err(),
-        Some(Error::PublishMaxWaitTooLarge {
-            secs: super::MAX_CLUSTER_INGEST_WAIT_SECS + 1,
-            max: super::MAX_CLUSTER_INGEST_WAIT_SECS,
-        })
-    );
+        assert_eq!(
+            check(&cfg, mode).err(),
+            Some(Error::PublishMaxWaitTooLarge {
+                secs: super::MAX_PUBLISH_WAIT_SECS + 1,
+                max: super::MAX_PUBLISH_WAIT_SECS,
+            }),
+            "{mode_str}"
+        );
+    }
 }
 
-/// The cap itself is accepted.
+/// The cap itself, and a zero wait (every sync publish answered `202` at once),
+/// are within bounds in every ingest-serving mode.
 #[test]
-fn cluster_ingest_accepts_the_publish_wait_cap() {
-    let cfg = config_with_publish_wait("cluster_ingest", super::MAX_CLUSTER_INGEST_WAIT_SECS);
-
-    assert!(
-        check(&cfg, DeploymentMode::ClusterIngest).is_ok(),
-        "the cap itself is within bounds"
-    );
+fn an_ingest_mode_accepts_the_publish_wait_cap_and_zero() {
+    for (mode_str, mode) in [
+        ("standalone", DeploymentMode::Standalone),
+        ("cluster_ingest", DeploymentMode::ClusterIngest),
+    ] {
+        for wait in [super::MAX_PUBLISH_WAIT_SECS, 0] {
+            let cfg = config_with_publish_wait(mode_str, wait);
+            assert!(
+                check(&cfg, mode).is_ok(),
+                "{mode_str}: wait={wait} is within bounds"
+            );
+        }
+    }
 }
 
-/// The cap is `cluster_ingest`-only: standalone (a single dev/test process) may
-/// hold a synchronous publish as long as it likes.
+/// The cap binds the ingest-serving modes only: `cluster_delivery` never
+/// enqueues, so it carries the `publish` section without being subject to the
+/// rule.
 #[test]
-fn standalone_is_not_subject_to_the_publish_wait_cap() {
-    let cfg = config_with_publish_wait("standalone", super::MAX_CLUSTER_INGEST_WAIT_SECS * 100);
+fn a_non_ingest_mode_is_not_subject_to_the_publish_wait_cap() {
+    let cfg = config_with_publish_wait("cluster_delivery", super::MAX_PUBLISH_WAIT_SECS * 100);
 
     assert!(
-        check(&cfg, DeploymentMode::Standalone).is_ok(),
-        "standalone is unrestricted"
+        check(&cfg, DeploymentMode::ClusterDelivery).is_ok(),
+        "a non-ingest role is unrestricted"
     );
 }
 

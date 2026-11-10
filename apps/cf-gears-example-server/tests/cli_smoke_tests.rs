@@ -740,3 +740,29 @@ fn test_cli_dump_flags_require_config() {
         );
     }
 }
+
+#[test]
+fn test_publish_gts_timeout_is_a_bounded_humantime_duration() {
+    let help = run_cf_gears_server(&["publish-gts", "--help"]);
+    let help = String::from_utf8_lossy(&help.stdout);
+    assert!(help.contains("--timeout"), "{help}");
+    assert!(help.contains("[default: 2m]"), "{help}");
+    assert!(!help.contains("--deadline-secs"), "{help}");
+
+    for (value, needle) in [
+        ("11m", "too large"),
+        ("0s", "greater than zero"),
+        ("soon", "--timeout"),
+    ] {
+        let out = run_cf_gears_server(&[
+            "publish-gts",
+            "--registry",
+            "https://registry.example",
+            "--timeout",
+            value,
+        ]);
+        assert!(!out.status.success(), "{value} must be refused");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains(needle), "{value}: {stderr}");
+    }
+}

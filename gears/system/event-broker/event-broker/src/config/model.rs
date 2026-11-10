@@ -123,20 +123,19 @@ impl Default for BatchConfig {
 #[serde(deny_unknown_fields, default)]
 pub struct PublishConfig {
     /// The ceiling on a `Prefer: wait=N` publish's hold, in seconds. A request
-    /// asking for more is capped to this; the broker never holds a publish
-    /// open longer than the operator allows. Default 30 (matching the
-    /// long-poll cap). In `cluster_ingest` mode a startup check
-    /// (`config::checks`) refuses a value above
-    /// [`MAX_CLUSTER_INGEST_WAIT_SECS`](crate::config::checks::MAX_CLUSTER_INGEST_WAIT_SECS),
-    /// so a shared ingest tier cannot be made to pin connections open.
+    /// asking for more is capped to this; the broker never holds a publish open
+    /// longer than the operator allows. Default 20, to stay inside api-gateway's
+    /// request deadline. In the ingest-serving modes (`standalone` and
+    /// `cluster_ingest`) a startup check refuses a value above
+    /// [`MAX_PUBLISH_WAIT_SECS`](crate::config::checks::MAX_PUBLISH_WAIT_SECS),
+    /// which explains the bound and when it can rise (#4752).
     pub max_wait_secs: u32,
 }
 
 impl Default for PublishConfig {
     fn default() -> Self {
-        // Mirrors `PollingConfig::max_timeout_secs`: a 30s ceiling on how long
-        // the broker will hold any request open.
-        Self { max_wait_secs: 30 }
+        // Below api-gateway's request deadline; see `MAX_PUBLISH_WAIT_SECS`.
+        Self { max_wait_secs: 20 }
     }
 }
 

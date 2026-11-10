@@ -95,10 +95,12 @@ Multiple consumer instances share a group by JOINing with the same `consumer_gro
 - [positive-1.1 — Publish single (async)](producer/single/1.01-positive-publish-single-async.md) — `POST /v1/events` → `202 Accepted`; event enqueued in outbox.
 - [positive-1.2 - Publish sync (Prefer: wait=N)](producer/single/1.02-positive-publish-sync-wait-persisted.md) - `POST /v1/events` with `Prefer: wait=N` → `201 Created` after backend persist, `202 Accepted` if the wait elapses first.
 - [negative-1.5 — Read-only partition rejected](producer/single/1.05-negative-readonly-partition-rejected.md) — producer-supplied `partition` on publish → `400 Bad Request`; the backend assigns the backend partition itself.
+- [negative-1.6 - Malformed `Prefer: wait`](producer/single/1.06-negative-prefer-wait-malformed.md) - a non-numeric `Prefer: wait` value → `400 Bad Request`; parsed before the write path, so nothing is enqueued. A numeric over-cap value is **not** malformed - it clamps to the cap (see [single/1.02](producer/single/1.02-positive-publish-sync-wait-persisted.md)).
 
 #### producer/batch/ — `POST /v1/events:batch`
 - [positive-1.1 — Publish batch](producer/batch/1.01-positive-publish-batch.md) — `POST /v1/events:batch` → `202 Accepted`; one topic per batch, all-or-nothing.
 - [positive-1.9 - Batch of only duplicates](producer/batch/1.09-positive-batch-all-duplicates.md) - lost-ack resend of a whole chained run → `200 OK`, no body; the cursor stays and each event is stored once.
+- [positive-1.10 - Batch sync (Prefer: wait=N)](producer/batch/1.10-positive-batch-sync-wait.md) - `POST /v1/events:batch` with `Prefer: wait=N` → `201 Created` once every admitted event is stored, `202 Accepted` on timeout, `200 OK` when all duplicates; the hold is on the admitted events only (a duplicate prefix is not waited on).
 
 #### producer/flows/ — `POST /v1/producers`, `GET /cursors`, `POST :reset`
 - [positive-1.1 — Register chained producer](producer/flows/1.01-positive-register-chained-producer.md) — `POST /v1/producers { mode: chained }` → `201` with `producer_id`.
@@ -191,6 +193,7 @@ Multiple consumer instances share a group by JOINing with the same `consumer_gro
 
 - [negative-1.3 — Schema validation failure](producer/single/1.03-negative-schema-validation-failure.md) — `event.data` fails JSON Schema → `422 Invalid Argument`.
 - [negative-1.5 — Read-only partition rejected](producer/single/1.05-negative-readonly-partition-rejected.md) — producer-supplied `partition` on publish → `400 Bad Request`; `partition` is consumer-facing/read-side only.
+- [negative-1.6 — Malformed `Prefer: wait`](producer/single/1.06-negative-prefer-wait-malformed.md) — a non-numeric `Prefer: wait` value → `400 Bad Request`; parsed before the write path, so nothing is enqueued.
 - [negative-1.2 — Mixed-topic batch](producer/batch/1.02-negative-mixed-topic-batch.md) — batch events span different topics → `400 Invalid Argument`.
 - [negative-1.3 - Batch too large](producer/batch/1.03-negative-batch-too-large.md) - over 100 events or 1 MiB → `413 Content Too Large`.
 - [negative-1.4 — Batch late validation failure](producer/batch/1.04-negative-batch-late-validation-failure.md) — later invalid event rejects whole batch → `422 Invalid Argument`.

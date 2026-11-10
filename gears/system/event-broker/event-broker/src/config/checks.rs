@@ -23,13 +23,22 @@ use super::{BackendEntry, DeploymentMode, EventBrokerConfig};
 use crate::domain::backend::{self, Routing};
 use crate::domain::outbox::{INGEST_QUEUE_NAME, OutboxPartitions};
 
-/// The largest `publish.max_wait_secs` a `cluster_ingest` instance accepts. A
-/// shared ingest tier serves many producers, so an unbounded synchronous hold
-/// would let one slow backend pin every connection; the long-poll ceiling
-/// (`PollingConfig::max_timeout_secs`, 30s) doubled is generous headroom
-/// without being open-ended. `standalone` (a single process, dev/test) and the
-/// non-ingest cluster roles are left unrestricted.
-pub const MAX_CLUSTER_INGEST_WAIT_SECS: u32 = 60;
+/// The largest `publish.max_wait_secs` an ingest-serving instance accepts. A
+/// synchronous publish holds its HTTP response head open until the events are
+/// stored or the wait elapses, and every event route sits behind api-gateway,
+/// whose request deadline (`defaults.request_timeout`, default 30s) answers
+/// `504` when it expires - twice in cluster, where the request crosses the
+/// dispatcher host's gateway and then the ingest host's. A hold that outlasts
+/// that deadline turns a slow backend into a `504` *after* the event is
+/// already committed, which a retrying client then publishes again. Capping the
+/// hold at 20s leaves the dispatcher hop, the upstream connect, and the broker's
+/// pre-wait work inside the 30s deadline. Enforced in every mode that serves
+/// ingest ([`DeploymentMode::ingest_active`]); the non-ingest roles never
+/// enqueue, so they carry the section without being subject to it. The cap can
+/// rise once a route can ask api-gateway for a longer deadline (#4752).
+///
+/// [`DeploymentMode::ingest_active`]: crate::config::DeploymentMode::ingest_active
+pub const MAX_PUBLISH_WAIT_SECS: u32 = 20;
 
 /// The deployment as the checks proved it: every name valid, every route
 /// naming an entry, the instance-less route present, every entry routed to.
@@ -111,10 +120,10 @@ pub enum Error {
     )]
     DefaultOutboxGroupTopics,
 
-    /// `cluster_ingest` caps the synchronous-publish hold: a shared ingest tier
-    /// must not be configurable to pin connections open indefinitely.
+    /// `publish.max_wait_secs` exceeds [`MAX_PUBLISH_WAIT_SECS`] in a mode that
+    /// serves ingest (see the constant for why the hold is bounded there).
     #[error(
-        "publish: max_wait_secs is {secs}; in cluster_ingest mode it is at most {max} seconds, so a synchronous publish cannot hold a shared ingest connection open longer"
+        "publish: max_wait_secs is {secs}; in standalone and cluster_ingest modes it is at most {max} seconds, so a synchronous publish's hold stays inside the api-gateway request deadline"
     )]
     PublishMaxWaitTooLarge { secs: u32, max: u32 },
 }
@@ -125,25 +134,23 @@ pub enum Error {
 /// it carries the sections without being subject to their rules.
 ///
 /// # Errors
-/// The first rule the configuration breaks, checked in this order: in
-/// `cluster_ingest`, the synchronous-publish cap
-/// ([`MAX_CLUSTER_INGEST_WAIT_SECS`]); registry names; each routing key in
-/// sorted order, its form and then its target (C3); the instance-less route
-/// (C4); unreferenced entries (C5); outside `standalone`, a `SQLite` entry
-/// (C10); and, where ingest runs, the outbox groups - a group other than
-/// `default`, then the partition count, then `topics` (C8).
+/// The first rule the configuration breaks, checked in this order: in the
+/// ingest-serving modes (`standalone` and `cluster_ingest`), the
+/// synchronous-publish cap ([`MAX_PUBLISH_WAIT_SECS`]); registry names; each
+/// routing key in sorted order, its form and then its target (C3); the
+/// instance-less route (C4); unreferenced entries (C5); outside `standalone`, a
+/// `SQLite` entry (C10); and, where ingest runs, the outbox groups - a group
+/// other than `default`, then the partition count, then `topics` (C8).
 pub fn check(cfg: &EventBrokerConfig, mode: DeploymentMode) -> Result<Option<Deployment>, Error> {
     if mode.backend_role().is_none() {
         return Ok(None);
     }
-    // A shared ingest tier bounds how long a synchronous publish may hold a
-    // connection; standalone and the non-ingest roles are left unrestricted.
-    if mode == DeploymentMode::ClusterIngest
-        && cfg.publish.max_wait_secs > MAX_CLUSTER_INGEST_WAIT_SECS
-    {
+    // The sync-publish hold is bounded wherever ingest runs; see
+    // `MAX_PUBLISH_WAIT_SECS`.
+    if mode.ingest_active() && cfg.publish.max_wait_secs > MAX_PUBLISH_WAIT_SECS {
         return Err(Error::PublishMaxWaitTooLarge {
             secs: cfg.publish.max_wait_secs,
-            max: MAX_CLUSTER_INGEST_WAIT_SECS,
+            max: MAX_PUBLISH_WAIT_SECS,
         });
     }
     let backends = backends(cfg)?;

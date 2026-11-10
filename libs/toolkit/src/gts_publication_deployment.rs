@@ -140,7 +140,8 @@ fn publisher_tunings(
 /// future, ends every publication: they run in this future, not spawned.
 ///
 /// # Errors
-/// A setup error before any publication: `registry_endpoint` is not an
+/// A setup error before any publication: `deadline` exceeds
+/// [`MAX_PUBLICATION_BUDGET`](super::MAX_PUBLICATION_BUDGET), `registry_endpoint` is not an
 /// absolute `http`/`https` URI, a manifest does not build, a GTS id has two
 /// publishers, or registry wiring fails. Publication
 /// results, refusals, the deadline and cancellation included, are in the report.
@@ -154,6 +155,8 @@ pub async fn publish(
 ) -> anyhow::Result<GtsDeploymentReport> {
     // The platform credential goes to this endpoint: refuse anything but an
     // absolute URI naming a host, before any wiring.
+    // Before any parsing, wiring or credential use: nothing starts on a rejected deadline.
+    super::check_publication_budget("the publication deadline", deadline)?;
     let endpoint: http::Uri = registry_endpoint
         .parse()
         .map_err(|e| anyhow::anyhow!("registry endpoint '{registry_endpoint}': {e}"))?;

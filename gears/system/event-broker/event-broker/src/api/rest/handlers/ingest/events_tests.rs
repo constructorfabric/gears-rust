@@ -164,6 +164,100 @@ async fn publish_event_prefer_wait_returns_202_when_the_wait_elapses() {
 
     resp.assert_status(202);
     assert_eq!(resp.text(), "", "202 Accepted must carry no body");
+    assert_eq!(
+        resp.headers()
+            .get("preference-applied")
+            .map(|v| v.to_str().unwrap()),
+        Some("wait=0"),
+        "a honoured wait preference is echoed even on a 202"
+    );
+}
+
+// A nonzero `Prefer: wait` that runs out is a 202: the event is admitted and
+// enqueued, the wait elapses before the backend stores it, and
+// `Preference-Applied` still reports the wait the broker honoured. Distinct
+// from the `wait=0` case above, this exercises a real (if short) hold.
+#[tokio::test]
+async fn publish_event_prefer_nonzero_wait_that_runs_out_returns_202() {
+    let backend = Arc::new(NeverStoringBackend::new(Arc::new(
+        memory_event_broker_plugin::MemoryBackend::new(),
+    )));
+    let harness = EventBrokerHarness::builder()
+        .with_backend(backend)
+        .with_type_registry(stream_registry())
+        .build()
+        .await;
+
+    let resp = harness
+        .api_v1()
+        .post_events()
+        .with_header(
+            axum::http::header::HeaderName::from_static("prefer"),
+            axum::http::HeaderValue::from_static("wait=1"),
+        )
+        .with_body(Json(&json!({
+            "id": Uuid::new_v4(),
+            "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
+            "tenant_id": Uuid::new_v4(),
+            "source": "test-publish_event_prefer_nonzero_wait_that_runs_out",
+            "subject": "s-publish_event_prefer_nonzero_wait_that_runs_out",
+            "subject_type": "gts.x.eb.t1.subject.v1~",
+            "occurred_at": Utc::now().to_rfc3339(),
+        })))
+        .send()
+        .await;
+
+    resp.assert_status(202);
+    assert_eq!(resp.text(), "", "202 Accepted must carry no body");
+    assert_eq!(
+        resp.headers()
+            .get("preference-applied")
+            .map(|v| v.to_str().unwrap()),
+        Some("wait=1"),
+    );
+}
+
+// A `Prefer: wait` value too large for `u64` is still all digits, so it is not
+// malformed - it saturates to the broker's ceiling exactly like any over-cap
+// wait (events.rs: `parse::<u64>().map_or(Duration::MAX, ..)`). With a fast
+// backend the event stores inside the cap, so the answer is `201` and
+// `Preference-Applied` reports the cap. Pins the saturating branch, which a
+// merely large value like `99999` (which parses) would not reach.
+#[tokio::test]
+async fn publish_event_prefer_wait_beyond_u64_saturates_to_the_cap() {
+    let harness = EventBrokerHarness::builder()
+        .with_type_registry(stream_registry())
+        .build()
+        .await;
+
+    let resp = harness
+        .api_v1()
+        .post_events()
+        .with_header(
+            axum::http::header::HeaderName::from_static("prefer"),
+            // 30 nines, far beyond `u64::MAX` (~1.8e19, 20 digits).
+            axum::http::HeaderValue::from_static("wait=999999999999999999999999999999"),
+        )
+        .with_body(Json(&json!({
+            "id": Uuid::new_v4(),
+            "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
+            "tenant_id": Uuid::new_v4(),
+            "source": "test-publish_event_prefer_wait_beyond_u64",
+            "subject": "s-publish_event_prefer_wait_beyond_u64",
+            "subject_type": "gts.x.eb.t1.subject.v1~",
+            "occurred_at": Utc::now().to_rfc3339(),
+        })))
+        .send()
+        .await;
+
+    resp.assert_status(201);
+    assert_eq!(
+        resp.headers()
+            .get("preference-applied")
+            .map(|v| v.to_str().unwrap()),
+        Some("wait=20"),
+        "a wait beyond u64 saturates and clamps to the cap"
+    );
 }
 
 // A malformed `Prefer: wait` value is a bad request, not a silent fall-back to
@@ -246,7 +340,7 @@ async fn publish_event_prefer_wait_above_the_cap_clamps_and_reports_the_applied_
         .post_events()
         .with_header(
             axum::http::header::HeaderName::from_static("prefer"),
-            // Far above the default 30s ceiling.
+            // Far above the default 20s ceiling.
             axum::http::HeaderValue::from_static("wait=99999"),
         )
         .with_body(Json(&json!({
@@ -266,7 +360,7 @@ async fn publish_event_prefer_wait_above_the_cap_clamps_and_reports_the_applied_
         resp.headers()
             .get("preference-applied")
             .map(|v| v.to_str().unwrap()),
-        Some("wait=30"),
+        Some("wait=20"),
         "the applied wait is the cap, not the requested 99999"
     );
 }
@@ -305,7 +399,7 @@ async fn publish_event_prefer_bare_wait_uses_the_cap() {
         resp.headers()
             .get("preference-applied")
             .map(|v| v.to_str().unwrap()),
-        Some("wait=30")
+        Some("wait=20")
     );
 }
 
@@ -496,6 +590,13 @@ async fn publish_batch_prefer_wait_returns_202_when_the_wait_elapses() {
 
     resp.assert_status(202);
     assert_eq!(resp.text(), "", "202 Accepted must carry no body");
+    assert_eq!(
+        resp.headers()
+            .get("preference-applied")
+            .map(|v| v.to_str().unwrap()),
+        Some("wait=0"),
+        "a honoured wait preference is echoed even on a batch 202"
+    );
 }
 
 // A synchronous publish of an idempotent duplicate is answered `200` at once:

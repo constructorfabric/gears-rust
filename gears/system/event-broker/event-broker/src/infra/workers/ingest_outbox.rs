@@ -161,17 +161,21 @@ impl LeasedMessageHandler for IngestOutboxHandler {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     use chrono::{DateTime, Utc};
     use event_broker_sdk::Sequence;
+    use event_broker_sdk::api::Position;
     use event_broker_sdk::backend::{
-        Backend, LogClaim, LogId, Replacing, Retention, TopicPartition, TopicSpec, Wait,
+        AppendRequest, Appended, Backend, BackendError, Dedup, Flush, LogClaim, LogId,
+        Provisioning, Replacing, Retention, TopicPartition, TopicSpec, Wait, Watch,
     };
+    use event_broker_sdk::models::{PartitionRange, TopicSegment};
     use memory_event_broker_plugin::MemoryBackend;
     use opentelemetry::metrics::MeterProvider;
     use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData};
     use opentelemetry_sdk::metrics::{InMemoryMetricExporter, PeriodicReader, SdkMeterProvider};
+    use tokio_util::sync::CancellationToken;
     use toolkit_db::DBProvider;
     use uuid::Uuid;
 
@@ -387,14 +391,20 @@ mod tests {
     }
 
     fn test_message(event: &Event) -> OutboxMessage {
+        outbox_message(event, 1, false)
+    }
+
+    /// An outbox row carrying `event` under `seq`, with its payload's
+    /// `stored_wait` set (a `Prefer: wait` publish) or not.
+    fn outbox_message(event: &Event, seq: i64, stored_wait: bool) -> OutboxMessage {
         OutboxMessage {
             partition_id: 0,
-            seq: 1,
+            seq,
             payload: serde_json::to_vec(&IngestPayload {
                 topic: event.topic.clone(),
                 key: "key".to_owned(),
                 event: event.clone(),
-                stored_wait: false,
+                stored_wait,
             })
             .expect("serialize payload"),
             payload_type: INGEST_PAYLOAD_TYPE.to_owned(),
@@ -537,6 +547,150 @@ mod tests {
                 vec![label("outbox", "default"), label("partition", "0")],
                 90.0
             )]
+        );
+    }
+
+    /// A [`Backend`] that records the [`Flush`] of every append and otherwise
+    /// delegates to an inner backend, so a test can pin that a traced
+    /// (synchronous) row is appended [`Flush::Sync`] and an untraced row
+    /// [`Flush::Async`].
+    struct RecordingBackend {
+        inner: Arc<dyn Backend>,
+        flushes: Arc<Mutex<Vec<Flush>>>,
+    }
+
+    #[async_trait]
+    impl Backend for RecordingBackend {
+        async fn provision(
+            &self,
+            topic: &TopicSpec,
+            claim: &LogClaim,
+        ) -> Result<Provisioning, BackendError> {
+            self.inner.provision(topic, claim).await
+        }
+
+        async fn append(&self, request: &AppendRequest<'_>) -> Result<Appended, BackendError> {
+            self.flushes.lock().unwrap().push(request.flush);
+            self.inner.append(request).await
+        }
+
+        fn dedup(&self) -> Dedup {
+            self.inner.dedup()
+        }
+
+        fn max_events_per_append(&self) -> usize {
+            self.inner.max_events_per_append()
+        }
+
+        async fn read(
+            &self,
+            at: &TopicPartition,
+            offset: Sequence,
+            max_events: usize,
+            wait: Wait,
+        ) -> Result<Vec<event_broker_sdk::models::Event>, BackendError> {
+            self.inner.read(at, offset, max_events, wait).await
+        }
+
+        async fn resolve(
+            &self,
+            at: &TopicPartition,
+            position: Position,
+        ) -> Result<Sequence, BackendError> {
+            self.inner.resolve(at, position).await
+        }
+
+        fn watch(&self) -> Watch<'_> {
+            self.inner.watch()
+        }
+
+        async fn query(
+            &self,
+            at: &TopicPartition,
+            range: PartitionRange,
+        ) -> Result<Vec<TopicSegment>, BackendError> {
+            self.inner.query(at, range).await
+        }
+
+        async fn start(&self) -> Result<(), BackendError> {
+            self.inner.start().await
+        }
+
+        async fn stop(&self, deadline: CancellationToken) {
+            self.inner.stop(deadline).await;
+        }
+    }
+
+    /// A handler whose backend records every append's [`Flush`], over a
+    /// provisioned memory backend, plus the shared record it appends to.
+    async fn recording_handler() -> (IngestOutboxHandler, Arc<Mutex<Vec<Flush>>>) {
+        let (db, _dsn) = test_db().await;
+        let client: Arc<dyn types_registry_sdk::PlatformTypesRegistryApi> = registry_holding(
+            &[serde_json::json!({
+                "id": TOPIC_ID,
+                "description": "a topic this test drains the outbox into",
+            })],
+            &[],
+        );
+        crate::infra::specification::bulk_load(
+            &client,
+            &db,
+            &crate::test_support::StaticTypesRegistry::empty_config(),
+        )
+        .await
+        .expect("bulk_load");
+        let spec_manager: Arc<dyn SpecificationManager> =
+            Arc::new(TypesRegistrySpecificationManager::new(Arc::clone(&db)));
+        let memory = MemoryBackend::new();
+        memory
+            .provision(
+                &TopicSpec {
+                    topic: topic(),
+                    partitions: 1,
+                    retention: Retention::default(),
+                },
+                &LogClaim {
+                    replacing: Replacing::Nothing,
+                    new: LogId::from_uuid(Uuid::from_u128(1)),
+                },
+            )
+            .await
+            .expect("provision");
+        let flushes = Arc::new(Mutex::new(Vec::new()));
+        let recording = RecordingBackend {
+            inner: Arc::new(memory),
+            flushes: Arc::clone(&flushes),
+        };
+        let resolver = Arc::new(SingleBackendResolver::new(Arc::new(recording)));
+        let (_recorder, metrics) = Recorder::new();
+        (
+            IngestOutboxHandler::new(spec_manager, resolver, OUTBOX, metrics),
+            flushes,
+        )
+    }
+
+    /// The handler's choice of [`Flush`] is driven by the payload's
+    /// `stored_wait`: a traced (`Prefer: wait`) row is appended [`Flush::Sync`]
+    /// so its `201` is immediately readable (feature 0007 §4.1, AC-2, S2); an
+    /// untraced row keeps the cheaper [`Flush::Async`]. This pins that mapping -
+    /// flipping either arm fails here even though the outcome (`Ok`) is
+    /// unchanged.
+    #[tokio::test]
+    async fn a_traced_row_is_appended_flush_sync_and_an_untraced_row_flush_async() {
+        let (handler, flushes) = recording_handler().await;
+
+        // Two distinct fences (seq 1 and 2) so both are genuine appends, not a
+        // duplicate of the other.
+        let traced = outbox_message(&test_event(1), 1, true);
+        let untraced = outbox_message(&test_event(2), 2, false);
+
+        assert!(matches!(handler.handle(&traced).await, MessageResult::Ok));
+        assert!(matches!(handler.handle(&untraced).await, MessageResult::Ok));
+
+        assert_eq!(
+            *flushes.lock().unwrap(),
+            vec![Flush::Sync, Flush::Async],
+            "a traced row is Flush::Sync, an untraced row Flush::Async"
         );
     }
 

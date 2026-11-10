@@ -40,5 +40,4 @@ toolkit-odata = { workspace = true }
 toolkit-odata-macros = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true }
 proptest = { workspace = true }

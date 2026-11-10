@@ -1836,7 +1836,7 @@ Registry and DB available → migrate → publish-gts → Roll out application p
 ```
 
 - `migrate` runs `pre_init` and DB migrations, then exits.
-- `publish-gts --registry <url> --deadline-secs 300` publishes the linked gears’ GTS Type Schemas and Instances
+- `publish-gts --registry <url> --timeout 2m` (humantime such as `30s`, `2m`, `10m`; default `2m`; at most `10m`: a larger value is rejected before publication starts) publishes the linked gears’ GTS Type Schemas and Instances
   without running their lifecycle, under one absolute job deadline passed to every publisher.
   SDK retries do not renew it. It requires a platform credential and exits unsuccessfully
   on refusal or timeout. Success means admission, not just request acceptance.

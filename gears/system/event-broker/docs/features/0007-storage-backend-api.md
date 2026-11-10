@@ -372,9 +372,9 @@ for event in batch:
     key = resolve_pointer(event, event_type.partition_key)       # ADR-0002; no partition here
     group = outbox_group(topic)                                   # feature 0005 §2.5
     ip = murmur3(f"{topic}:{key}") % group.partitions            # ingest partition
-wait = prefer_wait(request)                                       # Prefer: wait=N, capped by publish.max_wait (default 30s)
+wait = prefer_wait(request)                                       # Prefer: wait=N (None = async), capped by publish.max_wait (default 20s, under the api-gateway deadline)
 groups = outbox groups the batch touches                          # feature 0005 §2.5
-if wait:
+if wait is not None:                                              # any Prefer: wait, wait=0 included (sync path, zero hold)
     for g in groups:
         trace[g] = Uuid::new_v4()                                 # broker-minted, never on the wire
         sub[g] = outbox[g].subscribe(trace[g])                    # before the enqueue commits
@@ -382,8 +382,8 @@ BEGIN                                                             # ONE ingest D
     producer chain checks and updates (ADR-0004)
     for g in groups: outbox[g].enqueue(&txn, events of g, trace[g])
 COMMIT
-if wait:
-    outcomes = await all(sub[g] for g in groups) up to wait       # one future per outbox, joined
+if wait is not None:
+    outcomes = await all(sub[g] for g in groups) up to wait       # one future per outbox, joined; wait=0 -> no hold
     return stored if every outcome complete  # 201
          | accepted if timed out             # 202: accepted, not yet confirmed
 return accepted                                                   # 202; 200 when every event was a duplicate
@@ -405,8 +405,8 @@ match backend.append(AppendRequest(fence, topic, [KeyedEvent(key, event)], flush
   struct IngestPayload {
       topic: GtsInstanceId,          // resolved at publish
       key: String,                   // partition key value (ADR-0002) -> KeyedEvent.key
-      stored_wait: Option<Uuid>,     // Prefer: wait trace -> Flush::Sync; None -> Flush::Async
       event: Event,                  // no partition, no sequence
+      stored_wait: bool,             // a Prefer: wait publish -> Flush::Sync; false -> Flush::Async
   }
   ```
 - **Outbox groups.** Each topic drains through its outbox group (feature 0005 §2.5), a toolkit-db queue with its own partitions; the ingest partition is `murmur3("{topic}:{key}") % group.partitions`: events of one key reach the backend in publish order, and the backend maps that key to one partition. Ingest never knows the backend partition.
@@ -414,7 +414,7 @@ match backend.append(AppendRequest(fence, topic, [KeyedEvent(key, event)], flush
 - **`NotProvisioned` and `LogConflict` at append retry endlessly** for the MVP. They mean a route change for a provisioned topic, or a backend that lost the topic; the operator reaction is ADR-0008's.
 - **No dead-lettering.** Every `append` error is retried, endlessly, and so is a payload that does not decode, a topic the registry does not hold and a topic lookup that cannot be read; nothing an ingest outbox holds is dead-lettered or dropped. A message that keeps failing stalls its outbox partition, which the alerts below surface: retries per registry entry and outbox partition (`evbk_ingest_append_retries_total{backend, outbox, partition, error}`; `error` is the `BackendError` kind in snake case, `undecodable_payload`, `unregistered_topic` or `specification_unavailable` (the topic lookup could not be read), and `backend` is `none` when no backend was resolved), and the age of the message each outbox partition is handling (`evbk_ingest_outbox_oldest_age_seconds{outbox, partition}`, 0 once it is acknowledged), alerted past a threshold.
 - **Declared dedup.** Ingest logs every registry entry's `dedup()` at startup, `AtLeastOnce` as a warning.
-- **Stored publish.** `Prefer: wait=N` (RFC 7240) asks for an answer once the batch is stored. The trace rides in EB's own outbox payload, since `OutboxMessage` does not carry the trace it was enqueued under (`libs/toolkit-db/src/outbox/handler.rs:12`). A timeout answers `202`, which is retry-safe for chained and monotonic producers. No answer carries a sequence.
+- **Stored publish.** `Prefer: wait=N` (RFC 7240) asks for an answer once the batch is stored. Ingest mints a per-publish trace (a `Uuid`, never on the wire), subscribes to it before the enqueue commits, and enqueues the admitted rows under it; the outbox's own trace machinery counts the trace down as each row is acked and releases the waiting publish. The trace does **not** ride in the payload - the payload carries only a `stored_wait` bool, which tells the handler to append the row `Flush::Sync`. A `wait=0` takes the same sync path with a zero hold: it still mints a trace and appends `Flush::Sync`, and answers `202` unless the row is already stored. A timeout answers `202`, which is retry-safe for chained and monotonic producers. No answer carries a sequence.
 
 ### 4.2 Head Watch
 

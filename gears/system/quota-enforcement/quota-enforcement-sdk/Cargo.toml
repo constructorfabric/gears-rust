@@ -27,10 +27,6 @@ rest-client = ["toolkit-contract/rest-client", "dep:toolkit-http", "dep:secrecy"
 # Generated server route registration, used by the quota-enforcement gear.
 rest-server = ["toolkit-contract/rest-server", "dep:axum"]
 
-# `#[toolkit::contract]` emits `#[async_trait]`, which cargo-shear cannot see.
-[package.metadata.cargo-shear]
-ignored = ["async-trait"]
-
 [dependencies]
 async-trait = { workspace = true }
 toolkit = { workspace = true }

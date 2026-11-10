@@ -1,6 +1,6 @@
 [package]
 name = "cf-gears-construct"
-version = "0.1.3"
+version = "0.1.4"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
@@ -79,11 +79,6 @@ toolkit-macros = { workspace = true }
 # Paged lists: OData $filter, $orderby and cursors, with the page schema
 toolkit-odata = { workspace = true, features = ["with-utoipa"] }
 toolkit-odata-macros = { workspace = true }
-
-# Reached only through a derive path (`toolkit_odata_macros::ODataFilterable`),
-# which `cargo shear --expand` no longer sees once the derive is expanded.
-[package.metadata.cargo-shear]
-ignored = ["toolkit-odata-macros"]
 
 [dev-dependencies]
 # Path-only: this adds only the test-support feature, so publishing this crate

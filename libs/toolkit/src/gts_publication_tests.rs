@@ -639,7 +639,7 @@ fn an_invalid_section_is_an_error_naming_the_gear_and_the_path() {
         (
             json!({ "timeout": "500000000000years" }),
             "gts_publication.timeout",
-            "too large to be a deadline",
+            "too large to be a publication budget",
         ),
     ];
     for (section, path, reason) in cases {
@@ -652,6 +652,21 @@ fn an_invalid_section_is_an_error_naming_the_gear_and_the_path() {
             "{section}: {message}"
         );
     }
+}
+
+#[test]
+fn the_timeout_bound_is_ten_minutes_on_every_os() {
+    let at_bound = options_of(&json!({ "gts_publication": { "timeout": "10min" } })).unwrap();
+    assert_eq!(at_bound.timeout(), Some(Duration::from_mins(10)));
+    assert_eq!(at_bound.timeout(), Some(super::MAX_PUBLICATION_BUDGET));
+    let over = options_of(&json!({ "gts_publication": { "timeout": "601s" } })).unwrap_err();
+    let message = format!("{over:#}");
+    assert!(
+        message.contains("gts_publication.timeout")
+            && message.contains("too large to be a publication budget")
+            && message.contains("at most"),
+        "{message}"
+    );
 }
 
 #[test]
@@ -880,5 +895,96 @@ fn an_invalid_static_id_fails_preparation_before_binding() {
     assert!(
         message.contains("gts.cf.test.publication.B.v1~ from test-gear: invalid GTS id"),
         "{message}"
+    );
+}
+
+/// An absolute deadline reaches the adapter only when it lies at most 10 minutes ahead.
+#[tokio::test(start_paused = true)]
+async fn an_absolute_deadline_is_held_to_the_same_maximum() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let backend = {
+        let calls = Arc::clone(&calls);
+        GtsPublicationBackend::new(move |_request| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            async { Ok(()) }
+        })
+    };
+    let request = |deadline| {
+        GtsPublicationRequest::new(
+            Arc::new(GtsManifest::build("widgets", "1.0.0", []).unwrap()),
+            CancellationToken::new(),
+            Arc::new(|_: &str| {}),
+        )
+        .with_deadline(Some(deadline))
+    };
+    let now = tokio::time::Instant::now();
+
+    backend
+        .publish(request(now + super::MAX_PUBLICATION_BUDGET))
+        .await
+        .expect("exactly the maximum is accepted");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+    let err = backend
+        .publish(request(
+            now + super::MAX_PUBLICATION_BUDGET + Duration::from_secs(1),
+        ))
+        .await
+        .unwrap_err();
+    let message = format!("{err:#}");
+    assert!(
+        message.contains("the publication deadline")
+            && message.contains("too large to be a publication budget"),
+        "{message}"
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "rejected before the adapter ran"
+    );
+
+    // An already-expired deadline is not a budget violation: it reaches the adapter,
+    // which reports the expiry itself.
+    tokio::time::advance(Duration::from_secs(5)).await;
+    backend
+        .publish(request(now))
+        .await
+        .expect("a deadline in the past is not rejected by the budget check");
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+    // No deadline at all: nothing to bound.
+    backend
+        .publish(
+            GtsPublicationRequest::new(
+                Arc::new(GtsManifest::build("widgets", "1.0.0", []).unwrap()),
+                CancellationToken::new(),
+                Arc::new(|_: &str| {}),
+            )
+            .with_deadline(None),
+        )
+        .await
+        .expect("no deadline is accepted");
+    assert_eq!(calls.load(Ordering::SeqCst), 3);
+}
+
+#[test]
+fn publication_budget_text_accepts_humantime_up_to_the_maximum() {
+    let parse = |t| super::parse_publication_budget("--timeout", t);
+    assert_eq!(parse("30s").unwrap(), Duration::from_secs(30));
+    assert_eq!(parse("2m").unwrap(), Duration::from_mins(2));
+    assert_eq!(parse("10m").unwrap(), super::MAX_PUBLICATION_BUDGET);
+}
+
+#[test]
+fn publication_budget_text_rejects_zero_garbage_and_above_the_maximum() {
+    let parse = |t| super::parse_publication_budget("--timeout", t);
+    for bad in ["0s", "abc", "300", "10m1s", "11m"] {
+        let err = format!("{:#}", parse(bad).unwrap_err());
+        assert!(err.contains("--timeout"), "{bad}: {err}");
+    }
+    let over = format!("{:#}", parse("11m").unwrap_err());
+    assert!(
+        over.contains("too large to be a publication budget"),
+        "{over}"
     );
 }

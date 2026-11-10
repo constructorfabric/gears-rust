@@ -23,12 +23,42 @@ use crate::sequence::Sequence;
 
 const V1: &str = "/event-broker/v1";
 
-/// The HTTP client's per-request timeout. It bounds the time to the *response
-/// head*, not the streamed body, so it is safe for the long-lived delivery
-/// streams; and it sits well above any synchronous-publish hold (which the
-/// broker caps at tens of seconds), so a held `201`/`202` is never cut off
-/// client-side regardless of the `Prefer: wait` a caller chooses.
-const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+/// The headroom the client timeout keeps above the broker's hold, for the round
+/// trip and the broker's own pre-wait and response work, so the final
+/// `201`/`202` always arrives before the client gives up. Without it the
+/// timeout would equal the hold and race the response.
+const SYNC_PROCESSING_MARGIN: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The client's per-request timeout: the caller's `sync_wait` budget plus
+/// [`SYNC_PROCESSING_MARGIN`].
+///
+/// It bounds the time to the response *head*, not the streamed body, so a
+/// long-lived delivery stream is unaffected. A synchronous publish is the only
+/// call the broker holds server-side, so sizing the timeout to outlast
+/// `sync_wait` keeps a held `201`/`202` from being cut off; every other call
+/// (management, async publish, opening a stream) returns well inside it.
+///
+/// There is no fixed ceiling: `sync_wait` is the caller's own budget, so the
+/// timeout tracks it - and therefore whatever hold a per-route gateway deadline
+/// may later allow (#4752) - rather than a hardcoded bound that would cut a
+/// longer hold off. The broker still clamps the actual hold to its
+/// `publish.max_wait_secs`, and api-gateway bounds every request at its own
+/// deadline (answering `504` past it), so at the default `sync_wait` this
+/// timeout sits just above that deadline: a stuck request surfaces as the
+/// server's `504`, not an opaque client timeout, and only a fully unresponsive
+/// connection waits the whole budget.
+fn request_timeout(sync_wait: std::time::Duration) -> std::time::Duration {
+    sync_wait.saturating_add(SYNC_PROCESSING_MARGIN)
+}
+
+/// Builds an [`HttpClient`] whose per-request timeout bounds the time to the
+/// response head.
+fn build_http(timeout: std::time::Duration) -> Result<HttpClient, EventBrokerError> {
+    HttpClientBuilder::new()
+        .timeout(timeout)
+        .build()
+        .map_err(|err| EventBrokerError::Transport(err.to_string()))
+}
 
 /// Wire framing for the delivery stream.
 ///
@@ -50,6 +80,9 @@ pub enum StreamTransport {
 /// same trait as the mock and any in-process implementation, so consumers
 /// resolving `Arc<dyn EventBrokerApi>` cannot tell which one they hold.
 pub struct RestBroker {
+    /// Every request goes through this client; its timeout is sized from
+    /// [`sync_wait`](Self::sync_wait) ([`request_timeout`]), the only hold the
+    /// broker keeps server-side.
     http: HttpClient,
     base_url: String,
     framing: StreamTransport,
@@ -69,30 +102,30 @@ impl RestBroker {
     /// [`EventBrokerError::Transport`] if the underlying HTTP client cannot be
     /// constructed.
     pub fn new(base_url: impl Into<String>) -> Result<Self, EventBrokerError> {
-        let http = HttpClientBuilder::new()
-            .timeout(REQUEST_TIMEOUT)
-            .build()
-            .map_err(|err| EventBrokerError::Transport(err.to_string()))?;
+        // A 30s default `Prefer: wait=N`; the broker caps it to its own
+        // `publish.max_wait_secs`, so this is an upper bound, not a demand.
+        let sync_wait = std::time::Duration::from_secs(30);
         Ok(Self {
-            http,
+            http: build_http(request_timeout(sync_wait))?,
             base_url: base_url.into(),
             framing: StreamTransport::default(),
             debug: false,
-            // A 30s default `Prefer: wait=N`; the broker caps it to its own
-            // `publish.max_wait_secs`, so this is an upper bound, not a demand.
-            sync_wait: std::time::Duration::from_secs(30),
+            sync_wait,
         })
     }
 
     /// Sets how long [`publish_sync`](EventBrokerApi::publish_sync) asks the
     /// broker to hold the response (`Prefer: wait=N`); clamped by the broker to
-    /// its configured ceiling. This sets only the header value - the client's
-    /// request timeout ([`REQUEST_TIMEOUT`]) already covers any hold the broker
-    /// will honour, so the client need not be rebuilt.
-    #[must_use]
-    pub fn with_sync_wait(mut self, wait: std::time::Duration) -> Self {
+    /// its configured ceiling. Rebuilds the HTTP client so its request timeout
+    /// still outlasts the new hold ([`request_timeout`]).
+    ///
+    /// # Errors
+    /// [`EventBrokerError::Transport`] if the rebuilt HTTP client cannot be
+    /// constructed.
+    pub fn with_sync_wait(mut self, wait: std::time::Duration) -> Result<Self, EventBrokerError> {
+        self.http = build_http(request_timeout(wait))?;
         self.sync_wait = wait;
-        self
+        Ok(self)
     }
 
     /// Selects the delivery stream framing this client opens streams with.
@@ -116,7 +149,8 @@ impl RestBroker {
         self.debug
     }
 
-    /// The underlying HTTP client every request goes through.
+    /// The HTTP client every request goes through, including opening a delivery
+    /// stream.
     pub(crate) fn http(&self) -> &HttpClient {
         &self.http
     }

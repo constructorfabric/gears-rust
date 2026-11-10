@@ -1039,7 +1039,7 @@ mod integration {
 // ---------------------------------------------------------------------------
 
 mod cluster_schema {
-    use super::super::{check_cluster_schema, engine_args};
+    use super::super::{check_cluster_schema, engine_args, normalize_key};
     use crate::infra::storage::test_mock::{
         cluster_topology as topology, good_cluster_rows as good_rows,
     };
@@ -1088,6 +1088,54 @@ mod cluster_schema {
             problems.iter().any(|p| p.contains("ORDER BY")),
             "{problems:?}"
         );
+    }
+
+    /// `ClickHouse` 26.8 reports the catalog's single-column key as `(gts_id)`.
+    #[test]
+    fn parenthesized_single_column_catalog_key_passes() {
+        let mut rows = good_rows();
+        rows[1].sorting_key = "(gts_id)".to_owned();
+        assert_eq!(
+            check_cluster_schema(&rows, &topology(), "db"),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn parenthesized_records_key_passes() {
+        let mut rows = good_rows();
+        rows[0].sorting_key = "(gts_id, tenant_id, created_at, id)".to_owned();
+        assert_eq!(
+            check_cluster_schema(&rows, &topology(), "db"),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn parenthesized_wrong_sort_key_is_rejected() {
+        let mut rows = good_rows();
+        rows[1].sorting_key = "(tenant_id)".to_owned();
+        let problems = check_cluster_schema(&rows, &topology(), "db");
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.contains("ORDER BY `(tenant_id)`")),
+            "{problems:?}"
+        );
+    }
+
+    #[test]
+    fn normalize_key_strips_only_enclosing_parens() {
+        for (raw, normalized) in [
+            ("((gts_id))", "gts_id"),
+            ("(a, b)", "a,b"),
+            ("(a), (b)", "(a),(b)"),
+            ("toYYYYMM(created_at)", "toYYYYMM(created_at)"),
+            ("gts_id, tenant_id", "gts_id,tenant_id"),
+            ("(toYYYYMM(created_at))", "toYYYYMM(created_at)"),
+        ] {
+            assert_eq!(normalize_key(raw), normalized, "{raw}");
+        }
     }
 
     /// A monthly partition is what the whole-partition TTL drop is sized for.

@@ -206,7 +206,8 @@ pub async fn run_migrate(config: AppConfig) -> Result<()> {
 pub struct PublishGtsOptions {
     /// Base URI of the remote registry, e.g. `https://registry:8443`.
     pub registry_endpoint: String,
-    /// The overall deadline for every publication.
+    /// The overall deadline for every publication; at most
+    /// [`MAX_PUBLICATION_BUDGET`](crate::gts_publication::MAX_PUBLICATION_BUDGET) (10 minutes).
     pub deadline: std::time::Duration,
 }
 
@@ -251,6 +252,8 @@ async fn publish_gts(
     options: &PublishGtsOptions,
     cancel: &CancellationToken,
 ) -> Result<()> {
+    // Reject an over-long deadline before touching the registry or the credential.
+    crate::gts_publication::check_publication_budget("--timeout", options.deadline)?;
     // Match startup validation without running gear lifecycle hooks.
     let registry = crate::registry::GearRegistry::discover_and_build()?;
     validate_deployment_configuration(&registry, config)?;
@@ -508,6 +511,30 @@ mod publish_gts_tests {
         let error = validate_deployment_configuration(&registry, &config).unwrap_err();
         assert!(error.to_string().contains("plain-gear"), "{error}");
         assert!(error.to_string().contains("gts_publication"), "{error}");
+    }
+
+    /// `publish-gts --timeout` above 10 minutes is refused first, before the
+    /// registry, the credential or the network; no clamping.
+    #[tokio::test]
+    async fn publish_gts_rejects_a_deadline_above_ten_minutes_first() {
+        let over =
+            crate::gts_publication::MAX_PUBLICATION_BUDGET + std::time::Duration::from_secs(1);
+        let err = publish_gts(
+            &AppConfig::default(),
+            &PublishGtsOptions {
+                registry_endpoint: "https://registry.example:8443".to_owned(),
+                deadline: over,
+            },
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("--timeout")
+                && message.contains("too large to be a publication budget"),
+            "{message}"
+        );
     }
 
     #[test]

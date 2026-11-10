@@ -283,17 +283,21 @@ async def test_sync_publish_times_out_to_202_when_the_backend_is_down(test_env):
         _docker("stop", sidecar.container_id)
 
         tenant_id = str(uuid.uuid4())
-        async with httpx.AsyncClient(timeout=15) as client:
+        # `wait=20` is the configured cap (`publish.max_wait_secs`): the hold runs
+        # its full length with the backend down and must still answer `202`
+        # through the real api-gateway, not `504` - so the cap sits inside the
+        # gateway's request deadline. The client timeout clears the full hold.
+        async with httpx.AsyncClient(timeout=30) as client:
             resp = await client.post(
                 f"{BASE_URL}/events",
-                headers={"Prefer": "wait=2"},
+                headers={"Prefer": "wait=20"},
                 json=_event(tenant_id),
             )
         # Admitted and enqueued, but the backend append cannot complete while the
         # backend is down, so the wait elapses to 202.
         assert resp.status_code == 202
         assert resp.text == "", "202 Accepted must carry no body"
-        assert resp.headers.get("preference-applied") == "wait=2"
+        assert resp.headers.get("preference-applied") == "wait=20"
 
         # Bring the backend back so the container stops cleanly in teardown.
         _docker("start", sidecar.container_id)

@@ -791,7 +791,7 @@ where
 
         // Subscribe before the enqueue commits, so the completion can never be
         // missed; a duplicate (no row enqueued) drops it with no statement.
-        let waiter = self.sync_wait.subscribe(trace.id());
+        let waiter = self.sync_wait.subscribe(trace);
         match self.repo.check_and_enqueue(enqueue).await? {
             ProducerIdempotencyOutcome::Accept => {}
             // A duplicate wrote no row and is already durable: `200`, no wait.
@@ -831,7 +831,7 @@ where
 
         // Subscribe before the enqueue commits, so the batch's completion can
         // never be missed; an all-duplicate batch drops it with no statement.
-        let waiter = self.sync_wait.subscribe(trace.id());
+        let waiter = self.sync_wait.subscribe(trace);
         let outcomes = self.repo.check_and_enqueue_batch(enqueues).await?;
         if outcomes.len() != expected {
             return Err(DomainError::Internal(format!(

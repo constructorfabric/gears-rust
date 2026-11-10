@@ -1347,7 +1347,7 @@ When the producer's local chain state is no longer trustworthy (DB restore, corr
 
 Synchronous persistence is requested with the standard `Prefer: wait=N` header (RFC 7240, N capped by configuration). Ingest mints a per-publish trace internally (never on the wire), subscribes to it before the enqueue commits, enqueues the admitted rows under it, and is told by the outbox's own trace machinery once every row is stored: it answers `201 Created` once the events are stored, `202 Accepted` when N elapses first, and `200 OK` when every event is a duplicate. A backend failure is retried, never answered: it shows as `202` on timeout. A malformed `Prefer: wait` value (one that is not a non-negative whole number of seconds) is rejected `400`; a numeric value larger than the cap simply clamps to it. `Prefer: respond-async` names the default (async) behaviour and is accepted as a no-op.
 
-Note the asymmetry of `200` for a synchronous caller: unlike `201`, it confirms only that the event is already durable in the ingest outbox (an idempotent duplicate), not that it has been stored on the backend. A caller retrying a lost `201` therefore gets `200`, not another `201`.
+Note the asymmetry of `200` for a synchronous caller: unlike `201`, it confirms only that the event is already durable in the ingest outbox (an idempotent duplicate), not that it has been stored on the backend. A **chained** or **monotonic** caller retrying a lost `201` therefore gets `200`, not another `201`. A **stateless** event is never a duplicate (there is no chain to deduplicate against), so its retry is admitted and stored again, answered `201` (or `202` on timeout) like any first publish.
 
 Errors (an error about the stream names the targeted stream in `context.resource_name`, a request-level `400` names the request, and an unknown producer names the producer resource; see §3.3 "Error Response Format"):
 - `400` - Read-only/unknown field on the body, a chained/monotonic mode invariant violated, or a malformed `Prefer: wait` value
@@ -2279,10 +2279,13 @@ modules:
       max_payload_bytes: 1048576  # 1MB
 
     publish:
-      # Ceiling on a `Prefer: wait=N` hold, in seconds. In cluster_ingest mode a
-      # value above 60 fails startup (a shared ingest tier must not pin
-      # connections open); standalone and the other modes are unrestricted.
-      max_wait_secs: 30
+      # Ceiling on a `Prefer: wait=N` hold, in seconds. Default 20: the hold must
+      # stay inside api-gateway's request deadline (`defaults.request_timeout`,
+      # default 30s), with margin for the two gateway hops a cluster publish
+      # crosses. In the ingest-serving modes (standalone, cluster_ingest) a value
+      # above 20 fails startup, so a publish cannot hold its response head until
+      # the gateway answers 504; the non-ingest roles never enqueue.
+      max_wait_secs: 20
 
     polling:
       default_timeout_secs: 30

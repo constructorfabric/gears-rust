@@ -246,6 +246,8 @@ pub fn check_ownership<'a>(
 /// URL, HTTP timeout and HTTP retries remain in `consumer_wiring`.
 ///
 /// `timeout` caps the budget from `publish` and never extends a caller's deadline.
+/// At most [`MAX_PUBLICATION_BUDGET`] (10 minutes), the same bound as a deployment
+/// deadline, on every OS.
 /// Without it, startup uses the adapter's default (120 s for the registry SDK);
 /// a deployment deadline replaces that default, even when longer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -267,6 +269,37 @@ impl Default for GtsPublicationOptions {
     }
 }
 
+/// The longest budget any publication path accepts: `gts_publication.timeout`, a
+/// deployment job's deadline (`publish-gts --timeout`) and programmatic callers of
+/// [`deployment::publish`], and an absolute deadline given to [`GtsPublicationBackend::publish`]
+/// (how far ahead it lies). One bound, so a mistyped value cannot hold startup or a
+/// deployment step for an impractically long time.
+pub const MAX_PUBLICATION_BUDGET: Duration = Duration::from_mins(10);
+
+/// Reject a publication budget above [`MAX_PUBLICATION_BUDGET`]: an error naming `what`,
+/// never a silent clamp. Exactly the maximum is accepted.
+///
+/// # Errors
+/// `budget` exceeds [`MAX_PUBLICATION_BUDGET`].
+pub(crate) fn check_publication_budget(what: &str, budget: Duration) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        budget <= MAX_PUBLICATION_BUDGET,
+        "{what}: {budget:?} is too large to be a publication budget (at most {MAX_PUBLICATION_BUDGET:?})"
+    );
+    Ok(())
+}
+
+/// Parse a publication budget given as text, such as `30s`, `2m` or `10m`: the format of
+/// `gts_publication.timeout`. `what` names the setting in errors (for example `--timeout`).
+///
+/// # Errors
+/// Not a humantime duration, zero, or above [`MAX_PUBLICATION_BUDGET`] (never clamped).
+pub fn parse_publication_budget(what: &str, text: &str) -> anyhow::Result<Duration> {
+    let budget = positive_duration(what, &serde_json::Value::String(text.to_owned()))?;
+    check_publication_budget(what, budget)?;
+    Ok(budget)
+}
+
 impl GtsPublicationOptions {
     const FIELDS: &str = "timeout, retry_backoff, retry_backoff_max, batch_size";
 
@@ -276,7 +309,7 @@ impl GtsPublicationOptions {
     /// Naming the gear and the config path: a section that is not a mapping (`null`
     /// included), an unknown field, a value of the wrong type, a zero duration or batch
     /// size, a `retry_backoff_max` below `retry_backoff` (defaults included), or a
-    /// `timeout` too large to be a deadline.
+    /// `timeout` above [`MAX_PUBLICATION_BUDGET`] (10 minutes).
     pub fn from_config(gear: &str, config: &dyn ConfigProvider) -> anyhow::Result<Self> {
         let path = format!(
             "gears.{gear}.config.{}",
@@ -323,10 +356,8 @@ impl GtsPublicationOptions {
                 options.retry_backoff
             );
         }
-        if let Some(timeout) = options.timeout
-            && tokio::time::Instant::now().checked_add(timeout).is_none()
-        {
-            anyhow::bail!("{path}.timeout: too large to be a deadline");
+        if let Some(timeout) = options.timeout {
+            check_publication_budget(&format!("{path}.timeout"), timeout)?;
         }
         Ok(options)
     }
@@ -455,8 +486,17 @@ impl GtsPublicationBackend {
     /// Publish within the budget. `Err` is expiry, a terminal refusal or cancellation.
     ///
     /// # Errors
-    /// See above.
+    /// See above; also a request whose absolute deadline lies more than
+    /// [`MAX_PUBLICATION_BUDGET`] ahead, rejected before the adapter runs.
     pub async fn publish(&self, request: GtsPublicationRequest) -> anyhow::Result<()> {
+        // Every caller-supplied absolute deadline, from any path, is held to the same
+        // maximum as `timeout`: rejected here, before the adapter runs, never clamped.
+        if let Some(deadline) = request.deadline() {
+            check_publication_budget(
+                "the publication deadline",
+                deadline.saturating_duration_since(tokio::time::Instant::now()),
+            )?;
+        }
         (self.0)(request).await
     }
 }

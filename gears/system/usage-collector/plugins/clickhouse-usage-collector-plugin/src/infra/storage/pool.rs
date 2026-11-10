@@ -757,6 +757,36 @@ fn squash(s: &str) -> String {
     s.chars().filter(|c| !c.is_whitespace()).collect()
 }
 
+/// [`squash`] a key expression, then strip every pair of outer parentheses
+/// that encloses the whole of it, so `ClickHouse` 26.8's `(gts_id)` compares
+/// equal to the canonical `gts_id`. `(a), (b)` and `toYYYYMM(created_at)` keep
+/// their parentheses: the first `(` does not close at the last character.
+fn normalize_key(s: &str) -> String {
+    let mut key = squash(s);
+    while key.starts_with('(') && closes_at_end(&key) {
+        key = key[1..key.len() - 1].to_owned();
+    }
+    key
+}
+
+/// Whether the `(` at the start of `s` closes at its last character.
+fn closes_at_end(s: &str) -> bool {
+    let mut depth = 0_u32;
+    for (i, c) in s.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return i == s.len() - 1;
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
 /// Top-level arguments of the first `<engine>(...)` call in `engine_full`,
 /// whitespace-squashed and with surrounding quotes removed; `None` when the
 /// text holds no well-formed call.
@@ -858,13 +888,13 @@ pub(crate) fn check_cluster_schema(
                 version = m0001_init::VERSION_COLUMN,
             ));
         }
-        if squash(&row.sorting_key) != sorting_key {
+        if normalize_key(&row.sorting_key) != normalize_key(sorting_key) {
             problems.push(format!(
-                "local table `{local}` is ORDER BY ({}), expected ({sorting_key})",
+                "local table `{local}` is ORDER BY `{}`, expected ({sorting_key})",
                 row.sorting_key
             ));
         }
-        if squash(&row.partition_key) != partition_key {
+        if normalize_key(&row.partition_key) != normalize_key(partition_key) {
             problems.push(format!(
                 "local table `{local}` is PARTITION BY `{}`, expected `{partition_key}`",
                 row.partition_key

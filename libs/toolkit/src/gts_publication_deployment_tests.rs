@@ -628,7 +628,7 @@ async fn caller_cancellation_is_not_a_deadline() {
             &NoConfig,
             ENDPOINT,
             &tuning,
-            Duration::from_secs(3600),
+            Duration::from_secs(600),
             &cancel
         ),
         canceller
@@ -642,5 +642,37 @@ async fn caller_cancellation_is_not_a_deadline() {
                 unconfirmed: vec!["gts.cf.test.publication.hanging.v1~".to_owned()]
             }
         )]
+    );
+}
+
+/// Exactly the maximum deadline is accepted and reaches every publisher.
+#[tokio::test(start_paused = true)]
+async fn a_deadline_of_exactly_ten_minutes_is_accepted() {
+    let _serial = SERIAL.lock().await;
+    let (report, registry) =
+        run(&[&BASE_PUB], crate::gts_publication::MAX_PUBLICATION_BUDGET).await;
+    assert!(report.unwrap().succeeded());
+    let deadlines_seen = { registry.deadlines.lock().len() };
+    assert_eq!(deadlines_seen, 1);
+}
+
+/// A deadline above the maximum is an error before any wiring or publication:
+/// not clamped, and no credential reaches a registry.
+#[tokio::test(start_paused = true)]
+async fn a_deadline_above_ten_minutes_is_rejected_before_publication_starts() {
+    let _serial = SERIAL.lock().await;
+    let over = crate::gts_publication::MAX_PUBLICATION_BUDGET + Duration::from_secs(1);
+    let (report, registry) = run(&[&BASE_PUB], over).await;
+    let message = format!("{:#}", report.unwrap_err());
+    assert!(
+        message.contains("the publication deadline")
+            && message.contains("too large to be a publication budget")
+            && message.contains("at most"),
+        "{message}"
+    );
+    assert!(registry.endpoint.lock().is_none(), "nothing was wired");
+    assert!(
+        registry.deadlines.lock().is_empty(),
+        "nothing was published"
     );
 }

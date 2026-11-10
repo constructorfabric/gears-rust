@@ -38,7 +38,7 @@ use crate::domain::error::{DomainError, ErrorCode};
 use crate::domain::idempotency::{IdempotencyGuard, ProducerIdempotencyOutcome, PublishEnqueue};
 use crate::domain::ingest::{
     ProducerCursors, ProducerMode, ProducerRecord, ProducerRegistration, ProducerRegistry,
-    ProducerTopicCursors,
+    ProducerTopicCursors, SyncTrace,
 };
 use crate::domain::model::{ConsumerGroup, ConsumerGroupKind, Cursor};
 use crate::domain::producer_reset::ProducerResetScope;
@@ -728,14 +728,14 @@ impl RoutingMarkers for Storage {
 }
 
 impl SyncWaitRegistry for Storage {
-    fn subscribe(&self, trace: Uuid) -> Box<dyn SyncWait> {
+    fn subscribe(&self, trace: SyncTrace) -> Box<dyn SyncWait> {
         // The ingest outbox owns the trace machinery. If it is not wired yet
         // the publish's own `check_and_enqueue` fails with a `503` before the
         // wait is ever awaited, so an unsubscribed waiter is only ever dropped.
         let subscription = self
             .outbox
             .get()
-            .and_then(|outbox| outbox.subscribe(&trace.to_string()).ok());
+            .and_then(|outbox| outbox.subscribe(&trace.id().to_string()).ok());
         Box::new(TraceWaiter { subscription })
     }
 }

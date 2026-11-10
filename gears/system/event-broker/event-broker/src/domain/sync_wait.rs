@@ -19,7 +19,8 @@
 use std::time::Duration;
 
 use async_trait::async_trait;
-use uuid::Uuid;
+
+use crate::domain::ingest::SyncTrace;
 
 /// Registers interest in a synchronous-publish trace, before its outbox rows
 /// are enqueued.
@@ -29,9 +30,9 @@ use uuid::Uuid;
 /// Implemented by `infra::storage::Storage` over
 /// [`Outbox::subscribe`](toolkit_db::outbox::Outbox::subscribe).
 pub trait SyncWaitRegistry: Send + Sync {
-    /// Subscribe to `trace` before its rows are enqueued. `trace` must be unique
-    /// per publish (a fresh UUID), the trace machinery's own requirement.
-    fn subscribe(&self, trace: Uuid) -> Box<dyn SyncWait>;
+    /// Subscribe to `trace` before its rows are enqueued. A [`SyncTrace`] is
+    /// unique per publish by construction, which the trace machinery requires.
+    fn subscribe(&self, trace: SyncTrace) -> Box<dyn SyncWait>;
 }
 
 /// A live subscription to one sync-publish trace, awaited after the enqueue has

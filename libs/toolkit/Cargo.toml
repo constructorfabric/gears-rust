@@ -18,6 +18,11 @@ name = "toolkit"
 [lints]
 workspace = true
 
+# `toolkit-http` is never named in code: the `fips` feature enables it only to
+# forward `toolkit-http/fips`.
+[package.metadata.cargo-shear]
+ignored = ["toolkit-http"]
+
 [features]
 # Enable the runner and the runtime integration by default.
 default = ["otel", "db"]

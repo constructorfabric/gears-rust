@@ -142,7 +142,8 @@ async fn publish_sync_sends_prefer_wait_and_reports_201_as_persisted() {
 
     let broker = RestBroker::new(base_url)
         .expect("build the client")
-        .with_sync_wait(std::time::Duration::from_secs(7));
+        .with_sync_wait(std::time::Duration::from_secs(7))
+        .expect("rebuild the sync client");
 
     let outcome = broker
         .publish_sync(&SecurityContext::anonymous(), &sample_event())
@@ -172,4 +173,27 @@ async fn publish_sync_reports_202_as_accepted() {
         .expect("a 202 is a success");
 
     assert_eq!(outcome, IngestOutcome::Accepted);
+}
+
+// The client timeout is the caller's wait budget plus the processing margin, so
+// the final `201`/`202` always outlasts the broker's hold. There is no ceiling:
+// the timeout tracks sync_wait, so it adapts to whatever hold the server (and,
+// later, a per-route gateway deadline, #4752) allows.
+#[test]
+fn request_timeout_is_the_wait_plus_a_margin() {
+    use std::time::Duration;
+
+    assert_eq!(
+        request_timeout(Duration::from_secs(30)),
+        Duration::from_secs(35)
+    );
+    // Zero wait still keeps the margin (the response head still has to arrive).
+    assert_eq!(request_timeout(Duration::ZERO), Duration::from_secs(5));
+    // A large wait is tracked, not clamped.
+    assert_eq!(
+        request_timeout(Duration::from_secs(600)),
+        Duration::from_secs(605)
+    );
+    // A wait near the limit saturates instead of overflowing.
+    assert_eq!(request_timeout(Duration::MAX), Duration::MAX);
 }

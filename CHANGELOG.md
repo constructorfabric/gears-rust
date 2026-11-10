@@ -14,6 +14,86 @@ release-plz updates this file in the Release PR.
 - utoipa 6.0.0 changed the representation of documented `$ref` fields and nullable (`Option<T>`) fields in the generated OpenAPI document (`docs/api/api.json`): a `$ref` field that carries a `default` is now a bare `$ref` with sibling `default` and `description` instead of a single-member `oneOf` wrapper, and nullable fields use a `oneOf` ordered `[$ref, null]` instead of `[null, $ref]`. There is no wire-level change.
 - `#[rest_contract]` now emits `"OK"` as the description of generated 200 responses (previously an empty string) as part of the utoipa 6 adaptation; this also shows up in `docs/api/api.json`.
 
+## [0.2.3](https://github.com/constructorfabric/gears-rust/compare/cf-gears-sqlite-event-broker-plugin-v0.2.2...cf-gears-sqlite-event-broker-plugin-v0.2.3) - 2026-11-10
+
+### Other
+
+- updated the following local packages: cf-gears-event-broker-sdk
+
+## [0.1.3](https://github.com/constructorfabric/gears-rust/compare/cf-gears-postgres-event-broker-plugin-v0.1.2...cf-gears-postgres-event-broker-plugin-v0.1.3) - 2026-11-10
+
+### Other
+
+- updated the following local packages: cf-gears-event-broker-sdk
+
+## [0.1.3](https://github.com/constructorfabric/gears-rust/compare/cf-gears-mysql-event-broker-plugin-v0.1.2...cf-gears-mysql-event-broker-plugin-v0.1.3) - 2026-11-10
+
+### Other
+
+- updated the following local packages: cf-gears-event-broker-sdk
+
+## [0.1.3](https://github.com/constructorfabric/gears-rust/compare/cf-gears-memory-event-broker-plugin-v0.1.2...cf-gears-memory-event-broker-plugin-v0.1.3) - 2026-11-10
+
+### Other
+
+- updated the following local packages: cf-gears-event-broker-sdk
+
+## [0.1.3](https://github.com/constructorfabric/gears-rust/compare/cf-gears-kafka-event-broker-plugin-v0.1.2...cf-gears-kafka-event-broker-plugin-v0.1.3) - 2026-11-10
+
+### Other
+
+- updated the following local packages: cf-gears-event-broker-sdk
+
+## [0.1.4](https://github.com/constructorfabric/gears-rust/compare/cf-gears-construct-v0.1.3...cf-gears-construct-v0.1.4) - 2026-11-10
+
+### Added
+
+- *(construct)* let a tenant administrator manage a subject's facts
+
+### Fixed
+
+- *(construct)* let the budget bound a resolution's claim and its record
+- *(construct)* give back a failed close's claim and share the fact delete
+- *(construct)* let the budget bound the administrator's permission check, reads and resolution
+
+### Other
+
+- *(construct)* share the one-step plan path
+
+## [0.2.4](https://github.com/constructorfabric/gears-rust/compare/cf-gears-keycloak-idp-plugin-v0.2.3...cf-gears-keycloak-idp-plugin-v0.2.4) - 2026-11-10
+
+### Fixed
+
+- *(keycloak-idp-plugin)* deprovision tenants of a deleted realm (by @macrocheese1)
+
+### Contributors
+
+* @macrocheese1
+
+## [0.4.4](https://github.com/constructorfabric/gears-rust/compare/cf-gears-file-storage-v0.4.3...cf-gears-file-storage-v0.4.4) - 2026-11-10
+
+### Other
+
+- update Cargo.lock dependencies
+
+## [0.5.2](https://github.com/constructorfabric/gears-rust/compare/cf-gears-event-broker-v0.5.1...cf-gears-event-broker-v0.5.2) - 2026-11-10
+
+### Other
+
+- update Cargo.lock dependencies
+
+## [0.4.2](https://github.com/constructorfabric/gears-rust/compare/cf-gears-cluster-v0.4.1...cf-gears-cluster-v0.4.2) - 2026-11-10
+
+### Other
+
+- update Cargo.lock dependencies
+
+## [0.5.2](https://github.com/constructorfabric/gears-rust/compare/cf-gears-event-broker-sdk-v0.5.1...cf-gears-event-broker-sdk-v0.5.2) - 2026-11-10
+
+### Other
+
+- update Cargo.lock dependencies
+
 ## [0.1.4](https://github.com/constructorfabric/gears-rust/compare/cf-gears-flight-control-v0.1.3...cf-gears-flight-control-v0.1.4) - 2026-11-09
 
 ### Other
