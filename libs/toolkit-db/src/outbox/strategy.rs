@@ -45,16 +45,40 @@ pub trait ProcessingStrategy: Send + Sync {
     /// `msg_batch_size` controls how many messages to fetch per cycle
     /// (from `WorkerTuning::batch_size`, possibly degraded by `PartitionMode`).
     ///
-    /// Returns `Ok(Some(result))` if work was done, `Ok(None)` if the
-    /// partition was empty or locked by another processor.
+    /// Returns [`Pass::Processed`] when work was done, [`Pass::Empty`] when the
+    /// partition had nothing pending, and [`Pass::Contended`] when another
+    /// processor holds it.
     fn process(
         &self,
         ctx: &ProcessContext<'_>,
         msg_batch_size: u32,
-    ) -> impl std::future::Future<Output = Result<Option<ProcessResult>, OutboxError>> + Send;
+    ) -> impl std::future::Future<Output = Result<Pass, OutboxError>> + Send;
+}
+
+/// What one pass over a partition found.
+#[derive(Debug)]
+pub enum Pass {
+    /// Messages were read and handed to the handler.
+    Processed(ProcessResult),
+    /// Nothing pending: the partition is drained.
+    Empty,
+    /// Another processor holds the partition — its lease in leased mode, the
+    /// processor row's lock in transactional mode — or this pass lost its lease
+    /// before acknowledgement. The holder may be inside a batch or in the empty
+    /// pass it makes right after one; ordinary contention ends within moments,
+    /// and a message enqueued by
+    /// THIS instance meanwhile is nobody else's to notice: the holder gets no
+    /// notification for it and looks again only at its idle poker. The caller
+    /// therefore re-checks after the active interval, with
+    /// [`super::workers::processor::CONTENDED_RECHECK_FLOOR`] as a floor,
+    /// rather than idling. A missing processor row would read as contended at this
+    /// pace indefinitely; the toolkit never removes it, and every registered
+    /// partition has one.
+    Contended,
 }
 
 /// Result of processing a batch.
+#[derive(Debug)]
 pub struct ProcessResult {
     pub count: u32,
     pub handler_result: HandlerResult,
@@ -451,13 +475,15 @@ impl ProcessingStrategy for TransactionalStrategy {
         &self,
         ctx: &ProcessContext<'_>,
         msg_batch_size: u32,
-    ) -> Result<Option<ProcessResult>, OutboxError> {
+    ) -> Result<Pass, OutboxError> {
         let txn = ctx.db.begin_tx().await?;
 
+        // No row under the lock query means another processor holds it (the
+        // query skips locked rows); a registered partition always has one.
         let Some(proc_row) = try_lock_and_read_state(&txn, &ctx.store, ctx.partition_id).await?
         else {
             txn.commit().await?;
-            return Ok(None);
+            return Ok(Pass::Contended);
         };
 
         let (msgs, trace_ids) = read_messages(
@@ -470,7 +496,7 @@ impl ProcessingStrategy for TransactionalStrategy {
         .await?;
         if msgs.is_empty() {
             txn.commit().await?;
-            return Ok(None);
+            return Ok(Pass::Empty);
         }
 
         #[allow(clippy::cast_possible_truncation)]
@@ -487,7 +513,7 @@ impl ProcessingStrategy for TransactionalStrategy {
         };
         let Some(result) = outcome else {
             txn.rollback().await?;
-            return Ok(None);
+            return Ok(Pass::Empty);
         };
         #[allow(clippy::cast_possible_truncation)]
         let pc = self.handler.processed_count().map(|n| n as u32);
@@ -515,7 +541,7 @@ impl ProcessingStrategy for TransactionalStrategy {
         // Committed, so the completion is now true and may be handed over.
         deliver_claimed(ctx.trace_mailbox, claimed);
 
-        Ok(Some(ProcessResult {
+        Ok(Pass::Processed(ProcessResult {
             count,
             handler_result: result,
             processed_count: pc,
@@ -525,14 +551,23 @@ impl ProcessingStrategy for TransactionalStrategy {
 
 // ---- Shared lease helpers ----
 
+/// What phase 1 of a leased pass came back with.
+enum Acquired {
+    /// The lease is ours and these messages are pending.
+    Batch(Vec<OutboxMessage>, TraceIds),
+    /// The lease was ours, nothing was pending, and it is released again.
+    Empty,
+    /// Another processor holds the lease; nothing was read.
+    Contended,
+}
+
 /// Phase 1: Acquire a time-based lease and read messages.
-/// Returns `None` if another processor holds the lease or no messages are available.
 async fn acquire_lease_and_read(
     ctx: &ProcessContext<'_>,
     lease_id: &str,
     lease_secs: i64,
     msg_batch_size: u32,
-) -> Result<Option<(Vec<OutboxMessage>, TraceIds)>, OutboxError> {
+) -> Result<Acquired, OutboxError> {
     let txn = ctx.db.begin_tx().await?;
 
     let proc_row = ctx
@@ -554,7 +589,7 @@ async fn acquire_lease_and_read(
 
     let Some(proc_row) = proc_row else {
         txn.commit().await?;
-        return Ok(None);
+        return Ok(Acquired::Contended);
     };
 
     let (msgs, trace_ids) = read_messages(
@@ -582,10 +617,10 @@ async fn acquire_lease_and_read(
             [ctx.partition_id.into(), lease_id.into()],
         ))
         .await?;
-        return Ok(None);
+        return Ok(Acquired::Empty);
     }
 
-    Ok(Some((msgs, trace_ids)))
+    Ok(Acquired::Batch(msgs, trace_ids))
 }
 
 // ---- Lease-guarded ack helpers ----
@@ -838,7 +873,7 @@ impl ProcessingStrategy for LeasedStrategy {
         &self,
         ctx: &ProcessContext<'_>,
         msg_batch_size: u32,
-    ) -> Result<Option<ProcessResult>, OutboxError> {
+    ) -> Result<Pass, OutboxError> {
         let lease_secs = i64::try_from(self.lease_config.duration.as_secs()).unwrap_or(i64::MAX);
 
         // Capture the clock before Phase 1 so that acquire+read time is
@@ -849,14 +884,15 @@ impl ProcessingStrategy for LeasedStrategy {
         // A pass that starts after shutdown takes no lease, so the message
         // keeps its full delivery budget for the next process.
         if ctx.cancel.is_cancelled() {
-            return Ok(None);
+            return Ok(Pass::Empty);
         }
 
-        let Some((msgs, trace_ids)) =
-            acquire_lease_and_read(ctx, &self.worker_id, lease_secs, msg_batch_size).await?
-        else {
-            return Ok(None);
-        };
+        let (msgs, trace_ids) =
+            match acquire_lease_and_read(ctx, &self.worker_id, lease_secs, msg_batch_size).await? {
+                Acquired::Batch(msgs, trace_ids) => (msgs, trace_ids),
+                Acquired::Empty => return Ok(Pass::Empty),
+                Acquired::Contended => return Ok(Pass::Contended),
+            };
 
         // Phase 2: call handler with graceful two-phase cancellation.
         //
@@ -883,7 +919,9 @@ impl ProcessingStrategy for LeasedStrategy {
             },
         };
 
-        // Phase 3: lease-guarded ack
+        // Phase 3: lease-guarded ack. `None` means the lease was lost before
+        // the ack committed: the partition changed hands, so the pass reads as
+        // contended and the caller looks again soon rather than idling on it.
         lease_guarded_ack(
             ctx,
             &msgs,
@@ -894,6 +932,7 @@ impl ProcessingStrategy for LeasedStrategy {
             batch.rejections(),
         )
         .await
+        .map(|acked| acked.map_or(Pass::Contended, Pass::Processed))
     }
 }
 
