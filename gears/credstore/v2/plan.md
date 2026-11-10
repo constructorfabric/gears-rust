@@ -1,10 +1,12 @@
 # credstore v2: temporary parallel version
 
-`gears/credstore/v2/` is a temporary, complete second version of the credstore gear, built next to the current one (v1: `gears/credstore/credstore`, `credstore-sdk`, `plugins`). It implements the design in [`../docs`](../docs) (ADRs, DESIGN, [`out-of-scope.md`](../docs/out-of-scope.md)) and is merged into `main` piece by piece, each PR at most 6K changed lines including lock files.
+`gears/credstore/v2/` is a temporary, complete second version of the credstore gear, built next to the current one (v1: `gears/credstore/credstore`, `credstore-sdk`, `plugins`). It implements the design in [`../docs`](../docs) (ADRs, DESIGN, [`out-of-scope.md`](../docs/out-of-scope.md)) and is merged into `main` in a few PRs.
 
 ## Nobody uses v2 yet
 
-- v2 is not registered in the server, has no REST routes and no database connection until the switch.
+- v2 is not registered in the server: its REST routes and database connection are not wired into any binary until the switch.
+- v2 carries no `gear.gdl`: it is not a product gear until the switch.
+- The v2 gears are declared under the names `credstore-v2`, `static-credstore-plugin-v2` and `vault-credstore-plugin-v2` until the switch: `cargo gears` refuses two gears with one name in the workspace.
 - No gear, plugin or app depends on the v2 crates; consumers keep using v1.
 - v1 and v2 must never be linked into one binary: they will share the gear name, routes and metric names at the switch.
 - The v2 crates are `publish = false`; their package names differ from v1 until the switch.
@@ -20,18 +22,14 @@
 
 1. SDK contract (models, errors, types, client and plugin API) and the gear skeleton: domain model, repository contract, DB schema; `out-of-scope.md`.
 2. Repository implementation and its tests, including the PostgreSQL migration test, its lane `credstore-pg` of `make test-integration` and the CI step (on the v2 package).
-3. Domain service: type rules, hierarchy reduction, list filter, authorization, write intents, write protocol, listing; several PRs with their tests.
-4. Infrastructure adapters (metrics, audit, tenant resolver, types registry, plugin selection, error mapping, GTS permissions), client and config.
-5. REST API and gear wiring (still not registered).
-6. Plugin conformance suite and test utilities in the SDK.
-7. Plugins: static and Vault (Vault is new, v1 has none), with `-v2` package names.
-8. Switch.
+3. Everything else, still unused: the domain service (type rules, hierarchy reduction, list filter, authorization, write intents, write protocol, listing), the infrastructure adapters (metrics, audit, tenant resolver, types registry, plugin selection, error mapping, GTS permissions), the client and config, the REST API and gear wiring, the plugin conformance suite and test utilities in the SDK, and the static and Vault plugins (Vault is new, v1 has none) with `-v2` package names.
+4. Switch, once the data migration has been rehearsed on a copy of an existing v1 installation.
 
 ## Switch
 
 Before it, diff `main` against the v1 baseline v2 was copied from (`bdf434ebd`) and port or drop every v1 change. Consumers cannot move earlier: the v2 SDK is a different crate, so their client lookup fails while v1 is registered. Afterwards a single version remains:
 
-- **S1:** blocked until the migration of existing v1 data ([#5347](https://github.com/constructorfabric/gears-rust/issues/5347)) is done. Register v2 under the gear name `credstore`; move oagw, settings-service, keycloak-idp-plugin and github-mirror (the gear and its CLI) to the v2 SDK; update `config/*.yaml`, the e2e suites, `docs/api/api.json`, QUICKSTART, the example-server features, the `[workspace.dependencies]` entries and the `credstore-pg` lane. v1 stays in the tree, unlinked.
+- **S1:** blocked until the migration of existing v1 data ([#5347](https://github.com/constructorfabric/gears-rust/issues/5347)) is done. Register v2 under the gear name `credstore`; move oagw, settings-service, keycloak-idp-plugin and github-mirror (the gear and its CLI) to the v2 SDK; update `config/*.yaml`, the `gear.gdl` files, the e2e suites, `docs/api/api.json`, QUICKSTART, the example-server features, the `[workspace.dependencies]` entries and the `credstore-pg` lane. v1 stays in the tree, unlinked.
 - **S2:** delete v1 and the v2 duplication exclusion in `.sonarcloud.properties` (deletions only).
-- **S3:** move v2 to `gears/credstore/{credstore,credstore-sdk,plugins}`; rename the packages to `cf-gears-credstore*` with versions above the published ones; drop `publish = false`; delete `gears/credstore/v2/` and this file. With the package rename, also change `-p cf-gears-credstore-v2` in `lane_args_credstore-pg` (`gears-rust.mk`) and the CI step name "Test credstore v2 ...".
+- **S3:** move v2 to `gears/credstore/{credstore,credstore-sdk,plugins}`; rename the packages to `cf-gears-credstore*` with versions above the published ones (the `-v2` suffix of the plugin packages goes away too, and so does the `-v2` of the gear names in `#[toolkit::gear]`, in the config sections and in the docs); drop `publish = false`; delete `gears/credstore/v2/` and this file. With the package rename, also change `-p cf-gears-credstore-v2` in `lane_args_credstore-pg` (`gears-rust.mk`) and the CI step name "Test credstore v2 ...".
 - Operators reissue PDP grants before the deploy: the base type `secret.v1~` becomes `credential.v1~`, with six actions (ADR-0010).
