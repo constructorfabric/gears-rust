@@ -10,10 +10,13 @@
 //! timeout, and every failure is reduced to "log an error without the secret
 //! and count `audit_publish_failed`". `record` never fails and never panics.
 //!
-//! Topic and event type are declared through the types-registry at gear init
-//! ([`register_audit_types`]): the topic as an instance of the broker's topic
-//! base type, the event type as a derived schema of its event base type, the
-//! way the broker's design prescribes for an owning gear.
+//! Topic and event type are declared in Rust, next to the sink, through the
+//! crate's `toolkit_gts::local` collector: the topic as an instance of the
+//! broker's topic base type ([`TopicV1`]), the event type as a derived schema
+//! of its event base type ([`EventV1`]), the way the broker's design
+//! prescribes for an owning gear. The gear publishes both with its other
+//! declarations before `init` (`gts_publication`), so nothing here talks to
+//! the registry.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -21,13 +24,13 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use credstore_sdk::CREDENTIAL_RESOURCE_TYPE;
-use event_broker_sdk::gts::{EventV1, EventV1Traits};
+use event_broker_sdk::gts::{EventV1, EventV1Traits, TopicV1};
 use event_broker_sdk::{Ack, EventBrokerApi, EventBrokerError, GtsTypeId};
 use gts::GtsSchema;
 use serde_json::json;
-use toolkit_gts::{gts_id, gts_type_schema};
+use toolkit_gts::gts_id;
+use toolkit_gts::local::{gts_instance, gts_type_schema};
 use toolkit_security::SecurityContext;
-use types_registry_sdk::{RegisterResult, TypesRegistryClient};
 use uuid::Uuid;
 
 use crate::domain::ports::audit::{AuditEvent, AuditSink};
@@ -170,14 +173,12 @@ impl AuditSink for EventBrokerAuditSink {
     }
 }
 
-/// The topic instance document registered in the types-registry.
-fn audit_topic() -> serde_json::Value {
-    json!({
-        "id": AUDIT_TOPIC_ID,
-        "description": "Credstore audit stream: one event per secret read or secret write, \
-                        naming subject, tenant, reference, type, operation and outcome; never \
-                        the secret.",
-    })
+gts_instance! {
+    TopicV1 {
+        id: gts_id!("cf.core.events.topic.v1~cf.core.credstore.audit.v1"),
+        description: "Credstore audit stream: one event per secret read or secret write, naming subject, tenant, reference, type, operation and outcome; never the secret.".to_owned(),
+        retention: None,
+    }
 }
 
 /// Declaration of the secret-audit event type under the broker's event base,
@@ -209,43 +210,6 @@ pub struct SecretAuditEventV1 {
     /// How it ended: `success` or `failure`.
     #[schemars(with = "String", extend("enum" = ["success", "failure"]))]
     pub outcome: String,
-}
-
-/// The derived event-type schema registered in the types-registry.
-fn audit_event_type() -> serde_json::Value {
-    SecretAuditEventV1::gts_schema_with_refs()
-}
-
-/// Declare the audit topic and event type in the types-registry.
-///
-/// # Errors
-///
-/// Returns `Err` when the registry call fails or rejects either document. The
-/// caller treats this as non-fatal: publishing then fails per event and is
-/// counted, it never stops the gear from starting.
-pub async fn register_audit_types(registry: &dyn TypesRegistryClient) -> anyhow::Result<()> {
-    let results = registry
-        .register_instances(vec![audit_topic()])
-        .await
-        .map_err(|e| anyhow::anyhow!("registering the audit topic failed: {e}"))?;
-    first_error(results, "audit topic")?;
-    let results = registry
-        .register_type_schemas(vec![audit_event_type()])
-        .await
-        .map_err(|e| anyhow::anyhow!("registering the audit event type failed: {e}"))?;
-    first_error(results, "audit event type")
-}
-
-fn first_error(results: Vec<RegisterResult>, what: &str) -> anyhow::Result<()> {
-    for result in results {
-        if let RegisterResult::Err { gts_id, error } = result {
-            return Err(anyhow::anyhow!(
-                "registering the {what} ({}) was rejected: {error}",
-                gts_id.as_deref().unwrap_or("unknown id")
-            ));
-        }
-    }
-    Ok(())
 }
 
 #[cfg(test)]

@@ -2743,9 +2743,11 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "axum",
  "cf-gears-authz-resolver-sdk",
  "cf-gears-credstore-v2-sdk",
  "cf-gears-event-broker-sdk",
+ "cf-gears-tenant-resolver",
  "cf-gears-tenant-resolver-sdk",
  "cf-gears-test-containers",
  "cf-gears-toolkit",
@@ -2755,6 +2757,7 @@ dependencies = [
  "cf-gears-toolkit-macros",
  "cf-gears-toolkit-odata",
  "cf-gears-toolkit-security",
+ "cf-gears-types-registry",
  "cf-gears-types-registry-sdk",
  "futures",
  "gts",
@@ -2772,7 +2775,10 @@ dependencies = [
  "thiserror 2.0.21",
  "time",
  "tokio",
+ "tokio-util",
+ "tower",
  "tracing",
+ "utoipa",
  "uuid",
 ]
 

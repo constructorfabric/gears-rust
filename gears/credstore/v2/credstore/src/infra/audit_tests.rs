@@ -24,12 +24,13 @@ use event_broker_sdk::models::{
     ConsumerGroup, ConsumerGroupQuery, CreateConsumerGroupRequest, EventType, Page, PartitionRange,
     ResetScope, Subscription, Topic, TopicSegment,
 };
+use gts::GtsSchema as _;
 use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
 use super::{
     AUDIT_TOPIC_ID, BrokerResolver, EventBrokerAuditSink, SECRET_AUDIT_EVENT_TYPE_ID,
-    audit_event_type, audit_topic,
+    SecretAuditEventV1,
 };
 use crate::domain::ports::audit::{AuditEvent, AuditOperation, AuditOutcome, AuditSink};
 use crate::domain::secret::test_support::FakeMetrics;
@@ -336,7 +337,7 @@ async fn a_broker_that_appears_later_is_used_from_then_on() {
 
 #[test]
 fn declared_event_type_targets_the_audit_topic_and_has_no_secret_member() {
-    let schema = audit_event_type();
+    let schema = SecretAuditEventV1::gts_schema_with_refs();
     assert_eq!(
         schema["x-gts-traits"]["topic"].as_str(),
         Some(AUDIT_TOPIC_ID)
@@ -345,5 +346,20 @@ fn declared_event_type_targets_the_audit_topic_and_has_no_secret_member() {
     assert!(text.contains(SECRET_AUDIT_EVENT_TYPE_ID));
     let props = &schema["allOf"][1]["properties"]["data"]["properties"];
     assert!(props.get("secret").is_none() && props.get("value").is_none());
-    assert_eq!(audit_topic()["id"].as_str(), Some(AUDIT_TOPIC_ID));
+}
+
+/// The topic and the event type are among the declarations the gear publishes
+/// before `init`; the topic is a document of its own, named by the event type.
+#[test]
+fn the_topic_and_the_event_type_are_declared_for_publication() {
+    let declared = crate::gts_declarations();
+    let ids: Vec<&str> = declared.iter().map(|(id, _)| id.as_str()).collect();
+    assert!(ids.contains(&AUDIT_TOPIC_ID), "{ids:?}");
+    assert!(ids.contains(&SECRET_AUDIT_EVENT_TYPE_ID), "{ids:?}");
+    let (_, topic) = declared
+        .iter()
+        .find(|(id, _)| id == AUDIT_TOPIC_ID)
+        .expect("topic declared");
+    let topic: serde_json::Value = serde_json::from_str(topic).expect("topic json");
+    assert_eq!(topic["id"].as_str(), Some(AUDIT_TOPIC_ID));
 }

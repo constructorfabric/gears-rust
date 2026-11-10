@@ -1,21 +1,24 @@
 // Updated: 2026-10-06 by Constructor Tech
-//! `GtsSecretTypeResolver` — the production [`SecretTypeResolver`] wired
-//! against `types_registry_sdk::TypesRegistryClient` resolved from
-//! `ClientHub`.
+//! `GtsSecretTypeResolver`: the production [`SecretTypeResolver`] wired
+//! against `types_registry_sdk::PlatformTypesRegistryApi` resolved from
+//! `ClientHub` (a linked registry's local client, or the resolving REST
+//! client otherwise).
 //!
 //! Mirrors AM's `GtsTenantTypeChecker` shape:
 //!
-//! 1. Resolve the [`GtsTypeSchema`] for the stored/declared type UUID via
-//!    [`TypesRegistryClient::get_type_schema_by_uuid`] (the SDK's local
-//!    client keeps a short TTL cache, so this is one cached lookup per
-//!    operation — no cache here).
+//! 1. Read the [`TypeSchema`] for the stored/declared type UUID via
+//!    [`PlatformTypesRegistryApiExt::get_type_schema_by_uuid`], projecting
+//!    only the effective traits (the SDK client keeps a short TTL cache, so
+//!    this is one cached lookup per operation; no cache here). The read is
+//!    on the platform plane: a secret type is not tenant data.
 //! 2. Reject schemas whose chain does not descend from the credstore
 //!    credential base type (`gts.cf.core.credstore.credential.v1~`,
-//!    renamed from `secret.v1~` by ADR-0004) — anything else cannot
-//!    legitimately carry `SecretTypeTraits`.
-//! 3. Read the effective traits via [`GtsTypeSchema::effective_traits`]
-//!    (chain merge: the leaf's declared values win; the abstract base
-//!    supplies none) and deserialize them into [`SecretTypeTraits`]:
+//!    renamed from `secret.v1~` by ADR-0004), judged by the root of the
+//!    type id's GTS chain: anything else cannot legitimately carry
+//!    `SecretTypeTraits`.
+//! 3. Read the effective traits (chain merge: the leaf's declared values
+//!    win; the abstract base supplies none) and deserialize them into
+//!    [`SecretTypeTraits`]:
 //!    `allow_sharing` and `max_size_bytes` are required, the optional
 //!    traits take their schema defaults.
 //! 4. Map failures fail-closed: not-registered / non-secret types onto
@@ -32,7 +35,11 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use credstore_sdk::{CREDENTIAL_RESOURCE_TYPE, SecretTypeTraits};
 use toolkit_canonical_errors::CanonicalError;
-use types_registry_sdk::{GtsTypeSchema, TypesRegistryClient};
+use toolkit_security::PlatformSecurityContext;
+use types_registry_sdk::{
+    EntityField, FieldSelection, GtsId, PlatformTypesRegistryApi, PlatformTypesRegistryApiExt,
+    Projection, ReadOptions, TypeSchema,
+};
 use uuid::Uuid;
 
 use crate::domain::error::DomainError;
@@ -49,7 +56,7 @@ const DEFAULT_PROBE_TIMEOUT_MS: u64 = 2_000;
 
 /// Production [`SecretTypeResolver`] backed by the GTS types-registry.
 pub struct GtsSecretTypeResolver {
-    registry: Arc<dyn TypesRegistryClient>,
+    registry: Arc<dyn PlatformTypesRegistryApi>,
     metrics: Arc<dyn CredStoreMetricsPort>,
     probe_timeout: Duration,
 }
@@ -59,7 +66,7 @@ impl GtsSecretTypeResolver {
     /// `ClientHub`, using the default probe timeout.
     #[must_use]
     pub fn new(
-        registry: Arc<dyn TypesRegistryClient>,
+        registry: Arc<dyn PlatformTypesRegistryApi>,
         metrics: Arc<dyn CredStoreMetricsPort>,
     ) -> Self {
         Self::with_timeout(registry, metrics, DEFAULT_PROBE_TIMEOUT_MS)
@@ -68,7 +75,7 @@ impl GtsSecretTypeResolver {
     /// Construct a resolver with an explicit probe timeout.
     #[must_use]
     pub fn with_timeout(
-        registry: Arc<dyn TypesRegistryClient>,
+        registry: Arc<dyn PlatformTypesRegistryApi>,
         metrics: Arc<dyn CredStoreMetricsPort>,
         probe_timeout_ms: u64,
     ) -> Self {
@@ -79,14 +86,15 @@ impl GtsSecretTypeResolver {
         }
     }
 
-    /// Whether `schema` descends from the credstore credential base type.
-    /// Walks `ancestors()` (self → parent → ...), so the base type itself
-    /// also passes here; [`SecretTypeResolver::resolve`] then rejects it
-    /// separately — it is an abstract trait carrier, not a concrete type.
-    fn descends_from_secret_envelope(schema: &GtsTypeSchema) -> bool {
-        schema
-            .ancestors()
-            .any(|s| s.type_id.as_ref() == CREDENTIAL_RESOURCE_TYPE)
+    /// Whether the schema's GTS chain starts at the credstore credential base
+    /// type. The base type itself also passes here;
+    /// [`SecretTypeResolver::resolve`] then rejects it separately: it is an
+    /// abstract trait carrier, not a concrete type.
+    fn descends_from_secret_envelope(schema: &TypeSchema) -> bool {
+        GtsId::try_new(schema.type_id.as_ref())
+            .ok()
+            .and_then(|id| id.chain_ids().into_iter().next())
+            .is_some_and(|root| root == CREDENTIAL_RESOURCE_TYPE)
     }
 }
 
@@ -117,7 +125,16 @@ impl SecretTypeResolver for GtsSecretTypeResolver {
         let t0 = Instant::now();
         let result = tokio::time::timeout(
             self.probe_timeout,
-            self.registry.get_type_schema_by_uuid(type_uuid),
+            self.registry.get_type_schema_by_uuid(
+                &PlatformSecurityContext::outbound_marker(),
+                type_uuid,
+                ReadOptions {
+                    projection: Projection::Select(FieldSelection::with(&[
+                        EntityField::EffectiveTraits,
+                    ])),
+                    ..ReadOptions::default()
+                },
+            ),
         )
         .await;
 
@@ -175,22 +192,35 @@ impl SecretTypeResolver for GtsSecretTypeResolver {
         // always resolves them (the optional traits take their defaults);
         // a deserialization failure means the registered chain is malformed
         // — fail closed as a (registration-fixable) 503, not a caller error.
-        let traits: SecretTypeTraits =
-            serde_json::from_value(schema.effective_traits()).map_err(|e| {
-                tracing::warn!(
-                    uuid = %type_uuid,
-                    type_id = %schema.type_id.as_ref(),
-                    err = %e,
-                    "secret type effective traits failed to resolve"
-                );
-                unavailable(
-                    format!(
-                        "types-registry: secret type {} has malformed effective traits",
-                        schema.type_id.as_ref(),
-                    ),
-                    None,
-                )
-            })?;
+        let Some(effective_traits) = schema.effective_traits else {
+            tracing::warn!(
+                uuid = %type_uuid,
+                type_id = %schema.type_id.as_ref(),
+                "types-registry answered a secret type without the selected effective traits"
+            );
+            return Err(unavailable(
+                format!(
+                    "types-registry: secret type {} has no effective traits",
+                    schema.type_id.as_ref(),
+                ),
+                None,
+            ));
+        };
+        let traits: SecretTypeTraits = serde_json::from_value(effective_traits).map_err(|e| {
+            tracing::warn!(
+                uuid = %type_uuid,
+                type_id = %schema.type_id.as_ref(),
+                err = %e,
+                "secret type effective traits failed to resolve"
+            );
+            unavailable(
+                format!(
+                    "types-registry: secret type {} has malformed effective traits",
+                    schema.type_id.as_ref(),
+                ),
+                None,
+            )
+        })?;
 
         Ok(ResolvedSecretType {
             gts_id: schema.type_id.as_ref().to_owned(),

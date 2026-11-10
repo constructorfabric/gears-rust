@@ -1,18 +1,18 @@
 // Updated: 2026-10-06 by Constructor Tech
 //! Unit tests for [`GtsSecretTypeResolver`].
 
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use std::time::Duration;
 
-use async_trait::async_trait;
-use serde_json::json;
+use serde_json::{Value, json};
 use toolkit_gts::gts_id;
-use types_registry_sdk::testing::MockTypesRegistryClient;
-use types_registry_sdk::{GtsInstance, GtsTypeId, InstanceQuery, RegisterResult, TypeSchemaQuery};
+use types_registry_sdk::testing_platform::{Call, Fault, MockTypesRegistry};
 
 use super::*;
 use crate::domain::ports::metrics::NoopMetrics;
 use credstore_sdk::SharingMode;
+
+const DRAFT: &str = "http://json-schema.org/draft-07/schema#";
 
 /// Deterministic v5 UUID of a GTS type id, via the SDK helper.
 fn uuid_of(gts_id: &str) -> Uuid {
@@ -20,34 +20,50 @@ fn uuid_of(gts_id: &str) -> Uuid {
 }
 
 /// The credstore secret base type as registered by the SDK: abstract (a pure
-/// trait/schema carrier — secrets are always typed by a derived id) and
+/// trait/schema carrier, secrets are always typed by a derived id) and
 /// supplying no trait values: every non-abstract type declares the required
-/// `allow_sharing` and `max_size_bytes` itself.
-fn secret_envelope() -> Arc<GtsTypeSchema> {
-    let raw = json!({
+/// `allow_sharing` and `max_size_bytes` itself. The registry is seeded with it
+/// so a derived type chains off it.
+fn secret_envelope() -> Value {
+    json!({
         "$id": format!("gts://{CREDENTIAL_RESOURCE_TYPE}"),
+        "$schema": DRAFT,
         "type": "object",
         "x-gts-abstract": true,
-    });
-    Arc::new(
-        GtsTypeSchema::try_new(GtsTypeId::new(CREDENTIAL_RESOURCE_TYPE), raw, None, None)
-            .expect("envelope schema"),
-    )
+        "x-gts-traits-schema": {
+            "type": "object",
+            "properties": {
+                "allow_sharing": {"type": "array"},
+                "max_size_bytes": {"type": "integer"},
+                "expirable": {"type": "boolean", "default": false},
+                "utf8_only": {"type": "boolean", "default": false},
+                "value_schema": {"type": "object"},
+            },
+        },
+    })
 }
 
 /// A derived secret-type schema declaring its own `x-gts-traits`.
-fn derived(type_id: &str, traits: &serde_json::Value) -> GtsTypeSchema {
-    let raw = json!({
+fn derived(type_id: &str, traits: &Value) -> Value {
+    json!({
         "$id": format!("gts://{type_id}"),
-        "type": "object",
+        "$schema": DRAFT,
         "allOf": [{"$ref": format!("gts://{CREDENTIAL_RESOURCE_TYPE}")}],
         "x-gts-traits": traits,
-    });
-    GtsTypeSchema::try_new(GtsTypeId::new(type_id), raw, None, Some(secret_envelope()))
-        .expect("derived schema")
+    })
 }
 
-fn resolver(registry: Arc<dyn TypesRegistryClient>) -> GtsSecretTypeResolver {
+/// A registry holding the secret base type and `schemas`.
+fn registry_with(schemas: &[(&str, Value)]) -> Arc<MockTypesRegistry> {
+    let registry = Arc::new(MockTypesRegistry::new());
+    registry.seed(CREDENTIAL_RESOURCE_TYPE, secret_envelope());
+    for (id, schema) in schemas {
+        registry.seed(id, schema.clone());
+    }
+    registry
+}
+
+fn resolver(registry: Arc<MockTypesRegistry>) -> GtsSecretTypeResolver {
     GtsSecretTypeResolver::new(registry, Arc::new(NoopMetrics))
 }
 
@@ -65,7 +81,7 @@ async fn resolves_gts_id_and_effective_traits() {
             "value_schema": {"type": "object", "required": ["password"]},
         }),
     );
-    let registry = Arc::new(MockTypesRegistryClient::new().with_type_schemas([schema]));
+    let registry = registry_with(&[(CUSTOM_TYPE_ID, schema)]);
     let resolved = resolver(registry)
         .resolve(uuid_of(CUSTOM_TYPE_ID))
         .await
@@ -84,14 +100,32 @@ async fn resolves_gts_id_and_effective_traits() {
     );
 }
 
-/// The base type is abstract (`x-gts-abstract`) — a trait carrier, never a
-/// concrete secret type. The types-registry SDK does not surface
-/// abstractness, so the resolver rejects the base by its known id, with the
-/// same `UNKNOWN_SECRET_TYPE` violation as a foreign type.
+/// The built-in types, as the SDK declares them, resolve with the traits of
+/// their catalog entries.
+#[tokio::test]
+async fn the_builtin_types_resolve_from_the_declared_inventory() {
+    let registry = Arc::new(MockTypesRegistry::new());
+    registry.seed_inventory();
+    let generic = credstore_sdk::types::SecretType::from_name("generic")
+        .expect("catalog type")
+        .descriptor();
+
+    let resolved = resolver(registry)
+        .resolve(uuid_of(generic.gts_id))
+        .await
+        .expect("a built-in type resolves");
+
+    assert_eq!(resolved.gts_id, generic.gts_id);
+    assert_eq!(resolved.traits, generic.traits());
+}
+
+/// The base type is abstract (`x-gts-abstract`): a trait carrier, never a
+/// concrete secret type. The registry answer does not surface abstractness,
+/// so the resolver rejects the base by its known id, with the same
+/// `UNKNOWN_SECRET_TYPE` violation as a foreign type.
 #[tokio::test]
 async fn the_abstract_envelope_itself_is_rejected_as_a_secret_type() {
-    let envelope = (*secret_envelope()).clone();
-    let registry = Arc::new(MockTypesRegistryClient::new().with_type_schemas([envelope]));
+    let registry = registry_with(&[]);
     let err = resolver(registry)
         .resolve(uuid_of(CREDENTIAL_RESOURCE_TYPE))
         .await
@@ -110,7 +144,7 @@ async fn the_abstract_envelope_itself_is_rejected_as_a_secret_type() {
 
 #[tokio::test]
 async fn unknown_uuid_is_an_unknown_secret_type_violation() {
-    let registry = Arc::new(MockTypesRegistryClient::new());
+    let registry = registry_with(&[]);
     let err = resolver(registry)
         .resolve(Uuid::from_u128(0xDEAD))
         .await
@@ -130,26 +164,28 @@ async fn unknown_uuid_is_an_unknown_secret_type_violation() {
 #[tokio::test]
 async fn non_secret_type_is_an_unknown_secret_type_violation() {
     // Registered and resolvable, but rooted outside the credstore secret
-    // envelope — must not be admitted as a secret type even though its
+    // envelope: must not be admitted as a secret type even though its
     // traits could deserialize by luck.
-    let alien_root = Arc::new(
-        GtsTypeSchema::try_new(
-            GtsTypeId::new(gts_id!("acme.core.events.type.v1~")),
-            json!({"type": "object"}),
-            None,
-            None,
-        )
-        .expect("alien root"),
-    );
+    let alien_root = gts_id!("acme.core.events.type.v1~");
     let alien_id = gts_id!("acme.core.events.type.v1~acme.commerce.orders.order.v1~");
-    let alien = GtsTypeSchema::try_new(
-        GtsTypeId::new(alien_id),
-        json!({"type": "object"}),
-        None,
-        Some(alien_root),
-    )
-    .expect("alien leaf");
-    let registry = Arc::new(MockTypesRegistryClient::new().with_type_schemas([alien]));
+    let registry = registry_with(&[
+        (
+            alien_root,
+            json!({
+                "$id": format!("gts://{alien_root}"),
+                "$schema": DRAFT,
+                "type": "object",
+            }),
+        ),
+        (
+            alien_id,
+            json!({
+                "$id": format!("gts://{alien_id}"),
+                "$schema": DRAFT,
+                "allOf": [{"$ref": format!("gts://{alien_root}")}],
+            }),
+        ),
+    ]);
     let err = resolver(registry)
         .resolve(uuid_of(alien_id))
         .await
@@ -171,12 +207,12 @@ async fn non_secret_type_is_an_unknown_secret_type_violation() {
 async fn malformed_effective_traits_fail_closed_as_service_unavailable() {
     // `allow_sharing` declared with a value outside the SharingMode enum:
     // the registry would reject this at registration, so hitting it at
-    // resolve time means the registered chain is broken — 503, not 400.
+    // resolve time means the registered chain is broken: 503, not 400.
     let schema = derived(
         CUSTOM_TYPE_ID,
         &json!({"allow_sharing": ["everyone"], "max_size_bytes": 1024}),
     );
-    let registry = Arc::new(MockTypesRegistryClient::new().with_type_schemas([schema]));
+    let registry = registry_with(&[(CUSTOM_TYPE_ID, schema)]);
     let err = resolver(registry)
         .resolve(uuid_of(CUSTOM_TYPE_ID))
         .await
@@ -197,7 +233,7 @@ async fn a_type_missing_a_required_trait_fails_closed_as_service_unavailable() {
         json!({"max_size_bytes": 1024}),
     ] {
         let schema = derived(CUSTOM_TYPE_ID, &traits);
-        let registry = Arc::new(MockTypesRegistryClient::new().with_type_schemas([schema]));
+        let registry = registry_with(&[(CUSTOM_TYPE_ID, schema)]);
         let err = resolver(registry)
             .resolve(uuid_of(CUSTOM_TYPE_ID))
             .await
@@ -211,111 +247,10 @@ async fn a_type_missing_a_required_trait_fails_closed_as_service_unavailable() {
 
 // -------- transport / infra --------
 
-/// Minimal fake for the transport-failure and timeout paths the stateful
-/// SDK mock cannot express. Only `get_type_schema_by_uuid` is reachable.
-struct FailingRegistry {
-    error: CanonicalError,
-    delay: Option<Duration>,
-    calls: Mutex<u32>,
-}
-
-impl FailingRegistry {
-    fn new(error: CanonicalError) -> Self {
-        Self {
-            error,
-            delay: None,
-            calls: Mutex::new(0),
-        }
-    }
-
-    fn with_delay(mut self, delay: Duration) -> Self {
-        self.delay = Some(delay);
-        self
-    }
-}
-
-#[async_trait]
-impl TypesRegistryClient for FailingRegistry {
-    async fn register(
-        &self,
-        _entities: Vec<serde_json::Value>,
-    ) -> Result<Vec<RegisterResult>, CanonicalError> {
-        unreachable!()
-    }
-    async fn register_type_schemas(
-        &self,
-        _type_schemas: Vec<serde_json::Value>,
-    ) -> Result<Vec<RegisterResult>, CanonicalError> {
-        unreachable!()
-    }
-    async fn get_type_schema(&self, _type_id: &str) -> Result<GtsTypeSchema, CanonicalError> {
-        unreachable!()
-    }
-    async fn get_type_schema_by_uuid(
-        &self,
-        _type_uuid: Uuid,
-    ) -> Result<GtsTypeSchema, CanonicalError> {
-        *self.calls.lock().expect("lock") += 1;
-        if let Some(d) = self.delay {
-            tokio::time::sleep(d).await;
-        }
-        Err(self.error.clone())
-    }
-    async fn get_type_schemas(
-        &self,
-        _type_ids: Vec<String>,
-    ) -> HashMap<String, Result<GtsTypeSchema, CanonicalError>> {
-        unreachable!()
-    }
-    async fn get_type_schemas_by_uuid(
-        &self,
-        _type_uuids: Vec<Uuid>,
-    ) -> HashMap<Uuid, Result<GtsTypeSchema, CanonicalError>> {
-        unreachable!("resolver uses the single-key variant")
-    }
-    async fn list_type_schemas(
-        &self,
-        _query: TypeSchemaQuery,
-    ) -> Result<Vec<GtsTypeSchema>, CanonicalError> {
-        unreachable!()
-    }
-    async fn register_instances(
-        &self,
-        _instances: Vec<serde_json::Value>,
-    ) -> Result<Vec<RegisterResult>, CanonicalError> {
-        unreachable!()
-    }
-    async fn get_instance(&self, _id: &str) -> Result<GtsInstance, CanonicalError> {
-        unreachable!()
-    }
-    async fn get_instance_by_uuid(&self, _uuid: Uuid) -> Result<GtsInstance, CanonicalError> {
-        unreachable!()
-    }
-    async fn get_instances(
-        &self,
-        _ids: Vec<String>,
-    ) -> HashMap<String, Result<GtsInstance, CanonicalError>> {
-        unreachable!()
-    }
-    async fn get_instances_by_uuid(
-        &self,
-        _uuids: Vec<Uuid>,
-    ) -> HashMap<Uuid, Result<GtsInstance, CanonicalError>> {
-        unreachable!()
-    }
-    async fn list_instances(
-        &self,
-        _query: InstanceQuery,
-    ) -> Result<Vec<GtsInstance>, CanonicalError> {
-        unreachable!()
-    }
-}
-
 #[tokio::test]
 async fn registry_transport_error_maps_to_service_unavailable() {
-    let registry = Arc::new(FailingRegistry::new(types_registry_sdk::testing::internal(
-        "registry exploded",
-    )));
+    let registry = registry_with(&[]);
+    registry.inject(Fault::on(Call::BatchGet).fail(CanonicalError::service_unavailable().create()));
     let err = resolver(registry)
         .resolve(Uuid::from_u128(0x1))
         .await
@@ -333,10 +268,8 @@ async fn registry_transport_error_maps_to_service_unavailable() {
 
 #[tokio::test(start_paused = true)]
 async fn slow_registry_times_out_as_service_unavailable() {
-    let registry = Arc::new(
-        FailingRegistry::new(types_registry_sdk::testing::internal("never reached"))
-            .with_delay(Duration::from_millis(50)),
-    );
+    let registry = registry_with(&[]);
+    registry.inject(Fault::on(Call::BatchGet).delay(Duration::from_millis(50)));
     let resolver = GtsSecretTypeResolver::with_timeout(registry.clone(), Arc::new(NoopMetrics), 10);
     let err = resolver
         .resolve(Uuid::from_u128(0x1))
@@ -347,5 +280,5 @@ async fn slow_registry_times_out_as_service_unavailable() {
         "got: {err:?}"
     );
     assert!(err.to_string().contains("timeout exceeded"), "got: {err}");
-    assert_eq!(*registry.calls.lock().expect("lock"), 1);
+    assert_eq!(registry.calls(Call::BatchGet), 1);
 }

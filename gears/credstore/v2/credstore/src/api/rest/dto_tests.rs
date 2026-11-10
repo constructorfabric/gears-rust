@@ -1,0 +1,354 @@
+// Updated: 2026-10-06 by Constructor Tech
+//! Unit tests for the credstore REST DTOs.
+
+use credstore_sdk::{
+    Credential, CredentialListItem, CredentialStatus, Fallback, InheritanceStatus, OwnRow, OwnerId,
+    SecretRef, SecretType, SecretValue, SharingMode, Validator,
+};
+use uuid::Uuid;
+
+use super::*;
+
+fn sref(s: &str) -> SecretRef {
+    SecretRef::new(s).expect("valid ref")
+}
+
+#[test]
+fn sharing_mode_roundtrip() {
+    for (dto, sdk) in [
+        (SharingModeDto::Private, SharingMode::Private),
+        (SharingModeDto::Tenant, SharingMode::Tenant),
+        (SharingModeDto::Shared, SharingMode::Shared),
+    ] {
+        assert_eq!(SharingModeDto::from(sdk), dto);
+        assert_eq!(SharingMode::from(dto), sdk);
+    }
+}
+
+#[test]
+fn fallback_roundtrip() {
+    for (dto, sdk) in [
+        (FallbackDto::Inherit, Fallback::Inherit),
+        (FallbackDto::None, Fallback::None),
+    ] {
+        assert_eq!(FallbackDto::from(sdk), dto);
+        assert_eq!(Fallback::from(dto), sdk);
+    }
+}
+
+#[test]
+fn credential_status_and_inheritance_status_convert() {
+    assert_eq!(
+        CredentialStatusDto::from(Some(CredentialStatus::Active)),
+        CredentialStatusDto::Active
+    );
+    assert_eq!(
+        CredentialStatusDto::from(Some(CredentialStatus::Declared)),
+        CredentialStatusDto::Declared
+    );
+    assert_eq!(
+        CredentialStatusDto::from(Some(CredentialStatus::Expired)),
+        CredentialStatusDto::Expired
+    );
+    // No own row (`Credential::own` is `None`) is the wire status `none`.
+    assert_eq!(CredentialStatusDto::from(None), CredentialStatusDto::None);
+    assert_eq!(
+        InheritanceStatusDto::from(InheritanceStatus::Overridden),
+        InheritanceStatusDto::Overridden
+    );
+    assert_eq!(
+        InheritanceStatusDto::from(InheritanceStatus::Suppressed),
+        InheritanceStatusDto::Suppressed
+    );
+}
+
+/// The DTO -> SDK direction exists only here, as exhaustive matches: a
+/// variant added to a DTO enum or to its SDK counterpart makes this fail to
+/// compile (the REST DTOs mirror the closed SDK enums one-to-one; the
+/// production conversions are exhaustive in the SDK -> DTO direction).
+fn credential_status_to_sdk(dto: CredentialStatusDto) -> Option<CredentialStatus> {
+    match dto {
+        CredentialStatusDto::None => None,
+        CredentialStatusDto::Declared => Some(CredentialStatus::Declared),
+        CredentialStatusDto::Active => Some(CredentialStatus::Active),
+        CredentialStatusDto::Expired => Some(CredentialStatus::Expired),
+    }
+}
+
+fn inheritance_status_to_sdk(dto: InheritanceStatusDto) -> InheritanceStatus {
+    match dto {
+        InheritanceStatusDto::Own => InheritanceStatus::Own,
+        InheritanceStatusDto::Inherited => InheritanceStatus::Inherited,
+        InheritanceStatusDto::Overridden => InheritanceStatus::Overridden,
+        InheritanceStatusDto::Suppressed => InheritanceStatus::Suppressed,
+    }
+}
+
+#[test]
+fn status_dtos_mirror_the_sdk_enums_one_to_one() {
+    for dto in [
+        CredentialStatusDto::None,
+        CredentialStatusDto::Declared,
+        CredentialStatusDto::Active,
+        CredentialStatusDto::Expired,
+    ] {
+        assert_eq!(
+            CredentialStatusDto::from(credential_status_to_sdk(dto)),
+            dto
+        );
+    }
+    for dto in [
+        InheritanceStatusDto::Own,
+        InheritanceStatusDto::Inherited,
+        InheritanceStatusDto::Overridden,
+        InheritanceStatusDto::Suppressed,
+    ] {
+        assert_eq!(
+            InheritanceStatusDto::from(inheritance_status_to_sdk(dto)),
+            dto
+        );
+    }
+}
+
+#[test]
+fn put_credential_request_debug_redacts_secret() {
+    let dto = PutCredentialRequestDto {
+        secret_type: None,
+        sharing: SharingModeDto::default(),
+        fallback: FallbackDto::default(),
+        expires_at: None,
+        secret: Some(Some("super-secret-value".to_owned())),
+    };
+    let debug = format!("{dto:?}");
+    assert!(debug.contains("[REDACTED]"));
+    assert!(!debug.contains("super-secret-value"));
+}
+
+#[test]
+fn put_credential_request_debug_shows_absent_and_null_tri_state() {
+    let absent = PutCredentialRequestDto {
+        secret_type: None,
+        sharing: SharingModeDto::default(),
+        fallback: FallbackDto::default(),
+        expires_at: None,
+        secret: None,
+    };
+    assert!(format!("{absent:?}").contains("<absent>"));
+
+    let null = PutCredentialRequestDto {
+        secret: Some(None),
+        ..absent
+    };
+    assert!(format!("{null:?}").contains("<null>"));
+}
+
+#[test]
+fn put_credential_request_deserializes_absent_null_and_set_secret() {
+    let json = r#"{"sharing": "tenant", "secret": null}"#;
+    let dto: PutCredentialRequestDto = serde_json::from_str(json).expect("deserialize");
+    assert_eq!(dto.secret, Some(None));
+
+    let json2 = r#"{"sharing": "tenant", "secret": "s"}"#;
+    let dto2: PutCredentialRequestDto = serde_json::from_str(json2).expect("deserialize");
+    assert_eq!(dto2.secret, Some(Some("s".to_owned())));
+
+    let json3 = r#"{"sharing": "tenant"}"#;
+    let dto3: PutCredentialRequestDto = serde_json::from_str(json3).expect("deserialize");
+    assert_eq!(dto3.secret, None, "an absent secret key must stay Absent");
+}
+
+#[test]
+fn credential_patch_dto_debug_redacts_secret_and_shows_tri_state() {
+    let absent = CredentialPatchDto {
+        secret_type: None,
+        sharing: None,
+        fallback: None,
+        expires_at: None,
+        secret: None,
+    };
+    assert!(format!("{absent:?}").contains("<absent>"));
+
+    let null = CredentialPatchDto {
+        secret: Some(None),
+        ..absent.clone()
+    };
+    assert!(format!("{null:?}").contains("<null>"));
+
+    let set = CredentialPatchDto {
+        secret: Some(Some("super-secret-value".to_owned())),
+        ..absent
+    };
+    let debug = format!("{set:?}");
+    assert!(debug.contains("[REDACTED]"));
+    assert!(!debug.contains("super-secret-value"));
+}
+
+#[test]
+fn credential_patch_dto_deserializes_absent_null_and_set() {
+    let json = r#"{"secret": null, "fallback": "none"}"#;
+    let dto: CredentialPatchDto = serde_json::from_str(json).expect("deserialize");
+    assert_eq!(dto.secret, Some(None));
+    assert_eq!(dto.fallback, Some(Some(FallbackDto::None)));
+    assert_eq!(dto.sharing, None, "omitted field must be Absent (None)");
+    assert_eq!(dto.expires_at, None);
+    assert_eq!(dto.secret_type, None);
+
+    let json2 = r#"{"secret": "rotated"}"#;
+    let dto2: CredentialPatchDto = serde_json::from_str(json2).expect("deserialize");
+    assert_eq!(dto2.secret, Some(Some("rotated".to_owned())));
+}
+
+#[test]
+fn credential_dto_from_credential_own_row() {
+    let owner = Uuid::new_v4();
+    let cred = Credential {
+        reference: sref("k"),
+        secret_type: SecretType::generic().gts_id().to_owned(),
+        sharing: SharingMode::Shared,
+        inheritance: InheritanceStatus::Own,
+        expires_at: None,
+        own: Some(OwnRow {
+            status: CredentialStatus::Active,
+            fallback: Fallback::Inherit,
+            updated_at: time::OffsetDateTime::now_utc(),
+            owner_id: OwnerId(owner),
+            validator: Validator {
+                id: Uuid::new_v4(),
+                version: 3,
+            },
+        }),
+    };
+    let dto = CredentialDto::try_from_credential(&cred).expect("no formatting error");
+    assert_eq!(dto.reference, "k");
+    assert_eq!(dto.sharing, SharingModeDto::Shared);
+    assert_eq!(dto.fallback, Some(FallbackDto::Inherit));
+    assert_eq!(dto.status, CredentialStatusDto::Active);
+    assert_eq!(dto.inheritance, InheritanceStatusDto::Own);
+    assert_eq!(dto.version, Some(3));
+    assert!(dto.updated_at.is_some());
+    assert_eq!(dto.owner_id, Some(owner.to_string()));
+
+    // The own row's owner id is present on the wire too.
+    let json = serde_json::to_value(&dto).expect("serialize");
+    assert_eq!(json["owner_id"], owner.to_string());
+}
+
+#[test]
+fn credential_dto_from_credential_no_own_row() {
+    let cred = Credential {
+        reference: sref("k"),
+        secret_type: SecretType::generic().gts_id().to_owned(),
+        sharing: SharingMode::Shared,
+        inheritance: InheritanceStatus::Inherited,
+        expires_at: None,
+        own: None,
+    };
+    let dto = CredentialDto::try_from_credential(&cred).expect("no formatting error");
+    assert_eq!(dto.fallback, None);
+    assert_eq!(dto.version, None);
+    assert_eq!(dto.updated_at, None);
+    assert_eq!(dto.status, CredentialStatusDto::None);
+    assert_eq!(
+        dto.owner_id, None,
+        "an inherited record must not carry an ancestor's owner id"
+    );
+
+    // Fields absent from Credential must be absent from the wire too.
+    let json = serde_json::to_value(&dto).expect("serialize");
+    assert!(json.get("fallback").is_none());
+    assert!(json.get("version").is_none());
+    assert!(json.get("updated_at").is_none());
+    assert!(
+        json.get("owner_id").is_none(),
+        "owner_id key must be absent (not null) on the wire"
+    );
+}
+
+fn cred_with_secret_fields(owner: Uuid) -> Credential {
+    Credential {
+        reference: sref("k"),
+        secret_type: SecretType::generic().gts_id().to_owned(),
+        sharing: SharingMode::Tenant,
+        inheritance: InheritanceStatus::Own,
+        expires_at: None,
+        own: Some(OwnRow {
+            status: CredentialStatus::Active,
+            fallback: Fallback::Inherit,
+            updated_at: time::OffsetDateTime::UNIX_EPOCH,
+            owner_id: OwnerId(owner),
+            validator: Validator {
+                id: Uuid::new_v4(),
+                version: 1,
+            },
+        }),
+    }
+}
+
+#[test]
+fn credential_dto_try_from_parts_carries_secret_and_debug_redacts_it() {
+    let cred = cred_with_secret_fields(Uuid::new_v4());
+    let value = SecretValue::from("super-secret-value");
+    let dto = CredentialDto::try_from_parts(&cred, Some(&value)).expect("utf-8 value");
+    let debug = format!("{dto:?}");
+    assert!(debug.contains("[REDACTED]"));
+    assert!(!debug.contains("super-secret-value"));
+    assert_eq!(dto.secret.as_deref(), Some("super-secret-value"));
+
+    let json = serde_json::to_value(&dto).expect("serialize");
+    assert_eq!(json["secret"], "super-secret-value");
+}
+
+#[test]
+fn credential_dto_try_from_parts_without_secret_omits_the_key() {
+    let cred = cred_with_secret_fields(Uuid::new_v4());
+    let dto = CredentialDto::try_from_parts(&cred, None).expect("no value");
+    assert_eq!(dto.secret, None);
+    let json = serde_json::to_value(&dto).expect("serialize");
+    assert!(
+        json.get("secret").is_none(),
+        "secret key must be absent, not null"
+    );
+}
+
+#[test]
+fn credential_dto_rejects_non_utf8_value() {
+    let cred = cred_with_secret_fields(Uuid::new_v4());
+    let value = SecretValue::new(vec![0xff, 0xfe, 0x00]);
+    let err = CredentialDto::try_from_parts(&cred, Some(&value))
+        .expect_err("non-UTF-8 value must be rejected, not lossily decoded");
+    assert!(matches!(
+        err,
+        crate::domain::error::DomainError::Internal { .. }
+    ));
+}
+
+#[test]
+fn credential_dto_try_from_list_item_carries_the_item_secret() {
+    let cred = cred_with_secret_fields(Uuid::new_v4());
+    let item = CredentialListItem {
+        credential: cred,
+        secret: Some(SecretValue::from("listed-value")),
+    };
+    let dto = CredentialDto::try_from_list_item(&item).expect("utf-8 value");
+    assert_eq!(dto.secret.as_deref(), Some("listed-value"));
+}
+
+#[test]
+fn weak_etag_is_deterministic_opaque_and_sensitive_to_its_inputs() {
+    let tenant = Uuid::new_v4();
+    let winner_id = Uuid::new_v4();
+    let a = weak_etag(tenant, "ref", winner_id, 1);
+    let b = weak_etag(tenant, "ref", winner_id, 1);
+    assert_eq!(a, b, "deterministic");
+    assert!(a.starts_with("W/\""));
+    assert!(a.ends_with('"'));
+
+    let different_version = weak_etag(tenant, "ref", winner_id, 2);
+    assert_ne!(a, different_version, "must change when the winner rotates");
+
+    let different_ref = weak_etag(tenant, "other-ref", winner_id, 1);
+    assert_ne!(a, different_ref);
+
+    let different_tenant = weak_etag(Uuid::new_v4(), "ref", winner_id, 1);
+    assert_ne!(a, different_tenant);
+}

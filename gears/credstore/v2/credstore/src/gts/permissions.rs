@@ -4,8 +4,9 @@
 //!
 //! Declares every permission credstore can grant as a well-known GTS instance
 //! of [`AuthzPermissionV1`] via [`gts_instance!`]. Each invocation submits an
-//! [`InventoryInstance`] to the process-wide `toolkit-gts` inventory;
-//! `types-registry::init()` aggregates them at boot.
+//! [`InventoryInstance`] to this crate's collector, which the gear publishes
+//! itself before `init`, and to the process-wide inventory an embedded
+//! `types-registry::init()` still aggregates.
 //!
 //! `resource_type` for all six is [`credstore_sdk::CREDENTIAL_RESOURCE_TYPE`],
 //! the base credential type id (with its trailing `~`) — per
@@ -29,10 +30,11 @@
 //!
 //! [`AuthzPermissionV1`]: toolkit_gts::AuthzPermissionV1
 //! [`InventoryInstance`]: toolkit_gts::InventoryInstance
-//! [`gts_instance!`]: toolkit_gts::gts_instance
+//! [`gts_instance!`]: toolkit_gts::local::gts_instance
 
 use credstore_sdk::CREDENTIAL_RESOURCE_TYPE;
-use toolkit_gts::{AuthzPermissionV1, gts_instance};
+use toolkit_gts::AuthzPermissionV1;
+use toolkit_gts::local::gts_instance;
 
 use crate::domain::authz::actions;
 
