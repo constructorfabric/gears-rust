@@ -150,6 +150,98 @@ with `CredStorePluginError::unavailable(detail, retry_after)`,
 never carry secret bytes or the plugin's own credentials: the plugin redacts
 whatever text the store returned before it goes into either.
 
+### Plugin conformance suite
+
+Any `CredStorePluginClientV2` implementation, in-tree or out-of-tree (a
+customer's `PostgreSQL` plugin, say), can prove it meets the backend contract
+with the suite in `credstore_v2_sdk::conformance`, behind the `conformance`
+feature. Add the feature to the plugin's dev-dependencies (the generated tests
+also need `tokio` with `rt` and `macros`):
+
+```toml
+[dev-dependencies]
+credstore-sdk = { package = "cf-gears-credstore-v2-sdk", version = "0.1", features = ["conformance"] }
+tokio = { version = "1", features = ["rt", "macros"] }
+```
+
+One macro line then generates one `#[tokio::test]` per check, each against a
+fresh plugin built by the expression (it may `.await`):
+
+```no_run
+# #[cfg(feature = "conformance")]
+# mod conformance_tests {
+# use async_trait::async_trait;
+# use credstore_v2_sdk::{
+#     CredStorePluginClientV2, CredStorePluginError, SecretValue, StoreKey, ValueVersion,
+# };
+# use toolkit_security::SecurityContext;
+# #[derive(Default)]
+# struct MyPlugin;
+# #[async_trait]
+# impl CredStorePluginClientV2 for MyPlugin {
+#     async fn put(&self, _: &SecurityContext, _: &StoreKey, _: SecretValue)
+#         -> Result<ValueVersion, CredStorePluginError> { unimplemented!() }
+#     async fn get(&self, _: &SecurityContext, _: &StoreKey, _: &ValueVersion)
+#         -> Result<Option<SecretValue>, CredStorePluginError> { unimplemented!() }
+#     async fn delete_key(&self, _: &SecurityContext, _: &StoreKey)
+#         -> Result<(), CredStorePluginError> { unimplemented!() }
+# }
+use credstore_v2_sdk::credstore_plugin_conformance;
+
+credstore_plugin_conformance!(MyPlugin::default());
+# }
+# fn main() {}
+```
+
+Outer attributes written before the expression are applied to every generated
+test. A plugin whose backend needs Docker keeps the suite out of a default
+`cargo test` with `#[ignore]`:
+
+```no_run
+# #[cfg(feature = "conformance")]
+# mod conformance_tests {
+# use async_trait::async_trait;
+# use credstore_v2_sdk::{
+#     CredStorePluginClientV2, CredStorePluginError, SecretValue, StoreKey, ValueVersion,
+# };
+# use toolkit_security::SecurityContext;
+# struct MyPlugin;
+# impl MyPlugin {
+#     async fn connect_to_docker_backend() -> Self {
+#         Self
+#     }
+# }
+# #[async_trait]
+# impl CredStorePluginClientV2 for MyPlugin {
+#     async fn put(&self, _: &SecurityContext, _: &StoreKey, _: SecretValue)
+#         -> Result<ValueVersion, CredStorePluginError> { unimplemented!() }
+#     async fn get(&self, _: &SecurityContext, _: &StoreKey, _: &ValueVersion)
+#         -> Result<Option<SecretValue>, CredStorePluginError> { unimplemented!() }
+#     async fn delete_key(&self, _: &SecurityContext, _: &StoreKey)
+#         -> Result<(), CredStorePluginError> { unimplemented!() }
+# }
+use credstore_v2_sdk::credstore_plugin_conformance;
+
+credstore_plugin_conformance!(
+    #[ignore = "needs Docker; run with `-- --ignored`"]
+    MyPlugin::connect_to_docker_backend().await
+);
+# }
+# fn main() {}
+```
+
+The checks cover exact bytes (text, binary with NUL and invalid UTF-8, empty,
+64 KiB), a new immutable version per `put`, absence (`None` for a never-written
+key or a never-issued version), key isolation across tenants and records,
+`delete_key` (removes every version, idempotent), concurrent puts, and, when
+`destroyer()` is `Some`, `destroy` (`Below`, `Exactly`, idempotency) and
+ordered versions, observed through `destroy(Below(..))` because versions are
+opaque. A plugin whose `destroyer()` is `None` skips those checks and is
+never asked to destroy. Every check uses fresh random ids, so checks can share
+one backend. See the module docs for the full list and what the suite leaves
+to the plugin (`Internal` for an unreadable version, `Unavailable`, `CredentialsRejected`,
+durability across a restart).
+
 ## Usage
 
 A `ToolKit` consumer normally obtains `CredStoreClientV2` from `ClientHub`. The SDK

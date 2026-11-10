@@ -43,5 +43,17 @@ toolkit-odata = { workspace = true }
 # Domain types owned by tenant-resolver
 tenant-resolver-sdk = { workspace = true }
 
+# Plugin conformance suite (`conformance` feature): concurrent calls, skip notices
+futures-util = { workspace = true, optional = true }
+tracing = { workspace = true, optional = true }
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros"] }
+
+[features]
+# Centralized `CredStoreClientV1` test double for downstream gears' tests.
+test-util = []
+# Reusable conformance suite for `CredStorePluginClientV2` implementations
+# (`credstore_v2_sdk::conformance`). Enable it in a plugin's dev-dependencies; the
+# generated tests need `tokio` with `rt` and `macros` there too.
+conformance = ["dep:futures-util", "dep:tracing", "uuid/v4"]
