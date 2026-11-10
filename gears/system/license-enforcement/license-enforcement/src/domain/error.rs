@@ -1,7 +1,7 @@
 //! Domain errors and their canonical mapping (DESIGN §3.3, Error model).
 
 use license_enforcement_sdk::error::{PRECONDITION_TYPE, aborted, precondition};
-use license_enforcement_sdk::{GrantId, RejectionReason};
+use license_enforcement_sdk::{DelegationId, GrantId, RejectionReason};
 use toolkit_canonical_errors::{CanonicalError, FieldViolation, resource_error};
 use toolkit_macros::domain_model;
 
@@ -11,12 +11,16 @@ struct GrantResourceError;
 #[resource_error(gts_id!("cf.core.license_enforcement.pack.v1~"))]
 struct PackResourceError;
 
+#[resource_error(gts_id!("cf.core.license_enforcement.delegation.v1~"))]
+struct DelegationResourceError;
+
 /// What a [`DomainError::NotFound`] did not find.
 #[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Missing {
     Grant,
     Pack,
+    Delegation,
 }
 
 #[domain_model]
@@ -39,11 +43,20 @@ pub enum DomainError {
     #[error("invalid transition: {0}")]
     InvalidTransition(String),
 
+    /// Replacement cannot carry the bindings of these grants.
+    #[error("{} binding(s) without a successor", .0.len())]
+    /// Each grant whose binding has no successor, with the delegation in its
+    /// chain that does not fit the successor, when one is the cause.
+    BindingsWithoutSuccessor(Vec<(GrantId, Option<DelegationId>)>),
+
     #[error("expected_version differs")]
     VersionMismatch,
 
     #[error("a concurrent write changed the plugin material")]
     AdmissionConflict,
+
+    #[error("a concurrent replacement moved a tree")]
+    TreeMoved,
 
     /// The plugin admitted a root whose id is already stored: a retry admits
     /// it again.
@@ -63,6 +76,11 @@ pub enum DomainError {
     #[error("the linked plugin does not serve the intake of this operation")]
     IntakeNotServed,
 
+    /// `renew` changes the stored window, and a plugin that verifies evidence
+    /// takes the window from the evidence: the renewal would not apply.
+    #[error("renew in place needs a plugin that does not verify evidence")]
+    RenewNeedsNewEvidence,
+
     #[error("not implemented yet: {0}")]
     NotImplemented(&'static str),
 
@@ -80,6 +98,10 @@ impl DomainError {
         reason: impl Into<String>,
     ) -> Self {
         Self::InvalidArgument(vec![FieldViolation::new(field, description, reason)])
+    }
+
+    pub fn transition(detail: impl Into<String>) -> Self {
+        Self::InvalidTransition(detail.into())
     }
 
     pub fn store(e: impl std::fmt::Display) -> Self {
@@ -125,6 +147,11 @@ impl From<DomainError> for CanonicalError {
                 Missing::Pack => PackResourceError::not_found(format!("pack {id} not found"))
                     .with_resource(id)
                     .create(),
+                Missing::Delegation => {
+                    DelegationResourceError::not_found(format!("delegation {id} not found"))
+                        .with_resource(id)
+                        .create()
+                }
             },
             DomainError::PermissionDenied => GrantResourceError::permission_denied()
                 .with_reason("ACCESS_DENIED")
@@ -152,6 +179,33 @@ impl From<DomainError> for CanonicalError {
                     PRECONDITION_TYPE,
                 )
                 .create(),
+            DomainError::BindingsWithoutSuccessor(ids) => {
+                let mut ids = ids.into_iter();
+                let Some(first) = ids.next() else {
+                    return CanonicalError::internal("empty binding list").create();
+                };
+                let violation = |(id, blocking): (GrantId, Option<DelegationId>)| {
+                    let detail = match blocking {
+                        Some(d) => format!(
+                            "the binding of grant {id} has no successor: delegation {d} does not fit it"
+                        ),
+                        None => format!("the binding of grant {id} has no successor"),
+                    };
+                    (
+                        precondition::BINDING_WITHOUT_SUCCESSOR,
+                        detail,
+                        PRECONDITION_TYPE,
+                    )
+                };
+                let (s, d, t) = violation(first);
+                let mut builder =
+                    GrantResourceError::failed_precondition().with_precondition_violation(s, d, t);
+                for v in ids {
+                    let (s, d, t) = violation(v);
+                    builder = builder.with_precondition_violation(s, d, t);
+                }
+                builder.create()
+            }
             DomainError::VersionMismatch => {
                 GrantResourceError::aborted("expected_version differs from the current version")
                     .with_reason(aborted::OPTIMISTIC_LOCK_FAILURE)
@@ -161,6 +215,11 @@ impl From<DomainError> for CanonicalError {
                 "a concurrent admission changed the plugin material; retry with the same token",
             )
             .with_reason(aborted::ADMISSION_CONFLICT)
+            .create(),
+            DomainError::TreeMoved => GrantResourceError::aborted(
+                "a concurrent replacement moved a tree; retry with the same token",
+            )
+            .with_reason(aborted::TREE_MOVED)
             .create(),
             DomainError::RootAlreadyAdmitted(id) => GrantResourceError::already_exists(
                 "the evidence names a root that is already stored",
@@ -184,6 +243,12 @@ impl From<DomainError> for CanonicalError {
                 .create(),
             DomainError::IntakeNotServed => GrantResourceError::unimplemented(
                 "the linked admission plugin does not serve the intake of this operation",
+            )
+            .create(),
+            DomainError::RenewNeedsNewEvidence => GrantResourceError::unimplemented(
+                "renew in place needs an admission plugin that does not verify evidence; \
+                 new evidence replaces the grant: `replace` when the plugin also admits \
+                 `issue` requests, evidence supersession (not implemented yet) otherwise",
             )
             .create(),
             DomainError::NotImplemented(op) => {

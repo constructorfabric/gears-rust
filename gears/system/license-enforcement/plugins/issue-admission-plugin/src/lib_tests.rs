@@ -1,7 +1,7 @@
 use gts::GtsTypeId;
 use license_enforcement_sdk::models::{PermissionsInput, ResourceRefInput, WindowInput};
 use license_enforcement_sdk::{
-    CallerIdentity, EvidenceId, Intake, MaterialError, linked_admission_plugin,
+    CallerIdentity, EvidenceId, Intake, MaterialError, RequestedRoot, linked_admission_plugin,
 };
 use time::OffsetDateTime;
 use time::macros::datetime;
@@ -43,17 +43,16 @@ fn terms() -> GrantTerms {
 fn issue(grants: Vec<GrantTerms>, token: &str) -> (AdmissionInput, Uuid, Uuid) {
     let caller_tenant = Uuid::now_v7();
     let holder = Uuid::now_v7();
-    let input = AdmissionInput::Issue {
-        holder_tenant_id: holder,
-        grants,
-        as_pack: true,
-        caller: CallerIdentity {
-            subject_id: Uuid::now_v7(),
-            subject_type: Some("user".to_owned()),
-            tenant_id: caller_tenant,
-        },
-        idempotency_token: token.to_owned(),
+    let grants = grants
+        .into_iter()
+        .map(|t| RequestedRoot::new(GrantId(Uuid::now_v7()), t))
+        .collect();
+    let caller = CallerIdentity {
+        subject_id: Uuid::now_v7(),
+        subject_type: Some("user".to_owned()),
+        tenant_id: caller_tenant,
     };
+    let input = AdmissionInput::issue(holder, grants, true, caller, token);
     (input, caller_tenant, holder)
 }
 
@@ -67,6 +66,11 @@ fn links_as_the_only_plugin() {
 #[tokio::test]
 async fn admit_names_each_root_in_the_evidence() {
     let (input, caller_tenant, holder) = issue(vec![terms(), terms()], "t-1");
+    let AdmissionInput::Issue { caller, grants, .. } = &input else {
+        unreachable!()
+    };
+    let caller_subject = caller.subject_id;
+    let root_ids: Vec<GrantId> = grants.iter().map(|r| r.id).collect();
     let admission = IssueAdmissionPlugin
         .admit(input, OffsetDateTime::now_utc(), &NoMaterial)
         .await
@@ -75,7 +79,8 @@ async fn admit_names_each_root_in_the_evidence() {
     assert!(admission.as_pack);
     assert!(admission.material.is_empty());
     assert_eq!(admission.roots.len(), 2);
-    assert_ne!(admission.roots[0].id, admission.roots[1].id);
+    let ids: Vec<GrantId> = admission.roots.iter().map(|r| r.id).collect();
+    assert_eq!(ids, root_ids);
     assert!(
         admission
             .roots
@@ -84,7 +89,10 @@ async fn admit_names_each_root_in_the_evidence() {
     );
 
     let evidence = admission.evidence.unwrap();
-    assert_eq!(evidence.replay_key, Some(format!("{caller_tenant}:t-1")));
+    assert_eq!(
+        evidence.replay_key,
+        Some(format!("{caller_tenant}:{caller_subject}:t-1"))
+    );
     assert_eq!(evidence.replaces, None);
     let body: serde_json::Value = serde_json::from_slice(&evidence.bytes).unwrap();
     let ids: Vec<String> = body["roots"]
@@ -102,7 +110,7 @@ async fn admit_names_each_root_in_the_evidence() {
 async fn admit_rejects_import() {
     let err = IssueAdmissionPlugin
         .admit(
-            AdmissionInput::Import { bytes: vec![1] },
+            AdmissionInput::import(vec![1]),
             OffsetDateTime::now_utc(),
             &NoMaterial,
         )

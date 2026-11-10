@@ -513,7 +513,7 @@ test-eb-kafka: install-tools
 TOOLKIT_DB_LANES := toolkit-db-sqlite toolkit-db-pg toolkit-db-pgq toolkit-db-mysql
 INTEGRATION_LANES := $(TOOLKIT_DB_LANES) users-info-pg usage-collector-pg usage-collector-ch \
 	types-registry-db oagw-db oagw-cluster cluster-pg cluster-redis rg-pg settings-service-pg credstore-pg construct-pg \
-	pricing-pg coord-pg products-pg ledger-pg orders-pg eb-gear-db quota-enforcement-pg
+	pricing-pg coord-pg products-pg ledger-pg orders-pg eb-gear-db quota-enforcement-pg license-enforcement-pg
 
 ## toolkit-db on SQLite; the examples must still build after the tests.
 lane_args_toolkit-db-sqlite = -p cf-gears-toolkit-db --features sqlite,integration
@@ -641,6 +641,13 @@ lane_env_credstore-pg = CREDSTORE_PG_REQUIRE_DOCKER=1
 ## CONSTRUCT_PG_REQUIRE_DOCKER=1 turns an unreachable Docker into a failure.
 lane_args_construct-pg = -p cf-gears-construct --features integration --test pg_erasure_test
 lane_env_construct-pg = CONSTRUCT_PG_REQUIRE_DOCKER=1
+
+## The license-enforcement gear's unit suite on PostgreSQL (Docker required;
+## every test gets its own database on one shared, named postgres container,
+## `license-enforcement-pg-harness`, which is reused across runs — remove it
+## with `docker rm -fv` to start clean): the row locks, lock order and snapshot
+## reads that SQLite does not exercise.
+lane_args_license-enforcement-pg = -p cf-gears-license-enforcement --features integration --lib
 
 ## bss-pricing's Postgres tier (Docker required; each suite spins up its own
 ## postgres container via testcontainers).

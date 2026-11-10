@@ -13,8 +13,8 @@ use time::Duration;
 use tokio_util::sync::CancellationToken;
 use toolkit::api::OpenApiRegistry;
 use toolkit::client_hub::ClientScope;
-use toolkit::contracts::RunnableCapability;
 use toolkit::gts::PluginV1;
+use toolkit::lifecycle::ReadySignal;
 use toolkit::{DatabaseCapability, Gear, GearCtx, RestApiCapability};
 use toolkit_db::DBProvider;
 use toolkit_db::odata::LimitCfg;
@@ -24,7 +24,7 @@ use types_registry_sdk::{RegisterResult, TypesRegistryClient};
 use crate::config::LicenseEnforcementConfig;
 use crate::domain::check::CheckService;
 use crate::domain::error::DomainError;
-use crate::domain::grants::GrantService;
+use crate::domain::grants::{GrantService, SWEEP_LOCK};
 use crate::domain::local_client::{LocalClient, ResolverAdapter};
 use crate::domain::types::TypeResolver;
 use crate::infra::storage::Store;
@@ -45,11 +45,14 @@ pub const INSTANCE_SUFFIX: &str = "cf.builtin.license_enforcement.plugin.v1";
 #[toolkit::gear(
     name = "license-enforcement",
     deps = [types_registry, authz_resolver, tenant_resolver],
-    capabilities = [db, rest, stateful]
+    capabilities = [db, rest, stateful],
+    lifecycle(entry = "serve", stop_timeout = "30s", await_ready)
 )]
 #[derive(Default)]
 pub struct LicenseEnforcement {
     grants: OnceLock<Arc<Grants>>,
+    /// Retention of terminated grants and the interval of the sweeper.
+    sweep: OnceLock<(Duration, std::time::Duration)>,
     named_types: OnceLock<(TypeResolver, Vec<GtsTypeId>)>,
 }
 
@@ -96,8 +99,17 @@ impl Gear for LicenseEnforcement {
         self.grants
             .set(Arc::clone(&grants))
             .map_err(|_| anyhow::anyhow!("{} gear already initialized", Self::MODULE_NAME))?;
+        self.sweep
+            .set((
+                Duration::days(cfg.retention_days),
+                std::time::Duration::from_secs(cfg.sweep_interval_secs),
+            ))
+            .map_err(|_| anyhow::anyhow!("{} gear already initialized", Self::MODULE_NAME))?;
 
-        hub.register::<dyn LicenseEnforcementApi>(Arc::new(LocalClient::new(grants)));
+        hub.register::<dyn LicenseEnforcementApi>(Arc::new(LocalClient::new(
+            grants,
+            Arc::clone(&check),
+        )));
 
         let (instance_id, instance_json) =
             PluginV1::<LicenseResolverPluginSpecV1>::build_registration(
@@ -125,19 +137,48 @@ impl Gear for LicenseEnforcement {
     }
 }
 
-#[async_trait]
-impl RunnableCapability for LicenseEnforcement {
-    async fn start(&self, _cancel: CancellationToken) -> anyhow::Result<()> {
-        let (types, named) = self
-            .named_types
-            .get()
-            .ok_or_else(|| anyhow::anyhow!("{} gear not initialized", Self::MODULE_NAME))?;
+impl LicenseEnforcement {
+    /// The lifecycle entry: ready once the types that the evaluator names are
+    /// registered, then the retention sweeper until `cancel`. A cancelled
+    /// sweep rolls its transaction back.
+    pub(crate) async fn serve(
+        self: Arc<Self>,
+        cancel: CancellationToken,
+        ready: ReadySignal,
+    ) -> anyhow::Result<()> {
+        let not_initialized = || anyhow::anyhow!("{} gear not initialized", Self::MODULE_NAME);
+        let (types, named) = self.named_types.get().ok_or_else(not_initialized)?;
         types.ensure_registered(named).await?;
+        let grants = Arc::clone(self.grants.get().ok_or_else(not_initialized)?);
+        let (retention, interval) = *self.sweep.get().ok_or_else(not_initialized)?;
+        // A marker that a killed process left on the file lock of SQLite.
+        grants
+            .db()
+            .remove_lock_marker_at_startup(SWEEP_LOCK.0, SWEEP_LOCK.1)
+            .await?;
+        ready.notify();
+        let first = tokio::time::Instant::now() + interval;
+        let mut tick = tokio::time::interval_at(first, interval);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                () = cancel.cancelled() => break,
+                _ = tick.tick() => {}
+            }
+            tokio::select! {
+                () = cancel.cancelled() => break,
+                () = sweep_once(&grants, retention) => {}
+            }
+        }
         Ok(())
     }
+}
 
-    async fn stop(&self, _deadline: CancellationToken) -> anyhow::Result<()> {
-        Ok(())
+async fn sweep_once(grants: &Grants, retention: Duration) {
+    match grants.sweep(retention).await {
+        Ok(Some((grants, records))) => info!(grants, records, "license-enforcement sweep"),
+        Ok(None) => {}
+        Err(e) => tracing::warn!(error = %e, "license-enforcement sweep failed"),
     }
 }
 

@@ -43,6 +43,7 @@ fn grant() -> Grant {
         },
         recipient_rules: None,
         parent_grant_id: None,
+        grantor_tenant_id: None,
         delegation_id: None,
         pack_id: None,
         evidence_id: EvidenceId(Uuid::nil()),
@@ -73,6 +74,7 @@ fn inherited_validity_and_delegated_binding_round_trip() {
     };
     g.binding = Binding::Delegated {
         grant_id: GrantId(Uuid::nil()),
+        tenant_id: Uuid::nil(),
     };
     let json = serde_json::to_value(&g).unwrap();
     assert_eq!(json["validity"]["kind"], "inherited");

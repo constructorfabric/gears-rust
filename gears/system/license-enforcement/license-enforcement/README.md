@@ -8,14 +8,16 @@ The binary links exactly one admission plugin and one evaluator; the gear does n
 otherwise. The defaults are [`issue-admission-plugin`](../plugins/issue-admission-plugin) and
 [`default-evaluator`](../plugins/default-evaluator).
 
-## Implemented
+## Not implemented yet
 
-- `issue_grant`, `issue_pack` through the `issue` intake;
-- `bind_grant`, `unbind_grant`;
-- `get_grant`, `get_pack`, `list_grants`;
-- the check: `is_licensed` of license-resolver.
+These return `unimplemented`:
 
-Every other operation of the contract returns `unimplemented` for now.
+- `import_evidence`, and evidence that replaces other evidence (supersession);
+- recipient rules: `issue` refuses a grant with them, because the gear does not build the
+  recipient projection that `delegate` evaluates them against;
+- conditions added at `delegate`: the evaluator cannot combine them with the parent conditions
+  yet, so a sub-grant takes the conditions of its parent. `replace` moves a delegation only to a
+  successor whose conditions equal those of the sub-grant; it changes together with this item.
 
 ## Configuration
 
@@ -24,25 +26,48 @@ license-enforcement:
   database:
     server: "sqlite_users"
     file: "license_enforcement.db"
+    params:
+      # SQLite only: verbs wait for the write lock instead of failing at once
+      # beside another writer; checks stay deferred.
+      transaction_mode: "immediate"
   config:
     vendor: "constructorfabric"    # license-resolver selects its backend by vendor
     priority: 50                   # lower wins among backends of the same vendor
     idempotency_window_secs: 86400
-    max_candidates: 100            # most candidate grants that one check reads
+    default_page_size: 50
+    max_page_size: 1000
+    max_candidates: 100
+    retention_days: 400
+    sweep_interval_secs: 3600
 ```
+
+The values above are the defaults. The gear does not start when a value is out of range.
+
+| Key | Meaning | Range |
+|---|---|---|
+| `vendor` | Vendor of the backend that the gear registers in `license-resolver`; `license-resolver` selects its backend by vendor. | any string |
+| `priority` | Priority among the backends of the same vendor; the lower value wins. 50 wins over the default of the static license plugin (100). | `i16` |
+| `idempotency_window_secs` | How long the answer to a mutating request is kept: a repeat with the same idempotency token in this window gets that answer. | 1 s ..= one year |
+| `default_page_size` | Page size of a list without `limit`. | 1 ..= `max_page_size` |
+| `max_page_size` | Largest `limit` of a list. | `default_page_size` ..< `u64::MAX` |
+| `max_candidates` | Most candidate grants that one check reads. | 1 ..= 1000 |
+| `retention_days` | How long a terminated grant is kept before the sweeper deletes it. | 1 ..= 36 500, and at least `idempotency_window_secs` |
+| `sweep_interval_secs` | Pause between two runs of the sweeper, which deletes terminated grants after `retention_days` and the expired answers of `idempotency_window_secs`. | 1 s ..= one week |
 
 ## Known limits
 
-- `issue`, `bind`, and `unbind` write no audit events and emit no metrics yet. The history of
-  these changes before audit exists cannot be restored later, so turn the gear on only in
-  development environments until then.
-- Nothing deletes expired idempotency records yet: a record goes only when its tenant sends the
-  same token again, so the table grows with every mutation.
+- No operation writes audit events or emits metrics yet. The history of changes made before
+  audit exists cannot be restored later, so turn the gear on only in development environments
+  until then.
 - A grant keeps the id of the plugin that admitted its evidence. A binary that links another
   plugin denies every check on such grants as `chain_invalid`. To change the plugin, issue the
   grants again.
 - The default of `max_candidates` is an estimate, not a measurement: the check benchmark of the
   NFR does not exist yet.
-- The size limits of the SDK (`license_enforcement_sdk::limits`) apply to `issue_grant`,
-  `issue_pack`, and `bind_grant`. `MAX_EVIDENCE_LEN` and the token limit of the other operations
-  apply when those operations are implemented.
+- `MAX_EVIDENCE_LEN` of the SDK applies when `import_evidence` is implemented.
+- `renew` of a grant or a pack returns `unimplemented` when the linked plugin verifies evidence: the
+  window comes from the evidence there, so a renewal needs new evidence. That is `replace` when the
+  plugin also admits `issue` requests, and evidence supersession (not implemented yet) otherwise.
+- `replace` moves a delegation only to a successor whose `max_depth` is one more than that of the
+  sub-grant. A new plan with a deeper delegation does not take the existing delegations: the
+  grantors recall them first, or the vendor keeps the depth.

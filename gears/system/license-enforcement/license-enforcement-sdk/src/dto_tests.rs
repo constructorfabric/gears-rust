@@ -33,14 +33,7 @@ fn verb_request_rejects_unknown_fields_and_missing_token() {
 
 #[test]
 fn check_explanation_serializes_reason_as_wire_string() {
-    let explanation = CheckExplanation {
-        granted: false,
-        reason: Some(DenialReason::SubjectNotBound),
-        termination_reason: None,
-        grant_id: None,
-        grace: false,
-        diagnostics: std::collections::HashMap::default(),
-    };
+    let explanation = CheckExplanation::denied(DenialReason::SubjectNotBound, None);
     let json = serde_json::to_value(&explanation).unwrap();
     assert_eq!(json["reason"], "subject_not_bound");
     assert_eq!(
@@ -57,6 +50,7 @@ fn list_query_uses_odata_wire_keys() {
         orderby: Some("resource_type asc".to_owned()),
         limit: Some(10),
         cursor: Some("c1".to_owned()),
+        include_subtree: true,
     };
     let encoded = toolkit_contract::query::to_query_string(&query)
         .unwrap()
@@ -65,5 +59,30 @@ fn list_query_uses_odata_wire_keys() {
         .split('&')
         .filter_map(|pair| pair.split('=').next())
         .collect();
-    assert_eq!(keys, ["%24filter", "%24orderby", "limit", "cursor"]);
+    assert_eq!(
+        keys,
+        [
+            "%24filter",
+            "%24orderby",
+            "limit",
+            "cursor",
+            "include_subtree"
+        ]
+    );
+}
+
+/// Each party of a delegation reads a side that names itself on the wire.
+#[test]
+fn delegation_grants_name_their_side() {
+    let given = serde_json::to_value(super::DelegationGrants::Given { grants: vec![] }).unwrap();
+    assert_eq!(given, serde_json::json!({ "side": "given", "grants": [] }));
+    let received =
+        serde_json::to_value(super::DelegationGrants::Received { grants: vec![] }).unwrap();
+    assert_eq!(
+        received,
+        serde_json::json!({ "side": "received", "grants": [] })
+    );
+    let later: super::DelegationGrants =
+        serde_json::from_value(serde_json::json!({ "side": "tree", "nodes": [] })).unwrap();
+    assert_eq!(later, super::DelegationGrants::Unknown);
 }

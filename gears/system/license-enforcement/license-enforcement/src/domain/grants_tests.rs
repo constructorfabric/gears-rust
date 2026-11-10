@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use gts::GtsTypeId;
+use license_enforcement_sdk::RejectionReason;
 use license_enforcement_sdk::models::{
     Binding, Conditions, GrantState, SubjectRef, SubjectRefInput,
 };
@@ -10,7 +11,7 @@ use uuid::Uuid;
 
 use super::*;
 use crate::test_support::{
-    ADMIN, AllowAuthZ, DenyAuthZ, GHOST, SERVICE, ctx, env, env_with, env_with_plugin,
+    ADMIN, AllowAuthZ, DenyAuthZ, GHOST, SERVICE, TestPlugin, ctx, env, env_with, env_with_plugin,
     env_with_window, input, tenant_subject, terms, token, user,
 };
 
@@ -116,17 +117,17 @@ async fn an_absent_id_is_allowed_an_empty_or_nul_one_is_not() {
 }
 
 #[tokio::test]
-async fn issue_refuses_a_grant_that_awaits_acceptance() {
+async fn issue_creates_a_grant_that_awaits_acceptance() {
     let env = env().await;
     let tenant = Uuid::now_v7();
     let mut t = terms();
     t.permissions.requires_acceptance = true;
-    let err = env
+    let issued = env
         .grants
         .issue(&ctx(tenant), tenant, vec![t], false, token())
         .await
-        .unwrap_err();
-    assert!(matches!(err, DomainError::NotImplemented(_)), "{err:?}");
+        .unwrap();
+    assert_eq!(issued.grants[0].state, GrantState::AwaitingAcceptance);
 }
 
 #[tokio::test]
@@ -160,6 +161,8 @@ async fn issue_validates_terms() {
     unknown.resource.gts_type = GtsTypeId::new("gts.cf.core.lic.res.v1~test.le.app.nope.v1~");
     let mut not_admitted = terms();
     not_admitted.subject_type = GtsTypeId::new(SERVICE);
+    let mut abstract_resource = terms();
+    abstract_resource.resource.gts_type = GtsTypeId::new(crate::test_support::ABSTRACT);
     let mut conditions = terms();
     conditions.conditions = Some(Conditions(json!({"plan": "pro"})));
     let mut window = terms();
@@ -201,6 +204,7 @@ async fn issue_validates_terms() {
         (year_minus_1, reason::INVALID_WINDOW),
         (fixed_unknown_type, reason::TYPE_NOT_REGISTERED),
         (fixed_wrong_type, reason::TYPE_NOT_DERIVED),
+        (abstract_resource, reason::TYPE_ABSTRACT),
     ];
     for (t, expected) in cases {
         let err = env
@@ -245,6 +249,15 @@ async fn requests_over_size_limits_are_invalid_arguments() {
             false,
             "t".repeat(MAX_IDEMPOTENCY_TOKEN_LEN + 1),
         )
+        .await
+        .unwrap_err();
+    assert_eq!(reasons(&err), too_large());
+    let mut deep = terms();
+    deep.permissions.max_depth =
+        u16::try_from(license_enforcement_sdk::limits::MAX_DELEGATION_DEPTH + 1).unwrap();
+    let err = env
+        .grants
+        .issue(&c, tenant, vec![deep], false, token())
         .await
         .unwrap_err();
     assert_eq!(reasons(&err), too_large());
@@ -338,6 +351,9 @@ async fn issue_is_refused_by_the_pdp() {
 #[tokio::test]
 async fn issue_for_another_tenant_fails_closed_without_tenant_resolver() {
     let env = env().await;
+    env.hub
+        .remove::<dyn tenant_resolver_sdk::TenantResolverClient>()
+        .unwrap();
     let tenant = Uuid::now_v7();
     let err = env
         .grants
@@ -474,7 +490,7 @@ async fn list_orders_only_by_id() {
     ] {
         let err = env
             .grants
-            .list_grants(&c, &ordered(&format!("{field} asc")))
+            .list_grants(&c, &ordered(&format!("{field} asc")), false)
             .await
             .unwrap_err();
         assert!(
@@ -489,7 +505,7 @@ async fn list_orders_only_by_id() {
     }
     let first = env
         .grants
-        .list_grants(&c, &ordered("id asc"))
+        .list_grants(&c, &ordered("id asc"), false)
         .await
         .unwrap();
     let cursor = first.page_info.next_cursor.clone().expect("a second page");
@@ -500,6 +516,7 @@ async fn list_orders_only_by_id() {
             &ODataQuery::new()
                 .with_cursor(toolkit_odata::CursorV1::decode(&cursor).unwrap())
                 .with_order(toolkit_odata::ODataOrderBy::empty()),
+            false,
         )
         .await
         .unwrap();
@@ -529,12 +546,16 @@ async fn type_filters_ignore_minor_versions() {
         "resource_type eq 'gts.cf.core.lic.res.v1.2~test.le.app.seat.v1.7~'",
         "binding_subject_type in ('gts.cf.core.lic.subj.v1~test.le.app.user.v1.3~')",
     ] {
-        let page = env.grants.list_grants(&c, &filtered(raw)).await.unwrap();
+        let page = env
+            .grants
+            .list_grants(&c, &filtered(raw), false)
+            .await
+            .unwrap();
         assert_eq!(page.items.len(), 1, "{raw}");
     }
     let err = env
         .grants
-        .list_grants(&c, &filtered("contains(resource_type, 'seat')"))
+        .list_grants(&c, &filtered("contains(resource_type, 'seat')"), false)
         .await
         .unwrap_err();
     assert!(
@@ -547,7 +568,7 @@ async fn type_filters_ignore_minor_versions() {
     // PostgreSQL does not take a NUL: the filter is refused before the store.
     let err = env
         .grants
-        .list_grants(&c, &filtered("binding_subject_id eq 'a\u{0}b'"))
+        .list_grants(&c, &filtered("binding_subject_id eq 'a\u{0}b'"), false)
         .await
         .unwrap_err();
     assert!(
@@ -634,12 +655,7 @@ async fn bind_and_unbind() {
         )
         .await
         .unwrap();
-    assert_eq!(
-        bound.binding,
-        Binding::Subject {
-            subject: user("alice")
-        }
-    );
+    assert_eq!(bound.binding, Binding::subject(user("alice")));
     assert_eq!(bound.version, 2);
     let replay = env
         .grants
@@ -722,7 +738,7 @@ async fn bind_accepts_derived_subject_types_only() {
         .change_binding(&c, g.id, BindingChange::Bind(admin.clone()), token(), None)
         .await
         .unwrap();
-    assert_eq!(bound.binding, Binding::Subject { subject: admin });
+    assert_eq!(bound.binding, Binding::subject(admin));
 }
 
 #[tokio::test]
@@ -768,7 +784,7 @@ async fn reads_are_scoped_to_the_tenant() {
 
     let page = env
         .grants
-        .list_grants(&ctx(a), &ODataQuery::new())
+        .list_grants(&ctx(a), &ODataQuery::new(), false)
         .await
         .unwrap();
     assert_eq!(page.items, vec![g.clone()]);
@@ -819,7 +835,7 @@ async fn list_with_an_empty_scope_is_an_empty_page() {
 
         let page = env
             .grants
-            .list_grants(&ctx(a), &ODataQuery::new())
+            .list_grants(&ctx(a), &ODataQuery::new(), false)
             .await
             .expect("a permitted LIST succeeds even when its scope is empty");
         let expected = if live { vec![g.clone()] } else { vec![] };
@@ -829,7 +845,11 @@ async fn list_with_an_empty_scope_is_an_empty_page() {
         // The query is still validated.
         let bad =
             ODataQuery::new().with_order(toolkit::api::odata::parse_orderby("state asc").unwrap());
-        let err = env.grants.list_grants(&ctx(a), &bad).await.unwrap_err();
+        let err = env
+            .grants
+            .list_grants(&ctx(a), &bad, false)
+            .await
+            .unwrap_err();
         assert!(
             matches!(
                 err,
@@ -845,7 +865,7 @@ async fn list_refused_by_the_pdp_is_permission_denied() {
     let env = env_with(Arc::new(DenyAuthZ)).await;
     let err = env
         .grants
-        .list_grants(&ctx(Uuid::now_v7()), &ODataQuery::new())
+        .list_grants(&ctx(Uuid::now_v7()), &ODataQuery::new(), false)
         .await
         .unwrap_err();
     assert!(matches!(err, DomainError::PermissionDenied), "{err:?}");
@@ -868,29 +888,14 @@ async fn bind_refused_by_the_pdp_is_permission_denied() {
     assert!(matches!(err, DomainError::PermissionDenied), "{err:?}");
 }
 
-/// The `issue` plugin, with the external id and the replaced evidence taken
-/// from the token: `"1/b>a"` is evidence `b` that replaces `a`.
-struct ChainPlugin;
-
-#[async_trait::async_trait]
-impl GrantAdmissionPluginV1 for ChainPlugin {
-    fn info(&self) -> license_enforcement_sdk::PluginInfo {
-        le_issue_admission_plugin::IssueAdmissionPlugin.info()
-    }
-
-    fn intakes(&self) -> license_enforcement_sdk::Intakes {
-        le_issue_admission_plugin::IssueAdmissionPlugin.intakes()
-    }
-
-    async fn admit(
-        &self,
-        input: AdmissionInput,
-        instant: OffsetDateTime,
-        material: &dyn license_enforcement_sdk::PluginMaterial,
-    ) -> Result<license_enforcement_sdk::Admission, AdmissionError> {
+#[tokio::test]
+async fn evidence_ids_and_replacement_are_checked() {
+    // The external id and the replaced evidence come from the token:
+    // `"1/b>a"` is evidence `b` that replaces `a`.
+    let chain = TestPlugin::admitting(|input, admission| {
         let AdmissionInput::Issue {
             idempotency_token, ..
-        } = &input
+        } = input
         else {
             unreachable!()
         };
@@ -901,36 +906,12 @@ impl GrantAdmissionPluginV1 for ChainPlugin {
             Some((e, r)) => (e.to_owned(), Some(r.to_owned())),
             None => (ids.to_owned(), None),
         };
-        let mut admission = le_issue_admission_plugin::IssueAdmissionPlugin
-            .admit(input, instant, material)
-            .await?;
         if let Some(e) = admission.evidence.as_mut() {
             e.external_id = Some(external);
             e.replaces = replaces;
         }
-        Ok(admission)
-    }
-
-    async fn verify(
-        &self,
-        root_id: GrantId,
-        evidence: &license_enforcement_sdk::StoredEvidence,
-        instant: OffsetDateTime,
-        material: &dyn license_enforcement_sdk::PluginMaterial,
-    ) -> Result<license_enforcement_sdk::Verification, license_enforcement_sdk::PluginFault> {
-        le_issue_admission_plugin::IssueAdmissionPlugin
-            .verify(root_id, evidence, instant, material)
-            .await
-    }
-
-    async fn health(&self) -> Result<(), license_enforcement_sdk::PluginFault> {
-        Ok(())
-    }
-}
-
-#[tokio::test]
-async fn evidence_ids_and_replacement_are_checked() {
-    let env = env_with_plugin(Arc::new(AllowAuthZ), Arc::new(ChainPlugin)).await;
+    });
+    let env = env_with_plugin(Arc::new(AllowAuthZ), Arc::new(chain)).await;
     let tenant = Uuid::now_v7();
     let c = ctx(tenant);
     let issue = |token: &str| {
@@ -954,6 +935,28 @@ async fn evidence_ids_and_replacement_are_checked() {
     );
     let err = issue("4/b>a").await.unwrap_err();
     assert!(matches!(err, DomainError::NotImplemented(_)), "{err:?}");
+
+    // The external id is unique for the plugin; the replaced evidence is
+    // looked up in the holder's tenant only.
+    let other = Uuid::now_v7();
+    let oc = ctx(other);
+    let issue_other = |token: &str| {
+        env.grants
+            .issue(&oc, other, vec![terms()], false, token.to_owned())
+    };
+    let err = issue_other("5/a").await.unwrap_err();
+    assert!(
+        matches!(err, DomainError::EvidenceRejected(RejectionReason::Replay)),
+        "{err:?}"
+    );
+    let err = issue_other("6/c>a").await.unwrap_err();
+    assert!(
+        matches!(
+            err,
+            DomainError::EvidenceChainBroken(precondition::REPLACED_EVIDENCE_MISSING)
+        ),
+        "{err:?}"
+    );
 }
 
 /// Allows everything; scopes a request on one resource to that resource id.
@@ -1024,12 +1027,28 @@ async fn bind_in_another_tenant_answers_not_found() {
     assert!(matches!(err, DomainError::NotFound { .. }), "{err:?}");
 }
 
-/// As [`AllowAuthZ`], except that it scopes every constrained request of one
-/// subject to a tenant that holds nothing.
-struct NarrowedSubjectAuthZ(Uuid);
+/// The subject type of a session that the PDP scopes to fewer grants than
+/// the other sessions of the same subject.
+const NARROWED: &str = "narrowed";
+
+/// `subject` of `tenant` in a narrowed session: the replay key is the same as
+/// that of [`ctx`].
+fn narrowed(tenant: Uuid) -> toolkit_security::SecurityContext {
+    toolkit_security::SecurityContext::builder()
+        .subject_id(tenant)
+        .subject_tenant_id(tenant)
+        .subject_type(NARROWED)
+        .build()
+        .unwrap()
+}
+
+/// As [`AllowAuthZ`], except that a [`NARROWED`] session is scoped to the
+/// grant ids in it, or to none.
+#[derive(Default)]
+struct NarrowedSessionAuthZ(std::sync::Mutex<Vec<Uuid>>);
 
 #[async_trait::async_trait]
-impl authz_resolver_sdk::AuthZResolverApi for NarrowedSubjectAuthZ {
+impl authz_resolver_sdk::AuthZResolverApi for NarrowedSessionAuthZ {
     async fn evaluate(
         &self,
         ctx: toolkit_security::PlatformSecurityContext,
@@ -1039,16 +1058,20 @@ impl authz_resolver_sdk::AuthZResolverApi for NarrowedSubjectAuthZ {
         toolkit_canonical_errors::CanonicalError,
     > {
         use authz_resolver_sdk::constraints::{Constraint, InPredicate, Predicate};
-        if request.subject.id != self.0 {
+        if request.subject.subject_type.as_deref() != Some(NARROWED) {
             return AllowAuthZ.evaluate(ctx, request).await;
+        }
+        let mut ids = self.0.lock().unwrap().clone();
+        if ids.is_empty() {
+            ids.push(Uuid::now_v7());
         }
         Ok(authz_resolver_sdk::models::EvaluationResponse {
             decision: true,
             context: authz_resolver_sdk::models::EvaluationResponseContext {
                 constraints: vec![Constraint {
                     predicates: vec![Predicate::In(InPredicate::new(
-                        toolkit_security::pep_properties::OWNER_TENANT_ID,
-                        [Uuid::now_v7()],
+                        toolkit_security::pep_properties::RESOURCE_ID,
+                        ids,
                     ))],
                 }],
                 ..Default::default()
@@ -1057,51 +1080,52 @@ impl authz_resolver_sdk::AuthZResolverApi for NarrowedSubjectAuthZ {
     }
 }
 
+/// The same subject replays after its scope narrowed: `issue` answers only
+/// when every root is in the scope, `bind` only when its grant is.
 #[tokio::test]
-async fn a_replay_outside_the_scope_of_the_caller_is_refused() {
+async fn a_replay_outside_the_narrowed_scope_is_refused() {
     let tenant = Uuid::now_v7();
-    let (owner, outsider) = (ctx(tenant), ctx(tenant));
-    let env = env_with(Arc::new(NarrowedSubjectAuthZ(outsider.subject_id()))).await;
-    let (issue_token, bind_token, issued) = (token(), token(), terms());
-
-    let g = env
+    let pdp = Arc::new(NarrowedSessionAuthZ::default());
+    let env = env_with(pdp.clone()).await;
+    let (issue_token, bind_token, roots) = (token(), token(), vec![terms(), terms()]);
+    let issued = env
         .grants
         .issue(
-            &owner,
+            &ctx(tenant),
             tenant,
-            vec![issued.clone()],
+            roots.clone(),
             false,
             issue_token.clone(),
         )
         .await
-        .unwrap()
-        .grants[0]
-        .clone();
+        .unwrap();
+    let (first, second) = (issued.grants[0].id, issued.grants[1].id);
     let bind = BindingChange::Bind(user("alice"));
     env.grants
-        .change_binding(&owner, g.id, bind.clone(), bind_token.clone(), None)
+        .change_binding(&ctx(tenant), second, bind.clone(), bind_token.clone(), None)
         .await
         .unwrap();
 
+    // The narrowed session sees the first root only.
+    pdp.0.lock().unwrap().push(first.0);
     let err = env
         .grants
-        .issue(&outsider, tenant, vec![issued], false, issue_token)
+        .issue(&narrowed(tenant), tenant, roots, false, issue_token)
         .await
         .unwrap_err();
     assert!(matches!(err, DomainError::PermissionDenied), "{err:?}");
     let err = env
         .grants
-        .change_binding(&outsider, g.id, bind, bind_token, None)
+        .change_binding(&narrowed(tenant), second, bind, bind_token, None)
         .await
         .unwrap_err();
     assert!(matches!(err, DomainError::NotFound { .. }), "{err:?}");
 }
 
-/// The `issue` plugin that holds the admission of one subject until
-/// `release`, and the admission of any other until that one is held: the held
+/// The `issue` plugin that holds the admission of the narrowed session until
+/// `release`, and any other admission until that one is held: the held
 /// request has looked for a stored result and found none.
 struct GatePlugin {
-    held: Uuid,
     holding: tokio::sync::Notify,
     release: tokio::sync::Notify,
 }
@@ -1125,7 +1149,7 @@ impl GrantAdmissionPluginV1 for GatePlugin {
         let AdmissionInput::Issue { caller, .. } = &input else {
             unreachable!()
         };
-        if caller.subject_id == self.held {
+        if caller.subject_type.as_deref() == Some(NARROWED) {
             self.holding.notify_one();
             self.release.notified().await;
         } else {
@@ -1153,112 +1177,43 @@ impl GrantAdmissionPluginV1 for GatePlugin {
     }
 }
 
-/// The write of the outsider fails after the owner commits the token: the
-/// stored result it falls back to is checked against its scope too.
+/// The write of the narrowed session fails after the other session of the
+/// same subject commits the token: the stored result that it falls back to is
+/// checked against its scope too.
 #[tokio::test]
-async fn a_concurrent_retry_outside_the_scope_of_the_caller_is_refused() {
+async fn a_concurrent_retry_outside_the_narrowed_scope_is_refused() {
     let tenant = Uuid::now_v7();
-    let (owner, outsider) = (ctx(tenant), ctx(tenant));
     let gate = Arc::new(GatePlugin {
-        held: outsider.subject_id(),
         holding: tokio::sync::Notify::new(),
         release: tokio::sync::Notify::new(),
     });
-    let env = env_with_plugin(
-        Arc::new(NarrowedSubjectAuthZ(outsider.subject_id())),
-        gate.clone(),
-    )
-    .await;
+    let env = env_with_plugin(Arc::new(NarrowedSessionAuthZ::default()), gate.clone()).await;
     let (issue_token, issued) = (token(), terms());
     let issue = |c| {
-        env.grants
-            .issue(c, tenant, vec![issued.clone()], false, issue_token.clone())
+        let (env, issue_token, issued) = (&env, issue_token.clone(), issued.clone());
+        async move {
+            env.grants
+                .issue(&c, tenant, vec![issued], false, issue_token)
+                .await
+        }
     };
 
-    let (by_owner, by_outsider) = tokio::join!(
+    let (wide, narrow) = tokio::join!(
         async {
-            let r = issue(&owner).await;
+            let r = issue(ctx(tenant)).await;
             gate.release.notify_one();
             r
         },
-        issue(&outsider),
+        issue(narrowed(tenant)),
     );
-    by_owner.unwrap();
-    let err = by_outsider.unwrap_err();
+    wide.unwrap();
+    let err = narrow.unwrap_err();
     assert!(matches!(err, DomainError::PermissionDenied), "{err:?}");
-}
-
-/// The `issue` plugin that writes the plugin material named by the token:
-/// `"n/put:1:absent"` puts `1` if the key is absent, `"n/del::2"` deletes the
-/// key if it holds `2`, an empty expectation is `Any`.
-struct MaterialPlugin;
-
-#[async_trait::async_trait]
-impl GrantAdmissionPluginV1 for MaterialPlugin {
-    fn info(&self) -> license_enforcement_sdk::PluginInfo {
-        le_issue_admission_plugin::IssueAdmissionPlugin.info()
-    }
-
-    fn intakes(&self) -> license_enforcement_sdk::Intakes {
-        le_issue_admission_plugin::IssueAdmissionPlugin.intakes()
-    }
-
-    async fn admit(
-        &self,
-        input: AdmissionInput,
-        instant: OffsetDateTime,
-        material: &dyn license_enforcement_sdk::PluginMaterial,
-    ) -> Result<license_enforcement_sdk::Admission, AdmissionError> {
-        use license_enforcement_sdk::{Expect, MaterialWrite};
-        let AdmissionInput::Issue {
-            idempotency_token, ..
-        } = &input
-        else {
-            unreachable!()
-        };
-        let (_, spec) = idempotency_token.split_once('/').unwrap();
-        let mut parts = spec.split(':');
-        let (op, value, expect) = (
-            parts.next().unwrap(),
-            parts.next().unwrap(),
-            parts.next().unwrap(),
-        );
-        let write = match op {
-            "put" => MaterialWrite::put("k", value.as_bytes().to_vec()),
-            _ => MaterialWrite::delete("k"),
-        };
-        let write = match expect {
-            "" => write,
-            "absent" => write.expecting(Expect::Absent),
-            v => write.expecting(Expect::Equals(v.as_bytes().to_vec())),
-        };
-        let mut admission = le_issue_admission_plugin::IssueAdmissionPlugin
-            .admit(input, instant, material)
-            .await?;
-        admission.material = vec![write];
-        Ok(admission)
-    }
-
-    async fn verify(
-        &self,
-        root_id: GrantId,
-        evidence: &license_enforcement_sdk::StoredEvidence,
-        instant: OffsetDateTime,
-        material: &dyn license_enforcement_sdk::PluginMaterial,
-    ) -> Result<license_enforcement_sdk::Verification, license_enforcement_sdk::PluginFault> {
-        le_issue_admission_plugin::IssueAdmissionPlugin
-            .verify(root_id, evidence, instant, material)
-            .await
-    }
-
-    async fn health(&self) -> Result<(), license_enforcement_sdk::PluginFault> {
-        Ok(())
-    }
 }
 
 #[tokio::test]
 async fn material_writes_apply_only_when_the_expectation_holds() {
-    let env = env_with_plugin(Arc::new(AllowAuthZ), Arc::new(MaterialPlugin)).await;
+    let env = env_with_plugin(Arc::new(AllowAuthZ), Arc::new(material_plugin())).await;
     let tenant = Uuid::now_v7();
     let c = ctx(tenant);
     let issue = |token: &str| {
@@ -1301,60 +1256,62 @@ async fn issue_with_a_token_reused_after_its_window_names_the_token() {
     assert_eq!(v[0].field, "idempotency_token");
 }
 
-/// The `issue` plugin, which admits a root whose window ends before it starts.
-struct BadWindowPlugin;
-
-#[async_trait::async_trait]
-impl GrantAdmissionPluginV1 for BadWindowPlugin {
-    fn info(&self) -> license_enforcement_sdk::PluginInfo {
-        le_issue_admission_plugin::IssueAdmissionPlugin.info()
-    }
-
-    fn intakes(&self) -> license_enforcement_sdk::Intakes {
-        le_issue_admission_plugin::IssueAdmissionPlugin.intakes()
-    }
-
-    async fn admit(
-        &self,
-        input: AdmissionInput,
-        instant: OffsetDateTime,
-        material: &dyn license_enforcement_sdk::PluginMaterial,
-    ) -> Result<license_enforcement_sdk::Admission, AdmissionError> {
-        let mut admission = le_issue_admission_plugin::IssueAdmissionPlugin
-            .admit(input, instant, material)
-            .await?;
-        let window = &mut admission.roots[0].fields.terms.window;
-        window.expires_at = window.not_before - Duration::days(1);
-        Ok(admission)
-    }
-
-    async fn verify(
-        &self,
-        root_id: GrantId,
-        evidence: &license_enforcement_sdk::StoredEvidence,
-        instant: OffsetDateTime,
-        material: &dyn license_enforcement_sdk::PluginMaterial,
-    ) -> Result<license_enforcement_sdk::Verification, license_enforcement_sdk::PluginFault> {
-        le_issue_admission_plugin::IssueAdmissionPlugin
-            .verify(root_id, evidence, instant, material)
+/// Another subject of the tenant with the same token runs its own `issue`.
+#[tokio::test]
+async fn two_subjects_of_a_tenant_issue_with_the_same_token() {
+    let env = env().await;
+    let tenant = Uuid::now_v7();
+    let t = token();
+    let mut ids = Vec::new();
+    for subject in [Uuid::now_v7(), Uuid::now_v7()] {
+        let issued = env
+            .grants
+            .issue(
+                &crate::test_support::ctx_as(tenant, subject),
+                tenant,
+                vec![terms()],
+                false,
+                t.clone(),
+            )
             .await
+            .unwrap();
+        ids.push(issued.grants[0].id);
     }
-
-    async fn health(&self) -> Result<(), license_enforcement_sdk::PluginFault> {
-        Ok(())
-    }
+    assert_ne!(ids[0], ids[1]);
 }
 
 #[tokio::test]
 async fn issue_validates_the_roots_of_the_plugin_not_the_request() {
-    let env = env_with_plugin(Arc::new(AllowAuthZ), Arc::new(BadWindowPlugin)).await;
-    let tenant = Uuid::now_v7();
-    let err = env
-        .grants
-        .issue(&ctx(tenant), tenant, vec![terms()], false, token())
-        .await
-        .unwrap_err();
-    assert_eq!(reasons(&err), vec![reason::INVALID_WINDOW.to_owned()]);
+    let cases: [(Tamper, &str); 2] = [
+        (
+            |t| t.window.expires_at = t.window.not_before - Duration::days(1),
+            reason::INVALID_WINDOW,
+        ),
+        (
+            |t| {
+                t.permissions.max_depth =
+                    u16::try_from(license_enforcement_sdk::limits::MAX_DELEGATION_DEPTH + 1)
+                        .unwrap();
+            },
+            reason::TOO_LARGE,
+        ),
+    ];
+    for (tamper, expected) in cases {
+        let env = env_with_plugin(
+            Arc::new(AllowAuthZ),
+            Arc::new(TestPlugin::admitting(move |_, admission| {
+                tamper(&mut admission.roots[0].fields.terms);
+            })),
+        )
+        .await;
+        let tenant = Uuid::now_v7();
+        let err = env
+            .grants
+            .issue(&ctx(tenant), tenant, vec![terms()], false, token())
+            .await
+            .unwrap_err();
+        assert_eq!(reasons(&err), vec![expected.to_owned()]);
+    }
 }
 
 #[tokio::test]
@@ -1448,7 +1405,7 @@ async fn concurrent_binds_with_different_tokens_bind_once() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_material_writes_with_one_expectation_apply_once() {
-    let env = env_with_plugin(Arc::new(AllowAuthZ), Arc::new(MaterialPlugin)).await;
+    let env = env_with_plugin(Arc::new(AllowAuthZ), Arc::new(material_plugin())).await;
     let tenant = Uuid::now_v7();
     let c = ctx(tenant);
     env.grants
@@ -1483,10 +1440,10 @@ async fn concurrent_material_writes_with_one_expectation_apply_once() {
 
 #[test]
 fn sdk_filters_have_the_limits_of_rest() {
-    use license_enforcement_sdk::dto::ListQuery;
-    let query = |filter: String| ListQuery {
-        filter: Some(filter),
-        ..ListQuery::default()
+    let query = |filter: String| {
+        let mut q = license_enforcement_sdk::dto::ListQuery::default();
+        q.filter = Some(filter);
+        q
     };
     let field_reason = |e: toolkit_canonical_errors::CanonicalError| format!("{e:?}");
     let long = format!(
@@ -1500,73 +1457,504 @@ fn sdk_filters_have_the_limits_of_rest() {
     }
 }
 
-/// Admits through the issue plugin, but names one fixed root.
-struct SameRoot(GrantId);
+/// A root id that is already stored answers `already_exists` and names it.
+#[tokio::test]
+async fn a_root_that_is_already_stored_is_already_exists() {
+    use crate::domain::repo::GrantRepo;
+    let env = env().await;
+    let tenant = Uuid::now_v7();
+    let g = crate::test_support::issue_one(&env, tenant, terms()).await;
+    let conn = env.db.conn().unwrap();
+    let err = env
+        .store
+        .insert_roots(
+            &conn,
+            &AccessScope::for_tenant(tenant),
+            std::slice::from_ref(&g),
+            OffsetDateTime::now_utc(),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, DomainError::RootAlreadyAdmitted(id) if id == g.id),
+        "{err:?}"
+    );
+    let canonical = toolkit_canonical_errors::CanonicalError::from(err);
+    let named = g.id.to_string();
+    assert!(
+        matches!(&canonical, toolkit_canonical_errors::CanonicalError::AlreadyExists {
+            resource_name: Some(n), ..
+        } if *n == named),
+        "{canonical:?}"
+    );
+}
 
-#[async_trait::async_trait]
-impl GrantAdmissionPluginV1 for SameRoot {
-    fn info(&self) -> license_enforcement_sdk::PluginInfo {
-        le_issue_admission_plugin::IssueAdmissionPlugin.info()
-    }
+/// The gear finds the roots of the plugin by the ids that it gave, whatever
+/// their order; a root under another id is a plugin fault.
+#[tokio::test]
+async fn issue_finds_the_admitted_roots_by_their_ids() {
+    // Gives the roots in reverse order; `true` also renames the first.
+    let shuffled = |rename: bool| {
+        TestPlugin::admitting(move |_, admission| {
+            admission.roots.reverse();
+            if rename {
+                admission.roots[0].id = GrantId(Uuid::now_v7());
+            }
+        })
+    };
+    let tenant = Uuid::now_v7();
+    let mut long = terms();
+    long.window.expires_at += Duration::days(7);
+    let env = env_with_plugin(Arc::new(AllowAuthZ), Arc::new(shuffled(false))).await;
+    let issued = env
+        .grants
+        .issue(
+            &ctx(tenant),
+            tenant,
+            vec![terms(), long.clone()],
+            false,
+            token(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        issued.grants[1].validity.window().expires_at,
+        long.window.expires_at
+    );
 
-    fn intakes(&self) -> license_enforcement_sdk::Intakes {
-        le_issue_admission_plugin::IssueAdmissionPlugin.intakes()
-    }
+    let env = env_with_plugin(Arc::new(AllowAuthZ), Arc::new(shuffled(true))).await;
+    let err = env
+        .grants
+        .issue(&ctx(tenant), tenant, vec![terms(), long], false, token())
+        .await
+        .unwrap_err();
+    assert!(matches!(err, DomainError::Internal(_)), "{err:?}");
+}
 
-    async fn admit(
-        &self,
-        input: license_enforcement_sdk::AdmissionInput,
-        instant: time::OffsetDateTime,
-        material: &dyn license_enforcement_sdk::PluginMaterial,
-    ) -> Result<license_enforcement_sdk::Admission, license_enforcement_sdk::AdmissionError> {
-        let mut admission = le_issue_admission_plugin::IssueAdmissionPlugin
-            .admit(input, instant, material)
-            .await?;
-        for root in &mut admission.roots {
-            root.id = self.0;
-        }
-        Ok(admission)
-    }
-
-    async fn verify(
-        &self,
-        root_id: GrantId,
-        evidence: &license_enforcement_sdk::StoredEvidence,
-        instant: time::OffsetDateTime,
-        material: &dyn license_enforcement_sdk::PluginMaterial,
-    ) -> Result<license_enforcement_sdk::Verification, license_enforcement_sdk::PluginFault> {
-        le_issue_admission_plugin::IssueAdmissionPlugin
-            .verify(root_id, evidence, instant, material)
+/// A plugin that turns a pack into single grants, or back, is a fault: the
+/// members of a pack stay fixed.
+#[tokio::test]
+async fn issue_keeps_the_kind_that_was_asked() {
+    let flip = TestPlugin::admitting(|_, admission| admission.as_pack = !admission.as_pack);
+    let env = env_with_plugin(Arc::new(AllowAuthZ), Arc::new(flip)).await;
+    let tenant = Uuid::now_v7();
+    for as_pack in [true, false] {
+        let err = env
+            .grants
+            .issue(&ctx(tenant), tenant, vec![terms()], as_pack, token())
             .await
-    }
-
-    async fn health(&self) -> Result<(), license_enforcement_sdk::PluginFault> {
-        Ok(())
+            .unwrap_err();
+        assert!(matches!(err, DomainError::Internal(_)), "{err:?}");
     }
 }
 
 #[tokio::test]
-async fn a_root_that_is_already_stored_is_already_exists() {
-    let root = GrantId(Uuid::now_v7());
-    let env = env_with_plugin(Arc::new(AllowAuthZ), Arc::new(SameRoot(root))).await;
+async fn check_explain_requests_conform_to_their_contracts() {
+    use license_enforcement_sdk::dto::CheckExplainRequest;
+    let env = env().await;
     let tenant = Uuid::now_v7();
-    let c = ctx(tenant);
-    env.grants
-        .issue(&c, tenant, vec![terms()], false, token())
+    let req = crate::test_support::request(crate::test_support::USER, "alice", tenant);
+    let built = env
+        .grants
+        .explain_request(
+            &ctx(tenant),
+            CheckExplainRequest {
+                subject: req.subject.clone(),
+                resource: req.resource.clone(),
+            },
+        )
         .await
         .unwrap();
+    assert_eq!(built.context.tenant_id, tenant);
+
+    let mut subject = req.subject.clone();
+    subject.gts_type = GtsTypeId::new(SERVICE);
     let err = env
         .grants
-        .issue(&c, tenant, vec![terms()], false, token())
+        .explain_request(
+            &ctx(tenant),
+            CheckExplainRequest {
+                subject,
+                resource: req.resource.clone(),
+            },
+        )
         .await
         .unwrap_err();
-    assert!(
-        matches!(err, DomainError::RootAlreadyAdmitted(id) if id == root),
-        "{err:?}"
-    );
-    let canonical = toolkit_canonical_errors::CanonicalError::from(err);
-    assert!(
-        format!("{canonical:?}").contains(&root.to_string()),
-        "{canonical:?}"
-    );
+    assert_eq!(reasons(&err), ["SUBJECT_NOT_ADMITTED"]);
+
+    let mut subject = req.subject.clone();
+    subject.gts_type = GtsTypeId::new(GHOST);
+    let err = env
+        .grants
+        .explain_request(
+            &ctx(tenant),
+            CheckExplainRequest {
+                subject,
+                resource: req.resource.clone(),
+            },
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(reasons(&err), ["CONTRACT_NOT_REGISTERED"]);
+    let DomainError::InvalidArgument(v) = &err else {
+        unreachable!()
+    };
+    assert_eq!(v[0].field, "subject/type");
+
+    // An unusable registered contract is not the caller's fault.
+    let mut resource = req.resource.clone();
+    resource.gts_type = GtsTypeId::new(crate::test_support::BROKEN);
+    let err = env
+        .grants
+        .explain_request(
+            &ctx(tenant),
+            CheckExplainRequest {
+                subject: req.subject.clone(),
+                resource,
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, DomainError::Internal(_)), "{err:?}");
 }
+
+/// Check-explain refuses an object that does not conform to its schema, an
+/// abstract contract, and a type that is not a licensing contract of its slot.
+#[tokio::test]
+async fn check_explain_refuses_what_the_gateway_refuses() {
+    use crate::test_support::{ABSTRACT, STRICT, USER};
+    use license_enforcement_sdk::dto::CheckExplainRequest;
+    let env = env().await;
+    let tenant = Uuid::now_v7();
+    let req = crate::test_support::request(USER, "alice", tenant);
+    let refused = |subject: &str, resource: &str| {
+        let mut req = req.clone();
+        req.subject.gts_type = GtsTypeId::new(subject);
+        req.resource.gts_type = GtsTypeId::new(resource);
+        let grants = &env.grants;
+        async move {
+            let err = grants
+                .explain_request(
+                    &ctx(tenant),
+                    CheckExplainRequest {
+                        subject: req.subject,
+                        resource: req.resource,
+                    },
+                )
+                .await
+                .unwrap_err();
+            reasons(&err)
+        }
+    };
+    let resource = crate::test_support::RESOURCE;
+    assert_eq!(refused(STRICT, resource).await, ["SCHEMA_MISMATCH"]);
+    assert_eq!(refused(USER, ABSTRACT).await, ["CONTRACT_ABSTRACT"]);
+    // A subject contract in the resource slot.
+    assert_eq!(refused(USER, USER).await, ["CONTRACT_NOT_DERIVED"]);
+}
+
+/// `issue` reports an unusable registered contract as license-resolver does.
+#[tokio::test]
+async fn issue_on_an_unusable_contract_is_internal() {
+    let env = env().await;
+    let tenant = Uuid::now_v7();
+    let mut t = terms();
+    t.resource.gts_type = GtsTypeId::new(crate::test_support::BROKEN);
+    let err = env
+        .grants
+        .issue(&ctx(tenant), tenant, vec![t], false, token())
+        .await
+        .unwrap_err();
+    assert!(matches!(err, DomainError::Internal(_)), "{err:?}");
+}
+
+mod pdp_per_table {
+    use std::sync::Arc;
+
+    use license_enforcement_sdk::dto::{CheckExplainRequest, ReplaceRequest, Successor};
+    use uuid::Uuid;
+
+    use crate::domain::error::DomainError;
+    use crate::domain::grants::Target;
+    use crate::test_support::{
+        RESOURCE, RuleAuthZ, USER, ctx, delegable, env_with, issue_one, request, terms, token,
+    };
+
+    const GRANT: &str = "license_enforcement.grant";
+    const PACK: &str = "license_enforcement.pack";
+    const DELEGATION: &str = "license_enforcement.delegation";
+
+    fn denied<T: std::fmt::Debug>(r: &Result<T, DomainError>) {
+        assert!(matches!(r, Err(DomainError::PermissionDenied)), "{r:?}");
+    }
+
+    fn successor(replaces: Option<license_enforcement_sdk::GrantId>) -> ReplaceRequest {
+        ReplaceRequest::new(vec![Successor::new(terms(), replaces)], token())
+    }
+
+    /// A pack row goes under `PACK/issue`, its members under `GRANT/issue`:
+    /// each decision gates its own table.
+    #[tokio::test]
+    async fn a_pack_needs_the_issue_decision_on_packs_and_on_grants() {
+        let a = Uuid::now_v7();
+        for (resource, grant_ok) in [(PACK, true), (GRANT, false)] {
+            let pdp = Arc::new(RuleAuthZ::default());
+            let env = env_with(pdp.clone()).await;
+            let old = env
+                .grants
+                .issue(&ctx(a), a, vec![terms()], true, token())
+                .await
+                .unwrap()
+                .pack
+                .unwrap();
+            pdp.set(resource, "issue", None);
+            let grant = env
+                .grants
+                .issue(&ctx(a), a, vec![terms()], false, token())
+                .await;
+            assert_eq!(grant.is_ok(), grant_ok, "{resource}: {grant:?}");
+            denied(
+                &env.grants
+                    .issue(&ctx(a), a, vec![terms()], true, token())
+                    .await,
+            );
+            denied(
+                &env.grants
+                    .replace(&ctx(a), Target::Pack(old.id), successor(None))
+                    .await,
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn replace_inserts_under_the_issue_decision() {
+        let pdp = Arc::new(RuleAuthZ::default());
+        let env = env_with(pdp.clone()).await;
+        let a = Uuid::now_v7();
+        let g = issue_one(&env, a, terms()).await;
+        let issued = env
+            .grants
+            .issue(&ctx(a), a, vec![terms()], true, token())
+            .await
+            .unwrap();
+        let pack = issued.pack.unwrap();
+        // `replace` on the replaced ids alone: the new rows are not among them.
+        pdp.set(GRANT, "replace", Some(vec![g.id.0, issued.grants[0].id.0]));
+        pdp.set(PACK, "replace", Some(vec![pack.id.0]));
+        env.grants
+            .replace(&ctx(a), Target::Grant(g.id), successor(None))
+            .await
+            .unwrap();
+        let replaced = env
+            .grants
+            .replace(&ctx(a), Target::Pack(pack.id), successor(None))
+            .await
+            .unwrap();
+        assert!(replaced.pack.is_some());
+
+        // Without the right to issue, nothing is replaced.
+        let g = issue_one(&env, a, terms()).await;
+        pdp.set(GRANT, "replace", Some(vec![g.id.0]));
+        pdp.set(GRANT, "issue", None);
+        denied(
+            &env.grants
+                .replace(&ctx(a), Target::Grant(g.id), successor(None))
+                .await,
+        );
+    }
+
+    /// A pack verb changes its members: the decision on the same verb on
+    /// grants must allow each live member.
+    #[tokio::test]
+    async fn a_pack_verb_needs_the_grant_decision_on_every_member() {
+        use crate::domain::grants::Verb;
+        let pdp = Arc::new(RuleAuthZ::default());
+        let env = env_with(pdp.clone()).await;
+        let a = Uuid::now_v7();
+        let issued = env
+            .grants
+            .issue(&ctx(a), a, vec![terms(), terms()], true, token())
+            .await
+            .unwrap();
+        let pack = issued.pack.unwrap();
+        let (g1, g2) = (issued.grants[0].id.0, issued.grants[1].id.0);
+        pdp.set(GRANT, "revoke", Some(vec![g1]));
+        denied(
+            &env.grants
+                .pack_verb(&ctx(a), pack.id, Verb::Revoke, token(), None)
+                .await,
+        );
+        pdp.set(GRANT, "replace", Some(vec![g1]));
+        denied(
+            &env.grants
+                .replace(&ctx(a), Target::Pack(pack.id), successor(None))
+                .await,
+        );
+        pdp.set(GRANT, "revoke", Some(vec![g1, g2]));
+        env.grants
+            .pack_verb(&ctx(a), pack.id, Verb::Revoke, token(), None)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn list_packs_filters_members_under_the_grant_decision() {
+        let pdp = Arc::new(RuleAuthZ::default());
+        let env = env_with(pdp.clone()).await;
+        let a = Uuid::now_v7();
+        let pack = |n| {
+            let env = &env;
+            async move {
+                env.grants
+                    .issue(&ctx(a), a, vec![terms(); n], true, token())
+                    .await
+                    .unwrap()
+                    .pack
+                    .unwrap()
+            }
+        };
+        let (p1, p2) = (pack(1).await, pack(2).await);
+        pdp.set(PACK, "list", Some(vec![p1.id.0, p2.id.0]));
+        let query = |filter: Option<String>| {
+            crate::domain::local_client::odata_query(&{
+                let mut q = license_enforcement_sdk::dto::ListQuery::default();
+                q.filter = filter;
+                q
+            })
+            .unwrap()
+        };
+        let by_resource = query(Some(format!("resource_type eq '{RESOURCE}'")));
+        let found = env
+            .grants
+            .list_packs(&ctx(a), &by_resource, false)
+            .await
+            .unwrap();
+        assert_eq!(found.items.len(), 2);
+
+        // A filter reads grants; without the right to list them it is refused.
+        pdp.set(GRANT, "list", None);
+        denied(&env.grants.list_packs(&ctx(a), &by_resource, false).await);
+        let all = env
+            .grants
+            .list_packs(&ctx(a), &query(None), false)
+            .await
+            .unwrap();
+        assert_eq!(all.items.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn delegate_is_decided_on_the_grant() {
+        let pdp = Arc::new(RuleAuthZ::default());
+        let env = env_with(pdp.clone()).await;
+        let (a, b) = (Uuid::now_v7(), Uuid::now_v7());
+        env.tenants.link(a, b);
+        let g = issue_one(&env, a, delegable(1)).await;
+        let req = |ids| crate::test_support::by_ids(b, ids);
+        // The delegation does not exist yet: a decision on it is not asked.
+        pdp.set(DELEGATION, "delegate", None);
+        pdp.set(GRANT, "delegate", Some(vec![g.id.0]));
+        env.grants.delegate(&ctx(a), req(vec![g.id])).await.unwrap();
+
+        let other = issue_one(&env, a, delegable(1)).await;
+        let err = env
+            .grants
+            .delegate(&ctx(a), req(vec![other.id]))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, DomainError::NotFound { .. }), "{err:?}");
+    }
+
+    /// A verb on a delegation and its read reach the grants of the caller's
+    /// side: the decision on grants must allow each, as on a pack.
+    #[tokio::test]
+    async fn a_delegation_needs_the_grant_decision_on_the_side_of_the_caller() {
+        use crate::domain::grants::Verb;
+        let pdp = Arc::new(RuleAuthZ::default());
+        let env = env_with(pdp.clone()).await;
+        let (a, b) = (Uuid::now_v7(), Uuid::now_v7());
+        env.tenants.link(a, b);
+        let g = issue_one(&env, a, delegable(1)).await;
+        let d = env
+            .grants
+            .delegate(&ctx(a), crate::test_support::by_ids(b, vec![g.id]))
+            .await
+            .unwrap();
+        let sub = crate::test_support::sub_grants(&env, &d).await[0].id;
+
+        // The recipient reads its sub-grant, the grantor its own grant.
+        pdp.set(GRANT, "get", Some(vec![g.id.0]));
+        denied(&env.grants.get_delegation(&ctx(b), d.id).await);
+        env.grants.get_delegation(&ctx(a), d.id).await.unwrap();
+        pdp.set(GRANT, "get", Some(vec![sub.0]));
+        env.grants.get_delegation(&ctx(b), d.id).await.unwrap();
+
+        pdp.set(GRANT, "recall", Some(vec![sub.0]));
+        denied(
+            &env.grants
+                .delegation_verb(&ctx(a), d.id, Verb::Recall, token(), None)
+                .await,
+        );
+        pdp.set(GRANT, "recall", Some(vec![g.id.0]));
+        env.grants
+            .delegation_verb(&ctx(a), d.id, Verb::Recall, token(), None)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn check_explain_refuses_a_scope_narrower_than_the_tenant() {
+        let pdp = Arc::new(RuleAuthZ::default());
+        let env = env_with(pdp.clone()).await;
+        let a = Uuid::now_v7();
+        let g = issue_one(&env, a, terms()).await;
+        let req = request(USER, "alice", a);
+        let c = ctx(a);
+        let explain = || {
+            env.grants.explain_request(
+                &c,
+                CheckExplainRequest {
+                    subject: req.subject.clone(),
+                    resource: req.resource.clone(),
+                },
+            )
+        };
+        explain().await.unwrap();
+        pdp.set(GRANT, "check_explain", Some(vec![g.id.0]));
+        denied(&explain().await);
+    }
+}
+
+/// The `issue` plugin that writes the plugin material named by the token:
+/// `"n/put:1:absent"` puts `1` if the key is absent, `"n/del::2"` deletes the
+/// key if it holds `2`, an empty expectation is `Any`.
+fn material_plugin() -> TestPlugin {
+    TestPlugin::admitting(|input, admission| {
+        use license_enforcement_sdk::{Expect, MaterialWrite};
+        let AdmissionInput::Issue {
+            idempotency_token, ..
+        } = input
+        else {
+            unreachable!()
+        };
+        let (_, spec) = idempotency_token.split_once('/').unwrap();
+        let mut parts = spec.split(':');
+        let (op, value, expect) = (
+            parts.next().unwrap(),
+            parts.next().unwrap(),
+            parts.next().unwrap(),
+        );
+        let write = match op {
+            "put" => MaterialWrite::put("k", value.as_bytes().to_vec()),
+            _ => MaterialWrite::delete("k"),
+        };
+        let write = match expect {
+            "" => write,
+            "absent" => write.expecting(Expect::Absent),
+            v => write.expecting(Expect::Equals(v.as_bytes().to_vec())),
+        };
+        admission.material = vec![write];
+    })
+}
+
+/// A change of the terms of the first root that the plugin admits.
+type Tamper = fn(&mut GrantTerms);
