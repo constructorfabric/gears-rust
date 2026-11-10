@@ -190,6 +190,7 @@ fn validate_single_method_binding(
     validate_path_template_braces(method_binding, &method_loc, errors);
     validate_field_references(contract, method_binding, &method_loc, errors);
     validate_single_body_binding(method_binding, &method_loc, errors);
+    validate_passthrough(method_binding, &method_loc, errors);
 }
 
 fn validate_body_constraint(
@@ -199,7 +200,7 @@ fn validate_body_constraint(
 ) {
     if !matches!(
         method_binding.http_method,
-        HttpMethod::Get | HttpMethod::Delete
+        HttpMethod::Get | HttpMethod::Delete | HttpMethod::Head | HttpMethod::Options
     ) {
         return;
     }
@@ -210,13 +211,7 @@ fn validate_body_constraint(
         .any(|fb| matches!(fb, HttpFieldBinding::Body));
 
     if has_body {
-        let verb = match method_binding.http_method {
-            HttpMethod::Get => "GET",
-            HttpMethod::Post => "POST",
-            HttpMethod::Put => "PUT",
-            HttpMethod::Patch => "PATCH",
-            HttpMethod::Delete => "DELETE",
-        };
+        let verb = method_binding.http_method.as_str().unwrap_or_default();
         errors.push(ValidationError {
             location: method_loc.to_owned(),
             message: format!("{verb} method must not have Body field binding"),
@@ -243,6 +238,11 @@ fn validate_path_params(
         .collect();
 
     for param in &template_params {
+        // A trailing `{*name}` wildcard is bound by a passthrough binding;
+        // `validate_passthrough` checks it.
+        if param.starts_with('*') {
+            continue;
+        }
         if !path_binding_params.contains(param.as_str()) {
             errors.push(ValidationError {
                 location: method_loc.to_owned(),
@@ -279,6 +279,7 @@ fn validate_field_references(
         let (kind, field) = match fb {
             HttpFieldBinding::Path { field, .. } => ("Path", field),
             HttpFieldBinding::Query { field, .. } => ("Query", field),
+            HttpFieldBinding::Passthrough { field, .. } => ("Passthrough", field),
             HttpFieldBinding::Body => continue,
         };
         if !input_field_names.contains(field.as_str()) {
@@ -351,13 +352,14 @@ fn validate_path_template_braces(
                         message: format!("path template '{template}' has empty parameter '{{}}'"),
                     });
                 }
-                if !current_param
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '_')
-                    || current_param
-                        .chars()
-                        .next()
-                        .is_some_and(|c| c.is_ascii_digit())
+                // `{*name}` is a wildcard; where it may appear is checked by
+                // `validate_passthrough`.
+                let name = current_param
+                    .strip_prefix('*')
+                    .unwrap_or(current_param.as_str());
+                if name.is_empty()
+                    || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                    || name.chars().next().is_some_and(|c| c.is_ascii_digit())
                 {
                     errors.push(ValidationError {
                         location: method_loc.to_owned(),
@@ -393,6 +395,86 @@ fn validate_path_template_braces(
             location: method_loc.to_owned(),
             message: format!("path template '{template}' has unbalanced braces"),
         });
+    }
+}
+
+/// A passthrough binding (ADR-0009 §5) forwards an opaque request, so it must
+/// say exactly that and nothing else: method from the request within a declared
+/// set, one trailing wildcard for the request path, no JSON body or query
+/// fields, no retry, no streaming framing. A wildcard anywhere else is an error.
+fn validate_passthrough(
+    method_binding: &HttpMethodBindingIr,
+    method_loc: &str,
+    errors: &mut Vec<ValidationError>,
+) {
+    let mut push = |message: String| {
+        errors.push(ValidationError {
+            location: method_loc.to_owned(),
+            message,
+        });
+    };
+    let passthrough: Vec<(&String, &Vec<HttpMethod>)> = method_binding
+        .field_bindings
+        .iter()
+        .filter_map(|fb| match fb {
+            HttpFieldBinding::Passthrough { param, methods, .. } => Some((param, methods)),
+            _ => None,
+        })
+        .collect();
+    let wildcards: Vec<String> = extract_path_params(&method_binding.path_template)
+        .into_iter()
+        .filter(|p| p.starts_with('*'))
+        .collect();
+
+    if method_binding.http_method != HttpMethod::Passthrough {
+        if !passthrough.is_empty() {
+            push("Passthrough field binding requires http_method Passthrough".to_owned());
+        }
+        if !wildcards.is_empty() {
+            push(format!(
+                "path template '{}' has a wildcard parameter; only a Passthrough binding may have one",
+                method_binding.path_template
+            ));
+        }
+        return;
+    }
+
+    let [(param, methods)] = passthrough.as_slice() else {
+        push(format!(
+            "Passthrough method needs exactly one Passthrough field binding, found {}",
+            passthrough.len()
+        ));
+        return;
+    };
+    if method_binding.field_bindings.len() != 1 {
+        push("Passthrough method must not have Path, Query or Body field bindings".to_owned());
+    }
+    if methods.is_empty() {
+        push("Passthrough method set must not be empty".to_owned());
+    }
+    let mut seen = HashSet::new();
+    for method in *methods {
+        if *method == HttpMethod::Passthrough {
+            push("Passthrough method set must name concrete HTTP methods".to_owned());
+        } else if !seen.insert(*method) {
+            push(format!(
+                "Passthrough method set lists {} more than once",
+                method.as_str().unwrap_or_default()
+            ));
+        }
+    }
+    let expected = format!("{{*{param}}}");
+    if wildcards.len() != 1 || !method_binding.path_template.ends_with(&expected) {
+        push(format!(
+            "path template '{}' must end with exactly one wildcard '{expected}'",
+            method_binding.path_template
+        ));
+    }
+    if method_binding.retryable {
+        push("Passthrough method must not be retryable".to_owned());
+    }
+    if method_binding.streaming {
+        push("Passthrough method must not declare a streaming framing".to_owned());
     }
 }
 
@@ -547,6 +629,162 @@ mod tests {
                 .any(|e| e.message.contains("unclosed '{'")
                     || e.message.contains("unbalanced braces")),
             "expected unbalanced brace error, got: {errs:?}"
+        );
+    }
+
+    fn passthrough_contract() -> ContractIr {
+        let mut contract = one_method_contract();
+        contract.methods[0].name = "proxy".into();
+        contract.methods[0].input.fields[0].name = "req".into();
+        contract
+    }
+
+    fn passthrough_binding(path: &str, methods: Vec<HttpMethod>) -> HttpBindingIr {
+        HttpBindingIr {
+            base_path: "/api".into(),
+            methods: vec![HttpMethodBindingIr {
+                method_name: "proxy".into(),
+                http_method: HttpMethod::Passthrough,
+                path_template: path.into(),
+                field_bindings: vec![HttpFieldBinding::Passthrough {
+                    field: "req".into(),
+                    param: "path".into(),
+                    methods,
+                }],
+                retryable: false,
+                streaming: false,
+                stream_framing: StreamFraming::default(),
+                optional: false,
+            }],
+        }
+    }
+
+    #[test]
+    fn accepts_passthrough_binding() {
+        let binding = passthrough_binding(
+            "/proxy/{*path}",
+            vec![HttpMethod::Get, HttpMethod::Head, HttpMethod::Options],
+        );
+        validate_http_binding(&passthrough_contract(), &binding)
+            .expect("valid passthrough binding should pass");
+    }
+
+    #[test]
+    fn rejects_malformed_passthrough_bindings() {
+        let contract = passthrough_contract();
+        let cases = [
+            (
+                passthrough_binding("/proxy/{*path}", vec![]),
+                "method set must not be empty",
+            ),
+            (
+                passthrough_binding("/proxy/{*path}", vec![HttpMethod::Get, HttpMethod::Get]),
+                "more than once",
+            ),
+            (
+                passthrough_binding("/proxy/{*path}", vec![HttpMethod::Passthrough]),
+                "concrete HTTP methods",
+            ),
+            (
+                passthrough_binding("/proxy/{*other}", vec![HttpMethod::Get]),
+                "must end with exactly one wildcard '{*path}'",
+            ),
+            (
+                passthrough_binding("/proxy/{*path}/tail", vec![HttpMethod::Get]),
+                "must end with exactly one wildcard",
+            ),
+        ];
+        for (binding, expected) in cases {
+            let errs = validate_http_binding(&contract, &binding).unwrap_err();
+            assert!(
+                errs.iter().any(|e| e.message.contains(expected)),
+                "expected '{expected}', got: {errs:?}"
+            );
+        }
+
+        let mut retryable = passthrough_binding("/proxy/{*path}", vec![HttpMethod::Get]);
+        retryable.methods[0].retryable = true;
+        let errs = validate_http_binding(&contract, &retryable).unwrap_err();
+        assert!(
+            errs.iter()
+                .any(|e| e.message.contains("must not be retryable"))
+        );
+
+        // Shape of the field bindings: exactly one passthrough, nothing else.
+        let rebind = |field_bindings: Vec<HttpFieldBinding>| {
+            let mut binding = passthrough_binding("/proxy/{*path}", vec![HttpMethod::Get]);
+            binding.methods[0].field_bindings = field_bindings;
+            binding
+        };
+        let passthrough = || HttpFieldBinding::Passthrough {
+            field: "req".into(),
+            param: "path".into(),
+            methods: vec![HttpMethod::Get],
+        };
+        let shapes = [
+            (rebind(vec![]), "found 0"),
+            (rebind(vec![passthrough(), passthrough()]), "found 2"),
+            (
+                rebind(vec![passthrough(), HttpFieldBinding::Body]),
+                "must not have Path, Query or Body",
+            ),
+        ];
+        for (binding, expected) in shapes {
+            let errs = validate_http_binding(&contract, &binding).unwrap_err();
+            assert!(
+                errs.iter().any(|e| e.message.contains(expected)),
+                "expected '{expected}', got: {errs:?}"
+            );
+        }
+
+        let mut streaming = passthrough_binding("/proxy/{*path}", vec![HttpMethod::Get]);
+        streaming.methods[0].streaming = true;
+        let errs = validate_http_binding(&contract, &streaming).unwrap_err();
+        assert!(
+            errs.iter()
+                .any(|e| e.message.contains("must not declare a streaming framing"))
+        );
+    }
+
+    #[test]
+    fn rejects_body_on_head() {
+        let contract = one_method_contract();
+        let binding = HttpBindingIr {
+            base_path: "/api".into(),
+            methods: vec![HttpMethodBindingIr {
+                method_name: "do_thing".into(),
+                http_method: HttpMethod::Head,
+                path_template: "/things".into(),
+                field_bindings: vec![HttpFieldBinding::Body],
+                retryable: false,
+                streaming: false,
+                stream_framing: StreamFraming::default(),
+                optional: false,
+            }],
+        };
+        let errs = validate_http_binding(&contract, &binding).unwrap_err();
+        assert!(
+            errs.iter()
+                .any(|e| e.message == "HEAD method must not have Body field binding"),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn passthrough_parts_are_rejected_outside_a_passthrough_method() {
+        let contract = passthrough_contract();
+        let mut binding = passthrough_binding("/proxy/{*path}", vec![HttpMethod::Get]);
+        binding.methods[0].http_method = HttpMethod::Post;
+        let errs = validate_http_binding(&contract, &binding).unwrap_err();
+        assert!(
+            errs.iter()
+                .any(|e| e.message.contains("requires http_method Passthrough")),
+            "{errs:?}"
+        );
+        assert!(
+            errs.iter()
+                .any(|e| e.message.contains("wildcard parameter")),
+            "{errs:?}"
         );
     }
 

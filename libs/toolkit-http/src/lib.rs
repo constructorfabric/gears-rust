@@ -54,6 +54,7 @@ mod config;
 /// Error types returned by the HTTP client.
 mod error;
 mod layers;
+mod limiter;
 pub mod otel;
 /// Request builder types.
 mod request;
@@ -75,11 +76,15 @@ pub use config::{
 };
 pub use error::{HttpError, InvalidUriKind};
 #[cfg(feature = "otel")]
-pub use layers::{ClassifyFn, MetricsLayer, MetricsService, default_classify};
+pub use layers::{
+    ClassifyFn, MetricsLayer, MetricsService, RequestDurationRecorder, RequestLabels,
+    RequestOutcome, default_classify,
+};
 pub use layers::{
     OtelLayer, OtelService, RETRY_ATTEMPT_HEADER, RetryLayer, RetryService, SecureRedirectPolicy,
     UserAgentLayer, UserAgentService,
 };
+pub use limiter::{ConcurrencyLimiter, ConcurrencySlot};
 pub use request::{RequestBuilder, RequestType};
 pub use response::{HttpResponse, LimitedBody, ResponseBody};
 pub use security::{attach_bearer_http, attach_internal_token_http};

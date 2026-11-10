@@ -1,0 +1,18 @@
+error[E0053]: method `one` has an incompatible type for trait
+  --> tests/ui/fail/handler_signature_drift.rs:30:14
+   |
+30 |         _id: u64,
+   |              ^^^ expected `std::string::String`, found `u64`
+   |
+note: type in trait
+  --> tests/ui/fail/handler_signature_drift.rs:17:51
+   |
+17 |     async fn one(&self, ctx: SecurityContext, id: String) -> Result<u32, CanonicalError>;
+   |                                                   ^^^^^^
+   = note: expected signature `fn(&'life0 Local, &'life1 ManualCallContext<'life2>, toolkit_security::SecurityContext, std::string::String) -> Pin<Box<(dyn std::future::Future<Output = Result<u32, CanonicalError>> + Send + 'async_trait)>>`
+              found signature `fn(&'life0 Local, &'life1 ManualCallContext<'life2>, toolkit_security::SecurityContext, u64) -> Pin<Box<(dyn std::future::Future<Output = Result<u32, CanonicalError>> + Send + 'async_trait)>>`
+help: change the parameter type to match the trait
+   |
+30 -         _id: u64,
+30 +         _id: std::string::String,
+   |

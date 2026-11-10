@@ -1,0 +1,19 @@
+error[E0599]: no associated function or constant named `new` found for struct `StatefulDemoApiRestClient<__Handler>` in the current scope
+ --> tests/ui/fail/new_without_manual_handler.rs:7:40
+  |
+7 |     let _ = StatefulDemoApiRestClient::new(ClientConfig::new("http://x"));
+  |                                        ^^^ associated function or constant not found in `StatefulDemoApiRestClient<_>`
+  |
+note: if you're trying to build a new `StatefulDemoApiRestClient<_>` consider using one of the following associated functions:
+      StatefulDemoApiRestClient::<__Handler>::with_manual
+      StatefulDemoApiRestClient::<__Handler>::with_http_client_and_manual
+ --> src/lib.rs
+  |
+  | #[toolkit::rest_contract(base_path = "/stateful-demo/v1")]
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  = help: items from traits can only be used if the trait is in scope
+  = note: this error originates in the attribute macro `toolkit::rest_contract` (in Nightly builds, run with -Z macro-backtrace for more info)
+help: trait `Paint` which provides `new` is implemented but not in scope; perhaps you want to import it
+  |
+3 + use yansi::paint::Paint;
+  |

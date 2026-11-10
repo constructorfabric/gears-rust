@@ -19,6 +19,7 @@ mod provides;
 mod query_params;
 mod rest_contract;
 mod rest_contract_parse;
+mod rest_manual;
 mod stream_attr;
 mod support;
 

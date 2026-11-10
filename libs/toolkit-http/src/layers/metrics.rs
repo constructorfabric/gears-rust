@@ -29,7 +29,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tower::{Layer, Service};
 
 /// Classifies a request into a low-cardinality route label (the `http.route`
@@ -104,10 +104,95 @@ fn error_type(err: &HttpError) -> &'static str {
     }
 }
 
+/// How an outbound request ended, for [`RequestDurationRecorder::record`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestOutcome {
+    /// A response head arrived with this status code.
+    Status(u16),
+    /// No response head: a low-cardinality failure class such as `"timeout"`,
+    /// `"transport"` or `"tls"`.
+    Error(&'static str),
+}
+
+/// The bounded attributes of one outbound request.
+#[derive(Debug, Clone, Copy)]
+pub struct RequestLabels<'a> {
+    /// Request method; unknown methods are recorded as `_OTHER`.
+    pub method: &'a http::Method,
+    /// Low-cardinality `http.route` label (never a raw path).
+    pub route: &'a str,
+    /// Request URI; only its host and explicit port are recorded.
+    pub uri: &'a http::Uri,
+    /// `request_type` attribute, when the caller sets one.
+    pub request_type: Option<&'a str>,
+}
+
+/// The `http.client.request.duration` instrument, usable without
+/// [`MetricsLayer`] by clients whose requests do not pass through the
+/// `toolkit-http` service stack (e.g. streaming-body requests sent by
+/// another engine). Attributes and buckets are the ones the layer records.
+#[derive(Clone)]
+pub struct RequestDurationRecorder {
+    duration: Histogram<f64>,
+}
+
+impl RequestDurationRecorder {
+    /// Create a recorder on the global meter provider; `client_type` names the
+    /// instrumentation scope, as in [`MetricsLayer::new`].
+    #[must_use]
+    pub fn new(client_type: &str) -> Self {
+        let scope = opentelemetry::InstrumentationScope::builder(client_type.to_owned()).build();
+        Self::with_meter(&global::meter_with_scope(scope))
+    }
+
+    /// Create a recorder on a caller-provided [`Meter`].
+    #[must_use]
+    pub fn with_meter(meter: &Meter) -> Self {
+        let duration = meter
+            .f64_histogram("http.client.request.duration")
+            .with_description("Duration of outbound HTTP client requests")
+            .with_unit("s")
+            .with_boundaries(DURATION_BOUNDARIES_SECS.to_vec())
+            .build();
+        Self { duration }
+    }
+
+    /// Record one request that took `elapsed` until its response head (or
+    /// failure).
+    pub fn record(&self, elapsed: Duration, labels: RequestLabels<'_>, outcome: RequestOutcome) {
+        let mut attrs = vec![
+            KeyValue::new("http.request.method", normalize_method(labels.method)),
+            KeyValue::new("http.route", labels.route.to_owned()),
+            KeyValue::new(
+                "server.address",
+                labels.uri.host().unwrap_or("unknown").to_owned(),
+            ),
+        ];
+        // OTel client semconv pairs server.address with server.port; only
+        // explicit ports are present in the URI (default 80/443 are elided).
+        if let Some(port) = labels.uri.port_u16() {
+            attrs.push(KeyValue::new("server.port", i64::from(port)));
+        }
+        if let Some(rt) = labels.request_type {
+            attrs.push(KeyValue::new("request_type", rt.to_owned()));
+        }
+        match outcome {
+            RequestOutcome::Status(status) => {
+                attrs.push(KeyValue::new(
+                    "http.response.status_code",
+                    i64::from(status),
+                ));
+            }
+            RequestOutcome::Error(kind) => attrs.push(KeyValue::new("error.type", kind)),
+        }
+        self.duration.record(elapsed.as_secs_f64(), &attrs);
+    }
+}
+
 /// Tower layer recording HTTP client request-duration metrics.
 #[derive(Clone)]
 pub struct MetricsLayer {
-    duration: Histogram<f64>,
+    recorder: RequestDurationRecorder,
     classify: ClassifyFn,
 }
 
@@ -119,9 +204,10 @@ impl MetricsLayer {
     /// `classify` produces the bounded `http.route` attribute for each request.
     #[must_use]
     pub fn new(client_type: &str, classify: ClassifyFn) -> Self {
-        let scope = opentelemetry::InstrumentationScope::builder(client_type.to_owned()).build();
-        let meter = global::meter_with_scope(scope);
-        Self::with_meter(&meter, classify)
+        Self {
+            recorder: RequestDurationRecorder::new(client_type),
+            classify,
+        }
     }
 
     /// Create a metrics layer using a caller-provided [`Meter`].
@@ -131,13 +217,10 @@ impl MetricsLayer {
     /// name, unit, bucket boundaries, and behavior are identical to [`new`](Self::new).
     #[must_use]
     pub fn with_meter(meter: &Meter, classify: ClassifyFn) -> Self {
-        let duration = meter
-            .f64_histogram("http.client.request.duration")
-            .with_description("Duration of outbound HTTP client requests")
-            .with_unit("s")
-            .with_boundaries(DURATION_BOUNDARIES_SECS.to_vec())
-            .build();
-        Self { duration, classify }
+        Self {
+            recorder: RequestDurationRecorder::with_meter(meter),
+            classify,
+        }
     }
 }
 
@@ -147,7 +230,7 @@ impl<S> Layer<S> for MetricsLayer {
     fn layer(&self, inner: S) -> Self::Service {
         MetricsService {
             inner,
-            duration: self.duration.clone(),
+            recorder: self.recorder.clone(),
             classify: self.classify.clone(),
         }
     }
@@ -157,7 +240,7 @@ impl<S> Layer<S> for MetricsLayer {
 #[derive(Clone)]
 pub struct MetricsService<S> {
     inner: S,
-    duration: Histogram<f64>,
+    recorder: RequestDurationRecorder,
     classify: ClassifyFn,
 }
 
@@ -181,16 +264,15 @@ where
         // Compute attributes from the request up front; the request itself is
         // moved into the inner service.
         let route = (self.classify)(&req).into_owned();
-        let method = normalize_method(req.method());
-        let server_address = req.uri().host().unwrap_or("unknown").to_owned();
-        let server_port = req.uri().port_u16();
+        let method = req.method().clone();
+        let uri = req.uri().clone();
         // Read request_type set by RequestBuilder::with_request_type — mirrors
         // go-appkit's GetRequestTypeFromContext.
         let request_type = req
             .extensions()
             .get::<RequestType>()
             .map(|rt| rt.0.clone().into_owned());
-        let duration = self.duration.clone();
+        let recorder = self.recorder.clone();
 
         // Swap so we call the instance that was poll_ready'd, leaving a fresh
         // clone for the next poll_ready cycle (Tower Service contract).
@@ -200,29 +282,20 @@ where
         Box::pin(async move {
             let start = Instant::now();
             let result = inner.call(req).await;
-            let elapsed = start.elapsed().as_secs_f64();
-
-            let mut attrs = vec![
-                KeyValue::new("http.request.method", method),
-                KeyValue::new("http.route", route),
-                KeyValue::new("server.address", server_address),
-            ];
-            // OTel client semconv pairs server.address with server.port; only
-            // explicit ports are present in the URI (default 80/443 are elided).
-            if let Some(port) = server_port {
-                attrs.push(KeyValue::new("server.port", i64::from(port)));
-            }
-            if let Some(rt) = request_type {
-                attrs.push(KeyValue::new("request_type", rt));
-            }
-            match &result {
-                Ok(response) => attrs.push(KeyValue::new(
-                    "http.response.status_code",
-                    i64::from(response.status().as_u16()),
-                )),
-                Err(e) => attrs.push(KeyValue::new("error.type", error_type(e))),
-            }
-            duration.record(elapsed, &attrs);
+            let outcome = match &result {
+                Ok(response) => RequestOutcome::Status(response.status().as_u16()),
+                Err(e) => RequestOutcome::Error(error_type(e)),
+            };
+            recorder.record(
+                start.elapsed(),
+                RequestLabels {
+                    method: &method,
+                    route: &route,
+                    uri: &uri,
+                    request_type: request_type.as_deref(),
+                },
+                outcome,
+            );
 
             result
         })
@@ -354,6 +427,46 @@ mod tests {
                 .all(|kv| kv.key.as_str() != "http.response.status_code"),
             "transport failures must not record http.response.status_code"
         );
+    }
+
+    #[test]
+    fn recorder_used_directly_records_the_layer_attributes() {
+        let (provider, exporter) = test_provider();
+        let recorder = RequestDurationRecorder::with_meter(&provider.meter("raw-client"));
+        let uri: http::Uri = "https://example.com:8443/proxy/a".parse().unwrap();
+        let labels = RequestLabels {
+            method: &http::Method::from_bytes(b"PROPFIND").unwrap(),
+            route: "proxy",
+            uri: &uri,
+            request_type: None,
+        };
+        recorder.record(
+            Duration::from_millis(5),
+            labels,
+            RequestOutcome::Status(502),
+        );
+        recorder.record(
+            Duration::from_millis(5),
+            labels,
+            RequestOutcome::Error("timeout"),
+        );
+
+        provider.force_flush().unwrap();
+        let ok = find_duration_point(
+            &exporter,
+            &[
+                ("http.request.method", "_OTHER"),
+                ("http.route", "proxy"),
+                ("server.address", "example.com"),
+                ("server.port", "8443"),
+                ("http.response.status_code", "502"),
+            ],
+        )
+        .expect("status data point");
+        assert_eq!(ok.count(), 1);
+        let failed =
+            find_duration_point(&exporter, &[("error.type", "timeout")]).expect("error data point");
+        assert_eq!(failed.count(), 1);
     }
 
     #[test]

@@ -94,10 +94,15 @@ where
 /// wired here. `timeout` is wired on purpose: the SDK also enforces it per call,
 /// and matching the transport's `TimeoutLayer` to it stops a `config.timeout`
 /// above toolkit-http's 30s default being silently capped at 30s.
-fn transport_builder(config: &ClientConfig) -> toolkit_http::HttpClientBuilder {
-    toolkit_http::HttpClient::builder()
+fn transport_builder(
+    config: &ClientConfig,
+    limiter: Option<toolkit_http::ConcurrencyLimiter>,
+) -> toolkit_http::HttpClientBuilder {
+    let builder = toolkit_http::HttpClient::builder()
         .retry(None)
         .transport(transport_security(config.require_tls))
+        .tls_roots(config.tls_roots)
+        .tls(config.tls.clone())
         .timeout(config.timeout)
         .pool_max_idle_per_host(config.pool_max_idle_per_host)
         .pool_idle_timeout(config.pool_idle_timeout)
@@ -107,7 +112,21 @@ fn transport_builder(config: &ClientConfig) -> toolkit_http::HttpClientBuilder {
                 .map(|max_concurrent_requests| toolkit_http::RateLimitConfig {
                     max_concurrent_requests,
                 }),
-        )
+        );
+    match limiter {
+        Some(limiter) => builder.concurrency_limiter(limiter),
+        None => builder,
+    }
+}
+
+/// The limiter `max_concurrent_requests` asks for, to share between the
+/// `toolkit-http` client and another transport of the same generated client.
+#[must_use]
+pub fn concurrency_limiter(config: &ClientConfig) -> Option<toolkit_http::ConcurrencyLimiter> {
+    config
+        .max_concurrent_requests
+        .filter(|max| *max < usize::MAX)
+        .map(toolkit_http::ConcurrencyLimiter::new)
 }
 
 /// Build the default `toolkit-http` client used by macro-generated REST clients.
@@ -151,7 +170,21 @@ pub fn build_default_http_client(
     client_type: &str,
     config: &ClientConfig,
 ) -> Result<toolkit_http::HttpClient, toolkit_http::HttpError> {
-    transport_builder(config)
+    build_http_client_with_limiter(client_type, config, None)
+}
+
+/// [`build_default_http_client`] drawing on `limiter` (when `Some`) instead of
+/// a limit of its own, so another transport can share the budget.
+///
+/// # Errors
+/// As [`build_default_http_client`].
+#[cfg(feature = "otel")]
+pub fn build_http_client_with_limiter(
+    client_type: &str,
+    config: &ClientConfig,
+    limiter: Option<toolkit_http::ConcurrencyLimiter>,
+) -> Result<toolkit_http::HttpClient, toolkit_http::HttpError> {
+    transport_builder(config, limiter)
         .with_otel()
         .with_metrics(client_type)
         .build()
@@ -170,10 +203,23 @@ pub fn build_default_http_client(
 /// TLS backend that cannot be constructed under FIPS).
 #[cfg(not(feature = "otel"))]
 pub fn build_default_http_client(
-    _client_type: &str,
+    client_type: &str,
     config: &ClientConfig,
 ) -> Result<toolkit_http::HttpClient, toolkit_http::HttpError> {
-    transport_builder(config).with_otel().build()
+    build_http_client_with_limiter(client_type, config, None)
+}
+
+/// Non-`otel` build of [`build_http_client_with_limiter`].
+///
+/// # Errors
+/// As [`build_default_http_client`].
+#[cfg(not(feature = "otel"))]
+pub fn build_http_client_with_limiter(
+    _client_type: &str,
+    config: &ClientConfig,
+    limiter: Option<toolkit_http::ConcurrencyLimiter>,
+) -> Result<toolkit_http::HttpClient, toolkit_http::HttpError> {
+    transport_builder(config, limiter).with_otel().build()
 }
 
 fn transport_security(require_tls: bool) -> toolkit_http::TransportSecurity {

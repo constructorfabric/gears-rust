@@ -4,6 +4,7 @@ use crate::config::{
 };
 use crate::error::HttpError;
 use crate::layers::{OtelLayer, RetryLayer, SecureRedirectPolicy, UserAgentLayer};
+use crate::limiter::{ConcurrencyLimiter, LimitLayer};
 use crate::response::ResponseBody;
 use crate::tls;
 use bytes::Bytes;
@@ -15,8 +16,6 @@ use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::{TokioExecutor, TokioTimer};
 use std::time::Duration;
 use tower::buffer::Buffer;
-use tower::limit::ConcurrencyLimitLayer;
-use tower::load_shed::LoadShedLayer;
 use tower::timeout::TimeoutLayer;
 use tower::util::BoxCloneService;
 use tower::{ServiceBuilder, ServiceExt};
@@ -32,6 +31,7 @@ pub struct HttpClientBuilder {
     config: HttpClientConfig,
     auth_layer: Option<Box<dyn FnOnce(InnerService) -> InnerService + Send>>,
     metrics_layer: Option<Box<dyn FnOnce(InnerService) -> InnerService + Send>>,
+    limiter: Option<ConcurrencyLimiter>,
 }
 
 impl HttpClientBuilder {
@@ -42,6 +42,7 @@ impl HttpClientBuilder {
             config: HttpClientConfig::default(),
             auth_layer: None,
             metrics_layer: None,
+            limiter: None,
         }
     }
 
@@ -52,6 +53,7 @@ impl HttpClientBuilder {
             config,
             auth_layer: None,
             metrics_layer: None,
+            limiter: None,
         }
     }
 
@@ -101,8 +103,7 @@ impl HttpClientBuilder {
     ///
     /// This installs a *concurrency* cap (max in-flight requests), not a
     /// requests-per-second rate limit. `None` disables the limiter entirely.
-    /// `Some(cfg)` installs a load-shedding
-    /// [`ConcurrencyLimitLayer`](tower::limit::ConcurrencyLimitLayer) capped at
+    /// `Some(cfg)` installs a concurrency limit capped at
     /// `cfg.max_concurrent_requests`; requests beyond the cap fail fast with
     /// [`HttpError::Overloaded`](crate::error::HttpError::Overloaded) rather
     /// than queueing. A `max_concurrent_requests` of `usize::MAX` is treated as
@@ -112,6 +113,17 @@ impl HttpClientBuilder {
     #[must_use]
     pub fn concurrency_limit(mut self, rate_limit: Option<RateLimitConfig>) -> Self {
         self.config.rate_limit = rate_limit;
+        self
+    }
+
+    /// Cap in-flight requests with a caller-owned [`ConcurrencyLimiter`]
+    /// instead of [`concurrency_limit`](Self::concurrency_limit), so the cap can
+    /// be shared with other clients or engines. Requests beyond it fail fast
+    /// with [`HttpError::Overloaded`](crate::error::HttpError::Overloaded), as
+    /// with the built-in limit.
+    #[must_use]
+    pub fn concurrency_limiter(mut self, limiter: ConcurrencyLimiter) -> Self {
+        self.limiter = Some(limiter);
         self
     }
 
@@ -154,6 +166,13 @@ impl HttpClientBuilder {
     #[must_use]
     pub fn tls(mut self, tls: TlsConfig) -> Self {
         self.config.tls = tls;
+        self
+    }
+
+    /// Set the root-trust strategy for server certificates.
+    #[must_use]
+    pub fn tls_roots(mut self, roots: TlsRootConfig) -> Self {
+        self.config.tls_roots = roots;
         self
     }
 
@@ -417,7 +436,7 @@ impl HttpClientBuilder {
         // =======================================================================
         //
         // Request flow (outer → inner):
-        //   Buffer → OtelLayer → [MetricsLayer?] → LoadShed/Concurrency →
+        //   Buffer → OtelLayer → [MetricsLayer?] → ConcurrencyLimit →
         //   RetryLayer → [AuthLayer?] → ErrorMapping → Timeout → UserAgent →
         //   Decompression → FollowRedirect → hyper_client
         //
@@ -433,7 +452,7 @@ impl HttpClientBuilder {
         // Response flow (inner → outer):
         //   hyper_client → FollowRedirect → Decompression → UserAgent →
         //   Timeout → ErrorMapping → [AuthLayer?] → RetryLayer →
-        //   LoadShed/Concurrency → [MetricsLayer?] → OtelLayer → Buffer
+        //   ConcurrencyLimit → [MetricsLayer?] → OtelLayer → Buffer
         //
         // Key semantics (reqwest-like):
         //  - send() returns Ok(Response) for ALL HTTP statuses (including 4xx/5xx)
@@ -496,29 +515,14 @@ impl HttpClientBuilder {
             boxed_service = retry_service.boxed_clone();
         }
 
-        // Conditionally wrap with concurrency limit + load shedding.
-        // LoadShedLayer returns error immediately when ConcurrencyLimitLayer is
-        // saturated instead of waiting indefinitely (Poll::Pending).
+        // Conditionally wrap with a fail-fast concurrency limit: a request
+        // beyond the cap fails with `Overloaded` instead of waiting.
         //
         // Applied BEFORE the metrics layer (i.e. inner to it) on purpose: a shed
         // request then propagates back out through MetricsLayer and is recorded
         // in `http.client.request.duration` with `error.type = "overloaded"`,
         // rather than being rejected outside metrics and left invisible.
-        if let Some(rate_limit) = self.config.rate_limit
-            && rate_limit.max_concurrent_requests < usize::MAX
-        {
-            let limited_service = ServiceBuilder::new()
-                .layer(LoadShedLayer::new())
-                // `.max(1)`: a cap of 0 never grants a permit (sheds everything);
-                // mirrors the `buffer_capacity` clamp below.
-                .layer(ConcurrencyLimitLayer::new(
-                    rate_limit.max_concurrent_requests.max(1),
-                ))
-                .service(boxed_service);
-            // Map load shed errors to HttpError::Overloaded
-            let limited_service = limited_service.map_err(map_load_shed_error);
-            boxed_service = limited_service.boxed_clone();
-        }
+        boxed_service = limit_concurrency(boxed_service, self.config.rate_limit, self.limiter);
 
         // Apply metrics layer (outside both retry and the concurrency limiter).
         // Outside retry: observes one logical request, not per-attempt. Outside
@@ -573,18 +577,7 @@ impl HttpClientBuilder {
             boxed_service = retry_service.boxed_clone();
         }
 
-        if let Some(rate_limit) = self.config.rate_limit
-            && rate_limit.max_concurrent_requests < usize::MAX
-        {
-            let limited_service = ServiceBuilder::new()
-                .layer(LoadShedLayer::new())
-                .layer(ConcurrencyLimitLayer::new(
-                    rate_limit.max_concurrent_requests.max(1),
-                ))
-                .service(boxed_service);
-            let limited_service = limited_service.map_err(map_load_shed_error);
-            boxed_service = limited_service.boxed_clone();
-        }
+        boxed_service = limit_concurrency(boxed_service, self.config.rate_limit, self.limiter);
 
         let buffer_capacity = self.config.buffer_capacity.max(1);
         let buffered_service: crate::client::BufferedService =
@@ -621,21 +614,30 @@ fn map_tower_error(err: tower::BoxError, timeout: Duration) -> HttpError {
     }
 }
 
-/// Map load shed errors to `HttpError::Overloaded`.
+/// Wrap `service` in a fail-fast concurrency limit: the caller's shared
+/// `limiter` when given, else one built from `rate_limit` (`usize::MAX` means
+/// unlimited). Requests beyond the cap fail with `HttpError::Overloaded`.
 ///
-/// A shed request is observable via metrics: the concurrency limiter is inner to
+/// A shed request is observable via metrics: the limit is inner to
 /// [`MetricsLayer`](crate::layers::metrics), so the rejection is recorded in
 /// `http.client.request.duration` with `error.type = "overloaded"`.
-fn map_load_shed_error(err: tower::BoxError) -> HttpError {
-    if err.is::<tower::load_shed::error::Overloaded>() {
-        HttpError::Overloaded
-    } else {
-        // Pass through other HttpError types (from inner service)
-        match err.downcast::<HttpError>() {
-            Ok(http_err) => *http_err,
-            Err(err) => HttpError::Transport(err),
-        }
-    }
+fn limit_concurrency(
+    service: InnerService,
+    rate_limit: Option<RateLimitConfig>,
+    limiter: Option<ConcurrencyLimiter>,
+) -> InnerService {
+    let limiter = limiter.or_else(|| {
+        rate_limit
+            .filter(|limit| limit.max_concurrent_requests < usize::MAX)
+            .map(|limit| ConcurrencyLimiter::new(limit.max_concurrent_requests))
+    });
+    let Some(limiter) = limiter else {
+        return service;
+    };
+    ServiceBuilder::new()
+        .layer(LimitLayer::new(limiter))
+        .service(service)
+        .boxed_clone()
 }
 
 /// Map the decompression response to our boxed response body type.
@@ -816,6 +818,35 @@ mod tests {
             builder.config.rate_limit.is_none(),
             "None should disable the limiter"
         );
+    }
+
+    /// A caller-owned limiter is one budget: a slot taken outside the client
+    /// sheds the client's own requests, and frees them again when dropped.
+    #[tokio::test]
+    async fn test_builder_shared_limiter_is_one_budget() {
+        let inner = tower::service_fn(|_req: http::Request<Full<Bytes>>| async {
+            let body: ResponseBody = http_body_util::Empty::<Bytes>::new()
+                .map_err(|e: std::convert::Infallible| match e {})
+                .boxed();
+            Ok::<_, HttpError>(http::Response::new(body))
+        });
+        let limiter = ConcurrencyLimiter::new(1);
+        let client = HttpClientBuilder::new()
+            .retry(None)
+            .concurrency_limiter(limiter.clone())
+            .build_with_inner_service(inner.boxed_clone());
+
+        let slot = limiter.try_acquire().unwrap();
+        let shed = client.get("https://fake/").send().await;
+        assert!(matches!(shed, Err(HttpError::Overloaded)), "{shed:?}");
+
+        // The shed request reserved nothing: the released slot is free for
+        // anyone, not held for the idle client.
+        drop(slot);
+        drop(limiter.try_acquire().unwrap());
+        client.get("https://fake/").send().await.unwrap();
+        // The client's request released its slot when its head arrived.
+        limiter.try_acquire().unwrap();
     }
 
     /// `max_concurrent_requests: usize::MAX` is treated as unlimited — the layer
@@ -1024,10 +1055,9 @@ mod tests {
         );
     }
 
-    /// Test that concurrency limit uses fail-fast behavior (C2).
-    ///
-    /// `LoadShedLayer` + `ConcurrencyLimitLayer` combination returns Overloaded error
-    /// immediately when capacity is exhausted, instead of blocking indefinitely.
+    /// Test that concurrency limit uses fail-fast behavior (C2): the limit
+    /// layer returns Overloaded immediately when capacity is exhausted,
+    /// instead of blocking indefinitely.
     #[tokio::test]
     async fn test_load_shedding_returns_overloaded_error() {
         use bytes::Bytes;
@@ -1065,15 +1095,12 @@ mod tests {
 
         let active = Arc::new(AtomicUsize::new(0));
 
-        // Build a service with load shedding and concurrency limit of 1
+        // Build a service with a concurrency limit of 1
         let service = tower::ServiceBuilder::new()
-            .layer(LoadShedLayer::new())
-            .layer(ConcurrencyLimitLayer::new(1))
+            .layer(LimitLayer::new(ConcurrencyLimiter::new(1)))
             .service(SlotHoldingService {
                 active: active.clone(),
             });
-
-        let service = service.map_err(map_load_shed_error);
 
         // First request: will occupy the single slot
         let req1 = Request::builder()
@@ -1093,7 +1120,7 @@ mod tests {
             "First request should be active"
         );
 
-        // Second request: LoadShedLayer should reject because ConcurrencyLimit is at capacity
+        // Second request: the limit layer rejects it because the only slot is taken
         let req2 = Request::builder()
             .uri("http://test")
             .body(Full::new(Bytes::new()))
@@ -1101,7 +1128,7 @@ mod tests {
 
         let mut svc2 = service.clone();
 
-        // LoadShedLayer checks poll_ready and returns Overloaded if inner service is not ready
+        // The limit layer fails the call at once instead of waiting for a slot
         let result = tokio::time::timeout(Duration::from_millis(100), async {
             // poll_ready should return quickly with error (not block)
             match svc2.ready().await {

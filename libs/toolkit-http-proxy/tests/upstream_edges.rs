@@ -607,6 +607,75 @@ async fn partial_head_then_close_fails_without_a_resend() {
     assert_eq!(conns.load(Ordering::SeqCst), 1);
 }
 
+/// A pooled connection that reads the next request and closes unanswered:
+/// the upstream may have processed it.
+static STALE_AFTER_ONE: &[Step] = &[
+    Read,
+    Write(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"),
+    Read,
+    Close,
+];
+
+#[tokio::test]
+async fn stale_keep_alive_resends_an_idempotent_request_by_default() {
+    let (t, conns) = scripted(&[STALE_AFTER_ONE, &[]]).await;
+    let c = support::client();
+    assert_eq!(text(c.send(&t, get()).await.unwrap()).await, "ok");
+    assert_eq!(next_conn(&c, &t).await, "conn=2");
+    assert_eq!(conns.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn stale_keep_alive_is_not_resent_without_resend_idempotent() {
+    let (t, conns) = scripted(&[STALE_AFTER_ONE, &[]]).await;
+    let mut cfg = support::test_config();
+    cfg.resend_idempotent = false;
+    let c = ProxyClient::new(cfg).unwrap();
+    assert_eq!(text(c.send(&t, get()).await.unwrap()).await, "ok");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    c.send(&t, get()).await.unwrap_err();
+    assert_eq!(conns.load(Ordering::SeqCst), 1);
+}
+
+/// A target nothing listens on.
+async fn refusing_target() -> Target {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    plain(listener.local_addr().unwrap())
+}
+
+#[tokio::test]
+async fn send_any_moves_past_a_refused_target_with_a_streaming_body() {
+    let (t, conns) = scripted(&[&[]]).await;
+    let refused = refusing_target().await;
+    // A streaming body cannot be replayed: moving on is safe only because
+    // the refused connect sent nothing.
+    let body =
+        toolkit_http_proxy::stream_body(futures_util::stream::iter([Ok::<_, std::io::Error>(
+            bytes::Bytes::from_static(b"x"),
+        )]));
+    let req = Request::post("/").body(body).unwrap();
+
+    let resp = support::client()
+        .send_any(&[refused, t], req)
+        .await
+        .unwrap();
+    assert_eq!(text(resp).await, "conn=1");
+    assert_eq!(conns.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn send_any_reports_the_last_connect_failure() {
+    let targets = [refusing_target().await, refusing_target().await];
+    let err = support::client()
+        .send_any(&targets, get())
+        .await
+        .unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::ConnectRefused);
+
+    let none = support::client().send_any(&[], get()).await.unwrap_err();
+    assert_eq!(none.kind(), ErrorKind::InvalidRequest);
+}
+
 // ---------------------------------------------------------------------------
 // Upgrades
 // ---------------------------------------------------------------------------

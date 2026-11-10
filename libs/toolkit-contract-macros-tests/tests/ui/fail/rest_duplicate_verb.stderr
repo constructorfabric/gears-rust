@@ -1,4 +1,4 @@
-error: duplicate HTTP method annotation: a projection method must declare exactly one of `#[get]`/`#[post]`/`#[put]`/`#[patch]`/`#[delete]`
+error: duplicate HTTP method annotation: a projection method must declare exactly one of `#[get]`/`#[post]`/`#[put]`/`#[patch]`/`#[delete]`/`#[passthrough]`
   --> tests/ui/fail/rest_duplicate_verb.rs:16:5
    |
 16 |     #[post("/act")]

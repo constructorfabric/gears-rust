@@ -1,0 +1,5 @@
+error: `manual_handler` names the default `#[client_manual]` handler, but no method of this projection is `#[client_manual]`
+  --> tests/ui/fail/manual_handler_without_methods.rs:11:68
+   |
+11 | #[toolkit::rest_contract(base_path = "/local/v1", manual_handler = Local)]
+   |                                                                    ^^^^^

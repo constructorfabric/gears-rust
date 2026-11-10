@@ -119,7 +119,9 @@ where
 ///
 /// # Errors
 /// Returns [`TransportError::UrlBuild`] when a required path parameter is missing,
-/// null, or empty, or when a referenced field is not convertible to a string.
+/// null, or empty, when a referenced field is not convertible to a string, or
+/// for a passthrough binding, whose URL comes from the forwarded request (see
+/// [`crate::runtime::manual::ManualCallContext::send_raw`]).
 pub fn build_request_url(
     base_url: &str,
     base_path: &str,
@@ -148,6 +150,12 @@ pub fn build_request_url(
             // Query values are encoded by the caller; the binding entry stays in
             // the IR for validation and spec generation.
             HttpFieldBinding::Query { .. } | HttpFieldBinding::Body => {}
+            HttpFieldBinding::Passthrough { .. } => {
+                return Err(TransportError::UrlBuild(format!(
+                    "method '{}' is a passthrough binding; its URL comes from the forwarded request",
+                    method_binding.method_name
+                )));
+            }
         }
     }
 
@@ -181,15 +189,19 @@ pub fn attach_internal_token(
     }
 }
 
-/// Map an HTTP method enum to [`http::Method`].
+/// Map an HTTP method enum to [`http::Method`], or `None` for
+/// [`HttpMethod::Passthrough`], whose method is chosen per request.
 #[must_use]
-pub fn to_http_method(method: HttpMethod) -> http::Method {
+pub fn to_http_method(method: HttpMethod) -> Option<http::Method> {
     match method {
-        HttpMethod::Get => http::Method::GET,
-        HttpMethod::Post => http::Method::POST,
-        HttpMethod::Put => http::Method::PUT,
-        HttpMethod::Patch => http::Method::PATCH,
-        HttpMethod::Delete => http::Method::DELETE,
+        HttpMethod::Get => Some(http::Method::GET),
+        HttpMethod::Post => Some(http::Method::POST),
+        HttpMethod::Put => Some(http::Method::PUT),
+        HttpMethod::Patch => Some(http::Method::PATCH),
+        HttpMethod::Delete => Some(http::Method::DELETE),
+        HttpMethod::Head => Some(http::Method::HEAD),
+        HttpMethod::Options => Some(http::Method::OPTIONS),
+        HttpMethod::Passthrough => None,
     }
 }
 
@@ -317,6 +329,47 @@ mod tests {
             streaming: false,
             stream_framing: StreamFraming::default(),
             optional: false,
+        }
+    }
+
+    #[test]
+    fn passthrough_binding_has_no_generated_url() {
+        let b = binding(
+            "/proxy/{*path}",
+            vec![HttpFieldBinding::Passthrough {
+                field: "req".into(),
+                param: "path".into(),
+                methods: vec![HttpMethod::Get],
+            }],
+        );
+        let err = build_request_url(
+            "https://x.example",
+            "/api",
+            &b,
+            &serde_json::json!({}),
+            None,
+        )
+        .unwrap_err();
+        assert!(matches!(err, TransportError::UrlBuild(_)), "{err:?}");
+    }
+
+    #[test]
+    fn http_method_names_agree_with_the_wire_methods() {
+        for method in [
+            HttpMethod::Get,
+            HttpMethod::Post,
+            HttpMethod::Put,
+            HttpMethod::Patch,
+            HttpMethod::Delete,
+            HttpMethod::Head,
+            HttpMethod::Options,
+            HttpMethod::Passthrough,
+        ] {
+            assert_eq!(
+                to_http_method(method).map(|m| m.as_str().to_owned()),
+                method.as_str().map(str::to_owned),
+                "{method:?}"
+            );
         }
     }
 

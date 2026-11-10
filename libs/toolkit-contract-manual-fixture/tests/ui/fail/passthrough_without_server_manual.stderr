@@ -1,0 +1,5 @@
+error: `#[passthrough]` forwards an opaque request that neither side can generate: mark the method `#[client_manual]` and `#[server_manual]`
+  --> tests/ui/fail/passthrough_without_server_manual.rs:18:5
+   |
+18 |     #[passthrough("/proxy/{*path}", methods = [get])]
+   |     ^

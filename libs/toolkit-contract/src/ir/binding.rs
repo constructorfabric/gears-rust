@@ -62,7 +62,7 @@ pub struct HttpMethodBindingIr {
 }
 
 /// HTTP method verb.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum HttpMethod {
     /// HTTP GET.
@@ -75,6 +75,31 @@ pub enum HttpMethod {
     Patch,
     /// HTTP DELETE.
     Delete,
+    /// HTTP HEAD. Only valid in a passthrough method set.
+    Head,
+    /// HTTP OPTIONS. Only valid in a passthrough method set.
+    Options,
+    /// The request method comes from the opaque request at call time, limited
+    /// to the set in the method's [`HttpFieldBinding::Passthrough`] binding.
+    Passthrough,
+}
+
+impl HttpMethod {
+    /// Upper-case wire name, or `None` for [`Self::Passthrough`], which names
+    /// no single method.
+    #[must_use]
+    pub const fn as_str(self) -> Option<&'static str> {
+        match self {
+            Self::Get => Some("GET"),
+            Self::Post => Some("POST"),
+            Self::Put => Some("PUT"),
+            Self::Patch => Some("PATCH"),
+            Self::Delete => Some("DELETE"),
+            Self::Head => Some("HEAD"),
+            Self::Options => Some("OPTIONS"),
+            Self::Passthrough => None,
+        }
+    }
 }
 
 /// Wire framing for a server-streaming HTTP binding.
@@ -178,11 +203,56 @@ pub enum HttpFieldBinding {
     },
     /// Field value goes into the request body.
     Body,
+    /// The field is an opaque HTTP request forwarded as is (ADR-0009 §5).
+    ///
+    /// Only valid with [`HttpMethod::Passthrough`]. The request path and query
+    /// fill the trailing `{*path_param}` wildcard of the template; its method
+    /// must be one of `methods`. Request and response bodies are opaque: no JSON
+    /// schema is implied for either.
+    Passthrough {
+        /// Name of the request field in `InputShape`.
+        field: String,
+        /// Name of the trailing wildcard parameter in the path template.
+        param: String,
+        /// HTTP methods the request may use.
+        methods: Vec<HttpMethod>,
+    },
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_ir_still_deserializes_and_passthrough_round_trips() {
+        let legacy: HttpMethodBindingIr = serde_json::from_str(
+            r#"{"method_name":"get","http_method":"Get","path_template":"/x","field_bindings":["Body"]}"#,
+        )
+        .unwrap();
+        assert_eq!(legacy.http_method, HttpMethod::Get);
+
+        let passthrough = HttpMethodBindingIr {
+            method_name: "proxy".into(),
+            http_method: HttpMethod::Passthrough,
+            path_template: "/proxy/{*path}".into(),
+            field_bindings: vec![HttpFieldBinding::Passthrough {
+                field: "req".into(),
+                param: "path".into(),
+                methods: vec![HttpMethod::Get, HttpMethod::Options],
+            }],
+            retryable: false,
+            streaming: false,
+            stream_framing: StreamFraming::default(),
+            optional: false,
+        };
+        let json = serde_json::to_string(&passthrough).unwrap();
+        let back: HttpMethodBindingIr = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.http_method, HttpMethod::Passthrough);
+        assert!(matches!(
+            back.field_bindings.as_slice(),
+            [HttpFieldBinding::Passthrough { methods, .. }] if methods == &[HttpMethod::Get, HttpMethod::Options]
+        ));
+    }
 
     #[test]
     fn every_framing_media_type_is_recognised_as_streaming() {

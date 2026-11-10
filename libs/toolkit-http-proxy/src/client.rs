@@ -204,6 +204,25 @@ impl ProxyClient {
         target: &Target,
         req: Request<ProxyBody>,
     ) -> Result<Response<ResponseBody>, ProxyError> {
+        self.send_any(std::slice::from_ref(target), req).await
+    }
+
+    /// [`send`](Self::send) to the first of `targets` that accepts a
+    /// connection, e.g. every address a host name resolved to.
+    ///
+    /// A target whose TCP connect fails is skipped for the next one: the
+    /// request has not left yet, so this holds for streaming bodies too.
+    /// Once connected, the exchange behaves as with [`send`](Self::send).
+    ///
+    /// # Errors
+    ///
+    /// As [`send`](Self::send); the last connect failure when no target
+    /// accepts a connection, or [`ErrorKind::InvalidRequest`] for no targets.
+    pub async fn send_any(
+        &self,
+        targets: &[Target],
+        req: Request<ProxyBody>,
+    ) -> Result<Response<ResponseBody>, ProxyError> {
         let (mut parts, body) = req.into_parts();
         // Fields the head's `Connection` nominated: HTTP/2 request trailers
         // lose them too (HTTP/1.1 sends no request trailers: `Trailer` is
@@ -223,7 +242,8 @@ impl ProxyClient {
                 .map(|copy| copy.0.clone())
         };
         let mut req = Request::from_parts(parts, body);
-        let key = PoolKey::of(target);
+        let (target, key, first) = self.connect_any(targets).await?;
+        let mut first = Some(first);
 
         // At most one retry, and never of a request the upstream may have
         // processed, except an idempotent one (RFC 9110 §9.2.2):
@@ -234,7 +254,10 @@ impl ProxyClient {
         //   replayable body.
         let mut retry: Option<Retry> = None;
         loop {
-            let acquired = self.acquire(target, &key, retry).await?;
+            let acquired = match first.take() {
+                Some(acquired) => acquired,
+                None => self.acquire(target, &key, retry).await?,
+            };
             let reused = acquired.reused;
             let generation = acquired.conn.generation;
             let failed_generation = Some(Retry {
@@ -269,6 +292,27 @@ impl ProxyClient {
                 ) => return Err(err),
             }
         }
+    }
+
+    /// A connection to the first target that accepts one.
+    async fn connect_any<'t>(
+        &self,
+        targets: &'t [Target],
+    ) -> Result<(&'t Target, PoolKey, Acquired), ProxyError> {
+        let mut last = None;
+        for target in targets {
+            let key = PoolKey::of(target);
+            match self.acquire(target, &key, None).await {
+                Ok(acquired) => return Ok((target, key, acquired)),
+                Err(err) if is_connect_failure(&err) => {
+                    tracing::debug!(target = %target, error = %err, "connect failed, trying the next target");
+                    last = Some(err);
+                }
+                Err(err) => return Err(err),
+            }
+        }
+        Err(last
+            .unwrap_or_else(|| ProxyError::new(ErrorKind::InvalidRequest, "no target to send to")))
     }
 
     /// Perform a WebSocket opening handshake with `target` on a dedicated
@@ -680,8 +724,11 @@ impl ProxyClient {
             Sender::H1(mut h1) => {
                 // A stale keep-alive connection may only cost an idempotent,
                 // replayable request a resend; keep its head for that.
-                let resend = (reused && replayable && is_idempotent(req.method()))
-                    .then(|| Box::new(head_of(&req)));
+                let resend = (reused
+                    && replayable
+                    && inner.cfg.resend_idempotent
+                    && is_idempotent(req.method()))
+                .then(|| Box::new(head_of(&req)));
                 // `h1` owns the connection: on any failure, timeout or
                 // cancellation below it is dropped, closing the connection.
                 // Until the response head arrives, this task drives it.
@@ -769,7 +816,9 @@ impl ProxyClient {
                             && match refusal {
                                 Some(Refusal::Refused) => true,
                                 Some(Refusal::Http1Required) => fallback,
-                                Some(Refusal::GoingAway) => is_idempotent(&sent_head.method),
+                                Some(Refusal::GoingAway) => {
+                                    inner.cfg.resend_idempotent && is_idempotent(&sent_head.method)
+                                }
                                 None => false,
                             };
                         let err =
@@ -848,6 +897,17 @@ fn is_bodiless_method(method: &Method) -> bool {
 /// The upstream closed a reused HTTP/1.1 connection before answering: the
 /// classic keep-alive race. A connection the engine killed itself
 /// (`ConnectionAborted`, write stall) does not count.
+/// A TCP-level connect failure: nothing reached the target.
+fn is_connect_failure(err: &ProxyError) -> bool {
+    matches!(
+        err.kind(),
+        ErrorKind::ConnectTimeout
+            | ErrorKind::ConnectRefused
+            | ErrorKind::ConnectNoRoute
+            | ErrorKind::Connect
+    )
+}
+
 fn is_stale(err: &hyper::Error) -> bool {
     if err.is_incomplete_message() || err.is_canceled() {
         return true;
