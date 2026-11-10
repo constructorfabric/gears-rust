@@ -816,16 +816,7 @@ where
             .ensure_tiebreaker(tiebreaker.0, tiebreaker.1)
     };
 
-    // Validate cursor consistency (filter hash only) if cursor present
-    // A cursor issued for a filter carries only its hash, so a continuation
-    // must send the same filter: a missing or different one is a mismatch.
-    // A cursor without a hash is accepted (an added filter only narrows it).
-    if let Some(cur) = &q.cursor
-        && let Some(cf) = cur.f.as_deref()
-        && q.filter_hash.as_deref() != Some(cf)
-    {
-        return Err(ODataError::FilterMismatch);
-    }
+    toolkit_odata::check_cursor_filter(q)?;
 
     // Compose: filter → cursor predicate → order; apply limit+1 at the end
     let mut s = select;
@@ -953,7 +944,7 @@ fn build_cursor<E: EntityTrait>(
                 effective_order,
                 fmap,
                 tiebreaker.1,
-                q.filter_hash.clone(),
+                q.effective_filter_hash(),
                 direction,
             )
             .and_then(|c| c.encode().map_err(|_| ODataError::InvalidCursor))
@@ -966,6 +957,7 @@ fn build_cursor<E: EntityTrait>(
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
     // `super` aliases `toolkit_odata::ast` as `core`, which shadows the `core`
     // crate inside this module; spell the path out to disambiguate.
     use self::core::Value as V;
