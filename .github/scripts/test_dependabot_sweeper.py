@@ -592,6 +592,20 @@ class Main(unittest.TestCase):
         self.assertEqual((rc, proc.call_count, "deferred: run deadline reached, 2 PRs not processed" in out.getvalue()),
                          (0, 1, True))
 
+    def test_deadline_counts_setup_time(self):
+        prs = [{"number": i, "title": "t", "headRefName": "b"} for i in (1, 2)]
+        out = io.StringIO()
+        clock = iter([0, 400, 400])  # label and PR-list reads already used 400 s of the budget
+        with mock.patch.object(s.Gh, "read_json", lambda self, *a: prs if a[:2] == ("pr", "list") else []), \
+                mock.patch.object(s, "process") as proc, \
+                mock.patch.object(s.time, "monotonic", side_effect=lambda: next(clock)), \
+                mock.patch.dict(os.environ, {"GITHUB_REPOSITORY": "o/r"}, clear=True), \
+                mock.patch("sys.argv", ["dependabot_sweeper.py"]), \
+                redirect_stdout(out), redirect_stderr(io.StringIO()):
+            rc = s.main()
+        self.assertEqual((rc, proc.call_count, "deferred: run deadline reached, 2 PRs not processed" in out.getvalue()),
+                         (0, 0, True))
+
     def run_main(self, read):
         env = {k: v for k, v in os.environ.items() if k != "GITHUB_STEP_SUMMARY"}
         env["GITHUB_REPOSITORY"] = "o/r"

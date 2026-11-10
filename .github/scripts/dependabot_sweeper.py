@@ -32,7 +32,10 @@ MAX_RECREATES = 3
 STALE_HOURS = 72
 GH_TIMEOUT = 60  # seconds, per gh call
 PR_LIST_LIMIT = 500
-RUN_DEADLINE_SECONDS = 600
+# Measured from the top of main(). The deadline plus one worst-case PR (4 reads + 3 writes at
+# GH_TIMEOUT = 420 s) must fit under the 15 min job timeout, or the runner kills the job before
+# write_summary runs.
+RUN_DEADLINE_SECONDS = 300
 LIVE_REF = "refs/heads/main"
 REPO_RE = r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+"
 TITLE_MAX = 100
@@ -464,6 +467,7 @@ def write_summary(text):
 
 
 def main():
+    start = time.monotonic()
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--repo", default=os.environ.get("GITHUB_REPOSITORY"))
     ap.add_argument("--live", action="store_true", help="perform writes (default: dry-run)")
@@ -487,7 +491,6 @@ def main():
         write_summary(f"### Dependabot sweeper: listing PRs FAILED ({describe(e)})\n")
         return 1
     budget, now, rows = Budget(), datetime.now(timezone.utc), []
-    start = time.monotonic()
     ordered = sorted(prs, key=lambda p: p["number"])
     deferred = 0
     for i, pr in enumerate(ordered):
