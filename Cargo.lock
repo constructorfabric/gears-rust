@@ -4677,6 +4677,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "cf-gears-static-credstore-plugin-v2"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "cf-gears-credstore-v2-sdk",
+ "cf-gears-toolkit",
+ "cf-gears-toolkit-macros",
+ "cf-gears-toolkit-security",
+ "cf-gears-types-registry",
+ "cf-gears-types-registry-sdk",
+ "inventory",
+ "serde",
+ "serde-saphyr 1.3.0",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "cf-gears-static-idp-plugin"
 version = "0.1.27"
 dependencies = [
