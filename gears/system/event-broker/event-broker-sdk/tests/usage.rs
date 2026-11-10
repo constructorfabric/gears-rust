@@ -245,13 +245,13 @@ async fn producer_stateless_publish_sends_typed_event() -> TestResult {
     Ok(())
 }
 
-/// A persisted publish reports `Accepted` while the in-process broker
-/// confirms no durable write, and the event still reaches storage.
+/// A persisted publish holds until the in-process broker has stored the event
+/// on its backend, and reports `Persisted`.
 ///
 /// Preconditions: the producer uses the same direct setup as normal publishing.
-/// Expected: `publish_persisted` returns `Accepted` and the event is stored.
+/// Expected: `publish_persisted` returns `Persisted` and the event is stored.
 #[tokio::test]
-async fn producer_persisted_publish_reports_accepted_until_sync_publish_lands() -> TestResult {
+async fn producer_persisted_publish_reports_persisted() -> TestResult {
     let harness = harness_with(orders_catalog()).await;
     let broker = harness.broker();
 
@@ -267,8 +267,9 @@ async fn producer_persisted_publish_reports_accepted_until_sync_publish_lands() 
 
     let outcome = producer.publish_persisted(order_created()).await?;
 
-    // #5655: the in-process broker confirms no durable write until synchronous publish lands.
-    assert_eq!(outcome, IngestOutcome::Accepted);
+    // The in-process broker waits for the outbox to store the event, so a
+    // synchronous publish reports `Persisted`.
+    assert_eq!(outcome, IngestOutcome::Persisted);
     wait_for_stored(&harness, ORDERS_TOPIC, 1).await;
 
     Ok(())

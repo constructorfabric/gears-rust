@@ -22,7 +22,8 @@ use crate::reason::DenialReason;
 pub struct PluginInfo {
     /// Plugin id.
     pub id: &'static str,
-    /// The plugin verifies its evidence.
+    /// The plugin verifies its evidence. A plugin that does not gets the
+    /// evidence in `verify` without its bytes.
     pub verifies_evidence: bool,
     /// Version of the trust material that the plugin uses now.
     pub trust_material_version: Option<String>,
@@ -336,7 +337,8 @@ pub struct StoredEvidence {
     pub plugin_id: String,
     /// The intake it came through.
     pub intake: Intake,
-    /// The exact bytes that the plugin admitted.
+    /// The exact bytes that the plugin admitted. Empty in `verify` when the
+    /// plugin does not verify evidence ([`PluginInfo::verifies_evidence`]).
     pub bytes: Vec<u8>,
 }
 
@@ -535,6 +537,7 @@ pub trait GrantAdmissionPluginV1: Send + Sync {
     /// checks freshness and the clock mark against `instant`, not against the
     /// system clock. If `evidence` does not name `root_id` exactly once, the
     /// outcome is [`VerifyOutcome::Denied`] with [`PluginDenial::Duplicated`].
+    /// A plugin that does not verify evidence gets `evidence` with empty bytes.
     ///
     /// # Errors
     ///

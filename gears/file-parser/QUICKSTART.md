@@ -42,8 +42,7 @@ curl -s http://127.0.0.1:8087/cf/file-parser/v1/info | python3 -m json.tool
 {
     "supported_extensions": {
         "plain_text": ["txt", "log", "md"],
-        "html": ["html", "htm"],
-        "pdf": ["pdf"],
+        "kreuzberg": ["pdf", "html", "htm", "xlsx", "xls", "xlsm", "xlsb", "pptx"],
         "docx": ["docx"],
         "image": ["png", "jpg", "jpeg", "webp", "gif"],
         "generic_stub": ["doc", "rtf", "odt", "xls", "xlsx", "ppt", "pptx"]

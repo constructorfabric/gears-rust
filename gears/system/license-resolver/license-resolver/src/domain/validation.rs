@@ -6,8 +6,8 @@
 
 use std::sync::Arc;
 
-use gts::GtsSchema;
 use gts::schema_modifiers::X_GTS_ABSTRACT;
+use gts::{GtsId, GtsIdPattern, GtsSchema};
 use license_resolver_sdk::gts::{LicenseResourceV1, LicenseSubjectV1};
 use license_resolver_sdk::{FieldViolation, LicenseCheckRequest, field};
 use serde::Serialize;
@@ -259,7 +259,14 @@ fn validate_admitted(
         admitted.push(id);
     }
 
-    if !admitted.contains(&subject_type) {
+    // A subject type that derives from an admitted type is admitted (GTS
+    // implicit derived-type coverage, minor versions aside).
+    let covered = GtsId::try_new(subject_type).is_ok_and(|subject| {
+        admitted.iter().any(|a| {
+            GtsIdPattern::try_new(a).is_ok_and(|pattern| subject.matches_pattern(&pattern))
+        })
+    });
+    if !covered {
         violations.push(FieldViolation::new(
             field::SUBJECT_TYPE_FIELD,
             format!(

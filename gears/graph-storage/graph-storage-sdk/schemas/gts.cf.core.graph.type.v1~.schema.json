@@ -1,0 +1,26 @@
+{
+  "$id": "gts://gts.cf.core.graph.type.v1~",
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "description": "A graph type as the gear's type catalogue holds it: the authorization resource of the type_read and type_admin permissions. Not part of the graph ontology and never instantiated in the types-registry; it is published so a policy can name the type catalogue without a wildcard.",
+  "x-gts-abstract": true,
+  "type": "object",
+  "required": [
+    "type_id",
+    "kind"
+  ],
+  "properties": {
+    "type_id": {
+      "type": "string",
+      "description": "GTS identifier of the registered graph type."
+    },
+    "kind": {
+      "type": "string",
+      "enum": [
+        "node",
+        "edge",
+        "attribute"
+      ],
+      "description": "Which ontology base the type derives from."
+    }
+  }
+}

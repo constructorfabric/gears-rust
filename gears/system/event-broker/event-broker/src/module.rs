@@ -431,6 +431,14 @@ impl RestApiCapability for EventBrokerModule {
             // `Duration` arg exists only so a test harness can run it faster.
             let heartbeat =
                 std::time::Duration::from_secs(u64::from(streaming.heartbeat_interval_secs));
+            // The configured ceiling a `Prefer: wait=N` publish is clamped to.
+            let sync_wait_max = std::time::Duration::from_secs(u64::from(
+                self.config
+                    .get()
+                    .ok_or_else(|| anyhow::anyhow!("init must run before register_rest()"))?
+                    .publish
+                    .max_wait_secs,
+            ));
             let state = crate::infra::wiring::build_handler_state(
                 storage,
                 PolicyEnforcer::new(authz),
@@ -446,6 +454,7 @@ impl RestApiCapability for EventBrokerModule {
                     .get()
                     .copied()
                     .ok_or_else(|| anyhow::anyhow!("init must run before register_rest()"))?,
+                sync_wait_max,
                 streaming,
                 heartbeat,
             );

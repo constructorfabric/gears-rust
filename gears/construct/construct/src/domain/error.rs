@@ -56,6 +56,11 @@ pub enum DomainError {
     #[error("Invalid {field}: {rule}")]
     InvalidValue { field: &'static str, rule: String },
 
+    /// An administrator's add of a value the subject holds already, or of a
+    /// second value of a one-valued property: the fact that holds it.
+    #[error("Fact held: {}", .0.0)]
+    FactHeld(super::plan::NodeKey),
+
     /// A correction the checks or Admission did not let through; nothing was
     /// stored.
     #[error("Not stored: {}", .0.name())]

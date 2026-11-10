@@ -1,3 +1,4 @@
+pub mod admin_facts_events;
 pub mod admission_events;
 #[cfg(test)]
 mod admission_events_test;

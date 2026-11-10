@@ -65,8 +65,6 @@ fn declared_responses(
         .collect()
 }
 
-// #5655: no `201 Created`, and `Prefer: wait` is answered `501`, until
-// synchronous publish lands.
 #[test]
 fn the_single_publish_route_declares_its_full_response_list() {
     let registry = RecordingOpenApiRegistry::default();
@@ -76,9 +74,15 @@ fn the_single_publish_route_declares_its_full_response_list() {
         declared_responses(&registry, "/event-broker/v1/events"),
         vec![
             (
+                201,
+                "",
+                "Stored - `Prefer: wait=N` was satisfied: the backend has the event".to_owned()
+            ),
+            (
                 202,
                 "",
-                "Accepted, durably enqueued in the outbox".to_owned()
+                "Accepted, durably enqueued in the outbox (or `Prefer: wait=N` elapsed first)"
+                    .to_owned()
             ),
             (
                 200,
@@ -99,11 +103,6 @@ fn the_single_publish_route_declares_its_full_response_list() {
                 "SchemaViolation - the event `data` does not satisfy the event type's \
                  `data_schema`."
                     .to_owned()
-            ),
-            (
-                501,
-                "application/problem+json",
-                "Synchronous publish (`Prefer: wait`) is not implemented yet".to_owned()
             ),
             (
                 503,
@@ -132,8 +131,6 @@ fn the_single_publish_route_declares_its_full_response_list() {
     );
 }
 
-// #5655: no `201 Created`, and `Prefer: wait` is answered `501`, until
-// synchronous publish lands.
 #[test]
 fn the_batch_route_declares_its_full_response_list() {
     let registry = RecordingOpenApiRegistry::default();
@@ -142,7 +139,16 @@ fn the_batch_route_declares_its_full_response_list() {
     assert_eq!(
         declared_responses(&registry, "/event-broker/v1/events:batch"),
         vec![
-            (202, "", "Accepted".to_owned()),
+            (
+                201,
+                "",
+                "Stored - `Prefer: wait=N` was satisfied: the backend has every event".to_owned()
+            ),
+            (
+                202,
+                "",
+                "Accepted (or `Prefer: wait=N` elapsed first)".to_owned()
+            ),
             (
                 200,
                 "",
@@ -168,11 +174,6 @@ fn the_batch_route_declares_its_full_response_list() {
                 "SchemaViolation - an event's `data` does not satisfy its event type's \
                  `data_schema` (atomic batch rejection)"
                     .to_owned()
-            ),
-            (
-                501,
-                "application/problem+json",
-                "Synchronous publish (`Prefer: wait`) is not implemented yet".to_owned()
             ),
             (
                 503,
@@ -238,7 +239,9 @@ fn the_event_types_route_declares_its_full_response_list() {
 }
 
 #[test]
-fn the_single_publish_route_declares_no_query_parameter() {
+fn the_single_publish_route_declares_only_the_prefer_header() {
+    use toolkit::api::operation_builder::ParamLocation;
+
     let registry = RecordingOpenApiRegistry::default();
     let _router = register_ingest_routes(Router::new(), &registry);
 
@@ -250,12 +253,14 @@ fn the_single_publish_route_declares_no_query_parameter() {
     else {
         panic!("expected one operation on /event-broker/v1/events");
     };
+    // The only parameter is the optional `Prefer: wait=N` request header; there
+    // is no query parameter on the publish route.
     assert_eq!(
         operation
             .params
             .iter()
-            .map(|param| param.name.as_str())
+            .map(|param| (param.name.as_str(), param.location.clone(), param.required))
             .collect::<Vec<_>>(),
-        Vec::<&str>::new()
+        vec![("Prefer", ParamLocation::Header, false)]
     );
 }

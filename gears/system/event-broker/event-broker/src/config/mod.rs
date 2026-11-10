@@ -10,6 +10,7 @@ pub(crate) use model::MAX_REQUEST_BODY_BYTES;
 pub use model::{
     BUILT_IN_PARTITIONS, BackendEntry, BatchConfig, DEFAULT_RETENTION_DURATION, DeploymentMode,
     EventBrokerConfig, LoaderConfig, OutboxGroupEntry, PollingConfig, ProvisioningConfig,
-    RegistrationConfig, RetentionSettings, RetentionSettingsEntry, RetentionSize, StreamingConfig,
-    SubscriptionConfig, TopicSettingsEntry, TopicSettingsError, TopicSettingsMap, WorkersConfig,
+    PublishConfig, RegistrationConfig, RetentionSettings, RetentionSettingsEntry, RetentionSize,
+    StreamingConfig, SubscriptionConfig, TopicSettingsEntry, TopicSettingsError, TopicSettingsMap,
+    WorkersConfig,
 };

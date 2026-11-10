@@ -246,6 +246,11 @@ pub struct PublishEnqueue {
     pub ingest_partition: u32,
     pub payload: Vec<u8>,
     pub payload_type: String,
+    /// The synchronous-publish trace this row is enqueued under, or `None` for
+    /// an async publish. When set, the admitted rows are enqueued as one traced
+    /// outbox batch so the waiting publish is told once every one is stored
+    /// (feature 0007 §4.1); every event of one publish shares the same trace.
+    pub trace: Option<Uuid>,
 }
 
 impl PublishEnqueue {
@@ -262,6 +267,7 @@ impl PublishEnqueue {
             ingest_partition,
             payload,
             payload_type: payload_type.to_owned(),
+            trace: None,
         }
     }
 }
@@ -272,6 +278,7 @@ pub struct PublishEnqueueBuilder {
     ingest_partition: u32,
     payload: Vec<u8>,
     payload_type: String,
+    trace: Option<Uuid>,
 }
 
 impl PublishEnqueueBuilder {
@@ -283,6 +290,14 @@ impl PublishEnqueueBuilder {
         self
     }
 
+    /// Enqueues this row under a synchronous-publish `trace`. Left unset, the
+    /// publish is asynchronous and records no trace.
+    #[must_use]
+    pub fn trace(mut self, trace: Uuid) -> Self {
+        self.trace = Some(trace);
+        self
+    }
+
     #[must_use]
     pub fn build(self) -> PublishEnqueue {
         PublishEnqueue {
@@ -290,6 +305,7 @@ impl PublishEnqueueBuilder {
             ingest_partition: self.ingest_partition,
             payload: self.payload,
             payload_type: self.payload_type,
+            trace: self.trace,
         }
     }
 }

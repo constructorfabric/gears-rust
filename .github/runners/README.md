@@ -7,7 +7,7 @@ so nothing carries over between jobs.
 
 | Label | Machine | A job belongs here when |
 |---|---|---|
-| `gears-small` | a container: 1 CPU, 2-4 GiB, no Docker, no Rust toolchain; Python, Node, gh, yq, helm, make, git, pipx | it starts no container, needs no Rust toolchain, uses no secret beyond `GITHUB_TOKEN`, and its token has no `contents`, `packages`, `id-token` or `attestations` write (`issues`, `checks`, `security-events`, `pull-requests` write are fine). Short. |
+| `gears-small` | a container: 1 CPU, 2-4 GiB, no Docker, no Rust toolchain; Python (`python3` is guaranteed, bare `python` is not), Node, gh, yq, helm, make, git, pipx | it starts no container, needs no Rust toolchain, uses no secret beyond `GITHUB_TOKEN`, and its token has no `contents`, `packages`, `id-token` or `attestations` write (`issues`, `checks`, `security-events`, `pull-requests` write are fine). Short. |
 | `gears-small-vm` | a small VM with Docker and the Rust toolchains | short, but needs cargo or rustfmt, holds a secret, or needs a write permission |
 | `gears-large` | a large VM with Docker, privileged containers allowed | it compiles, tests, builds images, or starts containers (testcontainers, compose, k3s) |
 

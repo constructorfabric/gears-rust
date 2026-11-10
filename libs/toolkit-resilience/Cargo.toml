@@ -1,0 +1,46 @@
+[package]
+name = "cf-gears-toolkit-resilience"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "ToolKit client resilience: circuit breaker core, a tower layer and OpenTelemetry metrics"
+readme = "README.md"
+keywords = ["constructorfabric", "cf-gears", "cf-gears-toolkit"]
+categories = ["asynchronous", "network-programming"]
+metadata.docs.rs.all-features = true
+
+[lib]
+name = "toolkit_resilience"
+
+[lints]
+workspace = true
+
+[features]
+default = []
+# `Deserialize` for `CircuitBreakerConfig`, with humantime durations.
+serde = ["dep:serde", "dep:toolkit-utils"]
+# `CircuitBreakerLayer`: the breaker as a tower middleware.
+tower = ["dep:tower", "dep:pin-project-lite"]
+# OpenTelemetry metrics (`metrics::otel::OtelCircuitBreakerMetrics`).
+# Off by default so clients that do not export metrics carry no OTel dependency.
+otel = ["dep:opentelemetry"]
+
+[dependencies]
+tokio = { workspace = true }
+parking_lot = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true, optional = true }
+toolkit-utils = { workspace = true, features = ["humantime-serde"], optional = true }
+tower = { workspace = true, features = ["util"], optional = true }
+pin-project-lite = { workspace = true, optional = true }
+opentelemetry = { workspace = true, optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+tower = { workspace = true, features = ["util"] }
+serde_json = { workspace = true }
+opentelemetry_sdk = { workspace = true, features = ["testing"] }

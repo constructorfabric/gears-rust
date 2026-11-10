@@ -19,7 +19,7 @@
 //! cannot prove inclusion, it can still ask whether every stored row of the
 //! type validates against the candidate. That admits a change for *these
 //! rows*, which is a weaker claim than the schema-proved one and is reported
-//! as such ([`Basis::DataBacked`]).
+//! as such ([`AdmissionBasis::DataBacked`](graph_storage_sdk::models::AdmissionBasis::DataBacked)).
 //!
 //! **Measured on the Studio domain model (2026-09-10).** With the payload
 //! object left open — as the exporter emits it — adding one optional property

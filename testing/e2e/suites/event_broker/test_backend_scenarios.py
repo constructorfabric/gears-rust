@@ -8,8 +8,9 @@ the stream at the tail and then publishes; S4 (crash after an answered
 publish) is `test_restart_durability.py`, on a durable backend. S6 (a crash
 between the backend commit and the outbox ack) has no e2e hook to stop the
 process at that point; the gear's `redelivery_after_append_is_a_duplicate` and
-the conformance suite's dedup scenarios cover it. S2 (`Prefer: wait`) answers
-501 and has no test.
+the conformance suite's dedup scenarios cover it. S2 (`Prefer: wait`) is
+synchronous publish, covered by `test_producer_single.py` (`201` stored,
+`202` on timeout, `200` duplicate).
 """
 
 from __future__ import annotations

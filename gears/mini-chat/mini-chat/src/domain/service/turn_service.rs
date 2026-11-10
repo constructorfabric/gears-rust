@@ -480,16 +480,35 @@ impl<
         )
         .await?;
 
-        let original_msg = self
+        let found = self
             .message_repo
             .find_user_message_by_request_id(&conn, &scope, chat_id, request_id)
             .await
             .map_err(|e| MutationError::Internal {
                 message: e.to_string(),
-            })?
-            .ok_or_else(|| MutationError::Internal {
-                message: format!("User message not found for turn {request_id}"),
             })?;
+        let Some(original_msg) = found else {
+            // The preview runs outside the mutation transaction. A
+            // concurrent retry/edit/delete can commit between the
+            // validation above and this lookup, soft-deleting the
+            // messages. Re-validate to report the real cause (e.g.
+            // `NotLatestTurn` -> 409) instead of a spurious 500; only a
+            // turn that still validates but has no user message is a
+            // genuine inconsistency.
+            validate_mutation(
+                &*self.chat_repo,
+                &*self.turn_repo,
+                &chat_scope,
+                ctx,
+                &conn,
+                chat_id,
+                request_id,
+            )
+            .await?;
+            return Err(MutationError::Internal {
+                message: format!("User message not found for turn {request_id}"),
+            });
+        };
 
         Ok(MutationPreview {
             chat_scope,

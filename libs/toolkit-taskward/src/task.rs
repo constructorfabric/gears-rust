@@ -1183,6 +1183,50 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn a_worker_outlives_a_hundred_failed_passes_in_a_row() {
+        use crate::bulkhead::{BackoffConfig, Bulkhead, BulkheadConfig, ConcurrencyLimit};
+        use crate::poker::poker;
+        let cancel = CancellationToken::new();
+        // 10 ms doubled leaves the range of `Duration` at the 72nd failure.
+        let bulkhead = Bulkhead::new(
+            "test",
+            BulkheadConfig {
+                semaphore: ConcurrencyLimit::Unlimited,
+                backoff: BackoffConfig {
+                    initial: Duration::from_millis(10),
+                    max: Duration::from_secs(1),
+                    multiplier: 2.0,
+                    jitter: 0.0,
+                },
+            },
+        );
+        let mut results: Vec<Result<Directive, String>> =
+            (0..100).map(|i| Err(format!("e{i}"))).collect();
+        results.push(Ok(Directive::sleep(Duration::from_hours(1))));
+        let action = MockAction::new(results);
+        let count = action.call_count();
+        let (timer, _timer_handle) = poker(Duration::from_secs(1), cancel.clone());
+        timer.notify_one(); // break initial Idle
+        let worker = WorkerBuilder::new("test", cancel.clone())
+            .bulkhead(bulkhead)
+            .pacing(zero_pacing())
+            .notifier(timer)
+            .build(action);
+
+        let cancel_c = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(400)).await;
+            cancel_c.cancel();
+        });
+
+        worker.run().await;
+        // Every failed pass ran, and the worker went on running passes after
+        // them until it was cancelled.
+        let passes = count.load(Ordering::SeqCst);
+        assert!(passes > 100, "only {passes} passes ran");
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn success_resets_bulkhead() {
         use crate::bulkhead::{BackoffConfig, Bulkhead, BulkheadConfig, ConcurrencyLimit};
         let cancel = CancellationToken::new();

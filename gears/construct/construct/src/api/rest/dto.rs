@@ -2,6 +2,7 @@ use serde::Deserialize;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
+use crate::domain::one_step::NewFact;
 use crate::domain::planner::processing::{Changes, Managed};
 use crate::domain::profile::Category;
 use crate::domain::profile_read::{OriginKind, ProfileView, StoredFact};
@@ -537,7 +538,7 @@ pub struct ResolutionRequest {
     pub value: Option<serde_json::Value>,
 }
 
-/// Why a resolution's body does not fit its outcome: the field and the rule.
+/// Why a body does not fit: the field and the rule.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BodyMistake {
     pub field: &'static str,
@@ -576,6 +577,80 @@ impl TryFrom<ResolutionRequest> for Resolution {
             (ReviewOutcomeDto::Rejected | ReviewOutcomeDto::Deleted, None, Some(_)) => {
                 mistake("value", "only a correction takes a value")
             }
+        }
+    }
+}
+
+/// What a tenant administrator sends to add a fact, or to edit one: one
+/// property of the person types, as a fact names it, and its value. An edit
+/// keeps the fact's own property.
+#[derive(Debug)]
+#[toolkit_macros::api_dto(request)]
+#[serde(deny_unknown_fields)]
+pub struct AdminFactRequest {
+    /// The fact's property, such as `skills`.
+    pub property: String,
+    /// The value: a string, or an object for a property with fields, such
+    /// as `{"name": "Rust"}` for a skill.
+    pub value: serde_json::Value,
+}
+
+/// The longest property name an administrator's body takes; every name of
+/// the person types is far shorter.
+const MAX_PROPERTY_CHARS: usize = 64;
+
+impl AdminFactRequest {
+    /// The property and its value.
+    ///
+    /// # Errors
+    ///
+    /// A property name longer than 64 characters or of other characters
+    /// than lower-case letters, digits and `_`, which no person type has.
+    pub fn into_property(self) -> Result<(String, serde_json::Value), BodyMistake> {
+        let plausible = (1..=MAX_PROPERTY_CHARS).contains(&self.property.len())
+            && self
+                .property
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_');
+        if !plausible {
+            return Err(BodyMistake {
+                field: "property",
+                rule: "no person type has this property",
+            });
+        }
+        Ok((self.property, self.value))
+    }
+}
+
+/// A fact an administrator stored: its new id, its category, and its
+/// property with the value Admission let through.
+///
+/// @cpt-dod:cpt-cf-construct-dod-admin-facts-change:p2
+#[derive(Debug)]
+#[toolkit_macros::api_dto(response)]
+pub struct StoredFactDto {
+    /// The fact's id, the graph node key.
+    pub fact_id: String,
+    pub entity_kind: EntityKindDto,
+    /// The fact's property, such as `skills`.
+    pub property: String,
+    /// The value as Admission let it through.
+    pub value: serde_json::Value,
+    pub origin: OriginDto,
+}
+
+impl StoredFactDto {
+    /// A fact the administrator stored, with the administrator as origin.
+    #[must_use]
+    pub fn administrator(fact: NewFact) -> Self {
+        Self {
+            fact_id: fact.node_key.0,
+            entity_kind: fact.category.into(),
+            property: fact.property.name,
+            value: fact.property.value,
+            origin: OriginDto {
+                kind: OriginKindDto::Administrator,
+            },
         }
     }
 }

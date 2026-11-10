@@ -9,7 +9,8 @@
 //!   grants. [`GrantEvaluatorV1`] — decides which grants satisfy a check.
 //!   The binary links exactly one of each; see [`register_admission_plugin!`]
 //!   and [`register_evaluator!`].
-//! - [`error`] — discriminators of the `CanonicalError`s of the contract.
+//! - [`error`] — discriminators of the `CanonicalError`s of the contract;
+//!   [`limits`] — size limits of the requests.
 //! - [`RecipientProjectionV1`] — the GTS type that recipient rules address.
 #![cfg_attr(coverage_nightly, feature(coverage_attribute))]
 
@@ -20,6 +21,7 @@ pub mod error;
 pub mod evaluator;
 pub mod gts;
 pub mod ids;
+pub mod limits;
 mod link;
 pub mod models;
 pub mod reason;

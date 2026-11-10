@@ -87,7 +87,6 @@
     "arithmetic": [],
     "refusals": [
       "missing_policy",
-      "minimum_fee",
       "unaligned_anchor",
       "package",
       "missing_billing_terms",

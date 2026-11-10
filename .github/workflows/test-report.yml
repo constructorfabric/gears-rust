@@ -125,7 +125,7 @@ jobs:
       - name: Publish JUnit results
         id: publish
         if: steps.plan.outputs.paths != ''
-        uses: mikepenz/action-junit-report@8a133bfa3ecb0ea9024c1e2ae788b4c25f6cdb9d # v6.6.2
+        uses: mikepenz/action-junit-report@4a26df3e2ae132254ba12a53f65a388d0961e786 # v6.7.0
         with:
           report_paths: ${{ steps.plan.outputs.paths }}
           check_name: ${{ steps.plan.outputs.names }}
@@ -164,7 +164,7 @@ jobs:
           SHA: ${{ github.event.workflow_run.head_sha }}
           PATHS: ${{ steps.plan.outputs.paths }}
           NAMES: ${{ steps.plan.outputs.names }}
-        shell: python
+        shell: python3 {0}
         run: |
           import glob, json, os, urllib.error, urllib.parse, urllib.request
           import xml.etree.ElementTree as ET

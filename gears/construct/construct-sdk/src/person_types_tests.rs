@@ -1,56 +1,13 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::LazyLock;
 
-use graph_storage_sdk::gts::{
-    ATTRIBUTE_BASE_TYPE, NODE_BASE_TYPE, OWNED_NODE_TYPE, PROVENANCE_ATTRIBUTE_TYPE,
-};
-use jsonschema::{Retrieve, Uri, Validator};
+use graph_storage_sdk::gts::{OWNED_NODE_TYPE, PROVENANCE_ATTRIBUTE_TYPE};
+use jsonschema::Validator;
 use serde_json::{Value, json};
 
 use super::*;
+use crate::graph_schemas_tests::GraphStorageSchemas;
 use crate::gts::PREFERENCE_TYPE;
-
-const GRAPH_STORAGE_SCHEMAS: [(&str, &str); 4] = [
-    (
-        NODE_BASE_TYPE,
-        include_str!(
-            "../../../graph-storage/graph-storage/schemas/gts.cf.core.graph.node.v1~.schema.json"
-        ),
-    ),
-    (
-        OWNED_NODE_TYPE,
-        include_str!(
-            "../../../graph-storage/graph-storage/schemas/gts.cf.core.graph.node.v1~cf.core.graph.owned_node.v1~.schema.json"
-        ),
-    ),
-    (
-        ATTRIBUTE_BASE_TYPE,
-        include_str!(
-            "../../../graph-storage/graph-storage/schemas/gts.cf.core.graph.attribute.v1~.schema.json"
-        ),
-    ),
-    (
-        PROVENANCE_ATTRIBUTE_TYPE,
-        include_str!(
-            "../../../graph-storage/graph-storage/schemas/gts.cf.core.graph.attribute.v1~cf.core.graph.provenance.v1~.schema.json"
-        ),
-    ),
-];
-
-struct GraphStorageSchemas;
-
-impl Retrieve for GraphStorageSchemas {
-    fn retrieve(
-        &self,
-        uri: &Uri<String>,
-    ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
-        GRAPH_STORAGE_SCHEMAS
-            .iter()
-            .find(|(id, _)| format!("gts://{id}") == uri.as_str())
-            .map(|(_, text)| serde_json::from_str(text).expect("a JSON schema"))
-            .ok_or_else(|| format!("unresolved schema reference `{uri}`").into())
-    }
-}
 
 static NODE_VALIDATORS: LazyLock<BTreeMap<&str, Validator>> = LazyLock::new(|| {
     PERSON_TYPES

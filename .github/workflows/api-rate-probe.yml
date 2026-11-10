@@ -1,0 +1,37 @@
+name: API rate probe
+
+# TEMPORARY (remove after ~2 weeks, by 2026-11-30): samples the shared
+# GITHUB_TOKEN REST budget (1,000/h per repo) so the burst at job start and the
+# effect of the fixes can be measured. GET /rate_limit itself is free.
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: api-rate-probe
+  cancel-in-progress: false
+
+jobs:
+  probe:
+    if: github.repository == 'constructorfabric/gears-rust'
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Read rate limit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Self-expiry: if nobody removed this file, it goes quiet on its own.
+          if [ "$(date -u +%Y%m%d)" -gt 20261130 ]; then
+            echo "::notice::api-rate-probe expired on 2026-11-30 - delete .github/workflows/api-rate-probe.yml"
+            exit 0
+          fi
+          json=$(curl -fsS -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" https://api.github.com/rate_limit)
+          line=$(jq -r '.resources.core | "RATE ts=\(now|todate) limit=\(.limit) used=\(.used) remaining=\(.remaining) reset=\(.reset|todate)"' <<<"$json")
+          echo "$line"
+          echo "$line" >> "$GITHUB_STEP_SUMMARY"

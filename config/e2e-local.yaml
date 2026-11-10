@@ -106,6 +106,7 @@ gears:
         description: "CF/Gears Server API Documentation"
       defaults:
         body_limit_bytes: 64000000
+        request_timeout: 30s
 
       # Authentication Configuration
       auth_disabled: false

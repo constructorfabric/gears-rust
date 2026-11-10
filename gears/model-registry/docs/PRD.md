@@ -50,13 +50,13 @@ Created: 2026-10-22 by Constructor Tech
 
 ### 1.1 Purpose
 
-Model Registry is the platform's catalog of AI models. For each model it holds the identity (`provider_slug::provider_model_id`), the provider that serves it, and the LLM Gateway plugin type that evaluates it (evaluation means running an inference request). It also holds provider-specific settings including cost, general connection settings, default parameters, capabilities, user-facing information, sharing mode, and approval state.
+Model Registry is the platform's catalog of AI models. For each model it holds the identity (`provider_slug::name`), the provider that serves it, the identifier the provider knows the model by, and the LLM Gateway plugin type that evaluates it (evaluation means running an inference request). It also holds the model's cost in AI credits, provider-specific settings, general connection settings, default parameters, capabilities, user-facing information, sharing mode, and approval state.
 
 The registry records which provider offers which model and which tenants may use it. LLM Gateway calls it on every request. It resolves a model identifier into everything needed to evaluate the request and checks that the calling tenant may use that model.
 
 ### 1.2 Background / Problem Statement
 
-Platform gears (chat, agents, batch jobs) send inference requests to LLM Gateway naming a model. The gateway must find, from one place, which plugin evaluates the model, which endpoint and credential to use, and which settings and prices apply. It must also know whether the tenant is allowed to use the model.
+Platform gears (chat, agents, batch jobs) send inference requests to LLM Gateway naming a model. The gateway must find, from one place, which plugin evaluates the model, which endpoint and credential to use, and which settings and cost apply. It must also know whether the tenant is allowed to use the model.
 
 Tenants form a hierarchy. A parent, for example a partner, wants to configure providers and models once and let descendants use them. A descendant may add its own providers or block an inherited one. Without a registry, each consumer would keep its own model list and access rules would be scattered.
 
@@ -86,11 +86,13 @@ The Customer tenant defines its own `Shared` provider with the slug `openai`, wh
 |------|------------|
 | Model | A catalog entry describing one AI model offered by exactly one provider. |
 | Provider | An entity describing where models come from. It belongs to exactly one tenant and has a name, slug, and Global Type System (GTS) type. |
-| Canonical ID | The model identifier `provider_slug::provider_model_id`, for example `openai::gpt-4o`. |
+| Canonical ID | The model identifier `provider_slug::name`, for example `openai::gpt-4o`. |
 | GTS | Global Type System: the platform's registry of globally unique type identifiers and their schemas. |
 | Provider GTS type | A globally unique type identifier naming the LLM Gateway plugin family that evaluates the provider's models. |
-| Provider-specific settings | Settings whose shape is defined by the provider type, including cost. |
-| General settings | The `base_url` and an optional reference to a secret in the credential store. |
+| Provider-specific settings | Settings whose shape is defined by the provider type. |
+| Cost | Provider-independent rates of a model in AI credits: per 1M input, output, cache read, and cache write tokens, and per 1K web search calls. |
+| AI credits | The platform billing unit. Model cost is expressed in AI credits. |
+| General settings | An optional `base_url` and an optional reference to a secret in the credential store. When `base_url` is absent, the LLM Gateway provider plugin uses its built-in default URL. |
 | Default parameters | Provider-independent inference defaults, such as temperature or maximum output tokens. The model record also states whether callers may override them and which extra parameters callers may pass. |
 | Capabilities | What a model can do: streaming, tool calling, vision, structured output, reasoning controls, embeddings. |
 | User-facing information | Presentation fields: display name, description, icon, hosted by, context window size, and similar. |
@@ -167,6 +169,7 @@ The Customer tenant defines its own `Shared` provider with the slug `openai`, wh
 - Tenant-scoped model catalog with the model record contents described in section 5.2.
 - Model approval state managed by the owning tenant.
 - Inheritance down the tenant hierarchy, with provider shadowing.
+- Restriction of individual inherited models by a descendant tenant (`p2`).
 - Management API following platform conventions (OData, authorization, canonical errors).
 - Resolution API for evaluation: get a model by canonical id and list available models.
 - Durable storage of the catalog.
@@ -177,7 +180,8 @@ The Customer tenant defines its own `Shared` provider with the slug `openai`, wh
 - Storing secrets. CredStore holds them; the registry stores only a reference.
 - Automatic discovery or synchronization of models from provider APIs.
 - Provider health or latency monitoring.
-- Usage metering and billing. The registry only stores cost settings.
+- Usage metering and billing. The registry stores a model's cost rates and does not compute usage cost.
+- Per-tenant approval overrides of inherited models. A descendant tenant cannot change the approval state of an inherited model.
 - Multi-step approval workflows with external approvers. The registry records the owning tenant's approval decision.
 - Per-user or per-group model entitlements beyond the policy decisions of the PDP.
 
@@ -191,7 +195,7 @@ The Customer tenant defines its own `Shared` provider with the slug `openai`, wh
 
 - [ ] `p1` - **ID**: `cpt-cf-model-registry-fr-provider-management`
 
-The system **MUST** let a Tenant Administrator create, read, update, and delete providers in their own tenant. A provider has a name, a slug unique among the providers the tenant owns, a provider GTS type, an enabled flag, and a sharing mode. A provider belongs to exactly one tenant and is managed only by that tenant. The slug and the provider GTS type are immutable after creation. Deleting a provider deletes its models, and the change takes effect for later resolutions. When the deleted provider shadowed an inherited one, the inherited provider and its models become visible again.
+The system **MUST** let a Tenant Administrator create, read, update, and delete providers in their own tenant. A provider has a name, a slug unique among the providers the tenant owns, a provider GTS type, an enabled flag, a sharing mode, an informational flag saying whether the platform manages the provider runtime, and optional opaque metadata. A provider belongs to exactly one tenant and is managed only by that tenant. The slug is immutable after creation. The provider GTS type **MAY** be changed to another provider type only when every model of the provider is valid against the new type's schema; the change **MUST** apply to the provider and all its models together, keep their identifiers and canonical ids, and otherwise leave the catalog unchanged. Deleting a provider deletes its models, and the change takes effect for later resolutions. When the deleted provider shadowed an inherited one, the inherited provider and its models become visible again.
 
 - **Rationale**: Tenants need to describe where their models come from and keep control of that description.
 - **Actors**: `cpt-cf-model-registry-actor-tenant-admin`
@@ -209,7 +213,7 @@ The system **MUST** make every model of a disabled provider unavailable for eval
 
 - [ ] `p1` - **ID**: `cpt-cf-model-registry-fr-provider-sharing`
 
-The system **MUST** support two provider sharing modes. With `Tenant`, the provider and its models are visible only to the owning tenant. With `Shared`, the provider is visible to all descendant tenants. A change of mode **MUST** take effect for later resolutions.
+The system **MUST** support two provider sharing modes. With `Tenant`, the provider and its models are visible only to the owning tenant. With `Shared`, the provider is visible to every descendant tenant whose ancestor chain reaches the owner, that is, up to an isolation barrier (`cpt-cf-model-registry-contract-tenant-hierarchy`). A change of mode **MUST** take effect for later resolutions.
 
 - **Rationale**: Parents configure a provider once and choose whether descendants receive it.
 - **Actors**: `cpt-cf-model-registry-actor-tenant-admin`
@@ -229,9 +233,9 @@ The system **MUST** let a tenant shadow an inherited provider by owning a provid
 
 - [ ] `p1` - **ID**: `cpt-cf-model-registry-fr-model-identity`
 
-The system **MUST** identify every model by the canonical id `provider_slug::provider_model_id`, for example `openai::gpt-4o`. A model belongs to exactly one provider of the same tenant, is unique among the models that tenant owns, and has a `provider_model_id` that is immutable after creation. With the immutable provider slug, its canonical id never changes.
+The system **MUST** identify every model by the canonical id `provider_slug::name`, for example `openai::gpt-4o`. The `name` is chosen by the Tenant Administrator on create, is unique among the models of the provider, and is immutable after creation. A model belongs to exactly one provider of the same tenant. With the immutable provider slug, its canonical id never changes. The identifier the provider knows the model by (`provider_model_id`) is a separate, mutable field that is not part of the canonical id; several models of one provider **MAY** carry the same `provider_model_id`.
 
-- **Rationale**: A stable, human-readable identifier lets consumers refer to models without knowing tenant or storage details.
+- **Rationale**: A stable, human-readable identifier lets consumers refer to models without knowing tenant or storage details. Keeping the name independent of the provider's identifier lets one provider hold several entries for the same provider model, for example in different regions or with different settings, and lets an administrator repoint an entry to a new provider model id without changing its canonical id.
 - **Actors**: `cpt-cf-model-registry-actor-llm-gateway`, `cpt-cf-model-registry-actor-tenant-admin`
 
 #### Model Management
@@ -241,8 +245,9 @@ The system **MUST** identify every model by the canonical id `provider_slug::pro
 The system **MUST** let a Tenant Administrator create, read, update, and delete models in their own tenant. A model record holds the following.
 
 - The provider GTS type that evaluates it, taken from its provider.
-- Provider-specific settings, including cost.
-- General settings: `base_url` and an optional credential-store secret reference.
+- Provider-specific settings.
+- Cost in AI credits, in one shape for every provider type.
+- General settings: optional `base_url` and optional credential-store secret reference. When `base_url` is absent, the LLM Gateway provider plugin uses its built-in default URL. A secret reference, when set, **MUST** name a secret in the credential store that the writing tenant owns; a reference to an inherited or unknown secret **MUST** be rejected with a validation error.
 - Default parameters, and which parameters callers may override or add per request.
 - Capabilities.
 - User-facing information: display name, description, icon, hosted by, context window size, and similar.
@@ -251,7 +256,7 @@ The system **MUST** let a Tenant Administrator create, read, update, and delete 
 
 The gear does not interpret provider-specific settings beyond validation.
 
-- **Rationale**: LLM Gateway needs one complete record per model to evaluate a request.
+- **Rationale**: LLM Gateway needs one complete record per model to evaluate a request. Binding the secret reference to its owner keeps a descendant from spending an ancestor's shared credential through a model of its own.
 - **Actors**: `cpt-cf-model-registry-actor-tenant-admin`
 
 #### Model Settings Validation
@@ -263,11 +268,20 @@ The system **MUST** validate provider-specific settings against the GTS schema r
 - **Rationale**: Invalid settings found at write time cannot break requests at evaluation time.
 - **Actors**: `cpt-cf-model-registry-actor-tenant-admin`, `cpt-cf-model-registry-actor-types-registry`
 
+#### Model Cost
+
+- [ ] `p1` - **ID**: `cpt-cf-model-registry-fr-model-cost`
+
+The system **MUST** hold for each model a provider-independent cost in AI credits: a rate per 1M input tokens, per 1M output tokens, per 1M cache read tokens, per 1M cache write tokens, and per 1K web search calls. Each rate is optional; an absent rate means the model does not price that kind of usage. The cost **MUST** be returned with the full model record and with every model in the available list, so that consumers can show it to users. The registry stores the rates and does not interpret them.
+
+- **Rationale**: Customers see the price of every model in one shape, whatever provider serves it, and LLM Gateway computes usage cost from the same rates.
+- **Actors**: `cpt-cf-model-registry-actor-tenant-admin`, `cpt-cf-model-registry-actor-consumer-gear`, `cpt-cf-model-registry-actor-llm-gateway`
+
 #### Model Approval
 
 - [ ] `p1` - **ID**: `cpt-cf-model-registry-fr-model-approval`
 
-The system **MUST** keep an approval state on each model, set by the owning tenant's administrator. Each model carries one of four approval states: Pending, Approved, Rejected, or Revoked, together with who made the last decision and when. Create and update **MAY** set the approval state under the model management permission. A model created without an approval state starts as Approved. Only Approved models **MUST** be available for evaluation. Approval is inherited with the model. A descendant tenant cannot change the approval of an inherited model and can only exclude it by shadowing its provider.
+The system **MUST** keep an approval state on each model, set by the owning tenant's administrator. Each model carries one of four approval states: Pending, Approved, Rejected, or Revoked, together with who made the last decision and when. Create and update **MAY** set the approval state under the model management permission. A model created without an approval state starts as Approved. Only Approved models **MUST** be available for evaluation. Approval is inherited with the model. A descendant tenant cannot change the approval of an inherited model; it excludes the model by shadowing its provider or, at `p2`, by restricting the model (`cpt-cf-model-registry-fr-inherited-model-restriction`).
 
 - **Rationale**: The owning tenant controls which models are cleared for use, and the latest decision and who made it stay visible.
 - **Actors**: `cpt-cf-model-registry-actor-tenant-admin`
@@ -281,11 +295,20 @@ The system **MUST** give models the same sharing modes as providers. A model **M
 - **Rationale**: Administrators can share a provider yet keep some of its models private by setting them to `Tenant` mode. Shadowing a model would require shadowing its provider first, which already replaces all its inherited models.
 - **Actors**: `cpt-cf-model-registry-actor-tenant-admin`
 
+#### Inherited Model Restriction
+
+- [ ] `p2` - **ID**: `cpt-cf-model-registry-fr-inherited-model-restriction`
+
+The system **MUST** let a Tenant Administrator restrict an individual inherited model for their tenant without shadowing its provider. A restricted model **MUST NOT** resolve or appear in the available list for the restricting tenant. The restriction **MUST NOT** change the model's approval state or the ancestor's catalog, and the other models of the provider and later changes to the ancestor's catalog **MUST** stay inherited. Lifting the restriction **MUST** return the model to the availability it would have without the restriction.
+
+- **Rationale**: Shadowing replaces a whole provider. A tenant that wants to block one inherited model, for example an expensive one, while keeping the others and future catalog updates would otherwise have to copy and maintain the rest of the provider's models.
+- **Actors**: `cpt-cf-model-registry-actor-tenant-admin`
+
 #### Effective Catalog
 
 - [ ] `p1` - **ID**: `cpt-cf-model-registry-fr-effective-catalog`
 
-The system **MUST** build a tenant's effective catalog from the providers and models it owns plus the shared providers and models of its ancestors. Shadowing is applied per provider slug, and the nearest tenant whose provider is visible to the caller wins. Inherited entries **MUST** be read-only for the inheriting tenant. An inheriting tenant sees the full record of an inherited provider and model, including provider-specific settings and cost, general settings with `base_url` and the secret reference, default parameters, capabilities, and user-facing information.
+The system **MUST** build a tenant's effective catalog from the providers and models it owns plus the shared providers and models of its ancestors. Shadowing is applied per provider slug, and the nearest tenant whose provider is visible to the caller wins. Inherited entries **MUST** be read-only for the inheriting tenant. An inheriting tenant sees the full record of an inherited provider and model, including cost, provider-specific settings, general settings (`base_url` and the secret reference, when set), default parameters, capabilities, and user-facing information.
 
 - **Rationale**: A single, predictable rule decides what each tenant sees, so all consumers get the same answer.
 - **Actors**: `cpt-cf-model-registry-actor-llm-gateway`, `cpt-cf-model-registry-actor-tenant-admin`, `cpt-cf-model-registry-actor-tenant-resolver`
@@ -305,7 +328,7 @@ The system **MUST**, given a canonical id and the calling tenant, return the ful
 
 - [ ] `p1` - **ID**: `cpt-cf-model-registry-fr-list-available-models`
 
-The system **MUST** list, for the calling tenant, exactly the models that would resolve successfully under `cpt-cf-model-registry-fr-resolve-model`. The list **MUST** support OData filtering, ordering, selection, and paging on the model's general fields: identity, approval, capabilities, and user-facing fields.
+The system **MUST** list, for the calling tenant, exactly the models that would resolve successfully under `cpt-cf-model-registry-fr-resolve-model`. Listed models **MUST** carry the full model record, the same record resolution returns, unless the caller selects fields. The list **MUST** support OData filtering, ordering, selection, and paging on the model's general fields: identity, approval, capabilities, and user-facing fields.
 
 - **Rationale**: Users and consumer gears need to pick from models they can actually use.
 - **Actors**: `cpt-cf-model-registry-actor-consumer-gear`, `cpt-cf-model-registry-actor-llm-gateway`
@@ -334,7 +357,7 @@ The system **MUST** authorize every management and resolution operation through 
 
 - [ ] `p1` - **ID**: `cpt-cf-model-registry-fr-management-api-conventions`
 
-The system **MUST** expose the management API following the platform REST conventions: OData query options on list operations, canonical problem-details errors, and a versioned API surface. It **MUST** expose inherited entries read-only and mark them as inherited.
+The system **MUST** expose the management API following the platform REST conventions: OData query options on list operations, canonical problem-details errors, and a versioned API surface. It **MUST** expose inherited entries read-only and mark them as inherited. Every provider and model record **MUST** carry a version, and an update **MUST** be conditional on the version the client last saw unless the client explicitly requests an unconditional update, so a stale client cannot overwrite a newer change by accident.
 
 - **Rationale**: Consistent conventions reduce integration effort, and explicit marking prevents confusion about what a tenant can edit.
 - **Actors**: `cpt-cf-model-registry-actor-tenant-admin`, `cpt-cf-model-registry-actor-consumer-gear`
@@ -347,6 +370,15 @@ The system **MUST** record who made each change to a provider or model and when,
 
 - **Rationale**: Changes to sharing, shadowing, and enablement alter what other tenants can use.
 - **Actors**: `cpt-cf-model-registry-actor-tenant-admin`
+
+#### Change Notifications
+
+- [ ] `p2` - **ID**: `cpt-cf-model-registry-fr-change-notifications`
+
+The system **MUST** publish a notification through Event Broker when a provider or model is created, updated, or deleted, including enable or disable, sharing mode, and approval changes. A notification **MUST** carry the tenant id, the stable provider or model id, and the record version. A committed change **MUST NOT** lose its notification if the gear stops after the commit.
+
+- **Rationale**: Without notifications, consumers poll the catalog or learn of a change only when a request fails, so model lists, routing candidates, and caches go stale.
+- **Actors**: `cpt-cf-model-registry-actor-consumer-gear`, `cpt-cf-model-registry-actor-llm-gateway`
 
 ## 6. Non-Functional Requirements
 
@@ -363,9 +395,10 @@ The system **MUST** record who made each change to a provider or model and when,
 The system **MUST** resolve a canonical id for a tenant within 10 ms at the 99th percentile inside the gear, excluding network time.
 
 - **Threshold**: p99 at or below 10 ms per resolution, measured inside the gear and excluding time spent waiting on the PDP and Tenant Resolver; sustained load of 1,000 resolutions per second with peaks of 5,000 per second platform-wide; catalog of 10,000 models platform-wide across all tenants; tenant hierarchies up to 10 levels deep.
+- **Dependency cost**: Each resolution also waits for one PDP decision, and for a Tenant Resolver call when the tenant hierarchy is not cached. A caller's resolution time is the in-gear time plus these waits.
 - **Rationale**: Resolution runs on every LLM request, and LLM Gateway budgets 50 ms of total overhead.
 - **Verification Method**: Automated benchmark at the stated load, catalog size, and hierarchy depth.
-- **Architecture Allocation**: Pending DESIGN (not yet created)
+- **Architecture Allocation**: See [DESIGN](./DESIGN.md) §1.2 NFR Allocation.
 
 #### Availability
 
@@ -376,7 +409,7 @@ The system **MUST** keep the resolution operations available 99.9% of the time p
 - **Threshold**: 99.9% monthly availability of resolution; recovery within 15 minutes after a gear failure.
 - **Rationale**: LLM Gateway targets 99.9% availability and depends on resolution on every request.
 - **Verification Method**: Monitoring of monthly resolution availability and of recovery time after gear failures.
-- **Architecture Allocation**: Pending DESIGN (not yet created)
+- **Architecture Allocation**: See [DESIGN](./DESIGN.md) §1.2 NFR Allocation.
 
 #### Durability
 
@@ -387,7 +420,7 @@ An acknowledged change to a provider or model **MUST** survive restarts of the g
 - **Threshold**: Zero loss of acknowledged writes.
 - **Rationale**: The catalog is the source of truth for model access, and losing it would stop all LLM calls that depend on it.
 - **Verification Method**: Restart and backup-restore tests confirming that acknowledged writes survive.
-- **Architecture Allocation**: Pending DESIGN (not yet created)
+- **Architecture Allocation**: See [DESIGN](./DESIGN.md) §1.2 NFR Allocation.
 
 ### 6.2 NFR Exclusions
 
@@ -408,7 +441,7 @@ An acknowledged change to a provider or model **MUST** survive restarts of the g
 
 - **Type**: REST API
 - **Stability**: stable
-- **Description**: Tenant-scoped management of providers and models, plus the two resolution operations: get by canonical id and list available for evaluation.
+- **Description**: Tenant-scoped management of providers and models, plus the two resolution operations: get by canonical id and list available for evaluation. Both surfaces return the same records; resolution by canonical id returns the full model record on REST as on the SDK.
 - **Breaking Change Policy**: A breaking change requires a new API version.
 
 #### SDK Client
@@ -435,8 +468,8 @@ An acknowledged change to a provider or model **MUST** survive restarts of the g
 - [ ] `p1` - **ID**: `cpt-cf-model-registry-contract-tenant-hierarchy`
 
 - **Direction**: required from client (Tenant Resolver)
-- **Protocol/Format**: Ancestor chain of a tenant, root first
-- **Compatibility**: Hierarchy changes take effect on the next resolution.
+- **Protocol/Format**: Ancestor chain of a tenant, parent first, root last, stopping at isolation barriers: a self-managed tenant has an empty chain, and the chain of a tenant below it ends at that tenant
+- **Compatibility**: Hierarchy changes take effect within a bounded, configurable delay (see [DESIGN](./DESIGN.md)).
 
 ## 8. Use Cases
 
@@ -456,7 +489,7 @@ An acknowledged change to a provider or model **MUST** survive restarts of the g
 4. The registry checks that the provider is enabled and the model is approved.
 5. The registry asks the PDP whether the caller may evaluate the model.
 6. The registry returns the full model record.
-7. LLM Gateway selects the plugin, endpoint, credential, and settings from the record.
+7. LLM Gateway selects the plugin, endpoint, credential, settings, and cost from the record.
 
 **Postconditions**:
 - LLM Gateway holds everything needed to evaluate the request.
@@ -527,10 +560,10 @@ An acknowledged change to a provider or model **MUST** survive restarts of the g
 2. The consumer gear adds a capability filter, for example models that support vision.
 3. The registry builds the tenant's effective catalog.
 4. The registry keeps only models that would resolve successfully and match the filter.
-5. The registry returns a page of results.
+5. The registry returns a page of full model records.
 
 **Postconditions**:
-- The consumer gear can show the user models that are certain to resolve.
+- The consumer gear can show the user models that are certain to resolve, with their cost.
 
 **Alternative Flows**:
 - **No match**: The registry returns an empty list.
@@ -538,13 +571,14 @@ An acknowledged change to a provider or model **MUST** survive restarts of the g
 ## 9. Acceptance Criteria
 
 - [ ] A model from a disabled provider never resolves and is absent from the available list.
-- [ ] A descendant tenant sees the shared providers and models of its ancestors and none of their `Tenant`-mode entries.
+- [ ] A descendant tenant sees the shared providers and models of the ancestors in its chain, up to an isolation barrier, and none of their `Tenant`-mode entries.
 - [ ] Defining a `Shared` provider with an inherited slug replaces all inherited models of that slug for the tenant and its descendants.
 - [ ] Defining a `Tenant`-mode provider with an inherited slug replaces the inherited models for the owning tenant only; its descendants keep the inherited models.
 - [ ] A `Shared`, disabled shadowing provider removes the inherited models from the whole subtree.
 - [ ] Deleting a shadowing provider restores the inherited provider and its models for the affected tenants.
 - [ ] Only approved models resolve, and a revoked model stops resolving on the next call.
 - [ ] Provider-specific settings that violate the provider type schema are rejected with a validation error.
+- [ ] A model's cost is returned with the full record and in the available list, in the same shape for every provider type.
 - [ ] Management calls never return another tenant's owned entries.
 - [ ] Resolution meets `cpt-cf-model-registry-nfr-resolution-latency` at its stated load, catalog size, and hierarchy depth.
 - [ ] Resolution meets `cpt-cf-model-registry-nfr-availability`.
@@ -558,11 +592,12 @@ An acknowledged change to a provider or model **MUST** survive restarts of the g
 | Types Registry | Holds provider type schemas used to validate settings. | p1 |
 | Platform database | Stores the catalog durably. | p1 |
 | LLM Gateway provider plugins | Register provider types and schemas, and consume model records. | p1 |
-| CredStore | Stores and resolves the secrets that models reference, outside the registry. | p2 |
+| CredStore | Stores and resolves the secrets that models reference, outside the registry; answers the registry's ownership check of a secret reference on model writes. | p1 |
+| Event Broker | Delivers change notifications to consumers. | p2 |
 
 ## 11. Assumptions
 
-- Secrets live in CredStore, and the registry stores only a reference.
+- Secrets live in CredStore. The registry stores only a reference and checks on write that the writing tenant owns the referenced secret.
 - LLM Gateway is the only evaluator and enforces capabilities and parameter overrides at request time.
 - The tenant hierarchy is a tree with one root.
 - The root tenant's administrator seeds the platform-wide shared catalog.
@@ -579,15 +614,14 @@ An acknowledged change to a provider or model **MUST** survive restarts of the g
 
 ## 13. Open Questions
 
-- Confirm the resolution latency budget and load conditions (`cpt-cf-model-registry-nfr-resolution-latency`) and the availability and recovery targets (`cpt-cf-model-registry-nfr-availability`). (Owner: LLM Gateway team and Model Registry team, Resolve by: before P1 implementation begins)
-- Will descendant tenants need per-tenant approval overrides of inherited models? This is currently excluded by design. (Owner: Model Registry team, Resolve by: before DESIGN is approved)
 - Will multi-step approval through an external approval service be required later? (Owner: Platform Architecture, Resolve by: before P2 planning)
 - How will auto-discovery of provider models work? Discovered models would start as Pending and wait for an administrator's approval. (Owner: Model Registry team, Resolve by: before P2 planning)
-- Must cost settings be exposed in a provider-independent form for consumers other than LLM Gateway? (Owner: Model Registry team, Resolve by: before DESIGN is approved)
+- How will change notifications be published and delivered: event types and payload, which tenants receive a change to a shared entry, and how publication survives a crash after commit (for example, an outbox in the catalog transaction)? (Owner: Model Registry team, Resolve by: before P2 planning)
+- Does a tenant's restriction of an inherited model (`cpt-cf-model-registry-fr-inherited-model-restriction`) reach its descendants, and can a descendant lift it? (Owner: Model Registry team, Resolve by: before P2 planning)
 
 ## 14. Traceability
 
-- **Design**: not yet created.
-- **ADRs**: not yet created.
+- **Design**: [DESIGN.md](./DESIGN.md)
+- **ADRs**: [ADR-0001](./ADR/0001-cpt-cf-model-registry-adr-inherited-read-scope.md) inherited read scope; [ADR-0002](./ADR/0002-cpt-cf-model-registry-adr-credential-binding.md) credential binding; [ADR-0003](./ADR/0003-cpt-cf-model-registry-adr-caching-strategy.md) caching strategy; [ADR-0004](./ADR/0004-cpt-cf-model-registry-adr-update-semantics.md) update semantics and concurrency.
 - **Features**: not yet created.
 - **SDK crate**: `cf-gears-model-registry-sdk` (`gears/model-registry/model-registry-sdk`) exists and predates this PRD.

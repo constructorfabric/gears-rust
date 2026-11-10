@@ -364,11 +364,11 @@ impl Producer {
         self.publish_inner(event, false).await
     }
 
-    /// Publishes `event` through [`EventBrokerApi::publish_sync`]. Until #5655
-    /// neither broker confirms the durable write: the REST client publishes
-    /// asynchronously and reports the server's status, and the in-process
-    /// `LocalBroker` inherits the trait default that delegates to `publish`;
-    /// both report `Accepted` or `Duplicate`.
+    /// Publishes `event` through [`EventBrokerApi::publish_sync`], which holds
+    /// the response until the backend stores the event (`Persisted`) or the
+    /// broker's `Prefer: wait` ceiling elapses (`Accepted`); a duplicate is
+    /// `Duplicate`. Both the REST client (via `Prefer: wait=N`) and the
+    /// in-process `LocalBroker` implement it.
     ///
     /// # Errors
     ///

@@ -76,6 +76,19 @@ where
         )
 }
 
+/// The optional `Prefer: wait=N` request header (RFC 7240) both publish
+/// endpoints accept: hold the response until the backend stores the events or
+/// N seconds elapse, N capped by configuration. `Prefer: respond-async` names
+/// the default and is a no-op.
+fn prefer_wait_param() -> toolkit::api::operation_builder::ParamSpec {
+    toolkit::api::operation_builder::ParamSpec::header("Prefer").description(
+        "RFC 7240 preference selecting synchronous persistence. `wait=N` asks the broker to hold \
+         the response until the events are stored, N seconds capped by configuration; a bare \
+         `wait` uses the cap and a non-numeric value is rejected (400). `respond-async` is the \
+         default (no-op).",
+    )
+}
+
 /// The ingest role's endpoints of `docs/openapi.yaml`, registered when
 /// `DeploymentMode::ingest_active()` (`module.rs::register_rest`).
 ///
@@ -95,17 +108,24 @@ pub fn register_ingest_routes(mut router: Router, openapi: &dyn OpenApiRegistry)
         .summary("Publish a single event")
         .description(
             "Enqueue one event into the per-topic ingest outbox. Default response is 202 \
-             Accepted once durably enqueued, 200 OK for an idempotent duplicate. Synchronous \
-             persistence (`Prefer: wait`) is not served yet and answers 501 Not Implemented.",
+             Accepted once durably enqueued, 200 OK for an idempotent duplicate. With \
+             `Prefer: wait=N` (RFC 7240, N capped by configuration) the response is held until \
+             the backend stores the event: 201 Created once stored, 202 Accepted if N elapses \
+             first, 200 OK when the event is a duplicate.",
         )
         .tag(INGEST_API_TAG)
         .authenticated()
         .no_license_required()
+        .param(prefer_wait_param())
         .json_request::<ingest_dto::PublishEventRequest>(openapi, "Event to publish")
         .handler(ingest_h::publish_event)
         .no_content_response(
+            StatusCode::CREATED,
+            "Stored - `Prefer: wait=N` was satisfied: the backend has the event",
+        )
+        .no_content_response(
             StatusCode::ACCEPTED,
-            "Accepted, durably enqueued in the outbox",
+            "Accepted, durably enqueued in the outbox (or `Prefer: wait=N` elapsed first)",
         )
         .no_content_response(
             StatusCode::OK,
@@ -125,11 +145,6 @@ pub fn register_ingest_routes(mut router: Router, openapi: &dyn OpenApiRegistry)
         )
         .problem_response(
             openapi,
-            StatusCode::NOT_IMPLEMENTED,
-            "Synchronous publish (`Prefer: wait`) is not implemented yet",
-        )
-        .problem_response(
-            openapi,
             StatusCode::SERVICE_UNAVAILABLE,
             "ServiceUnavailable, retryable - the topic is not yet provisioned, the broker's \
              database or ingest pipeline is unavailable (including a producer-chain write \
@@ -143,14 +158,23 @@ pub fn register_ingest_routes(mut router: Router, openapi: &dyn OpenApiRegistry)
         .summary("Publish a batch of events (atomic per topic)")
         .description(
             "Atomic per-topic batch of up to 100 events. All-or-nothing per topic; mixing \
-             topics in one batch is rejected.",
+             topics in one batch is rejected. `Prefer: wait=N` applies to the batch as a \
+             whole, with the status codes of a single publish.",
         )
         .tag(INGEST_API_TAG)
         .authenticated()
         .no_license_required()
+        .param(prefer_wait_param())
         .json_request::<ingest_dto::PublishBatchRequest>(openapi, "Batch of events to publish")
         .handler(ingest_h::publish_batch)
-        .no_content_response(StatusCode::ACCEPTED, "Accepted")
+        .no_content_response(
+            StatusCode::CREATED,
+            "Stored - `Prefer: wait=N` was satisfied: the backend has every event",
+        )
+        .no_content_response(
+            StatusCode::ACCEPTED,
+            "Accepted (or `Prefer: wait=N` elapsed first)",
+        )
         .no_content_response(
             StatusCode::OK,
             "Every event of the batch is a duplicate; nothing is written",
@@ -172,11 +196,6 @@ pub fn register_ingest_routes(mut router: Router, openapi: &dyn OpenApiRegistry)
             StatusCode::UNPROCESSABLE_ENTITY,
             "SchemaViolation - an event's `data` does not satisfy its event type's \
              `data_schema` (atomic batch rejection)",
-        )
-        .problem_response(
-            openapi,
-            StatusCode::NOT_IMPLEMENTED,
-            "Synchronous publish (`Prefer: wait`) is not implemented yet",
         )
         .problem_response(
             openapi,

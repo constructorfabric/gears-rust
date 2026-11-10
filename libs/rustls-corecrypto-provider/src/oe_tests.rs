@@ -152,8 +152,8 @@ fn compute_fips_witness_returns_false_on_parse_failed() {
     assert!(compute_fips_witness(&err, true));
 }
 
-/// On a healthy macOS dev/CI host (major ∈ [12, 13, 14, 15] at the time
-/// of writing) the cached witness must report `true`. If this test
+/// On a healthy macOS dev/CI host (major ∈ [`SUPPORTED_OE_MACOS_MAJOR`])
+/// the cached witness must report `true`. If this test
 /// flips, either the OE whitelist needs extending for a new macOS
 /// release, or the host running CI has rolled past Apple's currently
 /// published cert OE.

@@ -123,6 +123,7 @@ pub fn for_settings(e: DomainError) -> CanonicalError {
         | DomainError::NoSuchReviewRequest(_)
         | DomainError::ReviewConflict(_)
         | DomainError::InvalidValue { .. }
+        | DomainError::FactHeld(_)
         | DomainError::NotStored(_)
         | DomainError::Database(_)) => e.into(),
     }
@@ -190,6 +191,7 @@ pub fn for_export(e: DomainError) -> CanonicalError {
         | DomainError::NoSuchReviewRequest(_)
         | DomainError::ReviewConflict(_)
         | DomainError::InvalidValue { .. }
+        | DomainError::FactHeld(_)
         | DomainError::NotStored(_)
         | DomainError::Database(_)) => e.into(),
     }
@@ -244,6 +246,7 @@ pub fn for_facts(e: DomainError, subject_id: Uuid) -> CanonicalError {
         | DomainError::NoSuchReviewRequest(_)
         | DomainError::ReviewConflict(_)
         | DomainError::InvalidValue { .. }
+        | DomainError::FactHeld(_)
         | DomainError::NotStored(_)
         | DomainError::Database(_)) => e.into(),
     }
@@ -313,10 +316,77 @@ pub fn for_reviews(e: DomainError) -> CanonicalError {
         | DomainError::NoSuchReviewRequest(_)
         | DomainError::ReviewConflict(_)
         | DomainError::InvalidValue { .. }
+        | DomainError::FactHeld(_)
         | DomainError::Internal(_)
         | DomainError::ProfileFull(_)
         | DomainError::Database(_)) => e.into(),
     }
+}
+
+/// The REST answer for a domain error on the administrator's fact routes.
+/// An administrator is told a refusal as such, 403: the routes are about the
+/// tenant's subjects, not the caller's own facts. An add or an edit the
+/// checks or Admission refuse is 422, naming the reason.
+///
+/// @cpt-dod:cpt-cf-construct-dod-admin-facts-read:p2
+#[must_use]
+#[expect(
+    clippy::cognitive_complexity,
+    reason = "flat match on the domain enum; the tracing macros count toward the complexity"
+)]
+pub fn for_admin_facts(e: DomainError, subject_id: Uuid) -> CanonicalError {
+    match e {
+        DomainError::Forbidden(msg) => {
+            tracing::warn!(msg = %msg, "construct administrator access refused");
+            SubjectFactsError::permission_denied()
+                .with_reason("ACCESS_DENIED")
+                .create()
+        }
+        DomainError::NotConfigured(msg) => {
+            tracing::error!(msg = %msg, "construct is not configured for this call");
+            SubjectFactsError::unimplemented("this deployment does not provide this call").create()
+        }
+        DomainError::NoSuchFact(msg) => {
+            tracing::warn!(msg = %msg, "construct subject fact not found");
+            no_such_fact(subject_id)
+        }
+        DomainError::InvalidValue { field, rule } => {
+            tracing::info!(field, rule = %rule, "construct administrator value refused");
+            SubjectFactsError::invalid_argument()
+                .with_field_violation(field, rule, "invalid_value")
+                .create()
+        }
+        DomainError::NotStored(reason) => {
+            tracing::info!(
+                reason = reason.name(),
+                "construct administrator value not stored"
+            );
+            SubjectFactsError::failed_precondition()
+                .with_precondition_violation("value", "the value was not stored", reason.name())
+                .with_override(Http::status_code(422))
+                .create()
+        }
+        e @ (DomainError::Refused(_)
+        | DomainError::OutOfScope(_)
+        | DomainError::Unavailable(_)
+        | DomainError::NotVisible(_)
+        | DomainError::NoSuchReviewRequest(_)
+        | DomainError::ReviewConflict(_)
+        | DomainError::FactHeld(_)
+        | DomainError::InvalidQuery(_)
+        | DomainError::Internal(_)
+        | DomainError::ProfileFull(_)
+        | DomainError::Database(_)) => e.into(),
+    }
+}
+
+/// An administrator's body that does not fit, as an invalid-argument
+/// problem that names the field.
+#[must_use]
+pub fn bad_fact_body(mistake: &crate::api::rest::dto::BodyMistake) -> CanonicalError {
+    SubjectFactsError::invalid_argument()
+        .with_field_violation(mistake.field, mistake.rule, "invalid_fact")
+        .create()
 }
 
 /// The field, detail and reason of a query a list does not take, so a
@@ -405,6 +475,19 @@ impl From<DomainError> for CanonicalError {
                 ReviewRequestError::invalid_argument()
                     .with_field_violation(field, rule, "invalid_value")
                     .create()
+            }
+            // An administrator's add of a value the subject holds already:
+            // the answer names the fact that holds it, an id the caller may
+            // read.
+            DomainError::FactHeld(fact) => {
+                tracing::info!(fact_id = %fact.0, "construct fact already held");
+                SubjectFactsError::aborted(format!(
+                    "the subject holds this value, or this one-valued property, already as \
+                     fact {}; edit that fact instead",
+                    fact.0
+                ))
+                .with_reason("ALREADY_HELD")
+                .create()
             }
             // The correction is refused by the checks or Admission; the
             // request stays open, and the reason says why.

@@ -29,6 +29,9 @@ pub mod person_types;
 pub mod profile_types;
 pub mod reason;
 
+#[cfg(test)]
+mod graph_schemas_tests;
+
 pub use api::ConstructClientV1;
 pub use models::{
     FactCategory, FactId, FactOrigin, ProfileCategory, ProfileFact, RecordOutcome, SubjectProfile,

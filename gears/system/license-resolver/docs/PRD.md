@@ -276,8 +276,9 @@ The system **MUST** validate every check request against the registered contract
 plugin, and **MUST** reject non-conforming requests with a validation error — fail-closed and distinct from a
 not-granted decision. At minimum: Subject or Resource `metadata` not matching the registered schema of its declared
 contract type → error; a missing contract type → error; a Subject contract type not admitted by the Resource contract
-type → error. The resolver validates *shape and compatibility* only; it **MUST NOT** interpret what the properties mean
-or decide licensability — those remain the backend's concern.
+type → error. A Subject type that derives from an admitted type is admitted. The resolver validates
+*shape and compatibility* only; it **MUST NOT** interpret what the properties mean or decide licensability —
+those remain the backend's concern.
 
 - **Rationale**: An invalid check silently evaluated is an unauditable check. Validation in the engine gives every
   plugin vendor the same guarantee — a request that reaches the plugin conforms to a published contract — instead of

@@ -21,60 +21,11 @@ use uuid::Uuid;
 
 use crate::domain::error::DomainError;
 
-/// The nine base-ontology schemas, embedded from the crate's `schemas/` so the
-/// boot registration and the published schema files cannot drift apart. They
-/// live inside the crate rather than under `docs/` because `cargo package`
-/// ships nothing outside the crate directory.
-pub const BASE_SCHEMAS: [(&str, &str); 9] = [
-    (
-        graph_storage_sdk::gts::NODE_BASE_TYPE,
-        include_str!("../../schemas/gts.cf.core.graph.node.v1~.schema.json"),
-    ),
-    (
-        graph_storage_sdk::gts::EDGE_BASE_TYPE,
-        include_str!("../../schemas/gts.cf.core.graph.edge.v1~.schema.json"),
-    ),
-    (
-        graph_storage_sdk::gts::ATTRIBUTE_BASE_TYPE,
-        include_str!("../../schemas/gts.cf.core.graph.attribute.v1~.schema.json"),
-    ),
-    (
-        graph_storage_sdk::gts::OWNED_NODE_TYPE,
-        include_str!(
-            "../../schemas/gts.cf.core.graph.node.v1~cf.core.graph.owned_node.v1~.schema.json"
-        ),
-    ),
-    (
-        graph_storage_sdk::gts::REFERENCE_NODE_TYPE,
-        include_str!(
-            "../../schemas/gts.cf.core.graph.node.v1~cf.core.graph.reference_node.v1~.schema.json"
-        ),
-    ),
-    (
-        graph_storage_sdk::gts::PHANTOM_NODE_TYPE,
-        include_str!(
-            "../../schemas/gts.cf.core.graph.node.v1~cf.core.graph.phantom_node.v1~.schema.json"
-        ),
-    ),
-    (
-        graph_storage_sdk::gts::STATIC_EDGE_TYPE,
-        include_str!(
-            "../../schemas/gts.cf.core.graph.edge.v1~cf.core.graph.static_edge.v1~.schema.json"
-        ),
-    ),
-    (
-        graph_storage_sdk::gts::ANALYSIS_EDGE_TYPE,
-        include_str!(
-            "../../schemas/gts.cf.core.graph.edge.v1~cf.core.graph.analysis_edge.v1~.schema.json"
-        ),
-    ),
-    (
-        graph_storage_sdk::gts::PROVENANCE_ATTRIBUTE_TYPE,
-        include_str!(
-            "../../schemas/gts.cf.core.graph.attribute.v1~cf.core.graph.provenance.v1~.schema.json"
-        ),
-    ),
-];
+/// The nine base-ontology schemas. Defined, embedded and published to the
+/// types-registry by the SDK (`graph_storage_sdk::gts`), the public contract
+/// producers derive from; re-exported here, where the gear registers and
+/// validates against them.
+pub use graph_storage_sdk::gts::BASE_SCHEMAS;
 
 /// The platform's GTS keyword vocabulary. The gear registers **no** extension
 /// keyword of its own, so this list is exactly what `gts` defines; anything

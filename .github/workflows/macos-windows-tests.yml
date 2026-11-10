@@ -83,21 +83,62 @@ jobs:
             --jq '.jobs[] | select(.name | startswith("Test Suite (")) | [.name, (.conclusion // "")] | @tsv' \
             > jobs.tsv
 
+      # The macOS runner sometimes returns I/O errors from its data disk
+      # (actions/runner-images#15265). test-suite.yml uploads the kernel log on a
+      # macOS failure. We fetch the newest one so the summary can say so. A run
+      # without that artifact is fine, and this step never fails the job.
+      - name: Download macOS kernel log
+        if: needs.test.result == 'failure'
+        continue-on-error: true
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          id=$(gh api --paginate "repos/$REPO/actions/runs/$RUN_ID/artifacts" \
+            --jq '.artifacts[] | select(.name=="macos-kernel-log") | .id' | sort -nr | head -1)
+          if [ -z "$id" ]; then
+            exit 0
+          fi
+          gh api "repos/$REPO/actions/artifacts/$id/zip" > "$RUNNER_TEMP/kernel-log.zip"
+          mkdir -p infra/macOS
+          unzip -q "$RUNNER_TEMP/kernel-log.zip" -d infra/macOS
+
       # These tests often flake on macOS and Windows. Listing the failed tests
       # helps tell a flake from a real break.
       - name: Summarize failures
         if: needs.test.result == 'failure'
-        shell: python
+        shell: python3 {0}
         run: |
-          import glob, os
+          import glob, os, re
           import xml.etree.ElementTree as ET
 
           MAX = 20
+          # Fewer matches than this is noise, not a failing disk.
+          INFRA_EIO_MIN = 10
           lines = []
+          macos_failed = False
           for row in open("jobs.tsv"):
               job, conclusion = row.rstrip("\n").split("\t")
               lines.append(f"- {job}: **{conclusion or 'unknown'}**")
+              if "macos" in job.lower() and conclusion == "failure":
+                  macos_failed = True
           lines.append("")
+          eio = 0
+          try:
+              with open("infra/macOS/kernel-storage.log", errors="replace") as f:
+                  eio = sum(1 for l in f if re.search(r"disk\d+s\d+: I/O error", l))
+          except OSError:
+              pass
+          infra = macos_failed and eio >= INFRA_EIO_MIN
+          if infra:
+              lines += [
+                  f"**macOS: runner storage fault detected.** The kernel log shows {eio} `I/O error` lines on the runner's data disk. "
+                  "The macOS failures in this run are probably the hosted runner's disk, not a code regression "
+                  "(tracked in actions/runner-images#15265). This says nothing about Windows.",
+                  "",
+              ]
           for report in sorted(glob.glob("reports/*")):
               failed = []
               for path in glob.glob(f"{report}/*.xml"):
@@ -106,7 +147,9 @@ jobs:
                           failed.append(f"- `{case.get('name')}` ({case.get('classname', '')})")
               if failed:
                   more = [f"- ...and {len(failed) - MAX} more"] if len(failed) > MAX else []
-                  lines += [f"Failed on {os.path.basename(report)}:", ""] + failed[:MAX] + more + [""]
+                  name = os.path.basename(report)
+                  suffix = " (likely infra, see above)" if infra and name == "macOS" else ""
+                  lines += [f"Failed on {name}{suffix}:", ""] + failed[:MAX] + more + [""]
           if not any(l.startswith("Failed on") for l in lines):
               lines.append("No failed tests in the reports, so the build or setup failed. Check the run log.")
           lines += [

@@ -680,3 +680,41 @@ async fn two_creators_with_expected_version_zero_do_not_both_win() {
     )
     .await;
 }
+
+#[tokio::test]
+async fn a_read_returns_the_version_a_write_compares_against() {
+    conformance::a_read_returns_the_version_a_write_compares_against(&store(), Uuid::now_v7())
+        .await;
+}
+
+#[tokio::test]
+async fn a_hop_follows_only_its_direction() {
+    let store = std::sync::Arc::new(store());
+    let engine =
+        graph_storage::infra::fake_store::FakeGraphEngine::new(std::sync::Arc::clone(&store));
+    conformance::a_hop_follows_only_its_direction(store.as_ref(), &engine, Uuid::now_v7()).await;
+}
+
+#[tokio::test]
+async fn a_hop_reports_and_filters_discriminators() {
+    let store = std::sync::Arc::new(store());
+    let engine =
+        graph_storage::infra::fake_store::FakeGraphEngine::new(std::sync::Arc::clone(&store));
+    conformance::a_hop_reports_and_filters_discriminators(store.as_ref(), &engine, Uuid::now_v7())
+        .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn overlapping_batches_all_land() {
+    conformance::overlapping_batches_all_land(
+        std::sync::Arc::new(store())
+            as std::sync::Arc<dyn graph_storage_sdk::plugin_api::GraphStoreV1>,
+        Uuid::now_v7(),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_count_agrees_with_the_listing() {
+    conformance::a_count_agrees_with_the_listing(&store(), Uuid::now_v7()).await;
+}

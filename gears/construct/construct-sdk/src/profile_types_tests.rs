@@ -1,38 +1,9 @@
-use graph_storage_sdk::gts::{NODE_BASE_TYPE, OWNED_NODE_TYPE, STATIC_EDGE_TYPE};
-use jsonschema::{Retrieve, Uri, Validator};
+use graph_storage_sdk::gts::{OWNED_NODE_TYPE, STATIC_EDGE_TYPE};
+use jsonschema::Validator;
 use serde_json::{Value, json};
 
 use super::*;
-
-const GRAPH_STORAGE_SCHEMAS: [(&str, &str); 2] = [
-    (
-        NODE_BASE_TYPE,
-        include_str!(
-            "../../../graph-storage/graph-storage/schemas/gts.cf.core.graph.node.v1~.schema.json"
-        ),
-    ),
-    (
-        OWNED_NODE_TYPE,
-        include_str!(
-            "../../../graph-storage/graph-storage/schemas/gts.cf.core.graph.node.v1~cf.core.graph.owned_node.v1~.schema.json"
-        ),
-    ),
-];
-
-struct GraphStorageSchemas;
-
-impl Retrieve for GraphStorageSchemas {
-    fn retrieve(
-        &self,
-        uri: &Uri<String>,
-    ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
-        GRAPH_STORAGE_SCHEMAS
-            .iter()
-            .find(|(id, _)| format!("gts://{id}") == uri.as_str())
-            .map(|(_, text)| serde_json::from_str(text).expect("a JSON schema"))
-            .ok_or_else(|| format!("unresolved schema reference `{uri}`").into())
-    }
-}
+use crate::graph_schemas_tests::GraphStorageSchemas;
 
 fn schema(graph_type: GraphType) -> Value {
     serde_json::from_str(graph_type.schema).expect("a JSON schema")

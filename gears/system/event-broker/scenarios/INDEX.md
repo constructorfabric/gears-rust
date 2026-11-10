@@ -34,10 +34,10 @@ Anonymous groups are broker-minted via REST. Named groups are registered via `ty
 
 #### Step 2 — Publish events
 
-Producers submit typed events to a topic. Publish is async (`202`); opt into synchronous persistence with the standard `Prefer: wait` header (RFC 7240). Not yet served: `Prefer: wait` answers `501`; tracked in #5655.
+Producers submit typed events to a topic. Publish is async (`202`); opt into synchronous persistence with the standard `Prefer: wait=N` header (RFC 7240).
 
 - [Publish a single event (async)](producer/single/1.01-positive-publish-single-async.md) — `POST /v1/events` → `202 Accepted`.
-- [Publish sync (Prefer: wait)](producer/single/1.02-positive-publish-sync-wait-persisted.md) - `POST /v1/events` with `Prefer: wait` → `201 Created`. Not yet served: `Prefer: wait` answers `501`; tracked in #5655.
+- [Publish sync (Prefer: wait=N)](producer/single/1.02-positive-publish-sync-wait-persisted.md) - `POST /v1/events` with `Prefer: wait=N` → `201 Created` once stored, `202` on timeout.
 
 #### Step 3 — JOIN a subscription
 
@@ -93,7 +93,7 @@ Multiple consumer instances share a group by JOINing with the same `consumer_gro
 
 #### producer/single/ — `POST /v1/events` (stateless)
 - [positive-1.1 — Publish single (async)](producer/single/1.01-positive-publish-single-async.md) — `POST /v1/events` → `202 Accepted`; event enqueued in outbox.
-- [positive-1.2 - Publish sync (Prefer: wait)](producer/single/1.02-positive-publish-sync-wait-persisted.md) - `POST /v1/events` with `Prefer: wait` → `201 Created` after backend persist. Not yet served: `Prefer: wait` answers `501`; tracked in #5655.
+- [positive-1.2 - Publish sync (Prefer: wait=N)](producer/single/1.02-positive-publish-sync-wait-persisted.md) - `POST /v1/events` with `Prefer: wait=N` → `201 Created` after backend persist, `202 Accepted` if the wait elapses first.
 - [negative-1.5 — Read-only partition rejected](producer/single/1.05-negative-readonly-partition-rejected.md) — producer-supplied `partition` on publish → `400 Bad Request`; the backend assigns the backend partition itself.
 
 #### producer/batch/ — `POST /v1/events:batch`

@@ -257,6 +257,7 @@ pub(super) fn view(type_id: &str, payload: Option<Value>) -> NodeView {
                 source_epoch: 1,
                 revision: 1,
             },
+            version: None,
         },
     }
 }

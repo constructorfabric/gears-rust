@@ -18,3 +18,6 @@ pub type ConcreteSubjectControl = crate::domain::subject_control::SubjectControl
 
 /// The Review Queue used by the REST layer.
 pub type ConcreteReviewQueue = crate::domain::review_queue::ReviewQueueService;
+
+/// Administrator Fact Management used by the REST layer.
+pub type ConcreteAdminFacts = crate::domain::admin_facts::AdminFactsService;

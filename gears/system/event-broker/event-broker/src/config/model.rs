@@ -38,6 +38,8 @@ pub struct EventBrokerConfig {
     #[serde(default)]
     pub batch: BatchConfig,
     #[serde(default)]
+    pub publish: PublishConfig,
+    #[serde(default)]
     pub polling: PollingConfig,
     #[serde(default)]
     pub subscription: SubscriptionConfig,
@@ -112,6 +114,29 @@ impl Default for BatchConfig {
             max_size: 100,
             max_payload_bytes: 1_048_576,
         }
+    }
+}
+
+/// The `[modules.event_broker.publish]` section: synchronous-publish
+/// (`Prefer: wait=N`) tuning.
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct PublishConfig {
+    /// The ceiling on a `Prefer: wait=N` publish's hold, in seconds. A request
+    /// asking for more is capped to this; the broker never holds a publish
+    /// open longer than the operator allows. Default 30 (matching the
+    /// long-poll cap). In `cluster_ingest` mode a startup check
+    /// (`config::checks`) refuses a value above
+    /// [`MAX_CLUSTER_INGEST_WAIT_SECS`](crate::config::checks::MAX_CLUSTER_INGEST_WAIT_SECS),
+    /// so a shared ingest tier cannot be made to pin connections open.
+    pub max_wait_secs: u32,
+}
+
+impl Default for PublishConfig {
+    fn default() -> Self {
+        // Mirrors `PollingConfig::max_timeout_secs`: a 30s ceiling on how long
+        // the broker will hold any request open.
+        Self { max_wait_secs: 30 }
     }
 }
 

@@ -227,14 +227,11 @@ async fn reuse_monotonic_primes_from_broker_cursor() {
     assert_eq!(cursors.last_sequence(&topic_instance()), Some(1));
 }
 
-/// `publish_persisted` asks for a durable-write confirmation, but the in-process
-/// broker enqueues to its async ingest outbox and exposes no persist-confirm hook
-/// (see `local_broker.rs`: the REST layer answers `501` for `Prefer: wait`), so
-/// the honest outcome is `Accepted`, not `Persisted`: the broker does not assert a
-/// write it has not confirmed.
-// #5655: the in-process broker confirms no durable write until synchronous publish lands.
+/// `publish_persisted` asks the in-process broker to hold until its ingest
+/// outbox has stored the event on the backend; the harness's memory backend
+/// stores it well within the wait, so the outcome is `Persisted`.
 #[tokio::test]
-async fn persisted_publish_is_accepted_without_a_persist_confirm_hook() {
+async fn persisted_publish_reports_persisted_once_stored() {
     let harness = harness().await;
     let broker = harness.broker();
     let producer = Producer::builder()
@@ -250,7 +247,7 @@ async fn persisted_publish_is_accepted_without_a_persist_confirm_hook() {
 
     let outcome = producer.publish_persisted(order()).await.unwrap();
 
-    assert_eq!(outcome, IngestOutcome::Accepted);
+    assert_eq!(outcome, IngestOutcome::Persisted);
     wait_for_stored(&harness, TENANT_PARTITION, 1).await;
 }
 

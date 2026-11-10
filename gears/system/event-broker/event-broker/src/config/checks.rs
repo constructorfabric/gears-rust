@@ -23,6 +23,14 @@ use super::{BackendEntry, DeploymentMode, EventBrokerConfig};
 use crate::domain::backend::{self, Routing};
 use crate::domain::outbox::{INGEST_QUEUE_NAME, OutboxPartitions};
 
+/// The largest `publish.max_wait_secs` a `cluster_ingest` instance accepts. A
+/// shared ingest tier serves many producers, so an unbounded synchronous hold
+/// would let one slow backend pin every connection; the long-poll ceiling
+/// (`PollingConfig::max_timeout_secs`, 30s) doubled is generous headroom
+/// without being open-ended. `standalone` (a single process, dev/test) and the
+/// non-ingest cluster roles are left unrestricted.
+pub const MAX_CLUSTER_INGEST_WAIT_SECS: u32 = 60;
+
 /// The deployment as the checks proved it: every name valid, every route
 /// naming an entry, the instance-less route present, every entry routed to.
 /// Constructed only by [`check`].
@@ -102,6 +110,13 @@ pub enum Error {
         "outbox_groups: group 'default' states `topics`; `default` always carries every topic and sets nothing but `partitions` (feature 0005 section 2.4, C8)"
     )]
     DefaultOutboxGroupTopics,
+
+    /// `cluster_ingest` caps the synchronous-publish hold: a shared ingest tier
+    /// must not be configurable to pin connections open indefinitely.
+    #[error(
+        "publish: max_wait_secs is {secs}; in cluster_ingest mode it is at most {max} seconds, so a synchronous publish cannot hold a shared ingest connection open longer"
+    )]
+    PublishMaxWaitTooLarge { secs: u32, max: u32 },
 }
 
 /// Runs every configuration-level check this instance's role is subject to.
@@ -110,15 +125,26 @@ pub enum Error {
 /// it carries the sections without being subject to their rules.
 ///
 /// # Errors
-/// The first rule the configuration breaks, checked in this order: registry
-/// names; each routing key in sorted order, its form and then its target
-/// (C3); the instance-less route (C4); unreferenced entries (C5); outside
-/// `standalone`, a `SQLite` entry (C10); and, where
-/// ingest runs, the outbox groups - a group other than `default`, then the
-/// partition count, then `topics` (C8).
+/// The first rule the configuration breaks, checked in this order: in
+/// `cluster_ingest`, the synchronous-publish cap
+/// ([`MAX_CLUSTER_INGEST_WAIT_SECS`]); registry names; each routing key in
+/// sorted order, its form and then its target (C3); the instance-less route
+/// (C4); unreferenced entries (C5); outside `standalone`, a `SQLite` entry
+/// (C10); and, where ingest runs, the outbox groups - a group other than
+/// `default`, then the partition count, then `topics` (C8).
 pub fn check(cfg: &EventBrokerConfig, mode: DeploymentMode) -> Result<Option<Deployment>, Error> {
     if mode.backend_role().is_none() {
         return Ok(None);
+    }
+    // A shared ingest tier bounds how long a synchronous publish may hold a
+    // connection; standalone and the non-ingest roles are left unrestricted.
+    if mode == DeploymentMode::ClusterIngest
+        && cfg.publish.max_wait_secs > MAX_CLUSTER_INGEST_WAIT_SECS
+    {
+        return Err(Error::PublishMaxWaitTooLarge {
+            secs: cfg.publish.max_wait_secs,
+            max: MAX_CLUSTER_INGEST_WAIT_SECS,
+        });
     }
     let backends = backends(cfg)?;
     let routing = routing(cfg)?;

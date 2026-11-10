@@ -143,6 +143,20 @@ fn a_rule_for_another_subject_type_does_not_match() {
     assert!(!other.matches(&request()));
 }
 
+/// A rule on a subject type answers a subject of a type derived from it, and
+/// not the other way round.
+#[test]
+fn a_rule_covers_derived_subject_types_only() {
+    let derived = format!("{SUBJECT_TYPE}test.lic.gateway.admin.v1~");
+    let mut req = request();
+    req.subject.gts_type = GtsTypeId::new(&derived);
+    assert!(rule().matches(&req));
+
+    let mut narrow = rule();
+    narrow.subject_type = derived;
+    assert!(!narrow.matches(&request()));
+}
+
 /// A grant for the whole type answers a check naming one instance of it, and
 /// an id-less check about the type as a class.
 #[test]

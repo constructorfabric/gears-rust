@@ -128,11 +128,11 @@ fn classify_sqlstate(sqlstate: &str) -> Option<GraphStoreError> {
         // `Serialization` tells a caller -- retry unchanged, as against
         // `Internal`'s retry once and escalate.
         //
-        // `40P01` is not hypothetical here. Ingest takes row locks in a fixed
-        // order because the secure ORM exposes no `FOR UPDATE`, and fixed-order
-        // locking across concurrent writers is the shape that produces
-        // deadlocks. Leaving it out meant the one failure this design invites
-        // was the one the classifier could not name.
+        // `40P01` is kept although ingest no longer invites it: it writes
+        // nodes, endpoints and edges in key order (DESIGN § Concurrent Ingest
+        // Protocol, point 5), so two batches take the locks they share in one
+        // order. A deadlock can still come from outside that order -- a scope
+        // removal, an operator's statement -- and must still name itself.
         //
         // `55P03` is a row lock not granted within `lock_timeout`: rolled
         // back, nothing written, the same answer. It used to read as
@@ -440,6 +440,15 @@ impl GraphStoreV1 for PgGraphStore {
         req: ProjectionRequest,
     ) -> Result<toolkit_odata::Page<NodeRow>, GraphStoreError> {
         reads::project_table(self, ctx, req).await
+    }
+
+    async fn count_table(
+        &self,
+        ctx: &StoreCtx<'_>,
+        req: ProjectionRequest,
+        max: u64,
+    ) -> Result<graph_storage_sdk::models::NodeCount, GraphStoreError> {
+        reads::count_table(self, ctx, req, max).await
     }
 
     async fn load_topology(

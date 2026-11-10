@@ -53,6 +53,11 @@ const MIN_TOKEN_TTL: Duration = Duration::from_secs(5);
 /// lifetime and bounds both arithmetic and stale-token exposure.
 const MAX_TOKEN_TTL: Duration = Duration::from_hours(24);
 
+/// `path_template` carried by every [`PluginError::KcRest`] raised from the
+/// OIDC token endpoint. Callers match on it to tell a token-acquisition
+/// failure apart from a failure of the Admin REST call that followed.
+pub const TOKEN_PATH_TEMPLATE: &str = "/realms/{realm}/protocol/openid-connect/token";
+
 /// Origin for an admin client's `client_secret`.
 ///
 /// `Inline` — static infra cred (bootstrap admin, default-shared-realm admin)
@@ -485,7 +490,7 @@ impl KeycloakAdminClientFactory {
                 detail: e.to_string(),
             })?;
 
-        let path_template = "/realms/{realm}/protocol/openid-connect/token";
+        let path_template = TOKEN_PATH_TEMPLATE;
         let fields = [
             ("grant_type", "client_credentials"),
             ("client_id", client_id),
@@ -499,7 +504,7 @@ impl KeycloakAdminClientFactory {
         if !(200..=299).contains(&status) {
             return Err(PluginError::KcRest {
                 method: "POST",
-                path_template: "/realms/{realm}/protocol/openid-connect/token".into(),
+                path_template: TOKEN_PATH_TEMPLATE.into(),
                 status: KcStatusKind::Http(status),
                 // Token-endpoint error bodies can echo the rejected
                 // `client_secret` form field on certain KC misconfigs
@@ -526,7 +531,7 @@ impl KeycloakAdminClientFactory {
             };
             PluginError::KcRest {
                 method: "POST",
-                path_template: "/realms/{realm}/protocol/openid-connect/token".into(),
+                path_template: TOKEN_PATH_TEMPLATE.into(),
                 // Preserve the real 2xx status (typically 200, but KC could
                 // return 201/204 on a token-issue path); a hard-coded 200
                 // misled post-mortems when the actual response was different.

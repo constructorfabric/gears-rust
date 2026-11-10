@@ -228,6 +228,22 @@ impl GraphStorageClientV1 for Scripted {
         }
         self.inner.register_types(ctx, batch).await
     }
+    async fn register_types_with(
+        &self,
+        ctx: &SecurityContext,
+        batch: Vec<TypeRegistration>,
+        options: graph_storage_sdk::models::TypeRegistrationOptions,
+    ) -> Result<Vec<graph_storage_sdk::models::RegisteredType>, CanonicalError> {
+        self.inner.register_types_with(ctx, batch, options).await
+    }
+    async fn count_nodes(
+        &self,
+        ctx: &SecurityContext,
+        type_patterns: &[String],
+        query: toolkit_odata::ODataQuery,
+    ) -> Result<graph_storage_sdk::models::NodeCount, CanonicalError> {
+        self.inner.count_nodes(ctx, type_patterns, query).await
+    }
     async fn get_type(
         &self,
         ctx: &SecurityContext,

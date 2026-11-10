@@ -47,10 +47,23 @@ paths:
         storage backend and is never returned inline.
 
         Synchronous persistence - holding the response until the backend confirms
-        the event is persisted - is requested with the standard `Prefer: wait`
-        header (RFC 7240). It is not implemented yet and is answered
-        `501 Not Implemented`. `Prefer: respond-async` names the default (async)
-        behaviour and is accepted as a no-op (still `202`).
+        the event is persisted - is requested with the standard `Prefer: wait=N`
+        header (RFC 7240, N capped by configuration): `201 Created` once the event
+        is stored, `202 Accepted` if N elapses first (the event stays enqueued and
+        is stored later), `200 OK` when the event is a duplicate. `Prefer:
+        respond-async` names the default (async) behaviour and is accepted as a
+        no-op (still `202`).
+      parameters:
+        - name: Prefer
+          in: header
+          required: false
+          description: >-
+            RFC 7240 preference selecting synchronous persistence. `wait=N` asks
+            the broker to hold the response until the event is stored, N seconds
+            capped by configuration; a bare `wait` uses the cap and a non-numeric
+            value is rejected (`400`). `respond-async` is the default (no-op).
+          schema:
+            type: string
       requestBody:
         required: true
         content:
@@ -58,15 +71,33 @@ paths:
             schema:
               $ref: "./schemas/gts.cf.core.events.event.v1~.schema.json"
       responses:
+        "201":
+          description: >-
+            Stored - `Prefer: wait=N` was satisfied: the backend has the event.
+            No body.
+          headers:
+            Preference-Applied:
+              $ref: "#/components/headers/PreferenceApplied"
         "202":
-          description: Accepted, durably enqueued in the outbox
+          description: >-
+            Accepted, durably enqueued in the outbox (or `Prefer: wait=N` elapsed
+            before the backend stored the event).
+          headers:
+            Preference-Applied:
+              $ref: "#/components/headers/PreferenceApplied"
         "200":
           description: >-
             Idempotent duplicate - a lost-ack retry of the producer chain's current
             head. The event is already durable; nothing is written and the response
             carries no body.
+          headers:
+            Preference-Applied:
+              $ref: "#/components/headers/PreferenceApplied"
         "400":
-          description: Validation error (read-only/unknown field, unknown producer, etc.)
+          description: >-
+            Validation error - a read-only/unknown field on the body, a
+            chained/monotonic mode invariant violated, or a malformed
+            `Prefer: wait` value (not a non-negative whole number of seconds).
           content:
             application/problem+json:
               schema:
@@ -105,13 +136,6 @@ paths:
             application/problem+json:
               schema:
                 $ref: "#/components/schemas/Problem"
-        "501":
-          description: >-
-            Synchronous publish (`Prefer: wait`) is not implemented yet.
-          content:
-            application/problem+json:
-              schema:
-                $ref: "#/components/schemas/Problem"
         "503":
           description: >-
             ServiceUnavailable, retryable - the topic is not yet provisioned, the
@@ -140,6 +164,23 @@ paths:
         `sequence` equals the head, and is otherwise a `412`; a monotonic run
         skips its leading events with `sequence <= last_sequence`. Duplicates are
         not enqueued; the rest of the batch is. Every answer is status only.
+
+        `Prefer: wait=N` (RFC 7240, N capped by configuration) applies to the
+        batch as a whole, with the status codes of a single publish: `201` once
+        every admitted event is stored, `202` if N elapses first, `200` when every
+        event is a duplicate.
+      parameters:
+        - name: Prefer
+          in: header
+          required: false
+          description: >-
+            RFC 7240 preference selecting synchronous persistence. `wait=N` asks
+            the broker to hold the response until every admitted event is stored,
+            N seconds capped by configuration; a bare `wait` uses the cap and a
+            non-numeric value is rejected (`400`). `respond-async` is the default
+            (no-op).
+          schema:
+            type: string
       requestBody:
         required: true
         content:
@@ -155,14 +196,28 @@ paths:
                   minItems: 1
                   maxItems: 100
       responses:
+        "201":
+          description: >-
+            Stored - `Prefer: wait=N` was satisfied: the backend has every event.
+            No body.
+          headers:
+            Preference-Applied:
+              $ref: "#/components/headers/PreferenceApplied"
         "202":
           description: >-
             Accepted (async; every event that is not a duplicate durably
-            enqueued). A batch carrying any stateless event is never a duplicate.
+            enqueued, or `Prefer: wait=N` elapsed before they were stored). A batch
+            carrying any stateless event is never a duplicate.
+          headers:
+            Preference-Applied:
+              $ref: "#/components/headers/PreferenceApplied"
         "200":
           description: >-
             Every event of the batch is a duplicate - a lost-ack resend. Nothing
             is written and the response carries no body.
+          headers:
+            Preference-Applied:
+              $ref: "#/components/headers/PreferenceApplied"
         "400":
           description: >-
             Validation error, or a batch run rule broken - each a
@@ -173,8 +228,9 @@ paths:
             event has `sequence > previous` and each after the first has
             `previous` equal to the prior event's `sequence` - or a monotonic
             run's sequences do not strictly increase; field
-            `events[<index>].meta`, the first offending event). The run rules are
-            checked before any chain state is read.
+            `events[<index>].meta`, the first offending event). A malformed
+            `Prefer: wait` value (not a non-negative whole number of seconds) is
+            also `400`. The run rules are checked before any chain state is read.
           content:
             application/problem+json:
               schema:
@@ -211,13 +267,6 @@ paths:
                 $ref: "#/components/schemas/Problem"
         "422":
           description: SchemaViolation - an event's `data` does not satisfy its event type's `data_schema` (atomic batch rejection)
-          content:
-            application/problem+json:
-              schema:
-                $ref: "#/components/schemas/Problem"
-        "501":
-          description: >-
-            Synchronous publish (`Prefer: wait`) is not implemented yet.
           content:
             application/problem+json:
               schema:
@@ -1277,3 +1326,11 @@ components:
         application/problem+json:
           schema:
             $ref: "#/components/schemas/Problem"
+
+  headers:
+    PreferenceApplied:
+      description: >-
+        Present on a synchronous publish: the applied wait as `wait=<seconds>`
+        (RFC 7240 §3) - the requested `wait` capped by configuration.
+      schema:
+        type: string

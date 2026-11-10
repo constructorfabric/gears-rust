@@ -1,0 +1,33 @@
+gdl_version = "1.0"
+
+# Every GDL field: https://github.com/constructorfabric/gearbox/blob/main/docs/gdl.md
+#
+# Gearbox product metadata for License Enforcement.
+#
+# Projected from #[toolkit::gear]: id, runtime_caps (db, rest, stateful), colocated_deps
+# (types-registry, authz-resolver, tenant-resolver).
+
+gear(
+    deps = ["types-registry", "authz-resolver", "tenant-resolver"],
+    source = git(url = "https://github.com/constructorfabric/gears-rust", path = "gears/system/license-enforcement/license-enforcement"),
+    maturity = "preview",
+    implementation = "in-progress",
+    name = "License Enforcement",
+    description = "Grant store and management API; answers license checks as a license-resolver backend.",
+    category = "core-platform-integration",
+    visibility = "internal",
+
+    package = cargo(
+        crate_name = "cf-gears-license-enforcement",
+        lib = "license_enforcement",
+        path = ".",
+    ),
+
+    sdk = cargo(
+        crate_name = "cf-gears-license-enforcement-sdk",
+        lib = "license_enforcement_sdk",
+        path = "../license-enforcement-sdk",
+    ),
+
+    config_schema = config(exposes = ["vendor", "priority"]),
+)

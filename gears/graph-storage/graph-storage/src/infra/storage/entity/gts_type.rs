@@ -1,10 +1,10 @@
-//! Per-tenant projection of the platform types-registry
-//! (`cpt-cf-graph-storage-dbtable-gts-type`).
+//! The gear's per-tenant type catalogue (`cpt-cf-graph-storage-dbtable-gts-type`).
 //!
 //! Exists for interning (a 4-byte reference on every node and edge row) and
-//! for batch validation without a registry round trip per item. The registry
-//! stays authoritative — this is a cache with a foreign identity, never a
-//! second source of truth.
+//! for batch validation without a registry round trip per item. Until
+//! types-registry holds tenant-owned types it is the authority for producer
+//! types; the target is the registry authoritative and this table its
+//! projection (ADR-0007).
 
 use sea_orm::entity::prelude::*;
 use time::OffsetDateTime;

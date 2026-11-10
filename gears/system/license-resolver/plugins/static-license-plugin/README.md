@@ -48,7 +48,7 @@ gears:
 |---|---|---|
 | `resource_type` | — (required) | the check's resource contract type must equal it |
 | `resource_id` | the whole type is licensed, which also answers a check naming one instance | only that instance is licensed, and never a whole-type check |
-| `subject_type` | — (required) | the check's subject contract type must equal it |
+| `subject_type` | — (required) | the check's subject contract type must equal it or derive from it |
 | `subject_id` | every subject of the type | only that subject |
 | `tenant_id` | every tenant in this deployment | only that tenant |
 | `resource_metadata` | resource properties unconstrained | each named property must be present and equal |

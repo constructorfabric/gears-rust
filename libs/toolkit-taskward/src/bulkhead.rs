@@ -39,9 +39,11 @@ pub struct BackoffConfig {
     /// Upper bound — escalation never exceeds this.
     pub max: Duration,
     /// Growth factor per consecutive failure (e.g. 2.0 for doubling).
+    /// A value below 1.0 or non-finite counts as 1.0 (no growth).
     pub multiplier: f64,
     /// Jitter factor (0.0–1.0). Scales each interval by a deterministic
     /// factor in `[1.0 - jitter, 1.0 + jitter]`. Default: 0.3 (±30%).
+    /// A value above 1.0 counts as 1.0; a negative or non-finite one as 0.0.
     pub jitter: f64,
 }
 
@@ -119,12 +121,18 @@ impl Bulkhead {
     pub fn escalate(&mut self) {
         self.consecutive_failures = self.consecutive_failures.saturating_add(1);
         let exponent = self.consecutive_failures.saturating_sub(1);
-        let exp = self
-            .backoff
-            .multiplier
-            .powi(i32::try_from(exponent).unwrap_or(i32::MAX));
-        let raw = self.backoff.initial.mul_f64(exp);
-        let capped = raw.min(self.backoff.max);
+        // `BackoffConfig::new` refuses such a multiplier; a struct literal does not.
+        let multiplier = if self.backoff.multiplier.is_finite() && self.backoff.multiplier >= 1.0 {
+            self.backoff.multiplier
+        } else {
+            1.0
+        };
+        let exp = multiplier.powi(i32::try_from(exponent).unwrap_or(i32::MAX));
+        // The growth leaves the range of `Duration` long before a worker
+        // stops failing (1 s doubled 64 times), so it is capped as a float:
+        // `Duration::mul_f64` would panic in the worker loop, outside the
+        // panic policy, and end the worker.
+        let capped = capped_secs(self.backoff.initial.as_secs_f64() * exp, self.backoff.max);
         self.current_interval = self.apply_jitter(capped);
     }
 
@@ -196,7 +204,11 @@ impl Bulkhead {
     /// Uses a hash of `(name, consecutive_failures)` to produce a factor
     /// in `[1.0 - jitter, 1.0 + jitter]`.
     fn apply_jitter(&self, interval: Duration) -> Duration {
-        let jitter = self.backoff.jitter;
+        let jitter = if self.backoff.jitter.is_finite() {
+            self.backoff.jitter.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
         if jitter == 0.0 || interval.is_zero() {
             return interval;
         }
@@ -208,9 +220,19 @@ impl Bulkhead {
         let fraction = (hash as f64) / (u64::MAX as f64);
         // Scale to [1.0 - jitter, 1.0 + jitter]
         let factor = 1.0 - jitter + fraction * 2.0 * jitter;
-        let jittered = interval.mul_f64(factor);
-        // Never exceed max
-        jittered.min(self.backoff.max)
+        // Never exceed max, even where `interval × factor` has no `Duration`.
+        capped_secs(interval.as_secs_f64() * factor, self.backoff.max)
+    }
+}
+
+/// `secs` as a `Duration` of at most `max`. A value at or above `max` (an
+/// infinite one included) is `max`; a NaN, which only a zero interval times
+/// an infinite growth produces, is zero, the interval it grows from.
+fn capped_secs(secs: f64, max: Duration) -> Duration {
+    if secs >= max.as_secs_f64() {
+        max
+    } else {
+        Duration::try_from_secs_f64(secs).unwrap_or(Duration::ZERO)
     }
 }
 
@@ -326,6 +348,114 @@ mod tests {
             bh.escalate();
         }
         assert_eq!(bh.min_interval(), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn escalate_stays_at_max_long_after_the_growth_leaves_duration_range() {
+        // 1 s doubled 64 times is 2^64 s, more than a `Duration` holds.
+        let mut bh = Bulkhead::new(
+            "test",
+            test_config(Duration::from_secs(1), Duration::from_mins(1), 2.0),
+        );
+        for _ in 0..200 {
+            bh.escalate();
+            assert!(bh.min_interval() <= Duration::from_mins(1));
+        }
+        assert_eq!(bh.min_interval(), Duration::from_mins(1));
+        assert_eq!(bh.consecutive_failures(), 200);
+    }
+
+    #[test]
+    fn escalate_with_jitter_stays_within_max_long_after_the_cap() {
+        let config = BulkheadConfig {
+            semaphore: ConcurrencyLimit::Unlimited,
+            backoff: BackoffConfig {
+                initial: Duration::from_millis(500),
+                max: Duration::from_mins(1),
+                multiplier: 2.0,
+                jitter: 0.3,
+            },
+        };
+        let mut bh = Bulkhead::new("test-worker", config);
+        for _ in 0..200 {
+            bh.escalate();
+        }
+        // ±30% of the cap, never above it: [42 s, 60 s].
+        let interval = bh.min_interval();
+        assert!(
+            interval >= Duration::from_secs(42) && interval <= Duration::from_mins(1),
+            "interval {interval:?} should be in [42s, 60s]"
+        );
+    }
+
+    #[test]
+    fn escalate_from_a_zero_initial_stays_at_zero_past_infinite_growth() {
+        // 2.0^1024 is infinite, and zero times infinity is NaN.
+        let mut bh = Bulkhead::new(
+            "test",
+            test_config(Duration::ZERO, Duration::from_mins(1), 2.0),
+        );
+        for _ in 0..1100 {
+            bh.escalate();
+        }
+        assert_eq!(bh.min_interval(), Duration::ZERO);
+    }
+
+    #[test]
+    fn jitter_on_a_cap_of_duration_max_stays_within_it() {
+        // Above 1.0, the jitter factor takes `Duration::MAX` out of range.
+        let config = BulkheadConfig {
+            semaphore: ConcurrencyLimit::Unlimited,
+            backoff: BackoffConfig {
+                initial: Duration::from_secs(1),
+                max: Duration::MAX,
+                multiplier: 2.0,
+                jitter: 0.3,
+            },
+        };
+        let mut bh = Bulkhead::new("test-worker", config);
+        for _ in 0..200 {
+            bh.escalate();
+        }
+        // At the cap: 70% of it at least.
+        assert!(bh.min_interval() >= Duration::MAX.mul_f64(0.7));
+    }
+
+    #[test]
+    fn a_multiplier_below_one_or_not_finite_counts_as_one() {
+        for multiplier in [-2.0, 0.5, f64::NAN, f64::INFINITY] {
+            let mut bh = Bulkhead::new(
+                "test",
+                test_config(Duration::from_secs(1), Duration::from_mins(1), multiplier),
+            );
+            for _ in 0..5 {
+                bh.escalate();
+                assert_eq!(bh.min_interval(), Duration::from_secs(1), "{multiplier}");
+            }
+        }
+    }
+
+    #[test]
+    fn jitter_above_one_counts_as_one() {
+        // A factor in [0.0, 2.0], never negative.
+        let config = BulkheadConfig {
+            semaphore: ConcurrencyLimit::Unlimited,
+            backoff: BackoffConfig {
+                initial: Duration::from_secs(10),
+                max: Duration::from_mins(1),
+                multiplier: 1.0,
+                jitter: 1.5,
+            },
+        };
+        let mut bh = Bulkhead::new("test-worker", config);
+        for _ in 0..50 {
+            bh.escalate();
+            let interval = bh.min_interval();
+            assert!(
+                interval <= Duration::from_secs(20),
+                "interval {interval:?} should be in [0s, 20s]"
+            );
+        }
     }
 
     #[test]

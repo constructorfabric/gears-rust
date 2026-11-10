@@ -82,6 +82,9 @@ pub(crate) async fn read_stored(
         edge_type_patterns: vec![HAS_FACT_TYPE.to_owned()],
         node_type_patterns: Vec::new(),
         max_nodes: Some(MAX_PROFILE_NODES),
+        // Both directions and every relation, as before these existed.
+        direction: None,
+        edge_discriminators: Vec::new(),
     };
     // Without a snapshot, the root and the facts may come from different
     // graph states: a fresh version with stale facts would pass the write's

@@ -1259,11 +1259,13 @@ mod publication_config_tests {
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path().join("home");
         let config_path = dir.path().join("unit.yaml");
+        // Forward slashes: a Windows `C:\Users\...` inside a double-quoted YAML
+        // scalar is read as escape sequences (`\U` is a hex escape).
+        let home_yaml = home.to_string_lossy().replace('\\', "/");
         std::fs::write(
             &config_path,
             format!(
-                "server:\n  home_dir: \"{}\"\ngears:\n  test_gear:\n{local_gear_section}",
-                home.display()
+                "server:\n  home_dir: \"{home_yaml}\"\ngears:\n  test_gear:\n{local_gear_section}"
             ),
         )
         .unwrap();

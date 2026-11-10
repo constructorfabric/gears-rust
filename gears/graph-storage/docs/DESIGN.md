@@ -118,6 +118,7 @@ The gear follows the standard ToolKit gear anatomy: an SDK crate exposing a type
 | [`cpt-cf-graph-storage-adr-embedding-provider`](./ADR/0004-cpt-cf-graph-storage-adr-embedding-provider.md) | Pluggable embedding provider; in-process ONNX default, remote plugin, deterministic fake for CI | `cpt-cf-graph-storage-component-embedding-coordinator`, `cpt-cf-graph-storage-constraint-single-embedding-space` |
 | [`cpt-cf-graph-storage-adr-sqlpgq-access`](./ADR/0005-cpt-cf-graph-storage-adr-sqlpgq-access.md) | **Superseded 2026-10-14**: the gear no longer emits SQL/PGQ | `cpt-cf-graph-storage-component-traversal-service`, `cpt-cf-graph-storage-component-storage-layer` |
 | [`cpt-cf-graph-storage-adr-type-evolution`](./ADR/0006-cpt-cf-graph-storage-adr-type-evolution.md) | A backward-compatible schema change is admitted under the same GTS identifier (types-registry ADR-0003 direction, the gear's own data-backed second ground, a bounded synchronous migration as the third); a byte-identical re-registration converges, an incompatible change is refused naming its location; asking what an edit costs is its own read-only operation | `cpt-cf-graph-storage-component-ontology-registry`, `cpt-cf-graph-storage-fr-type-registration` |
+| [`cpt-cf-graph-storage-adr-types-registry-staging`](./ADR/0007-cpt-cf-graph-storage-adr-types-registry-staging.md) | *Proposed.* Graph types move to the platform types-registry in stages: the base ontology and the permissions are seeded from the inventory now, with no runtime dependency; producer types follow when the registry holds tenant-owned types, and the graph rules when it has validation hooks | `cpt-cf-graph-storage-component-ontology-registry`, `cpt-cf-graph-storage-dbtable-gts-type` |
 
 Two decisions this gear depends on are owned by the `graph-analytics` gear and
 recorded in its ADR set: [how metrics are computed and what determinism they
@@ -499,8 +500,10 @@ is frequently the wrong field to embed.
 **The edge base declares no key, and the node base declares `node_key`.** The
 asymmetry is the rule applied, not an inconsistency: `edge_key` is a hash of
 type, endpoints and discriminator, so the gear derives it from fields already in
-the submission and a producer has nothing to author. It appears on the API
-envelope like any other gear-assigned field. `node_key`, by contrast, is the
+the submission and a producer has nothing to author. An empty discriminator is
+no discriminator: it hashes as an absent one, ingest stores and returns it as
+none, and an empty value in a traversal's `edge_discriminators` is refused. It
+appears on the API envelope like any other gear-assigned field. `node_key`, by contrast, is the
 producer's own name for the thing, and the next section says why the gear cannot
 mint it.
 
@@ -824,14 +827,14 @@ accumulate, so a leaf restating `index` restates all of it.
 ##### Files and verification
 
 The schemas above are kept as registrable files under
-[`schemas/`](../graph-storage/schemas/), with the worked producer types in
-[`graph-storage/schemas/examples/`](../graph-storage/schemas/examples/) under the fictional `acme` vendor.
+[`graph-storage-sdk/schemas/`](../graph-storage-sdk/schemas/), with the worked producer types in
+[`graph-storage-sdk/schemas/examples/`](../graph-storage-sdk/schemas/examples/) under the fictional `acme` vendor.
 This section is the normative narrative; those files are the same content in the
 form the types-registry accepts, so the chain can be validated mechanically
 rather than read for correctness:
 
 ```bash
-gts --path gears/graph-storage/graph-storage/schemas \
+gts --path gears/graph-storage/graph-storage-sdk/schemas \
     validate-type-schema --type-id 'gts.cf.core.graph.node.v1~cf.core.graph.owned_node.v1~'
 ```
 
@@ -862,7 +865,7 @@ GTS identifier parsing and UUIDv5 derivation; draft-07 schema validation across 
 
 ##### Responsibility boundaries
 
-Does not validate instance payloads at query time (ingest does), does not own permission checks (routes do), does not publish the gear's own base types to the platform types-registry. **Status, found while integrating: that publication is not built.** The gear's type catalogue (`gts_type`) is the one ingest validates against, and the gear has no runtime dependency on the registry (`deps = [authz_resolver]`; readiness reports `types_registry` as `not_implemented`), so a producer registers its types with graph-storage only, and deployment has no order beyond authz-resolver.
+Does not validate instance payloads at query time (ingest does), does not own permission checks (routes do), does not publish the gear's own base types to the platform types-registry at runtime: they are submitted to the `toolkit-gts` inventory, which the registry seeds at its own startup (§ Base Ontology Publication). The gear's type catalogue (`gts_type`) is the one ingest validates against and the authority for producer types until the registry holds tenant-owned types; the gear has no runtime dependency on the registry (`deps = [authz_resolver]`; readiness reports `types_registry` as `not_implemented`), so a producer registers its types with graph-storage only, and deployment has no order beyond authz-resolver. ADR-0007 (`cpt-cf-graph-storage-adr-types-registry-staging`) records the interim and the stages.
 
 ##### Related components (by ID)
 
@@ -1113,6 +1116,7 @@ The public surfaces are defined in the PRD as `cpt-cf-graph-storage-interface-re
 | `GET` | `/api/graph-storage/v1/revision` | The tenant's current `(source_epoch, graph_revision)` — the cache-invalidation signal (`fr-revision-signal`) | p1 |
 | `GET` | `/api/graph-storage/v1/nodes/{node_key}` | Node with payload, chunk inventory and bounded adjacency | p1 |
 | `GET` | `/api/graph-storage/v1/nodes` | Tabular projection (OData) | p1 |
+| `GET` | `/api/graph-storage/v1/nodes:count` | How many nodes the projection lists for the same `type_pattern` and `$filter`; exact up to `projection_count_max`, `capped` past it | p1 |
 | `DELETE` | `/api/graph-storage/v1/nodes/{node_key}` | Soft-delete a node and its incident edges | p1 |
 | `GET` | `/api/graph-storage/v1/edges/{edge_key}` | One edge with its payload and audit envelope | p1 |
 | `DELETE` | `/api/graph-storage/v1/edges/{edge_key}` | Soft-delete one edge | p1 |
@@ -1233,6 +1237,7 @@ rejected, so that a document read from the API can be sent back unchanged.
 | `created_at` / `created_by` | yes | yes | first write |
 | `updated_at` / `updated_by` | yes | yes | most recent write |
 | `deleted_at` / `deleted_by` | yes | yes | soft delete; absent on live elements |
+| `version` | yes | absent | the node's stored version, the target of `expected_version` on ingest |
 | `graph_revision` | yes | yes | the revision the read observed |
 
 `created_by`, `updated_by` and `deleted_by` are **subjects**, not users:
@@ -1258,8 +1263,12 @@ element: `GET /edges/{edge_key}`, above. Without it the edge columns were
 written by every ingest path and read by nothing, so a path that forgot one
 would have broken no test — a requirement nothing can observe is a requirement
 nothing checks. Topology references stay what they are: `EdgeRef` in a
-traversal and `AdjacencyEntry` in a node read carry a key, a type and two
-endpoints, and the key is the one the edge read accepts.
+traversal and `AdjacencyEntry` in a node read carry a key, a type, two
+endpoints and the discriminator, and the key is the one the edge read
+accepts. The discriminator is on the reference because the key is opaque: a
+consumer that stores several relations under one edge type (one verb, told
+apart by discriminator) otherwise learns which relation an edge is only by
+reading every edge.
 
 **A search hit is a reference too, by the same rule.** `SearchHit` carries a
 key, a type, a name, the fused score and each arm's rank — what a ranking is
@@ -1543,6 +1552,7 @@ pub struct ExpandRequest {
     pub frontier: Vec<NodeId>,
     pub direction: Direction,          // explicit; there is no "undirected" shorthand
     pub edge_types: Option<TypeIdSet>, // per-hop restriction
+    pub discriminators: Option<Vec<String>>, // per-hop restriction; never matches NULL
     pub labels: Option<LabelFilter>,   // per-hop restriction
     pub budget: HopBudget,             // frontier cap and edges scanned
     pub with_degrees: bool,            // fill `degrees` below; costs a second scoped read
@@ -1952,12 +1962,16 @@ depends on.**
 
 **ID**: `cpt-cf-graph-storage-dbtable-gts-type`
 
-Per-tenant projection of the platform types-registry. It exists for two reasons,
-both measurable: interning, so every node and edge row carries a 4-byte reference
+The gear's per-tenant type catalogue. It exists for two reasons, both
+measurable: interning, so every node and edge row carries a 4-byte reference
 instead of a 16-byte UUID or a GTS identifier of up to 1024 characters; and the
 chain-resolved schema and traits, so a 10,000-item batch validates without a
-types-registry round trip per item. The registry stays authoritative — this table
-is a cache with a foreign identity, never a second source of truth.
+registry round trip per item. **Today it is the authority for producer types**:
+ingest validates against it and producers register with the gear only, because
+types-registry holds global entities alone until its P1. The target is the
+reverse — the registry authoritative and this table its projection — reached in
+the stages of ADR-0007 (`cpt-cf-graph-storage-adr-types-registry-staging`). The base ontology rows are byte-identical to the
+schemas the registry seeds from the gear's inventory.
 
 | Column | Type | Description |
 |--------|------|-------------|
@@ -2268,6 +2282,8 @@ The key is optional on the wire and the gear does not supply one. An ingest with
 **3. Scope replacement serialization (write skew on sets).** Two concurrent replacements of one scope each read the same snapshot, each deletes rows absent from its own batch, and both commit — producing a union state neither producer submitted. Therefore: a scope has a canonical identity `(tenant, owning producer, scope attribute, scope value)` registered in the scope registry; every replacement takes an exclusive transaction-scoped lock on that identity (locked registry row) held through commit. Ordinary ingests writing into an owned scope were meant to take the same lock in shared mode; they cannot, because the secure ORM offers no row lock, so the protection they need is provided a different way. **A replacement's removals re-check membership at the moment of removal.** Membership is asked as containment, `payload @> {attribute: value}`, which the payload GIN index serves; the path extraction it replaced had no index, and every replacement read the tenant's managed nodes. A replacement reads the scope's members and removes the ones its batch no longer names; an ordinary ingest can move a member out of the scope between that read and the removal, and removing by id alone then deleted a node the ingest had just reported writing — an outcome no serial order produces. So the node removal carries the membership predicate in the statement itself, and PostgreSQL re-evaluates it on the row as the ingest left it, after waiting for its lock: a node that has left the scope stays. Its static edges have already gone by then, removed first because the foreign key requires it, and a surviving node without them is exactly the replace-then-ingest outcome, so the pair still lands in a state a serial order reaches. **The residual, stated rather than implied:** an ordinary ingest that creates a *new* edge to a node a concurrent replacement is removing can lose that edge, or see the replacement refused by the foreign key. Closing it needs a row lock or `UPDATE … RETURNING` from the platform's database layer, neither of which it offers today.
 
 **4. Source ordering (fencing).** Lock order is arrival order, not source order: a stalled generation 10 can acquire the lock after generation 11 committed and overwrite fresh state with stale state, legally. Therefore: every replacement snapshot carries a monotonic source generation; the scope registry stores the highest accepted generation, compared-and-updated atomically under the scope lock. Older generations are rejected with a stale-generation error; an equal generation with an identical request hash replays the recorded outcome; an equal generation with different content is a conflict.
+
+**5. Overlapping batches (lock order).** Two batches that upsert overlapping keys take row locks on the same `node` and `edge` rows, and in request order they take them in different orders and deadlock; on the Studio stand most such batches were killed as `40P01` (gears-rust #5042). Therefore: a batch writes its nodes and the edge endpoints it names but does not carry in one key order — nodes and phantoms together, since they share one key space — then its edges in edge-key order, and bumps the revision last, so every batch takes the locks it shares with another in the same order. Two batches inserting the same new node key, or declaring the same new edge, converge instead of colliding: the second waits for the first (`ON CONFLICT DO NOTHING`), reads its row and writes over it as an update — for an edge, through the same ownership check an existing edge gets — exactly as if the two had run one after the other; an `expected_version: 0` claim on a node is the one that loses. The per-item report stays in request order. A batch can still wait behind another's locks; it is no longer aborted by them.
 
 Conflict and stale-generation rejections are canonical problem types distinct from validation errors and from resource exhaustion, so producers can implement the correct reaction (re-read and rebase, drop the stale run, or back off) mechanically.
 
@@ -2742,7 +2758,7 @@ log instead.
 | Database, migrations | `Unhealthy` — unreachable or migrations unapplied | Everything; gear not ready, no traffic admitted | None | Connectivity restored and migrations applied; probe re-runs on an interval and flips to `Healthy` without restart |
 | AuthZ resolver | `Degraded` — elevated latency | Nothing; requests consume more of their deadline | All | Automatic when latency returns below threshold |
 | AuthZ resolver | `Unhealthy` — unreachable | Every authenticated data path fails closed, `unavailable` / `DEPENDENCY_UNAVAILABLE`; gear not ready | Unauthenticated health/readiness endpoints only | Automatic on reconnect; no local state to rebuild |
-| Types registry | `Unhealthy` — unreachable | Type registration and any request needing an unresolved type, `unavailable` / `DEPENDENCY_UNAVAILABLE`; gear not ready | — | Automatic on reconnect; the local type cache is re-validated before flipping to `Healthy` |
+| Types registry | `Unhealthy` — unreachable (from ADR-0007 stage 2) | Registration of new types, `unavailable` / `DEPENDENCY_UNAVAILABLE`; ingest against known types continues from the projection | — | Automatic on reconnect; the projection is re-validated before flipping to `Healthy` |
 | Embedding provider | `Degraded` — provider unavailable | Requests with `embed=true`, `unavailable` / `DEPENDENCY_UNAVAILABLE`; vector arms of search omitted with the response saying so | Ingest with `embed=false`, lexical search, traversal, projections, reads | Automatic on provider recovery; vectors missed while degraded are stale by input hash and re-embedded by the normal path |
 | Embedding-space identity | `Unhealthy` — active identity ≠ stored identity | Vector and hybrid search, `failed_precondition` / `EMBEDDING_SPACE_MISMATCH` | Lexical search, ingest, traversal, projections, reads — the gear stays ready | Operator runs the re-embedding lifecycle (ADR-0004) to `cutover`; identity match restores the capability automatically at cutover |
 | Graph-engine plugin | `Degraded` — stale projection or unprovable cursor | Capabilities unique to the plugin, `unimplemented` / `CAPABILITY_UNSUPPORTED` | Everything routable to the built-in PostgreSQL engine | Plugin acknowledges a rebuild from the current `(source_epoch, graph_revision)`; the gear re-activates it through the activation gate |
@@ -2867,6 +2883,7 @@ Every bound the gear enforces is a named configuration key with a safe default a
 | Traversal edges scanned | `traversal_max_edges_scanned` | 100,000 | 1 – 10,000,000 | Engine, **per hop** (see below) |
 | Search arm limit | `search_max_arm_limit` | 50 | 1 – 500 | Admission |
 | Projection page size | `projection_max_page` | 200 | 1 – 1,000 | Admission |
+| Rows a listing count counts exactly | `projection_count_max` | 10,000 | 1 – 1,000,000 | Store; past it the count is the ceiling with `capped` |
 | Interactive statement deadline | `deadline_interactive` | 10 s | 1 – 60 s | DB `statement_timeout` + cancellation token |
 | Per-tenant concurrent ingest batches | `tenant_max_ingest` | 4 | 1 – 64 | Admission |
 | Per-tenant concurrent queries | `tenant_max_queries` | 32 | 1 – 1,024 | Admission |
@@ -3017,11 +3034,23 @@ scan.
 
 ### Base Ontology Publication
 
-At startup the gear registers the base ontology defined in § 3.1 (Base Ontology
-GTS Schemas) — the three abstract bases and the six family types — and its
-permission instances with the platform types-registry through the standard
-inventory mechanism, so producers can derive types and administrators can grant
-permissions before any runtime registration happens. Registration is idempotent
+The SDK submits the base ontology defined in § 3.1 (Base Ontology GTS
+Schemas) — the three abstract bases and the six family types — and the schema
+of the type catalogue's authorization resource (`gts.cf.core.graph.type.v1~`,
+which is not part of the ontology) to the `toolkit-gts` inventory
+(`graph_storage_sdk::gts`), as the other gears publish their type schemas: the
+ontology is the public contract producers derive from, and a process that links
+only the SDK publishes it too. The gear submits its permission instances (one
+`AuthzPermissionV1` per resource and action the PEP checks: node read, write
+and delete; type read and admin; `src/gts.rs`). Every permission's resource
+type is therefore in the registry, which the policy-engine requires of a policy
+naming it without a wildcard. types-registry seeds the inventory at its own startup,
+so producers can derive types and administrators can grant permissions before
+any runtime registration happens, and the gear makes no call to the registry.
+The submitted schemas are the same embedded documents the gear validates
+against; `tests/types_registry.rs` seeds the real registry with them and reads
+them back byte-identical, because one entry the registry refused would stop its
+startup and the platform's. Registration is idempotent
 for byte-identical schemas; a schema change to a base type is a new GTS version,
 never an in-place edit, because producer types are already derived from the
 existing one.

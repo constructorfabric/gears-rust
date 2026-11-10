@@ -383,6 +383,7 @@ pub(crate) fn read_failure(err: DomainError) -> DomainError {
         | DomainError::NoSuchReviewRequest(_)
         | DomainError::ReviewConflict(_)
         | DomainError::InvalidValue { .. }
+        | DomainError::FactHeld(_)
         | DomainError::NotStored(_)
         | DomainError::InvalidQuery(_)
         | DomainError::Internal(_)

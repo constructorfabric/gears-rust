@@ -1,5 +1,6 @@
 use crate::api::rest::types::{
-    ConcreteIntake, ConcreteProfile, ConcreteReviewQueue, ConcreteSettings, ConcreteSubjectControl,
+    ConcreteAdminFacts, ConcreteIntake, ConcreteProfile, ConcreteReviewQueue, ConcreteSettings,
+    ConcreteSubjectControl,
 };
 use crate::api::rest::{dto, handlers};
 use crate::domain::planner::manage::ManageFacts;
@@ -23,6 +24,9 @@ const SUBJECT_REVIEWS_PATH: &str = "/construct/v1/subjects/{subject_id}/review-r
 const OPEN_REVIEWS_PATH: &str = "/construct/v1/admin/review-requests";
 const RESOLUTION_PATH: &str = "/construct/v1/admin/review-requests/{request_id}/resolution";
 const REVIEW_TAG: &str = "Review requests";
+const ADMIN_FACTS_PATH: &str = "/construct/v1/admin/subjects/{subject_id}/facts";
+const ADMIN_FACT_PATH: &str = "/construct/v1/admin/subjects/{subject_id}/facts/{fact_id}";
+const ADMIN_FACTS_TAG: &str = "Administrator facts";
 
 struct License;
 
@@ -436,6 +440,160 @@ pub fn register_review_queue_routes(
         )
         .register(ops, openapi);
     // @cpt-end:cpt-cf-construct-flow-review-queue-resolve:p1:inst-resolve-send
+
+    router.merge(not_stored(ops)).layer(Extension(svc))
+}
+
+/// The administrator's routes on a subject's facts: read, add, edit and
+/// delete, each under the permission to administer a subject's facts in the
+/// caller's tenant.
+///
+/// @cpt-dod:cpt-cf-construct-dod-admin-facts-read:p2
+/// @cpt-dod:cpt-cf-construct-dod-admin-facts-change:p2
+/// @cpt-dod:cpt-cf-construct-dod-admin-facts-delete:p2
+pub fn register_admin_facts_routes(
+    router: Router,
+    openapi: &dyn OpenApiRegistry,
+    svc: Arc<ConcreteAdminFacts>,
+) -> Router {
+    // @cpt-begin:cpt-cf-construct-flow-admin-facts-read:p2:inst-read-send
+    let mut ops = OperationBuilder::get(ADMIN_FACTS_PATH)
+        .operation_id("construct.admin_list_subject_facts")
+        .summary("A subject's facts, for a tenant administrator")
+        .description(
+            "Every live fact of a subject in the caller's tenant, in every category, with \
+             who it came from and its latest review request. Needs the permission to \
+             administer a subject's facts; without it, 403. A subject of another tenant, or \
+             without a profile, has no facts. Paged and filtered as the subject's own facts \
+             list: `limit` (default 50, at most 200), `cursor`, and `$filter` and `$orderby` \
+             over `fact_id`, `entity_kind`, `origin` and `stored_at`.",
+        )
+        .tag(ADMIN_FACTS_TAG)
+        .authenticated()
+        .require_license_features::<License>([])
+        .path_param("subject_id", "The subject")
+        .query_param_typed("limit", false, "Page size, at most 200", "integer")
+        .query_param("cursor", false, "Cursor of the next page")
+        .with_odata_filter::<crate::domain::subject_control::SubjectFactField>()
+        .with_odata_orderby::<crate::domain::subject_control::SubjectFactField>()
+        .handler(handlers::admin_list_facts)
+        .json_response_with_schema::<dto::SubjectFactsPageDto>(
+            openapi,
+            StatusCode::OK,
+            "A page of the subject's facts",
+        )
+        .standard_errors(openapi)
+        .error_503(openapi)
+        .problem_response(
+            openapi,
+            StatusCode::NOT_IMPLEMENTED,
+            "The deployment does not provide subject control",
+        )
+        .register(Router::new(), openapi);
+    // @cpt-end:cpt-cf-construct-flow-admin-facts-read:p2:inst-read-send
+
+    // @cpt-begin:cpt-cf-construct-flow-admin-facts-add:p2:inst-add-send
+    ops = OperationBuilder::post(ADMIN_FACTS_PATH)
+        .operation_id("construct.admin_add_subject_fact")
+        .summary("Add a fact to a subject's profile")
+        .description(
+            "Adds one fact, a `property` of the person types and its `value`, with the \
+             administrator as origin; a subject without a profile gets \
+             one. The value passes the sensitive-data checks and Admission; when they refuse \
+             it, or personalization is off for the subject, 422 names the reason and nothing \
+             is stored. A value the subject holds already, or a second value of a one-valued \
+             property, is 409 naming the fact that holds it. Needs the permission to \
+             administer a subject's facts; without it, 403.",
+        )
+        .tag(ADMIN_FACTS_TAG)
+        .authenticated()
+        .require_license_features::<License>([])
+        .path_param("subject_id", "The subject")
+        .json_request::<dto::AdminFactRequest>(openapi, "The property and its value")
+        .handler(handlers::admin_add_fact)
+        .json_response_with_schema::<dto::StoredFactDto>(
+            openapi,
+            StatusCode::CREATED,
+            "The fact as stored",
+        )
+        .standard_errors(openapi)
+        .error_422(openapi)
+        .error_503(openapi)
+        .problem_response(
+            openapi,
+            StatusCode::NOT_IMPLEMENTED,
+            "The deployment does not store values set by hand",
+        )
+        .register(ops, openapi);
+    // @cpt-end:cpt-cf-construct-flow-admin-facts-add:p2:inst-add-send
+
+    // @cpt-begin:cpt-cf-construct-flow-admin-facts-edit:p2:inst-edit-send
+    ops = OperationBuilder::put(ADMIN_FACT_PATH)
+        .operation_id("construct.admin_edit_subject_fact")
+        .summary("Edit a subject's fact")
+        .description(
+            "Stores a new value for the fact's own property in place of the fact, with the \
+             administrator as origin; the fact gets a new id. An open review request on the \
+             fact closes as corrected; while a reviewer resolves it, 409. When the edit was \
+             stored but the request did not close, 409 with reason `WRITTEN_NOT_CLOSED`: the \
+             fact has its new id already, so the edit is not sent again. The value passes \
+             the sensitive-data checks and Admission; when they refuse it, 422 names the \
+             reason, nothing is stored and a review request stays open. A fact the subject \
+             does not have answers 404. Needs the permission to administer a subject's \
+             facts; without it, 403.",
+        )
+        .tag(ADMIN_FACTS_TAG)
+        .authenticated()
+        .require_license_features::<License>([])
+        .path_param("subject_id", "The subject")
+        .path_param("fact_id", "The fact's id, as the facts list gives it")
+        .json_request::<dto::AdminFactRequest>(openapi, "The fact's property and its new value")
+        .handler(handlers::admin_edit_fact)
+        .json_response_with_schema::<dto::StoredFactDto>(
+            openapi,
+            StatusCode::OK,
+            "The fact as stored, under its new id",
+        )
+        .standard_errors(openapi)
+        .error_422(openapi)
+        .error_503(openapi)
+        .problem_response(
+            openapi,
+            StatusCode::NOT_IMPLEMENTED,
+            "The deployment does not store values set by hand",
+        )
+        .register(ops, openapi);
+    // @cpt-end:cpt-cf-construct-flow-admin-facts-edit:p2:inst-edit-send
+
+    // @cpt-begin:cpt-cf-construct-flow-admin-facts-delete:p2:inst-delete-send
+    ops = OperationBuilder::delete(ADMIN_FACT_PATH)
+        .operation_id("construct.admin_delete_subject_fact")
+        .summary("Delete a subject's fact")
+        .description(
+            "Soft-deletes one live fact as the subject's delete does, with the administrator \
+             as origin; an open review request on it closes as deleted, and while a reviewer \
+             resolves it, 409. A fact the subject does not have answers 404. 503 when the \
+             profile kept changing, or when the fact was deleted but its review request \
+             could not be closed; sending the delete again then closes it. Works while \
+             personalization is off. Needs the permission to administer a subject's facts; \
+             without it, 403.",
+        )
+        .tag(ADMIN_FACTS_TAG)
+        .authenticated()
+        .require_license_features::<License>([])
+        .path_param("subject_id", "The subject")
+        .path_param("fact_id", "The fact's id, as the facts list gives it")
+        .handler(handlers::admin_delete_fact)
+        .no_content_response(StatusCode::NO_CONTENT, "The fact is deleted")
+        .standard_errors(openapi)
+        .error_503(openapi)
+        .problem_response(
+            openapi,
+            StatusCode::NOT_IMPLEMENTED,
+            "The deployment does not provide subject control",
+        )
+        .register(ops, openapi);
+    // @cpt-end:cpt-cf-construct-flow-admin-facts-delete:p2:inst-delete-send
 
     router.merge(not_stored(ops)).layer(Extension(svc))
 }

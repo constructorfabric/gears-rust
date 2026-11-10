@@ -14,9 +14,10 @@ use uuid::Uuid;
 
 use crate::api::rest::routes::register_review_queue_routes;
 use crate::domain::admission::{Admission, AdmissionPorts};
+use crate::domain::one_step::OneStepPath;
 use crate::domain::planner::catalog::PropertyCatalog;
 use crate::domain::profile::Category;
-use crate::domain::review_queue::{CLAIM_HOLD, Corrections, ReviewQueueService};
+use crate::domain::review_queue::{CLAIM_HOLD, ReviewQueueService};
 use crate::domain::sensitive_data::SensitiveDataChecks;
 use crate::domain::subject_settings::SubjectSettings;
 use crate::test_support::{
@@ -66,7 +67,7 @@ impl Tenant {
             Some(Uuid::new_v4()),
         );
         let drops = Arc::new(RecordingEvents::default());
-        let corrections = Corrections {
+        let one_step = Arc::new(OneStepPath {
             checks: SensitiveDataChecks::new(Vec::new(), Arc::clone(&drops) as _),
             admission: Admission::new(AdmissionPorts {
                 settings: Arc::new(FixedSubjectSettings(Ok(settings))),
@@ -75,12 +76,12 @@ impl Tenant {
                 drops,
             }),
             catalog: Arc::new(PropertyCatalog::load().unwrap()),
-        };
+        });
         let service = ReviewQueueService::new(
             Arc::new(writes),
             Arc::clone(&self.reviews) as _,
             Arc::default() as Arc<crate::test_support::RecordingReviewEvents>,
-            Some(corrections),
+            Some(one_step),
             PolicyEnforcer::new(resolver),
         );
         register_review_queue_routes(
