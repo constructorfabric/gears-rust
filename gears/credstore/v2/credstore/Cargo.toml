@@ -18,30 +18,52 @@ workspace = true
 [dependencies]
 # Aliased so the v2 sources keep `use credstore_sdk::…` while depending on the v2 SDK package (the v1 `credstore-sdk` is a separate crate).
 credstore-sdk = { package = "cf-gears-credstore-v2-sdk", version = "0.1.0", path = "../credstore-sdk" }
+# Audit events for secret reads and writes (`cpt-cf-credstore-nfr-audit`).
+# Resolved lazily from the ClientHub; the broker is never a hard init dependency.
+event-broker-sdk = { workspace = true }
 toolkit = { workspace = true }
 toolkit-macros = { workspace = true }
 toolkit-security = { workspace = true }
 toolkit-db = { workspace = true }
+toolkit-canonical-errors = { workspace = true }
 toolkit-odata = { workspace = true }
 authz-resolver-sdk = { workspace = true, features = ["rest-client"] }
+tenant-resolver-sdk = { workspace = true }
 types-registry-sdk = { workspace = true }
-sea-orm = { workspace = true }
-sea-orm-migration = { workspace = true }
+
 async-trait = { workspace = true }
 # Bounded-concurrency value reads in a list selecting `secret` (DESIGN §4.6):
 # `stream::iter(...).buffer_unordered(SECRET_READ_CONCURRENCY)`.
 futures = { workspace = true }
+sea-orm = { workspace = true }
+sea-orm-migration = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
 jsonschema = { workspace = true }
 tokio = { workspace = true }
-thiserror = { workspace = true }
-time = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+time = { workspace = true }
+opentelemetry = { workspace = true, features = ["metrics"] }
+# Link-time GTS permission catalog (`src/gts/permissions.rs`): declares
+# AuthzPermissionV1 instances into the toolkit-gts inventory that
+# types-registry aggregates at boot.
+toolkit-gts = { workspace = true }
+# Required by the `gts_type_schema` expansion (audit event type declaration).
+schemars = { workspace = true }
+# Direct dep needed because `gts_instance!` expansions reference `::gts::*`
+# paths (the compile-time `<S as GtsSchema>::SCHEMA_ID` prefix asserts).
+# Without this the proc-macro emits `::gts::…` identifiers that cannot be
+# resolved.
+gts = { workspace = true }
+inventory = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["rt", "macros"] }
 toolkit-db = { workspace = true, features = ["sqlite"] }
+tokio = { workspace = true, features = ["rt", "macros", "test-util"] }
+types-registry-sdk = { workspace = true, features = ["test-util"] }
 # The PostgreSQL migration suite behind `integration`: a real PostgreSQL in a
 # container, since what SQLite accepts PostgreSQL may refuse.
 testcontainers = { workspace = true }
@@ -49,8 +71,14 @@ testcontainers-modules = { workspace = true }
 test-containers = { workspace = true }
 
 [features]
+test-support = ["dep:opentelemetry_sdk"]
 # `tests/pg_migrations_test.rs`: `m0002_value_versions` on a real PostgreSQL via
 # testcontainers, Docker required (`make test-integration LANE=credstore-pg`).
 # Brings the PostgreSQL driver in for that lane only; the lib leaves the backend
 # to the server that hosts it.
 integration = ["toolkit-db/pg"]
+
+[dependencies.opentelemetry_sdk]
+workspace = true
+features = ["metrics", "testing"]
+optional = true
