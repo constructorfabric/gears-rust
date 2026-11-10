@@ -22,9 +22,18 @@ toolkit = { workspace = true }
 toolkit-macros = { workspace = true }
 toolkit-security = { workspace = true }
 toolkit-db = { workspace = true }
+toolkit-odata = { workspace = true }
+authz-resolver-sdk = { workspace = true, features = ["rest-client"] }
+types-registry-sdk = { workspace = true }
 sea-orm = { workspace = true }
 sea-orm-migration = { workspace = true }
 async-trait = { workspace = true }
+# Bounded-concurrency value reads in a list selecting `secret` (DESIGN §4.6):
+# `stream::iter(...).buffer_unordered(SECRET_READ_CONCURRENCY)`.
+futures = { workspace = true }
+serde_json = { workspace = true }
+jsonschema = { workspace = true }
+tokio = { workspace = true }
 thiserror = { workspace = true }
 time = { workspace = true }
 tracing = { workspace = true }
