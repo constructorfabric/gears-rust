@@ -20,13 +20,14 @@ Vision · PR #5729 · `docs/arch/tooling/VISION.md`
 
 ## The problem, in one sentence
 
-> A team creates a Gears repository by **copying `gears-rust`**,
-> and nothing afterwards reports that the copy went **stale or wrong**.
+> Nothing states **how a Gears repository starts** and how the conventions reach it,
+> and nothing afterwards reports **what arrived, what did not, or what went stale**.
 
-Both halves hurt, and the second one outlives the first.
+Each team invents a route, so each arrives at a different subset.
 
-- Copying is expensive **once**.
-- Having no signal is expensive **forever**.
+- Copy everything, and it **ages**.
+- Assemble your own, and you get a **silent fraction**.
+- Either way, **nobody is told** — that half outlives the first.
 
 ---
 
@@ -34,7 +35,7 @@ Both halves hurt, and the second one outlives the first.
 
 | | Name | You cannot… |
 |---|---|---|
-| **P1** | Bootstrap | create a correct repository — only copy one |
+| **P1** | Bootstrap | create a correct repository — only assemble one and hope |
 | **P2** | CI reproduction | reproduce CI |
 | **P3** | SDLC reproduction | reproduce the SDLC pipeline |
 | **P4** | Staying current | stay current |
@@ -186,7 +187,7 @@ A repository on 1.2 while upstream ships 1.3 is **conformant, not drifting**.
 
 Success is visible in **what stops happening**.
 
-- Nobody assembles a repository by reading `gears-rust` and copying from it.
+- Nobody starts a repository by guessing which parts of `gears-rust` to carry across.
 - Drift is found by a check on a pull request, not by an incident.
 - A developer learns what a gear is missing **before** pushing, not in review.
 - An upgrade lands in a week when nobody touched the repository.

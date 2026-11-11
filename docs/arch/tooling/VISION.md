@@ -9,8 +9,9 @@
 
 ## At a glance
 
-**The problem.** A team creates a Gears repository by copying `gears-rust`, and nothing afterwards
-reports that the copy went stale or wrong.
+**The problem.** Nothing states how to start a Gears repository and carry the conventions into it.
+Each team invents a route, so what arrives is a partial, undeclared subset — and nothing afterwards
+reports what came, what did not, or what has since gone stale.
 
 **The answer.** One tool sets a repository up, checks that it still matches the conventions the
 project chose, and carries those conventions forward. The conventions are referenced by version, not
@@ -101,9 +102,14 @@ could change under a project would fail that project for a decision it never saw
 
 ## 2. Problems
 
-These are the nine problems that this vision answers. They describe the state on the date above. A
-team creates a Gears repository by copying `gears-rust`, and nothing afterwards reports that the
-copy went stale or wrong. Everything else follows from those two facts.
+These are the nine problems that this vision answers. They describe the state on the date above.
+Two facts produce the rest. Nothing states how a Gears repository starts and how the conventions
+reach it, so each team invents a route and arrives at a different subset. And nothing afterwards
+reports which conventions a repository took, which it skipped, or what has gone stale since.
+
+Copying is one of those routes, not the problem itself. A team that copies gets everything and
+watches it age. A team that assembles its own gets a silent fraction, and the absences are as
+unreported as the staleness.
 
 P1 to P6 belong to the person who owns a repository. P7 to P9 belong to the people who work in one
 every day. Those people are the developer of a gear and the developer of an application that uses
@@ -112,12 +118,12 @@ Section 3 then shows how far each problem is covered today.
 
 | # | You cannot… | What is missing | Evidence |
 |---|---|---|---|
-| **P1** · Bootstrap | create a correct repository — only copy one | `cargo gears new` makes an application workspace. Nothing makes the make driver, CI, lint configuration, documentation layout or SDLC setup | The conventions are written down in no single place. They live in a working repository, and you cannot apply a working repository to a different one |
+| **P1** · Bootstrap | create a correct repository — only assemble one and hope | `cargo gears new` makes an application workspace. Nothing makes the make driver, CI, lint configuration, documentation layout or SDLC setup | The conventions are written down in no single place. They live in a working repository, and a repository is not something you can apply to another one — so each author carries across whatever they noticed |
 | **P2** · CI reproduction | reproduce CI | The checks that make Gears code reviewable have no portable form: `dylint` via `cargo gears lint` with a per-project skip list, `cargo-deny` in two configurations, clippy with `cargo-hack` passes, `shear` on a pinned nightly, `nextest` with JUnit enrichment, FIPS and database suites, GTS and API-contract checks | They live across `gears.mk`, `gears-rust.mk`, `Gears.toml` and 30 workflow files, together with every pinned tool version and action SHA. A new project rebuilds all of it, or runs weaker checks and learns later |
 | **P3** · SDLC reproduction | reproduce the SDLC pipeline | `cfs` reproduces the document-first order well — PRD, DESIGN, ADR, DECOMPOSITION, FEATURE, then code with `cpt-*` markers, then design-led review. But that pipeline is one half of a repository | The build, CI and lint configuration are the other half, and nothing carries the two together. A team assembles them separately and must know how they fit first. Agent files `cfs` does not own drift with no signal |
 | **P4** · Staying current | stay current | For almost every part the upgrade path is a person who notices a change in `gears-rust` and copies the files again | `gears.mk` gains targets, lint rules change, pinned tool and action versions move, templates are revised. Projects fall behind with no signal |
 | **P5** · Conformance signal | tell whether a repository is still correct | Nothing reports a repository that moved away: an edited managed file, a deleted workflow, a gear in the wrong place, a missing tool. It still builds, and a reviewer sees one change rather than the whole shape | `artifacts.toml` holds 37 `[[ignore]]` blocks, 13 of them recording that a module has no PRD or DESIGN — conformance debt kept as suppressions. The `toolkit-pr-review` prompt exists five times, once per vendor, and four copies no longer match. `cfs` stopped with an unclear error on an uninitialised `guidelines/DNA`, which is why PR #5326 adds `ensure-dna.py` |
-| **P6** · All or nothing | take only part of the conventions | Adoption means copying `gears-rust`, which gives everything. No list of conventions, no name for any one, no way to state which a project follows | An application project needs neither the gear document pipeline nor descriptor coverage; a single-gear project needs neither FIPS nor database suites. Each selects a subset by hand and records nothing. This also blocks P5: you cannot check against a standard never stated |
+| **P6** · All or nothing | take only part of the conventions | Adoption has no declared unit. Copying gives everything; assembling by hand gives whatever the author happened to carry across. No list of conventions, no name for any one, no way to state which a project follows | An application project needs neither the gear document pipeline nor descriptor coverage; a single-gear project needs neither FIPS nor database suites. Each selects a subset by hand and records nothing. This also blocks P5: you cannot check against a standard never stated |
 | **P7** · Gear completeness | state the complete set of parts a gear needs | A gear needs its five documents, the layered crate, the SDK crate, a `gear.gdl` descriptor, two workspace member entries, an alias in `[workspace.dependencies]`, registration in `artifacts.toml`, and publish settings for release-plz. No document holds that list | A developer learns it by reading another gear and copying what that one happens to have. Hence 13 of the `[[ignore]]` blocks, and four example gears with no descriptor. This is the developer's half of P5: nobody states what "complete" means, so intent is not enough |
 | **P8** · Version alignment | know which gear versions work together | Inside this repository `[workspace.dependencies]` aligns 256 entries. An application outside receives no such file and picks each version alone | Resolution is not the gap. Gearbox resolves gear versions from `path`, `git` and `registry` sources, and for a registry it lets cargo do the work, so ranges, authentication, mirrors and offline mode come from cargo. The gap is that **no set of versions known to work together is published**. `product.lock` pins the resolved set of one product; it is not a shared list. Maven has a BOM and Spring publishes one; Rust has neither the mechanism nor the list |
 | **P9** · Portability | leave `gears-rust` and keep any of it | The conventions, kit, rules and documents are written from inside this repository | The kit's facades pointed at this repository's Makefile targets and paths, which is why PR #5326 adds `cf-gears-init` to discover what another project has. An outside repository starts with `cargo gears new` and stops: no make driver, no CI, no statement of which rules apply |
@@ -632,7 +638,7 @@ signal is where to look, not a target to hit.
 
 | Outcome | Where it shows |
 |---|---|
-| Nobody assembles a repository by reading `gears-rust` and copying from it | New repositories start from a declared selection rather than a copied tree, and the first commit is not a dump of configuration |
+| Nobody starts a repository by guessing which parts of `gears-rust` to carry across | New repositories start from a declared selection rather than a copied tree, and the first commit is not a dump of configuration |
 | A maintainer learns about drift from a report, not an incident | Drift is found by a check on a pull request rather than by a build that broke for an unrelated reason |
 | A developer learns what a gear is missing before pushing | The check runs locally as a habit, not only in CI — if it only ever runs in CI, the value arrived too late |
 | An upgrade lands in a week when nobody touched the repository | Repositories do not sit on pins that upstream moved past long ago, and the update pull request is a small diff rather than an afternoon |
@@ -643,8 +649,9 @@ None of that is the same as a healthy repository, and the tool should never clai
 makes the state of a repository **legible** — what it follows, how far it has drifted, what it was
 never told to care about. Teams still decide and still do the work.
 
-Two outcomes would be failure even if every feature shipped. If teams keep copying `gears-rust` by
-hand while the tool exists, it did not solve its problem. And if a green check comes to mean
+Two outcomes would be failure even if every feature shipped. If teams keep assembling repositories
+by hand while the tool exists — copying some parts, inventing others — it did not solve its
+problem. And if a green check comes to mean
 "nothing ran", it is worse than what came before, because it replaces a known absence with a false
 assurance. The measurable form of these belongs in the requirements, not here.
 
