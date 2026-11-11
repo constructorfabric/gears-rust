@@ -73,19 +73,20 @@ OPENAPI_CONFIG ?= config/e2e-local.yaml
 # Gears that keep their data in graph storage need PostgreSQL 16+ with pgvector to start.
 # `make openapi GEAR=<one of them>` runs a throwaway pgvector container on a free local port
 # and points the `pg_graph` server of OPENAPI_CONFIG at it, so no config edit is needed.
+# An EXIT trap removes the container however the recipe ends, including Ctrl-C under dash.
 OPENAPI_PG_GEARS ?= graph-storage construct
 OPENAPI_PG_IMAGE ?= pgvector/pgvector:0.8.7-pg18
 OPENAPI_GEAR_NEEDS_PG := $(filter $(GEAR),$(OPENAPI_PG_GEARS))
 OPENAPI_PG_UP = command -v docker >/dev/null || { echo "docker is required: GEAR=$(GEAR) needs PostgreSQL with pgvector"; exit 1; }; \
 	PG_CID=$$(docker run -d --rm -e POSTGRES_PASSWORD=graph -e POSTGRES_DB=graph_storage -p 127.0.0.1::5432 $(OPENAPI_PG_IMAGE)) && \
+	trap 'docker rm -f "$$PG_CID" >/dev/null 2>&1' EXIT && trap 'exit 130' INT TERM && \
 	echo "Started $(OPENAPI_PG_IMAGE) for GEAR=$(GEAR)" && \
 	for i in $$(seq 1 60); do \
 		[ "$$(docker logs $$PG_CID 2>&1 | grep -c 'ready to accept connections')" -ge 2 ] && break; \
 		sleep 1; \
 	done && \
-	[ "$$(docker logs $$PG_CID 2>&1 | grep -c 'ready to accept connections')" -ge 2 ] || { echo "PostgreSQL did not become ready"; docker rm -f $$PG_CID >/dev/null 2>&1; exit 1; }; \
+	[ "$$(docker logs $$PG_CID 2>&1 | grep -c 'ready to accept connections')" -ge 2 ] || { echo "PostgreSQL did not become ready"; exit 1; }; \
 	export APP__DATABASE__SERVERS__PG_GRAPH__PORT=$$(docker port $$PG_CID 5432/tcp | head -n1 | sed 's/.*://')
-OPENAPI_PG_DOWN = docker rm -f $$PG_CID >/dev/null 2>&1
 
 EMPTY :=
 SPACE := $(EMPTY) $(EMPTY)
@@ -378,7 +379,7 @@ else
 	echo "Sorting OpenAPI JSON for deterministic ordering..." && \
 	$(PYTHON) tools/scripts/sort_openapi_json.py "$(OPENAPI_OUT)" && \
 	echo "OpenAPI spec saved to $(OPENAPI_OUT)" \
-	); rc=$$?; $(if $(OPENAPI_GEAR_NEEDS_PG),$(OPENAPI_PG_DOWN);) exit $$rc
+	)
 endif
 else
 	@command -v curl >/dev/null || (echo "curl is required to generate OpenAPI spec" && exit 1)
