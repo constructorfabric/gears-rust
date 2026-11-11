@@ -2,7 +2,10 @@
 
 use toolkit_gts::gts_id;
 
-use super::{LicenseCheckContext, LicenseCheckRequest, LicenseDecision, Resource, Subject};
+use super::{
+    IsLicensedRequest, LicenseCheckContext, LicenseCheckRequest, LicenseDecision, PrincipalSubject,
+    Resource, Subject, SubjectInput,
+};
 
 const SUBJECT_CONTRACT: &str = gts_id!("cf.core.lic.subj.v1~cf.genai.llm_gateway.user.v1~");
 const RESOURCE_CONTRACT: &str = gts_id!("cf.core.lic.res.v1~cf.genai.llm_gateway.model_usage.v1~");
@@ -92,6 +95,54 @@ fn request_round_trips() {
 }
 
 #[test]
+fn subject_input_is_tagged_by_kind() {
+    let principal = PrincipalSubject::new("user", uuid::Uuid::from_u128(7));
+    let wire = serde_json::to_value(SubjectInput::from(principal.clone())).unwrap();
+    assert_eq!(
+        wire,
+        serde_json::json!({ "kind": "principal", "type": "user", "id": uuid::Uuid::from_u128(7) })
+    );
+    assert_eq!(
+        serde_json::from_value::<SubjectInput>(wire).unwrap(),
+        SubjectInput::Principal(principal)
+    );
+
+    let license: SubjectInput = serde_json::from_str(&format!(
+        r#"{{"kind":"license","type":"{SUBJECT_CONTRACT}","metadata":{{}}}}"#
+    ))
+    .unwrap();
+    assert!(matches!(license, SubjectInput::License(_)));
+}
+
+#[test]
+fn nonconforming_subject_inputs_do_not_deserialize() {
+    for (case, raw) in [
+        (
+            "no kind",
+            format!(r#"{{"type":"{SUBJECT_CONTRACT}","metadata":{{}}}}"#),
+        ),
+        (
+            "principal with metadata",
+            r#"{"kind":"principal","type":"user","id":"00000000-0000-0000-0000-000000000007","metadata":{}}"#
+                .to_owned(),
+        ),
+        (
+            "principal with a non-uuid id",
+            r#"{"kind":"principal","type":"user","id":"u1"}"#.to_owned(),
+        ),
+        (
+            "license subject with an unknown field",
+            format!(r#"{{"kind":"license","type":"{SUBJECT_CONTRACT}","metadata":{{}},"bogus":1}}"#),
+        ),
+    ] {
+        assert!(
+            serde_json::from_str::<SubjectInput>(&raw).is_err(),
+            "`{case}` must not deserialize: {raw}"
+        );
+    }
+}
+
+#[test]
 fn nonconforming_resource_payloads_do_not_deserialize() {
     for (case, raw) in [
         (
@@ -148,7 +199,7 @@ fn envelope_ignores_unknown_fields() {
     let tenant = uuid::Uuid::from_u128(0x1d2f_6e3a);
     let raw = format!(
         concat!(
-            r#"{{"subject":{{"type":"{subject}","metadata":{{}}}},"#,
+            r#"{{"subject":{{"kind":"license","type":"{subject}","metadata":{{}}}},"#,
             r#""resource":{{"type":"{resource}","metadata":{{}}}},"#,
             r#""context":{{"tenant_id":"{tenant}","future_contextual_input":true}},"#,
             r#""future_request_input":1}}"#
@@ -158,10 +209,12 @@ fn envelope_ignores_unknown_fields() {
         tenant = tenant
     );
 
-    let request: LicenseCheckRequest = serde_json::from_str(&raw)
+    let request: IsLicensedRequest = serde_json::from_str(&raw)
         .expect("a newer producer's request must stay readable by an older reader");
     assert_eq!(request.context.tenant_id, tenant);
-    assert_eq!(request.subject.gts_type.as_ref(), SUBJECT_CONTRACT);
+    assert!(
+        matches!(&request.subject, SubjectInput::License(s) if s.gts_type.as_ref() == SUBJECT_CONTRACT)
+    );
 }
 
 #[test]

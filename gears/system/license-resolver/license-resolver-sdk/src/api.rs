@@ -6,9 +6,9 @@
 //! ones. Consumers do not branch on the binding.
 
 use toolkit_canonical_errors::CanonicalError;
-use toolkit_security::PlatformSecurityContext;
+use toolkit_security::{PlatformSecurityContext, SecurityContext};
 
-use crate::models::{LicenseCheckRequest, LicenseDecision};
+use crate::models::{IsLicensedRequest, LicenseDecision, SelfLicenseCheckRequest};
 
 /// Public API contract for the license resolver gateway.
 #[toolkit::contract(gear = "license-resolver", version = "v1")]
@@ -21,8 +21,11 @@ pub trait LicenseResolverApi: Send + Sync {
     /// from its own `SecurityContext`. Callers without a
     /// [`PlatformSecurityContext`] pass [`PlatformSecurityContext::outbound_marker`].
     ///
-    /// The resolver validates the request against the registered contracts,
-    /// then delegates to the selected backend plugin. A not-granted answer is
+    /// A principal subject is first mapped to the Subject contract type the
+    /// resolver's configuration names for its principal type; a principal type
+    /// without a mapping is `LicenseDecision { granted: false }`. The resolver
+    /// then validates the request against the registered contracts and
+    /// delegates to the selected backend plugin. A not-granted answer is
     /// `LicenseDecision { granted: false }`, not an error.
     ///
     /// # Errors
@@ -34,6 +37,20 @@ pub trait LicenseResolverApi: Send + Sync {
     async fn is_licensed(
         &self,
         ctx: PlatformSecurityContext,
-        request: LicenseCheckRequest,
+        request: IsLicensedRequest,
+    ) -> Result<LicenseDecision, CanonicalError>;
+
+    /// [`is_licensed`](Self::is_licensed) for the principal of `ctx`, scoped to
+    /// its tenant: the subject is `ctx.subject_type()` / `ctx.subject_id()`, the
+    /// tenant is `ctx.subject_tenant_id()`.
+    ///
+    /// # Errors
+    ///
+    /// As [`is_licensed`](Self::is_licensed).
+    #[idempotency(SafeRead)]
+    async fn is_self_licensed(
+        &self,
+        ctx: SecurityContext,
+        request: SelfLicenseCheckRequest,
     ) -> Result<LicenseDecision, CanonicalError>;
 }

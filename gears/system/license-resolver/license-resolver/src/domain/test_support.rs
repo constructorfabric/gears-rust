@@ -28,9 +28,10 @@ use super::ports::{
     CheckOutcome, ContractRegistry, ContractRegistryError, LicenseMetrics, ViolationKind,
 };
 pub use crate::test_contracts::{
-    ADMIN_SUBJECT, BARE_RESOURCE, MODEL_USAGE_RESOURCE, RESOURCE_BASE, SUBJECT_BASE,
-    TENANT_SUBJECT, TestModelUsageResourceV1, USER_SUBJECT, admin_subject_schema,
-    bare_resource_schema, model_usage_schema, resource_base_schema, subject_base_schema,
+    ADMIN_SUBJECT, BARE_RESOURCE, MODEL_USAGE_RESOURCE, OPERATOR_PRINCIPAL, PRINCIPAL_BASE,
+    RESOURCE_BASE, SEAT_SUBJECT, SUBJECT_BASE, TENANT_SUBJECT, TestModelUsageResourceV1,
+    USER_PRINCIPAL, USER_SUBJECT, admin_subject_schema, bare_resource_schema, model_usage_schema,
+    principal_schemas, resource_base_schema, seat_subject_schema, subject_base_schema,
     tenant_subject_schema, user_subject_schema,
 };
 
@@ -136,10 +137,16 @@ impl FakeContractRegistry {
         }
     }
 
-    /// Registry holding both conforming test contracts.
+    /// Registry holding the conforming test contracts and the principal types.
     #[must_use]
     pub fn with_test_contracts() -> Self {
-        Self::new().with_contracts([user_subject_schema(), model_usage_schema()])
+        Self::new()
+            .with_contracts([
+                user_subject_schema(),
+                seat_subject_schema(),
+                model_usage_schema(),
+            ])
+            .with_contracts(principal_schemas())
     }
 
     #[must_use]
@@ -335,4 +342,31 @@ pub fn hub_without_plugin_instances() -> Arc<ClientHub> {
     let registry: Arc<dyn TypesRegistryClient> = Arc::new(MockTypesRegistryClient::new());
     hub.register::<dyn TypesRegistryClient>(registry);
     hub
+}
+
+/// Principal type → Subject contract type, as configured.
+#[must_use]
+pub fn principal_mapping(entries: &[(&str, &str)]) -> HashMap<String, GtsTypeId> {
+    entries
+        .iter()
+        .map(|(principal, subject)| ((*principal).to_owned(), GtsTypeId::new(subject)))
+        .collect()
+}
+
+/// The conforming test resource.
+#[must_use]
+pub fn model_usage() -> Resource {
+    resource(
+        MODEL_USAGE_RESOURCE,
+        Some("gpt-4o"),
+        json!({ "model_vendor": "openai", "model_name": "gpt-4o" }),
+    )
+}
+
+#[must_use]
+pub fn test_context() -> LicenseCheckContext {
+    LicenseCheckContext::builder()
+        .tenant_id(test_tenant())
+        .build()
+        .expect("tenant is set")
 }

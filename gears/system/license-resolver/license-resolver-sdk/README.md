@@ -6,16 +6,24 @@ read-only, plugin-delegating resolver that answers a single question:
 
 ## What this crate provides
 
-- `LicenseResolverApi` — the public API contract, one method:
-  `is_licensed(PlatformSecurityContext, LicenseCheckRequest) -> LicenseDecision`,
-  errors as `CanonicalError`. `LicenseResolverApiRest` projects it to
-  `POST /license-resolver/v1/is-licensed`; feature `rest-client` emits the
-  client, `rest-server` the routes for the gear.
+- `LicenseResolverApi` — the public API contract, one check in two forms,
+  errors as `CanonicalError`:
+  - `is_licensed(PlatformSecurityContext, IsLicensedRequest) -> LicenseDecision`;
+    the subject is a `Subject` contract object or a `PrincipalSubject`
+    (principal type + id) that the resolver maps to a Subject contract type;
+  - `is_self_licensed(SecurityContext, SelfLicenseCheckRequest) -> LicenseDecision`;
+    the subject is the principal of the context, the tenant its tenant.
+
+  `LicenseResolverApiRest` projects them to `POST /license-resolver/v1/is-licensed`
+  and `POST /license-resolver/v1/is-self-licensed`; feature `rest-client`
+  emits the client, `rest-server` the routes for the gear.
 - `LicenseResolverPluginClient` — the in-process backend plugin trait:
   `is_licensed(LicenseCheckRequest) -> LicenseDecision`, errors as
   `LicenseResolverError`.
-- `LicenseCheckRequest` / `LicenseDecision` and the `Subject` / `Resource` /
-  `LicenseCheckContext` contract objects.
+- `IsLicensedRequest` / `SelfLicenseCheckRequest` / `LicenseCheckRequest` /
+  `LicenseDecision`, `SubjectInput` (wire tag `kind`: `license` | `principal`),
+  `PrincipalSubject`, and the `Subject` / `Resource` / `LicenseCheckContext`
+  contract objects.
 - `LicenseResolverError` — the typed error enum of the plugin trait, with the
   mapping to `CanonicalError` that `LicenseResolverApi` returns. A not-granted answer
   is **not** an error (`LicenseDecision { granted: false }`).

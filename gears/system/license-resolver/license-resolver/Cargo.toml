@@ -47,6 +47,7 @@ anyhow = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+uuid = { workspace = true }
 
 # Telemetry
 opentelemetry = { workspace = true }
@@ -61,5 +62,5 @@ schemars = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 toolkit-gts = { workspace = true }
+tracing-test = { workspace = true, features = ["no-env-filter"] }
 types-registry-sdk = { workspace = true, features = ["test-util"] }
-uuid = { workspace = true }

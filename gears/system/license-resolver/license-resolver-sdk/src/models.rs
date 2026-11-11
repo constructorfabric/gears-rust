@@ -47,6 +47,52 @@ pub struct Subject {
     pub metadata: Map<String, Value>,
 }
 
+/// The subject of a check given as a principal — whoever authenticated.
+///
+/// The resolver maps `principal_type` to the Subject contract type configured
+/// for it and checks a [`Subject`] of that type, with `id` and empty
+/// `metadata`. A principal type without a mapping is not granted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PrincipalSubject {
+    /// The principal type, as in `SecurityContext::subject_type`. Wire key `type`.
+    #[serde(rename = "type")]
+    pub principal_type: String,
+    /// The principal id, as in `SecurityContext::subject_id`.
+    pub id: Uuid,
+}
+
+impl PrincipalSubject {
+    #[must_use]
+    pub fn new(principal_type: impl Into<String>, id: Uuid) -> Self {
+        Self {
+            principal_type: principal_type.into(),
+            id,
+        }
+    }
+}
+
+/// The subject of an [`IsLicensedRequest`]: a Subject contract object or a
+/// principal. Wire tag `kind`: `license` or `principal`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SubjectInput {
+    License(Subject),
+    Principal(PrincipalSubject),
+}
+
+impl From<Subject> for SubjectInput {
+    fn from(subject: Subject) -> Self {
+        Self::License(subject)
+    }
+}
+
+impl From<PrincipalSubject> for SubjectInput {
+    fn from(principal: PrincipalSubject) -> Self {
+        Self::Principal(principal)
+    }
+}
+
 /// The resource of a check — the licensable thing.
 ///
 /// An instance of a derived Resource contract type (base
@@ -171,7 +217,8 @@ impl LicenseCheckContextBuilder {
     }
 }
 
-/// The single input to a check — the contract's growth surface.
+/// The input of [`LicenseResolverApi::is_licensed`](crate::LicenseResolverApi::is_licensed)
+/// — the contract's growth surface.
 ///
 /// New inputs are added as fields here, never as new method parameters. Because
 /// that growth is expected, the type is `#[non_exhaustive]` and is built through
@@ -180,6 +227,58 @@ impl LicenseCheckContextBuilder {
 /// [`LicenseCheckContext`].
 ///
 /// Unknown fields are **ignored** here too, under the same rule as
+/// [`LicenseCheckContext`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[non_exhaustive]
+pub struct IsLicensedRequest {
+    /// Whom the license is checked for.
+    pub subject: SubjectInput,
+    /// The licensable thing being checked.
+    pub resource: Resource,
+    /// The tenant isolation scope (caller-derived from its `SecurityContext`).
+    pub context: LicenseCheckContext,
+}
+
+impl IsLicensedRequest {
+    /// Build `context` with [`LicenseCheckContext::from_security_context`] so the
+    /// tenant scope follows the authenticated caller.
+    #[must_use]
+    pub fn new(
+        subject: impl Into<SubjectInput>,
+        resource: Resource,
+        context: LicenseCheckContext,
+    ) -> Self {
+        Self {
+            subject: subject.into(),
+            resource,
+            context,
+        }
+    }
+}
+
+/// The input of
+/// [`LicenseResolverApi::is_self_licensed`](crate::LicenseResolverApi::is_self_licensed).
+///
+/// Only the resource: the subject and the tenant scope come from the caller's
+/// `SecurityContext`. Unknown fields are **ignored**.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[non_exhaustive]
+pub struct SelfLicenseCheckRequest {
+    /// The licensable thing being checked.
+    pub resource: Resource,
+}
+
+impl SelfLicenseCheckRequest {
+    #[must_use]
+    pub fn new(resource: Resource) -> Self {
+        Self { resource }
+    }
+}
+
+/// The check a backend plugin receives: an [`IsLicensedRequest`] whose subject
+/// is a [`Subject`] contract object, a principal already mapped.
+///
+/// Unknown fields are **ignored**, under the same rule as
 /// [`LicenseCheckContext`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[non_exhaustive]
@@ -193,10 +292,6 @@ pub struct LicenseCheckRequest {
 }
 
 impl LicenseCheckRequest {
-    /// Assemble a check from its three parts.
-    ///
-    /// Build `context` with [`LicenseCheckContext::from_security_context`] so the
-    /// tenant scope follows the authenticated caller.
     #[must_use]
     pub fn new(subject: Subject, resource: Resource, context: LicenseCheckContext) -> Self {
         Self {
@@ -248,7 +343,8 @@ impl LicenseDecision {
 mod _api_dto_markers {
     use toolkit::api::api_dto::{RequestApiDto, ResponseApiDto};
 
-    impl RequestApiDto for super::LicenseCheckRequest {}
+    impl RequestApiDto for super::IsLicensedRequest {}
+    impl RequestApiDto for super::SelfLicenseCheckRequest {}
     impl ResponseApiDto for super::LicenseDecision {}
 }
 

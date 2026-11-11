@@ -3,15 +3,15 @@
 //! Integration tests demonstrating how a consuming Gear builds a license check.
 //!
 //! They compile from outside the crate, which carries a guarantee no unit test
-//! can: `LicenseCheckContext`, `LicenseCheckRequest` and `LicenseDecision` are
+//! can: `LicenseCheckContext`, `IsLicensedRequest` and `LicenseDecision` are
 //! `#[non_exhaustive]` so a future contextual input stays additive, which puts
 //! struct literals out of reach for consumers and makes the constructors the
 //! whole public surface. If a growth-surface field ever becomes unreachable
 //! through a constructor, this stops compiling.
 
 use license_resolver_sdk::{
-    LicenseCheckContext, LicenseCheckContextBuildError, LicenseCheckRequest, LicenseDecision,
-    Resource, Subject,
+    IsLicensedRequest, LicenseCheckContext, LicenseCheckContextBuildError, LicenseDecision,
+    PrincipalSubject, Resource, Subject, SubjectInput,
 };
 use toolkit_gts::gts_id;
 use toolkit_security::SecurityContext;
@@ -43,7 +43,7 @@ fn a_consumer_can_build_a_request_from_its_security_context() {
         .build()
         .expect("valid security context");
 
-    let request = LicenseCheckRequest::new(
+    let request = IsLicensedRequest::new(
         subject(),
         resource(),
         LicenseCheckContext::from_security_context(&ctx),
@@ -61,9 +61,22 @@ fn a_consumer_without_a_security_context_can_build_one_field_by_field() {
         .build()
         .expect("tenant scope set");
 
-    let request = LicenseCheckRequest::new(subject(), resource(), context);
+    let request = IsLicensedRequest::new(subject(), resource(), context);
 
     assert_eq!(request.context.tenant_id, tenant);
+}
+
+#[test]
+fn a_consumer_can_name_its_principal_as_the_subject() {
+    let principal = PrincipalSubject::new("user", Uuid::from_u128(7));
+    let context = LicenseCheckContext::builder()
+        .tenant_id(Uuid::from_u128(42))
+        .build()
+        .expect("tenant scope set");
+
+    let request = IsLicensedRequest::new(principal.clone(), resource(), context);
+
+    assert_eq!(request.subject, SubjectInput::Principal(principal));
 }
 
 #[test]

@@ -5,13 +5,20 @@ use license_resolver_sdk::{FieldViolation, LicenseResolverError};
 use serde_json::json;
 
 use super::*;
+use crate::domain::ContractRegistry;
+use crate::domain::principal::PrincipalMapper;
 use crate::domain::test_support::{
-    FailureKind, FakeContractRegistry, MODEL_USAGE_RESOURCE, MockPlugin, RecordingMetrics,
-    USER_SUBJECT, conforming_request, counting_hub_with_registry_only, empty_hub,
-    hub_with_registry_and_plugin, hub_without_plugin_instances, request, resource, subject,
-    test_instance_id, test_tenant,
+    FailureKind, FakeContractRegistry, MODEL_USAGE_RESOURCE, MockPlugin, OPERATOR_PRINCIPAL,
+    RecordingMetrics, SEAT_SUBJECT, USER_PRINCIPAL, USER_SUBJECT, conforming_request,
+    counting_hub_with_registry_only, empty_hub, hub_with_registry_and_plugin,
+    hub_without_plugin_instances, model_usage, principal_mapping, request, resource, subject,
+    test_context, test_instance_id, test_tenant,
 };
 use crate::domain::validation::ContractValidator;
+use uuid::Uuid;
+
+/// Principal type mapped to a Subject contract whose schema requires metadata.
+const METADATA_PRINCIPAL: &str = "needs-metadata";
 
 const VENDOR: &str = "constructorfabric";
 
@@ -20,10 +27,18 @@ fn service_with(
     registry: FakeContractRegistry,
     metrics: Arc<RecordingMetrics>,
 ) -> Service {
+    let registry: Arc<dyn ContractRegistry> = Arc::new(registry);
     Service::new(
         hub,
         VENDOR.to_owned(),
-        ContractValidator::new(Arc::new(registry)),
+        ContractValidator::new(registry.clone()),
+        PrincipalMapper::new(
+            principal_mapping(&[
+                (USER_PRINCIPAL, SEAT_SUBJECT),
+                (METADATA_PRINCIPAL, USER_SUBJECT),
+            ]),
+            registry,
+        ),
         metrics as Arc<dyn LicenseMetrics>,
     )
 }
@@ -388,4 +403,175 @@ async fn an_unvalidated_contract_type_never_becomes_a_metric_label() {
             CheckOutcome::InvalidRequest
         )]
     );
+}
+
+#[tokio::test]
+async fn a_mapped_principal_reaches_the_plugin_as_a_subject() {
+    let plugin = MockPlugin::granting();
+    let (svc, metrics) = wired_service(plugin.clone());
+    let principal_id = Uuid::from_u128(7);
+
+    let decision = svc
+        .is_principal_licensed(
+            Some(OPERATOR_PRINCIPAL),
+            principal_id,
+            model_usage(),
+            test_context(),
+        )
+        .await
+        .expect("mapped principal check succeeds");
+
+    assert!(decision.granted);
+    let seen = plugin.seen();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(
+        seen[0].subject,
+        subject(SEAT_SUBJECT, Some(&principal_id.to_string()), json!({}))
+    );
+    assert_eq!(seen[0].resource, model_usage());
+    assert_eq!(seen[0].context.tenant_id, test_tenant());
+    assert_eq!(metrics.latency_count(), 1);
+}
+
+#[tokio::test]
+async fn an_unmapped_principal_is_not_granted_without_the_plugin() {
+    let plugin = MockPlugin::granting();
+    let (svc, metrics) = wired_service(plugin.clone());
+
+    let decision = svc
+        .is_principal_licensed(
+            Some("app"),
+            Uuid::from_u128(7),
+            model_usage(),
+            test_context(),
+        )
+        .await
+        .expect("an unmapped principal is a decision");
+
+    assert!(!decision.granted);
+    assert_eq!(
+        decision.diagnostics.get("reason").and_then(|v| v.as_str()),
+        Some("principal_not_mapped")
+    );
+    assert!(plugin.seen().is_empty());
+    assert_eq!(
+        metrics.checks(),
+        vec![(
+            UNVALIDATED_CONTRACT.to_owned(),
+            CheckOutcome::PrincipalNotMapped
+        )]
+    );
+    assert_eq!(metrics.latency_count(), 1);
+}
+
+#[tokio::test]
+async fn a_nil_principal_id_is_not_mapped() {
+    let plugin = MockPlugin::granting();
+    let (svc, metrics) = wired_service(plugin.clone());
+
+    let decision = svc
+        .is_principal_licensed(
+            Some(OPERATOR_PRINCIPAL),
+            Uuid::nil(),
+            model_usage(),
+            test_context(),
+        )
+        .await
+        .expect("a nil principal is a decision");
+
+    assert!(!decision.granted);
+    assert!(plugin.seen().is_empty());
+    assert_eq!(
+        metrics.checks(),
+        vec![(
+            UNVALIDATED_CONTRACT.to_owned(),
+            CheckOutcome::PrincipalNotMapped
+        )]
+    );
+}
+
+#[tokio::test]
+#[tracing_test::traced_test]
+async fn a_backend_rejection_of_a_mapped_subject_is_not_logged_as_misconfiguration() {
+    let (svc, _metrics) =
+        wired_service(MockPlugin::failing(LicenseResolverError::InvalidRequest {
+            violations: vec![FieldViolation::new(
+                "subject/id",
+                "seat is held elsewhere",
+                "SEAT_HELD",
+            )],
+        }));
+
+    let err = svc
+        .is_principal_licensed(
+            Some(OPERATOR_PRINCIPAL),
+            Uuid::from_u128(7),
+            model_usage(),
+            test_context(),
+        )
+        .await
+        .expect_err("the backend rejects the subject");
+
+    assert!(
+        matches!(err, DomainError::ContractViolation { .. }),
+        "got: {err:?}"
+    );
+    assert!(!logs_contain("principal_subject_types maps"));
+}
+
+#[tokio::test]
+#[tracing_test::traced_test]
+async fn a_mapped_type_that_requires_metadata_is_an_invalid_request() {
+    let plugin = MockPlugin::granting();
+    let (svc, _metrics) = wired_service(plugin.clone());
+
+    let err = svc
+        .is_principal_licensed(
+            Some(METADATA_PRINCIPAL),
+            Uuid::from_u128(7),
+            model_usage(),
+            test_context(),
+        )
+        .await
+        .expect_err("empty metadata does not conform");
+
+    assert!(
+        matches!(err, DomainError::ContractViolation { .. }),
+        "got: {err:?}"
+    );
+    assert!(plugin.seen().is_empty());
+    assert!(logs_contain(
+        "principal_subject_types maps to a Subject contract type"
+    ));
+}
+
+#[tokio::test]
+async fn an_unresolvable_principal_mapping_fails_closed() {
+    let metrics = Arc::new(RecordingMetrics::default());
+    let svc = service_with(
+        hub_with_registry_and_plugin(
+            &test_instance_id(),
+            VENDOR,
+            MockPlugin::granting() as Arc<dyn LicenseResolverPluginClient>,
+        ),
+        FakeContractRegistry::failing(FailureKind::Unavailable),
+        metrics.clone(),
+    );
+
+    let err = svc
+        .is_principal_licensed(
+            Some(OPERATOR_PRINCIPAL),
+            Uuid::from_u128(7),
+            model_usage(),
+            test_context(),
+        )
+        .await
+        .expect_err("the mapping cannot be determined");
+
+    assert!(
+        matches!(err, DomainError::TypesRegistryUnavailable(_)),
+        "got: {err:?}"
+    );
+    assert_eq!(metrics.checks().len(), 1);
+    assert_eq!(metrics.latency_count(), 1);
 }

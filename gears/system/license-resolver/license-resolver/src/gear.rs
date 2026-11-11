@@ -11,7 +11,7 @@ use toolkit_contract::policy::PolicyStack;
 use tracing::info;
 
 use crate::config::LicenseResolverConfig;
-use crate::domain::{ContractValidator, LicenseResolverLocalClient, Service};
+use crate::domain::{ContractValidator, LicenseResolverLocalClient, PrincipalMapper, Service};
 use crate::infra::{GtsContractRegistry, metrics};
 
 /// License Resolver gear.
@@ -22,7 +22,8 @@ use crate::infra::{GtsContractRegistry, metrics};
 ///
 /// `LicenseResolverApi` is a `#[toolkit::contract]`: `provides` wires the local
 /// impl into `ClientHub`, and the `rest` capability hosts its REST projection
-/// (`/license-resolver/v1/is-licensed`, internal, not edge-exposed).
+/// (`/license-resolver/v1/is-licensed`, platform-only, and
+/// `/is-self-licensed`, public to any authenticated principal).
 #[toolkit::gear(
     name = "license-resolver",
     deps = [types_registry],
@@ -45,11 +46,12 @@ impl LicenseResolver {
         info!(vendor = %cfg.vendor, "wiring license-resolver local client");
 
         let hub = ctx.client_hub();
-        let validator = ContractValidator::new(Arc::new(GtsContractRegistry::new(hub.clone())));
+        let registry = Arc::new(GtsContractRegistry::new(hub.clone()));
         let svc = Arc::new(Service::new(
             hub,
             cfg.vendor.clone(),
-            validator,
+            ContractValidator::new(registry.clone()),
+            PrincipalMapper::new(cfg.principal_subject_types.clone(), registry),
             metrics::build_default_adapter(&cfg.vendor),
         ));
         Ok(Arc::new(LicenseResolverLocalClient::new(svc)))

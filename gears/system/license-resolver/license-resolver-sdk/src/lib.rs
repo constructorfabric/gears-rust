@@ -6,12 +6,13 @@
 //! right now?*
 //!
 //! - [`LicenseResolverApi`] — public API contract for consumers (the single
-//!   `is_licensed` check), in process or over REST ([`rest`]).
+//!   check, in two forms), in process or over REST ([`rest`]).
 //! - [`LicenseResolverPluginClient`] — plugin API trait for backend
 //!   implementations (mirrors the public signature).
-//! - [`LicenseCheckRequest`], [`LicenseDecision`] — the check input/output.
-//! - [`Subject`], [`Resource`], [`LicenseCheckContext`] — the contract objects
-//!   bundled into a request.
+//! - [`IsLicensedRequest`], [`SelfLicenseCheckRequest`], [`LicenseDecision`] —
+//!   the check inputs/output; [`LicenseCheckRequest`] — the plugin's input.
+//! - [`Subject`], [`PrincipalSubject`], [`Resource`], [`LicenseCheckContext`] —
+//!   the objects bundled into a request.
 //! - [`LicenseResolverError`] — the typed error enum of the plugin API, its
 //!   mapping to `CanonicalError`, and the violation vocabulary ([`field`]).
 //! - [`LicenseResolverPluginSpecV1`] — GTS plugin spec used for discovery.
@@ -51,8 +52,9 @@ pub use gts::{
     LicenseResolverPluginSpecV1, LicenseResourceV1, LicenseSubjectV1, LicenseTenantSubjectV1,
 };
 pub use models::{
-    LicenseCheckContext, LicenseCheckContextBuildError, LicenseCheckContextBuilder,
-    LicenseCheckRequest, LicenseDecision, Resource, Subject,
+    IsLicensedRequest, LicenseCheckContext, LicenseCheckContextBuildError,
+    LicenseCheckContextBuilder, LicenseCheckRequest, LicenseDecision, PrincipalSubject, Resource,
+    SelfLicenseCheckRequest, Subject, SubjectInput,
 };
 pub use plugin_api::LicenseResolverPluginClient;
 pub use rest::{LicenseResolverApiRest, license_resolver_api_rest_http_binding};

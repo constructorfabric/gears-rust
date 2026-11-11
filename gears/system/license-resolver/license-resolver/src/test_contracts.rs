@@ -26,7 +26,18 @@ pub struct TestUserSubjectV1 {
     category: String,
 }
 
-/// Resource contract admitting [`TestUserSubjectV1`].
+/// Subject contract without metadata, the target of principal mappings.
+#[toolkit_gts::gts_type_schema(
+    dir_path = "schemas",
+    base = LicenseSubjectV1,
+    type_id = gts_id!("cf.core.lic.subj.v1~test.lic.gateway.seat.v1~"),
+    description = "test Subject licensing contract without metadata",
+    properties = ""
+)]
+#[derive(Default)]
+pub struct TestSeatSubjectV1;
+
+/// Resource contract admitting [`TestUserSubjectV1`] and [`TestSeatSubjectV1`].
 #[toolkit_gts::gts_type_schema(
     dir_path = "schemas",
     base = LicenseResourceV1,
@@ -34,7 +45,10 @@ pub struct TestUserSubjectV1 {
     description = "test Resource licensing contract",
     properties = "model_vendor,model_name",
     traits = serde_json::json!({
-        "admitted_subjects": [gts_id!("cf.core.lic.subj.v1~test.lic.gateway.user.v1~")]
+        "admitted_subjects": [
+            gts_id!("cf.core.lic.subj.v1~test.lic.gateway.user.v1~"),
+            gts_id!("cf.core.lic.subj.v1~test.lic.gateway.seat.v1~"),
+        ]
     })
 )]
 #[derive(Default)]
@@ -75,6 +89,7 @@ pub const SUBJECT_BASE: &str = <LicenseSubjectV1<()> as GtsSchema>::TYPE_ID;
 pub const RESOURCE_BASE: &str = <LicenseResourceV1<()> as GtsSchema>::TYPE_ID;
 pub const USER_SUBJECT: &str = <TestUserSubjectV1 as GtsSchema>::TYPE_ID;
 pub const TENANT_SUBJECT: &str = <TestTenantSubjectV1 as GtsSchema>::TYPE_ID;
+pub const SEAT_SUBJECT: &str = <TestSeatSubjectV1 as GtsSchema>::TYPE_ID;
 pub const MODEL_USAGE_RESOURCE: &str = <TestModelUsageResourceV1 as GtsSchema>::TYPE_ID;
 pub const BARE_RESOURCE: &str = <TestBareResourceV1 as GtsSchema>::TYPE_ID;
 
@@ -139,4 +154,33 @@ pub fn model_usage_schema() -> GtsTypeSchema {
 #[must_use]
 pub fn bare_resource_schema() -> GtsTypeSchema {
     derived_schema::<TestBareResourceV1>(resource_base_schema())
+}
+
+#[must_use]
+pub fn seat_subject_schema() -> GtsTypeSchema {
+    derived_schema::<TestSeatSubjectV1>(subject_base_schema())
+}
+
+/// Principal types: a base, a user type under it, an operator subtype of user.
+pub const PRINCIPAL_BASE: &str = gts_id!("cf.core.identity.principal.v1~");
+pub const USER_PRINCIPAL: &str = gts_id!("cf.core.identity.principal.v1~cf.core.identity.user.v1~");
+pub const OPERATOR_PRINCIPAL: &str =
+    gts_id!("cf.core.identity.principal.v1~cf.core.identity.user.v1~test.op.identity.myuser.v1~");
+
+fn principal_schema(type_id: &str, parent: Option<GtsTypeSchema>) -> GtsTypeSchema {
+    let mut body = serde_json::json!({ "$id": format!("gts://{type_id}"), "type": "object" });
+    if let Some(parent) = &parent {
+        body["allOf"] =
+            serde_json::json!([{ "$ref": format!("gts://{}", parent.type_id.as_ref()) }]);
+    }
+    schema_of(type_id, body, parent.map(Arc::new))
+}
+
+/// The principal-type chains as the registry resolves them.
+#[must_use]
+pub fn principal_schemas() -> [GtsTypeSchema; 3] {
+    let base = principal_schema(PRINCIPAL_BASE, None);
+    let user = principal_schema(USER_PRINCIPAL, Some(base.clone()));
+    let operator = principal_schema(OPERATOR_PRINCIPAL, Some(user.clone()));
+    [base, user, operator]
 }
