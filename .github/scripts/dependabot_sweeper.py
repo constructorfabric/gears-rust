@@ -27,6 +27,7 @@ LABELS = {
     LABEL_RECREATED: ("FBCA04", "Dependabot was asked to recreate this PR"),
     LABEL_HOLD: ("C5DEF5", "Dependabot sweeper: do not touch this PR"),
 }
+ACT_LABEL_MIGRATION = "label needs-migration"
 MAX_MERGES = 3
 MAX_RECREATES = 3
 STALE_HOURS = 72
@@ -96,6 +97,30 @@ def _major(version):
     return int(m.group(1)) if m else None
 
 
+def _cargo_entry_veto(name, entries_count, from_versions):
+    """Reason string if a cargo minor bump is not provably non-breaking, else None."""
+    frm = from_versions.get(name)
+    if frm is None and entries_count == 1:
+        frm = from_versions.get(None)
+    major = _major(frm)
+    if major is None:
+        return f"{name}: minor, from-version unknown"
+    if major == 0:
+        return f"{name}: 0.x minor is breaking in cargo"
+    return None
+
+
+def _entry_veto(ecosystem, name, utype, entries_count, from_versions):
+    """Reason string if this updated-dependencies entry makes the PR ineligible, else None."""
+    if utype is None:
+        return f"{name}: no update-type (cargo)" if ecosystem == "cargo" else None
+    if utype not in SAFE_TYPES:
+        return f"{name}: {utype.replace('version-update:semver-', '')}"
+    if ecosystem == "cargo" and utype == MINOR:
+        return _cargo_entry_veto(name, entries_count, from_versions)
+    return None
+
+
 def eligibility(ecosystem, entries, from_versions):
     """Return (eligible, reason)."""
     if ecosystem not in ("cargo", "docker", "github_actions"):
@@ -103,21 +128,9 @@ def eligibility(ecosystem, entries, from_versions):
     if not entries:
         return False, "no updated-dependencies metadata"
     for name, utype in entries:
-        if utype is None:
-            if ecosystem == "cargo":
-                return False, f"{name}: no update-type (cargo)"
-            continue
-        if utype not in SAFE_TYPES:
-            return False, f"{name}: {utype.replace('version-update:semver-', '')}"
-        if ecosystem == "cargo" and utype == MINOR:
-            frm = from_versions.get(name)
-            if frm is None and len(entries) == 1:
-                frm = from_versions.get(None)
-            major = _major(frm)
-            if major is None:
-                return False, f"{name}: minor, from-version unknown"
-            if major == 0:
-                return False, f"{name}: 0.x minor is breaking in cargo"
+        veto = _entry_veto(ecosystem, name, utype, len(entries), from_versions)
+        if veto:
+            return False, veto
     return True, "patch/minor" if any(u for _, u in entries) else "digest/sha bump"
 
 
@@ -212,28 +225,23 @@ class Budget:
         self.recreates = 0
 
 
-def decide(*, untrusted_commits, eligible, checks, mergeable, labels, age_h, budget,
-           draft=False, review_decision=None, unresolved_threads=False):
-    """Return an action string; consumes budget for merge/recreate."""
-    if untrusted_commits:
-        return "skip: non-Dependabot commit"
-    if LABEL_HOLD in labels:
-        return "skip: hold"
-    if draft:
-        return "skip: draft"
-    if not eligible:
-        return "noop (labelled)" if LABEL_MIGRATION in labels else "label needs-migration"
-    if checks == "wait":
-        return "wait"
-    if checks == "red":
-        if age_h < STALE_HOURS:
-            return "wait (red <72h)"
-        if LABEL_RECREATED in labels:
-            return "noop (labelled)" if LABEL_MIGRATION in labels else "label needs-migration"
-        if budget.recreates >= MAX_RECREATES:
-            return "defer: recreate cap"
-        budget.recreates += 1
-        return "recreate"
+def _label_or_noop(labels):
+    return "noop (labelled)" if LABEL_MIGRATION in labels else ACT_LABEL_MIGRATION
+
+
+def _decide_red(labels, age_h, budget):
+    if age_h < STALE_HOURS:
+        return "wait (red <72h)"
+    if LABEL_RECREATED in labels:
+        return _label_or_noop(labels)
+    if budget.recreates >= MAX_RECREATES:
+        return "defer: recreate cap"
+    budget.recreates += 1
+    return "recreate"
+
+
+def _green_skip(labels, review_decision, unresolved_threads, mergeable):
+    """Return a skip/wait string for a green PR that must not merge, else None."""
     if LABEL_MIGRATION in labels:
         return "skip: needs-migration label"
     if review_decision == "CHANGES_REQUESTED":
@@ -244,6 +252,27 @@ def decide(*, untrusted_commits, eligible, checks, mergeable, labels, age_h, bud
         return "skip: conflicting"
     if mergeable != "MERGEABLE":
         return "wait: mergeability unknown"
+    return None
+
+
+def decide(*, untrusted_commits, eligible, checks, mergeable, labels, age_h, budget,
+           draft=False, review_decision=None, unresolved_threads=False):
+    """Return an action string; consumes budget for merge/recreate."""
+    if untrusted_commits:
+        return "skip: non-Dependabot commit"
+    if LABEL_HOLD in labels:
+        return "skip: hold"
+    if draft:
+        return "skip: draft"
+    if not eligible:
+        return _label_or_noop(labels)
+    if checks == "wait":
+        return "wait"
+    if checks == "red":
+        return _decide_red(labels, age_h, budget)
+    skip = _green_skip(labels, review_decision, unresolved_threads, mergeable)
+    if skip:
+        return skip
     if budget.merges >= MAX_MERGES:
         return "defer: merge cap"
     budget.merges += 1
@@ -386,27 +415,81 @@ def add_label(gh, n, label):
     gh.write("api", "-X", "POST", f"repos/{gh.repo}/issues/{n}/labels", "-f", f"labels[]={label}")
 
 
+def _fetch_state(gh, n):
+    view = gh.read_json(
+        "pr", "view", str(n), "--repo", gh.repo, "--json",
+        "statusCheckRollup,mergeable,reviews,labels,headRefOid,isDraft,reviewDecision",
+    )
+    total, commits = fetch_commits(gh, n)
+    unresolved = fetch_unresolved_threads(gh, n)
+    total_runs, runs = fetch_runs(gh, view.get("headRefOid"))
+    return view, total, commits, unresolved, total_runs, runs
+
+
+def _is_untrusted(view, total, commits):
+    head = commits[-1] if commits else {}
+    # The commit list and the view are two reads; a push in between must not
+    # let a commit we never checked become the approved/merged head.
+    return (
+        total > len(commits) or not commits or head.get("oid") != view.get("headRefOid")
+        or not all(is_trusted_commit(c) for c in commits)
+    )
+
+
+def _merge(gh, n, view):
+    """Approve (if needed) and squash-merge; return the outcome string."""
+    sha = view["headRefOid"]
+    review_id = None
+    if not has_head_approval(view.get("reviews"), sha):
+        # The approval is tied to the checked SHA; `--match-head-commit` is the
+        # actual merge gate, and on failure the approval is withdrawn.
+        review = gh.write("api", f"repos/{gh.repo}/pulls/{n}/reviews", "-f",
+                          "event=APPROVE", "-f", f"commit_id={sha}", capture=True)
+        review_id = (review or {}).get("id")
+    try:
+        gh.write("pr", "merge", str(n), "--repo", gh.repo, "--squash",
+                 "--match-head-commit", sha)
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+        done = f"merge FAILED ({describe(e)})"
+        if review_id is not None:
+            done += _dismiss_approval(gh, n, review_id)
+        return done
+    return "merge"
+
+
+def _dismiss_approval(gh, n, review_id):
+    try:
+        gh.write("api", "-X", "PUT",
+                 f"repos/{gh.repo}/pulls/{n}/reviews/{review_id}/dismissals",
+                 "-f", "message=Dependabot sweeper: merge failed, "
+                 "withdrawing automatic approval", "-f", "event=DISMISS")
+        return "; approval dismissed"
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e2:
+        return f"; approval dismiss FAILED ({describe(e2)})"
+
+
+def _execute(gh, n, view, action):
+    """Perform the live write for `action`; return the outcome string."""
+    if action == ACT_LABEL_MIGRATION:
+        add_label(gh, n, LABEL_MIGRATION)
+    elif action == "recreate":
+        gh.write("pr", "comment", str(n), "--repo", gh.repo, "--body", "@dependabot recreate")
+        add_label(gh, n, LABEL_RECREATED)
+    elif action == "merge":
+        return _merge(gh, n, view)
+    return action
+
+
 def process(gh, pr, budget, now):
     n = pr["number"]
     eco = ecosystem_from_branch(pr["headRefName"])
     title = md_title(pr["title"])
     try:
-        view = gh.read_json(
-            "pr", "view", str(n), "--repo", gh.repo, "--json",
-            "statusCheckRollup,mergeable,reviews,labels,headRefOid,isDraft,reviewDecision",
-        )
-        total, commits = fetch_commits(gh, n)
-        unresolved = fetch_unresolved_threads(gh, n)
-        total_runs, runs = fetch_runs(gh, view.get("headRefOid"))
+        view, total, commits, unresolved, total_runs, runs = _fetch_state(gh, n)
     except GH_ERRORS as e:
         return [f"#{n}", title, eco or "?", "?", "?", f"read FAILED ({describe(e)})"]
     head = commits[-1] if commits else {}
-    # The commit list and the view are two reads; a push in between must not
-    # let a commit we never checked become the approved/merged head.
-    untrusted = (
-        total > len(commits) or not commits or head.get("oid") != view.get("headRefOid")
-        or not all(is_trusted_commit(c) for c in commits)
-    )
+    untrusted = _is_untrusted(view, total, commits)
     message = head.get("messageHeadline", "") + "\n\n" + (head.get("messageBody") or "")
     ok, reason = eligibility(
         eco, parse_metadata(message), parse_from_versions(head.get("messageHeadline", ""), head.get("messageBody"))
@@ -422,37 +505,10 @@ def process(gh, pr, budget, now):
     done = action
     if gh.live:
         try:
-            if action == "label needs-migration":
-                add_label(gh, n, LABEL_MIGRATION)
-            elif action == "recreate":
-                gh.write("pr", "comment", str(n), "--repo", gh.repo, "--body", "@dependabot recreate")
-                add_label(gh, n, LABEL_RECREATED)
-            elif action == "merge":
-                sha = view["headRefOid"]
-                review_id = None
-                if not has_head_approval(view.get("reviews"), sha):
-                    # The approval is tied to the checked SHA; `--match-head-commit` is the
-                    # actual merge gate, and on failure the approval is withdrawn.
-                    review = gh.write("api", f"repos/{gh.repo}/pulls/{n}/reviews", "-f",
-                                      "event=APPROVE", "-f", f"commit_id={sha}", capture=True)
-                    review_id = (review or {}).get("id")
-                try:
-                    gh.write("pr", "merge", str(n), "--repo", gh.repo, "--squash",
-                             "--match-head-commit", sha)
-                except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
-                    done = f"merge FAILED ({describe(e)})"
-                    if review_id is not None:
-                        try:
-                            gh.write("api", "-X", "PUT",
-                                     f"repos/{gh.repo}/pulls/{n}/reviews/{review_id}/dismissals",
-                                     "-f", "message=Dependabot sweeper: merge failed, "
-                                     "withdrawing automatic approval", "-f", "event=DISMISS")
-                            done += "; approval dismissed"
-                        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e2:
-                            done += f"; approval dismiss FAILED ({describe(e2)})"
+            done = _execute(gh, n, view, action)
         except GH_ERRORS as e:
             done = f"{action} FAILED ({describe(e)})"
-    elif action in ("label needs-migration", "recreate", "merge"):
+    elif action in (ACT_LABEL_MIGRATION, "recreate", "merge"):
         done = f"{action} (dry-run)"
     return [f"#{n}", title, eco or "?",
             ("yes: " if ok else "no: ") + reason, checks, done]

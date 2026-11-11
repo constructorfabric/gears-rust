@@ -283,8 +283,9 @@ class Misc(unittest.TestCase):
         self.assertEqual((s.has_head_approval(rv, "a"), s.has_head_approval(rv, "b")), (True, False))
 
     def test_write_refuses_dry_run(self):
+        gh = s.Gh("o/r", False)
         with self.assertRaises(RuntimeError):
-            s.Gh("o/r", False).write("pr", "merge", "1")
+            gh.write("pr", "merge", "1")
 
 
 def commit(login="dependabot[bot]", headline="chore(deps): bump x", parents=1,
