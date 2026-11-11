@@ -465,29 +465,38 @@ async fn an_unmapped_principal_is_not_granted_without_the_plugin() {
 }
 
 #[tokio::test]
-async fn a_nil_principal_id_is_not_mapped() {
-    let plugin = MockPlugin::granting();
-    let (svc, metrics) = wired_service(plugin.clone());
+async fn an_anonymous_principal_is_not_mapped() {
+    let nil_tenant = LicenseCheckContext::builder()
+        .tenant_id(Uuid::nil())
+        .build()
+        .expect("tenant is set");
+    for (principal_id, context) in [
+        (Uuid::nil(), test_context()),
+        (Uuid::from_u128(7), nil_tenant),
+    ] {
+        let plugin = MockPlugin::granting();
+        let (svc, metrics) = wired_service(plugin.clone());
 
-    let decision = svc
-        .is_principal_licensed(
-            Some(OPERATOR_PRINCIPAL),
-            Uuid::nil(),
-            model_usage(),
-            test_context(),
-        )
-        .await
-        .expect("a nil principal is a decision");
+        let decision = svc
+            .is_principal_licensed(
+                Some(OPERATOR_PRINCIPAL),
+                principal_id,
+                model_usage(),
+                context,
+            )
+            .await
+            .expect("an anonymous principal is a decision");
 
-    assert!(!decision.granted);
-    assert!(plugin.seen().is_empty());
-    assert_eq!(
-        metrics.checks(),
-        vec![(
-            UNVALIDATED_CONTRACT.to_owned(),
-            CheckOutcome::PrincipalNotMapped
-        )]
-    );
+        assert!(!decision.granted);
+        assert!(plugin.seen().is_empty());
+        assert_eq!(
+            metrics.checks(),
+            vec![(
+                UNVALIDATED_CONTRACT.to_owned(),
+                CheckOutcome::PrincipalNotMapped
+            )]
+        );
+    }
 }
 
 #[tokio::test]

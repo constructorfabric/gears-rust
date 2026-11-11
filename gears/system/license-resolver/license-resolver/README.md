@@ -46,7 +46,7 @@ let resolver = hub.get::<dyn LicenseResolverApi>()?;
 
 let request = IsLicensedRequest::new(
     subject,   // instance of your derived `gts.cf.core.lic.subj.v1~…` contract, or a PrincipalSubject
-    resource,  // instance of your derived `gts.cf.core.lic.res.v1~…` contract
+    resource.clone(),  // instance of your derived `gts.cf.core.lic.res.v1~…` contract
     LicenseCheckContext::from_security_context(&ctx),
 );
 

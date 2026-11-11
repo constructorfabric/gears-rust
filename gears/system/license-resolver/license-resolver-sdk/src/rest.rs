@@ -29,6 +29,7 @@ pub trait LicenseResolverApiRest: LicenseResolverApi {
 
     /// `POST /license-resolver/v1/is-self-licensed`.
     #[post("/is-self-licensed")]
+    #[exposed]
     async fn is_self_licensed(
         &self,
         ctx: SecurityContext,

@@ -301,9 +301,9 @@ Both fields are forwarded to the backend plugin unchanged; it interprets them to
 **Principal mapping** — gateway configuration `principal_subject_types`, a map from principal type to Subject contract
 type, set by the platform vendor. For a principal type `P` the gateway takes the entry for `P`; failing that, it
 resolves `P` in the types registry and takes the entry of the nearest ancestor that has one. A principal type that is
-absent, malformed, not registered or without an entry is **not mapped**, and so is a principal with a nil id: the check returns `granted: false` with the
-diagnostic `reason: principal_not_mapped`, and neither the Resource is validated nor the plugin called. An operator
-subtype of a mapped principal type needs no entry of its own. See
+absent, malformed, not registered or without an entry is **not mapped**, and so is a principal with a nil id or tenant: 
+the check returns `granted: false` with the diagnostic `reason: principal_not_mapped`, and neither the Resource is 
+validated nor the plugin called. An operator subtype of a mapped principal type needs no entry of its own. See
 `cpt-cf-license-resolver-adr-principal-subject-mapping`.
 
 **Relationships**:

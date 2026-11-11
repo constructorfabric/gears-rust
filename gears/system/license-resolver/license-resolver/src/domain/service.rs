@@ -157,8 +157,8 @@ impl Service {
 
     /// Answer whether the resource is licensed to the principal, mapped to its
     /// Subject contract type with `id` and empty `metadata`. A principal that is
-    /// not mapped, or has a nil id, is not granted, without validating the
-    /// resource.
+    /// not mapped, or has a nil id or tenant, is not granted, without validating
+    /// the resource.
     ///
     /// # Errors
     ///
@@ -172,7 +172,7 @@ impl Service {
         context: LicenseCheckContext,
     ) -> Result<LicenseDecision, DomainError> {
         let started = Instant::now();
-        let subject_type = if principal_id.is_nil() {
+        let subject_type = if principal_id.is_nil() || context.tenant_id.is_nil() {
             Ok(None)
         } else {
             self.principals.subject_type(principal_type).await

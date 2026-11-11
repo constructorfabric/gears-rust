@@ -7349,6 +7349,29 @@
         ],
         "type": "object"
       },
+      "IsLicensedRequest": {
+        "description": "The input of [`LicenseResolverApi::is_licensed`](crate::LicenseResolverApi::is_licensed)\n— the contract's growth surface.\n\nNew inputs are added as fields here, never as new method parameters. Because\nthat growth is expected, the type is `#[non_exhaustive]` and is built through\n[`new`](Self::new), so adding an input stays additive instead of breaking\nevery caller's struct literal. Contextual inputs belong on\n[`LicenseCheckContext`].\n\nUnknown fields are **ignored** here too, under the same rule as\n[`LicenseCheckContext`].",
+        "properties": {
+          "context": {
+            "$ref": "#/components/schemas/LicenseCheckContext",
+            "description": "The tenant isolation scope (caller-derived from its `SecurityContext`)."
+          },
+          "resource": {
+            "$ref": "#/components/schemas/LicenseResource",
+            "description": "The licensable thing being checked."
+          },
+          "subject": {
+            "$ref": "#/components/schemas/SubjectInput",
+            "description": "Whom the license is checked for."
+          }
+        },
+        "required": [
+          "subject",
+          "resource",
+          "context"
+        ],
+        "type": "object"
+      },
       "IssueDto": {
         "description": "GitHub-shaped issue.",
         "properties": {
@@ -7694,29 +7717,6 @@
         },
         "required": [
           "tenant_id"
-        ],
-        "type": "object"
-      },
-      "LicenseCheckRequest": {
-        "description": "The single input to a check — the contract's growth surface.\n\nNew inputs are added as fields here, never as new method parameters. Because\nthat growth is expected, the type is `#[non_exhaustive]` and is built through\n[`new`](Self::new), so adding an input stays additive instead of breaking\nevery caller's struct literal. Contextual inputs belong on\n[`LicenseCheckContext`].\n\nUnknown fields are **ignored** here too, under the same rule as\n[`LicenseCheckContext`].",
-        "properties": {
-          "context": {
-            "$ref": "#/components/schemas/LicenseCheckContext",
-            "description": "The tenant isolation scope (caller-derived from its `SecurityContext`)."
-          },
-          "resource": {
-            "$ref": "#/components/schemas/LicenseResource",
-            "description": "The licensable thing being checked."
-          },
-          "subject": {
-            "$ref": "#/components/schemas/LicenseSubject",
-            "description": "Whom the license is checked for."
-          }
-        },
-        "required": [
-          "subject",
-          "resource",
-          "context"
         ],
         "type": "object"
       },
@@ -14906,6 +14906,26 @@
         ],
         "type": "object"
       },
+      "PrincipalSubject": {
+        "additionalProperties": false,
+        "description": "The subject of a check given as a principal — whoever authenticated.\n\nThe resolver maps `principal_type` to the Subject contract type configured\nfor it and checks a [`Subject`] of that type, with `id` and empty\n`metadata`. A principal type without a mapping is not granted.",
+        "properties": {
+          "id": {
+            "description": "The principal id, as in `SecurityContext::subject_id`.",
+            "format": "uuid",
+            "type": "string"
+          },
+          "type": {
+            "description": "The principal type, as in `SecurityContext::subject_type`. Wire key `type`.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "id"
+        ],
+        "type": "object"
+      },
       "Problem": {
         "description": "RFC 9457 problem+json. `context` varies by error category.",
         "properties": {
@@ -19259,6 +19279,19 @@
         ],
         "type": "object"
       },
+      "SelfLicenseCheckRequest": {
+        "description": "The input of\n[`LicenseResolverApi::is_self_licensed`](crate::LicenseResolverApi::is_self_licensed).\n\nOnly the resource: the subject and the tenant scope come from the caller's\n`SecurityContext`. Unknown fields are **ignored**.",
+        "properties": {
+          "resource": {
+            "$ref": "#/components/schemas/LicenseResource",
+            "description": "The licensable thing being checked."
+          }
+        },
+        "required": [
+          "resource"
+        ],
+        "type": "object"
+      },
       "Server": {
         "properties": {
           "endpoints": {
@@ -20718,6 +20751,53 @@
           "id"
         ],
         "type": "object"
+      },
+      "SubjectInput": {
+        "description": "The subject of an [`IsLicensedRequest`]: a Subject contract object or a\nprincipal. Wire tag `kind`: `license` or `principal`.",
+        "oneOf": [
+          {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/LicenseSubject"
+              },
+              {
+                "properties": {
+                  "kind": {
+                    "enum": [
+                      "license"
+                    ],
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "kind"
+                ],
+                "type": "object"
+              }
+            ]
+          },
+          {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/PrincipalSubject"
+              },
+              {
+                "properties": {
+                  "kind": {
+                    "enum": [
+                      "principal"
+                    ],
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "kind"
+                ],
+                "type": "object"
+              }
+            ]
+          }
+        ]
       },
       "SubjectRefDto": {
         "description": "Wire-projection of [`usage_collector_sdk::SubjectRef`].",
@@ -54178,7 +54258,7 @@
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/LicenseCheckRequest"
+                "$ref": "#/components/schemas/IsLicensedRequest"
               }
             }
           },
@@ -54272,6 +54352,110 @@
             "internalToken": []
           }
         ]
+      }
+    },
+    "/license-resolver/v1/is-self-licensed": {
+      "post": {
+        "operationId": "license_resolver_api_rest_is_self_licensed",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SelfLicenseCheckRequest"
+              }
+            }
+          },
+          "description": "",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LicenseDecision"
+                }
+              }
+            },
+            "description": ""
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "409": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
+          "429": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Too Many Requests"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "x-toolkit-visibility": "exposed"
       }
     },
     "/mini-chat/v1/chats": {
