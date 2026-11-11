@@ -1,5 +1,4 @@
-# CodeQL code scanning: nightly, manual, and called by release-plz.yml before it
-# publishes. Never runs on pull requests.
+# CodeQL code scanning: nightly and manual runs only, never on pull requests.
 #
 # Pull request runs were removed for two reasons: they were the biggest consumer of the
 # shared GITHUB_TOKEN REST budget (PR #5884 measured ~180 of 339 rate-limit failures in
@@ -12,7 +11,10 @@ on:
   schedule:
     - cron: '40 23 * * *'
   workflow_dispatch:
-  workflow_call:
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
 
 permissions:
   contents: read
