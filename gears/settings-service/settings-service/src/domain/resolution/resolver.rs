@@ -288,6 +288,41 @@ fn select(
     }
 }
 
+/// The effective value among `rows` found at the scopes `inspected` (root to
+/// self) for a requested `tenant`: the winner the resolver would select, or
+/// the Schema Default — the pure half of the in-transaction resolve.
+#[domain_model]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EffectiveOver {
+    /// The value; for a secret row the store reference, never plaintext.
+    pub value: Value,
+    /// Whether the value is a secret row's reference.
+    pub secret_backed: bool,
+    /// The tenant whose row supplies it; absent for the Schema Default.
+    pub source_tenant: Option<Uuid>,
+}
+
+/// See [`EffectiveOver`].
+#[must_use]
+#[allow(
+    clippy::implicit_hasher,
+    reason = "the rows are the resolver's own index, built with the default hasher"
+)]
+pub fn effective_over(
+    declaration: &Declaration,
+    tenant: Uuid,
+    root: Uuid,
+    inspected: &[Uuid],
+    rows: &HashMap<Uuid, StoredValue>,
+) -> EffectiveOver {
+    let walk = select(declaration, tenant, root, inspected, rows);
+    EffectiveOver {
+        value: walk.value,
+        secret_backed: walk.secret_backed,
+        source_tenant: walk.source_tenant,
+    }
+}
+
 fn index(rows: Vec<StoredValue>) -> HashMap<Uuid, StoredValue> {
     rows.into_iter().map(|r| (r.tenant_id, r)).collect()
 }
@@ -1004,6 +1039,87 @@ where
         ))
     }
 
+    /// Resolve one setting at a target from the store, never from the cache
+    /// and never into it: the freshness form of the read, outside any
+    /// transaction. A consumer re-reading what a change notification named,
+    /// a registration's read after its commit and the fallback a revert of a
+    /// secret leaves in effect all ask it, so what they see is what the
+    /// store holds at this moment, whatever this replica's cache still serves.
+    ///
+    /// # Errors
+    /// As [`Self::resolve`].
+    pub async fn resolve_fresh<C: DBRunner>(
+        &self,
+        conn: &C,
+        key: &SettingKey,
+        target: ScopeTarget,
+    ) -> Result<Arc<EffectiveValue>, DomainError> {
+        let root = self.platform.root_tenant().await?;
+        let mut ancestry = Ancestry::new(root, target);
+        // @cpt-begin:cpt-cf-settings-service-algo-consumer-activation-fresh-read:p1:inst-ca-fresh-2
+        // @cpt-begin:cpt-cf-settings-service-algo-consumer-activation-fresh-read:p1:inst-ca-fresh-3
+        // No `EffectiveCache` is consulted: the declaration and the rows are
+        // read from the store over the requested tenant's chain.
+        let declaration = self.declaration(conn, key).await?;
+        let assembled = self.assemble(conn, &declaration, &mut ancestry).await?;
+        // @cpt-end:cpt-cf-settings-service-algo-consumer-activation-fresh-read:p1:inst-ca-fresh-3
+        // @cpt-end:cpt-cf-settings-service-algo-consumer-activation-fresh-read:p1:inst-ca-fresh-2
+        // @cpt-begin:cpt-cf-settings-service-algo-consumer-activation-fresh-read:p1:inst-ca-fresh-4
+        // Never stored: the result goes to the caller and nowhere else, so the
+        // read leaves the cache as it found it.
+        Ok(Arc::new(assembled))
+        // @cpt-end:cpt-cf-settings-service-algo-consumer-activation-fresh-read:p1:inst-ca-fresh-4
+    }
+
+    /// The rows an effective value at `tenant` is selected from, read through
+    /// the caller's transaction over a chain it already holds: the in-transaction
+    /// form of the resolve. It bypasses the cache and never populates it, and
+    /// asks no resolver — `chain` is `tenant`'s root-to-self chain, handed in,
+    /// and is read only for a `cascading` setting. Returns the scopes the value
+    /// is selected among, root to self, with the rows found there.
+    ///
+    /// # Errors
+    /// [`DomainError`] when the rows cannot be read.
+    pub async fn rows_over<C: DBRunner>(
+        &self,
+        conn: &C,
+        declaration: &Declaration,
+        tenant: Uuid,
+        root: Uuid,
+        chain: &[Uuid],
+    ) -> Result<(Vec<Uuid>, HashMap<Uuid, StoredValue>), DomainError> {
+        let scope = AccessScope::allow_all();
+        match declaration.scope_class.as_str() {
+            scope_class::GLOBAL => {
+                let row = self
+                    .values
+                    .find_one(conn, &scope, declaration.id, root)
+                    .await?;
+                Ok((vec![root], index(row.into_iter().collect())))
+            }
+            scope_class::CASCADING => {
+                let rows = self
+                    .values
+                    .find_in_tenants(conn, &scope, declaration.id, chain)
+                    .await?;
+                Ok((chain.to_vec(), index(rows)))
+            }
+            scope_class::LOCAL => {
+                let row = self
+                    .values
+                    .find_one(conn, &scope, declaration.id, tenant)
+                    .await?;
+                Ok((vec![tenant], index(row.into_iter().collect())))
+            }
+            other => Err(DomainError::Internal {
+                diagnostic: format!(
+                    "declaration `{}` carries the unknown scope class `{other}`",
+                    declaration.key
+                ),
+            }),
+        }
+    }
+
     async fn resolve_shared<C: DBRunner>(
         &self,
         conn: &C,
@@ -1069,6 +1185,23 @@ where
             return Ok(hit);
         }
         let seen = seen.unwrap_or_else(|| self.cache.generation(&declaration.key, ancestry.tenant));
+        let effective = Arc::new(self.assemble(conn, declaration, ancestry).await?);
+        // @cpt-begin:cpt-cf-settings-service-flow-value-resolution-resolve:p1:inst-vr-resolve-11
+        self.cache.populate(Arc::clone(&effective), seen);
+        // @cpt-end:cpt-cf-settings-service-flow-value-resolution-resolve:p1:inst-vr-resolve-11
+        // @cpt-begin:cpt-cf-settings-service-flow-value-resolution-resolve:p1:inst-vr-resolve-12
+        Ok(effective)
+        // @cpt-end:cpt-cf-settings-service-flow-value-resolution-resolve:p1:inst-vr-resolve-12
+    }
+
+    /// The walk, assembled into a value: everything a resolve does but the
+    /// cache's two touches. The cached form and the freshness form share it.
+    async fn assemble<C: DBRunner>(
+        &self,
+        conn: &C,
+        declaration: &Declaration,
+        ancestry: &mut Ancestry,
+    ) -> Result<EffectiveValue, DomainError> {
         // @cpt-begin:cpt-cf-settings-service-flow-value-resolution-resolve:p1:inst-vr-resolve-6
         // A positive fact, distinct from not-found; the retained values stay
         // in the table and are not returned.
@@ -1090,19 +1223,13 @@ where
         // @cpt-begin:cpt-cf-settings-service-flow-value-resolution-resolve:p1:inst-vr-resolve-9
         let traits = self.traits(&declaration.value_type_id).await?;
         // @cpt-end:cpt-cf-settings-service-flow-value-resolution-resolve:p1:inst-vr-resolve-9
-        let effective = Arc::new(effective_value(
+        Ok(effective_value(
             declaration,
             ancestry.root,
             ancestry.tenant,
             walk,
             traits,
-        ));
-        // @cpt-begin:cpt-cf-settings-service-flow-value-resolution-resolve:p1:inst-vr-resolve-11
-        self.cache.populate(Arc::clone(&effective), seen);
-        // @cpt-end:cpt-cf-settings-service-flow-value-resolution-resolve:p1:inst-vr-resolve-11
-        // @cpt-begin:cpt-cf-settings-service-flow-value-resolution-resolve:p1:inst-vr-resolve-12
-        Ok(effective)
-        // @cpt-end:cpt-cf-settings-service-flow-value-resolution-resolve:p1:inst-vr-resolve-12
+        ))
     }
 
     /// The value type's trait set, for rendering.

@@ -14,7 +14,8 @@ use crate::domain::writes::value_state_tag;
 /// absent-state tag, which the read returns for the same state.
 pub const ABSENT_STATE_TAG: &str = crate::domain::writes::ABSENT_VALUE_TAG;
 
-fn rfc3339(at: OffsetDateTime) -> String {
+/// A timestamp as the wire carries it: RFC 3339.
+pub(crate) fn rfc3339(at: OffsetDateTime) -> String {
     at.format(&Rfc3339).unwrap_or_else(|_| at.to_string())
 }
 
@@ -625,7 +626,9 @@ pub struct AuditRecordDto {
     /// which belongs to no tenant and appears in every scope's history.
     #[schema(required)]
     pub tenant_id: Option<Uuid>,
-    /// `create`, `change`, `revert`, `remove`, `clone`, `secret_use` or `stage`.
+    /// `create`, `change`, `revert`, `remove`, `clone`, `secret_use`, `stage` or
+    /// `activation`. Treat the set as open: a client meets a value it does not
+    /// know as a record it cannot interpret.
     pub operation: String,
     /// Who did it, masked when the identity is PII the caller may not see.
     pub actor: String,
@@ -651,7 +654,9 @@ pub struct AuditRecordDto {
     pub post_value: Option<Value>,
     /// Whether the recorded values were masked for this caller.
     pub values_masked: bool,
-    /// `success` or `failure`.
+    /// `success`, `failure` or `silent` — the last on an `activation` record
+    /// the delivery loop wrote when it called an instance silent for the
+    /// change. Treat the set as open.
     pub outcome: String,
     /// The request that produced the record.
     pub request_id: String,
@@ -660,6 +665,63 @@ pub struct AuditRecordDto {
     pub change_set_id: Option<Uuid>,
     /// When it happened.
     pub occurred_at: String,
+    /// On an `activation` record, the id of the change record it answers.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub change_ref: Option<Uuid>,
+    /// On a `failure` `activation` record, the consumer's detail, free of
+    /// values and secrets by contract.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    /// On an `activation` record, the consumer instance that reported or was
+    /// called silent. Present only for a caller whose own tenant is the root
+    /// tenant; absent — never masked — for every other caller.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub instance_id: Option<Uuid>,
+    /// On an `activation` record, the instance's label at the time of the
+    /// record. Present only for a caller whose own tenant is the root tenant.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub instance_label: Option<String>,
+    /// The consumers' reports on this record, newest first, at every tenant of
+    /// the caller's subtree where the caller may read the setting; empty when
+    /// nothing answers it. Not paged and not counted.
+    pub activations: Vec<ActivationReportDto>,
+}
+
+/// One instance's report on a change, or one call of silence for it, attached
+/// under the change's record: one item per instance that reported and one per
+/// call of silence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[toolkit_macros::api_dto(response)]
+pub struct ActivationReportDto {
+    /// The id of the change record the report answers.
+    pub change_ref: Uuid,
+    /// The subscriber, a gear identity: shown as recorded when its tenant lies
+    /// on the path from the reader down to the report's tenant, else the mask
+    /// token, as a listed record's actor is.
+    pub actor: String,
+    /// The actor is the mask token because the upward disclosure boundary
+    /// withheld it; absent otherwise.
+    #[serde(skip_serializing_if = "is_false")]
+    pub actor_withheld: bool,
+    /// `success`, `failure` or `silent`, the last being a call of silence.
+    /// Treat the set as open.
+    pub outcome: String,
+    /// The consumer's detail on a `failure`; absent on a `success` and on a
+    /// call of silence.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    /// The tenant the report was made for.
+    pub tenant_id: Uuid,
+    /// When the report was recorded.
+    pub occurred_at: String,
+    /// The consumer instance. Present only for a caller whose own tenant is the
+    /// root tenant; absent — never masked — for every other caller.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub instance_id: Option<Uuid>,
+    /// The instance's label at the time of the record. Present only for a
+    /// caller whose own tenant is the root tenant.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub instance_label: Option<String>,
 }
 
 /// One image as a reader is shown it. A secret was recorded as its mask. A
@@ -693,16 +755,23 @@ fn recorded(
 #[must_use]
 pub fn render_record(
     record: &crate::audit::StoredAuditRecord,
+    attached: &[crate::audit::StoredAuditRecord],
     values_are_pii: bool,
     may_read_pii: bool,
     actor_shown: bool,
+    reader: Reader,
+    report_actor_shown: &dyn Fn(&crate::audit::StoredAuditRecord) -> bool,
 ) -> AuditRecordDto {
+    // An instance's identity sits above every tenant reader: the root
+    // tenant's reader is shown it and no other reader is.
+    let identity_shown = reader == Reader::Platform;
     // @cpt-begin:cpt-cf-settings-service-flow-audit-store-history:p1:inst-as-hist-10
     // The actor is withheld, whatever the entitlement and whatever its
     // classification, unless the boundary shows it to this reader.
     let actor_withheld = !actor_shown;
     // @cpt-end:cpt-cf-settings-service-flow-audit-store-history:p1:inst-as-hist-10
     // @cpt-begin:cpt-cf-settings-service-flow-audit-store-history:p1:inst-as-hist-8
+    // @cpt-begin:cpt-cf-settings-service-flow-activation-read-history:p1:inst-ar-history-5
     // The mask token is shown for either reason, so `actor_masked` stays true
     // whenever it is; `actor_withheld` says which.
     let actor_masked = actor_withheld
@@ -727,6 +796,73 @@ pub fn render_record(
         request_id: record.request_id.clone(),
         change_set_id: record.change_set_id,
         occurred_at: rfc3339(record.occurred_at),
+        // @cpt-begin:cpt-cf-settings-service-flow-activation-read-history:p1:inst-ar-history-6
+        // A listed `activation` record names its change and, on a failure,
+        // says why; it never carries a pre-value or post-value.
+        change_ref: record.change_ref,
+        detail: failure_detail(record),
+        // @cpt-end:cpt-cf-settings-service-flow-activation-read-history:p1:inst-ar-history-6
+        // @cpt-begin:cpt-cf-settings-service-flow-activation-read-history:p1:inst-ar-history-12
+        instance_id: record.instance_id.filter(|_| identity_shown),
+        instance_label: record.instance_label.clone().filter(|_| identity_shown),
+        // @cpt-end:cpt-cf-settings-service-flow-activation-read-history:p1:inst-ar-history-12
+        // @cpt-begin:cpt-cf-settings-service-flow-activation-read-history:p1:inst-ar-history-10
+        activations: attached
+            .iter()
+            .filter_map(|report| {
+                render_report(
+                    report,
+                    may_read_pii,
+                    report_actor_shown(report),
+                    identity_shown,
+                )
+            })
+            .collect(),
+        // @cpt-end:cpt-cf-settings-service-flow-activation-read-history:p1:inst-ar-history-10
     }
+    // @cpt-end:cpt-cf-settings-service-flow-activation-read-history:p1:inst-ar-history-5
     // @cpt-end:cpt-cf-settings-service-flow-audit-store-history:p1:inst-as-hist-8
+}
+
+/// The detail of a record, only when it is a failure: a success carries none.
+fn failure_detail(record: &crate::audit::StoredAuditRecord) -> Option<String> {
+    record
+        .detail
+        .clone()
+        .filter(|_| record.outcome == crate::audit::AuditOutcome::Failure)
+}
+
+/// A report as it is attached under its change: no pre-value, post-value or
+/// `request_id`, the actor masked as a listed record's is. A record that names
+/// no change or no tenant is not a report and renders as nothing.
+fn render_report(
+    report: &crate::audit::StoredAuditRecord,
+    may_read_pii: bool,
+    actor_shown: bool,
+    identity_shown: bool,
+) -> Option<ActivationReportDto> {
+    // @cpt-begin:cpt-cf-settings-service-algo-activation-read-attach:p1:inst-ar-attach-7
+    let actor_withheld = !actor_shown;
+    let masked = actor_withheld
+        || (report.actor_classification == crate::audit::ActorClassification::Pii && !may_read_pii);
+    Some(ActivationReportDto {
+        change_ref: report.change_ref?,
+        actor: if masked {
+            MASK_TOKEN.to_owned()
+        } else {
+            report.actor.clone()
+        },
+        actor_withheld,
+        outcome: report.outcome.as_str().to_owned(),
+        detail: failure_detail(report),
+        tenant_id: report.tenant_id?,
+        occurred_at: rfc3339(report.occurred_at),
+        // @cpt-begin:cpt-cf-settings-service-algo-activation-read-attach:p1:inst-ar-attach-9
+        // The identity is the instance's, and the reader tenant decides it:
+        // absent, never masked, for every reader but the root's.
+        instance_id: report.instance_id.filter(|_| identity_shown),
+        instance_label: report.instance_label.clone().filter(|_| identity_shown),
+        // @cpt-end:cpt-cf-settings-service-algo-activation-read-attach:p1:inst-ar-attach-9
+    })
+    // @cpt-end:cpt-cf-settings-service-algo-activation-read-attach:p1:inst-ar-attach-7
 }

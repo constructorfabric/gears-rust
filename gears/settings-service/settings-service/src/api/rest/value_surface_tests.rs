@@ -1145,3 +1145,89 @@ async fn a_target_outside_the_callers_subtree_is_refused_on_every_write() {
         "nothing was stored"
     );
 }
+
+// ── The key's mutation lock ──────────────────────────────────────────────────
+
+#[tokio::test]
+async fn a_set_whose_keys_lock_stays_held_is_a_503_with_nothing_stored() {
+    let h = RestHarness::new().await;
+    h.inner.declare("proxy", "cascading", json!(true)).await;
+    let key = h.inner.key("proxy");
+    let owner = h.activation.locks.hold(key.as_str());
+    let uri = value_of(&h, "proxy");
+
+    let answer = h
+        .send(
+            "PUT",
+            &uri,
+            Some(json!({ "value": false })),
+            Some("absent"),
+            h.inner.tree.root,
+        )
+        .await;
+
+    assert_eq!(answer.status, 503, "{}", answer.body);
+    let (status, body) = h.get(&setting(&h, "proxy"), h.inner.tree.root).await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        body["source"],
+        json!("schema_default"),
+        "nothing was stored"
+    );
+    assert!(
+        h.activation.locks.is_held(key.as_str()),
+        "still its owner's"
+    );
+
+    // The owner lets go; the retry the 503 invites goes through.
+    crate::domain::activation::HeldKey::release(Box::new(owner)).await;
+    let retried = h
+        .send(
+            "PUT",
+            &uri,
+            Some(json!({ "value": false })),
+            Some("absent"),
+            h.inner.tree.root,
+        )
+        .await;
+    assert_eq!(retried.status, 200, "{}", retried.body);
+    assert!(
+        !h.activation.locks.is_held(key.as_str()),
+        "released after the answer"
+    );
+}
+
+#[tokio::test]
+async fn a_batch_item_whose_lock_stays_held_is_reported_unavailable_beside_its_committed_neighbours()
+ {
+    let h = RestHarness::new().await;
+    for name in ["first", "held", "last"] {
+        h.inner.declare(name, "cascading", json!(true)).await;
+    }
+    let _owner = h.activation.locks.hold(h.inner.key("held").as_str());
+
+    let answer = h
+        .send(
+            "POST",
+            BATCH,
+            Some(json!({ "changes": [
+                { "key": h.inner.key("first").to_string(), "value": false, "if_match": "absent" },
+                { "key": h.inner.key("held").to_string(), "value": false, "if_match": "absent" },
+                { "key": h.inner.key("last").to_string(), "value": false, "if_match": "absent" },
+            ]})),
+            None,
+            h.inner.tree.root,
+        )
+        .await;
+
+    assert_eq!(answer.status, 200, "{}", answer.body);
+    let results = answer.body["results"].as_array().expect("results");
+    assert_eq!(results[0]["outcome"], json!("committed"));
+    assert_eq!(results[1]["outcome"], json!("rejected"));
+    assert_eq!(results[1]["error"], json!("unavailable"), "{}", results[1]);
+    assert_eq!(
+        results[2]["outcome"],
+        json!("committed"),
+        "later changes are attempted"
+    );
+}

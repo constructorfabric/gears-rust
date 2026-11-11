@@ -12,6 +12,7 @@ use std::time::Duration;
 use toolkit_macros::domain_model;
 
 use async_trait::async_trait;
+use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
 /// The subject type of an interactive human session, as the authorization
@@ -37,6 +38,16 @@ pub const USER_SUBJECT_TYPE: &str = toolkit_gts::gts_id!("cf.core.security.subje
 /// either one silently refuses every interactive write on the stands that use
 /// it, with a `403` that names a service principal and explains nothing.
 pub const INTERACTIVE_SUBJECT_TYPES: &[&str] = &[USER_SUBJECT_TYPE, "user"];
+
+/// Whether the subject of `ctx` is a human session: its subject type is one of
+/// [`INTERACTIVE_SUBJECT_TYPES`]. An unlabelled subject is not — absence of a
+/// label is no evidence of a person. The one classification every path that
+/// tells a person from a service principal asks.
+#[must_use]
+pub fn is_interactive_subject(ctx: &SecurityContext) -> bool {
+    ctx.subject_type()
+        .is_some_and(|t| INTERACTIVE_SUBJECT_TYPES.contains(&t))
+}
 
 /// What a deployment requires of a step-up token.
 #[domain_model]

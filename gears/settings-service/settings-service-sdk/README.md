@@ -56,6 +56,30 @@ typed projection a consumer matches on — `Unavailable`, `Retired`, `NotFound`,
 `SecretNotConfigured`, `Unauthorized`, `Other` — per
 [ADR 0005](../../../docs/arch/errors/ADR/0005-cpt-cf-adr-sdk-canonical-projection.md).
 
+## Consumer activation
+
+`SettingsActivationClient` — for a consumer that has *materialized* a setting (a
+pool sized by it, a socket bound from it) and must re-apply it when it changes:
+
+- `subscribe(ctx, keys, tenant, handler)` registers the calling gear for exact
+  keys at one tenant and returns a `SubscriptionHandle` at once. Every outcome
+  is a per-key `KeyState`: `Registered` with the fresh value to materialize
+  from, `Pending` (the SDK retries with backoff while the handle lives and warns
+  each minute), or `Refused` (terminal). `subscribe` fails only for invalid
+  input. Dropping a handle stops its retries and unsubscribes nothing;
+  `unsubscribe()` is explicit, and it deletes a key's subscription only when no
+  other live handle of the gear in the process still holds it.
+- On a change the handler's `on_change` receives a `ChangeBundle`: the keys that
+  changed at the tenant, each **re-read fresh** by the SDK (`Freshness::Fresh`
+  on `get_effective` bypasses the replica's cache), with the `change_ref` that
+  names the change. It returns one `ActivationOutcome` per key; the SDK reports
+  them. A consumer that finishes later calls `report_outcome` itself. Reacting
+  must be idempotent: a repeat is delivered until it is reported.
+- `ActivationOutcome` carries the applied value, encoded by the SDK
+  (`canonical`: RFC 8785, and a salted SHA-256 for a secret that the SDK
+  computes from the plaintext the consumer applied); a failure carries a
+  `detail` that must be free of values and secrets.
+
 ## Value-type catalogue
 
 `catalogue::CATALOGUE` ships one registered type per shape a setting may take —

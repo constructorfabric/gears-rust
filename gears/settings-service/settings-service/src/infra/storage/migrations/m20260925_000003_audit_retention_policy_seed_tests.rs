@@ -50,7 +50,11 @@ async fn rolling_the_seed_back_leaves_a_configured_row_where_it_is() {
         .await
         .expect("the gear configured a longer retention");
 
-    Migrator::down(&db, Some(1)).await.expect("one step back");
+    // The seed is the third from last: the display-name and the activation
+    // migrations were applied after it, so all three go.
+    Migrator::down(&db, Some(3))
+        .await
+        .expect("three steps back");
 
     let rows = db
         .query_all_raw(Statement::from_string(

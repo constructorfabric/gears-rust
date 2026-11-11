@@ -158,7 +158,7 @@ The hardest constraint here is not any single field but the rule connecting them
 10. [x] - `p1` - **IF** any field resolves to the step-up class → require a valid credential step-up assertion - `inst-decl-update-10`
 11. [x] - `p1` - **IF** step-up is required and absent or invalid → **RETURN** `403` - `inst-decl-update-11`
 12. [x] - `p1` - **IF** the request enables `anonymous_exposable` on a declaration whose `data_classification` is `secret` or `pii` → **RETURN** `400`, preserving the database check as the backstop - `inst-decl-update-12`
-13. [x] - `p1` - DB: UPDATE setting_declarations SET {supplied metadata} (an explicit `null` clears a nullable field — `display_name`, `description`, `domain_affinity`, `licence_feature` — and an absent field is unchanged, and a supplied `display_name` is stored trimmed), `updated_at` = now(), and `last_change_at` = now() only when a field that changes what a reader is served changed — classification, step-up, anonymous exposure, licence feature, domain affinity; a description, display name or mode edit leaves the definition recency alone — WHERE id = {id} AND `updated_at` = {the version the tag was compared against}; **IF** no row matched → **RETURN** `412`; invalidate the local cache for the key — inside the transaction and again once it commits, as retire does — since the cached effective value carries the declaration's classification and domain affinity - `inst-decl-update-13`
+13. [x] - `p1` - DB: UPDATE setting_declarations SET {supplied metadata} (an explicit `null` clears a nullable field — `display_name`, `description`, `domain_affinity`, `licence_feature` — and an absent field is unchanged, and a supplied `display_name` is stored trimmed), `updated_at` = now(), and `last_change_at` = now() only when a field that changes what a reader is served changed — classification, step-up, anonymous exposure, licence feature, domain affinity; a description, display name or mode edit leaves the definition recency alone — WHERE id = {id} AND `updated_at` = {the version the tag was compared against}; **IF** no row matched → **RETURN** `412`; invalidate the local cache for the key — inside the transaction and again once it commits, as retire does — since the cached effective value carries the declaration's classification and domain affinity; when the classification or domain affinity changed, after the request's commits, the audit record included, the end-of-request publish of replica coherence (`cpt-cf-settings-service-flow-replica-coherence-publish`) runs - `inst-decl-update-13`
 14. [x] - `p1` - Emit a declaration-updated audit record with pre-image and post-image - `inst-decl-update-14`
 15. [x] - `p1` - **RETURN** `200` with the updated declaration and a refreshed ETag - `inst-decl-update-15`
 
@@ -188,7 +188,7 @@ The hardest constraint here is not any single field but the rule connecting them
 9. [x] - `p1` - Evaluate the `If-Match` precondition; **IF** absent → **RETURN** `428`; **IF** stale → **RETURN** `412` - `inst-decl-retire-9`
 10. [x] - `p1` - DB: UPDATE setting_declarations SET `status` = 'retired' WHERE id = {id} AND `updated_at` = {the version the tag was compared against}, in one transaction with the invalidation below; **IF** no row matched → **RETURN** `412` - `inst-decl-retire-10`
 11. [x] - `p1` - Retain every row in `setting_values` for this declaration; retire never deletes values - `inst-decl-retire-11`
-12. [x] - `p1` - Invalidate the local cache for the affected scopes and publish the cache-invalidation and declaration-retired signals - `inst-decl-retire-12`
+12. [x] - `p1` - Invalidate the local cache for the affected scopes and emit the declaration-retired signal; after the request's commits, the audit record included, the end-of-request publish of replica coherence (`cpt-cf-settings-service-flow-replica-coherence-publish`) runs - `inst-decl-retire-12`
 13. [x] - `p1` - Emit a declaration-retired audit record carrying pre-images - `inst-decl-retire-13`
 14. [x] - `p1` - **RETURN** `200` with the retired declaration; this is a soft delete, not a `204` removal - `inst-decl-retire-14`
 
@@ -221,7 +221,7 @@ The hardest constraint here is not any single field but the rule connecting them
 11. [x] - `p1` - **IF** step-up is absent or invalid → **RETURN** `403` - `inst-decl-react-8`
 12. [x] - `p1` - Confirm the setting's own type in the Types Registry under the stored value type before anything is written, as a create registers before it inserts - `inst-decl-react-14`
 13. [x] - `p1` - DB: UPDATE setting_declarations SET `status` = 'active', the re-declared Schema Default and metadata WHERE key = {key}; re-validate every retained value against the value type, which may have gained a compatible revision while the setting sat retired, flagging what no longer validates `needs_review` with its detail and clearing the flag on what validates again - `inst-decl-react-9`
-14. [x] - `p1` - Invalidate the local cache for the affected scopes, since retained values re-enter resolution - `inst-decl-react-10`
+14. [x] - `p1` - Invalidate the local cache for the affected scopes, since retained values re-enter resolution; after the request's commits, the audit record included, the end-of-request publish of replica coherence (`cpt-cf-settings-service-flow-replica-coherence-publish`) runs - `inst-decl-react-10`
 15. [x] - `p1` - Emit a declaration-reactivated audit record - `inst-decl-react-11`
 16. [x] - `p1` - **RETURN** `200` with the revived declaration - `inst-decl-react-12`
 
@@ -289,16 +289,17 @@ The hardest constraint here is not any single field but the rule connecting them
 11. [x] - `p2` - Evaluate the `If-Match` precondition; **IF** absent → **RETURN** `428`; **IF** stale → **RETURN** `412` - `inst-decl-purge-11`
 12. [x] - `p2` - DB: SELECT the `(tenant_id, secret_ref)` pairs of every `setting_values` row of the declaration that holds a `secret_ref` — at any scope and with or without a subject, whatever the caller's scope, because the cascade removes them all — and of every `pending_secrets` row of the declaration, keeping out every reference a row of another declaration still holds (an evolution copies its predecessor's references into the successor) - `inst-decl-purge-12`
 13. [x] - `p2` - DB: DELETE FROM setting_declarations WHERE id = {id} AND `updated_at` = {the version the tag was compared against}; `setting_values`, `tenant_permissions` and `pending_secrets` go by `ON DELETE CASCADE`; **IF** no row matched → **RETURN** `412` - `inst-decl-purge-13`
-14. [x] - `p2` - Emit the declaration-purged audit record, attributed to the authenticated caller: operation `remove` on the definition resource, the definition as pre-image, no post-image and no stored value - `inst-decl-purge-14`
-15. [x] - `p2` - Invalidate the local cache for the key inside the transaction - `inst-decl-purge-15`
-16. [x] - `p2` - Commit the transaction - `inst-decl-purge-16`
-17. [x] - `p2` - Evict the key from the effective cache again, and check the references kept for another declaration again: one no declaration holds any more joins the release - `inst-decl-purge-17`
-18. [x] - `p2` - Start the release task, detached from the request, with the key and the collected pairs; log one `info` line with the key, the number of entries, the number kept for another declaration and the request id - `inst-decl-purge-18`
-19. [x] - `p2` - **FOR EACH** collected pair, at most 4 at a time → ask the Secret Manager to release the entry - `inst-decl-purge-19`
-20. [x] - `p2` - **IF** the entry is released, or is already absent → count `ok` in `settings_declaration_purge_secret_releases_total` - `inst-decl-purge-20`
-21. [x] - `p2` - **ELSE** → log at `error` with the key, the tenant and the error's log-safe text — never the secret — count `failed`, and keep the purge - `inst-decl-purge-21`
-22. [x] - `p2` - When every pair is done, log one `info` line with the released and failed counts and the request id - `inst-decl-purge-22`
-23. [x] - `p2` - Wait for the release task and **RETURN** `204`; a dropped request does not stop the task - `inst-decl-purge-23`
+14. [x] - `p2` - DB: DELETE every `activation_state` row and every `subscriptions` row of the key, in the same transaction — every subscriber's, at every tenant, whatever the state's status, since the key is unique to this declaration; nothing is reported for the deleted states, a consumer learns of the purge from its next fresh read, and a registration of the key in flight waits on the declaration row it shares and finds no declaration (`cpt-cf-settings-service-flow-consumer-activation-subscribe`); log at `info` with the key and the two counts when any row went - `inst-decl-purge-24`
+15. [x] - `p2` - Emit the declaration-purged audit record, attributed to the authenticated caller: operation `remove` on the definition resource, the definition as pre-image, no post-image and no stored value - `inst-decl-purge-14`
+16. [x] - `p2` - Invalidate the local cache for the key inside the transaction - `inst-decl-purge-15`
+17. [x] - `p2` - Commit the transaction - `inst-decl-purge-16`
+18. [x] - `p2` - Evict the key from the effective cache again, and check the references kept for another declaration again: one no declaration holds any more joins the release - `inst-decl-purge-17`
+19. [x] - `p2` - Start the release task, detached from the request, with the key and the collected pairs; log one `info` line with the key, the number of entries, the number kept for another declaration and the request id - `inst-decl-purge-18`
+20. [x] - `p2` - **FOR EACH** collected pair, at most 4 at a time → ask the Secret Manager to release the entry - `inst-decl-purge-19`
+21. [x] - `p2` - **IF** the entry is released, or is already absent → count `ok` in `settings_declaration_purge_secret_releases_total` - `inst-decl-purge-20`
+22. [x] - `p2` - **ELSE** → log at `error` with the key, the tenant and the error's log-safe text — never the secret — count `failed`, and keep the purge - `inst-decl-purge-21`
+23. [x] - `p2` - When every pair is done, log one `info` line with the released and failed counts and the request id - `inst-decl-purge-22`
+24. [x] - `p2` - Wait for the release task and **RETURN** `204`; a dropped request does not stop the task - `inst-decl-purge-23`
 
 A start line without an end line shows a release cut short by a process stop: nothing retries it, the purge stands, and the entries it did not reach are orphans an operator finds in the Credential Store under the reference prefix the gear derives from the key and the tenant the log names.
 
@@ -327,7 +328,7 @@ A purge's duration grows with the number of Credential Store entries it releases
 5. [x] - `p1` - **IF** the new value type flips the secret trait → **RETURN** `409`, since stored values would be re-interpreted rather than moved - `inst-decl-evolve-4`
 6. [x] - `p1` - Mint the next free major: one above the highest major the path has ever used, retired ones included, composed as `<vendor>.settings.<category>.<name>.vN~` - `inst-decl-evolve-5`
 7. [x] - `p1` - In one transaction: retire the active predecessor and record it; insert the successor at the new key — its own GTS setting type registered first, its create recorded; copy every predecessor value to it at the same scope under an update lock, carrying `set_by` and `set_by_tenant` unchanged, re-validating each against the new value type and flagging what fails `needs_review` with its detail, never coercing or dropping it - `inst-decl-evolve-6`
-8. [x] - `p1` - Invalidate the local cache for both keys, and **RETURN** `200` with the successor and `evolved: true` - `inst-decl-evolve-7`
+8. [x] - `p1` - Invalidate the local cache for both keys; after the request's commits, the audit record included, the end-of-request publish of replica coherence (`cpt-cf-settings-service-flow-replica-coherence-publish`) runs for both keys, and **RETURN** `200` with the successor and `evolved: true` - `inst-decl-evolve-7`
 
 ### Declare Dependency Group
 
@@ -580,7 +581,7 @@ The system **MUST** serve `POST /settings-service/v1/declarations/revival-previe
 
 Purge **MUST** refuse a declaration that is `module_contributed` (`409 ContributedDeclarationImmutable`, judged first) or not `retired` (`409 DeclarationNotRetired`), and one that is absent or outside the caller's administrative domain (`404`); it **MUST** require `If-Match`. `delete` authorization and credential step-up **MUST** be judged before any row is read. Every declaration action that requires credential step-up — retire, reactivate, evolve, a metadata update that loosens the classification or clears a step-up flag, and purge — **MUST** count its step-up outcome in `settings_step_up_total` under its own operation (`retire`, `reactivate`, `evolve`, `update`, `purge`).
 
-Purge **MUST** run as one transaction that first takes the declaration row for update, judges the refusals on the locked row, collects the `(tenant, secret_ref)` pairs of every value row of the declaration — whatever its scope or subject — and of every staged secret, except a reference another declaration still holds, hard-deletes the row guarded on the compared `updated_at` (cascading its values, tenant permissions and staged secrets) and writes one audit record, attributed to the authenticated caller (`remove` on the definition resource, the definition as pre-image, no post-image, no stored value).
+Purge **MUST** run as one transaction that first takes the declaration row for update, judges the refusals on the locked row, collects the `(tenant, secret_ref)` pairs of every value row of the declaration — whatever its scope or subject — and of every staged secret, except a reference another declaration still holds, hard-deletes the row guarded on the compared `updated_at` (cascading its values, tenant permissions and staged secrets), deletes every subscription and activation state of the key — every subscriber's, at every tenant — and writes one audit record, attributed to the authenticated caller (`remove` on the definition resource, the definition as pre-image, no post-image, no stored value).
 
 After the commit it **MUST** check the references it kept for another declaration again and add every one no declaration holds any more, then release every collected entry through the Secret Manager in a task detached from the request, at most 4 at a time, counting each outcome in `settings_declaration_purge_secret_releases_total{result}`, logging a refusal at `error` with the key, the tenant and the error's log-safe text, never the secret, and one line when the task starts and one when it ends, both carrying the request id. A refusal **MUST NOT** undo the purge; the request **MUST** wait for the task before answering `204`, and a dropped request **MUST NOT** stop the task.
 
@@ -597,6 +598,8 @@ Purge **MUST** publish no domain event and **MUST NOT** remove or alter existing
 - DB Table: `setting_values`
 - DB Table: `tenant_permissions`
 - DB Table: `pending_secrets`
+- DB Table: `subscriptions`
+- DB Table: `activation_state`
 - DB Table: `audit_records`
 - Entities: `SettingDeclaration`, `DeclarationStatus`
 - Port: the Credential Store through the Secret Manager (`delete_secret`)
@@ -743,6 +746,8 @@ The system **MUST** emit an audit record through the Audit Emitter for every dec
 - [x] Purge without `delete` authorization returns `403` and removes nothing
 - [x] The gates are judged before any row is read: purge of a non-existent id or of an `active` declaration answers `403` without `delete` authorization and `401`/`403` without a fresh step-up — never `404` or `409`
 - [x] After a purge, a declaration at the key is accepted under the same value type and refused `409` under a different one
+- [x] Purging a retired declaration deletes every `subscriptions` and `activation_state` row of the key — every subscriber's, at every tenant, whatever the state's status — in its transaction and leaves another key's rows untouched (unit, integration)
+- [x] A registration of the key that races the purge leaves no row behind: its transaction shares the declaration row the purge holds for update, so it waits and finds no declaration, or commits first and its row goes with the purge (integration, PostgreSQL)
 - [x] A purge racing a revive of the same declaration lets exactly one win and never deletes an active declaration
 - [x] A revive that loses the race to a purge answers `404`, never `500`
 - [x] A purge racing a value write that stores a secret leaves no Credential Store entry unreleased

@@ -18,7 +18,7 @@ use super::Migrator;
 /// to stop just short of it, and what `down` leaves when it and everything
 /// after it have been rolled back — so a later migration cannot break a test
 /// that is about an earlier one.
-fn before(name: &str) -> u32 {
+pub(super) fn before(name: &str) -> u32 {
     let at = Migrator::migrations()
         .iter()
         .position(|m| m.name() == name)
@@ -27,7 +27,7 @@ fn before(name: &str) -> u32 {
 }
 
 /// How many migrations the named one and everything after it come to.
-fn from(name: &str) -> u32 {
+pub(super) fn from(name: &str) -> u32 {
     u32::try_from(Migrator::migrations().len()).expect("a small list") - before(name)
 }
 
@@ -58,6 +58,8 @@ fn the_harness_declares_its_migrations_in_order() {
             "m20260925_000003_audit_retention_policy_seed".to_owned(),
             "m20261014_000001_declaration_display_name".to_owned(),
             "m20261015_000001_setter_tenant".to_owned(),
+            "m20261031_000001_activation_state".to_owned(),
+            "m20261031_000002_audit_change_ref_index".to_owned(),
         ]
     );
 }

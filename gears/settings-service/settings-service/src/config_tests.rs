@@ -158,3 +158,177 @@ fn a_local_binding_another_contract_and_no_section_at_all_are_all_accepted() {
         );
     }
 }
+
+#[test]
+fn the_publish_timeout_defaults_to_two_seconds_and_takes_an_override() {
+    let cfg = parse(serde_json::json!({})).expect("parses");
+    assert_eq!(cfg.publish_timeout_seconds, 2);
+    let cfg = parse(serde_json::json!({ "publish_timeout_seconds": 7 })).expect("parses");
+    assert_eq!(cfg.publish_timeout_seconds, 7);
+}
+
+#[test]
+fn the_publish_timeout_accepts_one_through_ten() {
+    for seconds in [1, 2, 10] {
+        let cfg = parse(serde_json::json!({ "publish_timeout_seconds": seconds })).expect("parses");
+        cfg.check_publish_timeout()
+            .unwrap_or_else(|reason| panic!("{seconds} s is within bounds: {reason}"));
+    }
+}
+
+#[test]
+fn the_publish_timeout_refuses_zero_and_anything_above_ten_naming_the_field_and_the_bounds() {
+    for seconds in [0, 11, 999_999] {
+        let cfg = parse(serde_json::json!({ "publish_timeout_seconds": seconds })).expect("parses");
+        let reason = cfg
+            .check_publish_timeout()
+            .expect_err("outside 1..=10 is refused");
+        assert!(
+            reason.contains("publish_timeout_seconds")
+                && reason.contains(&seconds.to_string())
+                && reason.contains("between 1 and 10"),
+            "the reason names the field, the value and the bounds: `{reason}`"
+        );
+    }
+}
+
+#[test]
+fn a_wrong_typed_publish_timeout_is_refused_rather_than_coerced() {
+    assert!(parse(serde_json::json!({ "publish_timeout_seconds": "two" })).is_err());
+    assert!(parse(serde_json::json!({ "publish_timeout_seconds": -1 })).is_err());
+}
+
+#[test]
+fn the_lock_budget_and_the_redelivery_interval_default_to_ten_and_thirty_seconds() {
+    let cfg = parse(serde_json::json!({})).expect("parses");
+    assert_eq!(cfg.mutation_lock_wait_seconds, 10);
+    assert_eq!(cfg.redeliver_interval_seconds, 30);
+    let cfg = parse(serde_json::json!({
+        "mutation_lock_wait_seconds": 3,
+        "redeliver_interval_seconds": 5,
+    }))
+    .expect("parses");
+    assert_eq!(cfg.mutation_lock_wait_seconds, 3);
+    assert_eq!(cfg.redeliver_interval_seconds, 5);
+    cfg.check_mutation_lock_wait().expect("3 s is fine");
+    cfg.check_redeliver_interval().expect("5 s is fine");
+}
+
+#[test]
+fn a_budget_above_the_request_deadline_is_accepted() {
+    // A misconfiguration the batch cap by the remaining deadline absorbs, not a
+    // refusal.
+    let cfg = parse(serde_json::json!({ "mutation_lock_wait_seconds": 3600 })).expect("parses");
+    cfg.check_mutation_lock_wait()
+        .expect("accepted and documented as a misconfiguration");
+}
+
+#[test]
+fn a_zero_lock_budget_or_redelivery_interval_is_refused_naming_the_field() {
+    let cfg = parse(serde_json::json!({ "mutation_lock_wait_seconds": 0 })).expect("parses");
+    let reason = cfg.check_mutation_lock_wait().expect_err("zero is refused");
+    assert!(reason.contains("mutation_lock_wait_seconds"), "{reason}");
+    assert!(
+        cfg.check_redeliver_interval().is_ok(),
+        "the other is its own check"
+    );
+
+    let cfg = parse(serde_json::json!({ "redeliver_interval_seconds": 0 })).expect("parses");
+    let reason = cfg.check_redeliver_interval().expect_err("zero is refused");
+    assert!(reason.contains("redeliver_interval_seconds"), "{reason}");
+    assert!(cfg.check_mutation_lock_wait().is_ok());
+}
+
+#[test]
+fn a_lock_budget_above_an_hour_or_an_interval_above_half_a_day_is_refused() {
+    let cfg = parse(serde_json::json!({ "mutation_lock_wait_seconds": 3601 })).expect("parses");
+    let reason = cfg
+        .check_mutation_lock_wait()
+        .expect_err("above the ceiling");
+    assert!(
+        reason.contains("mutation_lock_wait_seconds") && reason.contains("3600"),
+        "{reason}"
+    );
+    let cfg = parse(serde_json::json!({ "redeliver_interval_seconds": 43_201 })).expect("parses");
+    let reason = cfg
+        .check_redeliver_interval()
+        .expect_err("above the ceiling");
+    assert!(
+        reason.contains("redeliver_interval_seconds") && reason.contains("43200"),
+        "{reason}"
+    );
+    let cfg = parse(serde_json::json!({
+        "mutation_lock_wait_seconds": 3600,
+        "redeliver_interval_seconds": 43_200,
+        "activation_report_timeout_seconds": 86_400,
+    }))
+    .expect("parses");
+    assert!(cfg.check_mutation_lock_wait().is_ok() && cfg.check_redeliver_interval().is_ok());
+    assert!(
+        cfg.check_report_timeout().is_ok(),
+        "the ceiling interval still leaves a valid report timeout"
+    );
+    let cfg = parse(serde_json::json!({ "redeliver_interval_seconds": u64::MAX })).expect("parses");
+    assert!(cfg.check_redeliver_interval().is_err());
+}
+
+#[test]
+fn the_report_timeout_defaults_to_ten_minutes_and_twenty_deliveries() {
+    let cfg = parse(serde_json::json!({})).expect("parses");
+    assert_eq!(cfg.activation_report_timeout_seconds, 600);
+    cfg.check_report_timeout().expect("the default is valid");
+    assert_eq!(
+        crate::domain::activation::deliveries_within(
+            std::time::Duration::from_secs(cfg.activation_report_timeout_seconds),
+            std::time::Duration::from_secs(cfg.redeliver_interval_seconds),
+        ),
+        20,
+        "K = ceil(600 / 30)"
+    );
+    assert_eq!(
+        crate::domain::activation::deliveries_within(
+            std::time::Duration::from_secs(61),
+            std::time::Duration::from_secs(30),
+        ),
+        3,
+        "K rounds up"
+    );
+}
+
+#[test]
+fn a_report_timeout_below_two_intervals_or_above_a_day_is_refused_naming_the_field() {
+    for (interval, timeout, valid) in [
+        (30, 59, false),
+        (30, 60, true),
+        (30, 86_400, true),
+        (30, 86_401, false),
+        (1, 2, true),
+        (1, 1, false),
+        (43_200, 86_400, true),
+        (301, 600, false),
+    ] {
+        let cfg = parse(serde_json::json!({
+            "redeliver_interval_seconds": interval,
+            "activation_report_timeout_seconds": timeout,
+        }))
+        .expect("parses");
+        match cfg.check_report_timeout() {
+            Ok(()) => assert!(valid, "{interval}/{timeout} must be refused"),
+            Err(reason) => {
+                assert!(!valid, "{interval}/{timeout} must pass: {reason}");
+                assert!(
+                    reason.contains("activation_report_timeout_seconds")
+                        && reason.contains("86400"),
+                    "{reason}"
+                );
+            }
+        }
+    }
+    assert!(parse(serde_json::json!({ "activation_report_timeout_seconds": -1 })).is_err());
+}
+
+#[test]
+fn a_wrong_typed_lock_budget_or_interval_is_refused_rather_than_coerced() {
+    assert!(parse(serde_json::json!({ "mutation_lock_wait_seconds": "ten" })).is_err());
+    assert!(parse(serde_json::json!({ "redeliver_interval_seconds": -1 })).is_err());
+}

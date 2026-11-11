@@ -1,5 +1,9 @@
+---
+description: "Decomposition of the Settings Service gear into FEATURE candidates: the R1 read and write paths in two waves and the first R2 slice over the event broker — replica coherence, consumer activation and the activation read."
+---
+
 <!-- Created: 2026-08-10 by Virtuozzo International GmbH -->
-<!-- Updated: 2026-09-23 by Virtuozzo International GmbH -->
+<!-- Updated: 2026-10-31 by Virtuozzo International GmbH -->
 
 # Decomposition: Settings Service
 
@@ -21,30 +25,42 @@
   - [2.9 Secret Values &mdash; HIGH](#29-secret-values-mdash-high)
   - [2.10 Module-Contributed Declarations &mdash; HIGH](#210-module-contributed-declarations-mdash-high)
   - [2.11 Search & Discoverability &mdash; MEDIUM](#211-search--discoverability-mdash-medium)
+  - [2.12 Replica Cache Coherence &mdash; HIGH](#212-replica-cache-coherence-mdash-high)
+  - [2.13 Consumer Activation &mdash; HIGH](#213-consumer-activation-mdash-high)
+  - [2.14 Activation Read &mdash; HIGH](#214-activation-read-mdash-high)
 - [3. Feature Dependencies](#3-feature-dependencies)
 
 <!-- /toc -->
 
 ## 1. Overview
 
-This is a **partial decomposition, extended in waves**. It covers **R1** of DESIGN.md §2.3 — the release whose defining property is that it depends on no gear that does not exist — in two waves of entries. It is not a complete split of the DESIGN, and it does not claim full requirement coverage; what it leaves out is listed at the end of this section with the release each item belongs to, so nothing is dropped silently.
+This is a **partial decomposition, extended in waves**. It covers **R1** of DESIGN.md §2.3 — the release whose defining property is that it depends on no gear that does not exist — in two waves of entries, and the first **R2** slice, the event broker, in a third. It is not a complete split of the DESIGN, and it does not claim full requirement coverage; what it leaves out is listed at the end of this section with the release each item belongs to, so nothing is dropped silently.
 
-**Selection rule**: a feature qualifies for a wave only if its dependency closure lies entirely within the waves decomposed so far, and only if every platform primitive it needs exists today. The R2 and R3 items wait on things this gear does not own — verified machine caller identity, the platform-wide elevated session, the platform Audit Subsystem, a tenant-deleted signal, per-feature licence entitlement, and the activation machinery — and are therefore not decomposed here.
+**Selection rule**: a feature qualifies for a wave only if its dependency closure lies entirely within the waves decomposed so far, and only if every platform primitive it needs exists today. The remaining R2 and R3 items wait on things this gear does not own — verified machine caller identity, the platform-wide elevated session, the platform Audit Subsystem, a tenant-deleted signal, and per-feature licence entitlement — and are therefore not decomposed here; the activation machinery qualifies in wave 3 because the platform Event Broker exists.
 
 **Wave 1 — the read path (2.1–2.5).** Foundation, then the category taxonomy, then declarations, then value validation, then effective-value resolution: a chain with no edge pointing outside the set. After 2.5 the service is functionally alive on its read path. An administrator can create a category and declare a typed setting against a curated GTS value type with a Schema Default, and any consumer can resolve that setting's effective value for a scope, with the inheritance trail and the hot-path cache behind it.
 
 **Wave 2 — the write path and the rest of R1 (2.6–2.10).** The gear-local audit store, tenant access restrictions, validate-then-set value writes with the step-up gate built in this gear, secret values through the Credential Store, and module-contributed declarations. After 2.10 the service is R1-complete: an administrator sets, reverts, removes and clones values at any scope within their subtree, each write validated, step-up-verified where the declaration demands it, refused when stale, and audited in the same transaction; an ancestor restricts a descendant's access to a setting; a gear contributes declarations on every boot; and a consuming service resolves a secret's plaintext machine-only, with a secret-use record for each resolution.
 
-**Coverage** — stated precisely because a partial decomposition must not imply completeness, and because `cfs validate` does not enforce requirement coverage in a DECOMPOSITION (`fr.references.DESIGN` carries `coverage = true`; the DECOMPOSITION reference does not):
+**Wave 3 — the first R2 slice: the event broker (2.12–2.14).** These three entries qualify under the selection rule because their dependency closure lies within waves 1 and 2 and within one another, and the one primitive they need that waves 1 and 2 did not already use, the platform Event Broker, exists; the rest of R2 still waits on the platform primitives the rule names. The gear takes the broker as a soft dependency, so a write commits without it. Replica coherence (2.12) puts the `cache_invalidate` broadcast on the broker, so the several replicas R2 runs converge on a value one of them set, within `cache_ttl_seconds` whether or not a broadcast arrives. Consumer activation (2.13) ships the protocol of [DESIGN-activation](./DESIGN-activation.md) under [ADR-003](./ADR/ADR-003-thin-event-pull-report-activation.md) — a thin event carrying identifiers only, a pull of the current value, an outcome reported through the SDK — with one activation state per subscription, written in the change's own transaction, and the key's mutation lock, a `toolkit-db` advisory lock serializing every value, restriction and subscription mutation of a key, so that no activation is lost. The activation read (2.14) makes the account visible: which subscribers have confirmed a setting's current value at a tenant, and each report in the setting's history under the change it answers. Consumer activation is deliberately one entry: one protocol with one end-to-end definition of done (a subscribed gear is notified, re-reads and reports, and no activation is lost), which its implementation may deliver in slices. The three entries carry the priority of the design elements they deliver or extend, all `p1` in DESIGN-activation, since DESIGN.md §2.3 places consumer activation in R2; the `p3` on their requirement checkboxes is the PRD's and stays until the PRD is revised. After 2.14 a gear that materializes settings at startup subscribes to them, re-reads on a signal and reports what it applied, and the administrator who set a value sees whether its consumers run on it.
+
+**Coverage** — stated precisely because a partial decomposition must not imply completeness (a sequence counts as covered when an entry names it in its *Sequences* line, with or without a checkbox), and because `cfs validate` does not enforce requirement coverage in a DECOMPOSITION (`fr.references.DESIGN` carries `coverage = true`; the DECOMPOSITION reference does not):
 
 | Element | Covered here | Total | Remaining for later waves |
 |---|---|---|---|
-| PRD functional requirements | 19 | 28 | 9 |
+| PRD functional requirements | 24 | 29 | 5 |
 | PRD non-functional requirements | 9 | 9 | 0 |
-| DESIGN components | 10 | 11 | 1 |
-| DESIGN principles | 8 | 8 | 0 |
-| DESIGN constraints | 11 | 13 | 2 |
-| DESIGN sequences | 2 | 3 | 1 |
+| DESIGN components (DESIGN.md and DESIGN-activation) | 17 | 18 | 1 |
+| DESIGN principles (both documents) | 13 | 13 | 0 |
+| DESIGN constraints (both documents) | 19 | 22 | 3 |
+| DESIGN sequences (both documents) | 6 | 8 | 2 |
+
+Counts are taken from the `**ID**` definitions in PRD.md, DESIGN.md and DESIGN-activation.md; "covered" means an entry of §2 names the element. The elements no entry names are:
+
+- **Requirements**: `fr-anonymous-exposable`, `fr-domain-affinity-filtering`, `fr-feature-license-gating`, `fr-file-valued-settings`, `fr-standard-advanced-mode` — each is in the *Not decomposed yet* table above.
+- **Component**: `component-actor-name-resolver` — the actor-name lookup the history read applies; no entry owns it yet.
+- **Constraints**: `constraint-account-management-optional` (the actor-name lookup's optional dependency; no entry owns it yet), `constraint-files-by-reference` and `constraint-licence-entitlement-fail-closed` (both in the *Not decomposed yet* table).
+- **Sequences**: `seq-file-valued-setting` (in the *Not decomposed yet* table) and `seq-history-actor-names` (no entry owns it yet).
 
 One requirement is counted as covered while being split across releases: `cpt-cf-settings-service-fr-subject-scoped-values` asks for the subject identity model from v1 and lets resolution over subjects phase; the identity model — columns, partial unique indexes, subject-aware API shape — is in 2.4, and the resolution half is R2.
 
@@ -58,21 +74,21 @@ One requirement is counted as covered while being split across releases: `cpt-cf
 - **Tenant access is a sparse decision, not a pair of flags.** `tenant_visible` and `tenant_overridable` are gone from the declaration; a `tenant_permissions` row of `read_only` or `hidden`, recorded by an ancestor's administrator, restricts one tenant for one setting, and absence means `overridable`. The declaration keeps two flags that gate people rather than scopes: `requires_step_up` (default `true`) and `anonymous_exposable` (default `false`, refused on `secret` or `pii`).
 - **Licence gating is R2.** The `license-resolver` gear is documentation only, so the licence predicate the read surfaces will apply is left as a seam.
 
-**Accepted narrowing — notification filtering is by subscription, not by entitlement.** `cpt-cf-settings-service-fr-consumer-activation` requires that a notification carry *"never a setting it is not entitled to read"*. [DESIGN-activation](./DESIGN-activation.md) §4.1 filters each notification to the subscriber's **own subscribed keys** and states that, under the platform trusted-caller model, subscriber identity is taken on trust — making this least-privilege by blast radius rather than an identity-enforced entitlement check. **This narrowing is intended and accepted.** It is recorded here rather than left in passing prose because it qualifies a PRD `MUST`: a consumer that subscribes to a key it could not read on the read path is still notified of that key's change. Revisit if consumers ever cease to be trusted.
+**Accepted narrowing — entitlement is decided once, at registration; notifications are not re-decided.** `cpt-cf-settings-service-fr-consumer-activation` requires that a notification carry *"never a setting it is not entitled to read"*. Entitlement to a setting is decided once, at registration: `register_subscription` takes the read decision for the key at the subscription's tenant, and a `403` leaves the key `refused` on the handle ([DESIGN-activation](./DESIGN-activation.md) §4.2 *Subscription Manager*, §4.8). What the PRD's clause is narrowed to is this: no per-delivery re-decision, so a later revoke or a `hidden` restriction does not stop a notification already due, and `hidden` never filters notifications; and the subscriber identity and the subscription tenant are taken on trust under the platform trusted-caller model (DESIGN.md §6). Co-tenant notifications reach every subscribing process, and the SDK drops those whose `subscriber` is not its own (DESIGN-activation §4.2 *Event Broker Client*, *Broker topology*). **This narrowing is intended and accepted.** It is recorded here rather than left in passing prose because it qualifies a PRD `MUST` (DESIGN-activation §3.2). Revisit if consumers ever cease to be trusted.
 
 **Things to settle with the DESIGN owners**, none of which blocks a wave:
 
 - `audit_records.declaration_key` is `NOT NULL`, and the canonical resource id is built from a setting key. Category mutations have no setting key, yet 2.2 audits them through the same emitter. Either the column becomes nullable or category audit gets its own resource form; until that is decided, 2.6 keeps the emitter's interface value-centric and records category mutations with the category key in the resource field.
 - DESIGN §4.3 still carries `422` in several rule tables outside the Error Response Format section, which itself states that a validation rejection is the canonical invalid-argument category rendering as `400` with no `422` category. The FEATUREs and code follow the canonical-error ADRs and use `400`; the reason codes (`DefaultRequired`, `ValueTooLarge`, `SecretNotCloneable`, …) are kept.
 - DESIGN §4.8 *Bootstrap* has the gear seed "a minimal category set" at startup, but no section names the set. The init step is specified without its contents until it does.
-- DESIGN §4.9 has every consumed client declared with `#[toolkit::consumes]`, which requires the provider SDK's REST projection to exist. `tenant-resolver-sdk` has none, so the tenant resolver is fetched from the hub at first use instead — the same thing in the Embedded profile R1 is limited to, but the declaration has to land in that SDK before the out-of-process profiles of R2.
+- DESIGN §4.9 has every consumed client declared with `#[toolkit::consumes]`, which requires the provider SDK's REST projection to exist. `tenant-resolver-sdk` and `event-broker-sdk` have none, so the tenant resolver and, from R2, the Event Broker are fetched from the hub at first use instead — the same thing in the Embedded profile R1 is limited to, but the declaration has to land in that SDK before the out-of-process profiles of R2.
 - The default for an omitted `tenant` is stated twice in §4.3 and differently: "platform scope" on the read and write path notes, "the caller's own tenant" in the set rules. The FEATUREs assume the caller's own tenant, which for a platform administrator is the root tenant and therefore platform scope — the one reading that satisfies both sentences.
 - DESIGN names no authorization action for the PII entitlement it gates unmasked reads on (§1.3 `DataClassification`, §4.2 *Secret Manager* `mask`). The read surface asks the `PolicyEnforcer` for `read_unmasked` on the value resource and unmasks `pii` only when it is granted; the action name is this decomposition's, to be confirmed by the authorization owners. An omitted `tenant` resolves to the caller's own tenant, which for the root is platform scope, so both §4.3 wordings hold.
 - DESIGN leaves how the step-up assertion travels to the implementation (§4.2 *Value Writer*: the parameter MAY be folded into the bearer token). The write surface reads an `X-Step-Up-Token` header and, absent, checks the bearer token itself, which a session re-authenticated just now satisfies through its own `auth_time`; the header name is this decomposition's, to be confirmed against `authn-resolver`'s step-up contract when it lands. With no `step_up` configuration section nothing is bound and every write to a declaration that requires step-up refuses; the demo catalogue opts its settings out of step-up except `api_token`, so the example server can exercise writes without an identity provider.
 - §4.3 says the read's `last_change_at` is the ETag a write submits, but that field is the leak-safe maximum over the declaration and the resolved row, which may be an ancestor's. The FEATUREs guard a write on the target scope's **own** row — its `last_change_at`, or an absent-state tag when no row exists — and return that tag in `ETag`, distinct from the recency in the body.
 - DESIGN §4.2 *Secret Manager* names no principal for the gear's own calls to the Credential Store. The Secret Manager presents a fixed settings-service principal, a name-based UUID, in the target tenant with `private` sharing, so that only this gear reads an entry back; a real deployment has to grant that principal `read`, `write` and `delete` on the generic secret type in the authorization policy, which the static authorizer of the e2e profile grants implicitly. And §4.8 defines no action for the machine path's per-setting check, so `resolve_secret` asks the `PolicyEnforcer` for `read` on the value resource with the declaration id as the resource id.
 - DESIGN §4.2 *Secret Manager* has `store_secret` write "under a deterministic path". The implementation derives a deterministic prefix from the key and the tenant but stores each write under its own reference, create-only, because the Credential Store cannot join the row's transaction (§4.2 *Set atomicity model*) and toolkit-db refuses a fresh connection while one is open on the task: a write refused after the store leg must not have altered the live entry, so it releases the entry it created, and a write that lands releases the superseded one, the "applied-away" case `delete_secret` names.
-- `audit_records.operation` is checked to the value operations only; restriction changes (2.7) and declaration and category mutations need entries too, or a second vocabulary. The §4.3 history row still spells its parameter `scope={path}` although scopes are tenant ids everywhere else.
+- `audit_records.operation` is checked to the value operations only; restriction changes (2.7) and declaration and category mutations need entries too, or a second vocabulary.
 - The administrative read carries no effective tenant access for the caller, so a console cannot tell from the response whether to offer an editor; the FEATUREs keep the design's shape and leave the field to the DESIGN owners.
 
 **Not decomposed yet — R2 and R3, by owning component:**
@@ -82,12 +98,11 @@ One requirement is counted as covered while being split across releases: `cpt-cf
 | `cpt-cf-settings-service-fr-service-writes` | R2 | Value Writer (2.8) — the gate table already refuses a service principal on a `requires_step_up` declaration; the authorized service-write SDK operation `set_value` is R2 |
 | `cpt-cf-settings-service-fr-anonymous-exposable` | R2 | the anonymous read route `GET /settings-service/v1/public/settings`; the declaration flag and its schema check ship in 2.3 |
 | `cpt-cf-settings-service-fr-feature-license-gating`, `cpt-cf-settings-service-constraint-licence-entitlement-fail-closed` | R2 | the licence predicate seam in 2.3 and 2.5 reads; waits on the License Resolver gear |
-| `cpt-cf-settings-service-fr-standard-advanced-mode` | R2 | mode-filtered reads; the preference is a field addition on the `simple-user-settings` contract |
+| `cpt-cf-settings-service-fr-standard-advanced-mode` | tag R1 (2.5), mode-filtered reads R2 | mode-filtered reads; the preference is a field addition on the `simple-user-settings` contract |
 | `cpt-cf-settings-service-fr-file-valued-settings`, `cpt-cf-settings-service-constraint-files-by-reference`, `cpt-cf-settings-service-seq-file-valued-setting` | R2 | a file-reference value type over the platform file store |
 | `cpt-cf-settings-service-fr-subject-scoped-values` — resolution half | R2 | Value Resolver, over the identity model 2.4 delivers |
-| `cpt-cf-settings-service-fr-replica-coherence` | R2 | the `cache_invalidate` broadcast from the Value Writer; `cache_ttl_seconds` in 2.5 is the backstop |
 | tenant-deleted cleanup (DESIGN §4.4) | R2 | consumed once Account Management publishes the signal |
-| `cpt-cf-settings-service-fr-consumer-activation` | R3 | [DESIGN-activation](./DESIGN-activation.md) — subscription, filtered notification, delivery until confirmed |
+| the broker binding of the domain events of DESIGN §4.4 *Events Emitted* (value, declaration and secret-use events) | R2 | the Audit Emitter's `emit` publish path: 2.8, 2.9 and 2.10 raise the events through the port with the R1 binding, and their identifiers predate the broker's contract and are revisited when they are first published (DESIGN §4.4); no entry of wave 3 carries the broker publish |
 | `cpt-cf-settings-service-fr-dependency-group-declaration` — enforcement | R3 | the all-or-nothing set of a group's members; the group **declaration** is in 2.3 |
 | `cpt-cf-settings-service-fr-domain-affinity-filtering` | R3 | reads and search filtered by the caller's administrative domain |
 
@@ -344,7 +359,7 @@ One requirement is counted as covered while being split across releases: `cpt-cf
   - Hierarchy-change eviction for cascading declarations, noting that the Tenant Resolver does not publish that signal today so the TTL is currently the only backstop after a re-parent
 
 - **Out of scope**:
-  - The cross-replica `cache_invalidate` broadcast and its bounded-staleness guarantee, which ship in R2 when several replicas become the normal case (`cpt-cf-settings-service-fr-replica-coherence`)
+  - The cross-replica `cache_invalidate` broadcast and its bounded-staleness guarantee, which ship in R2 when several replicas become the normal case (`cpt-cf-settings-service-fr-replica-coherence`): entry 2.12 (`cpt-cf-settings-service-feature-replica-coherence`)
   - Tenant override writes, the cascading-impact report, and the validate-before-set check (2.8)
   - The revert **action** as an administrative operation, which is a value write like any other (2.8); only the resolution semantics of defaults are here
 
@@ -500,13 +515,14 @@ One requirement is counted as covered while being split across releases: `cpt-cf
   - `cascading_impact` as a bounded, non-blocking preview: breadth-first over `get_descendants`, the first `limit` changed descendants (default 100, at most 500) in traversal order, `total_changed`, `scanned`, and `truncated` under a node budget of 5,000; standalone descendants omitted from the list and the count
   - The default `StepUpVerifier` binding: the token authenticated by the platform's AuthN resolver, `sub` matching the session, `auth_time` within the freshness window of at most five minutes, `acr`/`amr` as required; the `401` refusal carrying the RFC 9470 challenge `insufficient_user_authentication` with `max_age`; no development or sandbox bypass, since a binding that cannot fail is the always-satisfied binding the contract rejects
   - A `change_set_id` minted per `set` request and carried on the audit records it produces
-  - Publication of `event_value_changed` and `event_value_change_failed` through the Change Publisher port; in R1 no consumer notification and no cross-replica broadcast are bound, so the local eviction is the write's only cache effect and a second host would be stale for at most `cache_ttl_seconds`
+  - Publication of `event_value_changed` and `event_value_change_failed` through the Audit Emitter's `emit` operation (DESIGN §4.2 *Audit Emitter*); in R1 no consumer notification and no cross-replica broadcast are bound, so the local eviction is the write's only cache effect and a second host would be stale for at most `cache_ttl_seconds`
   - The `settings_step_up_total` counter by operation and result, and the set-path metrics `cpt-cf-settings-service-nfr-ops-set-monitoring` requires
 
 - **Out of scope**:
   - Writes by an authorized service principal through the SDK `set_value`, which is R2 (`cpt-cf-settings-service-fr-service-writes`); the gate table's machine column — refusal on a `requires_step_up` declaration — is enforced here
   - Dependency Group all-or-nothing sets, which are R3
-  - The `cache_invalidate` broadcast and consumer `change_notification` delivery, owned by the Settings Activation and R2/R3 respectively
+  - The `cache_invalidate` broadcast, owned by the Settings Activation and R2: entry 2.12 (`cpt-cf-settings-service-feature-replica-coherence`)
+  - Consumer `change_notification` delivery, owned by the Settings Activation and R2: entry 2.13 (`cpt-cf-settings-service-feature-consumer-activation`)
   - Secret plaintext storage, which `set` routes through the Secret Manager of 2.9
 
 - **Requirements Covered**:
@@ -566,7 +582,7 @@ One requirement is counted as covered while being split across releases: `cpt-cf
   - `SettingsReaderClient::resolve_secret` over an opaque `SecretHandle`: per-setting authorization of the calling service, plaintext fetched from the store, one `event_secret_used` record with the value masked, plaintext never cached and never returned to an administrative caller
   - `delete_secret` when an override is removed or superseded
   - Staging a secret ahead of the step-up redirect: `POST /settings/{key}/secret-stage` validates and stores the plaintext as a set would and answers with a single-use `pending_id`; the batch names it in place of the value and adopts the entry without a second store leg; expired stages are swept with their entries (DESIGN §5 *A secret staged across the step-up redirect*, §4.7 `pending_secrets`)
-  - The placeholder-default rule, already enforced by 2.3 on the declaration side: a secret setting resolves to its empty placeholder, never to a credential
+  - The placeholder-default rule, already enforced by 2.3 on the declaration side: a secret setting with no stored credential resolves to its empty placeholder, an ordinary value, never to a credential
 
 - **Out of scope**:
   - Verified machine caller identity, without which the machine path enforces only the deployment trust boundary and attributes secret use to the caller's declared module (DESIGN §6); R2
@@ -681,6 +697,220 @@ One requirement is counted as covered while being split across releases: `cpt-cf
 - **Data**:
   - No new tables or indexes; reads `setting_declarations`, `setting_values`, `categories` through the trigram indexes 2.2–2.4 created
 
+### 2.12 Replica Cache Coherence &mdash; HIGH
+
+- [ ] `p1` - **ID**: `cpt-cf-settings-service-feature-replica-coherence`
+
+- **Purpose**: Make every replica of the gear converge on a value another replica set, within a staleness bound that holds whether or not the signal arrives. The writing replica evicts inside the write (2.8); this feature carries the `cache_invalidate` broadcast to the other replicas over the platform Event Broker and evicts on receipt, with the `cache_ttl_seconds` backstop of 2.5 bounding a broadcast that is lost. It is the gear's first use of the broker, so it also brings in the broker as a soft dependency and the publishing identity the activation entries of this wave build on.
+
+- **Depends On**: `cpt-cf-settings-service-feature-value-writes`, `cpt-cf-settings-service-feature-value-resolution`, `cpt-cf-settings-service-feature-secret-values`, `cpt-cf-settings-service-feature-setting-declarations`, `cpt-cf-settings-service-feature-module-contributions`
+
+- **Scope**:
+  - The end-of-request publish hook: 2.12 introduces the hook on the Value Writer and the per-request accumulation of touched tenants and changed keys; 2.13's Activation Publisher (`record_change`, `publish_request`) extends that hook with the activation state and the notifications
+  - The Cache Invalidation Broadcast (DESIGN-activation §4.2): at the end of each request or reconcile pass that changed values or declarations, one `cache_invalidate` per tenant the request touched, carrying the request's `change_set_id`, that tenant in `data.tenant` and its full changed-key set; published after the request's commits, inline and best-effort, each publish bounded by `publish_timeout_seconds` and the request's remaining publishes skipped after the first one refused or timed out; a key set over the broker's 60 KiB event limit split into several broadcasts; no durable queue, no subscription, no acknowledgement
+  - The declaration trigger (DESIGN §4.3, §4.4 *Events Consumed*): a declaration retire, a reactivate, an evolve and a `PATCH` that changes classification or domain affinity — the administrative paths of 2.3 — and a reconcile pass that retired, revived, upgraded or reclassified in place (classification or domain affinity changed at the same major) contributed declarations — the module path of 2.10 — publish the same `cache_invalidate` at the end of the request or pass, under the root tenant, with `data.tenant` set to the root tenant's id, `changed_keys` set to every key the request or pass changed — for an evolve or an upgrade the retired predecessor and the new successor key, for a reconcile pass every declaration key it retired, revived, upgraded or reclassified in place — and as `change_set_id` the request's correlation id, or for a reconcile pass a correlation id minted once per pass; a restriction change evicts locally and publishes nothing
+  - The signal on the broker (DESIGN §4.4 *Activation signals on the broker*): the cache topic `gts.cf.core.events.topic.v1~cf.core.settings.cache.v1`, the derived event type `gts.cf.core.events.event.v1~cf.core.settings.cache_invalidate.v1~` keeping the broker's default partition key `tenant_id`, the broker-native envelope with `tenant_id` set to the root tenant, which every replica's single interest names, `subject` set to the change's tenant and `subject_type` set to `gts.cf.core.settings.activation.v1~`; identifiers only, no value and no secret
+  - The cache half of the Event Broker Client (DESIGN-activation §4.2): `publish_cache_invalidation`; the cache topic and the `cache_invalidate` event type registered in the Types Registry by a background task once the broker resolves, idempotent and retried, gear init never waiting for it or failing on it; the activation subject type `gts.cf.core.settings.activation.v1~` registered at gear init with the gear's other schemas (DESIGN §4.7)
+  - The Event Broker as a soft dependency (DESIGN §4.9): fetched from the ClientHub at first use (`try_get`, as the tenant resolver is while the broker SDK carries no REST projection), never listed in `deps`; without a broker a write still commits and the broadcast counts as `skipped`; the background task retries the resolution, and a broker lost mid-life pauses the consumer until the next successful resolution
+  - The publishing identity (DESIGN §4.8 *Publishing identity*): the service principal the Secret Manager uses, with the first-party token scope `*`, in the root tenant, whose id the replica's consumer task of the Event Broker Client resolves lazily through the Tenant Resolver on its first successful resolution — never during gear init, a reconcile pass or a transaction — and caches for the process, every end-of-request publish taking it from that cache and a publish before it is known skipped and counted `skipped`; `produce` on the cache topic, the `cache_invalidate` type and the activation subject type, `consume` on the cache topic, `cache_invalidate` and the activation subject type through the replicas' own groups, and `define` for those groups, each grant covering events of every tenant; a missing grant leaves the gear up, with the broadcast counted `failed` or the consumer idle
+  - The replica's consumer, a `stateful` background task of the gear's lifecycle: an anonymous consumer group per replica on the cache topic with one interest on the root tenant, created when the consumer starts once the broker resolves, and left and deleted on `stop`; `on_cache_invalidate` evicting every cached scope of each named key, key-wide whatever its Scope Class, with no declaration read on the consume path — a `local` key's other tenants re-resolve on their next read; every replica consumes it, the writing one included, and the eviction is idempotent
+  - `settings_cache_broadcast_total{result}` (DESIGN §7): `sent`; `skipped` for no broker resolvable, the signal types not yet registered, the root tenant's id not yet known (DESIGN §4.8 *Publishing identity*), or a publish skipped after an earlier refusal or timeout in the same request; `failed` for a refusal, a missing grant included, or no acceptance within `publish_timeout_seconds`
+  - Tests: the broadcast rows of DESIGN-activation §7 — identifier-only payloads, one broadcast per tenant touched published under the root tenant with the full key set and the request's `change_set_id`, the split over 60 KiB, publish timeout and skip, *Refused join leaks no group*, *Malformed delivery*, *Group deleted on stop*, *Lost broker pauses and resumes*, *Registration refused*, *Publish accepted counts `sent`* and *Root tenant unknown → `skipped`* at Level 1, *Two-replica convergence* and *Dropped broadcast* at Level 2 — the broadcast half of DESIGN §7 *Set — no broker resolvable* (the write commits, the broadcast is counted `skipped`), DESIGN §7 *Set — commit + publish* for the broadcast half (local eviction, then `cache_invalidate`), DESIGN §7 *Declaration change broadcast* and *Restriction change publishes nothing*, and the E2E replica-coherence rows of both designs
+
+- **Out of scope**:
+  - Subscriptions, the `change_notification` signal and the tracking of a consumer's activation, which are 2.13 (`cpt-cf-settings-service-feature-consumer-activation`)
+  - Invalidation on a hierarchy change — a re-parent or a tenant inserted mid-chain — which no value change signals: a stated non-goal of the broadcast, owned by the cache of 2.5 and bounded by `cache_ttl_seconds` while the Tenant Resolver publishes no hierarchy-change signal
+  - Any request by which an actor triggers, targets or observes coherence, which the PRD prohibits
+  - The domain events of DESIGN §4.4 *Events Emitted* on the broker, and consuming `tenant_deleted`, which no entry of this wave carries (see the domain-events and tenant-deleted rows of the table of §1)
+
+- **Requirements Covered**:
+
+  - [ ] `p3` - `cpt-cf-settings-service-fr-replica-coherence`
+  - Extends `cpt-cf-settings-service-nfr-performance-read-cache`, listed under 2.5: replica staleness bounded by the broadcast and the `cache_ttl_seconds` backstop
+  - Extends `cpt-cf-settings-service-nfr-availability`, listed under 2.1: a broker that is absent or lost never fails gear init or a write
+
+- **Design Principles Covered**:
+
+  - [ ] `p1` - `cpt-cf-settings-service-principle-two-signal-split`
+
+- **Design Constraints Covered**:
+
+  - [ ] `p1` - `cpt-cf-settings-service-constraint-activation-in-settings-gear`
+  - The constraint above is covered here for its "lives in the gear" half; its session-pooling clause is covered by 2.13 (`cpt-cf-settings-service-feature-consumer-activation`), with the key mutation lock and the scan lock
+  - [ ] `p1` - `cpt-cf-settings-service-constraint-activation-broker-only`
+  - Extends `cpt-cf-settings-service-constraint-activation-two-events-per-change-set`, `cpt-cf-settings-service-constraint-activation-tenant-in-payload`, `cpt-cf-settings-service-constraint-activation-identifiers-only-payload`, listed under 2.13: the `cache_invalidate` half of each rule
+
+- **Domain Model Entities**:
+  - CacheInvalidation
+
+- **Design Components**:
+
+  - [ ] `p1` - `cpt-cf-settings-service-component-cache-invalidation-broadcast`
+  - [ ] `p1` - `cpt-cf-settings-service-component-event-broker-client`
+  - The Event Broker Client lands here with its cache half; 2.13 extends it with the activation topic and the delivery loop
+  - Extends `cpt-cf-settings-service-component-value-writer`, listed under 2.8: the broadcast at the end of the request, after the request's commits
+  - Extends `cpt-cf-settings-service-component-cache-and-invalidation`, listed under 2.5: peers evict through its `invalidate` on receipt
+  - Extends `cpt-cf-settings-service-component-declaration-management` and `cpt-cf-settings-service-component-module-contribution-reconciler`, listed under 2.3 and 2.10: they invoke the end-of-request publish hook
+
+- **API**:
+  - None — coherence has no request surface; the signal is the `cache_invalidate` event on the cache topic
+
+- **Sequences**:
+  - None of its own; the broadcast step of `cpt-cf-settings-service-seq-activation-change-set-notify` is delivered here and the sequence is listed under 2.13
+
+- **Data**:
+  - None — no table; configuration `publish_timeout_seconds` (default 2 s)
+
+### 2.13 Consumer Activation &mdash; HIGH
+
+- [ ] `p1` - **ID**: `cpt-cf-settings-service-feature-consumer-activation`
+
+- **Purpose**: Let a consuming gear subscribe to the settings it materializes, learn which of them changed at the tenant it serves, re-read them and report what it applied, and keep, per consumer instance's subscription, whether the current value is confirmed. This is the activation protocol of [DESIGN-activation](./DESIGN-activation.md) (`cpt-cf-settings-service-design-settings-activation`) under [ADR-003](./ADR/ADR-003-thin-event-pull-report-activation.md) (`cpt-cf-settings-service-adr-thin-event-pull-report-activation`): a thin event carrying identifiers only, a pull of the current value through the reader, and an outcome reported through the SDK and verified against the expectation recorded when the change committed. The account is per instance and the wait is bounded: every process of a consuming gear registers and reports for itself, and the wait is bounded by a report timeout counted in accepted deliveries, after which the outstanding instances are called silent and the change closes `incomplete` ([ADR-004](./ADR/ADR-004-per-instance-acknowledgement-bounded-wait.md), `cpt-cf-settings-service-adr-per-instance-acknowledgement-bounded-wait`). No activation is lost: the activation state commits with the value, the key's mutation lock serializes every mutation of a key, and delivery repeats until each instance reports or is called silent.
+
+- **Depends On**: `cpt-cf-settings-service-feature-replica-coherence`, `cpt-cf-settings-service-feature-value-writes`, `cpt-cf-settings-service-feature-audit-store`, `cpt-cf-settings-service-feature-secret-values`
+
+- **Scope**:
+  - The `subscriptions` and `activation_state` tables (DESIGN-activation §4.7): one subscription per `(subscriber, instance, key, tenant)` — carrying the instance's `instance_id`, its optional `instance_label` and `silent_since` — and one activation state per instance subscription a change expected, holding the expected value, the `change_ref`, the status (`awaiting`, `succeeded`, `failed` or `silent`), the count of accepted deliveries and the report that settled it; tenants as bare lowercase UUID strings, the root tenant's id for the platform-wide value
+  - The Subscription Manager (DESIGN-activation §4.2): `register_subscription` for any key the subscriber may read at the subscription's tenant — the registration read decision taken before the lock, a `403` refusing it — idempotent per `(subscriber, instance, key, tenant)`, a registration of an instance clearing its silence and re-arming its own silent row, and capped at 64 registrations per `(subscriber, key, tenant)` (`MAX_INSTANCES_PER_SUBSCRIPTION`) by evicting the oldest evictable registration, an undeclared key refused `NotFound`, a retired key registered; `unsubscribe` with the subscriber's identity from `Context` and the instance's id, deleting the instance's subscription and its activation states in one transaction, `404` for another subscriber's or instance's row; `resolve_subscribers` qualifying the key's subscriptions by Scope Class — every one for `global`, the written tenant for `local`, for `cascading` those whose tenant is the written scope or a descendant, answered by each subscription tenant's ancestor chain from the Tenant Resolver with no subtree enumeration — a resolver failure failing the write closed
+  - The key's mutation lock (DESIGN-activation §4.2 *Registration and writes*, DESIGN §4.8 *Access binds the writer, not the target*): a named advisory lock through `toolkit-db`'s `LockManager`, keyed on the setting key, taken by every value write (`set`, `revert`, `remove_value`, `clone`), every restriction change (`set_restriction`, `clear_restriction`) and every subscription registration and retire, after authorization and validation; held from before the candidate step until the transaction rolls back, or commits and the local cache is evicted, then released; declaration lifecycle changes stay outside it; acquisition waits for a bounded time, `mutation_lock_wait_seconds` per change (DESIGN-activation §4.2 *Registration and writes*), in a batch further capped by the remainder of the request deadline; an exhausted wait refuses the change `Unavailable` with nothing stored — per item in `SetResult[]`, `503` on the single-value writes and the restriction routes; a lock-session reconnect or a failed unlock logged at `warn`; the settings database reached through session pooling or a direct connection, never a transaction-pooling proxy (DESIGN §4.9)
+  - The Activation Publisher (DESIGN-activation §4.2): `record_change` inside each change's transaction, keeping the subscriptions whose effective value at their tenant differs after the change — an identical value affects nothing, every write to a `secret`-trait setting counts — the expected value resolved through the transaction over the handed-in ancestor chain, bypassing the cache, in the RFC 8785 canonical encoding, for a secret the salted SHA-256 over the canonical array of DESIGN-activation §4.1; `change_ref` set to the change's audit record id; an existing state overwritten whatever its status. A change expects every instance of an affected subscriber except the silent ones, left out while a sibling instance is expected, and all of them again when every instance is silent, so a subscriber the change affected is never expected by zero instances; `publish_request` at the end of the request, carrying the broadcast of 2.12 and then one filtered `change_notification` per affected `(subscriber, tenant)`, stamping `last_notified_at`
+  - The expected value of a secret the change holds no plaintext for (DESIGN-activation §4.2 *The expected value of a secret*): for an inherited secret on `revert` and `remove_value`, the fallback `secret_ref` read under the lock through the freshness form of the resolver and its plaintext fetched once per change through the Secret Manager's `resolve_plaintext` under the service's own identity before the transaction opens; and the staged-secret adoption fetch, a batch `set` adopting a staged secret having the staged entry's plaintext fetched the same way, once per change by its reference; each fetch with one `secret_use` record that stays when the change rolls back, the plaintext held in the redacting, zeroizing wrapper only until it is hashed; a change refused by the lock budget stores nothing for it
+  - The activation half of the Event Broker Client (DESIGN-activation §4.2): the activation topic `gts.cf.core.events.topic.v1~cf.core.settings.activation.v1` and the `change_notification` event type registered by the delivery loop's own background task once the broker resolves, as 2.12 registers the cache half; `publish_notification` per subscriber and tenant with every due `awaiting` key and its `change_ref`, envelope `tenant_id` set to the subscription's tenant, split over 60 KiB; the delivery loop `deliver_awaiting` on every replica, its scan serialized by a single non-blocking advisory-lock attempt, re-publishing a state once `redeliver_interval_seconds` has passed since `last_notified_at`, the stamp guarded by the state's `change_ref`; only the publishing and the calls of silence idle without a broker, while the forgetting and the orphan sweep run every tick; the loop stopped on `stop` with the `awaiting` states kept; the bounded wait — the report timeout `activation_report_timeout_seconds` counted in accepted redeliveries, `K = ceil(activation_report_timeout_seconds / redeliver_interval_seconds)`, so a broker outage never counts and cannot make every instance look silent: a row still `awaiting` after `K` accepted publications is called `silent` in one guarded transaction that also marks its subscription and appends the `silent` audit record, is not re-published until its instance re-enters, and keeps the change `incomplete`, never `failed`; and the forgetting of a subscription silent for a day (`SILENT_FORGET_SECONDS`), which deletes the instance's registration and its rows and alters no record of the history (`cpt-cf-settings-service-seq-activation-report-timeout`); the gear's `produce` grant on the activation topic and `change_notification`; a subscribing gear's `consume` grant on the activation topic, `change_notification` and the subject type `gts.cf.core.settings.activation.v1~`, and `define` for its own group
+  - The Activation Outcome Recorder's `receive_response` (DESIGN-activation §4.2): no subscription of the reporting instance answered `not_subscribed` with nothing written; no state, or a terminal one, ignored; a `silent` row not terminal — a late report is accounted as a timely one; the report accounted against the reporting instance's own row only, so one instance's confirmation says nothing of its siblings, and any report ending the instance's silence and re-arming its silent row when it is not accounted; a matching applied value `succeeded` whatever `change_ref` it names; a differing value or a `failed` status `failed` on the current `change_ref` and ignored as stale on an earlier one; a missing or non-canonical value treated as differing; reports settle the state under a guard against concurrent reports and overwrites (DESIGN-activation §4.2 *Concurrency of reports*); each transition, and each call of silence, appending, in the same transaction, one `activation` audit record carrying `change_ref`, the reporting instance's `instance_id` and `instance_label` (two nullable columns beside `change_ref` and `detail`, withheld by the reads from every reader but the root tenant's), `outcome` `success`, `failure` or `silent`, `detail` truncated to 1 KiB, the subscriber as `actor` with `actor_classification = public`, a minted `request_id`, and no pre or post value; the change outcome of a subscriber derived at read time over its instances' rows as `failed` over `incomplete` over `awaiting` over `succeeded` and never stored (DESIGN-activation §4.1 `ChangeOutcome`; the read of it is 2.14)
+  - The Consumer Activation SDK in `settings-service-sdk` (DESIGN-activation §4.2, §4.5): `subscribe(keys, tenant, handler)` — each process one consumer instance, its `instance_id` (a UUIDv7 generated once per process) and host-name `instance_label` carried by every registration, report and unsubscribe, the caller passing neither — returning a handle at once — an error only for invalid input — with a per-key state `registered` (with the fresh value read after the registration committed), `pending` (retried with backoff while the handle lives, a warning each minute, including the reason `PendingReason::NotRegistered` of a key whose registration the service no longer holds, registered again by the retry) or `refused` (terminal: a `403` read decision, or a 65th tenant interest checked before registering); one anonymous consumer group per subscribing gear per process with one interest per subscription tenant, offsets in memory from the latest position, the group deleted with the gear's last handle or on stop; notifications for another `subscriber` dropped; each notified key re-read with `get_effective` and the freshness option, the handler invoked with the bundle and the fresh values; a pending registration that commits handing the handler a bundle without `change_ref`, which owes no report; `report_outcome` idempotent per `(subscriber, instance_id, key, tenant, change_ref)`, answering `applied`, `ignored` or `ReportResult::not_subscribed`; `handle.unsubscribe()` explicit, never on drop, and the process's graceful stop (the settings-service gear's `stop`, which comes with every gear's) deregistering every subscription of the process under its `instance_id`, best effort within the shutdown deadline; the breaking SDK 0.3.0 contract (`cpt-cf-settings-service-contract-consumer-activation`): the service refuses a registration, report or unsubscribe without an `instance_id`, `ReportResult` gains `not_subscribed` and `PendingReason` gains `NotRegistered`, and the consumer-facing signatures are unchanged; the results table of DESIGN-activation §4.5
+  - `SettingsReaderClient.get_effective` taking an optional `freshness` beside `key` and `scope` (DESIGN §4.5): the freshness option bypasses the effective-value cache and resolves from the store on the replica that serves the read
+  - `audit_records` gaining `operation = activation` and the nullable `change_ref`, `detail`, `instance_id` and `instance_label` columns, and `silent` as a value of `outcome` for a call of silence (DESIGN §4.7)
+  - Metrics (DESIGN-activation §7): `settings_notify_publish_to_deliver_seconds{event}`, `settings_notify_response_latency_seconds{late}`, `settings_notify_redeliveries_total`, `settings_activation_awaiting`, `settings_notify_reactions_total{outcome}`, `settings_notify_reports_total{result}`, `settings_mutation_lock_wait_seconds`, `settings_mutation_lock_total{result}`, `settings_notify_subscriptions`, `settings_activation_incomplete_total`, `settings_activation_silent`, `settings_activation_silent_subscriptions`, `settings_activation_silenced_total`, `settings_activation_forgotten_total`, `settings_activation_evictions_total{result}`
+  - Tests: the unit, integration and E2E rows of DESIGN-activation §7 outside the broadcast of 2.12 and the reads of 2.14, including the canonical-encoding and secret-hash conformance rows and the concurrent rows on separate committed connections, held in flight by the test-only pause point between the candidate step and the commit; DESIGN §7 *Set — value write, audit record and activation state are one transaction*, the notification half of *Set — commit + publish* (activation state written, `change_notification` at the end of the request), the activation-state half of *Set — no broker resolvable* (the rows stay `awaiting` until the broker resolves) and the concurrency item for the mutations of one key
+
+- **Out of scope**:
+  - The per-setting activation read and the reports attached to the history, which are 2.14 (`cpt-cf-settings-service-feature-activation-read`)
+  - Activation of subject-scoped values, which v1 does not track
+  - The subtree subscription mode, deferred (DESIGN-activation §6.2)
+  - Signalling a hierarchy change to subscribers, a non-goal: no activation state is written for it and the pull path covers it
+  - Dependency groups and domain-affinity filtering, which are R3
+  - An administrator action that closes an outstanding state by hand, rejected by ADR-004, which RESOLVED the unbounded wait it answered with the report timeout and the forgetting (DESIGN-activation §6.2 *Unbounded wait*); and a secret hash keyed from the Credential Store, an open question (DESIGN-activation §6.2 *Keyed secret hash*)
+  - A heartbeat or lease for instance liveness: the delivery loop's re-publication is the only liveness signal. Accounting for a consumer that runs as several replicas is in scope, resolved by the per-instance account of ADR-004 (DESIGN-activation §6.2 *Replica registration* no longer open)
+
+- **Requirements Covered**:
+
+  - [ ] `p3` - `cpt-cf-settings-service-fr-consumer-activation`
+  - [ ] `p3` - `cpt-cf-settings-service-contract-consumer-activation`
+  - Extends `cpt-cf-settings-service-fr-live-read-activation`, listed under 2.8: the change signal a consumer self-reacts to
+  - Extends `cpt-cf-settings-service-nfr-reliability-validated-set`, listed under 2.8: a refused or stale write stores no activation state
+  - Extends `cpt-cf-settings-service-nfr-security-baseline`, listed under 2.1: identifiers only in the notification stream, a hash in place of a secret in a report
+  - Extends `cpt-cf-settings-service-nfr-ops-set-monitoring`, listed under 2.8: the activation and mutation-lock metrics
+
+- **Design Principles Covered**:
+
+  - [ ] `p1` - `cpt-cf-settings-service-principle-notify-not-execute`
+  - [ ] `p1` - `cpt-cf-settings-service-principle-identifiers-only`
+  - [ ] `p1` - `cpt-cf-settings-service-principle-snapshot-verification`
+  - [ ] `p1` - `cpt-cf-settings-service-principle-unbounded-wait` (superseded by ADR-004: the wait is bounded per instance by the report timeout counted in accepted deliveries; the outstanding instances are called silent and the change closes `incomplete`, the id and heading kept in DESIGN-activation with the new text)
+  - Extends `cpt-cf-settings-service-principle-two-signal-split`, listed under 2.12: the `change_notification` half
+
+- **Design Constraints Covered**:
+
+  - [ ] `p1` - `cpt-cf-settings-service-constraint-activation-two-events-per-change-set`
+  - [ ] `p1` - `cpt-cf-settings-service-constraint-activation-filtered-notification`
+  - [ ] `p1` - `cpt-cf-settings-service-constraint-activation-tenant-in-payload`
+  - [ ] `p1` - `cpt-cf-settings-service-constraint-activation-identifiers-only-payload`
+  - [ ] `p1` - `cpt-cf-settings-service-constraint-activation-pull-plus-back-response`
+  - [ ] `p1` - `cpt-cf-settings-service-constraint-activation-wait-for-all-unbounded` (superseded by ADR-004: every expected instance must confirm for a change to succeed, within the report timeout, after which the silent instances close it `incomplete`; no row is discarded or counted failed on silence)
+  - Extends `cpt-cf-settings-service-constraint-activation-in-settings-gear`, listed under 2.12: its session-pooling clause, with the key mutation lock and the scan lock
+  - Extends `cpt-cf-settings-service-constraint-activation-broker-only`, listed under 2.12: the activation signal over the broker as a soft dependency, the states staying `awaiting` while no broker resolves
+
+- **Domain Model Entities**:
+  - `ChangeNotification` and `BackResponse` are declared in 2.1 as SDK data types; their behaviour and the Consumer Activation SDK are delivered here
+  - ActivationState, Subscription
+  - ResponseStatus, ActivationStatus, ChangeOutcome, ReportResult
+  - The SDK subscription handle and its per-key state (`registered`, `pending`, `refused`) and its `PendingReason`
+
+- **Design Components**:
+
+  - [ ] `p1` - `cpt-cf-settings-service-component-subscription-manager`
+  - [ ] `p1` - `cpt-cf-settings-service-component-change-set-publisher`
+  - [ ] `p1` - `cpt-cf-settings-service-component-change-set-outcome-tracker`
+  - [ ] `p1` - `cpt-cf-settings-service-component-consumer-activation-sdk`
+  - Extends `cpt-cf-settings-service-component-event-broker-client`, listed under 2.12: the activation topic, `publish_notification`, `subscribe_notifications` and the delivery loop
+  - Extends the end-of-request publish hook of 2.12 on `cpt-cf-settings-service-component-value-writer`: the activation state and the notifications
+  - Extends `cpt-cf-settings-service-component-value-writer`, listed under 2.8: the key's mutation lock, `record_change` in each change's transaction, the fallback-secret fetch and the staged-secret adoption fetch
+  - Extends `cpt-cf-settings-service-component-tenant-permission`, listed under 2.7: the key's mutation lock on `set_restriction` and `clear_restriction`
+  - Extends `cpt-cf-settings-service-component-value-resolver`, listed under 2.5: the two uncached forms of `resolve`, inside a transaction and with the freshness option
+  - Extends `cpt-cf-settings-service-component-cache-and-invalidation`, listed under 2.5: the fresh read bypasses the cache
+  - Extends `cpt-cf-settings-service-component-secret-manager`, listed under 2.9: the two in-process uses of `resolve_plaintext` — the fallback fetch and the staged-secret adoption fetch — audited as `secret_use`
+
+- **API**:
+  - SDK `subscribe(keys, tenant, handler)`, the handle's `unsubscribe()`, and `report_outcome(change_ref, tenant, key, status, applied_value, detail?)` answering `applied`, `ignored` or `not_subscribed`, the instance id supplied by the client and not by the caller — in-process calls today, reaching the service through the SDK's remote binding in the out-of-process profiles; no REST route (DESIGN-activation §4.3)
+  - SDK `SettingsReaderClient.get_effective` with the freshness option
+  - The `change_notification` event on the activation topic
+
+- **Sequences**:
+
+  - [ ] `p1` - `cpt-cf-settings-service-seq-activation-change-set-notify`
+  - [ ] `p1` - `cpt-cf-settings-service-seq-activation-restart-resubscribe`
+  - [ ] `p1` - `cpt-cf-settings-service-seq-activation-report-timeout`
+
+- **Data**:
+  - `subscriptions` table with `uq_sub_subscriber_instance_key_tenant` on `(subscriber, instance_id, key, tenant)`, `idx_sub_key` and the partial `idx_sub_silent` on `(key, tenant, silent_since)`
+  - `activation_state` table with `uq_activation_state` on `(subscriber, instance_id, key, tenant)`, `idx_activation_key_tenant` and the partial `idx_activation_awaiting`
+  - `audit_records`: `operation = activation`, the nullable `change_ref`, `detail`, `instance_id` and `instance_label` columns, `outcome = silent` for a call of silence, and the partial index `idx_audit_change_ref` on `change_ref` `WHERE change_ref IS NOT NULL`, the index added by this entry's second migration and the rest by its first; this entry adds only the `activation` value to the history read's `operation` vocabulary, and 2.14 adds the attachment of reports to their change
+  - Configuration `redeliver_interval_seconds` (default 30 s), `mutation_lock_wait_seconds` (default 10 s) and `activation_report_timeout_seconds` (default 600 s, refused below `2 × redeliver_interval_seconds` or above 86,400)
+
+### 2.14 Activation Read &mdash; HIGH
+
+- [ ] `p1` - **ID**: `cpt-cf-settings-service-feature-activation-read`
+
+- **Purpose**: Show the administrator who made a change, and platform operations, whether the consumers have taken the value up: for a setting's current value at a tenant, how many of each subscriber's expected instances have confirmed it ("N of M") and which instance has not — awaiting, failed or silent — and, in the setting's history, each instance's report, and each call of silence, under the change it answers. A tenant administrator sees the counts and states, and only the root-tenant reader the instances' identities. Both are reads; nothing here writes, forges or clears a confirmation. The account it shows is per instance and bounded by the report timeout ([ADR-004](./ADR/ADR-004-per-instance-acknowledgement-bounded-wait.md), `cpt-cf-settings-service-adr-per-instance-acknowledgement-bounded-wait`).
+
+- **Depends On**: `cpt-cf-settings-service-feature-consumer-activation`, `cpt-cf-settings-service-feature-tenant-access`, `cpt-cf-settings-service-feature-audit-store`
+
+- **Scope**:
+  - `GET /settings-service/v1/settings/{key}/activation` served by the Recorder's `activation_status` (DESIGN-activation §4.3): the tenant, defaulting to the caller's own and normalised to a bare lowercase UUID string, and one item per subscriber with activation rows at `(key, tenant)` — `subscriber`, `change_ref`, the `outcome` derived at read time and never stored (`failed` over `incomplete` over `awaiting` over `succeeded`), the counts `expected` (`M`), `confirmed` (`N`), `failed`, `silent` and `silent_excluded`, and `instances`, one entry per row (`status`, `excluded: false`, `reported_at`, `silent_since`, `detail` on failure) followed by one entry per silent instance the change left out (`status` `silent`, `excluded: true`, `silent_since`), the rows first and then the excluded entries, each part ordered by status and then by `instance_id`; no values; a key nobody subscribed to there, or a subscriber with a registration and no row, has no item and answers `200` with none; a single resource, not a paginated list, bounded at 64 entries per item
+  - The identity rule (DESIGN-activation §4.3 *What each caller sees*): `instance_id` and `instance_label` shown only to a caller whose own tenant is the root, absent — not masked — for every other caller, in the activation read, on its excluded entries and in the history; the outcome, the counts, the statuses, the `excluded` flags and the order are the same for every reader
+  - The read's authorization (DESIGN §4.8, DESIGN-activation §4.8): the decision of a value read of the key at the tenant; `403` when the action is denied, whatever key and tenant are named; `404` for a tenant outside the caller's subtree, a key hidden from the caller there, or a declaration outside the caller's administrative domain, indistinguishable from an unknown key
+  - The route as an `OperationBuilder` declaration — `operation_id`, `.authenticated()`, licence posture, response schema and registered errors — collected by `OpenApiRegistry`, and the OpenAPI document regenerated with the route and the history's attached items
+  - The history read of 2.6 attaching, beside each change record of `(key, scope)`, the `activation` records whose `change_ref` is that record's `id`, whatever their tenant, found through `idx_audit_change_ref` (DESIGN §4.3); a report kept only where its tenant is inside the caller's subtree and the key is visible to the caller there; an attached item carrying `change_ref`, the subscriber (`actor`), `outcome` (`success`, `failure` or `silent`), `detail`, `tenant_id` and `occurred_at`, and `instance_id` and `instance_label` for a root-tenant reader only — one item per instance that reported and one per call of silence, the `silent` item staying under its change after a later change and after the instance is forgotten — the items under one record ordered newest first with the report's `id` breaking a tie; `activations` on every listed record, an empty list when none; a report whose change record belongs to the same `(key, scope)` history returned only attached to it, on whichever page the change record falls, and listed as an ordinary record only in another history
+  - Tests: the Level 3 rows of DESIGN-activation §7 — the activation read with its identity row, the out-of-subtree and hidden-key `404`, the action denial, and the history rows, per-instance reports and calls of silence among them — the read-side assertions of its E2E *Full loop* and *Value mismatch → failed* rows, and its *Smoke without a broker* row (a declared key `200` with no items, an undeclared key `404`, an anonymous caller `401`)
+
+- **Out of scope**:
+  - Any write: an administrator and platform operations read the account and cannot set, forge or clear a confirmation
+  - A view grouped by request: activation is tracked per change and subscription, and no grouping exists to read
+  - Paging the attached reports beyond the pages the history read already serves
+  - An account of an expectation that a later change replaces before any confirmation, which leaves no record by design
+
+- **Requirements Covered**:
+  - Extends `cpt-cf-settings-service-fr-consumer-activation`, listed under 2.13: the clause that the service shows, for a setting's current value, how many of the expected instances have confirmed it and which instance confirmed, failed or stayed silent, with the outcome precedence `failed` over `incomplete` over `awaiting` over `succeeded`, readable by the administrator and platform operations, the identities of the instances for the platform administrator only
+  - Extends `cpt-cf-settings-service-fr-audit-mutations`, listed under 2.6: each report, and each call of silence, recorded in the history under the change it answers
+  - Extends `cpt-cf-settings-service-nfr-scope-isolation`, listed under 2.7: the `404` of the activation read and the confinement of attached reports to the caller's subtree
+
+- **Design Principles Covered**:
+  - None beyond those listed under 2.13, `cpt-cf-settings-service-principle-unbounded-wait` among them, superseded by ADR-004 (the wait the read shows is bounded per instance by the report timeout)
+
+- **Design Constraints Covered**:
+  - Extends `cpt-cf-settings-service-constraint-rbac-policy-enforcer`, listed under 2.1: the read decision of the activation read
+  - Extends `cpt-cf-settings-service-constraint-audit-and-events`, listed under 2.1: the history attachment reads the audit store
+  - None beyond those listed under 2.13, `cpt-cf-settings-service-constraint-activation-wait-for-all-unbounded` among them (superseded by ADR-004)
+
+- **Domain Model Entities**:
+  - The per-setting activation response and its per-subscriber item
+  - The attached `activation` item of a history record, with its `silent` outcome and the instance identity for a root-tenant reader
+  - `ChangeOutcome` as derived at read time, and the per-instance entry of the activation item (`status`, `excluded`)
+
+- **Design Components**:
+  - Extends `cpt-cf-settings-service-component-change-set-outcome-tracker`, listed under 2.13: `activation_status`
+  - Extends `cpt-cf-settings-service-component-audit-emitter`, listed under 2.1 and completed by 2.6: the history read's attachment of `activation` records
+
+- **API**:
+  - GET /settings-service/v1/settings/{key}/activation?tenant={tenant_id}
+  - GET /settings-service/v1/settings/{key}/history?tenant={tenant_id} (attached activation reports)
+
+- **Sequences**:
+  - None of its own; it shows the account `cpt-cf-settings-service-seq-activation-change-set-notify` and `cpt-cf-settings-service-seq-activation-report-timeout` (both under 2.13) produce
+
+- **Data**:
+  - Reads `activation_state` through `idx_activation_key_tenant`, `subscriptions` — joined for `instance_label` (outer join) and read through the partial `idx_sub_silent` for the excluded silent entries — added by 2.13's first migration, and `audit_records` through the partial index `idx_audit_change_ref` on `audit_records.change_ref` `WHERE change_ref IS NOT NULL`, added by 2.13's second migration
+
 ## 3. Feature Dependencies
 
 ```text
@@ -701,6 +931,19 @@ cpt-cf-settings-service-feature-value-writes   cpt-cf-settings-service-feature-s
 cpt-cf-settings-service-feature-secret-values                          ↓
                                                                        ↓
 cpt-cf-settings-service-feature-typed-value-validation ─→ cpt-cf-settings-service-feature-module-contributions
+
+cpt-cf-settings-service-feature-value-writes ─→ cpt-cf-settings-service-feature-replica-coherence
+cpt-cf-settings-service-feature-value-resolution ─→ cpt-cf-settings-service-feature-replica-coherence
+cpt-cf-settings-service-feature-secret-values ─→ cpt-cf-settings-service-feature-replica-coherence
+cpt-cf-settings-service-feature-setting-declarations ─→ cpt-cf-settings-service-feature-replica-coherence
+cpt-cf-settings-service-feature-module-contributions ─→ cpt-cf-settings-service-feature-replica-coherence
+cpt-cf-settings-service-feature-replica-coherence ─→ cpt-cf-settings-service-feature-consumer-activation
+cpt-cf-settings-service-feature-value-writes ─→ cpt-cf-settings-service-feature-consumer-activation
+cpt-cf-settings-service-feature-audit-store ─→ cpt-cf-settings-service-feature-consumer-activation
+cpt-cf-settings-service-feature-secret-values ─→ cpt-cf-settings-service-feature-consumer-activation
+cpt-cf-settings-service-feature-consumer-activation ─→ cpt-cf-settings-service-feature-activation-read
+cpt-cf-settings-service-feature-audit-store ─→ cpt-cf-settings-service-feature-activation-read
+cpt-cf-settings-service-feature-tenant-access ─→ cpt-cf-settings-service-feature-activation-read
 ```
 
 **Dependency Rationale**:
@@ -714,12 +957,15 @@ cpt-cf-settings-service-feature-typed-value-validation ─→ cpt-cf-settings-se
 - `cpt-cf-settings-service-feature-tenant-access` requires resolution: effective access is consulted by the read path, and an access change evicts the target's and its descendants' cached values, so the cache and the visibility rule it feeds must exist first.
 - `cpt-cf-settings-service-feature-value-writes` requires the audit store, because every write commits its record in the same transaction and refuses without it, and tenant access, because a write requires the caller's own effective access to be `overridable`. Through those it also requires resolution, which supplies the current effective value the validate report and the impact preview compare against.
 - `cpt-cf-settings-service-feature-secret-values` requires value writes: a secret is set as a value at a scope, and `set` is what routes the plaintext through the Secret Manager and persists only the reference.
-- `cpt-cf-settings-service-feature-module-contributions` requires typed value validation, for the defaults and the copied values an upgrade re-validates and for the `setting_values` table the copies land in. It writes **no** audit records at all — a declaration has no scope to write one against — so the audit store never enters its ordering; and it does not require value writes, since the upgrade migration copies rows directly rather than setting them.
+- `cpt-cf-settings-service-feature-module-contributions` requires typed value validation, for the defaults and the copied values an upgrade re-validates and for the `setting_values` table the copies land in. It writes its audit records inside its own transaction, carrying no tenant — a declaration has no scope to write one against — through the Audit Emitter of 2.1, so it resolves no tenant and the audit store never enters its ordering; and it does not require value writes, since the upgrade migration copies rows directly rather than setting them.
 
 - `cpt-cf-settings-service-feature-search-discoverability` requires resolution and tenant access: it reuses the browse path's gates — the value-resource scope, the subtree target check, domain visibility and the `hidden` exclusion — and the hierarchy's non-standalone descendants bound its override corpus. It writes nothing and adds no table, so nothing depends on it.
+- `cpt-cf-settings-service-feature-replica-coherence` requires value writes, whose request ends with the broadcast after its commits, and value resolution, whose cache the peers evict on receipt and whose `cache_ttl_seconds` bounds a lost broadcast. It is the first feature to use the broker, so the soft-dependency resolution, the publishing identity and the signal-type registration the later entries reuse land here. It also requires secret values, because the publishing identity is the service principal the Secret Manager of 2.9 builds; 2.12 reuses it and defines none. It also requires setting declarations, whose retire, reactivate, evolve and `PATCH` paths end with the same broadcast under the root tenant, and module contributions, whose reconcile pass ends with it too.
+- `cpt-cf-settings-service-feature-consumer-activation` requires replica coherence, for the broker client, the publishing identity and the end-of-request publish it extends with the notification; the audit store, because `change_ref` is the id of the change's audit record and every report appends an `activation` record; and secret values, because the expected value of a secret is a hash over plaintext the Secret Manager holds, the inherited fallback of a revert included. It also requires value writes, whose transaction carries the activation state and whose mutations the key's lock serializes.
+- `cpt-cf-settings-service-feature-activation-read` requires consumer activation, which produces the activation states and the `activation` records it reads, tenant access, whose subtree and visibility gates decide the read's `404` and which reports the history keeps, and the audit store, whose history read it extends.
 
-**Parallelism**: wave 1 is strictly sequential. In wave 2, `audit-store` can start as soon as 2.3 lands and run alongside 2.4 and 2.5; `module-contributions` needs only 2.4 and can run alongside 2.5 through 2.9; `tenant-access`, `value-writes`, and `secret-values` form a chain. Work also parallelizes inside 2.1, where the SDK crate, persistence harness, REST and OData infrastructure, error mapping, and the Audit Emitter are largely independent of one another.
+**Parallelism**: wave 1 is strictly sequential. In wave 2, `audit-store` can start as soon as 2.3 lands and run alongside 2.4 and 2.5; `module-contributions` needs only 2.4 and can run alongside 2.5 through 2.9; `tenant-access`, `value-writes`, and `secret-values` form a chain. Work also parallelizes inside 2.1, where the SDK crate, persistence harness, REST and OData infrastructure, error mapping, and the Audit Emitter are largely independent of one another. In wave 3, `replica-coherence` needs 2.3, 2.5, 2.8, 2.9 and 2.10 and can run alongside 2.11; `consumer-activation` follows `replica-coherence`, and `activation-read` follows `consumer-activation`.
 
 **Order of delivery within the waves.** Declarations reach the platform through two doors, and only one of them is on the critical path: gears contribute theirs through the SDK (2.10), administrators author theirs through `POST /settings-service/v1/declarations` (the write flows of 2.3). Set and read of values need declarations to exist, not an administrative way to author them, so the sequence that reaches a working value path soonest is: the `setting_type` base registered at init (2.1, step 9 of gear init), the Type Validator and the `setting_values` table (2.4), the reconciler (2.10), the read surface and the in-process reader (2.5), the audit store (2.6), the write path (2.8) — with tenant access (2.7) entering as its absent-row semantics first, which is `overridable` for everyone, and its endpoints after. The administrative declaration writes of 2.3 follow; their read surface is already in place.
 
-**What unblocks next**: 2.10 and 2.11 complete R1 — 2.11 carries cross-field search, and the `mode` tag, with `display_name` when set, rides every browse item and search hit. R2 then waits on the platform — verified machine caller identity for the out-of-process profiles and the service-write SDK path, the platform-wide elevated session behind the existing `StepUpVerifier` port, the platform Audit Subsystem behind the existing `AuditSink` port, the tenant-deleted signal, and per-feature licence entitlement — while file-valued settings, the anonymous read route, and the replica broadcast need nothing outside this gear and the broker it already publishes to.
+**What unblocks next**: 2.10 and 2.11 complete R1 — 2.11 carries cross-field search, and the `mode` tag, with `display_name` when set, rides every browse item and search hit. Wave 3 opens R2 on the broker: 2.12 makes the replicas converge, 2.13 delivers consumer activation, and 2.14 shows its account to administrators. The rest of R2 waits on the platform — verified machine caller identity for the out-of-process profiles and the service-write SDK path, the platform-wide elevated session behind the existing `StepUpVerifier` port, the platform Audit Subsystem behind the existing `AuditSink` port, the tenant-deleted signal, and per-feature licence entitlement — while file-valued settings and the anonymous read route need nothing outside this gear. Dependency groups and domain-affinity filtering stay R3.

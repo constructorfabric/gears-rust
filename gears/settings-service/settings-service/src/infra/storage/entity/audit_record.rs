@@ -42,13 +42,29 @@ pub struct Model {
     /// The value after the operation, if any.
     #[sea_orm(nullable)]
     pub post_value: Option<Json>,
-    /// Result of the operation: `success` or `failure`.
+    /// Result of the operation: `success` or `failure`, or `silent` on an
+    /// `activation` record.
     pub outcome: String,
     /// Id of the request that caused the operation, for correlation.
     pub request_id: String,
     /// Id of the change set the record belongs to, when written as part of one.
     #[sea_orm(nullable)]
     pub change_set_id: Option<Uuid>,
+    /// The id of the change's audit record an `activation` record answers, and
+    /// the one an activation state names; absent on every other record.
+    #[sea_orm(nullable)]
+    pub change_ref: Option<Uuid>,
+    /// The consumer's failure detail on an `activation` record.
+    #[sea_orm(nullable)]
+    pub detail: Option<String>,
+    /// The reporting — or silent — consumer instance on an `activation`
+    /// record; absent on every other record.
+    #[sea_orm(nullable)]
+    pub instance_id: Option<Uuid>,
+    /// That instance's label at the time of the record, on an `activation`
+    /// record only.
+    #[sea_orm(nullable)]
+    pub instance_label: Option<String>,
     /// When the operation happened.
     pub occurred_at: OffsetDateTime,
     /// Earliest time the record may be purged; absent means no retention deadline yet.

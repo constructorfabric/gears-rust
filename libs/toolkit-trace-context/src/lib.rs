@@ -16,6 +16,8 @@
 //!   active context as `traceparent`; without it, a no-op.
 //! - [`current_trace_id`] / [`current_trace_ids`] — read the ids of the active
 //!   `OTel` span (what the log-correlation formatter and error path stamp).
+//! - [`current_traceparent`] — the active span context as a `traceparent` value,
+//!   for carrying in a payload (an event envelope) rather than a header.
 //! - [`extract_trace_id`] — the wire-id resolver: active span, else a validated
 //!   inbound `traceparent`.
 #![cfg_attr(coverage_nightly, feature(coverage_attribute))]
@@ -50,6 +52,37 @@ pub fn current_trace_ids() -> Option<(opentelemetry::trace::TraceId, opentelemet
     span_context
         .is_valid()
         .then(|| (span_context.trace_id(), span_context.span_id()))
+}
+
+/// The active `OTel` span context rendered as a W3C `traceparent` value,
+/// `00-<trace_id 32 hex>-<span_id 16 hex>-<flags 2 hex>`, if valid.
+///
+/// Carries the span's real `trace_flags` (so the sampled bit survives) and is
+/// the form [`set_parent_from_headers`] accepts back under the `traceparent`
+/// header. `None` when no valid span context is active.
+#[cfg(feature = "otel")]
+#[must_use]
+pub fn current_traceparent() -> Option<String> {
+    use opentelemetry::trace::TraceContextExt as _;
+
+    let context = opentelemetry::Context::current();
+    let span = context.span();
+    let span_context = span.span_context();
+    span_context.is_valid().then(|| {
+        format!(
+            "00-{}-{}-{:02x}",
+            span_context.trace_id(),
+            span_context.span_id(),
+            span_context.trace_flags().to_u8()
+        )
+    })
+}
+
+/// No `OTel` compiled in: there is never a span context to render.
+#[cfg(not(feature = "otel"))]
+#[must_use]
+pub fn current_traceparent() -> Option<String> {
+    None
 }
 
 /// The `trace_id` of the currently active `OTel` span, if valid.
@@ -561,5 +594,45 @@ mod resolver_tests {
         );
         assert!(extract_trace_id(&header("not-a-valid-traceparent")).is_none());
         assert!(extract_trace_id(&HeaderMap::new()).is_none());
+    }
+}
+
+#[cfg(test)]
+#[cfg(feature = "otel")]
+#[cfg_attr(coverage_nightly, coverage(off))]
+mod traceparent_tests {
+    use super::{current_trace_ids, current_traceparent, parse_trace_id};
+    use opentelemetry::trace::TracerProvider as _;
+    use tracing_subscriber::layer::SubscriberExt as _;
+
+    fn subscriber() -> impl tracing::Subscriber + Send + Sync {
+        let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder().build();
+        let tracer = provider.tracer("trace-context-test");
+        tracing_subscriber::registry().with(tracing_opentelemetry::layer().with_tracer(tracer))
+    }
+
+    #[test]
+    fn an_entered_span_renders_a_well_formed_traceparent_with_its_ids() {
+        tracing::subscriber::with_default(subscriber(), || {
+            let _span = tracing::info_span!("unit").entered();
+            let value = current_traceparent().expect("an active span renders");
+            let (trace_id, span_id) = current_trace_ids().expect("ids");
+            let parts: Vec<&str> = value.split('-').collect();
+            assert_eq!(parts.len(), 4);
+            assert_eq!(parts[0], "00");
+            assert_eq!(parts[1], trace_id.to_string());
+            assert_eq!(parts[2], span_id.to_string());
+            assert_eq!(parts[3].len(), 2);
+            assert_eq!(
+                parse_trace_id(&value).as_deref(),
+                Some(trace_id.to_string().as_str()),
+                "the whole value passes the library's own validation"
+            );
+        });
+    }
+
+    #[test]
+    fn no_span_renders_none() {
+        assert!(current_traceparent().is_none());
     }
 }

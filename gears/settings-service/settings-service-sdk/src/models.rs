@@ -4,8 +4,8 @@
 //! The opaque secret handle and the effective-source vocabulary, the reader
 //! request and response shapes, and the declaration-contribution shapes.
 //!
-//! The change-notification payloads belong to Settings Activation and are not
-//! modelled here; see the [`crate::api`] module docs for why.
+//! The activation contract — the change-notification body, the per-key states,
+//! the outcomes — is modelled in [`crate::activation`], not here.
 
 use serde::{Deserialize, Serialize};
 
@@ -33,10 +33,9 @@ pub enum EffectiveSource {
 impl EffectiveSource {
     /// Whether this source means no override exists anywhere in the chain.
     ///
-    /// For a `secret`-trait setting this is also how a machine consumer detects
-    /// an unconfigured credential: the declaration's default is a non-secret
-    /// placeholder, so a schema-default source means no credential is set at any
-    /// scope and the placeholder must be treated as absent.
+    /// For a `secret`-trait setting it means no credential is set at any scope:
+    /// the value is the declaration's default, an empty value of its type, and
+    /// `resolve_secret` hands that value out like any other.
     #[must_use]
     pub const fn is_unconfigured(self) -> bool {
         matches!(self, Self::SchemaDefault)
@@ -77,6 +76,40 @@ impl std::fmt::Debug for SecretHandle {
     }
 }
 
+/// How current a read of an effective value must be.
+///
+/// A replica serves a read from its cache until the `cache_invalidate`
+/// broadcast, or the cache's TTL, evicts the entry, so a read may trail a
+/// committed change by that long. A consumer that has just been told a value
+/// changed — and is about to apply it and report what it applied — cannot take
+/// that risk: it would apply the previous value and fail a report it could have
+/// settled.
+// @cpt-dod:cpt-cf-settings-service-dod-consumer-activation-sdk:p1
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Freshness {
+    /// The ordinary read: the replica's cache first. The default.
+    #[default]
+    Cached,
+    /// Resolve from the store on the replica that serves the read: no cached
+    /// entry is consulted and the result is not stored, so the read leaves the
+    /// cache as it found it. Authorization, visibility and retirement rules are
+    /// those of the ordinary read. The cost is one store read.
+    Fresh,
+}
+
+impl Freshness {
+    /// Whether this is the default, for `skip_serializing_if`.
+    #[must_use]
+    #[allow(
+        clippy::trivially_copy_pass_by_ref,
+        reason = "serde's `skip_serializing_if` hands the field by reference"
+    )]
+    pub const fn is_cached(&self) -> bool {
+        matches!(self, Self::Cached)
+    }
+}
+
 /// A request for one setting's effective value at a scope.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -85,6 +118,28 @@ pub struct GetEffectiveRequest {
     pub key: SettingKey,
     /// The scope to resolve it for.
     pub scope: String,
+    /// How current the read must be; the cached read when absent.
+    #[serde(default, skip_serializing_if = "Freshness::is_cached")]
+    pub freshness: Freshness,
+}
+
+impl GetEffectiveRequest {
+    /// An ordinary (cached) read of `key` at `scope`.
+    #[must_use]
+    pub fn new(key: SettingKey, scope: impl Into<String>) -> Self {
+        Self {
+            key,
+            scope: scope.into(),
+            freshness: Freshness::Cached,
+        }
+    }
+
+    /// The same read, resolved from the store rather than the cache.
+    #[must_use]
+    pub const fn fresh(mut self) -> Self {
+        self.freshness = Freshness::Fresh;
+        self
+    }
 }
 
 /// One scope the resolver inspected, as a consumer sees it.

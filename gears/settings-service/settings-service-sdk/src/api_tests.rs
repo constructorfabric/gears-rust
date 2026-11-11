@@ -203,6 +203,7 @@ async fn a_failed_read_is_an_error_not_a_schema_default() {
             GetEffectiveRequest {
                 key: key("proxy"),
                 scope: "tenant-a".to_owned(),
+                freshness: crate::models::Freshness::default(),
             },
         )
         .await;
@@ -229,6 +230,7 @@ async fn a_failure_is_distinguishable_from_a_genuine_schema_default() {
             GetEffectiveRequest {
                 key: key("timeout"),
                 scope: "tenant-a".to_owned(),
+                freshness: crate::models::Freshness::default(),
             },
         )
         .await
@@ -242,6 +244,7 @@ async fn a_failure_is_distinguishable_from_a_genuine_schema_default() {
             GetEffectiveRequest {
                 key: key("proxy"),
                 scope: "tenant-a".to_owned(),
+                freshness: crate::models::Freshness::default(),
             },
         )
         .await;

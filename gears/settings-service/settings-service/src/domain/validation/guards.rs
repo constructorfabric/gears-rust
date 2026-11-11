@@ -29,9 +29,6 @@ use crate::field;
 /// The largest serialized value the service stores.
 pub const MAX_SERIALIZED_BYTES: usize = 64 * 1024;
 
-/// The largest integer a binary64 double represents exactly, `2^53`.
-const MAX_EXACT_INTEGER: u64 = 1 << 53;
-
 /// The widest exponent a literal may carry and still be compared. A double's
 /// own range ends near `1e308` and `5e-324`, so a literal past this bound
 /// cannot round-trip anyway, and normalizing it would pad `|exponent|` zero
@@ -126,13 +123,15 @@ fn check_size(bytes: usize) -> Result<(), FieldViolation> {
 fn check_numbers(value: &Value, path: &str) -> Result<(), FieldViolation> {
     match value {
         Value::Number(n) => {
-            let exact = n.as_u64().map_or_else(
-                || {
-                    n.as_i64()
-                        .is_none_or(|i| i.unsigned_abs() <= MAX_EXACT_INTEGER)
-                },
-                |u| u <= MAX_EXACT_INTEGER,
-            );
+            // Judged by exactness, not by magnitude: `10^16` is a double, `2^53 + 1`
+            // is not, and the spelling serde saw (`1e16` or `10000000000000000`)
+            // must not decide, because PostgreSQL stores `numeric` and hands back
+            // the integer spelling of what was written as an exponent.
+            let exact = n
+                .as_u64()
+                .map(survives_binary64_u64)
+                .or_else(|| n.as_i64().map(survives_binary64_i64))
+                .unwrap_or(true);
             if exact {
                 Ok(())
             } else {
@@ -140,8 +139,8 @@ fn check_numbers(value: &Value, path: &str) -> Result<(), FieldViolation> {
                     field: path.to_owned(),
                     code: field::VALUE_NOT_CANONICAL,
                     message: format!(
-                        "integer {n} lies beyond ±2^53 and does not survive a round trip through \
-                         IEEE-754 binary64; declare a string type for wider range"
+                        "integer {n} does not survive a round trip through IEEE-754 binary64; \
+                         declare a string type for wider range"
                     ),
                 })
             }
@@ -157,20 +156,43 @@ fn check_numbers(value: &Value, path: &str) -> Result<(), FieldViolation> {
     }
 }
 
+/// Whether an unsigned integer is the double it converts to.
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
+fn survives_binary64_u64(n: u64) -> bool {
+    // The float-to-int cast saturates, so the top of the range (which rounds
+    // up to 2^64) is told apart by comparing in a wider type.
+    let double = n as f64;
+    double as u128 == u128::from(n)
+}
+
+/// Whether a signed integer is the double it converts to.
+#[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+fn survives_binary64_i64(n: i64) -> bool {
+    let double = n as f64;
+    double as i128 == i128::from(n)
+}
+
 /// Whether a numeric literal, as written, denotes exactly the double it parses
 /// to.
 ///
-/// Integers are compared as integers against `2^53`. Decimals are parsed to a
-/// double, printed back through the shortest-representation formatter, and the
+/// Integers are judged by whether they are the double they convert to, which
+/// is spelling-independent and has no magnitude threshold; one that does not fit
+/// 64 bits parses to a double on the value side and is refused here. Decimals are
+/// parsed to a double, printed back through the shortest-representation formatter, and the
 /// two are compared as decimal numbers: `0.1` prints as `0.1` and passes, while
 /// a literal carrying digits the double cannot hold prints shorter and fails.
 fn round_trips(literal: &str) -> bool {
     let is_integer = !literal.bytes().any(|b| matches!(b, b'.' | b'e' | b'E'));
     if is_integer {
-        let digits = literal.strip_prefix('-').unwrap_or(literal);
-        return digits
-            .parse::<u64>()
-            .is_ok_and(|magnitude| magnitude <= MAX_EXACT_INTEGER);
+        return if literal.starts_with('-') {
+            literal.parse::<i64>().is_ok_and(survives_binary64_i64)
+        } else {
+            literal.parse::<u64>().is_ok_and(survives_binary64_u64)
+        };
     }
     let Ok(parsed) = literal.parse::<f64>() else {
         return false;

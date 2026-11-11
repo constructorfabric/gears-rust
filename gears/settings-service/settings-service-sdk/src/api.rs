@@ -14,9 +14,9 @@
 //!
 //! Change notification is not a reader-trait method. A consumer that must
 //! actively re-apply a setting -- a connection pool, a listening socket --
-//! subscribes through [`crate::activation`]: `subscribe(keys, handler)` plus
-//! `report_outcome(...)`, specified by DESIGN-activation §4.5 *In-Process SDK —
-//! Consumer Activation*. An earlier draft listed a `watch` change stream on this
+//! subscribes through [`crate::activation`]: `subscribe(keys, tenant, handler)`
+//! plus `report_outcome(...)`, specified by DESIGN-activation §4.5 *In-Process
+//! SDK — Consumer Activation*. An earlier draft listed a `watch` change stream on this
 //! trait; it named the same capability twice, and its shape could not carry the
 //! per-setting acknowledgement the activation contract requires.
 
@@ -81,6 +81,11 @@ pub trait SettingsReaderClient: Send + Sync {
     /// equally unreachable — so the caller receives a distinguishable error and
     /// owns its own degradation posture.
     ///
+    /// The request's [`crate::Freshness`] chooses between the cache-first read
+    /// and one resolved from the store on the serving replica, which bypasses the
+    /// cache and leaves it as it found it — what a consumer re-reading a setting
+    /// it was just notified about asks for.
+    ///
     /// See [`crate::SettingsError`] for typed dispatch over the failure cases.
     async fn get_effective(
         &self,
@@ -121,13 +126,17 @@ pub trait SettingsReaderClient: Send + Sync {
     ///
     /// The only plaintext path, and machine-only: the caller is authorized
     /// against this specific setting and the resolution is audited. A setting
-    /// with no credential configured anywhere fails rather than returning the
-    /// declaration's non-secret placeholder.
+    /// with no override holding a credential resolves to its declaration's
+    /// default, an empty value of its type, and that value is what comes
+    /// back — as its text: the string itself for a string, and the empty
+    /// string for a `null` default, never the text `null` — exactly as any
+    /// other value would: the same audit record, and the same hash in an
+    /// activation report. The store is not asked for it.
     ///
-    /// That failure is [`crate::SettingsError::SecretNotConfigured`], and it is
-    /// deliberately not [`crate::SettingsError::NotFound`]: the declaration
-    /// resolved, only the credential is absent. Conflating the two is what lets
-    /// a consumer hand a placeholder to a backend believing it is a credential.
+    /// A value whose stored credential is gone from the store fails with
+    /// [`crate::SettingsError::SecretNotConfigured`], deliberately not
+    /// [`crate::SettingsError::NotFound`]: the declaration resolved, only the
+    /// stored credential is missing.
     ///
     /// The plaintext comes wrapped. A [`SecretString`] prints `[REDACTED]` in
     /// `Debug`, zeroes its bytes when dropped, and yields them only through an

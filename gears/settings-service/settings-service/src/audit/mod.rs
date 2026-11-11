@@ -30,6 +30,9 @@ pub enum AuditOutcome {
     Success,
     /// The mutation was attempted and refused.
     Failure,
+    /// The delivery loop called a consumer instance silent: the record of a
+    /// call of silence, an outcome only an `activation` record carries.
+    Silent,
 }
 
 impl AuditOutcome {
@@ -39,6 +42,7 @@ impl AuditOutcome {
         match self {
             Self::Success => "success",
             Self::Failure => "failure",
+            Self::Silent => "silent",
         }
     }
 
@@ -48,6 +52,7 @@ impl AuditOutcome {
         match raw {
             "success" => Some(Self::Success),
             "failure" => Some(Self::Failure),
+            "silent" => Some(Self::Silent),
             _ => None,
         }
     }
@@ -86,6 +91,9 @@ pub enum AuditOperation {
     /// A secret was staged ahead of the batch that commits it: the entry is in
     /// the store, nothing live has changed yet.
     Stage,
+    /// A consumer reported what it applied for a change: the record names the
+    /// change by its `change_ref`.
+    Activation,
 }
 
 impl AuditOperation {
@@ -100,6 +108,7 @@ impl AuditOperation {
             Self::Clone => "clone",
             Self::SecretUse => "secret_use",
             Self::Stage => "stage",
+            Self::Activation => "activation",
         }
     }
 
@@ -114,6 +123,7 @@ impl AuditOperation {
             "clone" => Some(Self::Clone),
             "secret_use" => Some(Self::SecretUse),
             "stage" => Some(Self::Stage),
+            "activation" => Some(Self::Activation),
             _ => None,
         }
     }
@@ -311,6 +321,25 @@ pub struct AuditRecord {
         with = "time::serde::rfc3339::option"
     )]
     pub retain_until: Option<OffsetDateTime>,
+    /// The id the record is stored under, minted by the mutation before the
+    /// append when something else must name it — an activation state names
+    /// the change's record as its `change_ref`. Absent, the store mints one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub record_id: Option<Uuid>,
+    /// The change an `activation` record answers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub change_ref: Option<Uuid>,
+    /// The consumer's failure detail on an `activation` record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    /// The reporting — or silent — consumer instance on an `activation`
+    /// record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance_id: Option<Uuid>,
+    /// That instance's label at the time of the record, on an `activation`
+    /// record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance_label: Option<String>,
 }
 
 impl AuditRecord {
@@ -353,6 +382,11 @@ impl AuditRecord {
             request_id: request_id.into(),
             change_set_id: None,
             retain_until: None,
+            record_id: None,
+            change_ref: None,
+            detail: None,
+            instance_id: None,
+            instance_label: None,
         }
         // @cpt-end:cpt-cf-settings-service-algo-audit-store-append:p1:inst-as-append-2
     }
@@ -385,6 +419,36 @@ impl AuditRecord {
         self
     }
 
+    /// Store the record under this id instead of a minted one.
+    #[must_use]
+    pub fn with_record_id(mut self, id: Uuid) -> Self {
+        self.record_id = Some(id);
+        self
+    }
+
+    /// Name the change an `activation` record answers.
+    #[must_use]
+    pub fn with_change_ref(mut self, change_ref: Uuid) -> Self {
+        self.change_ref = Some(change_ref);
+        self
+    }
+
+    /// Attach the consumer's failure detail.
+    #[must_use]
+    pub fn with_detail(mut self, detail: impl Into<String>) -> Self {
+        self.detail = Some(detail.into());
+        self
+    }
+
+    /// Name the consumer instance an `activation` record is about, with its
+    /// label at the time of the record.
+    #[must_use]
+    pub fn with_instance(mut self, instance_id: Uuid, instance_label: Option<String>) -> Self {
+        self.instance_id = Some(instance_id);
+        self.instance_label = instance_label;
+        self
+    }
+
     /// Give the record an explicit retention horizon.
     #[must_use]
     pub fn with_retain_until(mut self, at: OffsetDateTime) -> Self {
@@ -396,6 +460,13 @@ impl AuditRecord {
     #[must_use]
     pub fn failed(mut self) -> Self {
         self.outcome = AuditOutcome::Failure;
+        self
+    }
+
+    /// Mark an `activation` record as the record of a call of silence.
+    #[must_use]
+    pub fn silent(mut self) -> Self {
+        self.outcome = AuditOutcome::Silent;
         self
     }
 }
@@ -432,6 +503,15 @@ pub struct StoredAuditRecord {
     pub occurred_at: OffsetDateTime,
     /// The explicit retention horizon, when one was given.
     pub retain_until: Option<OffsetDateTime>,
+    /// The change an `activation` record answers.
+    pub change_ref: Option<Uuid>,
+    /// The consumer's failure detail on an `activation` record.
+    pub detail: Option<String>,
+    /// The reporting — or silent — consumer instance on an `activation`
+    /// record.
+    pub instance_id: Option<Uuid>,
+    /// That instance's label at the time of the record.
+    pub instance_label: Option<String>,
 }
 
 impl StoredAuditRecord {

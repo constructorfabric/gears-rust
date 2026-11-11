@@ -4290,7 +4290,7 @@ dependencies = [
 
 [[package]]
 name = "cf-gears-settings-service"
-version = "0.2.0"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4301,6 +4301,7 @@ dependencies = [
  "cf-gears-authz-resolver-sdk",
  "cf-gears-credstore",
  "cf-gears-credstore-sdk",
+ "cf-gears-event-broker-sdk",
  "cf-gears-settings-service-sdk",
  "cf-gears-tenant-resolver-sdk",
  "cf-gears-test-containers",
@@ -4312,16 +4313,21 @@ dependencies = [
  "cf-gears-toolkit-macros",
  "cf-gears-toolkit-odata",
  "cf-gears-toolkit-security",
+ "cf-gears-toolkit-trace-context",
  "cf-gears-types-registry",
  "cf-gears-types-registry-sdk",
+ "chrono",
  "fnv",
  "futures-util",
  "gts",
+ "hex",
  "http",
  "inventory",
  "jsonschema 0.60.2",
  "opentelemetry",
+ "opentelemetry_sdk",
  "regex",
+ "ryu",
  "sea-orm",
  "sea-orm-migration",
  "secrecy",
@@ -4335,14 +4341,17 @@ dependencies = [
  "tokio-util",
  "tower",
  "tracing",
+ "tracing-opentelemetry",
+ "tracing-subscriber",
  "tracing-test",
  "utoipa",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]
 name = "cf-gears-settings-service-sdk"
-version = "0.2.2"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "cf-gears-toolkit-canonical-errors",
@@ -4351,13 +4360,17 @@ dependencies = [
  "cf-gears-toolkit-odata-macros",
  "cf-gears-toolkit-security",
  "gts-id",
+ "hex",
+ "hostname",
  "jsonschema 0.60.2",
+ "ryu",
  "secrecy",
  "serde",
  "serde_json",
  "thiserror 2.0.21",
  "tokio",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]

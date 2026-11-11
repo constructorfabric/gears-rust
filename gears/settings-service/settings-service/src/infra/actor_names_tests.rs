@@ -25,6 +25,7 @@ use super::{
     ActorDirectory, ActorNameResolver, ActorRef, LOOKUP_BUDGET, LOOKUP_CONCURRENCY,
     NAME_CACHE_CAPACITY, NAME_TTL,
 };
+use crate::audit::AuditOperation;
 use crate::domain::ports::ActorNameMetrics;
 use crate::domain::resolution::MASK_TOKEN;
 
@@ -64,6 +65,7 @@ struct Rec {
     actor_tenant_id: Option<Uuid>,
     actor: String,
     actor_masked: bool,
+    operation: AuditOperation,
     actor_name: Option<String>,
 }
 
@@ -80,6 +82,7 @@ impl FillExt for ActorNameResolver {
                 actor_tenant_id: r.actor_tenant_id,
                 actor: r.actor.clone(),
                 masked: r.actor_masked,
+                operation: r.operation,
             })
             .collect();
         let names = self.names_for_page(ctx, &refs).await;
@@ -96,6 +99,7 @@ fn record(actor: &str, tenant: Option<Uuid>) -> Rec {
         actor_tenant_id: tenant,
         actor: actor.to_owned(),
         actor_masked: false,
+        operation: AuditOperation::Change,
         actor_name: None,
     }
 }
@@ -289,6 +293,36 @@ async fn a_module_actor_reads_no_name_and_is_never_looked_up() {
     assert_eq!(names_of(&records), [None, None]);
     assert!(d.calls().is_empty());
     assert_eq!(metrics.results(), ["skipped"]);
+}
+
+#[tokio::test]
+async fn the_gear_subject_of_an_activation_record_reads_no_name_and_is_never_looked_up() {
+    let d = Arc::new(Directory::default());
+    // Even were the directory to know the id, the subscriber is no user.
+    d.lists(home(), 7, "Not a person");
+    let (service, metrics) = resolver(&d);
+    let mut report = by(7);
+    report.operation = AuditOperation::Activation;
+    let mut records = vec![report];
+    service.fill(&ctx(), &mut records).await;
+    assert_eq!(names_of(&records), [None]);
+    assert!(d.calls().is_empty());
+    assert_eq!(metrics.results(), ["skipped"]);
+}
+
+#[tokio::test]
+async fn an_activation_record_beside_a_user_record_leaves_only_the_user_looked_up() {
+    let d = Arc::new(Directory::default());
+    d.lists(home(), 1, "Ann");
+    d.lists(home(), 7, "Not a person");
+    let (service, metrics) = resolver(&d);
+    let mut report = by(7);
+    report.operation = AuditOperation::Activation;
+    let mut records = vec![report, by(1)];
+    service.fill(&ctx(), &mut records).await;
+    assert_eq!(names_of(&records), [None, Some("Ann")]);
+    assert_eq!(d.calls(), [(home(), vec![id(1)])]);
+    assert_eq!(metrics.results(), ["ok"]);
 }
 
 #[tokio::test]

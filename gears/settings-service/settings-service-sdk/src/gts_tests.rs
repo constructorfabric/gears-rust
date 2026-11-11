@@ -33,7 +33,7 @@ fn an_unmodelled_resource_is_preserved_not_discarded() {
 #[test]
 fn declaration_and_value_are_different_resources() {
     // The projection leans on this distinction to tell "no such setting" from
-    // "no credential configured"; if these ever collapsed, that would break.
+    // "stored credential missing"; if these ever collapsed, that would break.
     assert_ne!(
         Resource::from_wire(DECLARATION_SCHEMA),
         Resource::from_wire(VALUE_SCHEMA)

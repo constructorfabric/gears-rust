@@ -111,3 +111,45 @@ fn parse_checked_yields_the_value_or_the_guards_fault() {
     let err = parse_checked("0.10000000000000000555").expect_err("finer than a double");
     assert_eq!(err.code, field::VALUE_NOT_CANONICAL);
 }
+
+#[test]
+fn an_integer_is_judged_by_binary64_exactness_in_either_spelling() {
+    // `1e16` is written as an exponent and read back from PostgreSQL as the
+    // integer; both are one double, so both are accepted.
+    for text in [
+        "1e16",
+        "10000000000000000",
+        "1152921504606846976",
+        "9007199254740992",
+        "-9223372036854775808",
+    ] {
+        parse_checked(text).unwrap_or_else(|e| panic!("{text}: {}", e.message));
+        let value: serde_json::Value = serde_json::from_str(text).expect("JSON");
+        assert!(check(&value).is_ok(), "{text}");
+    }
+    // Neither the parsed value nor the text survives binary64.
+    for text in [
+        "9007199254740993",
+        "12345678901234567",
+        "18446744073709551615",
+    ] {
+        let value: serde_json::Value = serde_json::from_str(text).expect("JSON");
+        let err = check(&value).expect_err(text);
+        assert_eq!(err.code, field::VALUE_NOT_CANONICAL, "{text}");
+        let err = parse_checked(text).expect_err(text);
+        assert_eq!(err.code, field::VALUE_NOT_CANONICAL, "{text}");
+    }
+}
+
+#[test]
+fn an_exponent_spelling_that_denotes_no_double_is_refused_by_the_text_check() {
+    // Serde parses it to a double and the value check waves it through; the
+    // literal does not denote that double.
+    let text = "9.007199254740993e15";
+    let value: serde_json::Value = serde_json::from_str(text).expect("JSON");
+    assert!(check(&value).is_ok());
+    assert_eq!(
+        check_text(text).expect_err(text).code,
+        field::VALUE_NOT_CANONICAL
+    );
+}

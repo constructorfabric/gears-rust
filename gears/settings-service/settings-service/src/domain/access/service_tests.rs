@@ -789,3 +789,219 @@ async fn a_hierarchy_lookup_inside_a_transaction_is_refused_by_the_connection_gu
     let outside = h.base.hierarchy.chain(tenant).await.expect("resolves");
     assert_eq!(outside.last(), Some(&tenant));
 }
+
+#[tokio::test]
+async fn a_restriction_change_evicts_locally_and_publishes_no_broadcast() {
+    // The cache holds values, never access decisions, which every replica
+    // decides afresh on each read: the access service takes no end-of-request
+    // publish hook, so nothing a set or a clear does can reach the broker.
+    use crate::domain::coherence::testing::{RecordingGateway, publisher};
+    let gateway = Arc::new(RecordingGateway::ready(Uuid::new_v4()));
+    let (_hook, metrics) = publisher(&gateway);
+    let h = Harness::new().await;
+    let d = h
+        .base
+        .declare("strict", scope_class::CASCADING, json!(false))
+        .await;
+    let t = &h.base.tree;
+    let conn = h.base.db.conn().expect("connection");
+    h.base.set(d, t.root, json!(true)).await;
+    h.base
+        .resolve("strict", ScopeTarget::Tenant(t.b))
+        .await
+        .expect("cached");
+    let key = h.key("strict");
+
+    h.set(
+        &conn,
+        &actor(t.root),
+        &key,
+        t.a,
+        TenantAccess::ReadOnly,
+        Some(ABSENT_RESTRICTION_TAG),
+    )
+    .await
+    .expect("sets");
+    h.service.evict(&key, t.a).await.expect("evicts");
+    assert!(
+        h.base.cache.get(key.as_str(), t.b).is_none(),
+        "evicted locally"
+    );
+    let tag = h
+        .service
+        .read(&conn, &actor(t.root), &key, t.a)
+        .await
+        .expect("reads")
+        .etag;
+    h.clear(&conn, &actor(t.root), &key, t.a, Some(tag.as_str()))
+        .await
+        .expect("clears");
+    h.service.evict(&key, t.a).await.expect("evicts");
+
+    assert!(gateway.events().is_empty(), "nothing published");
+    assert!(metrics.all().is_empty(), "nothing counted");
+}
+
+// ---------------------------------------------------------------------------
+// The key's mutation lock
+// ---------------------------------------------------------------------------
+
+mod locking {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    use super::*;
+    use crate::domain::activation::testing::InProcessLocks;
+    use crate::domain::activation::{HeldKey, KeyLocks};
+
+    fn locked_service(h: Harness, locks: &Arc<InProcessLocks>) -> (Harness, Service) {
+        let service = AccessService::new(
+            DeclarationRepo,
+            AccessRepo,
+            Arc::clone(&h.audit),
+            Arc::clone(&h.base.hierarchy) as Arc<dyn crate::domain::resolution::TenantHierarchy>,
+            Arc::new(FixedScope(h.base.tree.root)),
+            Arc::clone(&h.base.cache),
+        )
+        .with_locks(Arc::clone(locks) as Arc<dyn KeyLocks>);
+        (h, service)
+    }
+
+    #[tokio::test]
+    async fn a_restriction_changes_under_the_keys_lock_and_releases_it_before_answering() {
+        let locks = InProcessLocks::generous();
+        let (h, service) = locked_service(Harness::new().await, &locks);
+        let key = h.key("strict");
+        let seen_held = AtomicBool::new(false);
+
+        let outcome = service
+            .locked(&key, || async {
+                seen_held.store(locks.is_held(key.as_str()), Ordering::SeqCst);
+                Ok::<_, DomainError>(7)
+            })
+            .await;
+
+        assert_eq!(outcome.expect("ran"), 7);
+        assert!(
+            seen_held.load(Ordering::SeqCst),
+            "the change ran under the lock"
+        );
+        assert!(
+            !locks.is_held(key.as_str()),
+            "released and awaited before the answer"
+        );
+        assert_eq!(locks.released.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn the_lock_is_released_when_the_change_itself_fails() {
+        let locks = InProcessLocks::generous();
+        let (h, service) = locked_service(Harness::new().await, &locks);
+        let key = h.key("strict");
+
+        let outcome: Result<(), DomainError> = service
+            .locked(&key, || async {
+                Err(DomainError::PreconditionFailed {
+                    detail: "stale".to_owned(),
+                })
+            })
+            .await;
+
+        assert!(matches!(
+            outcome,
+            Err(DomainError::PreconditionFailed { .. })
+        ));
+        assert!(!locks.is_held(key.as_str()));
+    }
+
+    #[tokio::test]
+    async fn a_wait_that_runs_out_answers_unavailable_and_never_runs_the_change() {
+        let locks = InProcessLocks::with_budget(Duration::from_millis(40));
+        let (h, service) = locked_service(Harness::new().await, &locks);
+        let key = h.key("strict");
+        let owner = locks.hold(key.as_str());
+        let ran = AtomicBool::new(false);
+
+        let outcome = service
+            .locked(&key, || async {
+                ran.store(true, Ordering::SeqCst);
+                Ok::<_, DomainError>(())
+            })
+            .await;
+
+        assert!(
+            matches!(outcome, Err(DomainError::Unavailable { .. })),
+            "{outcome:?}"
+        );
+        assert!(!ran.load(Ordering::SeqCst), "nothing stored");
+        assert!(locks.is_held(key.as_str()), "still its owner's");
+        Box::new(owner).release().await;
+    }
+
+    #[tokio::test]
+    async fn the_precheck_refuses_without_contending_for_the_lock() {
+        let locks = InProcessLocks::generous();
+        let (h, service) = locked_service(Harness::new().await, &locks);
+        h.base
+            .declare("strict", scope_class::CASCADING, json!(false))
+            .await;
+        let t = &h.base.tree;
+        let conn = h.base.db.conn().expect("connection");
+
+        // A target outside the caller's reach, an `overridable` row, a key the
+        // caller cannot see: each is refused before any lock is asked for.
+        let denied = service.authorized_hierarchy_chains(&actor(t.a), t.c).await;
+        assert!(
+            matches!(denied, Err(DomainError::Unauthorized { .. })),
+            "the target check refuses a sibling branch"
+        );
+        let chains = service
+            .authorized_hierarchy_chains(&actor(t.root), t.a)
+            .await
+            .expect("chains");
+        let invalid = service
+            .precheck_set(
+                &conn,
+                &actor(t.root),
+                &chains,
+                &h.key("strict"),
+                t.a,
+                TenantAccess::Overridable,
+            )
+            .await;
+        assert!(
+            matches!(invalid, Err(DomainError::Validation { .. })),
+            "{invalid:?}"
+        );
+        let absent = service
+            .precheck_clear(&conn, &actor(t.root), &chains, &h.key("undeclared"), t.a)
+            .await;
+        assert!(
+            matches!(absent, Err(DomainError::NotFound { .. })),
+            "{absent:?}"
+        );
+        service
+            .precheck_set(
+                &conn,
+                &actor(t.root),
+                &chains,
+                &h.key("strict"),
+                t.a,
+                TenantAccess::Hidden,
+            )
+            .await
+            .expect("a change that may go ahead");
+
+        assert_eq!(locks.asked.lock().expect("asked").len(), 0);
+    }
+
+    #[tokio::test]
+    async fn without_a_lock_bound_the_change_simply_runs() {
+        let h = Harness::new().await;
+        let outcome = h
+            .service
+            .locked(&h.key("strict"), || async { Ok::<_, DomainError>("ran") })
+            .await;
+        assert_eq!(outcome.expect("ran"), "ran");
+    }
+}

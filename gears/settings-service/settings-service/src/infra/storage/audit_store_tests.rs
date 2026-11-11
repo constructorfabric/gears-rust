@@ -96,6 +96,68 @@ async fn appended_records_come_back_newest_first_for_their_pair_only() {
 }
 
 #[tokio::test]
+async fn a_record_stored_under_a_minted_id_carries_its_change_ref_and_detail() {
+    // An activation state names the change's record by the id the mutation
+    // minted before the append, and an `activation` record answers a change by
+    // its `change_ref` with the consumer's detail: both come back as written,
+    // and an ordinary record carries neither.
+    let db = db().await;
+    let tenant = Uuid::new_v4();
+    let (minted, change) = (Uuid::new_v4(), Uuid::new_v4());
+    let conn = db.conn().expect("connection");
+    AuditStore
+        .append(&conn, &AccessScope::allow_all(), record(tenant, "plain"))
+        .await
+        .expect("append");
+    AuditStore
+        .append(
+            &conn,
+            &AccessScope::allow_all(),
+            record(tenant, "minted").with_record_id(minted),
+        )
+        .await
+        .expect("append");
+    AuditStore
+        .append(
+            &conn,
+            &AccessScope::allow_all(),
+            AuditRecord::new(
+                KEY,
+                Some(tenant),
+                "gear",
+                ActorTenant::machine(),
+                AuditOperation::Activation,
+                "report",
+            )
+            .by_module()
+            .failed()
+            .with_change_ref(change)
+            .with_detail("could not apply"),
+        )
+        .await
+        .expect("append");
+
+    let page = history(&db, tenant, None, None).await;
+    let by_request = |request: &str| {
+        page.items
+            .iter()
+            .find(|r| r.request_id == request)
+            .expect("the record is in the history")
+    };
+    assert_eq!(
+        by_request("minted").id,
+        minted,
+        "stored under the minted id"
+    );
+    assert_eq!(by_request("plain").change_ref, None);
+    assert_eq!(by_request("plain").detail, None);
+    let report = by_request("report");
+    assert_eq!(report.operation, AuditOperation::Activation);
+    assert_eq!(report.change_ref, Some(change));
+    assert_eq!(report.detail.as_deref(), Some("could not apply"));
+}
+
+#[tokio::test]
 async fn a_second_page_follows_the_cursor_without_duplicates() {
     let db = db().await;
     let tenant = Uuid::new_v4();
@@ -317,6 +379,10 @@ fn stored_row(
         outcome: "success".to_owned(),
         request_id: "req".to_owned(),
         change_set_id: None,
+        change_ref: None,
+        detail: None,
+        instance_id: None,
+        instance_label: None,
         occurred_at: OffsetDateTime::now_utc(),
         retain_until: None,
     }
@@ -514,4 +580,161 @@ async fn a_record_is_stamped_on_the_shared_microsecond_clock() {
             item.occurred_at
         );
     }
+}
+
+#[test]
+fn an_activation_record_with_an_unknown_outcome_is_an_integrity_error_never_a_guess() {
+    // The database's CHECK refuses to store one, so the mapper is the only
+    // place the rule can be pinned: a listed report and an attached report
+    // both come through it, and a record the service cannot read fails the
+    // read rather than showing a guessed outcome or vanishing from the page.
+    let mut row = stored_row(None);
+    row.operation = "activation".to_owned();
+    row.change_ref = Some(Uuid::new_v4());
+    row.outcome = "partial".to_owned();
+    let refused = super::to_domain(row);
+    assert!(
+        matches!(refused, Err(DomainError::Internal { .. })),
+        "{refused:?}"
+    );
+}
+
+fn activation(tenant: Uuid, change: Uuid, subscriber: &str) -> AuditRecord {
+    AuditRecord::new(
+        KEY,
+        Some(tenant),
+        subscriber,
+        ActorTenant::machine(),
+        AuditOperation::Activation,
+        "req",
+    )
+    .by_module()
+    .with_change_ref(change)
+}
+
+async fn append(db: &DBProvider<DbError>, record: AuditRecord) {
+    let conn = db.conn().expect("connection");
+    AuditStore
+        .append(&conn, &AccessScope::allow_all(), record)
+        .await
+        .expect("append");
+}
+
+#[tokio::test]
+async fn a_report_leaves_the_listing_of_the_history_holding_its_change_and_stays_in_others() {
+    let db = db().await;
+    let (x, d) = (Uuid::new_v4(), Uuid::new_v4());
+    let change = Uuid::new_v4();
+    append(&db, record(x, "r1").with_record_id(change)).await;
+    append(&db, activation(x, change, "gear-a")).await;
+    append(&db, activation(d, change, "gear-b")).await;
+    // A report whose change record is not among this history's records.
+    append(&db, activation(x, Uuid::new_v4(), "gear-c")).await;
+
+    let at_x = history(&db, x, None, None).await;
+    let listed: Vec<&str> = at_x.items.iter().map(|r| r.actor.as_str()).collect();
+    assert_eq!(at_x.total_count, 2, "{listed:?}");
+    assert!(
+        listed.contains(&"admin") && listed.contains(&"gear-c"),
+        "{listed:?}"
+    );
+    assert!(
+        !listed.contains(&"gear-a"),
+        "attached, never listed: {listed:?}"
+    );
+
+    // The descendant's history has no record of the change, so its report is
+    // an ordinary record there.
+    let at_d = history(&db, d, None, None).await;
+    assert_eq!(at_d.total_count, 1);
+    assert_eq!(at_d.items[0].actor, "gear-b");
+    assert_eq!(at_d.items[0].change_ref, Some(change));
+}
+
+#[tokio::test]
+async fn the_attachment_lookup_is_one_read_by_change_ref_across_tenants() {
+    let db = db().await;
+    let (x, d) = (Uuid::new_v4(), Uuid::new_v4());
+    let (first, second, other) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+    append(&db, activation(x, first, "gear-a")).await;
+    append(&db, activation(d, first, "gear-b")).await;
+    append(&db, activation(d, second, "gear-c")).await;
+    append(&db, activation(d, other, "gear-d")).await;
+    // Another key's report on the same change, and a record that is no report.
+    append(
+        &db,
+        AuditRecord::new(
+            "gts.cf.core.settings.setting_type.v1~acme.settings.network.other.v1~",
+            Some(d),
+            "gear-e",
+            ActorTenant::machine(),
+            AuditOperation::Activation,
+            "req",
+        )
+        .with_change_ref(first),
+    )
+    .await;
+    append(&db, record(d, "r").with_record_id(Uuid::new_v4())).await;
+
+    let conn = db.conn().expect("connection");
+    let mut found: Vec<String> = AuditStore
+        .reports_for(&conn, &AccessScope::allow_all(), KEY, &[first, second])
+        .await
+        .expect("lookup")
+        .into_iter()
+        .map(|r| r.actor)
+        .collect();
+    found.sort();
+    assert_eq!(found, ["gear-a", "gear-b", "gear-c"]);
+    assert!(
+        AuditStore
+            .reports_for(&conn, &AccessScope::allow_all(), KEY, &[])
+            .await
+            .expect("no ids, no read")
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn a_call_of_silence_reads_back_as_an_ordinary_activation_record_with_its_instance() {
+    // Until the history attaches calls of silence to their change, a `silent`
+    // record of a change outside this history is listed like any other, and
+    // its outcome and instance columns read back as written.
+    let db = db().await;
+    let tenant = Uuid::new_v4();
+    let instance = Uuid::new_v4();
+    append(
+        &db,
+        activation(tenant, Uuid::new_v4(), "gear-a")
+            .with_instance(instance, Some("host-1".to_owned()))
+            .silent(),
+    )
+    .await;
+
+    let page = history(&db, tenant, None, None).await;
+
+    assert_eq!(page.total_count, 1);
+    let read = &page.items[0];
+    assert_eq!(read.operation, AuditOperation::Activation);
+    assert_eq!(read.outcome, crate::audit::AuditOutcome::Silent);
+    assert_eq!(read.instance_id, Some(instance));
+    assert_eq!(read.instance_label.as_deref(), Some("host-1"));
+    assert_eq!(read.detail, None);
+}
+
+#[tokio::test]
+async fn a_silent_outcome_on_any_other_operation_is_refused_by_the_table() {
+    let db = db().await;
+    let conn = db.conn().expect("connection");
+    let refused = AuditStore
+        .append(
+            &conn,
+            &AccessScope::allow_all(),
+            record(Uuid::new_v4(), "r").silent(),
+        )
+        .await;
+    assert!(
+        refused.is_err(),
+        "`silent` belongs to an `activation` record"
+    );
 }

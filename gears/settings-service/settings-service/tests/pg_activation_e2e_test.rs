@@ -1,0 +1,1317 @@
+#![cfg(feature = "integration")]
+// The doubles, the fixture and the polls are plain helpers, which
+// `allow-expect-in-tests` does not reach; a failed expectation there is the
+// test failing, as in the sibling PostgreSQL suites.
+#![allow(clippy::expect_used, clippy::unwrap_used)]
+//! Consumer activation, end to end, on a real `PostgreSQL`: a whole
+//! `SettingsService` replica, the delivering Event Broker double of
+//! `tests/support/platform.rs`, and an in-process consumer that is the SDK's
+//! own client taken out of the replica's `ClientHub` — `subscribe`, the fresh
+//! re-read, the handler, the report and `unsubscribe()` — the Level 2 end-to-end row
+//! of DESIGN-activation §7.
+//!
+//! What the test hosts is the platform around the replica: the broker double
+//! (which delivers a published event to every joined group whose interest names
+//! its tenant and type, and whose log the test reads), the Types Registry, the
+//! Tenant Resolver and a policy decision point that allows everything. The
+//! assertions are on outcomes, never on how long anything took; the delivery
+//! loop's interval is a whole second, so a row due again is waited for, with a
+//! deadline that only a hang can exhaust.
+//!
+//! Docker required: without it the suite skips, unless
+//! `SETTINGS_SERVICE_PG_REQUIRE_DOCKER=1` turns the skip into a failure, as CI
+//! sets it. Run via `make test-integration LANE=settings-service-pg` or:
+//!
+//! ```sh
+//! cargo nextest run -p cf-gears-settings-service --features integration --test pg_activation_e2e_test
+//! ```
+
+// @cpt-dod:cpt-cf-settings-service-dod-consumer-activation-tests:p1
+
+mod support;
+
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use async_trait::async_trait;
+use cf_gears_settings_service::infra::activation_client::{
+    ActivationClient, ClientTiming, ConsumerDeps, ServiceBackend,
+};
+use cf_gears_settings_service::infra::activation_metrics::OtelNotifyMetrics;
+use cf_gears_settings_service::infra::storage::audit_store::AuditStore;
+use event_broker_sdk::{Ack, EventBrokerApi};
+use serde_json::{Value, json};
+use settings_service_sdk::api::SettingsReaderClient;
+use settings_service_sdk::models::ScopeClass;
+use settings_service_sdk::{
+    ActivationOutcome, ChangeBundle, InstanceIdentity, KeyState, ReportResult,
+    SettingChangeHandler, SettingKey, SettingsActivationClient, SubscriptionHandle,
+    UnsubscribeResult,
+};
+use toolkit_security::{AccessScope, SecurityContext};
+use uuid::Uuid;
+
+use support::platform::{CHILD, PgFixture, Platform, ROOT, Replica, pg_fixture, platform};
+
+/// How long the test waits for something that must happen.
+const MUST_HAPPEN: Duration = Duration::from_secs(40);
+/// How long the test watches for something that must *not* have happened.
+const STILL_WAITING: Duration = Duration::from_millis(800);
+
+fn setting(name: &str) -> SettingKey {
+    SettingKey::contributed("cf", "demo", "e2e", name, std::num::NonZeroU32::MIN)
+        .expect("a valid key")
+}
+
+/// A subscriber: a gear's own security context.
+fn consumer() -> SecurityContext {
+    SecurityContext::builder()
+        .subject_id(Uuid::new_v4())
+        .subject_tenant_id(ROOT)
+        .subject_type("gts.cf.core.security.subject_service.v1~")
+        .build()
+        .expect("a context")
+}
+
+async fn until(what: &str, mut done: impl FnMut() -> bool) {
+    tokio::time::timeout(MUST_HAPPEN, async {
+        while !done() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("timed out waiting for {what}"));
+}
+
+async fn until_async<F, Fut>(what: &str, mut done: F)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    tokio::time::timeout(MUST_HAPPEN, async {
+        while !done().await {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("timed out waiting for {what}"));
+}
+
+/// What the consumer's handler does with a bundle.
+#[derive(Clone)]
+enum Mode {
+    /// Apply the fresh value and say so.
+    Faithful,
+    /// Report having applied this value instead.
+    Wrong(Value),
+    /// Report nothing: the application completes later.
+    Silent,
+}
+
+struct Applier {
+    mode: Mutex<Mode>,
+    bundles: Mutex<Vec<ChangeBundle>>,
+}
+
+impl Applier {
+    fn new(mode: Mode) -> Arc<Self> {
+        Arc::new(Self {
+            mode: Mutex::new(mode),
+            bundles: Mutex::new(Vec::new()),
+        })
+    }
+
+    fn bundles(&self) -> Vec<ChangeBundle> {
+        self.bundles.lock().unwrap().clone()
+    }
+
+    /// The `(change_ref, value)` pairs the handler was handed, in order.
+    fn heard(&self) -> Vec<(Option<Uuid>, Value)> {
+        self.bundles()
+            .iter()
+            .flat_map(|b| {
+                b.changes
+                    .iter()
+                    .map(|c| (c.change_ref, c.value.value.clone()))
+            })
+            .collect()
+    }
+}
+
+#[async_trait]
+impl SettingChangeHandler for Applier {
+    async fn on_change(&self, bundle: ChangeBundle) -> Vec<(SettingKey, ActivationOutcome)> {
+        let mode = self.mode.lock().unwrap().clone();
+        let outcomes = bundle
+            .changes
+            .iter()
+            .filter_map(|c| match &mode {
+                Mode::Faithful => Some((
+                    c.key.clone(),
+                    ActivationOutcome::Success {
+                        applied_value: c.value.value.clone(),
+                    },
+                )),
+                Mode::Wrong(other) => Some((
+                    c.key.clone(),
+                    ActivationOutcome::Success {
+                        applied_value: other.clone(),
+                    },
+                )),
+                Mode::Silent => None,
+            })
+            .collect();
+        self.bundles.lock().unwrap().push(bundle);
+        outcomes
+    }
+}
+
+/// One replica over a fresh database, `key` declared `cascading`, the lifecycle
+/// running, and the consumer's client.
+struct Scene {
+    pg: PgFixture,
+    platform: Platform,
+    replica: Replica,
+    key: SettingKey,
+    gear: SecurityContext,
+    client: Arc<dyn SettingsActivationClient>,
+}
+
+async fn scene(name: &str, serve: bool) -> Option<Scene> {
+    scene_with(name, serve, json!({ "redeliver_interval_seconds": 1 })).await
+}
+
+/// A scene whose replica has `config` as its section: a short report timeout
+/// makes a silent instance called so within a few ticks.
+async fn scene_with(name: &str, serve: bool, config: Value) -> Option<Scene> {
+    let pg = pg_fixture("activation-e2e").await?;
+    let platform = platform();
+    let replica = Replica::init(&pg, &platform, config).await;
+    let key = setting(name);
+    replica
+        .declare(&key, ScopeClass::Cascading, "default")
+        .await;
+    let client = replica
+        .hub
+        .get::<dyn SettingsActivationClient>()
+        .expect("the activation client is bound beside the reader");
+    let s = Scene {
+        pg,
+        platform,
+        replica,
+        key,
+        gear: consumer(),
+        client,
+    };
+    if serve {
+        s.serve().await;
+    }
+    Some(s)
+}
+
+impl Scene {
+    fn subscriber(&self) -> String {
+        self.gear.subject_id().to_string()
+    }
+
+    /// Run the lifecycle and wait for the replica's cache group to join.
+    async fn serve(&self) {
+        self.replica.serve().await;
+        self.platform.broker.await_joined(1).await;
+    }
+
+    async fn subscribe(&self, at: Uuid, handler: &Arc<Applier>) -> SubscriptionHandle {
+        self.client
+            .subscribe(
+                &self.gear,
+                vec![self.key.clone()],
+                at.to_string(),
+                Arc::clone(handler) as Arc<dyn SettingChangeHandler>,
+            )
+            .await
+            .expect("subscribe answers a handle")
+    }
+
+    /// Subscribe and wait until the key is registered and the consumer's group
+    /// holds an open stream beside the replica's own.
+    async fn subscribed(&self, at: Uuid, handler: &Arc<Applier>) -> SubscriptionHandle {
+        let handle = self.subscribe(at, handler).await;
+        until("the key to register", || {
+            matches!(
+                handle.states().get(&self.key),
+                Some(KeyState::Registered { .. })
+            )
+        })
+        .await;
+        until("the consumer's group to join", || {
+            self.platform.broker.open_streams() >= 2
+        })
+        .await;
+        handle
+    }
+
+    async fn write(&self, tenant: Uuid, value: &str, tag: Option<&str>) {
+        self.replica
+            .set(&self.key, tenant, value, tag)
+            .await
+            .expect("the write commits");
+    }
+
+    async fn overwrite(&self, tenant: Uuid, value: &str) {
+        let tag = self.pg.row_tag(&self.key, tenant).await;
+        self.write(tenant, value, Some(&tag)).await;
+    }
+
+    async fn report(
+        &self,
+        change_ref: &str,
+        tenant: Uuid,
+        outcome: ActivationOutcome,
+    ) -> ReportResult {
+        self.client
+            .report_outcome(
+                &self.gear,
+                Uuid::parse_str(change_ref).expect("a change_ref"),
+                tenant.to_string(),
+                self.key.clone(),
+                outcome,
+            )
+            .await
+            .expect("answered")
+    }
+
+    async fn status(&self) -> String {
+        let states = self.pg.states(&self.key).await;
+        assert_eq!(states.len(), 1, "{states:?}");
+        states[0].status.clone()
+    }
+
+    async fn settled(&self, status: &str) {
+        until_async("the state to settle", || async {
+            self.pg
+                .states(&self.key)
+                .await
+                .first()
+                .is_some_and(|s| s.status == status)
+        })
+        .await;
+    }
+
+    async fn subscriptions(&self) -> i64 {
+        self.pg
+            .count(
+                "SELECT count(*) FROM subscriptions WHERE key = $1",
+                vec![self.key.as_str().into()],
+            )
+            .await
+    }
+}
+
+/// Every event the broker accepted, as the text of its body.
+fn published_bodies(platform: &Platform) -> Vec<(bool, Value)> {
+    platform
+        .broker
+        .published()
+        .iter()
+        .map(|e| {
+            (
+                e.event_type().as_ref()
+                    == settings_service_sdk::gts::CHANGE_NOTIFICATION_EVENT_TYPE,
+                e.data().cloned().unwrap_or(Value::Null),
+            )
+        })
+        .collect()
+}
+
+/// The attribute names of an object, sorted.
+fn names(value: &Value) -> Vec<&str> {
+    let mut names: Vec<&str> = value
+        .as_object()
+        .map(|o| o.keys().map(String::as_str).collect())
+        .unwrap_or_default();
+    names.sort_unstable();
+    names
+}
+
+// ---------------------------------------------------------------------------
+// The loop
+// ---------------------------------------------------------------------------
+
+/// *Full loop*, the write side: a set → a `change_notification` → the fresh
+/// re-read → the handler → the report → the state `succeeded` with one
+/// `activation` audit record carrying the change's `change_ref`, visible
+/// through the audit store; no value in any published event.
+#[tokio::test]
+async fn a_set_is_notified_re_read_applied_and_reported_to_succeeded() {
+    let Some(s) = scene("loop", true).await else {
+        return;
+    };
+    let deadlocks = s.pg.deadlocks().await;
+    let applier = Applier::new(Mode::Faithful);
+    let handle = s.subscribed(ROOT, &applier).await;
+    // The subscription's own fresh read: the default, nothing set yet.
+    let KeyState::Registered { value: Some(value) } = handle.states()[&s.key].clone() else {
+        panic!("registered with its fresh value");
+    };
+    assert_eq!(value.value, json!("default"));
+    assert!(applier.bundles().is_empty(), "nothing changed yet");
+
+    s.write(ROOT, "one", Some("absent")).await;
+    let change = s.pg.newest_change(&s.key, ROOT).await;
+    until("the handler", || !applier.bundles().is_empty()).await;
+    s.settled("succeeded").await;
+
+    // At-least-once delivery may redeliver: keep the first bundle per change_ref.
+    let mut heard = applier.heard();
+    heard.dedup_by_key(|h| h.0);
+    assert_eq!(heard.len(), 1);
+    assert_eq!(heard[0].0.map(|c| c.to_string()), Some(change.clone()));
+    assert_eq!(
+        heard[0].1,
+        json!("one"),
+        "the fresh re-read saw the committed value"
+    );
+    let records = s.pg.activation_records(&s.key).await;
+    assert_eq!(
+        records,
+        [(
+            ROOT.to_string(),
+            s.subscriber(),
+            "success".to_owned(),
+            change.clone(),
+            None
+        )],
+        "one activation record under the change"
+    );
+    let conn = s.replica.db_conn();
+    let listing = AuditStore
+        .history(
+            &conn,
+            &AccessScope::allow_all(),
+            s.key.as_str(),
+            ROOT,
+            &toolkit_odata::ODataQuery::default(),
+        )
+        .await
+        .expect("history");
+    // The report is at the tenant its change was written at: the history
+    // attaches it under the change and does not list it beside it.
+    assert!(
+        listing
+            .items
+            .iter()
+            .all(|r| r.operation.as_str() != "activation"),
+        "a report of this history's own change is not listed"
+    );
+    let change_id = listing
+        .items
+        .iter()
+        .find(|r| r.id.to_string() == change)
+        .map(|r| r.id)
+        .expect("the change record is listed");
+    let attached = AuditStore
+        .reports_for(
+            &conn,
+            &AccessScope::allow_all(),
+            s.key.as_str(),
+            &[change_id],
+        )
+        .await
+        .expect("attachment lookup");
+    assert_eq!(attached.len(), 1, "visible through the audit store");
+    assert_eq!(attached[0].change_ref.map(|c| c.to_string()), Some(change));
+    // *No secret in stream*, as far as a plain value goes: no event carries it.
+    // Asserted on the published JSON's key set, not on a substring of its text:
+    // identifiers only, no attribute that could carry a value — for the
+    // notification and for the replicas' cache broadcast alike.
+    let bodies = published_bodies(&s.platform);
+    assert!(
+        bodies.iter().any(|(notification, _)| *notification),
+        "the change was notified"
+    );
+    for (notification, body) in &bodies {
+        if *notification {
+            assert_eq!(
+                names(body),
+                ["changes", "subscriber", "tenant"],
+                "a notification names its identifiers only: {body}"
+            );
+            for changed in body["changes"].as_array().expect("changes is an array") {
+                assert_eq!(names(changed), ["change_ref", "key"], "{body}");
+            }
+        } else {
+            assert_eq!(
+                names(body),
+                ["change_set_id", "changed_keys", "tenant"],
+                "a broadcast names its identifiers only: {body}"
+            );
+        }
+    }
+
+    drop(handle);
+    s.replica.stop().await;
+    assert_eq!(s.pg.deadlocks().await, deadlocks, "no deadlock");
+    let (_, _, left, deleted, held) = s.platform.broker.lifecycle();
+    assert_eq!(left, 2, "the replica's group and the consumer's each left");
+    assert_eq!(deleted, 2, "and each was deleted");
+    assert_eq!(held, 0, "the broker holds no group after the stop");
+}
+
+/// *Value mismatch → failed*: a success that reports another value than the
+/// one recorded when the change committed settles the state `failed`, with its
+/// `activation` record.
+#[tokio::test]
+async fn a_wrong_value_settles_failed_with_its_audit_record() {
+    let Some(s) = scene("wrong", true).await else {
+        return;
+    };
+    let applier = Applier::new(Mode::Wrong(json!("not-what-was-set")));
+    let _handle = s.subscribed(ROOT, &applier).await;
+
+    s.write(ROOT, "one", Some("absent")).await;
+    let change = s.pg.newest_change(&s.key, ROOT).await;
+    s.settled("failed").await;
+
+    let records = s.pg.activation_records(&s.key).await;
+    assert_eq!(records.len(), 1);
+    assert_eq!(
+        (
+            records[0].1.as_str(),
+            records[0].2.as_str(),
+            records[0].3.as_str()
+        ),
+        (s.subscriber().as_str(), "failure", change.as_str())
+    );
+    s.replica.stop().await;
+}
+
+/// A failed outcome carries the consumer's detail into the record.
+#[tokio::test]
+async fn a_failure_the_consumer_reports_settles_failed_with_its_detail() {
+    let Some(s) = scene("detail", true).await else {
+        return;
+    };
+    let applier = Applier::new(Mode::Silent);
+    let _handle = s.subscribed(ROOT, &applier).await;
+    s.write(ROOT, "one", Some("absent")).await;
+    let change = s.pg.newest_change(&s.key, ROOT).await;
+    until("the handler", || !applier.bundles().is_empty()).await;
+
+    let answer = s
+        .report(
+            &change,
+            ROOT,
+            ActivationOutcome::Failed {
+                detail: "the pool could not be rebuilt".to_owned(),
+            },
+        )
+        .await;
+
+    assert_eq!(answer, ReportResult::Applied);
+    assert_eq!(s.status().await, "failed");
+    let records = s.pg.activation_records(&s.key).await;
+    assert_eq!(
+        records[0].4.as_deref(),
+        Some("the pool could not be rebuilt")
+    );
+    s.replica.stop().await;
+}
+
+/// A report on a replaced `change_ref` is `ignored` and changes nothing; the
+/// report of the current expectation settles it.
+#[tokio::test]
+async fn a_report_on_a_replaced_expectation_is_ignored() {
+    let Some(s) = scene("stale", true).await else {
+        return;
+    };
+    let applier = Applier::new(Mode::Silent);
+    let _handle = s.subscribed(ROOT, &applier).await;
+    s.write(ROOT, "one", Some("absent")).await;
+    let first = s.pg.newest_change(&s.key, ROOT).await;
+    until("the first notification", || !applier.heard().is_empty()).await;
+    s.overwrite(ROOT, "two").await;
+    let second = s.pg.newest_change(&s.key, ROOT).await;
+    assert_ne!(first, second);
+    until("the second notification", || applier.heard().len() >= 2).await;
+    let (_, value) = applier.heard().pop().unwrap();
+    assert_eq!(
+        value,
+        json!("two"),
+        "the re-read after the overwrite is fresh"
+    );
+
+    let stale = s
+        .report(
+            &first,
+            ROOT,
+            ActivationOutcome::Failed {
+                detail: "late".to_owned(),
+            },
+        )
+        .await;
+
+    assert_eq!(
+        stale,
+        ReportResult::Ignored,
+        "it answers the replaced expectation"
+    );
+    assert_eq!(s.status().await, "awaiting", "and changes nothing");
+    assert!(
+        s.pg.activation_records(&s.key).await.is_empty(),
+        "no record is written"
+    );
+    let current = s
+        .report(
+            &second,
+            ROOT,
+            ActivationOutcome::Success {
+                applied_value: json!("two"),
+            },
+        )
+        .await;
+    assert_eq!(current, ReportResult::Applied);
+    assert_eq!(s.status().await, "succeeded");
+    s.replica.stop().await;
+}
+
+/// `unsubscribe()` deletes the subscription and its state; a late report is
+/// answered `not_subscribed` and writes no record; the handle's group goes with
+/// it.
+#[tokio::test]
+async fn unsubscribe_deletes_the_rows_and_a_late_report_is_ignored() {
+    let Some(s) = scene("retire", true).await else {
+        return;
+    };
+    let applier = Applier::new(Mode::Silent);
+    let handle = s.subscribed(ROOT, &applier).await;
+    s.write(ROOT, "one", Some("absent")).await;
+    let change = s.pg.newest_change(&s.key, ROOT).await;
+    until("the notification", || !applier.heard().is_empty()).await;
+    assert_eq!(s.status().await, "awaiting");
+    assert_eq!(s.subscriptions().await, 1);
+
+    let answers = handle.unsubscribe(&s.gear).await.expect("answers");
+
+    assert_eq!(answers[&s.key], UnsubscribeResult::Unsubscribed);
+    assert!(handle.states().is_empty());
+    assert_eq!(s.subscriptions().await, 0, "the subscription is gone");
+    assert!(s.pg.states(&s.key).await.is_empty(), "with its state");
+    let late = s
+        .report(
+            &change,
+            ROOT,
+            ActivationOutcome::Success {
+                applied_value: json!("one"),
+            },
+        )
+        .await;
+    assert_eq!(late, ReportResult::NotSubscribed);
+    assert!(s.pg.activation_records(&s.key).await.is_empty());
+    until("the consumer's group to be deleted", || {
+        s.platform.broker.lifecycle().3 >= 1
+    })
+    .await;
+    s.replica.stop().await;
+}
+
+/// *Restart re-publish*: the consumer goes away with a state `awaiting`; its
+/// replacement subscribes again, and the delivery loop re-publishes after its
+/// interval, the replacement re-reads, applies, reports, and the state settles.
+#[tokio::test]
+async fn a_consumer_restart_is_caught_up_by_the_delivery_loop() {
+    let Some(s) = scene("restart", true).await else {
+        return;
+    };
+    let first = Applier::new(Mode::Silent);
+    let handle = s.subscribed(ROOT, &first).await;
+    s.write(ROOT, "one", Some("absent")).await;
+    let change = s.pg.newest_change(&s.key, ROOT).await;
+    until("the first consumer to hear it", || {
+        !first.heard().is_empty()
+    })
+    .await;
+    assert_eq!(s.status().await, "awaiting");
+
+    // The consumer goes away: its handle is dropped, which unsubscribes nothing, and
+    // its group goes with it. Nothing reports.
+    drop(handle);
+    until("the group to be deleted", || {
+        s.platform.broker.lifecycle().3 >= 1
+    })
+    .await;
+    assert_eq!(
+        s.subscriptions().await,
+        1,
+        "the subscription survives the drop"
+    );
+    assert_eq!(s.status().await, "awaiting");
+
+    // The replacement subscribes; the loop re-publishes the awaiting state.
+    let second = Applier::new(Mode::Faithful);
+    let _again = s.subscribe(ROOT, &second).await;
+    until("the replacement to hear it", || !second.heard().is_empty()).await;
+    s.settled("succeeded").await;
+
+    let heard = second.heard();
+    assert_eq!(heard[0].0.map(|c| c.to_string()), Some(change.clone()));
+    assert_eq!(heard[0].1, json!("one"));
+    assert_eq!(s.pg.activation_records(&s.key).await.len(), 1);
+    assert_eq!(
+        s.subscriptions().await,
+        1,
+        "a repeated subscribe is a new handle over the one subscription"
+    );
+    s.replica.stop().await;
+}
+
+/// A repeated `change_notification` is re-read, re-applied and re-reported like
+/// the first; the repeat's report answers `ignored` once the first settled the
+/// state, and no second audit record is written.
+#[tokio::test]
+async fn a_repeated_notification_is_re_applied_and_its_report_writes_no_second_record() {
+    let Some(s) = scene("repeat", true).await else {
+        return;
+    };
+    let applier = Applier::new(Mode::Faithful);
+    let _handle = s.subscribed(ROOT, &applier).await;
+    s.write(ROOT, "one", Some("absent")).await;
+    s.settled("succeeded").await;
+    // A redelivered duplicate between polls is tolerated (at-least-once).
+    assert!(!applier.heard().is_empty());
+
+    // The broker delivers the same notification again, as at-least-once does.
+    let again = s
+        .platform
+        .broker
+        .notifications()
+        .first()
+        .cloned()
+        .expect("the notification published for the write");
+    s.platform
+        .broker
+        .publish(&s.gear, &again, Ack::Accepted)
+        .await
+        .expect("the broker takes the repeat");
+    until("the repeat to be handled", || applier.heard().len() == 2).await;
+    tokio::time::sleep(STILL_WAITING).await;
+
+    assert_eq!(
+        applier.heard()[0],
+        applier.heard()[1],
+        "re-read and re-applied alike"
+    );
+    assert_eq!(s.status().await, "succeeded", "the state ends as it did");
+    assert_eq!(
+        s.pg.activation_records(&s.key).await.len(),
+        1,
+        "the repeat's report answered ignored: no second record"
+    );
+    s.replica.stop().await;
+}
+
+/// *No broker*: a write commits with its state `awaiting` and nothing
+/// published; the loop idles; once the broker appears the loop registers the
+/// types and delivers, and the consumer's group joins, reads and reports.
+#[tokio::test]
+async fn a_write_without_a_broker_stays_awaiting_until_the_broker_appears() {
+    let Some(pg) = pg_fixture("activation-e2e").await else {
+        return;
+    };
+    let platform = platform();
+    let replica =
+        Replica::init_without_broker(&pg, &platform, json!({ "redeliver_interval_seconds": 1 }))
+            .await;
+    let key = setting("nobroker");
+    replica
+        .declare(&key, ScopeClass::Cascading, "default")
+        .await;
+    let client = replica
+        .hub
+        .get::<dyn SettingsActivationClient>()
+        .expect("bound");
+    let gear = consumer();
+    let applier = Applier::new(Mode::Faithful);
+    let handle = client
+        .subscribe(
+            &gear,
+            vec![key.clone()],
+            ROOT.to_string(),
+            Arc::clone(&applier) as Arc<dyn SettingChangeHandler>,
+        )
+        .await
+        .expect("a handle");
+    until("the key to register", || {
+        matches!(handle.states().get(&key), Some(KeyState::Registered { .. }))
+    })
+    .await;
+    replica.serve().await;
+
+    replica
+        .set(&key, ROOT, "one", Some("absent"))
+        .await
+        .expect("the write commits without a broker");
+    tokio::time::sleep(STILL_WAITING + Duration::from_millis(1200)).await;
+
+    let states = pg.states(&key).await;
+    assert_eq!(states.len(), 1);
+    assert_eq!(states[0].status, "awaiting");
+    assert!(!states[0].notified, "nothing was published");
+    assert!(platform.broker.published().is_empty());
+    assert!(applier.bundles().is_empty());
+    assert!(
+        matches!(handle.states().get(&key), Some(KeyState::Registered { .. })),
+        "no broker is not a pending key"
+    );
+    assert!(
+        !platform
+            .registry
+            .has_registered(settings_service_sdk::gts::ACTIVATION_TOPIC_ID),
+        "the loop idles until a broker resolves"
+    );
+
+    replica.plug_broker(&platform);
+    until("the consumer to hear the change", || {
+        !applier.bundles().is_empty()
+    })
+    .await;
+    until_async("the state to settle", || async {
+        pg.states(&key)
+            .await
+            .first()
+            .is_some_and(|s| s.status == "succeeded")
+    })
+    .await;
+    assert!(
+        platform
+            .registry
+            .has_registered(settings_service_sdk::gts::CHANGE_NOTIFICATION_EVENT_TYPE),
+        "the loop registered the activation types once the broker resolved"
+    );
+    assert_eq!(applier.heard()[0].1, json!("one"));
+    replica.stop().await;
+}
+
+/// A subscription at a descendant is notified for a write at its ancestor that
+/// changes the value it inherits, under the descendant's tenant.
+#[tokio::test]
+async fn a_descendants_subscription_hears_the_ancestors_write() {
+    let Some(s) = scene("inherit", true).await else {
+        return;
+    };
+    let applier = Applier::new(Mode::Faithful);
+    let _handle = s.subscribed(CHILD, &applier).await;
+
+    s.write(ROOT, "inherited", Some("absent")).await;
+    until("the handler", || !applier.bundles().is_empty()).await;
+    s.settled("succeeded").await;
+
+    let bundle = &applier.bundles()[0];
+    assert_eq!(
+        bundle.tenant,
+        CHILD.to_string(),
+        "the bundle is at the subscription's tenant"
+    );
+    assert_eq!(applier.heard()[0].1, json!("inherited"));
+    let states = s.pg.states(&s.key).await;
+    assert_eq!(states[0].tenant, CHILD.to_string());
+    s.replica.stop().await;
+}
+
+// ---------------------------------------------------------------------------
+// The per-instance account: several processes of one gear (ADR-004)
+// ---------------------------------------------------------------------------
+
+/// `K = 2` at the loop's one-second interval: an instance that never reports is
+/// called silent within a few ticks.
+fn short_timeout() -> Value {
+    json!({ "redeliver_interval_seconds": 1, "activation_report_timeout_seconds": 2 })
+}
+
+const FIRST: Uuid = Uuid::from_u128(0x1001);
+const SECOND: Uuid = Uuid::from_u128(0x1002);
+
+/// A second (third...) consumer process of the gear, in this process: the
+/// SDK's own client over the replica's services, under an identity of its own
+/// — what two processes of one gear are to the service.
+fn process(s: &Scene, id: Uuid, label: &str) -> Arc<ActivationClient> {
+    let gear = &s.replica.gear;
+    Arc::new(ActivationClient::new(ConsumerDeps {
+        backend: Arc::new(ServiceBackend::new(
+            gear.subscriptions().expect("initialized"),
+            gear.recorder().expect("initialized"),
+        )),
+        reader: s
+            .replica
+            .hub
+            .get::<dyn SettingsReaderClient>()
+            .expect("the reader is bound"),
+        metrics: Arc::new(OtelNotifyMetrics::new()),
+        hub: Arc::clone(&s.replica.hub),
+        timing: ClientTiming::standard(),
+        identity: InstanceIdentity::new(id, Some(label)),
+    }))
+}
+
+impl Scene {
+    /// Subscribe `client` and wait until its key is registered.
+    async fn join(
+        &self,
+        client: &Arc<ActivationClient>,
+        handler: &Arc<Applier>,
+    ) -> SubscriptionHandle {
+        let handle = client
+            .subscribe(
+                &self.gear,
+                vec![self.key.clone()],
+                ROOT.to_string(),
+                Arc::clone(handler) as Arc<dyn SettingChangeHandler>,
+            )
+            .await
+            .expect("subscribe answers a handle");
+        until("the key to register", || {
+            matches!(
+                handle.states().get(&self.key),
+                Some(KeyState::Registered { .. })
+            )
+        })
+        .await;
+        handle
+    }
+
+    /// `(instance_id, status)` of every state of the key, by instance.
+    async fn instance_states(&self) -> Vec<(Uuid, String)> {
+        self.pg
+            .rows(
+                "SELECT instance_id, status FROM activation_state WHERE key = $1
+                  ORDER BY instance_id",
+                vec![self.key.as_str().into()],
+            )
+            .await
+            .iter()
+            .map(|r| {
+                (
+                    r.try_get("", "instance_id").unwrap(),
+                    r.try_get("", "status").unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    /// `(instance_id, outcome, instance_label)` of every `activation` record.
+    async fn instance_records(&self) -> Vec<(Uuid, String, Option<String>)> {
+        self.pg
+            .rows(
+                "SELECT instance_id, outcome, instance_label FROM audit_records
+                  WHERE declaration_key = $1 AND operation = 'activation'
+                  ORDER BY occurred_at, id",
+                vec![self.key.as_str().into()],
+            )
+            .await
+            .iter()
+            .map(|r| {
+                (
+                    r.try_get("", "instance_id").unwrap(),
+                    r.try_get("", "outcome").unwrap(),
+                    r.try_get("", "instance_label").unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    async fn instance_status(&self, instance: Uuid) -> Option<String> {
+        self.instance_states()
+            .await
+            .into_iter()
+            .find(|(who, _)| *who == instance)
+            .map(|(_, status)| status)
+    }
+
+    async fn silent_subscription(&self, instance: Uuid) -> Option<bool> {
+        self.pg
+            .rows(
+                "SELECT (silent_since IS NOT NULL) AS silent FROM subscriptions
+                  WHERE key = $1 AND instance_id = $2",
+                vec![self.key.as_str().into(), instance.into()],
+            )
+            .await
+            .first()
+            .map(|r| r.try_get("", "silent").unwrap())
+    }
+}
+
+/// *Two consumer instances*: two processes of one gear register under their own
+/// `instance_id`, a set yields a state each, both `succeeded`, and two
+/// `activation` records under the change, one per instance, each carrying its
+/// instance's label.
+#[tokio::test]
+async fn two_consumer_instances_each_settle_their_own_state_and_record() {
+    let Some(s) = scene("two_instances", true).await else {
+        return;
+    };
+    let deadlocks = s.pg.deadlocks().await;
+    let (one, two) = (
+        process(&s, FIRST, "host-one"),
+        process(&s, SECOND, "host-two"),
+    );
+    let (applier_one, applier_two) = (Applier::new(Mode::Faithful), Applier::new(Mode::Faithful));
+    let handle_one = s.join(&one, &applier_one).await;
+    let handle_two = s.join(&two, &applier_two).await;
+    until("both consumers' groups to join", || {
+        s.platform.broker.open_streams() >= 3
+    })
+    .await;
+
+    s.write(ROOT, "one", Some("absent")).await;
+    let change = s.pg.newest_change(&s.key, ROOT).await;
+    until_async("both states to settle", || async {
+        let states = s.instance_states().await;
+        states.len() == 2 && states.iter().all(|(_, status)| status == "succeeded")
+    })
+    .await;
+
+    assert_eq!(
+        s.instance_states().await,
+        [
+            (FIRST, "succeeded".to_owned()),
+            (SECOND, "succeeded".to_owned())
+        ],
+        "a state per instance"
+    );
+    let mut records = s.instance_records().await;
+    records.sort();
+    assert_eq!(
+        records,
+        [
+            (FIRST, "success".to_owned(), Some("host-one".to_owned())),
+            (SECOND, "success".to_owned(), Some("host-two".to_owned()))
+        ],
+        "two records, one per instance"
+    );
+    let under: i64 =
+        s.pg.count(
+            "SELECT count(*) FROM audit_records WHERE operation = 'activation'
+               AND declaration_key = $1 AND change_ref = $2::uuid",
+            vec![s.key.as_str().into(), change.clone().into()],
+        )
+        .await;
+    assert_eq!(under, 2, "both under the one change");
+    assert_eq!(s.subscriptions().await, 2);
+
+    drop((handle_one, handle_two));
+    s.replica.stop().await;
+    assert_eq!(s.pg.deadlocks().await, deadlocks, "no deadlock");
+}
+
+/// *Restart as a new instance*, the killed process: the old instance never
+/// reports, its replacement registers under a new `instance_id` — it is not in
+/// the change's account, which closes with the old instance called silent after
+/// the report timeout — and is expected by the next change, which leaves the
+/// silent one out.
+#[tokio::test]
+async fn a_restart_under_a_new_instance_leaves_the_old_one_silent_and_is_expected_next() {
+    let Some(s) = scene_with("restart_new", true, short_timeout()).await else {
+        return;
+    };
+    let deadlocks = s.pg.deadlocks().await;
+    let old = process(&s, FIRST, "old");
+    let dead = Applier::new(Mode::Silent);
+    let _old_handle = s.join(&old, &dead).await;
+    until("the old consumer's group to join", || {
+        s.platform.broker.open_streams() >= 2
+    })
+    .await;
+
+    s.write(ROOT, "one", Some("absent")).await;
+    let first_change = s.pg.newest_change(&s.key, ROOT).await;
+    until("the old instance to hear it", || !dead.heard().is_empty()).await;
+
+    // The replacement registers under a new id: it reads the committed value and
+    // has no state for the change.
+    let new = process(&s, SECOND, "new");
+    let alive = Applier::new(Mode::Faithful);
+    let new_handle = s.join(&new, &alive).await;
+    let KeyState::Registered { value: Some(value) } = new_handle.states()[&s.key].clone() else {
+        panic!("registered with its fresh value");
+    };
+    assert_eq!(value.value, json!("one"), "it reads the committed value");
+    assert_eq!(
+        s.instance_states().await,
+        [(FIRST, "awaiting".to_owned())],
+        "the restart is not in the change's account"
+    );
+
+    // The old instance is called silent after the timeout and recorded so.
+    until_async("the old instance to be called silent", || async {
+        s.instance_status(FIRST).await.as_deref() == Some("silent")
+    })
+    .await;
+    assert_eq!(s.silent_subscription(FIRST).await, Some(true));
+    assert_eq!(s.silent_subscription(SECOND).await, Some(false));
+    let silent = s.instance_records().await;
+    assert_eq!(
+        silent,
+        [(FIRST, "silent".to_owned(), Some("old".to_owned()))],
+        "one `silent` record, under the first change"
+    );
+    let named: i64 =
+        s.pg.count(
+            "SELECT count(*) FROM audit_records WHERE operation = 'activation'
+               AND declaration_key = $1 AND change_ref = $2::uuid AND outcome = 'silent'",
+            vec![s.key.as_str().into(), first_change.into()],
+        )
+        .await;
+    assert_eq!(named, 1);
+
+    // The next change expects the replacement only.
+    let tag = s.pg.row_tag(&s.key, ROOT).await;
+    s.write(ROOT, "two", Some(&tag)).await;
+    assert_eq!(
+        s.instance_states().await.len(),
+        1,
+        "the silent instance is left out"
+    );
+    until_async("the replacement to settle", || async {
+        s.instance_status(SECOND).await.as_deref() == Some("succeeded")
+    })
+    .await;
+    assert_eq!(s.instance_status(FIRST).await, None);
+    let mut outcomes: Vec<(Uuid, String)> = s
+        .instance_records()
+        .await
+        .into_iter()
+        .map(|(who, outcome, _)| (who, outcome))
+        .collect();
+    outcomes.sort();
+    assert_eq!(
+        outcomes,
+        [(FIRST, "silent".to_owned()), (SECOND, "success".to_owned())]
+    );
+    s.replica.stop().await;
+    assert_eq!(s.pg.deadlocks().await, deadlocks, "no deadlock");
+}
+
+/// *Excluded instance notified and re-enters*: an instance called silent for a
+/// change and left out of the next one still hears that next change's
+/// notification through its own consumer group and reports — the report answers
+/// `ignored`, its `silent_since` is cleared, the change's account is
+/// unchanged — and the change after that writes a row for it and expects it.
+#[tokio::test]
+async fn an_excluded_instance_hears_the_next_notification_and_re_enters() {
+    let Some(s) = scene_with("excluded_reenters", true, short_timeout()).await else {
+        return;
+    };
+    let deadlocks = s.pg.deadlocks().await;
+    let (a, b) = (process(&s, FIRST, "a"), process(&s, SECOND, "b"));
+    let (live, quiet) = (Applier::new(Mode::Faithful), Applier::new(Mode::Silent));
+    let _live_handle = s.join(&a, &live).await;
+    let _quiet_handle = s.join(&b, &quiet).await;
+    until("both consumers' groups to join", || {
+        s.platform.broker.open_streams() >= 3
+    })
+    .await;
+
+    // Change 1: A confirms, B stays silent until called so.
+    s.write(ROOT, "one", Some("absent")).await;
+    until_async("B to be called silent", || async {
+        s.instance_status(SECOND).await.as_deref() == Some("silent")
+    })
+    .await;
+    assert_eq!(s.instance_status(FIRST).await.as_deref(), Some("succeeded"));
+    assert_eq!(s.silent_subscription(SECOND).await, Some(true));
+
+    // Change 2: B is excluded, yet its group hears the notification.
+    *quiet.mode.lock().unwrap() = Mode::Faithful;
+    let tag = s.pg.row_tag(&s.key, ROOT).await;
+    s.write(ROOT, "two", Some(&tag)).await;
+    let second_change = s.pg.newest_change(&s.key, ROOT).await;
+    // Only A has a row for change 2; its status is not pinned, since a live
+    // instance may already have confirmed by the time this reads.
+    let with_rows: Vec<_> = s
+        .instance_states()
+        .await
+        .into_iter()
+        .map(|(instance, _)| instance)
+        .collect();
+    assert_eq!(with_rows, [FIRST], "B has no row for change 2");
+    until("B to hear change 2", || {
+        quiet
+            .heard()
+            .iter()
+            .any(|(change, _)| change.map(|c| c.to_string()) == Some(second_change.clone()))
+    })
+    .await;
+    until_async("B's silence to end", || async {
+        s.silent_subscription(SECOND).await == Some(false)
+    })
+    .await;
+    until_async("A to settle change 2", || async {
+        s.instance_status(FIRST).await.as_deref() == Some("succeeded")
+    })
+    .await;
+    assert_eq!(s.instance_status(SECOND).await, None, "no row was created");
+    assert_eq!(
+        s.instance_records()
+            .await
+            .into_iter()
+            .filter(|(who, _, _)| *who == SECOND)
+            .count(),
+        1,
+        "the ignored report wrote nothing: B's `silent` record only"
+    );
+
+    // Change 3: B is expected again.
+    let tag = s.pg.row_tag(&s.key, ROOT).await;
+    s.write(ROOT, "three", Some(&tag)).await;
+    assert_eq!(s.instance_states().await.len(), 2, "a row for B again");
+    until_async("both to settle change 3", || async {
+        let states = s.instance_states().await;
+        states.len() == 2 && states.iter().all(|(_, status)| status == "succeeded")
+    })
+    .await;
+    s.replica.stop().await;
+    assert_eq!(s.pg.deadlocks().await, deadlocks, "no deadlock");
+}
+
+/// *`not_subscribed` → re-registration*: a live instance whose subscription was
+/// forgotten while its handle still holds the key hears a notification and
+/// reports — answered `not_subscribed` — and the SDK registers the key again,
+/// reads it fresh and invokes the handler without a `change_ref`; the next
+/// change writes a row for the instance.
+#[tokio::test]
+async fn a_report_answered_not_subscribed_makes_the_sdk_register_again() {
+    let Some(s) = scene("not_subscribed", true).await else {
+        return;
+    };
+    let (a, b) = (process(&s, FIRST, "a"), process(&s, SECOND, "b"));
+    let (steady, forgotten) = (Applier::new(Mode::Faithful), Applier::new(Mode::Faithful));
+    let _steady_handle = s.join(&a, &steady).await;
+    let forgotten_handle = s.join(&b, &forgotten).await;
+    until("both consumers' groups to join", || {
+        s.platform.broker.open_streams() >= 3
+    })
+    .await;
+
+    // The forgetting of B's subscription, as the delivery loop does it.
+    s.pg.exec(
+        "DELETE FROM activation_state WHERE key = $1 AND instance_id = $2",
+        vec![s.key.as_str().into(), SECOND.into()],
+    )
+    .await;
+    s.pg.exec(
+        "DELETE FROM subscriptions WHERE key = $1 AND instance_id = $2",
+        vec![s.key.as_str().into(), SECOND.into()],
+    )
+    .await;
+    assert_eq!(s.silent_subscription(SECOND).await, None);
+
+    // A change notified to the subscriber's group: A's row is what publishes it.
+    s.write(ROOT, "one", Some("absent")).await;
+    let change = s.pg.newest_change(&s.key, ROOT).await;
+    until("B to hear the change", || {
+        forgotten
+            .heard()
+            .iter()
+            .any(|(c, _)| c.map(|c| c.to_string()) == Some(change.clone()))
+    })
+    .await;
+    // Its report answered `not_subscribed`: the key registers again and the
+    // handler is invoked once more, with no change to name.
+    until("the key to be handed to the handler again", || {
+        forgotten.heard().iter().any(|(c, _)| c.is_none())
+    })
+    .await;
+    until_async("B's subscription to exist again", || async {
+        s.silent_subscription(SECOND).await == Some(false)
+    })
+    .await;
+    assert!(matches!(
+        forgotten_handle.states().get(&s.key),
+        Some(KeyState::Registered { .. })
+    ));
+    assert_eq!(
+        s.instance_status(SECOND).await,
+        None,
+        "no row for the change it was not subscribed for"
+    );
+
+    // The next change writes a row for it.
+    until_async("A to settle", || async {
+        s.instance_status(FIRST).await.as_deref() == Some("succeeded")
+    })
+    .await;
+    let tag = s.pg.row_tag(&s.key, ROOT).await;
+    s.write(ROOT, "two", Some(&tag)).await;
+    assert_eq!(s.instance_states().await.len(), 2, "a row for B again");
+    until_async("both to settle", || async {
+        let states = s.instance_states().await;
+        states.len() == 2 && states.iter().all(|(_, status)| status == "succeeded")
+    })
+    .await;
+    s.replica.stop().await;
+}
+
+/// *Graceful stop deregisters*, and the state half of *Read before and after a
+/// graceful stop*: a gear with two processes over one key, one stops — before,
+/// its row is `awaiting` beside the other's `succeeded`; after, its subscription
+/// and row are gone, the other process's stay, nothing is written to the history
+/// for the stopped one, and the gear is unsubscribed from the key only when the
+/// last process stops.
+#[tokio::test]
+async fn a_graceful_stop_deletes_only_the_stopping_processs_subscription_and_rows() {
+    let Some(s) = scene("graceful_stop", true).await else {
+        return;
+    };
+    let deadlocks = s.pg.deadlocks().await;
+    let (stays, stops) = (process(&s, FIRST, "stays"), process(&s, SECOND, "stops"));
+    let (confirming, silent) = (Applier::new(Mode::Faithful), Applier::new(Mode::Silent));
+    let _stays_handle = s.join(&stays, &confirming).await;
+    let _stops_handle = s.join(&stops, &silent).await;
+    until("both consumers' groups to join", || {
+        s.platform.broker.open_streams() >= 3
+    })
+    .await;
+
+    s.write(ROOT, "one", Some("absent")).await;
+    until_async("the first process to settle", || async {
+        s.instance_status(FIRST).await.as_deref() == Some("succeeded")
+    })
+    .await;
+    until("the second to hear it", || !silent.heard().is_empty()).await;
+    assert_eq!(
+        s.instance_states().await,
+        [
+            (FIRST, "succeeded".to_owned()),
+            (SECOND, "awaiting".to_owned())
+        ],
+        "before the stop"
+    );
+    let records = s.instance_records().await.len();
+
+    stops.stop().await;
+    assert_eq!(
+        s.silent_subscription(SECOND).await,
+        None,
+        "its subscription"
+    );
+    assert_eq!(
+        s.instance_states().await,
+        [(FIRST, "succeeded".to_owned())],
+        "and its row are gone, the other process's stay"
+    );
+    assert_eq!(s.silent_subscription(FIRST).await, Some(false));
+    assert_eq!(
+        s.instance_records().await.len(),
+        records,
+        "nothing is written to the history for the stopped process"
+    );
+
+    stays.stop().await;
+    assert_eq!(
+        s.subscriptions().await,
+        0,
+        "the last process leaves the key"
+    );
+    assert!(s.pg.states(&s.key).await.is_empty());
+    s.replica.stop().await;
+    assert_eq!(s.pg.deadlocks().await, deadlocks, "no deadlock");
+}

@@ -40,8 +40,16 @@ struct Entry {
 /// time-to-live is the nearest to expiry. A record whose slot was replaced or
 /// invalidated since no longer matches its entry's instant and is skipped when
 /// it reaches the head, so no eviction ever searches.
+///
+/// The entries are held by key, then by tenant, so a key-wide eviction — what
+/// every delivered `cache_invalidate` runs, on every replica — drops the key's
+/// own map and costs the entries of that key, never a walk of the cache under
+/// the lock every read takes. Only the subtree eviction, which names tenants
+/// and no key, still walks every key.
 struct Store {
-    entries: HashMap<(String, Uuid), Entry>,
+    entries: HashMap<String, HashMap<Uuid, Entry>>,
+    /// How many entries `entries` holds across every key.
+    len: usize,
     order: VecDeque<(String, Uuid, Instant)>,
     /// How many invalidations have touched each key: a value write, a
     /// declaration change, an access change on the key.
@@ -49,6 +57,21 @@ struct Store {
     /// How many subtree evictions have touched each tenant: a hierarchy
     /// change, where no key is named at all.
     tenant_generations: HashMap<Uuid, u64>,
+    /// How many entries the evictions have examined, and how many key-wide
+    /// eviction passes ran: what the tests read to pin their cost.
+    #[cfg(test)]
+    stats: EvictionStats,
+}
+
+/// What the evictions of a cache have cost so far; for tests.
+#[cfg(test)]
+#[domain_model]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct EvictionStats {
+    /// Entries an eviction examined, removed or not.
+    pub visited: usize,
+    /// Calls of [`EffectiveCache::invalidate_keys`].
+    pub key_passes: usize,
 }
 
 /// What a read captures before it goes to the database and hands back with
@@ -104,13 +127,80 @@ impl Store {
     /// Remove the slot's entry when it is the one the record describes.
     fn remove_if_stored_at(&mut self, slot: &(String, Uuid), stored_at: Instant) -> bool {
         let held = self
-            .entries
-            .get(slot)
+            .lookup(&slot.0, slot.1)
             .is_some_and(|entry| entry.stored_at == stored_at);
         if held {
-            self.entries.remove(slot);
+            self.remove(&slot.0, slot.1);
         }
         held
+    }
+
+    fn lookup(&self, key: &str, tenant: Uuid) -> Option<&Entry> {
+        self.entries.get(key)?.get(&tenant)
+    }
+
+    fn insert(&mut self, key: String, tenant: Uuid, entry: Entry) {
+        if self
+            .entries
+            .entry(key)
+            .or_default()
+            .insert(tenant, entry)
+            .is_none()
+        {
+            self.len += 1;
+        }
+    }
+
+    /// Remove one slot; a key left with no entry goes with it, so the outer
+    /// map never holds an empty one.
+    fn remove(&mut self, key: &str, tenant: Uuid) {
+        let Some(tenants) = self.entries.get_mut(key) else {
+            return;
+        };
+        #[cfg(test)]
+        {
+            self.stats.visited += 1;
+        }
+        if tenants.remove(&tenant).is_some() {
+            self.len -= 1;
+            if tenants.is_empty() {
+                self.entries.remove(key);
+            }
+        }
+    }
+
+    /// Remove every scope of one key: its own map, nothing else examined.
+    fn remove_key(&mut self, key: &str) {
+        if let Some(tenants) = self.entries.remove(key) {
+            self.len -= tenants.len();
+            #[cfg(test)]
+            {
+                self.stats.visited += tenants.len();
+            }
+        }
+    }
+
+    /// Remove every entry of the given tenants, whatever the key: a walk of
+    /// every key's map, because nothing indexes the entries by tenant.
+    fn remove_tenants(&mut self, tenants: &HashSet<Uuid>) {
+        let mut removed = 0;
+        #[cfg(test)]
+        let mut visited = 0;
+        self.entries.retain(|_, held| {
+            #[cfg(test)]
+            {
+                visited += held.len();
+            }
+            let before = held.len();
+            held.retain(|tenant, _| !tenants.contains(tenant));
+            removed += before - held.len();
+            !held.is_empty()
+        });
+        self.len -= removed;
+        #[cfg(test)]
+        {
+            self.stats.visited += visited;
+        }
     }
 }
 
@@ -154,9 +244,12 @@ impl EffectiveCache {
             max_entries: max_entries.max(1),
             store: Mutex::new(Store {
                 entries: HashMap::new(),
+                len: 0,
                 order: VecDeque::new(),
                 key_generations: HashMap::new(),
                 tenant_generations: HashMap::new(),
+                #[cfg(test)]
+                stats: EvictionStats::default(),
             }),
         }
     }
@@ -202,14 +295,13 @@ impl EffectiveCache {
     pub fn get(&self, key: &str, tenant: Uuid) -> Option<Arc<EffectiveValue>> {
         // @cpt-begin:cpt-cf-settings-service-algo-value-resolution-cache-read:p1:inst-vr-cache-1
         let mut store = self.lock();
-        let slot = (key.to_owned(), tenant);
         // @cpt-end:cpt-cf-settings-service-algo-value-resolution-cache-read:p1:inst-vr-cache-1
         // @cpt-begin:cpt-cf-settings-service-algo-value-resolution-cache-read:p1:inst-vr-cache-2
-        let entry = store.entries.get(&slot)?;
+        let entry = store.lookup(key, tenant)?;
         // @cpt-end:cpt-cf-settings-service-algo-value-resolution-cache-read:p1:inst-vr-cache-2
         // @cpt-begin:cpt-cf-settings-service-algo-value-resolution-cache-read:p1:inst-vr-cache-3
         if entry.stored_at.elapsed() > self.ttl {
-            store.entries.remove(&slot);
+            store.remove(key, tenant);
             return None;
         }
         // @cpt-end:cpt-cf-settings-service-algo-value-resolution-cache-read:p1:inst-vr-cache-3
@@ -238,13 +330,13 @@ impl EffectiveCache {
             return false;
         }
         store.sweep_expired(self.ttl);
-        let slot = (value.key.clone(), value.tenant_id);
-        if !store.entries.contains_key(&slot) && store.entries.len() >= self.max_entries {
+        let (key, tenant) = (value.key.clone(), value.tenant_id);
+        if store.lookup(&key, tenant).is_none() && store.len >= self.max_entries {
             store.evict_oldest();
         }
         let stored_at = Instant::now();
-        store.order.push_back((slot.0.clone(), slot.1, stored_at));
-        store.entries.insert(slot, Entry { stored_at, value });
+        store.order.push_back((key.clone(), tenant, stored_at));
+        store.insert(key, tenant, Entry { stored_at, value });
         true
     }
 
@@ -270,13 +362,13 @@ impl EffectiveCache {
             || declaration_scope_class == scope_class::GLOBAL
             || tenant.is_none()
         {
-            store.entries.retain(|(k, _), _| k != key);
+            store.remove_key(key);
             return;
         }
         // @cpt-end:cpt-cf-settings-service-algo-value-resolution-cache-invalidate:p1:inst-vr-inv-2
         // @cpt-begin:cpt-cf-settings-service-algo-value-resolution-cache-invalidate:p1:inst-vr-inv-1
         if let Some(tenant) = tenant {
-            store.entries.remove(&(key.to_owned(), tenant));
+            store.remove(key, tenant);
         }
         // @cpt-end:cpt-cf-settings-service-algo-value-resolution-cache-invalidate:p1:inst-vr-inv-1
         // @cpt-begin:cpt-cf-settings-service-algo-value-resolution-cache-invalidate:p1:inst-vr-inv-5
@@ -286,8 +378,6 @@ impl EffectiveCache {
         // @cpt-end:cpt-cf-settings-service-algo-value-resolution-cache-invalidate:p1:inst-vr-inv-5
     }
 
-    /// Evict a key's entries for the given tenants only: an access change on a
-    /// tenant and its descendants, whatever the scope class.
     /// Evict every cached entry of the given tenants, whatever the setting.
     ///
     /// What a tenant hierarchy change costs: an effective value is a function
@@ -305,7 +395,9 @@ impl EffectiveCache {
         // One membership set, built before the lock: the pass over the entries
         // is then linear in the cache, not in the cache times the subtree —
         // at the sizing anchors that difference is the lock held for
-        // milliseconds rather than for the better part of a minute.
+        // milliseconds rather than for the better part of a minute. It stays a
+        // pass over the whole cache: the entries are indexed by key, not by
+        // tenant, and no production signal calls this yet.
         let tenants: HashSet<Uuid> = tenants.iter().copied().collect();
         let mut store = self.lock();
         for tenant in &tenants {
@@ -315,17 +407,17 @@ impl EffectiveCache {
         // declaration and the subtree's chain changed for all of them at once;
         // a non-cascading entry re-resolves to the same answer, so evicting it
         // costs a read and risks nothing.
-        store
-            .entries
-            .retain(|(_, tenant), _| !tenants.contains(tenant));
+        store.remove_tenants(&tenants);
         // @cpt-end:cpt-cf-settings-service-algo-value-resolution-cache-invalidate:p1:inst-vr-inv-3
     }
 
+    /// Evict a key's entries for the given tenants only: an access change on a
+    /// tenant and its descendants, whatever the scope class.
     pub fn invalidate_tenants(&self, key: &str, tenants: &[Uuid]) {
         let mut store = self.lock();
         store.bump_key(key);
         for tenant in tenants {
-            store.entries.remove(&(key.to_owned(), *tenant));
+            store.remove(key, *tenant);
         }
     }
 
@@ -333,6 +425,36 @@ impl EffectiveCache {
     /// traits alter every scope's effective value at once.
     pub fn invalidate_key(&self, key: &str) {
         self.invalidate(key, scope_class::CASCADING, None);
+    }
+
+    /// Evict every scope of each of `keys` under one lock, each key's
+    /// generation moved as [`Self::invalidate_key`] moves it. What a broadcast
+    /// naming many keys costs: the entries of those keys, each key's map
+    /// dropped whole, and no other entry examined.
+    pub fn invalidate_keys(&self, keys: &[String]) {
+        if keys.is_empty() {
+            return;
+        }
+        let named: HashSet<&str> = keys.iter().map(String::as_str).collect();
+        let mut store = self.lock();
+        #[cfg(test)]
+        {
+            store.stats.key_passes += 1;
+        }
+        // Counted before anything is removed, as `invalidate` does.
+        for key in &named {
+            store.bump_key(key);
+        }
+        for key in &named {
+            store.remove_key(key);
+        }
+    }
+
+    /// What the evictions have cost so far; for tests.
+    #[cfg(test)]
+    #[must_use]
+    pub fn eviction_stats(&self) -> EvictionStats {
+        self.lock().stats
     }
 
     // @cpt-begin:cpt-cf-settings-service-algo-value-resolution-cache-invalidate:p1:inst-vr-inv-4
@@ -347,7 +469,7 @@ impl EffectiveCache {
     /// How many entries are held, stale ones included.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.lock().entries.len()
+        self.lock().len
     }
 
     /// Whether nothing is held.

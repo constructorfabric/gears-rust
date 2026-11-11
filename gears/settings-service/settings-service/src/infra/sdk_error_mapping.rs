@@ -120,13 +120,15 @@ impl From<DomainError> for CanonicalError {
             // @cpt-end:cpt-cf-settings-service-algo-gear-foundation-problem-mapping:p1:inst-gf-problem-5
 
             // 404 — names the kind of resource, never the caller's identifier.
-            // On the value type it means "no credential is configured", which
-            // the SDK projects to `SecretNotConfigured`; a consumer must never
-            // mistake it for a missing declaration.
+            // On the value type it means the credential the setting resolves
+            // to is not in the store, which the SDK projects to
+            // `SecretNotConfigured`; a consumer must never mistake it for a
+            // missing declaration. A setting at its declaration's default is
+            // not this: its value resolves like any other.
             DomainError::NotFound { resource }
                 if resource == settings_service_sdk::gts::VALUE_SCHEMA =>
             {
-                ValueResource::not_found("no credential is configured at any scope")
+                ValueResource::not_found("the credential the setting resolves to is not stored")
                     .with_resource(resource)
                     .create()
             }

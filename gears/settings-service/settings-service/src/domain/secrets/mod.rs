@@ -13,8 +13,11 @@ pub mod service;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use settings_service_sdk::SecretHandle;
+use settings_service_sdk::canonical::plaintext_text;
 use toolkit_macros::domain_model;
 
 use crate::domain::error::DomainError;
@@ -22,6 +25,24 @@ use crate::field;
 
 pub use pending::{PendingSecret, PendingSecretDraft, PendingSecretRepository};
 pub use service::SecretResolver;
+
+/// The plaintext a secret declaration's placeholder default is handed out as:
+/// the empty text for a `null` default, and otherwise the text
+/// [`plaintext_text`] gives it.
+///
+/// A `null` placeholder (a type that admits `null`) says that no credential is
+/// configured, so a consumer must see an empty one, never the four characters
+/// `null` a credential could carry. `resolve_secret` hands this out and the
+/// expected value of a change that falls back to the default is hashed over
+/// it, so the two cannot drift. A stored credential's text is never taken
+/// through here.
+#[must_use]
+pub fn default_plaintext(default: &Value) -> SecretString {
+    match default {
+        Value::Null => SecretString::from(String::new()),
+        other => plaintext_text(other),
+    }
+}
 
 /// The handle format version, so a later encoding can coexist with this one.
 const HANDLE_PREFIX: &str = "sh1.";

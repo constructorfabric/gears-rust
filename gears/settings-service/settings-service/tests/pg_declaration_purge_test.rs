@@ -27,6 +27,9 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use cf_gears_settings_service::audit::{AuditRecord, AuditSink};
+use cf_gears_settings_service::domain::activation::{
+    Admission, NoNotifyMetrics, ReadGate, SubscriptionManager,
+};
 use cf_gears_settings_service::domain::category::DomainVisibility;
 use cf_gears_settings_service::domain::contribution::SettingTypeRegistrar;
 use cf_gears_settings_service::domain::declaration::admin::etag_of;
@@ -34,13 +37,18 @@ use cf_gears_settings_service::domain::declaration::{
     CreateDeclaration, Created, DeclarationAdmin, DeclarationRepository, PurgedDeclaration,
 };
 use cf_gears_settings_service::domain::error::DomainError;
+use cf_gears_settings_service::domain::platform_scope::PlatformScope;
 use cf_gears_settings_service::domain::ports::{NoMetrics, SecretManager};
-use cf_gears_settings_service::domain::resolution::EffectiveCache;
+use cf_gears_settings_service::domain::resolution::{
+    EffectiveCache, Subtree, TenantHierarchy, ValueResolver,
+};
 use cf_gears_settings_service::domain::stepup::{
     StepUpRefusal, StepUpRequirement, StepUpSubject, StepUpVerifier, USER_SUBJECT_TYPE,
 };
 use cf_gears_settings_service::domain::validation::{TraitSet, TypeValidator, ValidationResult};
 use cf_gears_settings_service::domain::writes::WriteActor;
+use cf_gears_settings_service::infra::storage::access_repo::AccessRepo;
+use cf_gears_settings_service::infra::storage::activation_repo::ActivationRepo;
 use cf_gears_settings_service::infra::storage::category_repo::CategoryRepo;
 use cf_gears_settings_service::infra::storage::declaration_repo::DeclarationRepo;
 use cf_gears_settings_service::infra::storage::migrations::Migrator;
@@ -248,8 +256,14 @@ impl SecretManager for RecordingSecrets {
     }
 }
 
-type Admin =
-    DeclarationAdmin<DeclarationRepo, CategoryRepo, ValueRepo, GatedAudit, PendingSecretRepo>;
+type Admin = DeclarationAdmin<
+    DeclarationRepo,
+    CategoryRepo,
+    ValueRepo,
+    GatedAudit,
+    PendingSecretRepo,
+    ActivationRepo,
+>;
 
 fn admin() -> Arc<Admin> {
     admin_with(None, None)
@@ -283,6 +297,7 @@ fn admin_releasing_to(
         PendingSecretRepo,
         secrets,
         Arc::new(NoMetrics),
+        ActivationRepo,
     ))
 }
 
@@ -915,4 +930,199 @@ async fn an_evolution_that_loses_the_race_to_another_evolution_answers_the_confl
         .await,
         1
     );
+}
+
+/// Whatever a registration does not reach: the registration's re-read of the
+/// declaration asks none of the resolver's ports.
+struct Unreached;
+
+#[async_trait]
+impl PlatformScope for Unreached {
+    async fn root_tenant(&self) -> Result<Uuid, DomainError> {
+        unreachable!("the registration's re-read asks no platform scope")
+    }
+}
+
+#[async_trait]
+impl TenantHierarchy for Unreached {
+    async fn chain(&self, _tenant: Uuid) -> Result<Vec<Uuid>, DomainError> {
+        unreachable!("the registration's re-read asks no hierarchy")
+    }
+
+    async fn is_within_subtree(&self, _caller: Uuid, _target: Uuid) -> Result<bool, DomainError> {
+        unreachable!("the registration's re-read asks no hierarchy")
+    }
+
+    async fn is_standalone(&self, _tenant: Uuid) -> Result<bool, DomainError> {
+        unreachable!("the registration's re-read asks no hierarchy")
+    }
+
+    async fn subtree(&self, _tenant: Uuid, _budget: usize) -> Result<Subtree, DomainError> {
+        unreachable!("the registration's re-read asks no hierarchy")
+    }
+}
+
+#[async_trait]
+impl ReadGate for Unreached {
+    async fn read_visibility(
+        &self,
+        _ctx: &SecurityContext,
+    ) -> Result<DomainVisibility, DomainError> {
+        unreachable!("the registration's re-read takes no read decision")
+    }
+}
+
+type Manager = SubscriptionManager<DeclarationRepo, ValueRepo, AccessRepo, ActivationRepo>;
+
+/// The manager over the real repositories; only `register_in` is driven.
+fn manager() -> Manager {
+    let unreached = Arc::new(Unreached);
+    SubscriptionManager::new(
+        Arc::new(ValueResolver::new(
+            DeclarationRepo,
+            ValueRepo,
+            AccessRepo,
+            Arc::clone(&unreached) as Arc<dyn TenantHierarchy>,
+            Arc::clone(&unreached) as Arc<dyn PlatformScope>,
+            Arc::new(PlainValidator),
+            Arc::new(EffectiveCache::new(Duration::from_secs(60))),
+        )),
+        ActivationRepo,
+        unreached as Arc<dyn ReadGate>,
+        Arc::new(NoNotifyMetrics),
+    )
+}
+
+const SEEDED_KEY: &str = "gts.cf.core.settings.setting_type.v1~acme.settings.network.one.v1~";
+
+async fn activation_rows(conn: &DatabaseConnection, key: &str) -> [usize; 2] {
+    [
+        count(
+            conn,
+            &format!("SELECT id FROM subscriptions WHERE key = '{key}'"),
+        )
+        .await,
+        count(
+            conn,
+            &format!("SELECT key FROM activation_state WHERE key = '{key}'"),
+        )
+        .await,
+    ]
+}
+
+/// The purge deletes the key's subscriptions and states, every subscriber and
+/// tenant; another key's rows stay.
+#[tokio::test]
+async fn a_purge_removes_the_subscriptions_and_states_of_its_key() {
+    let Some(fixture) = pg_fixture("declaration purge").await else {
+        return;
+    };
+    run_migrations_for_testing(&fixture.db, Migrator::migrations())
+        .await
+        .expect("the chain applies");
+    let seeded = seed(&fixture.conn).await;
+    exec(
+        &fixture.conn,
+        &format!(
+            "INSERT INTO subscriptions (id, subscriber, instance_id, key, tenant, created_at)
+             VALUES (gen_random_uuid(), 'alpha', '{i1}', '{SEEDED_KEY}', '{a}', now()),
+                    (gen_random_uuid(), 'alpha', '{i2}', '{SEEDED_KEY}', '{a}', now()),
+                    (gen_random_uuid(), 'beta', '{i1}', '{SEEDED_KEY}', '{b}', now()),
+                    (gen_random_uuid(), 'alpha', '{i1}', 'other.key', '{a}', now());
+             INSERT INTO activation_state
+               (subscriber, instance_id, key, tenant, change_ref, changed_at, expected_value,
+                status, updated_at)
+             VALUES ('alpha', '{i1}', '{SEEDED_KEY}', '{a}', gen_random_uuid(), now(), 'true',
+                     'awaiting', now()),
+                    ('alpha', '{i2}', '{SEEDED_KEY}', '{a}', gen_random_uuid(), now(), 'true',
+                     'awaiting', now()),
+                    ('beta', '{i1}', '{SEEDED_KEY}', '{b}', gen_random_uuid(), now(), 'true',
+                     'succeeded', now()),
+                    ('alpha', '{i1}', 'other.key', '{a}', gen_random_uuid(), now(), 'true',
+                     'awaiting', now());",
+            i1 = Uuid::new_v4(),
+            i2 = Uuid::new_v4(),
+            a = seeded.tenant_a,
+            b = seeded.tenant_b,
+        ),
+    )
+    .await;
+    // Every instance of every subscriber: alpha has two instances at one tenant.
+    assert_eq!(activation_rows(&fixture.conn, SEEDED_KEY).await, [3, 3]);
+    let db = DBProvider::<DbError>::new(fixture.db.clone());
+    let tag = tag_of(&db, seeded.id).await;
+
+    purge(&db, &admin(), seeded.id, tag).await.expect("purged");
+
+    assert_eq!(activation_rows(&fixture.conn, SEEDED_KEY).await, [0, 0]);
+    assert_eq!(activation_rows(&fixture.conn, "other.key").await, [1, 1]);
+}
+
+/// A registration admitted before a purge is held by the purge's row lock: it
+/// does not complete while the lock is held, and once the purge commits it
+/// answers `NotFound` and leaves no row.
+#[tokio::test]
+async fn a_registration_racing_a_purge_leaves_no_row_behind() {
+    let Some(fixture) = pg_fixture("declaration purge").await else {
+        return;
+    };
+    run_migrations_for_testing(&fixture.db, Migrator::migrations())
+        .await
+        .expect("the chain applies");
+    let seeded = seed(&fixture.conn).await;
+    let db = Arc::new(DBProvider::<DbError>::new(fixture.db.clone()));
+    let admission = Admission {
+        declaration_id: seeded.id,
+        subscriber: "alpha".to_owned(),
+        instance_id: Uuid::nil(),
+        instance_label: None,
+        key: SEEDED_KEY.to_owned(),
+        tenant: seeded.tenant_a.to_string(),
+    };
+
+    // The purge side: the declaration row held for update, as the purge holds
+    // it, and the key's rows deleted with the row in the same transaction.
+    let purge_tx = fixture.conn.begin().await.expect("the purge's transaction");
+    purge_tx
+        .execute_unprepared(&format!(
+            "SELECT id FROM setting_declarations WHERE id = '{id}' FOR UPDATE",
+            id = seeded.id
+        ))
+        .await
+        .expect("the row is locked");
+
+    let registering = {
+        let (db, admission) = (Arc::clone(&db), admission.clone());
+        tokio::spawn(async move {
+            let manager = Arc::new(manager());
+            db.db()
+                .transaction_ref_mapped::<_, (), DomainError>(move |tx| {
+                    Box::pin(async move { manager.register_in(tx, &admission).await.map(|_| ()) })
+                })
+                .await
+        })
+    };
+    wait_until_a_backend_waits_on_a_lock(&fixture.conn).await;
+    assert!(
+        !registering.is_finished(),
+        "the registration is blocked behind the purge"
+    );
+
+    // The purge commits: the declaration and the key's rows are gone.
+    purge_tx
+        .execute_unprepared(&format!(
+            "DELETE FROM subscriptions WHERE key = '{SEEDED_KEY}';
+             DELETE FROM activation_state WHERE key = '{SEEDED_KEY}';
+             DELETE FROM setting_declarations WHERE id = '{id}';",
+            id = seeded.id
+        ))
+        .await
+        .expect("the purge deletes");
+    purge_tx.commit().await.expect("the purge commits");
+
+    match registering.await.expect("joined") {
+        Err(DomainError::NotFound { resource }) => assert_eq!(resource, "declaration"),
+        other => panic!("a registration that lost the race answers not found, got {other:?}"),
+    }
+    assert_eq!(activation_rows(&fixture.conn, SEEDED_KEY).await, [0, 0]);
 }

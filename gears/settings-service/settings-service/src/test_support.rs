@@ -5,6 +5,10 @@
 //! can run the real domain code and the real repositories over an in-memory
 //! database without a platform around it.
 
+pub mod activation_repo_forward;
+pub mod event_broker_stubs;
+pub mod scripted_broker;
+
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
@@ -245,6 +249,32 @@ pub async fn sqlite_provider() -> Arc<DBProvider<DbError>> {
     migrated(db).await
 }
 
+/// A database with no migration applied: every read of the gear's tables fails
+/// as a database that cannot answer does.
+pub async fn sqlite_provider_unmigrated() -> Arc<DBProvider<DbError>> {
+    Arc::new(DBProvider::new(
+        connect_db("sqlite::memory:", sqlite_opts())
+            .await
+            .expect("in-memory sqlite connects"),
+    ))
+}
+
+/// As [`sqlite_provider`], with a pool that gives up on a busy connection after
+/// `wait`: a transaction that begins while another holds the one connection
+/// fails to begin, as an exhausted pool does.
+pub async fn sqlite_provider_acquiring_within(wait: Duration) -> Arc<DBProvider<DbError>> {
+    let db = connect_db(
+        "sqlite::memory:",
+        ConnectOpts {
+            acquire_timeout: Some(wait),
+            ..sqlite_opts()
+        },
+    )
+    .await
+    .expect("in-memory sqlite connects");
+    migrated(db).await
+}
+
 /// As [`sqlite_provider`], with every statement recorded: for a test that
 /// pins how many round trips an operation takes, which no timing assertion
 /// could do without flaking. The recorder attaches before the connection is
@@ -300,6 +330,45 @@ fn sqlite_opts() -> ConnectOpts {
     }
 }
 
+/// The harness's last migration: the connection stops enforcing `CHECK`
+/// constraints. The provider never hands out its connection, and the one
+/// connection of an in-memory database carries the pragma for the rest of the
+/// test — the way to store what the schema refuses, an `activation` record
+/// with an outcome the service does not know.
+#[derive(sea_orm_migration::prelude::DeriveMigrationName)]
+struct IgnoreCheckConstraints;
+
+#[allow(elided_lifetimes_in_paths)]
+#[async_trait]
+impl sea_orm_migration::MigrationTrait for IgnoreCheckConstraints {
+    async fn up(
+        &self,
+        manager: &sea_orm_migration::SchemaManager,
+    ) -> Result<(), sea_orm_migration::sea_orm::DbErr> {
+        use sea_orm_migration::sea_orm::ConnectionTrait as _;
+        manager
+            .get_connection()
+            .execute_unprepared("PRAGMA ignore_check_constraints = ON")
+            .await
+            .map(|_| ())
+    }
+}
+
+/// As [`sqlite_provider`], on a connection that no longer enforces `CHECK`
+/// constraints.
+pub async fn sqlite_provider_ignoring_checks() -> Arc<DBProvider<DbError>> {
+    let db = connect_db("sqlite::memory:", sqlite_opts())
+        .await
+        .expect("in-memory sqlite connects");
+    let mut migrations = crate::infra::storage::migrations::Migrator::migrations();
+    migrations.push(Box::new(IgnoreCheckConstraints));
+    run_migrations_for_testing(&db, migrations)
+        .await
+        .map_err(|e| e.to_string())
+        .expect("migrations apply on sqlite");
+    Arc::new(DBProvider::new(db))
+}
+
 async fn migrated(db: Db) -> Arc<DBProvider<DbError>> {
     run_migrations_for_testing(
         &db,
@@ -325,6 +394,9 @@ pub struct FakeHierarchy {
     pub standalone: Mutex<HashSet<Uuid>>,
     pub chain_calls: std::sync::atomic::AtomicUsize,
     pub unavailable: std::sync::atomic::AtomicBool,
+    /// The subtree and standalone tests alone fail as unavailable, the chain
+    /// still answering: a resolver that goes down at the gate of one read.
+    pub membership_unavailable: std::sync::atomic::AtomicBool,
     /// How many of the next `chain` calls fail as unavailable before the
     /// resolver answers again: a transient outage, not a standing one.
     pub failing_chains: std::sync::atomic::AtomicUsize,
@@ -340,6 +412,12 @@ pub struct FakeHierarchy {
     /// Never answer a bounded walk: a tenant resolver that has stopped
     /// answering, for the time budget a walk runs under.
     pub stall_subtrees: std::sync::atomic::AtomicBool,
+    /// Tenants the standalone test answers `NotFound` for although the tree
+    /// holds them: a resolver that lost the tenant between two questions.
+    pub unknown_to_standalone: Mutex<HashSet<Uuid>>,
+    /// Tenants whose chain fails as unavailable while every other chain still
+    /// answers: a resolver down for one tenant's lookup only.
+    pub failing_chain_for: Mutex<HashSet<Uuid>>,
 }
 
 /// What [`FakeHierarchy::on_chain`] runs.
@@ -361,10 +439,41 @@ impl FakeHierarchy {
             .store(unavailable, std::sync::atomic::Ordering::SeqCst);
     }
 
+    /// Make the subtree and standalone tests fail as unavailable, or stop.
+    pub fn set_membership_unavailable(&self, unavailable: bool) {
+        self.membership_unavailable
+            .store(unavailable, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn membership_down(&self) -> Result<(), DomainError> {
+        if self
+            .membership_unavailable
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(DomainError::Unavailable {
+                detail: "tenant resolver down".to_owned(),
+            });
+        }
+        Ok(())
+    }
+
     /// Fail the next `n` `chain` calls, then answer normally.
     pub fn fail_next_chains(&self, n: usize) {
         self.failing_chains
             .store(n, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Make the standalone test answer `NotFound` for `tenant`.
+    pub fn forget_for_standalone(&self, tenant: Uuid) {
+        self.unknown_to_standalone
+            .lock()
+            .expect("lock")
+            .insert(tenant);
+    }
+
+    /// Fail the chain of `tenant`, and of it alone, as unavailable.
+    pub fn fail_chain_for(&self, tenant: Uuid) {
+        self.failing_chain_for.lock().expect("lock").insert(tenant);
     }
 
     pub fn chain_calls(&self) -> usize {
@@ -456,7 +565,12 @@ impl TenantHierarchy for FakeHierarchy {
                 |left| left.checked_sub(1),
             )
             .is_ok();
-        if transient || self.unavailable.load(std::sync::atomic::Ordering::SeqCst) {
+        let failing_here = self
+            .failing_chain_for
+            .lock()
+            .expect("lock")
+            .contains(&tenant);
+        if transient || failing_here || self.unavailable.load(std::sync::atomic::Ordering::SeqCst) {
             return Err(DomainError::Unavailable {
                 detail: "tenant resolver down".to_owned(),
             });
@@ -474,6 +588,7 @@ impl TenantHierarchy for FakeHierarchy {
         if caller == target {
             return Ok(true);
         }
+        self.membership_down()?;
         let path = self.path_to_root(target)?;
         let standalone = self.standalone.lock().expect("lock");
         // Walk up from the target; a barrier strictly below the caller seals
@@ -491,6 +606,15 @@ impl TenantHierarchy for FakeHierarchy {
 
     async fn is_standalone(&self, tenant: Uuid) -> Result<bool, DomainError> {
         self.check_connection_guard()?;
+        self.membership_down()?;
+        if self
+            .unknown_to_standalone
+            .lock()
+            .expect("lock")
+            .contains(&tenant)
+        {
+            return Err(DomainError::NotFound { resource: "tenant" });
+        }
         self.path_to_root(tenant)?;
         Ok(self.standalone.lock().expect("lock").contains(&tenant))
     }
@@ -621,6 +745,15 @@ impl ResolutionHarness {
 
     pub async fn with_ttl(ttl: Duration) -> Self {
         Self::over(sqlite_provider().await, ttl).await
+    }
+
+    /// A harness whose database no longer enforces `CHECK` constraints.
+    pub async fn ignoring_checks() -> Self {
+        Self::over(
+            sqlite_provider_ignoring_checks().await,
+            Duration::from_secs(30),
+        )
+        .await
     }
 
     /// A harness whose database records every statement.
@@ -1267,6 +1400,8 @@ impl crate::domain::stepup::StepUpVerifier for FixedStepUp {
 
 /// The database and the declaration a [`RecordingSecrets`] probe looks for.
 pub type RowProbe = (Arc<DBProvider<DbError>>, Uuid);
+/// What [`RecordingSecrets::on_delete`] runs.
+pub type DeleteHook = Box<dyn Fn() + Send + Sync>;
 
 /// A Secret Manager that keeps plaintext in memory under deterministic
 /// references and remembers what it was asked to release.
@@ -1284,6 +1419,9 @@ pub struct RecordingSecrets {
     pub row_probe: Mutex<Option<RowProbe>>,
     /// What the probe saw at each release, in order.
     pub row_present_at_release: Mutex<Vec<bool>>,
+    /// Runs on every `delete_secret`, before it is recorded: what a test uses
+    /// to observe the state of the world at the moment an entry is released.
+    pub on_delete: Mutex<Option<DeleteHook>>,
 }
 
 impl RecordingSecrets {
@@ -1405,6 +1543,9 @@ impl crate::domain::ports::SecretManager for RecordingSecrets {
                 .lock()
                 .expect("secrets lock")
                 .push(row.is_some());
+        }
+        if let Some(hook) = self.on_delete.lock().expect("secrets lock").as_ref() {
+            hook();
         }
         self.entries
             .lock()
@@ -1666,6 +1807,11 @@ pub struct RestHarness {
     /// The raw view of the database, on a harness built with
     /// [`RestHarness::probed`].
     pub probe: Option<Probe>,
+    /// The activation state half every value and restriction change goes
+    /// through: the lock table a test holds a key in.
+    pub activation: ActivationRig,
+    /// The Recorder behind the activation read, over the harness's database.
+    pub recorder: Arc<crate::gear::ConcreteRecorder>,
     router: axum::Router,
 }
 
@@ -1753,6 +1899,18 @@ impl RestHarness {
         .await
     }
 
+    /// The same surface over a database that stores what the schema refuses.
+    pub async fn ignoring_checks() -> Self {
+        Self::build_over(
+            ResolutionHarness::ignoring_checks().await,
+            None,
+            Arc::new(AllowAll),
+            Arc::new(FixedStepUp::verified()),
+            resolution_catalogue(),
+            nobody(),
+        )
+    }
+
     /// The same surface for a caller that may read categories and
     /// declarations but not values.
     pub async fn without_value_read() -> Self {
@@ -1790,6 +1948,21 @@ impl RestHarness {
             resolution_catalogue(),
             directory,
         )
+    }
+
+    /// The same surface over a database that records every statement, for the
+    /// tests that pin how many a read makes.
+    pub async fn recorded() -> (Self, QueryRecorder) {
+        let (inner, recorder) = ResolutionHarness::recorded().await;
+        let harness = Self::build_over(
+            inner,
+            None,
+            Arc::new(AllowAll),
+            Arc::new(FixedStepUp::verified()),
+            resolution_catalogue(),
+            nobody(),
+        );
+        (harness, recorder)
     }
 
     async fn build_with(
@@ -1898,14 +2071,39 @@ impl RestHarness {
             Arc::clone(&inner.db),
             Arc::clone(&enforcer),
         );
-        let access = Arc::new(crate::domain::access::AccessService::new(
-            crate::infra::storage::declaration_repo::DeclarationRepo,
-            crate::infra::storage::access_repo::AccessRepo,
+        let recorder = Arc::new(crate::domain::activation::ActivationRecorder::new(
+            Arc::clone(&inner.db),
+            crate::infra::storage::activation_repo::ActivationRepo,
             crate::infra::storage::audit_store::AuditStore,
-            Arc::clone(&inner.hierarchy) as Arc<dyn TenantHierarchy>,
-            Arc::new(FixedScope(inner.tree.root)) as Arc<dyn PlatformScope>,
-            Arc::clone(&inner.cache),
+            Arc::new(crate::domain::activation::NoNotifyMetrics),
         ));
+        let router = crate::api::rest::activation_routes::register_routes(
+            router,
+            &openapi,
+            Arc::clone(&inner.resolver),
+            Arc::clone(&recorder),
+            Arc::clone(&enforcer),
+        );
+        let secrets = Arc::new(RecordingSecrets::default());
+        let activation = activation_rig(
+            &inner,
+            &secrets,
+            Arc::new(AllowAllGate),
+            Duration::from_millis(80),
+        );
+        let access = Arc::new(
+            crate::domain::access::AccessService::new(
+                crate::infra::storage::declaration_repo::DeclarationRepo,
+                crate::infra::storage::access_repo::AccessRepo,
+                crate::infra::storage::audit_store::AuditStore,
+                Arc::clone(&inner.hierarchy) as Arc<dyn TenantHierarchy>,
+                Arc::new(FixedScope(inner.tree.root)) as Arc<dyn PlatformScope>,
+                Arc::clone(&inner.cache),
+            )
+            .with_locks(
+                Arc::clone(&activation.locks) as Arc<dyn crate::domain::activation::KeyLocks>
+            ),
+        );
         let router = crate::api::rest::access_routes::register_routes(
             router,
             &openapi,
@@ -1940,6 +2138,7 @@ impl RestHarness {
             crate::infra::storage::pending_secret_repo::PendingSecretRepo,
             Arc::clone(&secrets) as Arc<dyn crate::domain::ports::SecretManager>,
             Arc::new(crate::domain::ports::NoMetrics),
+            crate::infra::storage::activation_repo::ActivationRepo,
         ));
         let router = crate::api::rest::declaration_routes::register_routes(
             router,
@@ -1954,11 +2153,12 @@ impl RestHarness {
         // repositories and the audit store, which run for real against the
         // same database the reads use.
         let published = Arc::new(RecordingPublisher::default());
-        let coordinator = write_coordinator(
+        let coordinator = write_coordinator_with(
             &inner,
             Arc::clone(&secrets),
             Arc::clone(&published),
             step_up_for_writes,
+            Some(activation.wiring.clone()),
         );
         let router = crate::api::rest::value_routes::register_routes(
             router,
@@ -1972,6 +2172,8 @@ impl RestHarness {
             published,
             registrar,
             probe,
+            activation,
+            recorder,
             router,
         }
     }
@@ -2206,6 +2408,17 @@ pub fn write_coordinator(
     published: Arc<RecordingPublisher>,
     step_up: Arc<dyn crate::domain::stepup::StepUpVerifier>,
 ) -> Arc<crate::infra::value_writes::WriteCoordinator> {
+    write_coordinator_with(inner, secrets, published, step_up, None)
+}
+
+/// [`write_coordinator`] with consumer activation bound, when given.
+pub fn write_coordinator_with(
+    inner: &ResolutionHarness,
+    secrets: Arc<RecordingSecrets>,
+    published: Arc<RecordingPublisher>,
+    step_up: Arc<dyn crate::domain::stepup::StepUpVerifier>,
+    activation: Option<crate::infra::value_writes::ActivationWiring>,
+) -> Arc<crate::infra::value_writes::WriteCoordinator> {
     let writer = Arc::new(crate::domain::writes::ValueWriter::new(
         crate::infra::storage::value_repo::ValueRepo,
         Arc::clone(&inner.resolver),
@@ -2219,10 +2432,12 @@ pub fn write_coordinator(
         published as Arc<dyn crate::domain::ports::ChangePublisher>,
         Arc::new(crate::domain::ports::NoMetrics),
     ));
-    Arc::new(crate::infra::value_writes::WriteCoordinator::new(
-        Arc::clone(&inner.db),
-        writer,
-    ))
+    let coordinator =
+        crate::infra::value_writes::WriteCoordinator::new(Arc::clone(&inner.db), writer);
+    Arc::new(match activation {
+        Some(wiring) => coordinator.with_activation(wiring),
+        None => coordinator,
+    })
 }
 
 /// An interactive administrator of one tenant.
@@ -2248,4 +2463,111 @@ pub fn service_context_for(tenant: Uuid) -> SecurityContext {
         .subject_type("gts.cf.core.security.subject_service.v1~")
         .build()
         .expect("context")
+}
+
+// ---------------------------------------------------------------------------
+// Consumer activation
+// ---------------------------------------------------------------------------
+
+/// What the registration read decision answers.
+#[derive(Clone)]
+pub enum ReadAnswer {
+    /// Allowed, with the administrative domains this visibility names.
+    Allow(crate::domain::category::DomainVisibility),
+    /// A denial from the policy decision point.
+    Deny,
+    /// No decision could be had.
+    Down,
+}
+
+/// A registration read decision that answers what the test says.
+pub struct FakeReadGate {
+    answer: Mutex<ReadAnswer>,
+    /// How many times the decision was asked.
+    pub asked: std::sync::atomic::AtomicUsize,
+}
+
+impl FakeReadGate {
+    /// A gate that allows everything.
+    pub fn allowing() -> Arc<Self> {
+        Arc::new(Self {
+            answer: Mutex::new(ReadAnswer::Allow(
+                crate::domain::category::DomainVisibility::Unrestricted,
+            )),
+            asked: std::sync::atomic::AtomicUsize::new(0),
+        })
+    }
+
+    /// Answer `answer` from now on.
+    pub fn answer(&self, answer: ReadAnswer) {
+        *self.answer.lock().expect("gate lock") = answer;
+    }
+}
+
+#[async_trait]
+impl crate::domain::activation::ReadGate for FakeReadGate {
+    async fn read_visibility(
+        &self,
+        _ctx: &SecurityContext,
+    ) -> Result<crate::domain::category::DomainVisibility, DomainError> {
+        self.asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        match self.answer.lock().expect("gate lock").clone() {
+            ReadAnswer::Allow(visibility) => Ok(visibility),
+            ReadAnswer::Deny => Err(DomainError::Unauthorized {
+                resource: settings_service_sdk::gts::VALUE_SCHEMA,
+            }),
+            ReadAnswer::Down => Err(DomainError::Unavailable {
+                detail: "the authorization service could not decide".to_owned(),
+            }),
+        }
+    }
+}
+
+/// The activation state half over a harness: the doubles a test reaches into
+/// and the wiring a coordinator takes.
+pub struct ActivationRig {
+    /// What the coordinator takes.
+    pub wiring: crate::infra::value_writes::ActivationWiring,
+    /// The in-process lock table.
+    pub locks: Arc<crate::domain::activation::testing::InProcessLocks>,
+    /// The registration read decision.
+    pub gate: Arc<FakeReadGate>,
+}
+
+/// The state half of consumer activation over a harness, with a lock table
+/// whose waits give up after `budget`.
+pub fn activation_rig(
+    inner: &ResolutionHarness,
+    secrets: &Arc<RecordingSecrets>,
+    secret_gate: Arc<dyn crate::domain::ports::SecretResolveGate>,
+    budget: Duration,
+) -> ActivationRig {
+    let locks = crate::domain::activation::testing::InProcessLocks::with_budget(budget);
+    let gate = FakeReadGate::allowing();
+    let manager = Arc::new(crate::domain::activation::SubscriptionManager::new(
+        Arc::clone(&inner.resolver),
+        crate::infra::storage::activation_repo::ActivationRepo,
+        Arc::clone(&gate) as Arc<dyn crate::domain::activation::ReadGate>,
+        Arc::new(crate::domain::activation::NoNotifyMetrics),
+    ));
+    let publisher = Arc::new(crate::domain::activation::ActivationPublisher::new(
+        Arc::clone(&inner.resolver),
+        crate::infra::storage::activation_repo::ActivationRepo,
+    ));
+    let plaintext: Arc<dyn crate::domain::activation::PlaintextFetcher> =
+        Arc::new(crate::infra::service_plaintext::ServicePlaintext::new(
+            Arc::clone(secrets) as Arc<dyn crate::domain::ports::SecretManager>,
+            secret_gate,
+            Arc::clone(&inner.db),
+        ));
+    ActivationRig {
+        wiring: crate::infra::value_writes::ActivationWiring {
+            manager,
+            publisher,
+            locks: Arc::clone(&locks) as Arc<dyn crate::domain::activation::KeyLocks>,
+            plaintext,
+        },
+        locks,
+        gate,
+    }
 }

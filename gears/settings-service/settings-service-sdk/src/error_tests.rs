@@ -85,9 +85,9 @@ fn a_declaration_not_found_projects_to_not_found() {
 #[test]
 fn a_value_not_found_projects_to_secret_not_configured() {
     // Same canonical category as the case above; only the resource type differs.
-    // Conflating the two is what makes a consumer hand a placeholder to its
-    // backend believing it to be a credential.
-    let err = ValueScope::not_found("no credential at any scope")
+    // Conflating the two is what makes a consumer take a lost stored credential
+    // for a setting that was never declared.
+    let err = ValueScope::not_found("the stored credential is missing")
         .with_resource("some.key.v1")
         .create();
     assert!(matches!(
@@ -237,7 +237,7 @@ fn resource_constants_round_trip_to_the_not_found_context() {
 #[test]
 fn an_unattributed_not_found_falls_to_not_found_never_to_secret() {
     // A producer or proxy can strip `resource_type` on the wire, which is the
-    // only discriminator separating "never declared" from "no credential".
+    // only discriminator separating "never declared" from "credential gone".
     // Losing it must degrade to the weaker claim: `SecretNotConfigured` asserts
     // the declaration resolved, and an unattributed error does not support that.
     let mut problem = serde_json::to_value(Problem::from(

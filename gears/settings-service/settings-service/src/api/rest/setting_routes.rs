@@ -198,7 +198,16 @@ pub fn register_routes(
              subtree or a standalone descendant answers 403. A `pii` actor, and `pii` values, \
              are masked for a caller without the PII entitlement; a secret was never recorded \
              in plaintext. A retired declaration keeps its history. An empty history is an \
-             empty page. `$filter`, `$orderby` and `$select` are refused.",
+             empty page. `$filter`, `$orderby` and `$select` are refused. Every record \
+             carries `activations`: the consumers' reports on that change, newest first, the \
+             report's `id`, descending, breaking a tie, \
+             from every tenant of the caller's subtree where the caller may read the \
+             setting, an empty list when nothing answers it. A report made at the \
+             history's own tenant appears only there, under its change, on whichever page \
+             the change falls; a report at another tenant is also an ordinary record of \
+             that tenant's history, as is one whose change record retention removed, \
+             carrying its `change_ref` and, on a failure, its `detail`. `limit`, the \
+             cursor and `total_count` count the listed records only.",
         )
         .tag(TAG)
         .authenticated()

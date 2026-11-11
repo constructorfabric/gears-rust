@@ -3,9 +3,9 @@
 //! These are the values that reach `NotFound.ctx.resource_type` and its
 //! siblings. They are the discriminator the [`crate::SettingsError`] projection
 //! uses to tell two otherwise identical `NotFound` outcomes apart: a setting
-//! that was never declared, and a secret-backed setting whose credential is not
-//! configured at any scope. A consumer that conflates the two hands a
-//! placeholder to its backend believing it to be a credential.
+//! that was never declared, and a secret-backed setting whose stored credential
+//! is gone from the store. A consumer that conflates the two takes a lost
+//! credential for a setting that does not exist.
 
 /// A setting declaration — the record of what a setting *is*.
 /// The abstract base every setting key derives from, as a wire string.
@@ -51,6 +51,34 @@ toolkit_gts::inventory::submit! {
     }
 }
 // @cpt-end:cpt-cf-settings-service-algo-gear-foundation-gear-init:p1:inst-gf-init-9
+
+/// The activation signal subject: the `subject_type` of `cache_invalidate` and
+/// of the filtered `change_notification`. A signal describes a tenant's
+/// settings, not one key, so the subject is a control-plane type of this gear.
+/// The gear registers its schema through the link-time inventory.
+pub const ACTIVATION_SUBJECT_TYPE: &str = toolkit_gts::gts_id!("cf.core.settings.activation.v1~");
+
+/// The topic the replicas' `cache_invalidate` broadcasts travel on: an instance
+/// of the broker's topic base. Only this service's own replicas read it.
+pub const CACHE_TOPIC_ID: &str =
+    toolkit_gts::gts_id!("cf.core.events.topic.v1~cf.core.settings.cache.v1");
+
+/// The event type of the `cache_invalidate` broadcast: a derived schema of the
+/// broker's event base. The body and its schemas live in the gear.
+pub const CACHE_INVALIDATE_EVENT_TYPE: &str =
+    toolkit_gts::gts_id!("cf.core.events.event.v1~cf.core.settings.cache_invalidate.v1~");
+
+/// The topic the filtered `change_notification` of consumer activation travels
+/// on: an instance of the broker's topic base. A consuming gear joins it with
+/// one interest per subscription tenant.
+pub const ACTIVATION_TOPIC_ID: &str =
+    toolkit_gts::gts_id!("cf.core.events.topic.v1~cf.core.settings.activation.v1");
+
+/// The event type of the filtered `change_notification`: a derived schema of
+/// the broker's event base. It names the tenant, the subscriber and the keys
+/// with their `change_ref`, never a value.
+pub const CHANGE_NOTIFICATION_EVENT_TYPE: &str =
+    toolkit_gts::gts_id!("cf.core.events.event.v1~cf.core.settings.change_notification.v1~");
 
 pub const DECLARATION_SCHEMA: &str = toolkit_gts::gts_id!("cf.core.settings.declaration.v1~");
 

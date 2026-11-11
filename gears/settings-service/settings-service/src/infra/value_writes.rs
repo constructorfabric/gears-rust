@@ -7,9 +7,11 @@
 //! the writer's steps.
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
+use secrecy::SecretString;
 use serde_json::Value;
-use settings_service_sdk::SettingKey;
+use settings_service_sdk::{EffectiveSource, SettingKey};
 use time::OffsetDateTime;
 use tokio_util::sync::CancellationToken;
 use toolkit_db::secure::DBRunner;
@@ -18,20 +20,28 @@ use toolkit_security::AccessScope;
 use uuid::Uuid;
 
 use crate::audit::{ActorTenant, AuditOperation, AuditRecord, AuditSink, AuditValue};
+use crate::domain::activation::{
+    ActivationInput, ActivationPairs, ActivationPublisher, KeyLocks, PlaintextFetcher,
+    PlaintextRequest, SubscriberTenant, SubscriptionManager, plaintext_text,
+};
 use crate::domain::category::DomainVisibility;
+use crate::domain::coherence::{ChangeOutcome, CoherencePublisher};
 use crate::domain::declaration::{Declaration, DeclarationRepository};
 use crate::domain::error::DomainError;
 use crate::domain::ports::StepUpOperation;
 use crate::domain::resolution::{EffectiveValue, ScopeTarget};
+use crate::domain::secrets::default_plaintext;
 use crate::domain::secrets::pending::{
     self as pending, Claim, PendingSecret, PendingSecretRepository,
 };
+use crate::domain::value::ValueRepository;
 use crate::domain::writes::service::{ImpactPage, ImpactReport, StepUpPolicy, ValidationReport};
 use crate::domain::writes::{
     Change, Committed, Gated, StagePrecondition, Staged, ValueWriter, WriteActor,
 };
 use crate::field;
 use crate::infra::storage::access_repo::AccessRepo;
+use crate::infra::storage::activation_repo::ActivationRepo;
 use crate::infra::storage::audit_store::AuditStore;
 use crate::infra::storage::declaration_repo::DeclarationRepo;
 use crate::infra::storage::pending_secret_repo::PendingSecretRepo;
@@ -41,6 +51,86 @@ use crate::log_text::LogSafe;
 /// The writer over the concrete repositories and the audit store.
 pub type ConcreteWriter =
     ValueWriter<DeclarationRepo, ValueRepo, AccessRepo, AuditStore, PendingSecretRepo>;
+
+/// The Subscription Manager over the concrete repositories.
+pub type ConcreteManager =
+    SubscriptionManager<DeclarationRepo, ValueRepo, AccessRepo, ActivationRepo>;
+
+/// The Activation Publisher over the concrete repositories.
+pub type ConcretePublisher =
+    ActivationPublisher<DeclarationRepo, ValueRepo, AccessRepo, ActivationRepo>;
+
+/// The request deadline a batch's lock waits are capped by: the API gateway's,
+/// thirty seconds by default. The gateway's own setting is another gear's
+/// configuration, which the gear cannot read, so the figure is fixed here and
+/// follows `mutation_lock_wait_seconds` in `config.rs`; a platform that
+/// raises the gateway's deadline gains nothing until this constant does.
+pub const REQUEST_DEADLINE: Duration = Duration::from_secs(30);
+
+/// A test-only pause point: awaited with the key once a change has taken its
+/// lock and found its subscriptions, and before its transaction opens, so a
+/// test holds a write deterministically in flight between the candidate step
+/// and the commit.
+#[cfg(any(test, feature = "integration"))]
+pub type PausePoint = Arc<
+    dyn Fn(&str) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send + Sync,
+>;
+
+/// What the write path needs to record activation state: the key's mutation
+/// lock, the subscriptions of a key, the publisher that writes the states and
+/// the plaintext fetch a secret's expected value needs.
+#[derive(Clone)]
+pub struct ActivationWiring {
+    /// Qualifies a key's subscriptions under the lock.
+    pub manager: Arc<ConcreteManager>,
+    /// Writes the states in the change's transaction.
+    pub publisher: Arc<ConcretePublisher>,
+    /// The key's mutation lock.
+    pub locks: Arc<dyn KeyLocks>,
+    /// The plaintext fetch under the service's identity.
+    pub plaintext: Arc<dyn PlaintextFetcher>,
+}
+
+/// What a change carries into the part of its commit that runs under the key's
+/// lock.
+struct CommitParams<'a> {
+    /// The tag the caller presented.
+    if_match: Option<&'a str>,
+    /// The change set the request belongs to.
+    change_set_id: Uuid,
+    /// Where the plaintext of a secret comes from.
+    plan: PlaintextPlan,
+}
+
+/// Where the plaintext a secret's expected value is hashed from comes from.
+enum PlaintextPlan {
+    /// The setting is not a secret: no plaintext.
+    None,
+    /// An inline secret `set`: the value in the request.
+    Inline(Arc<SecretString>),
+    /// A batch `set` adopting a staged secret: fetched by its reference.
+    Adopted(String),
+    /// A `revert` or `remove_value`: the fallback left in effect.
+    Fallback,
+}
+
+impl PlaintextPlan {
+    fn of(declaration: &Declaration, change: &Change) -> Self {
+        // @cpt-begin:cpt-cf-settings-service-algo-consumer-activation-expected:p1:inst-ca-expected-6
+        // From the request for an inline secret `set`, from a fetch for an
+        // inherited fallback or an adopted staged entry, or the default's value
+        // when the fallback is not a stored secret.
+        if !declaration.has_secret_trait {
+            return Self::None;
+        }
+        match change {
+            Change::Set(value) => Self::Inline(Arc::new(plaintext_text(value))),
+            Change::AdoptSecret { secret_ref, .. } => Self::Adopted(secret_ref.clone()),
+            Change::Revert | Change::Remove => Self::Fallback,
+        }
+        // @cpt-end:cpt-cf-settings-service-algo-consumer-activation-expected:p1:inst-ca-expected-6
+    }
+}
 
 /// The most changes one batch may carry.
 pub const BATCH_LIMIT: usize = 500;
@@ -135,6 +225,9 @@ pub struct BatchOutcome {
     pub change_set_id: Uuid,
     /// In request order.
     pub results: Vec<Result<Committed, DomainError>>,
+    /// The subscribers and tenants the committed changes wrote activation
+    /// states for, each once, in the order the batch first touched them.
+    pub activation: ActivationPairs,
 }
 
 /// The coordinator.
@@ -143,6 +236,11 @@ pub struct WriteCoordinator {
     writer: Arc<ConcreteWriter>,
     pending: PendingSecretRepo,
     declarations: DeclarationRepo,
+    coherence: Option<Arc<CoherencePublisher>>,
+    activation: Option<ActivationWiring>,
+    request_deadline: Duration,
+    #[cfg(any(test, feature = "integration"))]
+    pause: std::sync::Mutex<Option<PausePoint>>,
 }
 
 fn conn_error(err: &DbError) -> DomainError {
@@ -160,6 +258,91 @@ impl WriteCoordinator {
             writer,
             pending: PendingSecretRepo,
             declarations: DeclarationRepo,
+            coherence: None,
+            activation: None,
+            request_deadline: REQUEST_DEADLINE,
+            #[cfg(any(test, feature = "integration"))]
+            pause: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// Take the key's mutation lock around every value change and record its
+    /// activation state in the change's transaction. Without this a change
+    /// takes no lock and records no state, as on a build before consumer
+    /// activation.
+    #[must_use]
+    pub fn with_activation(mut self, wiring: ActivationWiring) -> Self {
+        self.activation = Some(wiring);
+        self
+    }
+
+    /// The request deadline a batch's lock waits are capped by: a change waits
+    /// for its key's lock no longer than what remains of it.
+    #[must_use]
+    pub fn with_request_deadline(mut self, deadline: Duration) -> Self {
+        self.request_deadline = deadline;
+        self
+    }
+
+    /// Hold every change at `pause` once it has taken its lock and found its
+    /// subscriptions, before its transaction opens. For tests only.
+    #[cfg(any(test, feature = "integration"))]
+    #[must_use]
+    pub fn with_pause_point(self, pause: PausePoint) -> Self {
+        self.set_pause_point(Some(pause));
+        self
+    }
+
+    /// Install or clear the test-only pause point of a coordinator that is
+    /// already built and shared, as the gear's is.
+    ///
+    /// # Panics
+    /// If the pause point's own mutex is poisoned.
+    #[cfg(any(test, feature = "integration"))]
+    #[allow(clippy::expect_used)]
+    pub fn set_pause_point(&self, pause: Option<PausePoint>) {
+        *self.pause.lock().expect("the pause point's mutex") = pause;
+    }
+
+    /// Publish `cache_invalidate` at the end of every request through `hook`.
+    /// Without one a request ends silently, as when no broker resolves.
+    #[must_use]
+    pub fn with_coherence(mut self, hook: Arc<CoherencePublisher>) -> Self {
+        self.coherence = Some(hook);
+        self
+    }
+
+    /// The end of a batch: what its entries committed, published once.
+    async fn publish_batch_end(
+        &self,
+        results: &[Result<Committed, DomainError>],
+        change_set_id: Uuid,
+        pairs: &ActivationPairs,
+    ) {
+        let committed: Vec<&Committed> = results.iter().filter_map(|r| r.as_ref().ok()).collect();
+        self.publish_request_end(&committed, change_set_id, pairs)
+            .await;
+    }
+
+    /// The end of a request: one hook call over every change it committed.
+    /// The response of the request never depends on it. `pairs` are the
+    /// subscribers and tenants the request wrote activation states for, which
+    /// the notification half of the hook is published for.
+    async fn publish_request_end(
+        &self,
+        committed: &[&Committed],
+        change_set_id: Uuid,
+        pairs: &ActivationPairs,
+    ) {
+        if let Some(hook) = &self.coherence {
+            hook.publish_value_writes(
+                committed
+                    .iter()
+                    .map(|c| ChangeOutcome::value_write(&c.key, c.tenant_id, &c.scope_class, true)),
+                change_set_id,
+                pairs,
+            )
+            .await;
         }
     }
 
@@ -219,7 +402,9 @@ impl WriteCoordinator {
             .await
     }
 
-    /// Commit a gated change in its own transaction and run what follows.
+    /// Commit a gated change in its own transaction and run what follows. A
+    /// single-change request ends here, so the cache broadcast follows the
+    /// local eviction.
     ///
     /// # Errors
     /// The commit's rejection, after it was published.
@@ -231,6 +416,39 @@ impl WriteCoordinator {
         if_match: Option<&str>,
         change_set_id: Uuid,
     ) -> Result<Committed, DomainError> {
+        let mut pairs = ActivationPairs::new();
+        let committed = self
+            .commit_change(
+                actor,
+                gated,
+                change,
+                if_match,
+                change_set_id,
+                None,
+                &mut pairs,
+            )
+            .await?;
+        self.publish_request_end(&[&committed], committed.change_set_id, &pairs)
+            .await;
+        Ok(committed)
+    }
+
+    /// One change of a request: commit, evict, record. The request's own end
+    /// publishes the broadcast, once for all of its changes. `cap` is what a
+    /// batch has left of its request deadline, which bounds the wait for the
+    /// key's mutation lock; `pairs` remembers the subscribers and tenants the
+    /// change wrote activation states for.
+    #[allow(clippy::too_many_arguments)]
+    async fn commit_change(
+        &self,
+        actor: &WriteActor,
+        gated: Gated,
+        change: Change,
+        if_match: Option<&str>,
+        change_set_id: Uuid,
+        cap: Option<Duration>,
+        pairs: &mut ActivationPairs,
+    ) -> Result<Committed, DomainError> {
         let key = gated.declaration.key.clone();
         let tenant_id = gated.tenant_id;
         // Validation and the store leg come first, outside the transaction: the
@@ -238,6 +456,14 @@ impl WriteCoordinator {
         // connection while one is open on this task. The connection here is
         // for the intent row a secret records before its entry exists.
         let conn = self.db.conn().map_err(|e| conn_error(&e))?;
+        // What the expected value of a secret is hashed from, decided while the
+        // change still holds its value: staging takes it.
+        let plan = PlaintextPlan::of(&gated.declaration, &change);
+        // @cpt-begin:cpt-cf-settings-service-flow-consumer-activation-record:p1:inst-ca-record-1
+        // @cpt-begin:cpt-cf-settings-service-flow-consumer-activation-record:p1:inst-ca-record-2
+        // A change that passed its gates reaches the commit; one refused by
+        // validation or by its Credential Store put returns here, without
+        // contending for the lock.
         let staged = match self
             .writer
             .stage(
@@ -257,36 +483,78 @@ impl WriteCoordinator {
                 return Err(err);
             }
         };
-        let writer = Arc::clone(&self.writer);
-        let actor_owned = actor.clone();
-        let if_match = if_match.map(str::to_owned);
-        let gated_owned = gated.clone();
-        let staged_owned = staged.clone();
-        // @cpt-begin:cpt-cf-settings-service-flow-value-writes-set:p1:inst-vw-set-3
-        // @cpt-begin:cpt-cf-settings-service-flow-value-writes-set:p1:inst-vw-set-4
+        // @cpt-end:cpt-cf-settings-service-flow-consumer-activation-record:p1:inst-ca-record-2
+        // @cpt-end:cpt-cf-settings-service-flow-consumer-activation-record:p1:inst-ca-record-1
+        // @cpt-begin:cpt-cf-settings-service-flow-consumer-activation-record:p1:inst-ca-record-3
+        // @cpt-begin:cpt-cf-settings-service-flow-consumer-activation-record:p1:inst-ca-record-4
+        // @cpt-begin:cpt-cf-settings-service-algo-consumer-activation-lock:p1:inst-ca-lock-2
+        // The key's lock, taken only now that the gates and the validation have
+        // passed, so a refused change never contended for it. A wait that runs
+        // out refuses the change `Unavailable` with nothing stored — the staged
+        // entry of an inline secret is released as any refused commit's is —
+        // and a batch still attempts its later changes.
+        let held = match &self.activation {
+            None => None,
+            Some(wiring) => match wiring.locks.acquire(&key, cap).await {
+                Ok(held) => Some(held),
+                Err(err) => {
+                    self.writer.discard(&conn, &gated, &staged).await;
+                    self.writer
+                        .after_rejection(&key, tenant_id, actor, &err, change_set_id)
+                        .await;
+                    return Err(err);
+                }
+            },
+        };
+        // @cpt-end:cpt-cf-settings-service-algo-consumer-activation-lock:p1:inst-ca-lock-2
+        // @cpt-end:cpt-cf-settings-service-flow-consumer-activation-record:p1:inst-ca-record-4
+        // @cpt-end:cpt-cf-settings-service-flow-consumer-activation-record:p1:inst-ca-record-3
+        // @cpt-begin:cpt-cf-settings-service-algo-consumer-activation-lock:p1:inst-ca-lock-7
+        // @cpt-begin:cpt-cf-settings-service-algo-consumer-activation-lock:p1:inst-ca-lock-6
+        // The mutation runs under the lock, from its candidate step until its
+        // transaction rolled back, or committed and the local cache is evicted;
+        // it takes no second key's lock while it holds this one, so the locks
+        // cannot deadlock.
         let outcome = self
-            .db
-            .db()
-            .transaction_ref_mapped::<_, Committed, DomainError>(move |tx| {
-                Box::pin(async move {
-                    writer
-                        .commit_in(
-                            tx,
-                            &gated_owned,
-                            &staged_owned,
-                            if_match.as_deref(),
-                            &actor_owned,
-                            change_set_id,
-                        )
-                        .await
-                })
-            })
+            .commit_staged(
+                actor,
+                &gated,
+                &staged,
+                CommitParams {
+                    if_match,
+                    change_set_id,
+                    plan,
+                },
+                &conn,
+            )
             .await;
+        // @cpt-end:cpt-cf-settings-service-algo-consumer-activation-lock:p1:inst-ca-lock-6
+        // @cpt-end:cpt-cf-settings-service-algo-consumer-activation-lock:p1:inst-ca-lock-7
+        // @cpt-begin:cpt-cf-settings-service-flow-consumer-activation-record:p1:inst-ca-record-26
+        // @cpt-begin:cpt-cf-settings-service-algo-consumer-activation-lock:p1:inst-ca-lock-8
+        // Released, and the release awaited, before the change answers: the next
+        // mutation of the key acquires it without waiting, after a rollback too.
+        if let Some(held) = held {
+            held.release().await;
+        }
+        // @cpt-end:cpt-cf-settings-service-algo-consumer-activation-lock:p1:inst-ca-lock-8
+        // @cpt-end:cpt-cf-settings-service-flow-consumer-activation-record:p1:inst-ca-record-26
+        // @cpt-begin:cpt-cf-settings-service-flow-consumer-activation-record:p1:inst-ca-record-24
+        // @cpt-begin:cpt-cf-settings-service-algo-consumer-activation-lock:p1:inst-ca-lock-10
+        // The mutation's own result, the lock released and the release awaited;
+        // the guarantee rests on the lock, not on the isolation level.
         match outcome {
-            Ok(committed) => {
-                self.writer.after_commit(&committed, actor).await;
+            Ok((committed, written)) => {
+                // The change event and the release of a superseded secret's
+                // entry come after the lock is let go: neither needs it.
+                self.writer.publish_and_release(&committed, actor).await;
+                // @cpt-begin:cpt-cf-settings-service-flow-consumer-activation-record:p1:inst-ca-record-29
+                pairs.remember(written);
                 Ok(committed)
+                // @cpt-end:cpt-cf-settings-service-flow-consumer-activation-record:p1:inst-ca-record-29
             }
+            // Nothing of the change and no activation state is stored, and the
+            // pairs it would have remembered are never remembered.
             Err(err) => {
                 self.writer.discard(&conn, &gated, &staged).await;
                 self.writer
@@ -295,8 +563,210 @@ impl WriteCoordinator {
                 Err(err)
             }
         }
+        // @cpt-end:cpt-cf-settings-service-algo-consumer-activation-lock:p1:inst-ca-lock-10
+        // @cpt-end:cpt-cf-settings-service-flow-consumer-activation-record:p1:inst-ca-record-24
+    }
+
+    /// What a change does under its key's lock: find the subscriptions it may
+    /// reach, take the plaintext a secret's expectation is hashed from, then
+    /// the transaction that writes the value, its record and its activation
+    /// state, and the local eviction that follows the commit. The event and the
+    /// release of a superseded secret's entry are the caller's, after it has
+    /// released the lock.
+    async fn commit_staged(
+        &self,
+        actor: &WriteActor,
+        gated: &Gated,
+        staged: &Staged,
+        params: CommitParams<'_>,
+        conn: &toolkit_db::secure::DbConn<'_>,
+    ) -> Result<(Committed, Vec<SubscriberTenant>), DomainError> {
+        let CommitParams {
+            if_match,
+            change_set_id,
+            plan,
+        } = params;
+        let (qualified, plaintext) = match &self.activation {
+            None => (Vec::new(), None),
+            Some(wiring) => {
+                // @cpt-begin:cpt-cf-settings-service-flow-consumer-activation-record:p1:inst-ca-record-5
+                let qualified = wiring
+                    .manager
+                    .resolve_subscribers(conn, &gated.declaration, gated.tenant_id)
+                    .await?;
+                // @cpt-end:cpt-cf-settings-service-flow-consumer-activation-record:p1:inst-ca-record-5
+                let plaintext = if qualified.is_empty() {
+                    None
+                } else {
+                    self.plaintext_for(wiring, conn, gated, plan).await?
+                };
+                (qualified, plaintext)
+            }
+        };
+        #[cfg(any(test, feature = "integration"))]
+        {
+            #[allow(clippy::expect_used)]
+            let pause = self.pause.lock().expect("the pause point's mutex").clone();
+            if let Some(pause) = pause {
+                pause(&gated.declaration.key).await;
+            }
+        }
+        let writer = Arc::clone(&self.writer);
+        let publisher = self.activation.as_ref().map(|w| Arc::clone(&w.publisher));
+        let actor_owned = actor.clone();
+        let if_match = if_match.map(str::to_owned);
+        let gated_owned = gated.clone();
+        let staged_owned = staged.clone();
+        // @cpt-begin:cpt-cf-settings-service-flow-value-writes-set:p1:inst-vw-set-3
+        // @cpt-begin:cpt-cf-settings-service-flow-value-writes-set:p1:inst-vw-set-4
+        // @cpt-begin:cpt-cf-settings-service-flow-consumer-activation-record:p1:inst-ca-record-16
+        // @cpt-begin:cpt-cf-settings-service-flow-consumer-activation-record:p1:inst-ca-record-23
+        let (committed, written) = self
+            .db
+            .db()
+            .transaction_ref_mapped::<_, (Committed, Vec<SubscriberTenant>), DomainError>(
+                move |tx| {
+                    Box::pin(async move {
+                        let input = publisher.as_deref().and_then(|publisher| {
+                            (!qualified.is_empty()).then(|| ActivationInput {
+                                publisher,
+                                qualified: &qualified,
+                                plaintext: plaintext.as_deref(),
+                            })
+                        });
+                        writer
+                            .commit_in_recording(
+                                tx,
+                                &gated_owned,
+                                &staged_owned,
+                                if_match.as_deref(),
+                                &actor_owned,
+                                change_set_id,
+                                input,
+                            )
+                            .await
+                    })
+                },
+            )
+            .await?;
+        // @cpt-end:cpt-cf-settings-service-flow-consumer-activation-record:p1:inst-ca-record-23
+        // @cpt-end:cpt-cf-settings-service-flow-consumer-activation-record:p1:inst-ca-record-16
         // @cpt-end:cpt-cf-settings-service-flow-value-writes-set:p1:inst-vw-set-4
         // @cpt-end:cpt-cf-settings-service-flow-value-writes-set:p1:inst-vw-set-3
+        // @cpt-begin:cpt-cf-settings-service-flow-consumer-activation-record:p1:inst-ca-record-25
+        self.writer.evict(&committed);
+        // @cpt-end:cpt-cf-settings-service-flow-consumer-activation-record:p1:inst-ca-record-25
+        Ok((committed, written))
+    }
+
+    /// The plaintext the expected value of a secret is hashed from, when the
+    /// change qualified subscriptions: the inline value in hand, or one fetch
+    /// by reference under the service's identity — a staged entry's, an
+    /// inherited fallback's — before the transaction opens. A fallback that is
+    /// the declaration's default is the default's value, with no fetch. A fetch
+    /// that fails, for whatever reason, refuses the change `Unavailable`.
+    async fn plaintext_for(
+        &self,
+        wiring: &ActivationWiring,
+        conn: &toolkit_db::secure::DbConn<'_>,
+        gated: &Gated,
+        plan: PlaintextPlan,
+    ) -> Result<Option<Arc<SecretString>>, DomainError> {
+        let declaration = &gated.declaration;
+        let refused = |err: &DomainError| {
+            // @cpt-begin:cpt-cf-settings-service-flow-consumer-activation-record:p1:inst-ca-record-13
+            tracing::warn!(
+                key = %declaration.key,
+                err = %LogSafe(err),
+                "the secret behind a change could not be read; the change is refused"
+            );
+            DomainError::Unavailable {
+                detail: "the secret the change depends on could not be read; nothing was changed"
+                    .to_owned(),
+            }
+            // @cpt-end:cpt-cf-settings-service-flow-consumer-activation-record:p1:inst-ca-record-13
+        };
+        match plan {
+            PlaintextPlan::None => Ok(None),
+            // @cpt-begin:cpt-cf-settings-service-flow-consumer-activation-record:p1:inst-ca-record-14
+            // The plaintext lives only in the redacting, zeroizing wrapper
+            // until it is hashed, and is never logged.
+            PlaintextPlan::Inline(plaintext) => Ok(Some(plaintext)),
+            // @cpt-end:cpt-cf-settings-service-flow-consumer-activation-record:p1:inst-ca-record-14
+            PlaintextPlan::Adopted(secret_ref) => wiring
+                .plaintext
+                .fetch(PlaintextRequest {
+                    declaration_id: declaration.id,
+                    key: &declaration.key,
+                    audit_tenant: gated.tenant_id,
+                    source_tenant: gated.tenant_id,
+                    secret_ref: &secret_ref,
+                })
+                .await
+                .map(|plaintext| Some(Arc::new(plaintext)))
+                .map_err(|err| refused(&err)),
+            PlaintextPlan::Fallback => {
+                // A `revert` or `remove_value` of a scope with no override of
+                // its own is the transaction's `NotFound`, which re-reads the
+                // row and decides: no fallback is fetched, and no `secret_use`
+                // record written, for a change that is doomed.
+                if ValueRepo
+                    .find_one(
+                        conn,
+                        &AccessScope::allow_all(),
+                        declaration.id,
+                        gated.tenant_id,
+                    )
+                    .await?
+                    .is_none()
+                {
+                    return Ok(None);
+                }
+                // @cpt-begin:cpt-cf-settings-service-flow-consumer-activation-record:p1:inst-ca-record-9
+                // The value the scope falls back to once its override is gone,
+                // read through the resolver's freshness form outside a
+                // transaction — never from the effective-value cache.
+                let key =
+                    SettingKey::parse(&declaration.key).map_err(|e| DomainError::Internal {
+                        diagnostic: format!("stored key `{}` does not parse: {e}", declaration.key),
+                    })?;
+                let target = ScopeTarget::Tenant(gated.tenant_id).normalize(gated.root);
+                let effective = self
+                    .writer
+                    .resolver()
+                    .resolve_fresh(conn, &key, target)
+                    .await
+                    .map_err(|err| refused(&err))?;
+                // @cpt-end:cpt-cf-settings-service-flow-consumer-activation-record:p1:inst-ca-record-9
+                match (effective.fallback_source, effective.fallback.as_str()) {
+                    (EffectiveSource::Inherited, Some(secret_ref)) => {
+                        let source_tenant = match &effective.fallback_scope {
+                            Some(scope) => ScopeTarget::parse(scope)?.tenant_id(gated.root),
+                            None => gated.root,
+                        };
+                        wiring
+                            .plaintext
+                            .fetch(PlaintextRequest {
+                                declaration_id: declaration.id,
+                                key: &declaration.key,
+                                audit_tenant: gated.tenant_id,
+                                source_tenant,
+                                secret_ref,
+                            })
+                            .await
+                            .map(|plaintext| Some(Arc::new(plaintext)))
+                            .map_err(|err| refused(&err))
+                    }
+                    // @cpt-begin:cpt-cf-settings-service-flow-consumer-activation-record:p1:inst-ca-record-11
+                    // The declaration's default: its value, with no fetch, as
+                    // the plaintext `resolve_secret` hands out for it — the
+                    // same `default_plaintext`, the empty text for `null` — so
+                    // the consumer's hash of what it resolved is this hash.
+                    _ => Ok(Some(Arc::new(default_plaintext(&effective.fallback)))),
+                    // @cpt-end:cpt-cf-settings-service-flow-consumer-activation-record:p1:inst-ca-record-11
+                }
+            }
+        }
     }
 
     /// Several changes, each standing or falling alone; step-up verified once.
@@ -374,7 +844,15 @@ impl WriteCoordinator {
         let change_set_id = Uuid::new_v4();
         // @cpt-end:cpt-cf-settings-service-flow-value-writes-batch:p1:inst-vw-batch-4
         let mut results = Vec::with_capacity(entries.len());
+        // The batch's request deadline runs from here: each change waits for its
+        // key's lock no longer than what remains of it.
+        let started = Instant::now();
+        let mut pairs = ActivationPairs::new();
         // @cpt-begin:cpt-cf-settings-service-flow-value-writes-batch:p1:inst-vw-batch-5
+        // @cpt-begin:cpt-cf-settings-service-algo-consumer-activation-affected:p1:inst-ca-affected-8
+        // The changes of one request are evaluated in order, each under its own
+        // lock and in its own transaction, so the last change to a key at a
+        // tenant wins the row.
         for entry in entries {
             // @cpt-begin:cpt-cf-settings-service-flow-value-writes-batch:p1:inst-vw-batch-6
             let change = match entry {
@@ -383,19 +861,7 @@ impl WriteCoordinator {
                 // at the scope asked for or the caller's own, so the events
                 // alone still tell the whole outcome of the batch.
                 Err(refused) => {
-                    let tenant_id = refused
-                        .tenant
-                        .unwrap_or_else(|| actor.ctx.subject_tenant_id());
-                    self.writer
-                        .after_rejection(
-                            &refused.key,
-                            tenant_id,
-                            actor,
-                            &refused.error,
-                            change_set_id,
-                        )
-                        .await;
-                    results.push(Err(refused.error));
+                    results.push(self.refuse_entry(actor, refused, change_set_id).await);
                     continue;
                 }
             };
@@ -421,25 +887,24 @@ impl WriteCoordinator {
             // a requirement that pass could not see is verified here, once: a
             // success covers the rest of the request, a refusal is this
             // entry's and a later gated entry asks again.
-            let gated = match gated {
-                Ok(gated) if gated.declaration.requires_step_up && !verified => self
-                    .writer
-                    .verify_step_up(actor, StepUpOperation::Batch)
-                    .await
-                    .map(|()| {
-                        verified = true;
-                        gated
-                    }),
-                other => other,
-            };
+            let gated = self.verify_late(actor, gated, &mut verified).await;
             let outcome = match gated {
                 Ok(gated) => match self
                     .batch_change_for(&conn, &gated, actor, op.as_deref(), value)
                     .await
                 {
                     Ok(change) => {
-                        self.commit(actor, gated, change, if_match.as_deref(), change_set_id)
-                            .await
+                        let remaining = self.request_deadline.saturating_sub(started.elapsed());
+                        self.commit_change(
+                            actor,
+                            gated,
+                            change,
+                            if_match.as_deref(),
+                            change_set_id,
+                            Some(remaining),
+                            &mut pairs,
+                        )
+                        .await
                     }
                     Err(err) => {
                         self.writer
@@ -471,16 +936,66 @@ impl WriteCoordinator {
             results.push(outcome);
             // @cpt-end:cpt-cf-settings-service-flow-value-writes-batch:p1:inst-vw-batch-7
         }
+        // @cpt-end:cpt-cf-settings-service-algo-consumer-activation-affected:p1:inst-ca-affected-8
         // @cpt-end:cpt-cf-settings-service-flow-value-writes-batch:p1:inst-vw-batch-5
         // @cpt-begin:cpt-cf-settings-service-flow-value-writes-batch:p1:inst-vw-batch-8
         // Eviction and publication ran per committed change, after each
         // commit and before the next; nothing here is observable before it is
-        // stored.
+        // stored. The cache broadcast is the request's, published once after
+        // the last commit: one per tenant the batch touched.
+        self.publish_batch_end(&results, change_set_id, &pairs)
+            .await;
         // @cpt-end:cpt-cf-settings-service-flow-value-writes-batch:p1:inst-vw-batch-8
         Ok(BatchOutcome {
             change_set_id,
             results,
+            activation: pairs,
         })
+    }
+
+    /// A gate result whose requirement the up-front pass could not see: step-up
+    /// is verified here, once. A success covers the rest of the request, a
+    /// refusal is this entry's and a later gated entry asks again.
+    async fn verify_late(
+        &self,
+        actor: &WriteActor,
+        gated: Result<Gated, DomainError>,
+        verified: &mut bool,
+    ) -> Result<Gated, DomainError> {
+        match gated {
+            Ok(gated) if gated.declaration.requires_step_up && !*verified => self
+                .writer
+                .verify_step_up(actor, StepUpOperation::Batch)
+                .await
+                .map(|()| {
+                    *verified = true;
+                    gated
+                }),
+            other => other,
+        }
+    }
+
+    /// An entry refused on the surface, published as a refusal and handed back
+    /// as its outcome.
+    async fn refuse_entry(
+        &self,
+        actor: &WriteActor,
+        refused: RefusedEntry,
+        change_set_id: Uuid,
+    ) -> Result<Committed, DomainError> {
+        let tenant_id = refused
+            .tenant
+            .unwrap_or_else(|| actor.ctx.subject_tenant_id());
+        self.writer
+            .after_rejection(
+                &refused.key,
+                tenant_id,
+                actor,
+                &refused.error,
+                change_set_id,
+            )
+            .await;
+        Err(refused.error)
     }
 
     /// The change a batch entry carries: the operation it names, and for a set
@@ -921,3 +1436,8 @@ pub struct ImpactOutcome {
 #[cfg_attr(coverage_nightly, coverage(off))]
 #[path = "value_writes_tests.rs"]
 mod value_writes_tests;
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+#[path = "value_writes_activation_tests.rs"]
+mod value_writes_activation_tests;

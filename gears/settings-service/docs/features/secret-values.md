@@ -50,7 +50,7 @@ The Credential Store is the `credstore` gear. Each entry lives in the tenant the
 
 What the reader hands out for a secret is a handle, not a reference. The handle names the setting and the requested scope and nothing more, so a consumer cannot bypass the reader by taking the reference to the store itself, and the value is resolved again when the handle is used, so a credential changed after the handle was issued is the one that resolves.
 
-A `secret` declaration's default is a placeholder, an empty value of the type, enforced where declarations are made. Reverting a scope returns it to the placeholder, that is to *not configured*: the reader then answers that no credential is configured, and never hands a placeholder to a backend as if it were one.
+A `secret` declaration's default is a placeholder, an empty value of the type, enforced where declarations are made. Reverting a scope returns it to the placeholder, and the placeholder is an ordinary value: the reader hands it out as it is — a `null` placeholder as the empty string — without asking the Credential Store, and a consumer that applies it reports it like any other value. Whether an empty value is fit for a backend is the consumer's to decide.
 
 **Requirements**: `cpt-cf-settings-service-fr-typed-value-validation`, `cpt-cf-settings-service-fr-audit-mutations`
 
@@ -108,22 +108,23 @@ A `secret` declaration's default is a placeholder, an empty value of the type, e
 
 **Success Scenarios**:
 - The plaintext reaches an authorized consuming gear and one `secret_use` record is stored with the value masked
+- A scope where no row with a reference wins resolves to the declaration's empty default, handed out and recorded the same way
 
 **Error Scenarios**:
 - The handle is malformed, reported as an invalid argument
 - No declaration at the handle's key, or the declaration is retired
 - The declaration is not `secret`-classified, so there is nothing to resolve
 - The caller is not authorized to read that setting
-- No credential is configured at any scope, reported as the value not found, which the SDK projects to `SecretNotConfigured`
+- The winning row's reference names no entry in the Credential Store, or the winning row holds no reference and is not the default, reported as the value not found, which the SDK projects to `SecretNotConfigured`
 - The Credential Store or the audit store cannot answer
 
 **Steps**:
 1. [x] - `p1` - Consuming gear calls `SettingsReaderClient::resolve_secret` with the handle it took from `get_effective`'s value - `inst-sv-resolve-1`
 2. [x] - `p1` - Decode the handle through the handle process; **IF** malformed → **RETURN** invalid argument - `inst-sv-resolve-2`
-3. [x] - `p1` - Resolve the effective value at the handle's key and scope afresh; **IF** no declaration → **RETURN** `NotFound` on the declaration; **IF** retired → **RETURN** `Retired`; **IF** the declaration is not `secret`-classified → **RETURN** invalid argument - `inst-sv-resolve-3`
+3. [x] - `p1` - Resolve the effective value at the handle's key and scope afresh — from the store in the freshness form of the read, never from this replica's effective-value cache, so a reference rotated after the cache was filled is what resolves; **IF** no declaration → **RETURN** `NotFound` on the declaration; **IF** retired → **RETURN** `Retired`; **IF** the declaration is not `secret`-classified → **RETURN** invalid argument - `inst-sv-resolve-3`
 4. [x] - `p1` - Authorize the caller for `read` on the value resource naming that declaration through the `PolicyEnforcer` PEP; **IF** denied or undecidable → **RETURN** `Unauthorized`, before the store is asked anything and whether or not a credential exists - `inst-sv-resolve-4`
-5. [x] - `p1` - **IF** the effective value is the placeholder default, no row with a reference having won → **RETURN** `NotFound` on the value, not `Unauthorized` and never the placeholder - `inst-sv-resolve-5`
-6. [x] - `p1` - Credential Store: fetch the plaintext for the winning row's reference in the winning row's tenant; **IF** the store has no entry → **RETURN** `NotFound` on the value; **IF** it cannot answer → **RETURN** `Unavailable` - `inst-sv-resolve-6`
+5. [x] - `p1` - **IF** no row with a reference won, the effective value being the declaration's empty default → take that value as the plaintext, as the text a set of it would store (a string as itself, any other value as its JSON text), a `null` default as the empty string, and ask the Credential Store nothing; **IF** the winning row holds no reference and is not the default → **RETURN** `NotFound` on the value - `inst-sv-resolve-5`
+6. [x] - `p1` - Otherwise Credential Store: fetch the plaintext for the winning row's reference in the winning row's tenant; **IF** the store has no entry → **RETURN** `NotFound` on the value; **IF** it cannot answer → **RETURN** `Unavailable` - `inst-sv-resolve-6`
 7. [x] - `p1` - Append a `secret_use` record for the key at the requested scope's tenant, actor the caller's subject, post-image masked, in its own transaction; **IF** it cannot be written → **RETURN** `Unavailable` and hand out no plaintext - `inst-sv-resolve-7`
 8. [x] - `p1` - **RETURN** the plaintext; it is neither cached nor logged, and the cache keeps holding the reference only - `inst-sv-resolve-8`
 
@@ -185,7 +186,7 @@ A `secret` declaration's default is a placeholder, an empty value of the type, e
 5. [x] - `p1` - The intent row of step 4 is the `pending_secrets` row the token names — `(pending_id, declaration_id, tenant_id, subject_id, secret_ref, created_at, expires_at)` with `expires_at` ten minutes past now; write an audit record naming the stage, distinct from a commit; **IF** the record cannot be written → release the entry and the row as a refused set does; **IF** the intent row is gone because the declaration was purged meanwhile → release the entry and **RETURN** `404` - `inst-sv-stage-5`
 6. [x] - `p1` - **RETURN** `200` with `pending_id` and `expires_at`, never the reference and never the plaintext - `inst-sv-stage-6`
 7. [x] - `p1` - On a later batch change whose value is `{ "pending_id": ... }` for a `secret`-trait declaration: DB: SELECT the row by `pending_id`; **IF** none, **OR** its `(declaration_id, tenant_id)` differs from the change's, **OR** its `subject_id` is not the batch's actor, **OR** `expires_at` has passed → reject that change `invalid`, the row untouched - `inst-sv-stage-7`
-8. [x] - `p1` - Otherwise adopt its `secret_ref` as the staged reference, skip the store leg, and commit as steps 6-9 of the set flow commit, DELETEing the row inside that transaction with `expires_at` re-asserted in the same statement; a commit that fails leaves the row and the entry in place — the entry was the stage's to create, not the batch's to release — so the token stays claimable until it expires and is the sweep's after - `inst-sv-stage-8`
+8. [x] - `p1` - Otherwise adopt its `secret_ref` as the staged reference, skip the store leg, and commit as steps 6-9 of the set flow commit, DELETEing the row inside that transaction with `expires_at` re-asserted in the same statement; a commit that fails leaves the row and the entry in place — the entry was the stage's to create, not the batch's to release — so the token stays claimable until it expires and is the sweep's after. Adoption still skips the store leg for the value itself; when a subscription qualifies, the one fetch of the staged plaintext for the expected hash lands with entry 2.13 (`inst-ca-record-12` of `cpt-cf-settings-service-flow-consumer-activation-record`) - `inst-sv-stage-8`
 9. [x] - `p1` - A sweep on `expires_at`: release each expired row's entry from the Credential Store, then DELETE the row; **IF** the release fails → keep the row and retry it on the next pass; the lifecycle's sweep checks for shutdown before each row and stops there, letting only the release in flight finish, so rows it did not reach wait for the next pass - `inst-sv-stage-9`
 
 ## 3. Processes / Business Logic (CDSL)
@@ -261,7 +262,7 @@ A write to a `secret`-trait declaration **MUST** hand the plaintext to the store
 
 - [x] `p1` - **ID**: `cpt-cf-settings-service-dod-secret-values-machine-path`
 
-`SettingsReaderClient::resolve_secret` **MUST** be the only operation yielding plaintext, **MUST** authorize the caller for `read` on the value resource naming that declaration before the store is asked anything, **MUST** append one `secret_use` record per resolution with the value masked and refuse the plaintext when the record cannot be written, **MUST** never cache plaintext, and **MUST** answer an unconfigured secret as `NotFound` on the value, which the SDK projects to `SecretNotConfigured`, rather than `Unauthorized` or the placeholder.
+`SettingsReaderClient::resolve_secret` **MUST** be the only operation yielding plaintext, **MUST** authorize the caller for `read` on the value resource naming that declaration before the store is asked anything, **MUST** append one `secret_use` record per resolution with the value masked and refuse the plaintext when the record cannot be written, **MUST** never cache plaintext, **MUST** hand out a secret that resolves to its declaration's empty default as that value — the text a set of it would store, a `null` default as the empty string, the same text the expected hash of an activation state is taken over — without asking the Credential Store and with the same `secret_use` record as any resolution, and **MUST** answer a winning reference whose store entry is gone as `NotFound` on the value, which the SDK projects to `SecretNotConfigured`, rather than `Unauthorized`.
 
 **Implements**:
 - `cpt-cf-settings-service-flow-secret-values-resolve`
@@ -311,7 +312,7 @@ Removing, reverting or superseding a row that carries a reference **MUST** delet
 
 - [x] `p1` - **ID**: `cpt-cf-settings-service-dod-secret-values-placeholder`
 
-A `secret`-trait declaration **MUST** carry an empty placeholder default that is also a value of its type (`""` for a string-shaped secret, `null` only where the type admits it), refused otherwise on every path declarations are registered through, and a scope with no row **MUST** resolve to that placeholder on every administrative surface while the machine path **MUST** answer that no credential is configured instead of handing the placeholder out as plaintext.
+A `secret`-trait declaration **MUST** carry an empty placeholder default that is also a value of its type (`""` for a string-shaped secret, `null` only where the type admits it), refused otherwise on every path declarations are registered through, and a scope with no row **MUST** resolve to that placeholder on every surface: masked on the administrative ones, and on the machine path handed out as an ordinary value, so a consumer that applies it reports a hash equal to the one recorded for it.
 
 **Implements**:
 - `cpt-cf-settings-service-flow-secret-values-resolve`
@@ -347,7 +348,7 @@ The system **MUST** let an interactive caller stage a `secret`-trait value ahead
 - [x] The SDK reader returns the opaque handle as the value of a `secret`-classified setting whether or not a credential is configured, and the handle contains neither the reference nor the winning tenant
 - [x] `resolve_secret` returns the plaintext to an authorized caller and stores one `secret_use` record with the value masked, whose actor is the caller's subject
 - [x] `resolve_secret` for a caller denied `read` on that declaration returns `Unauthorized` and touches neither the store nor the audit store
-- [x] `resolve_secret` on a secret with no credential at any scope returns `NotFound` on the value, which the SDK projects to `SecretNotConfigured`, never the placeholder
+- [x] `resolve_secret` on a secret with no credential at any scope returns the declaration's empty default as its plaintext (`""` for a string-shaped secret), asks the Credential Store nothing and stores one `secret_use` record like any resolution; a winning reference whose store entry is gone returns `NotFound` on the value, which the SDK projects to `SecretNotConfigured`
 - [x] A malformed handle is refused as an invalid argument without echoing it
 - [x] Staging a `secret`-trait value before step-up creates a `private` entry under the gear's principal and a `pending_secrets` row, and answers with `pending_id` and `expires_at` only; the response carries neither the reference nor the plaintext
 - [x] A batch change carrying that `pending_id` commits the staged entry as the row's `secret_ref` with no second store leg, and the `pending_secrets` row is gone afterwards; a batch change carrying a `pending_id` staged by another subject, for another setting or tenant, or past its expiry is rejected `invalid` and the row is untouched
@@ -357,4 +358,5 @@ The system **MUST** let an interactive caller stage a `secret`-trait value ahead
 - [x] A claim past the row's expiry is refused by the statement that would consume it, whatever a check a moment earlier saw
 - [x] Removing or reverting a secret row deletes the store entry after the commit, and the scope resolves to the placeholder afterwards
 - [x] No plaintext is ever present in the effective cache; the cached entry carries the reference only
+- [x] `resolve_secret` resolves the reference from the store, never from this replica's effective-value cache: a credential rotated after the cache was filled with the old reference resolves to the new plaintext, and the cache still holds the old reference afterwards, unpopulated by the resolution (unit)
 - [x] A `secret`-trait declaration with a non-empty default is refused at registration

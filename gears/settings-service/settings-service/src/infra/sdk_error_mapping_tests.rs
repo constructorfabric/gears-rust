@@ -322,8 +322,8 @@ fn a_denial_names_the_resource_it_is_about_and_the_three_resources_differ() {
 fn a_missing_credential_is_a_value_not_found_and_says_so() {
     // `SecretNotConfigured` on the SDK side is told apart from a missing
     // declaration by exactly this: the value resource, and a detail that names
-    // the credential. A generic declaration 404 here would let a consumer hand
-    // a placeholder to a backend believing it is a credential.
+    // the credential. A generic declaration 404 here would tell a consumer the
+    // setting is undeclared when only its stored credential is gone.
     let value = problem(DomainError::NotFound {
         resource: settings_service_sdk::gts::VALUE_SCHEMA,
     });
@@ -336,7 +336,7 @@ fn a_missing_credential_is_a_value_not_found_and_says_so() {
     assert!(
         value
             .to_string()
-            .contains("no credential is configured at any scope"),
+            .contains("the credential the setting resolves to is not stored"),
         "{value}"
     );
 

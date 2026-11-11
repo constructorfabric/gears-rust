@@ -22,6 +22,7 @@ use toolkit_odata::Page;
 use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
+use crate::audit::AuditOperation;
 use crate::domain::ports::ActorNameMetrics;
 
 /// The most AM lookups one page runs at once.
@@ -182,6 +183,18 @@ pub struct ActorRef {
     pub actor: String,
     /// Whether the caller may not see the actor: it reads no name and is never looked up.
     pub masked: bool,
+    /// The record's operation. The actor of an `activation` record is a gear's
+    /// subject id — UUID-shaped, but no user id — so it reads no name and is
+    /// never looked up.
+    pub operation: AuditOperation,
+}
+
+impl ActorRef {
+    /// Whether the actor may be a user id to look up: unmasked, and not the
+    /// gear subject of an `activation` record.
+    fn may_be_user(&self) -> bool {
+        !self.masked && self.operation != AuditOperation::Activation
+    }
 }
 
 /// What a history record reads for its actor's name, as the resolver decides
@@ -192,8 +205,8 @@ pub enum ActorName {
     System,
     /// A user's current name, as Account Management gave it to this caller.
     User(String),
-    /// No name, read as `null`: the actor is masked or withheld, is a module,
-    /// or its name could not be had — no tenant recorded, unknown to Account
+    /// No name, read as `null`: the actor is masked or withheld, is a module or
+    /// the gear subject of an `activation` record, or its name could not be had — no tenant recorded, unknown to Account
     /// Management, or the lookup was refused, failed or late.
     Absent,
 }
@@ -249,8 +262,10 @@ impl ActorNameResolver {
 
     /// The name of each actor of a page, in input order, and report the pass once.
     ///
-    /// An actor reads [`ActorName::Absent`] when it is masked, is not a user id, is
-    /// not found, or its lookup was refused, failed or late; the nil id reads
+    /// An actor reads [`ActorName::Absent`] when it is masked, is not a user id —
+    /// a module name, or the gear subject of an `activation` record, told apart
+    /// by the record's operation and never looked up — is not found, or its
+    /// lookup was refused, failed or late; the nil id reads
     /// [`ActorName::System`] when unmasked.
     pub async fn names_for_page(
         &self,
@@ -263,9 +278,7 @@ impl ActorNameResolver {
         let out = actors
             .iter()
             .map(|a| {
-                if a.masked {
-                    ActorName::Absent
-                } else {
+                if a.may_be_user() {
                     match Uuid::parse_str(&a.actor) {
                         Ok(id) if id.is_nil() => ActorName::System,
                         Ok(id) => names
@@ -274,6 +287,8 @@ impl ActorNameResolver {
                             .map_or(ActorName::Absent, ActorName::User),
                         Err(_) => ActorName::Absent,
                     }
+                } else {
+                    ActorName::Absent
                 }
             })
             .collect();
@@ -295,9 +310,10 @@ impl ActorNameResolver {
     ) -> (BTreeMap<Uuid, String>, &'static str) {
         // @cpt-begin:cpt-cf-settings-service-algo-audit-store-actor-names:p2:inst-as-names-1
         // An actor is asked for in the tenant it acted from. A record without
-        // one, written before the tenant was recorded, reads `null`.
+        // one, written before the tenant was recorded, reads `null`. The gear
+        // subject of an `activation` record is no user id and is never asked for.
         let mut collected: BTreeMap<Uuid, BTreeSet<Uuid>> = BTreeMap::new();
-        for record in actors_in.iter().filter(|r| !r.masked) {
+        for record in actors_in.iter().filter(|r| r.may_be_user()) {
             if let Some(tenant) = record.actor_tenant_id
                 && let Ok(actor) = Uuid::parse_str(&record.actor)
                 && !actor.is_nil()

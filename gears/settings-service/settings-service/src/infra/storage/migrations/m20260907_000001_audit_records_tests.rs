@@ -37,6 +37,7 @@ async fn every_vocabulary_value_is_accepted_and_anything_else_refused() {
         "clone",
         "secret_use",
         "stage",
+        "activation",
     ]
     .iter()
     .enumerate()

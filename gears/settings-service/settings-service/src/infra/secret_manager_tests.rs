@@ -400,7 +400,7 @@ fn the_store_context_names_the_gear_principal_the_value_s_tenant_and_the_first_p
     // problem: the store's own answer is not this test's to assert.
     let (_store, manager) = manager();
     let tenant = Uuid::new_v4();
-    let ctx = manager.context(tenant).expect("context");
+    let ctx = CredStoreSecretManager::context(tenant).expect("context");
 
     assert_eq!(ctx.subject_id(), manager.principal());
     assert_eq!(ctx.subject_tenant_id(), tenant);

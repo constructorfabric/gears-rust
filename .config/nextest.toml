@@ -50,6 +50,16 @@ retries = 2
 filter = 'package(cf-gears-toolkit-security) & test(=internal_auth_cache::tests::invalid_token_rejections_are_briefly_negative_cached)'
 retries = 2
 
+# Settings service: two tests clear the SQLite lock markers of the delivery
+# scan lock, one name shared by every process through the user's cache
+# directory, and assert on the markers they removed. One at a time.
+[test-groups.settings-lock-markers]
+max-threads = 1
+
+[[profile.default.overrides]]
+filter = 'package(cf-gears-settings-service) & (test(/start_up_removes_the_stale_markers_of_the_scan_lock/) | test(/init_removes_the_stale_lock_markers_of_the_scan_lock/))'
+test-group = 'settings-lock-markers'
+
 # CI profile: every run writes target/nextest/ci/junit.xml, which the CI jobs
 # upload and .github/workflows/test-report.yml publishes as GitHub Check Runs.
 # The default profile's overrides above still apply under this profile.

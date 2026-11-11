@@ -141,3 +141,7 @@ pub const VALUE_NOT_IN_ENUM: &str = "value_not_in_enum";
 
 /// A dynamic enumeration source that does not resolve.
 pub const VALUE_ENUM_SOURCE_UNKNOWN: &str = "value_enum_source_unknown";
+
+/// A consumer call — a registration, a report or an unsubscribe — that
+/// reached the service without the `instance_id` the SDK client always sets.
+pub const INSTANCE_ID_REQUIRED: &str = "instance_id_required";

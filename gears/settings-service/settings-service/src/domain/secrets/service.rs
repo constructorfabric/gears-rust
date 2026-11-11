@@ -2,8 +2,10 @@
 //!
 //! Reached through the SDK reader and nowhere else. The caller is authorized
 //! for the one setting the handle names before the store is asked anything,
-//! the plaintext is fetched for the row that won the resolution, and one
-//! `secret_use` record is stored per resolution with the value masked. Nothing
+//! the plaintext is fetched for the row that won the resolution — or, when no
+//! row holding a reference won, is the declaration's empty default, an
+//! ordinary value the store is not asked for — and one `secret_use` record is
+//! stored per resolution with the value masked. Nothing
 //! here is cached: the effective cache keeps holding the reference only.
 
 use std::sync::Arc;
@@ -11,7 +13,7 @@ use toolkit_macros::domain_model;
 
 use secrecy::SecretString;
 use settings_service_sdk::gts::VALUE_SCHEMA;
-use settings_service_sdk::{SecretHandle, SettingKey};
+use settings_service_sdk::{EffectiveSource, SecretHandle, SettingKey};
 use toolkit_db::secure::DBRunner;
 use toolkit_security::{AccessScope, SecurityContext};
 use uuid::Uuid;
@@ -22,7 +24,7 @@ use crate::domain::declaration::DeclarationRepository;
 use crate::domain::error::DomainError;
 use crate::domain::ports::{SecretManager, SecretResolveGate};
 use crate::domain::resolution::{ScopeTarget, ValueResolver};
-use crate::domain::secrets::decode_handle;
+use crate::domain::secrets::{decode_handle, default_plaintext};
 use crate::domain::value::ValueRepository;
 use crate::field;
 
@@ -64,9 +66,11 @@ where
     /// # Errors
     /// [`DomainError::Validation`] for a malformed handle or one naming a
     /// setting that is not secret-classified; [`DomainError::NotFound`] on the
-    /// declaration when none exists and on the value when no credential is
-    /// configured; [`DomainError::Retired`]; [`DomainError::Unauthorized`] when
-    /// the caller may not read that setting; [`DomainError::Unavailable`] when
+    /// declaration when none exists, and on the value when the winning row's
+    /// reference names no entry in the store or the winning row holds no
+    /// reference and is not the declaration's default;
+    /// [`DomainError::Retired`]; [`DomainError::Unauthorized`] when the caller
+    /// may not read that setting; [`DomainError::Unavailable`] when
     /// the store or the audit store cannot answer.
     pub async fn resolve<C: DBRunner>(
         &self,
@@ -80,14 +84,17 @@ where
         // @cpt-begin:cpt-cf-settings-service-flow-secret-values-resolve:p1:inst-sv-resolve-3
         // @cpt-begin:cpt-cf-settings-service-algo-secret-values-handle:p1:inst-sv-handle-3
         // Resolved again, now: the handle asked for a scope, and whatever wins
-        // there at this moment is what the caller gets.
+        // there at this moment is what the caller gets. The handle carries no
+        // reference, so the resolution is the freshness form of the read: the
+        // store's answer, whatever this replica's cache still serves, because
+        // a rotation's invalidation may not have reached it yet.
         let key = SettingKey::parse(&claims.key).map_err(|_| DomainError::Validation {
             field: "handle".to_owned(),
             code: field::SECRET_HANDLE_MALFORMED,
             message: "the secret handle names no valid setting key".to_owned(),
         })?;
         let target = ScopeTarget::parse(&claims.scope)?;
-        let effective = self.resolver.resolve(conn, &key, target).await?;
+        let effective = self.resolver.resolve_fresh(conn, &key, target).await?;
         if effective.data_classification != "secret" {
             return Err(DomainError::Validation {
                 field: "handle".to_owned(),
@@ -103,34 +110,45 @@ where
         self.gate.may_resolve(ctx, effective.declaration_id).await?;
         // @cpt-end:cpt-cf-settings-service-flow-secret-values-resolve:p1:inst-sv-resolve-4
         // @cpt-begin:cpt-cf-settings-service-flow-secret-values-resolve:p1:inst-sv-resolve-5
-        // The placeholder default is not a credential. `NotFound` on the value
-        // is what the SDK projects to `SecretNotConfigured`.
-        let Some(secret_ref) = effective
-            .secret_backed
-            .then(|| effective.value.as_str())
-            .flatten()
-        else {
-            return Err(DomainError::NotFound {
-                resource: VALUE_SCHEMA,
-            });
+        // No row holding a reference won: the scope resolves to the
+        // declaration's empty default, which is an ordinary value. It is handed
+        // out as `default_plaintext` gives it — the empty text for `null` —
+        // the one rule the expected hash of an activation state is also taken
+        // over, and the store is asked nothing. A winning row that holds a value of its own
+        // rather than a reference is not the default and names nothing in the
+        // store: there is nothing to hand out for it.
+        let secret_ref = match (effective.secret_backed, effective.value.as_str()) {
+            (true, Some(secret_ref)) => Some(secret_ref),
+            _ if effective.source == EffectiveSource::SchemaDefault => None,
+            _ => {
+                return Err(DomainError::NotFound {
+                    resource: VALUE_SCHEMA,
+                });
+            }
         };
         // @cpt-end:cpt-cf-settings-service-flow-secret-values-resolve:p1:inst-sv-resolve-5
         // @cpt-begin:cpt-cf-settings-service-flow-secret-values-resolve:p1:inst-sv-resolve-6
-        // The entry lives in the tenant whose row won, which for an inherited
-        // value is an ancestor of the requested scope.
-        let root = self.resolver.root_tenant().await?;
-        let source_tenant = match &effective.source_scope {
-            Some(scope) => ScopeTarget::parse(scope)?.tenant_id(root),
-            None => effective.tenant_id,
+        let plaintext = match secret_ref {
+            None => default_plaintext(&effective.value),
+            Some(secret_ref) => {
+                // The entry lives in the tenant whose row won, which for an
+                // inherited value is an ancestor of the requested scope.
+                let root = self.resolver.root_tenant().await?;
+                let source_tenant = match &effective.source_scope {
+                    Some(scope) => ScopeTarget::parse(scope)?.tenant_id(root),
+                    None => effective.tenant_id,
+                };
+                self.secrets
+                    .resolve_plaintext(&effective.key, source_tenant, secret_ref)
+                    .await?
+            }
         };
-        let plaintext = self
-            .secrets
-            .resolve_plaintext(&effective.key, source_tenant, secret_ref)
-            .await?;
         // @cpt-end:cpt-cf-settings-service-flow-secret-values-resolve:p1:inst-sv-resolve-6
         // @cpt-begin:cpt-cf-settings-service-flow-secret-values-resolve:p1:inst-sv-resolve-7
         // One record per resolution, the value masked, before any plaintext
-        // leaves: a resolution that cannot be recorded does not happen.
+        // leaves: a resolution that cannot be recorded does not happen. The
+        // default's value is resolved and recorded like any other, so the
+        // record does not tell the two apart.
         let record = AuditRecord::new(
             effective.key.as_str(),
             Some(effective.tenant_id),

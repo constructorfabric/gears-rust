@@ -48,6 +48,9 @@ pub(crate) fn audit_request_id(headers: &axum::http::HeaderMap) -> String {
 pub mod access_dto;
 pub mod access_handlers;
 pub mod access_routes;
+pub mod activation_dto;
+pub mod activation_handlers;
+pub mod activation_routes;
 pub mod browse_narrowing;
 pub mod declaration_dto;
 pub mod declaration_handlers;
@@ -166,3 +169,7 @@ mod boundary_surface_tests;
 #[cfg(test)]
 #[path = "history_actor_names_tests.rs"]
 mod history_actor_names_tests;
+
+#[cfg(test)]
+#[path = "activation_surface_tests.rs"]
+mod activation_surface_tests;

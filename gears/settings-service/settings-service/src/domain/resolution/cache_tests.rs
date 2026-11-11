@@ -116,6 +116,30 @@ fn a_declaration_change_evicts_the_whole_key() {
 }
 
 #[test]
+fn many_keys_are_evicted_in_one_pass_and_each_generation_moves() {
+    let cache = EffectiveCache::new(Duration::from_secs(30));
+    let tenants = [Uuid::new_v4(), Uuid::new_v4()];
+    let named: Vec<String> = (0..500).map(|i| format!("named-{i}")).collect();
+    for tenant in tenants {
+        for key in &named {
+            cache.seed(entry(key, tenant));
+        }
+        cache.seed(entry("kept", tenant));
+    }
+    let before = cache.generation("named-7", tenants[0]);
+    cache.invalidate_keys(&named);
+    assert_eq!(cache.len(), tenants.len(), "only the unnamed key stays");
+    for tenant in tenants {
+        assert!(cache.get("kept", tenant).is_some());
+        assert!(cache.get("named-499", tenant).is_none());
+    }
+    assert_ne!(cache.generation("named-7", tenants[0]), before);
+    // Nothing named, nothing touched.
+    cache.invalidate_keys(&[]);
+    assert_eq!(cache.len(), tenants.len());
+}
+
+#[test]
 fn a_hierarchy_change_evicts_the_affected_subtree_across_every_setting() {
     let cache = EffectiveCache::new(Duration::from_secs(30));
     let moved = Uuid::new_v4();
@@ -277,4 +301,107 @@ fn a_local_or_tenant_set_invalidation_also_drops_a_store_it_has_passed() {
         cache.populate(entry("unrelated-too", t), seen_unrelated),
         "and leaves another key's read standing"
     );
+}
+
+#[test]
+fn a_key_wide_eviction_leaves_every_other_keys_entries_and_reads_untouched() {
+    let cache = EffectiveCache::new(Duration::from_secs(30));
+    let tenants = [Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4()];
+    for tenant in tenants {
+        for key in ["gone", "kept.one", "kept.two"] {
+            cache.seed(entry(key, tenant));
+        }
+    }
+    let kept: Vec<_> = tenants
+        .iter()
+        .flat_map(|t| {
+            ["kept.one", "kept.two"].map(|k| {
+                (
+                    k,
+                    *t,
+                    cache.get(k, *t).expect("seeded"),
+                    cache.generation(k, *t),
+                )
+            })
+        })
+        .collect();
+
+    cache.invalidate_keys(&["gone".to_owned()]);
+
+    assert_eq!(cache.len(), kept.len(), "only the named key's entries left");
+    for tenant in tenants {
+        assert!(cache.get("gone", tenant).is_none());
+    }
+    for (key, tenant, value, generation) in kept {
+        let held = cache.get(key, tenant).expect("another key stays");
+        assert!(Arc::ptr_eq(&held, &value), "the very entry, not a re-store");
+        assert_eq!(
+            cache.generation(key, tenant),
+            generation,
+            "and a read of it in flight may still store"
+        );
+    }
+}
+
+#[test]
+fn a_key_wide_eviction_examines_the_entries_of_its_keys_only() {
+    let cache = EffectiveCache::new(Duration::from_secs(30));
+    let tenants: Vec<Uuid> = (0..4).map(|_| Uuid::new_v4()).collect();
+    for i in 0..500 {
+        for tenant in &tenants {
+            cache.seed(entry(&format!("key-{i}"), *tenant));
+        }
+    }
+    assert_eq!(cache.len(), 2000);
+
+    let before = cache.eviction_stats();
+    cache.invalidate_keys(&["key-7".to_owned(), "key-8".to_owned()]);
+    let after = cache.eviction_stats();
+    assert_eq!(
+        after.visited - before.visited,
+        2 * tenants.len(),
+        "the two keys' entries, not the 2000 the cache holds"
+    );
+    assert_eq!(after.key_passes - before.key_passes, 1);
+    assert_eq!(cache.len(), 2000 - 2 * tenants.len());
+
+    // The same for the per-write key-wide eviction, and for a key not held.
+    let before = cache.eviction_stats();
+    cache.invalidate("key-9", scope_class::CASCADING, Some(tenants[0]));
+    cache.invalidate_keys(&["never-held".to_owned()]);
+    assert_eq!(
+        cache.eviction_stats().visited - before.visited,
+        tenants.len()
+    );
+    assert_eq!(cache.len(), 2000 - 3 * tenants.len());
+}
+
+#[test]
+fn the_count_follows_every_way_an_entry_leaves() {
+    let cache = EffectiveCache::bounded(Duration::from_secs(30), 6);
+    let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+    for key in ["k1", "k2", "k3"] {
+        cache.seed(entry(key, a));
+        cache.seed(entry(key, b));
+    }
+    cache.seed(entry("k1", a));
+    assert_eq!(cache.len(), 6, "a re-store replaces in place");
+    cache.seed(entry("k4", a));
+    assert_eq!(
+        cache.len(),
+        6,
+        "at capacity a new slot displaces the oldest"
+    );
+    assert!(
+        cache.get("k1", b).is_none(),
+        "the oldest still held: k1 at a was re-stored since"
+    );
+    cache.invalidate("k2", scope_class::LOCAL, Some(b));
+    assert_eq!(cache.len(), 5);
+    cache.invalidate_tenants("k3", &[a, b]);
+    assert_eq!(cache.len(), 3);
+    cache.invalidate_key("k1");
+    assert_eq!(cache.len(), 2);
+    cache.invalidate_subtree(&[a]);
+    assert!(cache.is_empty());
 }

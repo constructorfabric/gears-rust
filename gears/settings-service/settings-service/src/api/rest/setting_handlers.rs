@@ -24,6 +24,7 @@ use crate::api::rest::setting_dto::{
 };
 use crate::api::rest::setting_filter::interpret;
 pub(crate) use crate::api::rest::setting_filter::unsupported;
+use crate::domain::activation::attachment::attach;
 use crate::domain::category::visibility;
 use crate::domain::declaration::{BrowseNarrowing, Declaration};
 use crate::domain::error::DomainError;
@@ -32,6 +33,7 @@ use crate::domain::search::{Corpus, Needle};
 use crate::domain::value::{ReviewRequest, review_binding};
 use crate::field;
 use crate::gear::ConcreteResolver;
+use crate::infra::storage::audit_store::AuditStore;
 use crate::log_text::LogSafe;
 
 const READ: &str = "read";
@@ -74,7 +76,8 @@ pub(crate) fn parse_tenant(raw: Option<&str>) -> Result<Option<Uuid>, DomainErro
     }
 }
 
-fn parse_key(raw: &str) -> Result<SettingKey, DomainError> {
+/// Parses the `key` path segment as a setting key, `400` when it is not one.
+pub(crate) fn parse_key(raw: &str) -> Result<SettingKey, DomainError> {
     SettingKey::parse(raw).map_err(|e| DomainError::Validation {
         field: "key".to_owned(),
         code: field::VALIDATION,
@@ -930,6 +933,7 @@ pub async fn get_history(
     Query(params): Query<TenantParam>,
     OData(query): OData,
 ) -> ApiResult<impl IntoResponse> {
+    // @cpt-begin:cpt-cf-settings-service-flow-activation-read-history:p1:inst-ar-history-1
     // @cpt-begin:cpt-cf-settings-service-flow-audit-store-history:p1:inst-as-hist-1
     let key = parse_key(&key)?;
     let requested = parse_tenant(params.tenant.as_deref())?;
@@ -940,6 +944,7 @@ pub async fn get_history(
         .into());
     }
     // @cpt-end:cpt-cf-settings-service-flow-audit-store-history:p1:inst-as-hist-1
+    // @cpt-end:cpt-cf-settings-service-flow-activation-read-history:p1:inst-ar-history-1
     // @cpt-begin:cpt-cf-settings-service-flow-audit-store-history:p1:inst-as-hist-2
     // @cpt-begin:cpt-cf-settings-service-flow-audit-store-history:p1:inst-as-hist-3
     let scope = authz::access_scope(&enforcer, &ctx, &resource::VALUE, READ, None).await?;
@@ -986,10 +991,39 @@ pub async fn get_history(
     let page = crate::infra::storage::audit_store::AuditStore
         .history(&conn, &scope, key.as_str(), target.tenant_id(root), &query)
         .await?;
+    // @cpt-begin:cpt-cf-settings-service-flow-activation-read-history:p1:inst-ar-history-7
+    // @cpt-begin:cpt-cf-settings-service-algo-activation-read-attach:p1:inst-ar-attach-1
+    // The ids the page lists; an empty page asks nothing, and a page of any
+    // size asks once.
+    let listed: Vec<Uuid> = page.items.iter().map(|r| r.id).collect();
+    let found = if listed.is_empty() {
+        Ok(Vec::new())
+    } else {
+        AuditStore
+            .reports_for(&conn, &scope, key.as_str(), &listed)
+            .await
+    };
+    // @cpt-end:cpt-cf-settings-service-algo-activation-read-attach:p1:inst-ar-attach-1
+    // @cpt-begin:cpt-cf-settings-service-flow-activation-read-history:p1:inst-ar-history-8
+    // @cpt-begin:cpt-cf-settings-service-flow-activation-read-history:p1:inst-ar-history-9
+    // A resolver or a database that cannot answer fails the read `503`, and an
+    // attached report whose stored outcome is unknown fails it as an integrity
+    // error: either way no page is served.
+    let attachments = attach(
+        resolver.hierarchy().as_ref(),
+        ctx.subject_tenant_id(),
+        target.tenant_id(root),
+        found?,
+    )
+    .await?;
+    // @cpt-end:cpt-cf-settings-service-flow-activation-read-history:p1:inst-ar-history-9
+    // @cpt-end:cpt-cf-settings-service-flow-activation-read-history:p1:inst-ar-history-8
+    // @cpt-end:cpt-cf-settings-service-flow-activation-read-history:p1:inst-ar-history-7
     let values_are_pii = declaration.data_classification == "pii";
     // A `pii` image keeps its class after the setting is declassified, so it
     // asks for the entitlement as much as a `pii` setting or actor does.
     let needs_entitlement = values_are_pii
+        || attachments.has_pii_actor()
         || page.items.iter().any(|r| {
             r.actor_classification == crate::audit::ActorClassification::Pii || r.has_pii_image()
         });
@@ -1003,6 +1037,17 @@ pub async fn get_history(
     let target_chain = target_chain(&resolver, reader, target.tenant_id(root)).await?;
     let to_target = reader.path_in(&target_chain);
     // @cpt-end:cpt-cf-settings-service-flow-audit-store-history:p1:inst-as-hist-10
+    // @cpt-begin:cpt-cf-settings-service-flow-activation-read-history:p1:inst-ar-history-11
+    // A report's actor follows the same rule, over the path from the reader
+    // down to the report's own tenant.
+    let report_actor_shown = |report: &crate::audit::StoredAuditRecord| {
+        let path = match report.tenant_id {
+            Some(tenant) if tenant == target.tenant_id(root) => to_target,
+            Some(tenant) => reader.path_in(attachments.chain_of(tenant)),
+            None => &[],
+        };
+        reader.is_shown(report.actor_tenant_id, path)
+    };
     let mut items: Vec<AuditRecordDto> = page
         .items
         .iter()
@@ -1014,9 +1059,12 @@ pub async fn get_history(
             };
             render_record(
                 r,
+                attachments.of(r.id),
                 values_are_pii,
                 pii,
                 reader.is_shown(r.actor_tenant_id, path),
+                reader,
+                &report_actor_shown,
             )
         })
         .collect();
@@ -1029,6 +1077,7 @@ pub async fn get_history(
             actor_tenant_id: record.actor_tenant_id,
             actor: item.actor.clone(),
             masked: item.actor_masked,
+            operation: record.operation,
         })
         .collect();
     let actor_names = names.names_for_page(&ctx, &actors).await;
@@ -1040,5 +1089,6 @@ pub async fn get_history(
         items,
         page_info: PageInfoDto::of(page.page_info, Some(page.total_count)),
     }))
+    // @cpt-end:cpt-cf-settings-service-flow-activation-read-history:p1:inst-ar-history-11
     // @cpt-end:cpt-cf-settings-service-flow-audit-store-history:p1:inst-as-hist-9
 }

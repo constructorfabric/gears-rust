@@ -211,7 +211,7 @@ The system **MUST** define `SettingsReaderClient` with `get_effective`, `get_eff
 
 Every fallible trait method **MUST** return `Result<_, CanonicalError>`, the platform-wide error type. No settings-specific error type may appear in a trait signature: the platform ADR on SDK error surfaces fixes the boundary at canonical precisely so that adding a failure mode later is not a breaking change for every consuming gear. The typed view lives beside the trait, never inside it.
 
-Change notification is **not** a reader-trait method. A consumer that must actively re-apply a setting subscribes through the consumer activation contract — `subscribe(keys, handler)` plus `report_outcome(...)`, specified by [DESIGN-activation](../DESIGN-activation.md) §4.2 *Consumer Activation SDK* and delivered in this SDK alongside the reader traits. An earlier draft listed a `watch` method on `SettingsReaderClient`: it named the same capability twice, and its stated shape — a plain change stream — could not carry the per-setting acknowledgement the contract requires, since delivery repeats until the consumer accounts for every notified key and an apply does not settle until it does. `watch` has since been removed from DESIGN.
+Change notification is **not** a reader-trait method. A consumer that must actively re-apply a setting subscribes through the consumer activation contract — `subscribe(keys, tenant, handler)` plus `report_outcome(...)`, specified by [DESIGN-activation](../DESIGN-activation.md) §4.2 *Consumer Activation SDK* and delivered in this SDK alongside the reader traits. An earlier draft listed a `watch` method on `SettingsReaderClient`: it named the same capability twice, and its stated shape — a plain change stream — could not carry the per-setting acknowledgement the contract requires, since delivery repeats until the consumer accounts for every notified key and an apply does not settle until it does. `watch` has since been removed from DESIGN.
 
 **Implements**:
 - `cpt-cf-settings-service-algo-gear-foundation-gear-init`
@@ -227,13 +227,13 @@ Change notification is **not** a reader-trait method. A consumer that must activ
 
 Reader-facing failures **MUST** be mutually distinguishable, because each demands a different response from the consuming gear: `Unavailable` when the value could not be resolved and a retry may succeed; `Retired` when the declaration was withdrawn, so a retry will never help and the consumer should drop the dependency; and `NotFound` when no declaration row exists, which the consumer resolves against its own boot ordering. The service **MUST NOT** substitute a Schema Default on failure, since the default lives in the same database and is equally unreachable.
 
-This distinction **MUST** be delivered as a typed projection over `CanonicalError`, not as a parallel error taxonomy. Two of the three outcomes have no canonical category of their own — `Retired` is not a canonical concept, and the credential-absent case of `resolve_secret` collides with the resolver's own `NotFound` — so without a projection a consumer would have to compare context strings to satisfy a contract this document makes mandatory.
+This distinction **MUST** be delivered as a typed projection over `CanonicalError`, not as a parallel error taxonomy. Two of the three outcomes have no canonical category of their own — `Retired` is not a canonical concept, and the missing-credential case of `resolve_secret` collides with the resolver's own `NotFound` — so without a projection a consumer would have to compare context strings to satisfy a contract this document makes mandatory.
 
 The projection **MUST**:
 
 - be infallible, built from `CanonicalError` rather than fallibly parsed from it
 - carry a catch-all `Other { canonical }` variant, so a canonical category the SDK does not model still reaches the consumer with full fidelity and adding one later breaks nobody
-- distinguish the credential-absent outcome of `resolve_secret` from the resolver's `NotFound`, since a consumer that mistakes one for the other will hand a non-secret placeholder to a backend as if it were a credential
+- distinguish the missing-credential outcome of `resolve_secret` — a winning reference whose store entry is gone — from the resolver's `NotFound`, since a consumer that mistakes one for the other takes a lost credential for an undeclared setting
 - carry no transport fields; `instance` and `trace_id` belong to the Problem envelope
 - keep each wire-string constant beside the typed value it projects into, with conversions in both directions, so the two cannot drift apart
 - be pinned by round-trip Problem tests that assert every wire-string constant appears at its expected JSON path
@@ -346,7 +346,7 @@ The system **MUST** provide the shared Audit Emitter through which every mutatin
 - [x] A bulk read of a category whose enumeration fails — a malformed category id, the store unreachable, a stored key that does not parse — is refused as a whole with that failure, never shortened by the rows it could not name; a category that files nothing answers an empty batch
 - [x] Every fallible trait method returns `CanonicalError`; no settings-specific error type appears in any trait signature
 - [x] `Unavailable`, `Retired`, and `NotFound` are distinguishable by a consumer without string matching
-- [x] The credential-absent outcome of `resolve_secret` is a different variant from the resolver's `NotFound`, so a placeholder can never be mistaken for a configured credential
+- [x] The missing-credential outcome of `resolve_secret` is a different variant from the resolver's `NotFound`, so a lost stored credential is never mistaken for an undeclared setting
 - [x] A canonical category the projection does not model arrives as the catch-all variant with its canonical value intact, rather than being dropped or collapsed
 - [x] Adding a variant to the projection leaves every trait signature unchanged
 - [x] Each wire-string constant converts to its typed value and back, and an unrecognised string is preserved rather than discarded

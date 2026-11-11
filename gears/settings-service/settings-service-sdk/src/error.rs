@@ -21,10 +21,10 @@
 //! | [`SettingsError::Unavailable`] | retry, hold a last-known value, or degrade |
 //! | [`SettingsError::Retired`] | stop reading — a retry will never help |
 //! | [`SettingsError::NotFound`] | decide wait-vs-give-up from its own boot ordering |
-//! | [`SettingsError::SecretNotConfigured`] | treat the placeholder as absent, never as a credential |
+//! | [`SettingsError::SecretNotConfigured`] | the stored credential is gone: set it again |
 //! | [`SettingsError::Unauthorized`] | not entitled to this specific setting |
 //!
-//! `Retired` is not a canonical category, and the credential-absent case is a
+//! `Retired` is not a canonical category, and the missing-credential case is a
 //! `NotFound` that collides with the resolver's own. Without this projection a
 //! consumer would have to compare context strings to tell them apart.
 //!
@@ -114,13 +114,14 @@ pub enum SettingsError {
         detail: String,
     },
 
-    /// A secret-backed setting has no credential configured at any scope.
+    /// The credential a secret-backed setting resolves to is not in the store:
+    /// the value that won names a stored credential that no longer exists.
     ///
     /// Distinct from [`SettingsError::NotFound`]: the declaration exists and
-    /// resolves, but its value is the non-secret placeholder. Handing that
-    /// placeholder to a backend as if it were a credential is the failure this
-    /// variant exists to prevent.
-    #[error("no credential configured for this setting: {detail}")]
+    /// resolves, only the stored credential is gone. A setting resolving to its
+    /// declaration's default is not this — `resolve_secret` hands that default
+    /// (an empty value) out like any other value.
+    #[error("the stored credential for this setting is missing: {detail}")]
     SecretNotConfigured {
         /// Human-readable detail from the canonical error.
         detail: String,
@@ -155,7 +156,7 @@ impl From<CanonicalError> for SettingsError {
 
             // One canonical category, two consumer outcomes. The resource the
             // error was attributed to is the only thing separating "this setting
-            // was never declared" from "this secret has no credential anywhere".
+            // was never declared" from "this secret's stored credential is gone".
             CanonicalError::NotFound { detail, .. } => match not_found_resource(&err) {
                 Some(Resource::Value) => Self::SecretNotConfigured {
                     detail: detail.clone(),
@@ -204,7 +205,7 @@ impl From<CanonicalError> for SettingsError {
 /// The projection then falls to [`SettingsError::NotFound`], **never** to
 /// [`SettingsError::SecretNotConfigured`]. That direction is deliberate and is
 /// the safe one: `SecretNotConfigured` is the stronger claim — it asserts the
-/// declaration resolved and only the credential is absent — and fabricating it
+/// declaration resolved and only the stored credential is gone — and fabricating it
 /// from an unattributed error would tell a consumer something the error does not
 /// support. Losing the distinction degrades the typed surface; inventing it
 /// would mislead.

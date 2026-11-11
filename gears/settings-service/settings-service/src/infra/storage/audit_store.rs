@@ -5,6 +5,7 @@
 //! pruned by retention and nothing else.
 
 use async_trait::async_trait;
+use sea_orm::sea_query::{Alias, Expr, ExprTrait as _, Query};
 use sea_orm::{ActiveValue::Set, ColumnTrait, EntityTrait, QueryFilter, QuerySelect};
 use time::{Duration, OffsetDateTime};
 use toolkit_db::odata::{FieldToColumn, LimitCfg, ODataFieldMapping};
@@ -87,6 +88,10 @@ fn to_domain(model: audit_record::Model) -> Result<StoredAuditRecord, DomainErro
         change_set_id: model.change_set_id,
         occurred_at: model.occurred_at,
         retain_until: model.retain_until,
+        change_ref: model.change_ref,
+        detail: model.detail,
+        instance_id: model.instance_id,
+        instance_label: model.instance_label,
     })
 }
 
@@ -164,7 +169,7 @@ impl AuditSink for AuditStore {
     ) -> Result<(), DomainError> {
         // @cpt-begin:cpt-cf-settings-service-algo-audit-store-append:p1:inst-as-append-4
         let active = audit_record::ActiveModel {
-            id: Set(Uuid::new_v4()),
+            id: Set(record.record_id.unwrap_or_else(Uuid::new_v4)),
             resource: Set(record.resource),
             declaration_key: Set(record.declaration_key),
             tenant_id: Set(record.tenant_id),
@@ -181,6 +186,10 @@ impl AuditSink for AuditStore {
             outcome: Set(record.outcome.as_str().to_owned()),
             request_id: Set(record.request_id),
             change_set_id: Set(record.change_set_id),
+            change_ref: Set(record.change_ref),
+            detail: Set(record.detail),
+            instance_id: Set(record.instance_id),
+            instance_label: Set(record.instance_label),
             // The shared clock, aligned to what Postgres keeps: both backends
             // then hold the same instant, as for every other timestamp column,
             // and the history cursor minted from it means the same on either.
@@ -203,6 +212,18 @@ impl AuditSink for AuditStore {
         // @cpt-end:cpt-cf-settings-service-algo-audit-store-append:p1:inst-as-append-6
         // @cpt-end:cpt-cf-settings-service-algo-audit-store-append:p1:inst-as-append-5
     }
+}
+
+/// The statement `reports_for` runs, before the scope: the `activation`
+/// records of `declaration_key` answering any of `change_refs`. Public so the
+/// PostgreSQL suite plans the statement the gear emits, not a copy of it.
+#[doc(hidden)]
+#[must_use]
+pub fn reports_select(declaration_key: &str, change_refs: &[Uuid]) -> sea_orm::Select<AuditEntity> {
+    AuditEntity::find()
+        .filter(audit_record::Column::Operation.eq(AuditOperation::Activation.as_str()))
+        .filter(audit_record::Column::DeclarationKey.eq(declaration_key))
+        .filter(audit_record::Column::ChangeRef.is_in(change_refs.iter().copied()))
 }
 
 impl AuditStore {
@@ -237,6 +258,42 @@ impl AuditStore {
                     .add(audit_record::Column::TenantId.eq(tenant_id))
                     .add(audit_record::Column::TenantId.is_null()),
             );
+        // @cpt-begin:cpt-cf-settings-service-flow-activation-read-history:p1:inst-ar-history-2
+        // @cpt-begin:cpt-cf-settings-service-flow-activation-read-history:p1:inst-ar-history-3
+        // @cpt-begin:cpt-cf-settings-service-flow-activation-read-history:p1:inst-ar-history-4
+        // A report whose change record is among this history's records is
+        // attached under that change, never listed beside it. The test is part
+        // of the page query — so the page is cut and `total_count` counted
+        // after it, and no page is ever shortened — and it is an existence
+        // test on the change record itself: a report whose change retention
+        // has removed finds none, and so stays in the listing.
+        let change = Alias::new("change_record");
+        let written_here = Query::select()
+            .expr(Expr::val(1))
+            .from_as(AuditEntity, change.clone())
+            .and_where(
+                Expr::col((change.clone(), audit_record::Column::Id))
+                    .equals((AuditEntity, audit_record::Column::ChangeRef)),
+            )
+            .and_where(
+                Expr::col((change.clone(), audit_record::Column::DeclarationKey))
+                    .eq(declaration_key),
+            )
+            .and_where(
+                Expr::col((change.clone(), audit_record::Column::TenantId))
+                    .eq(tenant_id)
+                    .or(Expr::col((change, audit_record::Column::TenantId)).is_null()),
+            )
+            .to_owned();
+        let base = base.filter(
+            sea_orm::Condition::any()
+                .add(audit_record::Column::Operation.ne(AuditOperation::Activation.as_str()))
+                .add(audit_record::Column::ChangeRef.is_null())
+                .add(Expr::exists(written_here).not()),
+        );
+        // @cpt-end:cpt-cf-settings-service-flow-activation-read-history:p1:inst-ar-history-4
+        // @cpt-end:cpt-cf-settings-service-flow-activation-read-history:p1:inst-ar-history-3
+        // @cpt-end:cpt-cf-settings-service-flow-activation-read-history:p1:inst-ar-history-2
         let paged = ODataQuery {
             filter: None,
             order: toolkit_odata::ODataOrderBy(vec![toolkit_odata::OrderKey {
@@ -277,6 +334,42 @@ impl AuditStore {
             page_info: page.page_info,
             total_count: page.total_count,
         })
+    }
+
+    /// The `activation` records of `declaration_key` answering any of the
+    /// `change_refs`, whatever their tenant, in one statement through the
+    /// partial `idx_audit_change_ref`, on the caller's scope.
+    ///
+    /// Unordered: the caller groups and orders them. A record whose stored
+    /// outcome is unknown fails the read as an integrity error rather than
+    /// being dropped or shown with a guessed outcome.
+    ///
+    /// # Errors
+    /// [`DomainError::Unavailable`] when the read fails; [`DomainError::Internal`]
+    /// on a record that does not decode.
+    pub async fn reports_for<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        declaration_key: &str,
+        change_refs: &[Uuid],
+    ) -> Result<Vec<StoredAuditRecord>, DomainError> {
+        // The page's own caller short-circuits an empty page; the guard here
+        // keeps the statement from ever being built for no ids.
+        if change_refs.is_empty() {
+            return Ok(Vec::new());
+        }
+        // @cpt-begin:cpt-cf-settings-service-algo-activation-read-attach:p1:inst-ar-attach-2
+        // @cpt-begin:cpt-cf-settings-service-algo-activation-read-attach:p1:inst-ar-attach-3
+        let rows = reports_select(declaration_key, change_refs)
+            .secure()
+            .scope_with(scope)
+            .all(conn)
+            .await
+            .map_err(unavailable)?;
+        rows.into_iter().map(to_domain).collect()
+        // @cpt-end:cpt-cf-settings-service-algo-activation-read-attach:p1:inst-ar-attach-3
+        // @cpt-end:cpt-cf-settings-service-algo-activation-read-attach:p1:inst-ar-attach-2
     }
 
     /// Delete at most `limit` of the records past their retention horizon,

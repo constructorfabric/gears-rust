@@ -297,7 +297,8 @@ impl WriteHarness {
                 return Err(err);
             }
         };
-        self.writer.after_commit(&committed, actor).await;
+        self.writer.evict(&committed);
+        self.writer.publish_and_release(&committed, actor).await;
         Ok(committed)
     }
 
