@@ -386,11 +386,15 @@ pub async fn env_with_window(window: Duration) -> Env {
     .await
 }
 
-/// In-memory `SQLite`.
+/// In-memory `SQLite`, named per test: the advisory lock of `SQLite` is a
+/// marker file keyed by the DSN, and nextest runs tests as parallel processes.
 #[cfg(not(feature = "integration"))]
 async fn connect() -> toolkit_db::Db {
     connect_db(
-        "sqlite::memory:",
+        &format!(
+            "sqlite:file:le_{}?mode=memory&cache=shared",
+            Uuid::now_v7().simple()
+        ),
         ConnectOpts {
             max_conns: Some(1),
             min_conns: Some(1),
@@ -594,11 +598,7 @@ pub fn token() -> String {
     Uuid::now_v7().to_string()
 }
 
-/// One sweep at a time across tests: the in-memory `SQLite` databases of all
-/// tests share one advisory lock key.
 pub async fn sweep(env: &Env, retention: Duration) -> (u64, u64) {
-    static ONE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-    let _one = ONE.lock().await;
     env.grants.sweep(retention).await.unwrap().unwrap()
 }
 
