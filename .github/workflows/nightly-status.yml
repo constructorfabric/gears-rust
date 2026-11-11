@@ -1,6 +1,6 @@
 name: Nightly status
 
-# Keeps one issue, "Nightly status", with a table of the four nightly
+# Keeps one issue, "Nightly status", with a table of the five nightly
 # workflows. It is updated after every scheduled run of any of them, so a red
 # or cancelled nightly is visible without opening Actions.
 #
@@ -12,6 +12,7 @@ on:
       - Clippy (full feature matrix)
       - macOS and Windows tests
       - Unused Deps (nightly)
+      - CodeQL Advanced
     types: [completed]
   workflow_dispatch:
 

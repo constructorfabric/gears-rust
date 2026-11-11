@@ -9,6 +9,7 @@ const WORKFLOWS = [
   { file: 'clippy-nightly.yml', label: 'Clippy (full feature matrix)' },
   { file: 'macos-windows-tests.yml', label: 'macOS and Windows tests' },
   { file: 'shear-nightly.yml', label: 'Unused deps (cargo-shear)' },
+  { file: 'codeql.yml', label: 'CodeQL' },
 ];
 const TITLE = 'Nightly status';
 const NIGHTS = 14;
