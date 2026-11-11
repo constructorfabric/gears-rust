@@ -503,8 +503,13 @@ pub async fn insert_sub_grant(
         .await
 }
 
+/// The current time to the microsecond, as the store keeps it: a Linux clock
+/// gives nanoseconds, and a window built from them would not equal the stored
+/// one.
 pub fn now() -> OffsetDateTime {
-    OffsetDateTime::now_utc()
+    let t = OffsetDateTime::now_utc();
+    t.replace_nanosecond(t.nanosecond() - t.nanosecond() % 1000)
+        .expect("a whole microsecond is a valid nanosecond")
 }
 
 pub fn terms() -> GrantTerms {

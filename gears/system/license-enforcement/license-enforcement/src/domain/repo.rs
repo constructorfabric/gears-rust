@@ -41,6 +41,7 @@ pub struct NewEvidenceRow {
 
 /// Who sent a mutating request: the key of its idempotency record with the
 /// token. Another subject of the same tenant never replays it.
+#[domain_model]
 #[derive(Debug, Clone, Copy)]
 pub struct Caller {
     pub tenant: Uuid,

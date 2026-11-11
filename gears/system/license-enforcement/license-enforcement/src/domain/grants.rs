@@ -150,6 +150,7 @@ fn subject_size(field: &str, gts_type: &GtsTypeId, id: &str, out: &mut Vec<Field
 
 /// How violations name the terms of a request: `grants[i]` in `issue`,
 /// `successors[i].terms` in `replace`.
+#[domain_model]
 #[derive(Clone, Copy)]
 pub(super) struct TermsField {
     list: &'static str,
@@ -306,6 +307,7 @@ fn root_grant(root: &AdmittedRoot, pack_id: Option<PackId>, evidence_id: Evidenc
 }
 
 /// The scopes that the new rows of `issue` and `replace` are inserted under.
+#[domain_model]
 pub(super) struct Issued {
     grants: AccessScope,
     pack: Option<AccessScope>,
@@ -321,10 +323,14 @@ pub(crate) fn subject_loses_grant(reason: TerminationReason) -> bool {
 
 /// The count of its pack that a member is in. The one rule for the counts of
 /// a pack: a new pack and every later write of a member count by it.
+#[domain_model]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum PackCount {
+    /// Live, with no binding.
     Unbound,
+    /// Live, bound to a subject.
     Bound,
+    /// Live, bound to its sub-grant.
     Delegated,
 }
 
@@ -338,6 +344,7 @@ impl PackCount {
         })
     }
 
+    /// The counter of `c` that this count names.
     pub(crate) fn of_counts(self, c: &mut BindingCounts) -> &mut u64 {
         match self {
             Self::Unbound => &mut c.unbound,
