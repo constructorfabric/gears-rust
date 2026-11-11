@@ -1,0 +1,12 @@
+# Accepted CodeQL alerts. The release gate (tools/scripts/codeql_gate.py, run by
+# release-plz.yml) blocks publishing crates while an open CodeQL alert of high or
+# critical severity is not listed here. Prefer fixing the code. To accept an alert,
+# add an entry in a pull request: the review of that PR is the approval.
+#
+#   [[ignore]]
+#   rule    = "rust/cleartext-logging"          # rule id shown on the alert
+#   path    = "libs/some-crate/src/lib.rs"      # file of the alert; globs allowed
+#   reason  = "why this is safe, with a link to the discussion"   # required
+#   expires = "2027-03-01"                      # optional; the entry stops working after it
+#
+# An entry that matches no open alert produces a warning: remove it.

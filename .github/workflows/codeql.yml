@@ -8,8 +8,9 @@
 # ~180 of 339 rate-limit failures in 72 h on CodeQL), and a full Rust scan costs ~1h of
 # runner time per PR (codeql-action has no overlay/incremental mode for Rust).
 #
-# A failed run (setup, extraction or analysis error) fails the gate; alerts found by a
-# successful run do not. They go to the Security tab.
+# This workflow itself fails only on a run error (setup, extraction or analysis). Alerts
+# go to the Security tab; the release gate in release-plz.yml then blocks publishing on
+# open high/critical ones that are not accepted in .github/codeql-allowlist.toml.
 name: "CodeQL Advanced"
 
 on:
