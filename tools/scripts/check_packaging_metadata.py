@@ -60,13 +60,6 @@ SKIP_DIR_NAMES = {"target", ".git"}
 # so their packaging metadata is irrelevant here.
 EXCLUDED_DIRS = {"tools/fuzz"}
 
-# Relative to the workspace root, directories exempt from rule 3 only (they
-# are still checked for packaging metadata). `examples/oop-gears/` is being
-# rewritten in an open PR (#4663) and its four crates predate the rule; they
-# are left to that PR rather than edited underneath it. Delete this once the
-# PR merges — the rule is then unconditional.
-TARGET_RULE_EXEMPT_DIRS = {"examples/oop-gears"}
-
 
 def is_under(rel_dir: str, directories) -> bool:
     """True if `rel_dir` is one of `directories` or sits inside one."""
@@ -310,12 +303,10 @@ def main() -> int:
         if root is not None and root != workspace_root:
             continue
 
-        rel_dir = "/".join(manifest_path.relative_to(workspace_root).parts[:-1])
-        if not is_under(rel_dir, TARGET_RULE_EXEMPT_DIRS):
-            targets_checked += 1
-            targets_missing = check_declared_targets(data, package, manifest_path.parent)
-            if targets_missing:
-                target_violations.append((manifest_path, targets_missing))
+        targets_checked += 1
+        targets_missing = check_declared_targets(data, package, manifest_path.parent)
+        if targets_missing:
+            target_violations.append((manifest_path, targets_missing))
 
         if not is_publishable(package):
             continue

@@ -24,7 +24,7 @@ The toolkit (`libs/`) is the low-level substrate every gear builds on.
 | `toolkit-odata-macros` | OData-filterable DTO derive | `#[derive(ODataFilterable)]` |
 | `toolkit-gts` / `-macros` | [Global Type System](https://github.com/GlobalTypeSystem/gts-rust): schema collection & generation | GTS schema registration |
 | `toolkit-sdk` | SDK-pattern helpers and transport-agnostic contracts | facade/query helpers |
-| `toolkit-transport-grpc` | gRPC transport for out-of-process gears | gRPC client/connect helpers |
+| `toolkit-transport-grpc` | Opt-in gRPC transport for out-of-process gears | gRPC client/connect helpers |
 | `toolkit-node-info`, `toolkit-utils` | Node/deployment info; shared utilities | — |
 | `rustls-corecrypto-provider`, `rustls-fips-shim` | FIPS 140-3 crypto routing per platform | TLS provider shims |
 

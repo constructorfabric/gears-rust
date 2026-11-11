@@ -48,6 +48,11 @@ Flight Control spawns OoP Worker processes on the same host (or across hosts for
 communicate with it via UDS (single-node) or TCP+mTLS (multi-node). Flight Control runs the DirectoryService
 (service-discovery) and the control-plane core gears; Workers run the AuthZ plane and application gears.
 
+> **Refined by [Amendment 2026-11-04](#amendment-2026-11-04-self-hosted-oop-transport-is-rest-first).** The implemented
+> OoP transport is REST-first (gRPC opt-in) over the TCP directory endpoint; the UDS / TCP+mTLS transport above remains
+> the forward target. Shared-secret platform auth is wired, but the Profile 2 bootstrap-token / mTLS credentials are
+> deferred. The amendment also records that the host need not be `flight-control`.
+
 ### Profile 3: K8s Native
 
 Each gear runs as an independent Kubernetes pod. Service discovery uses K8s DNS
@@ -142,3 +147,26 @@ for the corresponding deployment target. Recorded in
 multi-node P2 variant described above remains in scope for this ADR, and
 `Self-Hosted` covers it: deploying across your own machines is still
 self-hosting, so adopting the multi-node variant will not require renaming again.
+
+## Amendment 2026-11-04: Self-Hosted OoP transport is REST-first
+
+**The transport named in the Decision Outcome is refined, not withdrawn.** The body describes Profile 2 Workers
+communicating over UDS (single-node) or TCP+mTLS (multi-node); that remains the forward target for inter-process
+platform-plane transport and auth, and ADR-0006 still builds on it. This amendment records what actually shipped.
+
+**REST is the default OoP transport.** OoP Workers start their own HTTP server, self-register their REST endpoints with
+the host's DirectoryService, and the host's edge gateway reverse-proxies their public routes; gRPC is opt-in per gear or
+contract. The directory endpoint is TCP (`127.0.0.1:50051`) today — the UDS single-node option is future work, the
+TCP+mTLS multi-node variant unchanged and still in scope.
+
+**Profile 2 platform-plane auth is partly deferred.** Shared-secret internal auth is wired end-to-end — set
+`internal_auth` on `grpc-hub` (inbound) and `oop_http.internal_auth` on each worker (outbound). What is deferred is the
+`BootstrapToken` (single-node) / `MtlsIdentity` (multi-node) credential variants ADR-0006 and the PRD name for this
+profile: they are struct-only, deferred to Priority 2 (PRD §4.1). The shipped `config/oop-self-hosted.yaml` configures
+neither — it runs on trusted loopback, so its DirectoryService accepts `RegisterInstance` from any local process.
+Accepted P1 gap — P1 targets Profiles 1 + 3.
+
+**The host need not be `flight-control`.** `flight-control` is the minimal control-plane-only composition (directory,
+transport, edge, GTS catalogue, edge JWT validation). For density a deployment may instead run a `HostRuntime` binary
+linking both control-plane and application gears, spawning only the gears that need isolation — a generic `HostRuntime`
+capability driven by `runtime.type: oop`, not a `flight-control` feature.

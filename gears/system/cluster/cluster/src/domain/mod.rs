@@ -4,7 +4,7 @@
 //! The platform's DDD-light layout (`02_gear_layout_and_sdk_pattern.md:44`) puts this
 //! layer between `api/` (transport adapters) and `infra/` (persistence and IO). This
 //! gear has no `infra/`: it owns no store, because a backend's persistence belongs to
-//! the plugin that implements it — the same reason `calculator` and `nodes-registry`
+//! the plugin that implements it — the same reason `api-contracts` and `nodes-registry`
 //! ship without one.
 //!
 //! # What decides whether a file belongs here: does it exist without the wire?
