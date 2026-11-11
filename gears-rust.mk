@@ -72,7 +72,8 @@ OPENAPI_OUT ?= docs/api/api.json
 OPENAPI_CONFIG ?= config/e2e-local.yaml
 # Gears that keep their data in graph storage need PostgreSQL 16+ with pgvector to start.
 # `make openapi GEAR=<one of them>` runs a throwaway pgvector container on a free local port
-# and points the `pg_graph` server of OPENAPI_CONFIG at it, so no config edit is needed.
+# and points the `pg_graph` server of OPENAPI_CONFIG at it (host, port, user and password), so no
+# config edit is needed. The container's database is `graph_storage`, the one the config names.
 # An EXIT trap removes the container however the recipe ends, including Ctrl-C under dash.
 OPENAPI_PG_GEARS ?= graph-storage construct
 OPENAPI_PG_IMAGE ?= pgvector/pgvector:0.8.7-pg18
@@ -82,11 +83,14 @@ OPENAPI_PG_UP = command -v docker >/dev/null || { echo "docker is required: GEAR
 	trap 'docker rm -f "$$PG_CID" >/dev/null 2>&1' EXIT && trap 'exit 130' INT TERM && \
 	echo "Started $(OPENAPI_PG_IMAGE) for GEAR=$(GEAR)" && \
 	for i in $$(seq 1 60); do \
-		[ "$$(docker logs $$PG_CID 2>&1 | grep -c 'ready to accept connections')" -ge 2 ] && break; \
+		docker exec $$PG_CID pg_isready -q -h 127.0.0.1 -U postgres -d graph_storage && break; \
 		sleep 1; \
 	done && \
-	[ "$$(docker logs $$PG_CID 2>&1 | grep -c 'ready to accept connections')" -ge 2 ] || { echo "PostgreSQL did not become ready"; exit 1; }; \
-	export APP__DATABASE__SERVERS__PG_GRAPH__PORT=$$(docker port $$PG_CID 5432/tcp | head -n1 | sed 's/.*://')
+	docker exec $$PG_CID pg_isready -q -h 127.0.0.1 -U postgres -d graph_storage || { echo "PostgreSQL did not become ready"; exit 1; }; \
+	export APP__DATABASE__SERVERS__PG_GRAPH__HOST=127.0.0.1 \
+		APP__DATABASE__SERVERS__PG_GRAPH__PORT=$$(docker port $$PG_CID 5432/tcp | head -n1 | sed 's/.*://') \
+		APP__DATABASE__SERVERS__PG_GRAPH__USER=postgres \
+		APP__DATABASE__SERVERS__PG_GRAPH__PASSWORD=graph
 
 EMPTY :=
 SPACE := $(EMPTY) $(EMPTY)
