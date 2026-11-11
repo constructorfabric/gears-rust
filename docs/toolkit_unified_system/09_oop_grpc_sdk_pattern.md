@@ -196,6 +196,26 @@ The provider's process must run grpc-hub with a `listen_addr` and an `advertise_
 register; otherwise the consumer's readiness probe never finds the service and logs a hint after about
 ten rounds.
 
+For a tenant-plane contract (methods take `SecurityContext`):
+
+- the client sends only the caller's bearer. A hub with `internal_auth` must set
+  `internal_auth_enforcement: permissive`, or it refuses every call for the missing internal token;
+- grpc-hub does not authenticate the bearer. The server does it itself, for example with the in-process
+  `AuthNResolverClient` wrapped in `AuthNResolverBearerAuthenticator`.
+
+```yaml
+gears:
+  grpc-hub:
+    config:
+      listen_addr: "0.0.0.0:50051"
+      advertise_addr: "payments:50051"
+      internal_auth: { provider: kube, audiences: ["toolkit-internal"] }
+      internal_auth_enforcement: permissive
+```
+
+The `api-contracts` example (`api-contracts/src/grpc_gear.rs`, `config/oop-api-contracts.yaml`) runs this
+setup in the OoP E2E suite.
+
 ### Consumer
 
 ```rust

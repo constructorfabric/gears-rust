@@ -1501,6 +1501,8 @@ dependencies = [
  "axum",
  "cf-api-contracts-sdk",
  "cf-gears-authn-resolver",
+ "cf-gears-authn-resolver-sdk",
+ "cf-gears-grpc-hub",
  "cf-gears-static-authn-plugin",
  "cf-gears-toolkit",
  "cf-gears-toolkit-canonical-errors",
@@ -1551,6 +1553,29 @@ dependencies = [
  "serde_json",
  "tokio",
  "tokio-util",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "cf-api-contracts-grpc-consumer"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "axum",
+ "cf-api-contracts-sdk",
+ "cf-gears-authn-resolver",
+ "cf-gears-static-authn-plugin",
+ "cf-gears-toolkit",
+ "cf-gears-toolkit-canonical-errors",
+ "cf-gears-toolkit-security",
+ "cf-gears-types-registry",
+ "clap",
+ "futures-util",
+ "mimalloc",
+ "serde_json",
+ "tokio",
  "tracing",
  "uuid",
 ]

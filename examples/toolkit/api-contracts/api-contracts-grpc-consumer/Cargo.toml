@@ -1,0 +1,59 @@
+[package]
+name = "cf-api-contracts-grpc-consumer"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "api-contracts example — consumer gear that calls PaymentApi over gRPC, found through the directory"
+rust-version.workspace = true
+publish = false
+
+[lib]
+name = "cf_api_contracts_grpc_consumer"
+
+[features]
+default = []
+# OoP binary (api-contracts-grpc-consumer-oop): bootstrap + embedded authn stack.
+oop_module = [
+    "dep:clap",
+    "dep:mimalloc",
+    "toolkit/bootstrap",
+    "dep:authn-resolver",
+    "dep:static-authn-plugin",
+    "dep:types-registry",
+]
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "api-contracts-grpc-consumer-oop"
+path = "src/main.rs"
+required-features = ["oop_module"]
+
+[dependencies]
+# grpc-client for the resolving client `#[toolkit::consumes(.., transport = grpc)]`
+# names.
+api-contracts-sdk = { workspace = true, features = ["grpc-client"] }
+toolkit.workspace = true
+toolkit-canonical-errors.workspace = true
+toolkit-security.workspace = true
+async-trait.workspace = true
+anyhow.workspace = true
+axum.workspace = true
+futures-util.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tokio.workspace = true
+
+# OoP-only, gated behind `oop_module`.
+clap = { workspace = true, optional = true }
+mimalloc = { workspace = true, optional = true }
+authn-resolver = { package = "cf-gears-authn-resolver", path = "../../../../gears/system/authn-resolver/authn-resolver", optional = true }
+static-authn-plugin = { package = "cf-gears-static-authn-plugin", path = "../../../../gears/system/authn-resolver/plugins/static-authn-plugin", optional = true }
+types-registry = { package = "cf-gears-types-registry", path = "../../../../gears/system/types-registry/types-registry", optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }
+uuid.workspace = true

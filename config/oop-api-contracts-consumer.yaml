@@ -6,7 +6,7 @@
 #       -- --config config/oop-api-contracts-consumer.yaml
 #
 # Then:
-#   curl -X POST -H 'Authorization: Bearer test-token' -H 'Content-Type: application/json' \
+#   curl -X POST -H 'Authorization: Bearer oop-e2e-token' -H 'Content-Type: application/json' \
 #     -d '{"amount_cents":1000,"currency":"USD","description":"test"}' \
 #     http://127.0.0.1:9093/api-contracts-consumer/v1/charge
 #

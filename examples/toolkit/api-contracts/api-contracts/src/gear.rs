@@ -24,7 +24,7 @@ use crate::domain::service::PaymentDomainService;
 /// cannot live in a struct field. Without sharing, v1 and v2 would each get
 /// their own store and a payment charged through one version would 404 on the
 /// other — a major version changes the wire contract, not the business data.
-fn domain_service() -> Arc<PaymentDomainService> {
+pub(crate) fn domain_service() -> Arc<PaymentDomainService> {
     static DOMAIN: OnceLock<Arc<PaymentDomainService>> = OnceLock::new();
     Arc::clone(DOMAIN.get_or_init(|| Arc::new(PaymentDomainService::new())))
 }
@@ -45,6 +45,9 @@ fn domain_service() -> Arc<PaymentDomainService> {
 /// names differ, each gets its own `wire_*` method and its own wiring config
 /// key (`clients.provides.payment_api` / `clients.provides.payment_api_v2`) with no
 /// collision.
+///
+/// The gRPC service of `PaymentApi` is hosted by a separate gear,
+/// [`crate::grpc_gear::ApiContractsGrpc`] (feature `grpc-server`).
 #[toolkit::gear(name = "api-contracts", capabilities = [rest])]
 #[toolkit::provides(
     contract   = api_contracts_sdk::PaymentApi,

@@ -3,8 +3,11 @@
 //! Implements the tonic-generated `PaymentApiServer` trait by:
 //! 1. Converting inbound `Request<proto::*>` into SDK DTOs via the SDK's
 //!    `From`/`Into` bridge.
-//! 2. Reconstructing a `SecurityContext` from the `authorization` metadata
-//!    header (Bearer token), or falling back to anonymous.
+//! 2. Building a `SecurityContext` from the `authorization` metadata (Bearer
+//!    token). With an authenticator ([`PaymentApiGrpcService::with_authenticator`])
+//!    the token is validated and the context carries the caller's identity and
+//!    tenant, as on the REST path; without one the token is carried unvalidated
+//!    and a call without it is anonymous (in-process tests only).
 //! 3. Calling into [`crate::domain::service::PaymentDomainService`].
 //! 4. Mapping `CanonicalError` → `tonic::Status` (with optional
 //!    `ProblemDetails` envelope in trailers).
@@ -20,26 +23,66 @@ use api_contracts_sdk::grpc::stubs::payment_api_server::{PaymentApi, PaymentApiS
 use futures_core::Stream;
 use tonic::{Code, Request, Response, Status};
 use toolkit_canonical_errors::{CanonicalError, Problem};
-use toolkit_security::SecurityContext;
+use toolkit_security::{AuthNError, BearerAuthenticator, DynBearerAuthenticator, SecurityContext};
 
 use crate::domain::service::PaymentDomainService;
 
 /// gRPC service implementation backing the `PaymentApi` contract.
 pub struct PaymentApiGrpcService {
     domain: Arc<PaymentDomainService>,
+    authenticator: Option<DynBearerAuthenticator>,
 }
 
 impl PaymentApiGrpcService {
-    /// Wrap the domain service.
+    /// Wrap the domain service. The bearer token is not validated; use
+    /// [`Self::with_authenticator`] wherever the service is reachable by peers.
     #[must_use]
     pub fn new(domain: Arc<PaymentDomainService>) -> Self {
-        Self { domain }
+        Self {
+            domain,
+            authenticator: None,
+        }
+    }
+
+    /// Validate every call's bearer token with `authenticator`. A call without
+    /// one is rejected with `UNAUTHENTICATED`: the contract is tenant-plane.
+    ///
+    /// grpc-hub checks only the platform-plane internal token, so a gRPC
+    /// service has to authenticate the tenant itself.
+    #[must_use]
+    pub fn with_authenticator(mut self, authenticator: DynBearerAuthenticator) -> Self {
+        self.authenticator = Some(authenticator);
+        self
     }
 
     /// Convenience constructor returning the tonic Server-trait wrapper.
     #[must_use]
     pub fn into_server(self) -> PaymentApiServer<Self> {
         PaymentApiServer::new(self)
+    }
+
+    /// The caller's [`SecurityContext`], or the `Status` to reject the call
+    /// with (canonical Problem trailer attached).
+    async fn security_context(
+        &self,
+        metadata: &tonic::metadata::MetadataMap,
+    ) -> Result<SecurityContext, Status> {
+        let token = match bearer_token(metadata) {
+            Ok(token) => token,
+            Err(reason) => return Err(unauthenticated(reason)),
+        };
+        match (&self.authenticator, token) {
+            (Some(auth), Some(token)) => auth
+                .authenticate(token)
+                .await
+                .map_err(|e| authn_to_status(&e)),
+            (Some(_), None) => Err(unauthenticated("MISSING_BEARER")),
+            (None, Some(token)) => SecurityContext::builder()
+                .bearer_token(token.to_owned())
+                .build()
+                .map_err(|_| unauthenticated("INVALID_BEARER")),
+            (None, None) => Ok(SecurityContext::anonymous()),
+        }
     }
 }
 
@@ -49,7 +92,7 @@ impl PaymentApi for PaymentApiGrpcService {
         &self,
         request: Request<stubs::ChargeRequest>,
     ) -> Result<Response<stubs::ChargeResponse>, Status> {
-        let ctx = require_security_context(request.metadata())?;
+        let ctx = self.security_context(request.metadata()).await?;
         let proto = request.into_inner();
         // `try_from_proto` surfaces `via_string` parse failures (e.g. malformed
         // UUID strings) as `InvalidArgument` instead of panicking the server.
@@ -65,7 +108,7 @@ impl PaymentApi for PaymentApiGrpcService {
         &self,
         request: Request<stubs::GetInvoiceRequest>,
     ) -> Result<Response<stubs::Invoice>, Status> {
-        let ctx = require_security_context(request.metadata())?;
+        let ctx = self.security_context(request.metadata()).await?;
         let invoice_id = request.into_inner().invoice_id;
         match self.domain.get_invoice(&ctx, &invoice_id) {
             Ok(invoice) => Ok(Response::new(invoice.into())),
@@ -80,7 +123,7 @@ impl PaymentApi for PaymentApiGrpcService {
         &self,
         request: Request<stubs::ListPaymentsFilter>,
     ) -> Result<Response<Self::ListPaymentsStream>, Status> {
-        let ctx = require_security_context(request.metadata())?;
+        let ctx = self.security_context(request.metadata()).await?;
         let proto = request.into_inner();
         let filter = api_contracts_sdk::models::ListPaymentsFilter::try_from_proto(&proto)
             .map_err(|e| Status::invalid_argument(e.to_string()))?;
@@ -120,7 +163,7 @@ impl PaymentApi for PaymentApiGrpcService {
         &self,
         request: Request<stubs::ListPaymentsFilter>,
     ) -> Result<Response<Self::StreamPaymentsStream>, Status> {
-        let ctx = require_security_context(request.metadata())?;
+        let ctx = self.security_context(request.metadata()).await?;
         let proto = request.into_inner();
         let filter = api_contracts_sdk::models::ListPaymentsFilter::try_from_proto(&proto)
             .map_err(|e| Status::invalid_argument(e.to_string()))?;
@@ -149,52 +192,76 @@ impl PaymentApi for PaymentApiGrpcService {
     }
 }
 
-/// Bearer-token validation outcome for the inbound gRPC call.
-enum AuthOutcome {
-    Anonymous,
-    Authenticated(SecurityContext),
-    /// `authorization` metadata was present but couldn't be turned into a
-    /// valid `SecurityContext`. The call must be rejected — silently
-    /// degrading to anonymous masks credential bugs in production. Mirror
-    /// of the REST handler's behaviour for symmetry across transports.
-    Invalid,
-}
+/// `Retry-After` hint when the authentication backend is unavailable; the REST
+/// middleware uses the same value.
+const AUTH_RETRY_AFTER_SECONDS: u64 = 5;
 
-fn classify_auth(metadata: &tonic::metadata::MetadataMap) -> AuthOutcome {
+/// The bearer token from the `authorization` metadata: `Ok(None)` when there
+/// is none, `Err(reason)` when it is present but malformed. A malformed header
+/// is rejected rather than treated as anonymous, which would hide credential
+/// bugs. Parsed as the REST middleware does: the scheme is case-insensitive,
+/// the token is trimmed and must not contain whitespace.
+fn bearer_token(metadata: &tonic::metadata::MetadataMap) -> Result<Option<&str>, &'static str> {
     let Some(raw) = metadata.get("authorization") else {
-        return AuthOutcome::Anonymous;
+        return Ok(None);
     };
-    let Ok(value) = raw.to_str() else {
-        return AuthOutcome::Invalid;
-    };
-    let Some(token) = value.strip_prefix("Bearer ") else {
-        return AuthOutcome::Invalid;
-    };
-    match SecurityContext::builder()
-        .bearer_token(token.to_owned())
-        .build()
+    let value = raw.to_str().map_err(|_| "INVALID_BEARER")?;
+    let (scheme, token) = value
+        .trim_start()
+        .split_once(char::is_whitespace)
+        .ok_or("INVALID_BEARER")?;
+    let token = token.trim();
+    if !scheme.eq_ignore_ascii_case("Bearer")
+        || token.is_empty()
+        || token.contains(char::is_whitespace)
     {
-        Ok(ctx) => AuthOutcome::Authenticated(ctx),
-        Err(_) => AuthOutcome::Invalid,
+        return Err("INVALID_BEARER");
+    }
+    Ok(Some(token))
+}
+
+/// `UNAUTHENTICATED` with a canonical Problem carrying `reason`. The reasons
+/// are the REST middleware's: `MISSING_BEARER`, `INVALID_BEARER`,
+/// `AUTHN_FAILED`.
+fn unauthenticated(reason: &str) -> Status {
+    canonical_to_status(
+        CanonicalError::unauthenticated()
+            .with_reason(reason)
+            .create(),
+    )
+}
+
+/// Maps an authentication failure the way the REST middleware does: a
+/// rejected token is `UNAUTHENTICATED`; an unreachable backend is `UNAVAILABLE`
+/// with a retry hint; anything else is an infrastructure failure, `INTERNAL`,
+/// not the caller's fault. Every status carries a Problem, so the caller's
+/// circuit breaker does not count it against this endpoint.
+fn authn_to_status(err: &AuthNError) -> Status {
+    match err {
+        AuthNError::InvalidToken => token_rejected(),
+        AuthNError::Unavailable => authn_backend_unavailable(),
+        // `AuthNError` is `#[non_exhaustive]`.
+        _ => authn_backend_failed(),
     }
 }
 
-/// Produce a [`SecurityContext`] for the gRPC call, rejecting with
-/// `Code::Unauthenticated` (canonical Problem trailer attached) when an
-/// `authorization` metadata is present but malformed.
-fn require_security_context(
-    metadata: &tonic::metadata::MetadataMap,
-) -> Result<SecurityContext, Status> {
-    match classify_auth(metadata) {
-        AuthOutcome::Anonymous => Ok(SecurityContext::anonymous()),
-        AuthOutcome::Authenticated(ctx) => Ok(ctx),
-        AuthOutcome::Invalid => {
-            let err = CanonicalError::unauthenticated()
-                .with_reason("malformed authorization metadata")
-                .create();
-            Err(canonical_to_status(err))
-        }
-    }
+fn token_rejected() -> Status {
+    tracing::warn!("gRPC bearer token rejected: invalid or expired");
+    unauthenticated("AUTHN_FAILED")
+}
+
+fn authn_backend_unavailable() -> Status {
+    tracing::warn!("gRPC bearer token validation: authentication backend unavailable");
+    canonical_to_status(
+        CanonicalError::service_unavailable()
+            .with_retry_after_seconds(AUTH_RETRY_AFTER_SECONDS)
+            .create(),
+    )
+}
+
+fn authn_backend_failed() -> Status {
+    tracing::error!("gRPC bearer token validation: unexpected infrastructure failure");
+    canonical_to_status(CanonicalError::internal("authentication infrastructure failure").create())
 }
 
 /// Map a [`CanonicalError`] onto a [`tonic::Status`] **with** the canonical

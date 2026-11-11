@@ -1169,8 +1169,9 @@ e2e-oop: py-env
 	$(call print_target_banner)
 	cargo build -p cf-gears-flight-control --bin flight-control
 	cargo build -p hello --features oop_module --bin hello-oop
-	cargo build -p cf-api-contracts --features oop_module --bin api-contracts-oop
+	cargo build -p cf-api-contracts --features oop_module,grpc-server --bin api-contracts-oop
 	cargo build -p cf-api-contracts-consumer --features oop_module --bin api-contracts-consumer-oop
+	cargo build -p cf-api-contracts-grpc-consumer --features oop_module --bin api-contracts-grpc-consumer-oop
 	OOP_E2E=1 $(PYTHON) -m pytest testing/e2e/suites/oop \
 		-o timeout_func_only=true --timeout=30 -vv
 

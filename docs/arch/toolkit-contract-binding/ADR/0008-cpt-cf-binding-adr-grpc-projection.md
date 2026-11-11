@@ -234,6 +234,15 @@ Recorded deliberately rather than left to be rediscovered:
   cleartext, and under `require_tls` (the default in FIPS builds) it refuses
   every endpoint: a gRPC consumer there needs an explicit `require_tls: false`.
   The REST client configures TLS through `toolkit-http`.
+* **Tenant-plane calls and grpc-hub's internal auth.** A tenant-plane method
+  sends only the caller's bearer, no internal token, as over REST. But REST's
+  platform-plane check is always permissive, while grpc-hub's
+  `internal_auth_enforcement` defaults to `required` and refuses any RPC
+  without a valid internal token. A hub that serves tenant-plane contracts and
+  has `internal_auth` set (required off loopback) must therefore use
+  `internal_auth_enforcement: permissive`. grpc-hub has no tenant-plane layer:
+  the hand-written server authenticates the bearer itself (the `api-contracts`
+  example does it with the `AuthN` resolver).
 * **Errors in trailers after headers are not seen by the circuit breaker.** The
   classifier reads trailers-only responses, which is how tonic servers send
   unary errors; a status that arrives after the response headers (a

@@ -8,7 +8,11 @@
 //! (embedded authn stack), and serves `/api-contracts/v1/...`. Consumer units
 //! (e.g. `api-contracts-consumer`) discover this endpoint via the
 //! `DirectoryService` and call the `PaymentApi` contract over REST — the `OoP`
-//! gear-to-gear path.
+//! gear-to-gear path. Built with `grpc-server` as well, the same process also
+//! serves `PaymentApi` over gRPC through grpc-hub, which publishes the service
+//! in the directory for consumers declared with `transport = grpc` (e.g.
+//! `api-contracts-grpc-consumer`); the config then needs a `gears.grpc-hub`
+//! section.
 
 mod registered_gears;
 
@@ -23,7 +27,7 @@ static GLOBAL: MiMalloc = MiMalloc;
 /// `api-contracts` `OoP` provider gear.
 #[derive(Parser)]
 #[command(name = "api-contracts-oop")]
-#[command(about = "api-contracts - PaymentApi REST provider OoP gear")]
+#[command(about = "api-contracts - PaymentApi provider OoP gear (REST, and gRPC with grpc-server)")]
 #[command(version = env!("CARGO_PKG_VERSION"))]
 struct Cli {
     /// Path to configuration file.

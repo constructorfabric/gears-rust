@@ -175,6 +175,7 @@ members = [
     "examples/toolkit/api-contracts/api-contracts-sdk",
     "examples/toolkit/api-contracts/api-contracts",
     "examples/toolkit/api-contracts/api-contracts-consumer",
+    "examples/toolkit/api-contracts/api-contracts-grpc-consumer",
     "gears/chat-engine/chat-engine-sdk",
     "gears/chat-engine/chat-engine",
     "gears/model-registry/model-registry-sdk",
