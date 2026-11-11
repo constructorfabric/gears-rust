@@ -25,27 +25,47 @@ env:
   CARGO_INCREMENTAL: "0"
 
 jobs:
-  # Publishing waits for CodeQL. A release is only expected when the pushed commit is the
-  # merge of a release-plz PR, or when someone dispatched `release` by hand; any other push
-  # to main skips the scan (it would cost ~1h on every merge) and publishes nothing.
-  # CodeQL failing, or open unaccepted high/critical CodeQL alerts, block `release`: no
-  # crate is published.
-  codeql:
-    name: CodeQL gate
+  # Publishing waits for CodeQL, but only when there is something to publish: a workspace
+  # crate whose manifest version is not on crates.io yet. That covers a release PR merge, a
+  # manual dispatch, and an interrupted release finished by a later push alike. Every other
+  # push to main skips the ~1h scan and publishes nothing. The check is fail-closed (an
+  # unreadable index counts as pending), and a failed check blocks `release`.
+  pending:
+    name: Release pending?
     if: >-
       ${{
         github.repository == 'constructorfabric/gears-rust'
         && (
-          (github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'release')
-          || (
-            github.event_name == 'push'
-            && (
-              startsWith(github.event.head_commit.message, 'chore: release')
-              || contains(github.event.head_commit.message, 'release-plz-')
-            )
-          )
+          github.event_name == 'push'
+          || (github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'release')
         )
       }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      release: ${{ steps.check.outputs.release }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Compare manifest versions with crates.io
+        id: check
+        env:
+          # `cargo metadata --no-deps` needs no toolchain; keep rustup from installing the
+          # one pinned in rust-toolchain.toml.
+          RUSTUP_TOOLCHAIN: stable
+        run: python3 -I tools/scripts/release_pending.py
+
+  # CodeQL failing, or open unaccepted high/critical CodeQL alerts (job below), block
+  # `release`: no crate is published.
+  codeql:
+    name: CodeQL gate
+    needs: pending
+    if: needs.pending.outputs.release == 'true'
     permissions:
       contents: read
       security-events: write
@@ -85,10 +105,11 @@ jobs:
     runs-on: ubuntu-latest
     # `!cancelled()` plus an explicit result check: the gate is skipped on most pushes
     # (then publishing proceeds as before), but a failed or cancelled gate blocks it.
-    needs: [codeql, codeql-alerts]
+    needs: [pending, codeql, codeql-alerts]
     if: >-
       ${{
         !cancelled()
+        && (needs.pending.result == 'success' || needs.pending.result == 'skipped')
         && (needs.codeql.result == 'success' || needs.codeql.result == 'skipped')
         && (needs.codeql-alerts.result == 'success' || needs.codeql-alerts.result == 'skipped')
         && github.repository == 'constructorfabric/gears-rust'
