@@ -70,6 +70,22 @@ OPENAPI_URL ?= http://127.0.0.1:$(OPENAPI_PORT)/openapi.json
 OPENAPI_READY_URL ?= $(patsubst %/openapi.json,%/readyz,$(OPENAPI_URL))
 OPENAPI_OUT ?= docs/api/api.json
 OPENAPI_CONFIG ?= config/e2e-local.yaml
+# Gears that keep their data in graph storage need PostgreSQL 16+ with pgvector to start.
+# `make openapi GEAR=<one of them>` runs a throwaway pgvector container on a free local port
+# and points the `pg_graph` server of OPENAPI_CONFIG at it, so no config edit is needed.
+OPENAPI_PG_GEARS ?= graph-storage construct
+OPENAPI_PG_IMAGE ?= pgvector/pgvector:0.8.7-pg18
+OPENAPI_GEAR_NEEDS_PG := $(filter $(GEAR),$(OPENAPI_PG_GEARS))
+OPENAPI_PG_UP = command -v docker >/dev/null || { echo "docker is required: GEAR=$(GEAR) needs PostgreSQL with pgvector"; exit 1; }; \
+	PG_CID=$$(docker run -d --rm -e POSTGRES_PASSWORD=graph -e POSTGRES_DB=graph_storage -p 127.0.0.1::5432 $(OPENAPI_PG_IMAGE)) && \
+	echo "Started $(OPENAPI_PG_IMAGE) for GEAR=$(GEAR)" && \
+	for i in $$(seq 1 60); do \
+		[ "$$(docker logs $$PG_CID 2>&1 | grep -c 'ready to accept connections')" -ge 2 ] && break; \
+		sleep 1; \
+	done && \
+	[ "$$(docker logs $$PG_CID 2>&1 | grep -c 'ready to accept connections')" -ge 2 ] || { echo "PostgreSQL did not become ready"; docker rm -f $$PG_CID >/dev/null 2>&1; exit 1; }; \
+	export APP__DATABASE__SERVERS__PG_GRAPH__PORT=$$(docker port $$PG_CID 5432/tcp | head -n1 | sed 's/.*://')
+OPENAPI_PG_DOWN = docker rm -f $$PG_CID >/dev/null 2>&1
 
 EMPTY :=
 SPACE := $(EMPTY) $(EMPTY)
@@ -352,17 +368,17 @@ ifeq ($(GEAR_HAS_SERVER_FEATURE),)
 else
 	@command -v curl >/dev/null || (echo "curl is required to generate OpenAPI spec" && exit 1)
 	@echo "Starting cf-gears-example-server to generate OpenAPI spec..."
-	@mkdir -p $$(dirname "$(if $(GEAR),$(GEAR_OPENAPI_TMP),$(OPENAPI_OUT))") && \
+	@$(if $(OPENAPI_GEAR_NEEDS_PG),$(OPENAPI_PG_UP) && )( \
+	mkdir -p $$(dirname "$(GEAR_OPENAPI_TMP)") && \
 	$(call start_server_and_wait,$(EXAMPLE_SERVER_DEBUG_BINARY) --config $(OPENAPI_CONFIG) --port $(OPENAPI_PORT),$(OPENAPI_READY_URL),300) && \
 	echo "Fetching OpenAPI spec..." && \
-	curl -fsS "$(OPENAPI_URL)" -o "$(if $(GEAR),$(GEAR_OPENAPI_TMP),$(OPENAPI_OUT))" && \
-	if [ -n "$(GEAR)" ]; then \
-		echo "Merging $(GEAR) OpenAPI into $(OPENAPI_OUT)..." && \
-		$(PYTHON) tools/scripts/merge_openapi_json.py "$(OPENAPI_OUT)" "$(GEAR_OPENAPI_TMP)"; \
-	fi && \
+	curl -fsS "$(OPENAPI_URL)" -o "$(GEAR_OPENAPI_TMP)" && \
+	echo "Merging $(GEAR) OpenAPI into $(OPENAPI_OUT)..." && \
+	$(PYTHON) tools/scripts/merge_openapi_json.py "$(OPENAPI_OUT)" "$(GEAR_OPENAPI_TMP)" && \
 	echo "Sorting OpenAPI JSON for deterministic ordering..." && \
 	$(PYTHON) tools/scripts/sort_openapi_json.py "$(OPENAPI_OUT)" && \
-	echo "OpenAPI spec saved to $(OPENAPI_OUT)"
+	echo "OpenAPI spec saved to $(OPENAPI_OUT)" \
+	); rc=$$?; $(if $(OPENAPI_GEAR_NEEDS_PG),$(OPENAPI_PG_DOWN);) exit $$rc
 endif
 else
 	@command -v curl >/dev/null || (echo "curl is required to generate OpenAPI spec" && exit 1)
