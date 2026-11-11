@@ -107,6 +107,13 @@ def main():
             run(["git", "tag", "-a", tag, sha, "-m", f"{name} v{version}"], env=env)
             run(["git", "push", url, f"refs/tags/{tag}"])
         except subprocess.CalledProcessError as e:
+            # A concurrent run (no concurrency group on this workflow) may have pushed it first.
+            try:
+                if tag in remote_tags():
+                    print(f"{tag} already exists on origin (concurrent run); nothing to do")
+                    continue
+            except subprocess.CalledProcessError:
+                pass
             msg = (e.stderr or "").replace(token, "***") if token else (e.stderr or "")
             print(f"::error::failed to backfill {tag} at {sha}: {msg.strip()}")
             failed.append(tag)
