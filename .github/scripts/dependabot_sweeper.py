@@ -242,8 +242,6 @@ def _decide_red(labels, age_h, budget):
 
 def _green_skip(labels, review_decision, unresolved_threads, mergeable):
     """Return a skip/wait string for a green PR that must not merge, else None."""
-    if LABEL_MIGRATION in labels:
-        return "skip: needs-migration label"
     if review_decision == "CHANGES_REQUESTED":
         return "skip: changes requested"
     if unresolved_threads:
@@ -266,6 +264,9 @@ def decide(*, untrusted_commits, eligible, checks, mergeable, labels, age_h, bud
         return "skip: draft"
     if not eligible:
         return _label_or_noop(labels)
+    if LABEL_MIGRATION in labels:
+        # Never recreate: it would overwrite the manual migration edits.
+        return "skip: needs-migration label"
     if checks == "wait":
         return "wait"
     if checks == "red":
@@ -415,6 +416,11 @@ def add_label(gh, n, label):
     gh.write("api", "-X", "POST", f"repos/{gh.repo}/issues/{n}/labels", "-f", f"labels[]={label}")
 
 
+def fetch_labels(gh, n):
+    view = gh.read_json("pr", "view", str(n), "--repo", gh.repo, "--json", "labels")
+    return {x["name"] for x in (view or {}).get("labels", [])}
+
+
 def _fetch_state(gh, n):
     view = gh.read_json(
         "pr", "view", str(n), "--repo", gh.repo, "--json",
@@ -440,12 +446,20 @@ def _merge(gh, n, view):
     """Approve (if needed) and squash-merge; return the outcome string."""
     sha = view["headRefOid"]
     review_id = None
+    # A hold label added after the decision is honoured by re-reading labels
+    # before each irreversible step. This narrows the race, it does not close it.
+    if LABEL_HOLD in fetch_labels(gh, n):
+        return "skip: hold (appeared before approval)"
     if not has_head_approval(view.get("reviews"), sha):
         # The approval is tied to the checked SHA; `--match-head-commit` is the
         # actual merge gate, and on failure the approval is withdrawn.
         review = gh.write("api", f"repos/{gh.repo}/pulls/{n}/reviews", "-f",
                           "event=APPROVE", "-f", f"commit_id={sha}", capture=True)
         review_id = (review or {}).get("id")
+        if LABEL_HOLD in fetch_labels(gh, n):
+            return "skip: hold (appeared after approval)" + (
+                _dismiss_approval(gh, n, review_id, reason="deps:hold appeared")
+                if review_id is not None else "")
     try:
         gh.write("pr", "merge", str(n), "--repo", gh.repo, "--squash",
                  "--match-head-commit", sha)
@@ -457,12 +471,12 @@ def _merge(gh, n, view):
     return "merge"
 
 
-def _dismiss_approval(gh, n, review_id):
+def _dismiss_approval(gh, n, review_id, reason="merge failed"):
     try:
         gh.write("api", "-X", "PUT",
                  f"repos/{gh.repo}/pulls/{n}/reviews/{review_id}/dismissals",
-                 "-f", "message=Dependabot sweeper: merge failed, "
-                 "withdrawing automatic approval", "-f", "event=DISMISS")
+                 "-f", f"message=Dependabot sweeper: {reason}, withdrawing automatic approval",
+                 "-f", "event=DISMISS")
         return "; approval dismissed"
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e2:
         return f"; approval dismiss FAILED ({describe(e2)})"

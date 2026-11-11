@@ -256,6 +256,11 @@ class Decide(unittest.TestCase):
     def test_green_needs_migration_label(self):
         self.assertEqual(act(labels={s.LABEL_MIGRATION}), "skip: needs-migration label")
 
+    def test_red_needs_migration_never_recreates(self):
+        b = s.Budget()
+        row = act(checks="red", age_h=s.STALE_HOURS + 1, labels={s.LABEL_MIGRATION}, budget=b)
+        self.assertEqual((row.startswith("skip"), b.recreates), (True, 0))
+
     def test_changes_requested(self):
         self.assertEqual(act(review_decision="CHANGES_REQUESTED"), "skip: changes requested")
 
@@ -414,6 +419,7 @@ class Failures(unittest.TestCase):
     def test_dismissal_call_shape(self):
         _, calls = self.live_run(["merge"])
         self.assertEqual(calls[-1][1:5], ["api", "-X", "PUT", "repos/o/r/pulls/7/reviews/99/dismissals"])
+        self.assertIn("message=Dependabot sweeper: merge failed, withdrawing automatic approval", calls[-1])
 
     def test_dismissal_failure_reported(self):
         row, _ = self.live_run(["merge", "-X"])
@@ -427,6 +433,30 @@ class Failures(unittest.TestCase):
     def test_approve_failure_skips_merge(self):
         row, calls = self.live_run(["event=APPROVE"])
         self.assertEqual((row[-1], len(calls)), ("merge FAILED (timeout)", 1))
+
+    def live_hold(self, label_reads):
+        calls = []
+
+        def fake_run(args, **kw):
+            calls.append(args)
+            return mock.Mock(stdout='{"id": 99}')
+
+        with mock.patch.object(s.Gh, "read_json", fake_read([GOOD])), \
+                mock.patch.object(s, "fetch_labels", side_effect=label_reads), \
+                mock.patch("subprocess.run", side_effect=fake_run):
+            row = s.process(s.Gh("o/r", True), PR, s.Budget(), NOW)
+        return row, calls
+
+    def test_hold_before_approval_does_nothing(self):
+        row, calls = self.live_hold([{s.LABEL_HOLD}])
+        self.assertEqual((row[-1], calls), ("skip: hold (appeared before approval)", []))
+
+    def test_hold_after_approval_dismisses_and_skips_merge(self):
+        row, calls = self.live_hold([set(), {s.LABEL_HOLD}])
+        self.assertEqual(row[-1], "skip: hold (appeared after approval); approval dismissed")
+        self.assertIn("message=Dependabot sweeper: deps:hold appeared, withdrawing automatic approval",
+                      calls[-1])
+        self.assertFalse(any("merge" in c for c in calls))
 
     def test_eligible_dry_run_merge(self):
         with mock.patch.object(s.Gh, "read_json", fake_read([GOOD])):
