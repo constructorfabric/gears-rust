@@ -23,7 +23,7 @@
 
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use sea_orm::{ConnectOptions, ConnectionTrait, Database, Statement};
 use testcontainers::bollard::Docker;
@@ -51,9 +51,14 @@ static NEXT_DATABASE: AtomicU32 = AtomicU32::new(0);
 /// A fresh database on the shared server; its DSN.
 pub async fn fresh_database() -> String {
     let port = server_port();
+    // The time keeps the name free when a finished run with the same process
+    // id left its databases on the reused server.
     let database = format!(
-        "t_{}_{}",
+        "t_{}_{}_{}",
         std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis()),
         NEXT_DATABASE.fetch_add(1, Ordering::Relaxed)
     );
     let admin = Database::connect(small_pool(&url(port, "postgres")))
@@ -239,9 +244,10 @@ async fn answers(port: u16) -> bool {
 
 /// The process id in a database name that this module minted.
 fn owning_pid(name: &str) -> Option<u32> {
-    let (pid, counter) = name.strip_prefix("t_")?.split_once('_')?;
-    counter.parse::<u32>().ok()?;
-    pid.parse().ok()
+    let (pid, rest) = name.strip_prefix("t_")?.split_once('_')?;
+    rest.split('_')
+        .all(|part| part.parse::<u128>().is_ok())
+        .then(|| pid.parse().ok())?
 }
 
 /// Whether a process with this id runs on this host; `None` when `ps` cannot
