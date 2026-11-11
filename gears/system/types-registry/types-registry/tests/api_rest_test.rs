@@ -5103,8 +5103,20 @@ fn every_entity_read_requires_identity_kind_and_lifecycle_in_the_generated_docum
     );
     let lookup = &schemas["EntityLookupDto"]["properties"]["entity"]["oneOf"];
     assert_eq!(lookup.as_array().map(Vec::len), Some(2), "{lookup}");
-    assert_eq!(lookup[0], json!({"type": "null"}));
-    assert_eq!(lookup[1]["$ref"], entity_ref);
+    let members = lookup.as_array().expect("oneOf members");
+    assert_eq!(
+        members
+            .iter()
+            .filter(|m| **m == json!({"type": "null"}))
+            .count(),
+        1,
+        "{lookup}"
+    );
+    assert_eq!(
+        members.iter().filter(|m| m["$ref"] == entity_ref).count(),
+        1,
+        "{lookup}"
+    );
     assert_eq!(
         schemas["EntityPageDto"]["properties"]["items"]["items"]["$ref"],
         entity_ref

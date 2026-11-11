@@ -19,11 +19,11 @@
           "stored": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/RestrictionDto",
                 "description": "The pair's own row, when one exists."
+              },
+              {
+                "type": "null"
               }
             ]
           },
@@ -539,11 +539,11 @@
           "amount": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/MoneyDto",
                 "description": "The governed magnitude the D2 threshold was compared against, in the\noperation's own currency and stored scale; `null` for a kind with no\nmonetary facts (period reopen, payer closure)."
+              },
+              {
+                "type": "null"
               }
             ]
           },
@@ -728,10 +728,10 @@
           "img_thumbnail": {
             "oneOf": [
               {
-                "type": "null"
+                "$ref": "#/components/schemas/ImgThumbnailDto"
               },
               {
-                "$ref": "#/components/schemas/ImgThumbnailDto"
+                "type": "null"
               }
             ]
           },
@@ -795,10 +795,10 @@
           "img_thumbnail": {
             "oneOf": [
               {
-                "type": "null"
+                "$ref": "#/components/schemas/ImgThumbnailDto"
               },
               {
-                "$ref": "#/components/schemas/ImgThumbnailDto"
+                "type": "null"
               }
             ]
           },
@@ -1119,11 +1119,11 @@
           "functional_balance": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/MoneyDto",
                 "description": "Functional-currency carried balance; `null` on a single-currency grain\n(functional ≡ transaction)."
+              },
+              {
+                "type": "null"
               }
             ]
           }
@@ -1228,11 +1228,11 @@
           "change": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/SetResultDto",
                 "description": "The change, when committed."
+              },
+              {
+                "type": "null"
               }
             ]
           },
@@ -1773,20 +1773,20 @@
           "app": {
             "oneOf": [
               {
-                "type": "null"
+                "$ref": "#/components/schemas/CheckAppDto"
               },
               {
-                "$ref": "#/components/schemas/CheckAppDto"
+                "type": "null"
               }
             ]
           },
           "check_suite": {
             "oneOf": [
               {
-                "type": "null"
+                "$ref": "#/components/schemas/CheckSuiteRefDto"
               },
               {
-                "$ref": "#/components/schemas/CheckSuiteRefDto"
+                "type": "null"
               }
             ]
           },
@@ -2036,10 +2036,10 @@
           "span": {
             "oneOf": [
               {
-                "type": "null"
+                "$ref": "#/components/schemas/TextSpan"
               },
               {
-                "$ref": "#/components/schemas/TextSpan"
+                "type": "null"
               }
             ]
           },
@@ -2197,10 +2197,10 @@
           "user": {
             "oneOf": [
               {
-                "type": "null"
+                "$ref": "#/components/schemas/ActorDto"
               },
               {
-                "$ref": "#/components/schemas/ActorDto"
+                "type": "null"
               }
             ]
           }
@@ -2270,10 +2270,10 @@
           "user": {
             "oneOf": [
               {
-                "type": "null"
+                "$ref": "#/components/schemas/ActorDto"
               },
               {
-                "$ref": "#/components/schemas/ActorDto"
+                "type": "null"
               }
             ]
           }
@@ -2312,10 +2312,10 @@
           "author": {
             "oneOf": [
               {
-                "type": "null"
+                "$ref": "#/components/schemas/ActorDto"
               },
               {
-                "$ref": "#/components/schemas/ActorDto"
+                "type": "null"
               }
             ]
           },
@@ -2325,10 +2325,10 @@
           "committer": {
             "oneOf": [
               {
-                "type": "null"
+                "$ref": "#/components/schemas/ActorDto"
               },
               {
-                "$ref": "#/components/schemas/ActorDto"
+                "type": "null"
               }
             ]
           },
@@ -2344,10 +2344,10 @@
           "stats": {
             "oneOf": [
               {
-                "type": "null"
+                "$ref": "#/components/schemas/CommitStatsDto"
               },
               {
-                "$ref": "#/components/schemas/CommitStatsDto"
+                "type": "null"
               }
             ]
           }
@@ -2446,10 +2446,10 @@
           "creator": {
             "oneOf": [
               {
-                "type": "null"
+                "$ref": "#/components/schemas/ActorDto"
               },
               {
-                "$ref": "#/components/schemas/ActorDto"
+                "type": "null"
               }
             ]
           },
@@ -3074,13 +3074,9 @@
         "description": "Request to create a file (`POST /files`).",
         "properties": {
           "bind": {
+            "$ref": "#/components/schemas/BindModeDto",
             "default": "auto",
-            "oneOf": [
-              {
-                "$ref": "#/components/schemas/BindModeDto",
-                "description": "Bind mode for the first content: `\"auto\"` (default; the upload itself binds under a\n`content_id IS NULL` CAS) or `\"manual\"` (an explicit `POST /files/{id}/bind`\nafterwards). Not part of the idempotency request hash."
-              }
-            ]
+            "description": "Bind mode for the first content: `\"auto\"` (default; the upload itself binds under a\n`content_id IS NULL` CAS) or `\"manual\"` (an explicit `POST /files/{id}/bind`\nafterwards). Not part of the idempotency request hash."
           },
           "custom_metadata": {
             "items": {
@@ -3104,11 +3100,11 @@
           "multipart": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/CreateMultipartIntentDto",
                 "description": "Optional multipart intent. When the server-computed plan has **two or more parts**,\nthe response carries the parts plan (`UploadTicketDto::multipart`) instead of a\nsingle-part `upload_url`; a one-part plan falls back to `upload_url`."
+              },
+              {
+                "type": "null"
               }
             ]
           },
@@ -3232,10 +3228,10 @@
           "cors": {
             "oneOf": [
               {
-                "type": "null"
+                "$ref": "#/components/schemas/CorsConfig"
               },
               {
-                "$ref": "#/components/schemas/CorsConfig"
+                "type": "null"
               }
             ]
           },
@@ -3248,10 +3244,10 @@
           "plugins": {
             "oneOf": [
               {
-                "type": "null"
+                "$ref": "#/components/schemas/PluginsConfig"
               },
               {
-                "$ref": "#/components/schemas/PluginsConfig"
+                "type": "null"
               }
             ]
           },
@@ -3262,10 +3258,10 @@
           "rate_limit": {
             "oneOf": [
               {
-                "type": "null"
+                "$ref": "#/components/schemas/RateLimitConfig"
               },
               {
-                "$ref": "#/components/schemas/RateLimitConfig"
+                "type": "null"
               }
             ]
           },
@@ -3372,20 +3368,20 @@
           "auth": {
             "oneOf": [
               {
-                "type": "null"
+                "$ref": "#/components/schemas/AuthConfig"
               },
               {
-                "$ref": "#/components/schemas/AuthConfig"
+                "type": "null"
               }
             ]
           },
           "cors": {
             "oneOf": [
               {
-                "type": "null"
+                "$ref": "#/components/schemas/CorsConfig"
               },
               {
-                "$ref": "#/components/schemas/CorsConfig"
+                "type": "null"
               }
             ]
           },
@@ -3395,20 +3391,20 @@
           "headers": {
             "oneOf": [
               {
-                "type": "null"
+                "$ref": "#/components/schemas/HeadersConfig"
               },
               {
-                "$ref": "#/components/schemas/HeadersConfig"
+                "type": "null"
               }
             ]
           },
           "plugins": {
             "oneOf": [
               {
-                "type": "null"
+                "$ref": "#/components/schemas/PluginsConfig"
               },
               {
-                "$ref": "#/components/schemas/PluginsConfig"
+                "type": "null"
               }
             ]
           },
@@ -3418,10 +3414,10 @@
           "rate_limit": {
             "oneOf": [
               {
-                "type": "null"
+                "$ref": "#/components/schemas/RateLimitConfig"
               },
               {
-                "$ref": "#/components/schemas/RateLimitConfig"
+                "type": "null"
               }
             ]
           },
@@ -3480,10 +3476,10 @@
           "subject_ref": {
             "oneOf": [
               {
-                "type": "null"
+                "$ref": "#/components/schemas/SubjectRefDto"
               },
               {
-                "$ref": "#/components/schemas/SubjectRefDto"
+                "type": "null"
               }
             ]
           },
@@ -3697,11 +3693,11 @@
           "money": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/MoneyDto",
                 "description": "Grant only: amount to park into the wallet, in major units. Required for\n`kind = \"grant\"`, ignored for `\"apply\"`."
+              },
+              {
+                "type": "null"
               }
             ]
           },
@@ -4032,11 +4028,11 @@
           "recognition": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/RecognitionInputDto",
                 "description": "The ASC 606 recognition spec (Slice 4 — the SAME shape the invoice-post\nitem carries). REQUIRED when `deferred > 0` (drives the schedule\nbuild, D4); `None` for a fully-recognized note."
+              },
+              {
+                "type": "null"
               }
             ]
           },
@@ -4361,11 +4357,11 @@
           "error": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/OperationItemErrorDto",
                 "description": "Present when this target failed."
+              },
+              {
+                "type": "null"
               }
             ]
           },
@@ -4499,10 +4495,10 @@
           "creator": {
             "oneOf": [
               {
-                "type": "null"
+                "$ref": "#/components/schemas/ActorDto"
               },
               {
-                "$ref": "#/components/schemas/ActorDto"
+                "type": "null"
               }
             ]
           },
@@ -5053,11 +5049,11 @@
           "entity": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/EntityDto",
                 "description": "The selected fields, exactly as the exact read returns them for the same\n`$select`. Present only on `found`."
+              },
+              {
+                "type": "null"
               }
             ]
           },
@@ -5411,11 +5407,11 @@
           "tenant_context": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/TenantContext",
                 "description": "Tenant context for multi-tenant scoping."
+              },
+              {
+                "type": "null"
               }
             ]
           },
@@ -5459,11 +5455,11 @@
           "deny_reason": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/DenyReason",
                 "description": "Reason for denial (present when `decision` is `false`)."
+              },
+              {
+                "type": "null"
               }
             ]
           }
@@ -6273,20 +6269,20 @@
           "request": {
             "oneOf": [
               {
-                "type": "null"
+                "$ref": "#/components/schemas/RequestHeaderRules"
               },
               {
-                "$ref": "#/components/schemas/RequestHeaderRules"
+                "type": "null"
               }
             ]
           },
           "response": {
             "oneOf": [
               {
-                "type": "null"
+                "$ref": "#/components/schemas/ResponseHeaderRules"
               },
               {
-                "$ref": "#/components/schemas/ResponseHeaderRules"
+                "type": "null"
               }
             ]
           }
@@ -7175,11 +7171,11 @@
           "recognition": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/RecognitionInputDto",
                 "description": "Optional ASC 606 recognition spec (Slice 4). `None` ⇒ the item is fully\nrecognized now (`deferred = 0`, the unchanged Variant-A contract). When\npresent, the post derives the deferral schedule and splits the credit\ninto Revenue (recognized now) + Contract-liability (deferred)."
+              },
+              {
+                "type": "null"
               }
             ]
           },
@@ -7268,10 +7264,10 @@
           "pull_request": {
             "oneOf": [
               {
-                "type": "null"
+                "$ref": "#/components/schemas/PullRequestMarkerDto"
               },
               {
-                "$ref": "#/components/schemas/PullRequestMarkerDto"
+                "type": "null"
               }
             ]
           },
@@ -7288,11 +7284,11 @@
           "user": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/ActorDto",
                 "description": "Who opened it, who it is assigned to, and the labels it carries —\nthe fields a GitHub client renders a list row from."
+              },
+              {
+                "type": "null"
               }
             ]
           }
@@ -7313,20 +7309,20 @@
           "actor": {
             "oneOf": [
               {
-                "type": "null"
+                "$ref": "#/components/schemas/ActorDto"
               },
               {
-                "$ref": "#/components/schemas/ActorDto"
+                "type": "null"
               }
             ]
           },
           "assignee": {
             "oneOf": [
               {
-                "type": "null"
+                "$ref": "#/components/schemas/ActorDto"
               },
               {
-                "$ref": "#/components/schemas/ActorDto"
+                "type": "null"
               }
             ]
           },
@@ -7350,20 +7346,20 @@
           "label": {
             "oneOf": [
               {
-                "type": "null"
+                "$ref": "#/components/schemas/EventLabelDto"
               },
               {
-                "$ref": "#/components/schemas/EventLabelDto"
+                "type": "null"
               }
             ]
           },
           "milestone": {
             "oneOf": [
               {
-                "type": "null"
+                "$ref": "#/components/schemas/EventMilestoneDto"
               },
               {
-                "$ref": "#/components/schemas/EventMilestoneDto"
+                "type": "null"
               }
             ]
           }
@@ -7393,10 +7389,10 @@
           "user": {
             "oneOf": [
               {
-                "type": "null"
+                "$ref": "#/components/schemas/ActorDto"
               },
               {
-                "$ref": "#/components/schemas/ActorDto"
+                "type": "null"
               }
             ]
           }
@@ -7703,11 +7699,11 @@
           "functional_money": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/MoneyDto",
                 "description": "The functional-currency translation; `null` on a single-currency line."
+              },
+              {
+                "type": "null"
               }
             ]
           },
@@ -7952,20 +7948,20 @@
           "grpc": {
             "oneOf": [
               {
-                "type": "null"
+                "$ref": "#/components/schemas/GrpcMatch"
               },
               {
-                "$ref": "#/components/schemas/GrpcMatch"
+                "type": "null"
               }
             ]
           },
           "http": {
             "oneOf": [
               {
-                "type": "null"
+                "$ref": "#/components/schemas/HttpMatch"
               },
               {
-                "$ref": "#/components/schemas/HttpMatch"
+                "type": "null"
               }
             ]
           }
@@ -8313,11 +8309,11 @@
           "my_reaction": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/ReactionKindDto",
                 "description": "The caller's reaction to this message; `null` when there is none."
+              },
+              {
+                "type": "null"
               }
             ]
           },
@@ -8947,22 +8943,22 @@
           "syscap": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/NodeSysCapDto",
                 "description": "System capabilities (included when details=true)"
+              },
+              {
+                "type": "null"
               }
             ]
           },
           "sysinfo": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/NodeSysInfoDto",
                 "description": "System information (included when details=true)"
+              },
+              {
+                "type": "null"
               }
             ]
           },
@@ -9010,10 +9006,10 @@
           "battery": {
             "oneOf": [
               {
-                "type": "null"
+                "$ref": "#/components/schemas/BatteryInfoDto"
               },
               {
-                "$ref": "#/components/schemas/BatteryInfoDto"
+                "type": "null"
               }
             ]
           },
@@ -12013,10 +12009,10 @@
           "period": {
             "oneOf": [
               {
-                "type": "null"
+                "$ref": "#/components/schemas/PricingPeriod"
               },
               {
-                "$ref": "#/components/schemas/PricingPeriod"
+                "type": "null"
               }
             ]
           },
@@ -12045,11 +12041,11 @@
           "status": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/PricingPinnedPriceStatus",
                 "description": "`cancelled` for a price cancelled before it started, the entry list's token (D-520): a\nstored fact, the same on every day. Absent on an approved price, whose display status\ndepends on the day, which this read never computes (D-422). Its own one-value set, so the\nschema offers nothing the read never serves."
+              },
+              {
+                "type": "null"
               }
             ]
           },
@@ -12492,11 +12488,11 @@
           "current": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/PricingPlanCurrent",
                 "description": "The revision being changed or waiting, else the one in effect (D-460); null without\nrevisions."
+              },
+              {
+                "type": "null"
               }
             ]
           },
@@ -12507,11 +12503,11 @@
           "in_effect": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/PricingPlanInEffect",
                 "description": "The published revision in effect today (D-460); null before the first publication."
+              },
+              {
+                "type": "null"
               }
             ]
           },
@@ -12592,10 +12588,10 @@
           "period": {
             "oneOf": [
               {
-                "type": "null"
+                "$ref": "#/components/schemas/PricingPeriod"
               },
               {
-                "$ref": "#/components/schemas/PricingPeriod"
+                "type": "null"
               }
             ]
           },
@@ -12606,11 +12602,11 @@
           "price_on_sale_date": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/PricingPriceDto",
                 "description": "The default chain's approved price in force on the revision's sale date, chosen by\n`price_book_entries::headline` (D-440, D-472). Null when only value chains price the\nentry, when none is in force, or when the caller's `price_book` read does not admit the\nentry's book (D-434)."
+              },
+              {
+                "type": "null"
               }
             ]
           }
@@ -12872,11 +12868,11 @@
           "approval": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/PricingPlanApprovalProgress",
                 "description": "The vote progress of a pending revision (D-462), readable under plan read; null for any\nother state."
+              },
+              {
+                "type": "null"
               }
             ]
           },
@@ -13226,11 +13222,11 @@
           "usage_rating_policy": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/UsageRatingPolicyRequest",
                 "description": "Required for usage entries; immutable after creation. Identity is server assigned.\n`quantity_semantics.fold`, `reset` and `partial_window` may be absent or null; the server\nfills `SUM`, `rating_window_start` and `actual_quantity_full_thresholds` (D-513)."
+              },
+              {
+                "type": "null"
               }
             ]
           }
@@ -13277,10 +13273,10 @@
           "period": {
             "oneOf": [
               {
-                "type": "null"
+                "$ref": "#/components/schemas/PricingPeriod"
               },
               {
-                "$ref": "#/components/schemas/PricingPeriod"
+                "type": "null"
               }
             ]
           },
@@ -13306,11 +13302,11 @@
           "usage_rating_policy": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/UsageRatingPolicy",
                 "description": "Immutable policy materialized from the entry; null for legacy/non-usage entries."
+              },
+              {
+                "type": "null"
               }
             ]
           },
@@ -13390,20 +13386,20 @@
               "current_price": {
                 "oneOf": [
                   {
-                    "type": "null"
+                    "$ref": "#/components/schemas/PricingPriceDto"
                   },
                   {
-                    "$ref": "#/components/schemas/PricingPriceDto"
+                    "type": "null"
                   }
                 ]
               },
               "next_price": {
                 "oneOf": [
                   {
-                    "type": "null"
+                    "$ref": "#/components/schemas/PricingPriceDto"
                   },
                   {
-                    "$ref": "#/components/schemas/PricingPriceDto"
+                    "type": "null"
                   }
                 ]
               },
@@ -13843,10 +13839,10 @@
           "before": {
             "oneOf": [
               {
-                "type": "null"
+                "$ref": "#/components/schemas/PricingPriceDto"
               },
               {
-                "$ref": "#/components/schemas/PricingPriceDto"
+                "type": "null"
               }
             ]
           },
@@ -13955,11 +13951,11 @@
           "reason": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/PricingReferenceOpReason",
                 "description": "Why the op releases its reference: `book_archived` for a `release` (D-522); null for every\nother op."
+              },
+              {
+                "type": "null"
               }
             ]
           },
@@ -14146,10 +14142,10 @@
           "binding": {
             "oneOf": [
               {
-                "type": "null"
+                "$ref": "#/components/schemas/PricingResolveBindingDto"
               },
               {
-                "$ref": "#/components/schemas/PricingResolveBindingDto"
+                "type": "null"
               }
             ]
           },
@@ -14227,10 +14223,10 @@
           "source": {
             "oneOf": [
               {
-                "type": "null"
+                "$ref": "#/components/schemas/PricingResolveSource"
               },
               {
-                "$ref": "#/components/schemas/PricingResolveSource"
+                "type": "null"
               }
             ]
           },
@@ -14260,11 +14256,11 @@
           "charge_kind": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/PricingChargeKind",
                 "description": "Null without an entry."
+              },
+              {
+                "type": "null"
               }
             ]
           },
@@ -14287,21 +14283,21 @@
           "model": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/PricingModel",
                 "description": "The entry's model (D-427), the model of every binding's money; null without an entry."
+              },
+              {
+                "type": "null"
               }
             ]
           },
           "period": {
             "oneOf": [
               {
-                "type": "null"
+                "$ref": "#/components/schemas/PricingPeriod"
               },
               {
-                "$ref": "#/components/schemas/PricingPeriod"
+                "type": "null"
               }
             ]
           },
@@ -14320,11 +14316,11 @@
           "sku_version": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/PricingResolveSkuVersionDto",
                 "description": "The SKU version in force on the date; null when Products has no version on that date or\ndoes not know the SKU."
+              },
+              {
+                "type": "null"
               }
             ]
           },
@@ -14335,11 +14331,11 @@
           "usage_rating_policy": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/UsageRatingPolicy",
                 "description": "Immutable policy projected from the selected entry; null for legacy entries."
+              },
+              {
+                "type": "null"
               }
             ]
           }
@@ -14595,20 +14591,20 @@
               "current_price": {
                 "oneOf": [
                   {
-                    "type": "null"
+                    "$ref": "#/components/schemas/PricingPriceDto"
                   },
                   {
-                    "$ref": "#/components/schemas/PricingPriceDto"
+                    "type": "null"
                   }
                 ]
               },
               "next_price": {
                 "oneOf": [
                   {
-                    "type": "null"
+                    "$ref": "#/components/schemas/PricingPriceDto"
                   },
                   {
-                    "$ref": "#/components/schemas/PricingPriceDto"
+                    "type": "null"
                   }
                 ]
               },
@@ -15039,10 +15035,10 @@
           "arg": {
             "oneOf": [
               {
-                "type": "null"
+                "$ref": "#/components/schemas/ProductsDerivedExpr"
               },
               {
-                "$ref": "#/components/schemas/ProductsDerivedExpr"
+                "type": "null"
               }
             ]
           },
@@ -15064,10 +15060,10 @@
           "left": {
             "oneOf": [
               {
-                "type": "null"
+                "$ref": "#/components/schemas/ProductsDerivedExpr"
               },
               {
-                "$ref": "#/components/schemas/ProductsDerivedExpr"
+                "type": "null"
               }
             ]
           },
@@ -15089,10 +15085,10 @@
           "right": {
             "oneOf": [
               {
-                "type": "null"
+                "$ref": "#/components/schemas/ProductsDerivedExpr"
               },
               {
-                "$ref": "#/components/schemas/ProductsDerivedExpr"
+                "type": "null"
               }
             ]
           },
@@ -15512,10 +15508,10 @@
           "from_lifecycle": {
             "oneOf": [
               {
-                "type": "null"
+                "$ref": "#/components/schemas/ProductsLifecycle"
               },
               {
-                "$ref": "#/components/schemas/ProductsLifecycle"
+                "type": "null"
               }
             ]
           },
@@ -15528,10 +15524,10 @@
           "to_lifecycle": {
             "oneOf": [
               {
-                "type": "null"
+                "$ref": "#/components/schemas/ProductsLifecycle"
               },
               {
-                "$ref": "#/components/schemas/ProductsLifecycle"
+                "type": "null"
               }
             ]
           },
@@ -15926,11 +15922,11 @@
           "user": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/ActorDto",
                 "description": "Who opened it, who it is assigned to, who was asked to review, and\nthe labels it carries."
+              },
+              {
+                "type": "null"
               }
             ]
           }
@@ -16059,13 +16055,9 @@
             "type": "string"
           },
           "fold": {
+            "$ref": "#/components/schemas/Fold",
             "default": "SUM",
-            "oneOf": [
-              {
-                "$ref": "#/components/schemas/Fold",
-                "description": "Absent or null defaults to `SUM` (D-513)."
-              }
-            ]
+            "description": "Absent or null defaults to `SUM` (D-513)."
           },
           "meter": {
             "$ref": "#/components/schemas/MeterRef"
@@ -16260,20 +16252,20 @@
           "budget": {
             "oneOf": [
               {
-                "type": "null"
+                "$ref": "#/components/schemas/BudgetConfig"
               },
               {
-                "$ref": "#/components/schemas/BudgetConfig"
+                "type": "null"
               }
             ]
           },
           "burst": {
             "oneOf": [
               {
-                "type": "null"
+                "$ref": "#/components/schemas/BurstConfig"
               },
               {
-                "$ref": "#/components/schemas/BurstConfig"
+                "type": "null"
               }
             ]
           },
@@ -17457,11 +17449,11 @@
           "error": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/OperationItemErrorDto",
                 "description": "Present when this candidate failed."
+              },
+              {
+                "type": "null"
               }
             ]
           },
@@ -17666,10 +17658,10 @@
           "author": {
             "oneOf": [
               {
-                "type": "null"
+                "$ref": "#/components/schemas/ActorDto"
               },
               {
-                "$ref": "#/components/schemas/ActorDto"
+                "type": "null"
               }
             ]
           },
@@ -18183,30 +18175,30 @@
           "age": {
             "oneOf": [
               {
-                "type": "null"
+                "$ref": "#/components/schemas/AgeRetentionDto"
               },
               {
-                "$ref": "#/components/schemas/AgeRetentionDto"
+                "type": "null"
               }
             ]
           },
           "inactivity": {
             "oneOf": [
               {
-                "type": "null"
+                "$ref": "#/components/schemas/InactivityRetentionDto"
               },
               {
-                "$ref": "#/components/schemas/InactivityRetentionDto"
+                "type": "null"
               }
             ]
           },
           "metadata": {
             "oneOf": [
               {
-                "type": "null"
+                "$ref": "#/components/schemas/MetadataRetentionDto"
               },
               {
-                "$ref": "#/components/schemas/MetadataRetentionDto"
+                "type": "null"
               }
             ]
           }
@@ -18586,10 +18578,10 @@
           "user": {
             "oneOf": [
               {
-                "type": "null"
+                "$ref": "#/components/schemas/ActorDto"
               },
               {
-                "$ref": "#/components/schemas/ActorDto"
+                "type": "null"
               }
             ]
           }
@@ -18639,10 +18631,10 @@
           "user": {
             "oneOf": [
               {
-                "type": "null"
+                "$ref": "#/components/schemas/ActorDto"
               },
               {
-                "$ref": "#/components/schemas/ActorDto"
+                "type": "null"
               }
             ]
           }
@@ -18872,10 +18864,10 @@
           "cors": {
             "oneOf": [
               {
-                "type": "null"
+                "$ref": "#/components/schemas/CorsConfig"
               },
               {
-                "$ref": "#/components/schemas/CorsConfig"
+                "type": "null"
               }
             ]
           },
@@ -18891,10 +18883,10 @@
           "plugins": {
             "oneOf": [
               {
-                "type": "null"
+                "$ref": "#/components/schemas/PluginsConfig"
               },
               {
-                "$ref": "#/components/schemas/PluginsConfig"
+                "type": "null"
               }
             ]
           },
@@ -18905,10 +18897,10 @@
           "rate_limit": {
             "oneOf": [
               {
-                "type": "null"
+                "$ref": "#/components/schemas/RateLimitConfig"
               },
               {
-                "$ref": "#/components/schemas/RateLimitConfig"
+                "type": "null"
               }
             ]
           },
@@ -19567,11 +19559,11 @@
           "effective": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/EffectiveValueDto",
                 "description": "The effective value, when `outcome` is `resolved`."
+              },
+              {
+                "type": "null"
               }
             ]
           },
@@ -19780,11 +19772,11 @@
           "usage": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/SkuUsageDto",
                 "description": "Pricing's usage of the SKU through the port pricing fills (P-D-197); `null` when no port is\nregistered, when it refuses the caller, or when it cannot answer."
+              },
+              {
+                "type": "null"
               }
             ]
           }
@@ -19827,10 +19819,10 @@
           "billing_timing": {
             "oneOf": [
               {
-                "type": "null"
+                "$ref": "#/components/schemas/ProductsBillingTiming"
               },
               {
-                "$ref": "#/components/schemas/ProductsBillingTiming"
+                "type": "null"
               }
             ]
           },
@@ -19933,10 +19925,10 @@
           "billing_timing": {
             "oneOf": [
               {
-                "type": "null"
+                "$ref": "#/components/schemas/ProductsBillingTiming"
               },
               {
-                "$ref": "#/components/schemas/ProductsBillingTiming"
+                "type": "null"
               }
             ]
           },
@@ -19991,11 +19983,11 @@
           "lifecycle_next": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/LifecycleNextDto",
                 "description": "A dated lifecycle change that has not arrived (P-D-249). Null when none is pending."
+              },
+              {
+                "type": "null"
               }
             ]
           },
@@ -20086,10 +20078,10 @@
               "usage": {
                 "oneOf": [
                   {
-                    "type": "null"
+                    "$ref": "#/components/schemas/SkuUsageDto"
                   },
                   {
-                    "$ref": "#/components/schemas/SkuUsageDto"
+                    "type": "null"
                   }
                 ]
               }
@@ -20492,11 +20484,11 @@
           "web_search": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/WebSearchConfig",
                 "description": "Web search configuration."
+              },
+              {
+                "type": "null"
               }
             ]
           }
@@ -20524,11 +20516,11 @@
           "thread_summary_applied": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/ThreadSummaryInfo",
                 "description": "Present when a thread summary is included in the context window.\nUI can display an informational indicator."
+              },
+              {
+                "type": "null"
               }
             ]
           }
@@ -20760,11 +20752,11 @@
           "summary": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/SyncSummaryDto",
                 "description": "The run's counters, replayed from the stored JSON; absent until the\nsession completes, or when `summary_unreadable` is set."
+              },
+              {
+                "type": "null"
               }
             ]
           },
@@ -20775,10 +20767,10 @@
           "telemetry": {
             "oneOf": [
               {
-                "type": "null"
+                "$ref": "#/components/schemas/SessionTelemetryDto"
               },
               {
-                "$ref": "#/components/schemas/SessionTelemetryDto"
+                "type": "null"
               }
             ]
           },
@@ -22041,10 +22033,10 @@
           "cors": {
             "oneOf": [
               {
-                "type": "null"
+                "$ref": "#/components/schemas/CorsConfig"
               },
               {
-                "$ref": "#/components/schemas/CorsConfig"
+                "type": "null"
               }
             ]
           },
@@ -22057,10 +22049,10 @@
           "plugins": {
             "oneOf": [
               {
-                "type": "null"
+                "$ref": "#/components/schemas/PluginsConfig"
               },
               {
-                "$ref": "#/components/schemas/PluginsConfig"
+                "type": "null"
               }
             ]
           },
@@ -22071,10 +22063,10 @@
           "rate_limit": {
             "oneOf": [
               {
-                "type": "null"
+                "$ref": "#/components/schemas/RateLimitConfig"
               },
               {
-                "$ref": "#/components/schemas/RateLimitConfig"
+                "type": "null"
               }
             ]
           },
@@ -22108,11 +22100,11 @@
           "sharing": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/SharingModeDto",
                 "description": "Sharing mode for the secret. **Optional: when omitted the secret's\ncurrent sharing is preserved**, so rotating a `shared` secret's value\nwith `{\"value\": \"...\"}` alone no longer silently narrows it back to\n`tenant` (review finding #8). Send an explicit value to change the\nsharing mode."
+              },
+              {
+                "type": "null"
               }
             ]
           },
@@ -22192,20 +22184,20 @@
           "auth": {
             "oneOf": [
               {
-                "type": "null"
+                "$ref": "#/components/schemas/AuthConfig"
               },
               {
-                "$ref": "#/components/schemas/AuthConfig"
+                "type": "null"
               }
             ]
           },
           "cors": {
             "oneOf": [
               {
-                "type": "null"
+                "$ref": "#/components/schemas/CorsConfig"
               },
               {
-                "$ref": "#/components/schemas/CorsConfig"
+                "type": "null"
               }
             ]
           },
@@ -22215,20 +22207,20 @@
           "headers": {
             "oneOf": [
               {
-                "type": "null"
+                "$ref": "#/components/schemas/HeadersConfig"
               },
               {
-                "$ref": "#/components/schemas/HeadersConfig"
+                "type": "null"
               }
             ]
           },
           "plugins": {
             "oneOf": [
               {
-                "type": "null"
+                "$ref": "#/components/schemas/PluginsConfig"
               },
               {
-                "$ref": "#/components/schemas/PluginsConfig"
+                "type": "null"
               }
             ]
           },
@@ -22238,10 +22230,10 @@
           "rate_limit": {
             "oneOf": [
               {
-                "type": "null"
+                "$ref": "#/components/schemas/RateLimitConfig"
               },
               {
-                "$ref": "#/components/schemas/RateLimitConfig"
+                "type": "null"
               }
             ]
           },
@@ -22291,11 +22283,11 @@
           "multipart": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/MultipartPlanDto",
                 "description": "Multipart plan (absent on the single-part path); same shape as the\n`POST /files/{id}/multipart` response."
+              },
+              {
+                "type": "null"
               }
             ]
           },
@@ -22325,20 +22317,20 @@
           "auth": {
             "oneOf": [
               {
-                "type": "null"
+                "$ref": "#/components/schemas/AuthConfig"
               },
               {
-                "$ref": "#/components/schemas/AuthConfig"
+                "type": "null"
               }
             ]
           },
           "cors": {
             "oneOf": [
               {
-                "type": "null"
+                "$ref": "#/components/schemas/CorsConfig"
               },
               {
-                "$ref": "#/components/schemas/CorsConfig"
+                "type": "null"
               }
             ]
           },
@@ -22348,10 +22340,10 @@
           "headers": {
             "oneOf": [
               {
-                "type": "null"
+                "$ref": "#/components/schemas/HeadersConfig"
               },
               {
-                "$ref": "#/components/schemas/HeadersConfig"
+                "type": "null"
               }
             ]
           },
@@ -22361,10 +22353,10 @@
           "plugins": {
             "oneOf": [
               {
-                "type": "null"
+                "$ref": "#/components/schemas/PluginsConfig"
               },
               {
-                "$ref": "#/components/schemas/PluginsConfig"
+                "type": "null"
               }
             ]
           },
@@ -22374,10 +22366,10 @@
           "rate_limit": {
             "oneOf": [
               {
-                "type": "null"
+                "$ref": "#/components/schemas/RateLimitConfig"
               },
               {
-                "$ref": "#/components/schemas/RateLimitConfig"
+                "type": "null"
               }
             ]
           },
@@ -22488,31 +22480,27 @@
           "fold": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/Fold",
                 "description": "Absent or null defers to `quantity_semantics.fold`, or `SUM` when that is absent too (D-513)."
+              },
+              {
+                "type": "null"
               }
             ]
           },
           "partial_window": {
+            "$ref": "#/components/schemas/PartialWindow",
             "default": "actual_quantity_full_thresholds",
-            "oneOf": [
-              {
-                "$ref": "#/components/schemas/PartialWindow",
-                "description": "Absent or null defaults to `actual_quantity_full_thresholds` (D-513)."
-              }
-            ]
+            "description": "Absent or null defaults to `actual_quantity_full_thresholds` (D-513)."
           },
           "quantity_semantics": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/QuantitySemanticsRequest",
                 "description": "Deploy-3 meter copy. Deprecated: verified, then dropped (D-514)."
+              },
+              {
+                "type": "null"
               }
             ]
           },
@@ -22520,13 +22508,9 @@
             "$ref": "#/components/schemas/RatingWindow"
           },
           "reset": {
+            "$ref": "#/components/schemas/Reset",
             "default": "rating_window_start",
-            "oneOf": [
-              {
-                "$ref": "#/components/schemas/Reset",
-                "description": "Absent or null defaults to `rating_window_start` (D-513)."
-              }
-            ]
+            "description": "Absent or null defaults to `rating_window_start` (D-513)."
           }
         },
         "required": [
@@ -22581,10 +22565,10 @@
           "subject_ref": {
             "oneOf": [
               {
-                "type": "null"
+                "$ref": "#/components/schemas/SubjectRefDto"
               },
               {
-                "$ref": "#/components/schemas/SubjectRefDto"
+                "type": "null"
               }
             ]
           },
@@ -22661,10 +22645,10 @@
           "password": {
             "oneOf": [
               {
-                "type": "null"
+                "$ref": "#/components/schemas/NewUserPasswordDto"
               },
               {
-                "$ref": "#/components/schemas/NewUserPasswordDto"
+                "type": "null"
               }
             ]
           },
@@ -22776,11 +22760,11 @@
           "password": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/NewUserPasswordDto",
                 "description": "Set a new credential. Omit to leave the password unchanged."
+              },
+              {
+                "type": "null"
               }
             ]
           },
@@ -22864,11 +22848,11 @@
           "impact": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/ImpactReportDto",
                 "description": "The descendants the change would affect, for a cascading setting;\nabsent when the request skipped it."
+              },
+              {
+                "type": "null"
               }
             ]
           },
@@ -23150,10 +23134,10 @@
           "actor": {
             "oneOf": [
               {
-                "type": "null"
+                "$ref": "#/components/schemas/ActorDto"
               },
               {
-                "$ref": "#/components/schemas/ActorDto"
+                "type": "null"
               }
             ]
           },
@@ -29956,7 +29940,7 @@
                 }
               }
             },
-            "description": ""
+            "description": "OK"
           },
           "400": {
             "content": {
@@ -54038,7 +54022,7 @@
                 }
               }
             },
-            "description": ""
+            "description": "OK"
           },
           "400": {
             "content": {

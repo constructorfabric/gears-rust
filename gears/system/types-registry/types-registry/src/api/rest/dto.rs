@@ -653,10 +653,22 @@ mod tests {
         for item in [&registration, &deletion] {
             let variants = &item["properties"]["error"]["oneOf"];
             assert_eq!(variants.as_array().map(Vec::len), Some(2), "{variants}");
-            assert_eq!(variants[0], serde_json::json!({"type": "null"}));
+            let members = variants.as_array().expect("oneOf members");
             assert_eq!(
-                variants[1]["$ref"],
-                "#/components/schemas/OperationItemErrorDto"
+                members
+                    .iter()
+                    .filter(|m| **m == serde_json::json!({"type": "null"}))
+                    .count(),
+                1,
+                "{variants}"
+            );
+            assert_eq!(
+                members
+                    .iter()
+                    .filter(|m| m["$ref"] == "#/components/schemas/OperationItemErrorDto")
+                    .count(),
+                1,
+                "{variants}"
             );
         }
         // A registration reports its identifier; a deletion echoes its key.
