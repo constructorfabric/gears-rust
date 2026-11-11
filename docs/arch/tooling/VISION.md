@@ -393,12 +393,37 @@ route is what turns a copied configuration file into a generated one — an igno
 stays managed and the project supplies a value. An exception is for what the convention did not
 anticipate — and a convention that collects many of them is a convention that needs a parameter.
 
+The best parameter surface is structural, not a list. Spring asks a project to define a bean, and
+the default steps aside; nothing has to be recorded anywhere, because the override *is* the record.
+A convention should reach for that shape first and for a named list second, so that a project
+states its intent in the place where it already works.
+
 Taking one costs automatic application, not visibility: the tool still knows the version the file
 diverged from and still reports when upstream moves past it. It only stops writing. Whether
 something narrower than a whole file can be declared — a section, a key — is a design question,
 and nothing here forbids it, provided ownership is declared per unit in advance rather than inferred
 by comparing edits. Inferring it is the part ruled out above: that is a merge without a base, under
 another name.
+
+**A suppression is a declaration too, and it needs the same discipline.** Taking a convention does
+not mean passing every check it brings, so every convention grows a way to switch one rule off: a
+skip list, an excluded path, a threshold. That route is necessary and it is also where conformance
+debt goes to hide — section 2 names 37 `[[ignore]]` blocks for exactly this reason, and the dylint
+skip list in `Gears.toml` holds four entries whose own comments say two of them are upstream false
+positives and two are an unfinished migration.
+
+Three different things therefore arrive in one list, and only the third is a decision:
+
+| What a suppression means | What it is | What should close it |
+|---|---|---|
+| the rule is wrong here | an upstream defect | a fixed release, and the entry expires with it |
+| the rule is right and the code is not yet | debt with a size | the work, and the entry names what it waits for |
+| the project does not accept the rule | a decision, and a permanent one | nothing; it is an exception, declared as one |
+
+The tool cannot tell them apart by looking, so it has to be told. A suppression carries a reason,
+and the first two carry what closes them. **A suppression with neither is indistinguishable from a
+rule nobody follows** — and a list of those is the ignore file this document opened by calling a
+problem.
 
 **The loop is not a bot either, but a bot must be able to drive it.** That is a requirement, not a
 convenience. Section 2 shows that P4 fails on human attention, so the loop has value only if it runs
@@ -554,9 +579,11 @@ is, so "later" is not the answer to any of them.
 
 Seven observations about tools people use every day. Each one decided something above.
 
-- **A scaffold costs what it leaves unmanaged.** Create React App upgraded its build configuration by
-  bumping `react-scripts`. What the generator wrote into the repository never upgraded at all. Judge
-  setup by how much of its output stays managed, not by how little it writes.
+- **A scaffold costs what it leaves unmanaged.** Two poles of one law. Create React App upgraded its
+  build configuration by bumping `react-scripts`, and what the generator wrote into the repository
+  never upgraded at all. Spring Initializr writes a build file holding a parent version, a main
+  class and a test — and needs no upgrade path, because the parent POM holds everything that could
+  need one. Judge setup by how much of its output stays managed, not by how little it writes.
 - **Conventions that outlive their authors travel as versioned references.** Maven parent POMs,
   Gradle convention plugins, reusable workflows, `tsconfig` `extends`. One change then needs one
   release, instead of one pull request per repository that copied it.
@@ -627,6 +654,12 @@ the rest together:
   shape.
 - **A check is worth more than a generator.** A generator acts once; a check acts always, including
   on what already exists and is wrong.
+- **Prefer a rule in a crate over a rule in a file.** Configuration in a file has no version and no
+  resolver, so it has to arrive and can then drift. The same rule compiled into a versioned crate
+  arrives by resolution, and there is no local copy to go stale. `cargo gears lint` already resolves
+  `cargo-gears-lints` this way while `clippy.toml` beside it is copied — one rule set with a
+  lifecycle, one without. Where a checker reads a file from a fixed path and offers no way to supply
+  defaults, the file stays. That residue measures the gap; it does not excuse it.
 - **Useful defaults over mandatory standards.** Conventions are a choice the project declares, and
   silence is never consent.
 - **Extensible at the edges, fixed at the core.** Exit codes, report schema and lifecycle stay fixed.

@@ -134,7 +134,7 @@ A name somebody can move later is not a pin.
 
 > An exception costs **automatic application**, not visibility.
 
-A convention that collects many exceptions is a convention that needs a parameter.
+**A suppression is a declaration too.** A skip list holds three different things — an upstream defect, debt with a size, and a decision — and only the third is permanent. Today's dylint `skip` holds four entries — two upstream defects, two unfinished migrations — told apart only by a comment. **A suppression with no reason is indistinguishable from a rule nobody follows**, and a list of those is the `[[ignore]]` file we opened by calling a problem.
 
 ---
 
