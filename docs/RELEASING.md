@@ -73,6 +73,13 @@ it are configured separately, in [`release-plz.toml`](../release-plz.toml), by p
 Per-crate git tags (`<crate>-v<version>`) are created for every published crate under
 either rule — `git_tag_enable` is left at its default and never set in this repo.
 
+release-plz creates each tag through the GitHub REST API after `cargo publish`. If that call
+is rate limited, the crate is published but untagged, and later runs skip it as "already
+published". The `release` job therefore ends with `scripts/ci/backfill_release_tags.py`: for
+every crates.io crate whose current manifest version is on crates.io but has no tag, it
+creates the annotated tag on the commit that introduced that version and pushes it over git
+(not subject to the API limit), with a `::warning::` annotation.
+
 `make check-release-config` also enforces this half: a missing `libs/**` entry, an entry
 for a `gears/**` crate (other than a `semver_check`-only one, see below), an entry for an
 unpublishable or no-longer-existing crate, or a flag set to the wrong value all fail the

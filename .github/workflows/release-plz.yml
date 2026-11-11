@@ -156,6 +156,17 @@ jobs:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
           CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
 
+      # release-plz tags through the REST API after publishing. If that call is rate
+      # limited the crate is published but untagged, and later runs skip it as "already
+      # published", so the tag would never appear. Runs even when release-plz failed.
+      # Pushes over git transport, which the REST API rate limit does not cover.
+      # Uses the same token as the release-plz step above.
+      - name: Backfill missing release tags
+        if: ${{ !cancelled() }}
+        env:
+          GITHUB_TOKEN: ${{ steps.app.outputs.token || secrets.GITHUB_TOKEN }}
+        run: python3 -I scripts/ci/backfill_release_tags.py
+
       - name: Disk report (post-mortem)
         if: always()
         run: df -h
