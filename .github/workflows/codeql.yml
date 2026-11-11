@@ -1,19 +1,30 @@
-# CodeQL code scanning: nightly and manual runs only, never on pull requests.
+# CodeQL code scanning. It runs:
+#   - nightly and on manual dispatch (everything, results land in the Security tab);
+#   - on release-plz pull requests (head branch `release-plz-*`), so a release PR is
+#     scanned before it is merged;
+#   - as a gate in release-plz.yml (workflow_call): publishing crates waits for it.
+# It does NOT run on ordinary pull requests. Those runs were removed for two reasons: they
+# were the biggest consumer of the shared GITHUB_TOKEN REST budget (PR #5884 measured
+# ~180 of 339 rate-limit failures in 72 h on CodeQL), and a full Rust scan costs ~1h of
+# runner time per PR (codeql-action has no overlay/incremental mode for Rust).
 #
-# Pull request runs were removed for two reasons: they were the biggest consumer of the
-# shared GITHUB_TOKEN REST budget (PR #5884 measured ~180 of 339 rate-limit failures in
-# 72 h on CodeQL), and a full Rust scan costs ~1h of runner time per PR (codeql-action
-# has no overlay/incremental mode for Rust). Results land in the Security tab after the
-# nightly run.
+# A failed run (setup, extraction or analysis error) fails the gate; alerts found by a
+# successful run do not. They go to the Security tab.
 name: "CodeQL Advanced"
 
 on:
   schedule:
     - cron: '40 23 * * *'
+  pull_request:
+    branches: [ "main" ]
+    types: [ opened, synchronize, reopened ]
+  workflow_call:
   workflow_dispatch:
 
 concurrency:
-  group: ${{ github.workflow }}
+  # Nightly and manual runs queue one by one. Every other run gets its own group: a
+  # release gate must never be cancelled by, or replaced in the queue by, another run.
+  group: ${{ github.workflow }}-${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && 'scheduled' || github.run_id }}
   cancel-in-progress: false
 
 permissions:
@@ -27,14 +38,19 @@ env:
 jobs:
   analyze:
     name: Analyze (${{ matrix.language }})
+    # Pull requests other than release-plz ones start this workflow but skip the job.
+    if: ${{ github.event_name != 'pull_request' || startsWith(github.head_ref, 'release-plz-') }}
     # The Rust leg builds nothing (`build-mode: none`) but still extracts the whole
     # workspace; the Python and Actions legs fit a small runner.
-    runs-on: ${{ (vars.GEARS_FORCE_GITHUB_HOSTED == 'true' || github.repository != 'constructorfabric/gears-rust') && 'ubuntu-latest' || (matrix.language == 'rust' && 'gears-large' || 'gears-small') }}
+    runs-on: ${{ (vars.GEARS_FORCE_GITHUB_HOSTED == 'true' || github.repository != 'constructorfabric/gears-rust' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && 'ubuntu-latest' || (matrix.language == 'rust' && 'gears-large' || 'gears-small') }}
     timeout-minutes: 90
     permissions:
-      # Required to upload SARIF results.
+      # Required to upload SARIF results; `actions` and `packages` are read by
+      # codeql-action. A workflow_call caller must grant the same set.
       security-events: write
       contents: read
+      actions: read
+      packages: read
 
     strategy:
       fail-fast: false

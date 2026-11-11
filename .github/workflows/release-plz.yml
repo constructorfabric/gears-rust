@@ -25,6 +25,33 @@ env:
   CARGO_INCREMENTAL: "0"
 
 jobs:
+  # Publishing waits for CodeQL. A release is only expected when the pushed commit is the
+  # merge of a release-plz PR, or when someone dispatched `release` by hand; any other push
+  # to main skips the scan (it would cost ~1h on every merge) and publishes nothing.
+  # CodeQL failing (a run error, not alerts) blocks `release`, so no crate is published.
+  codeql:
+    name: CodeQL gate
+    if: >-
+      ${{
+        github.repository == 'constructorfabric/gears-rust'
+        && (
+          (github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'release')
+          || (
+            github.event_name == 'push'
+            && (
+              startsWith(github.event.head_commit.message, 'chore: release')
+              || contains(github.event.head_commit.message, 'release-plz-')
+            )
+          )
+        )
+      }}
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
+      packages: read
+    uses: ./.github/workflows/codeql.yml
+
   # `release-plz release` publishes only versions present in the manifests and absent
   # from crates.io, so running it on every push is safe and makes an interrupted release
   # self-healing: a retry within the job, or the next push to main, finishes it. That
@@ -33,9 +60,14 @@ jobs:
   release:
     name: Publish crates
     runs-on: ubuntu-latest
+    # `!cancelled()` plus an explicit result check: the gate is skipped on most pushes
+    # (then publishing proceeds as before), but a failed or cancelled gate blocks it.
+    needs: codeql
     if: >-
       ${{
-        github.repository == 'constructorfabric/gears-rust'
+        !cancelled()
+        && (needs.codeql.result == 'success' || needs.codeql.result == 'skipped')
+        && github.repository == 'constructorfabric/gears-rust'
         && (
           github.event_name == 'push'
           || (github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'release')
