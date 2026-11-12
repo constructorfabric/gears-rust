@@ -526,3 +526,284 @@ async fn list_routes_filters_by_upstream() {
         assert_eq!(route["upstream_id"].as_str().unwrap(), upstream_gts_ids[0]);
     }
 }
+
+// #4974: list parameters OAGW does not support are refused, instead of being
+// dropped and answered with an unfiltered list.
+/// The fields of the `UNSUPPORTED_QUERY_PARAM` violations of a problem.
+fn unsupported_params(problem: &serde_json::Value) -> Vec<String> {
+    problem["context"]["field_violations"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|v| v["reason"] == "UNSUPPORTED_QUERY_PARAM")
+        .map(|v| v["field"].as_str().unwrap_or_default().to_owned())
+        .collect()
+}
+
+#[tokio::test]
+async fn list_rejects_unsupported_query_params() {
+    let h = AppHarness::builder().build().await;
+    for (key, value) in [("$filter", "x"), ("$orderby", "alias"), ("tags", "a")] {
+        let resp = h
+            .api_v1()
+            .list_upstreams()
+            .with_query(key, value)
+            .expect_status(400)
+            .await;
+        resp.assert_header("content-type", "application/problem+json");
+        assert_eq!(unsupported_params(&resp.json()), [key], "{}", resp.text());
+        let resp = h
+            .api_v1()
+            .list_routes(None)
+            .with_query(key, value)
+            .expect_status(400)
+            .await;
+        assert_eq!(unsupported_params(&resp.json()), [key], "{}", resp.text());
+    }
+    // Every unsupported key is reported once, in the order sent.
+    let resp = h
+        .api_v1()
+        .list_upstreams()
+        .with_query("$filter", "x")
+        .with_query("limit", "10")
+        .with_query("tags", "a")
+        .with_query("$filter", "y")
+        .expect_status(400)
+        .await;
+    assert_eq!(unsupported_params(&resp.json()), ["$filter", "tags"]);
+    // A route-list key is not an upstream-list key.
+    let resp = h
+        .api_v1()
+        .list_upstreams()
+        .with_query("upstream_id", "x")
+        .expect_status(400)
+        .await;
+    assert_eq!(unsupported_params(&resp.json()), ["upstream_id"]);
+    // Unsupported keys are reported before a bad value of a supported one,
+    // and a bad value alone is a problem response too.
+    let resp = h
+        .api_v1()
+        .list_routes(None)
+        .with_query("limit", "abc")
+        .with_query("$filter", "x")
+        .expect_status(400)
+        .await;
+    assert_eq!(unsupported_params(&resp.json()), ["$filter"]);
+    let resp = h
+        .api_v1()
+        .list_upstreams()
+        .with_query("limit", "abc")
+        .expect_status(400)
+        .await;
+    resp.assert_header("content-type", "application/problem+json");
+    assert_eq!(
+        resp.json()["context"]["field_violations"][0]["field"],
+        "query"
+    );
+    h.api_v1()
+        .list_routes(None)
+        .with_query("limit", "10")
+        .with_query("offset", "0")
+        .expect_status(200)
+        .await;
+}
+
+// Scenarios 2.9 and 2.15 show these bodies: one of each problem shape a
+// rejected write or list returns, compared whole.
+#[tokio::test]
+async fn rejected_writes_and_lists_return_the_documented_bodies() {
+    const INVALID_ARGUMENT: &str =
+        gts_uri!("cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~");
+    const FAILED_PRECONDITION: &str =
+        gts_uri!("cf.core.errors.err.v1~cf.core.err.failed_precondition.v1~");
+    let h = AppHarness::builder()
+        .with_credentials(vec![("client-id".into(), "id".into())])
+        .build()
+        .await;
+    let server = serde_json::json!({
+        "endpoints": [{"host": "api.example.com", "port": 443, "scheme": "https"}]
+    });
+    let post = |body: serde_json::Value| {
+        let mut body = body;
+        body["protocol"] = HTTP_PROTOCOL_ID.into();
+        body
+    };
+
+    // A rule without a field: a format error.
+    let resp = h
+        .api_v1()
+        .post_upstream()
+        .with_body(post(serde_json::json!({
+            "server": {"endpoints": [{"host": "10.0.0.1", "port": 0, "scheme": "https"}]},
+            "alias": "internal-api"
+        })))
+        .expect_status(400)
+        .await;
+    assert_eq!(
+        resp.json(),
+        serde_json::json!({
+            "type": INVALID_ARGUMENT,
+            "title": "Invalid Argument",
+            "status": 400,
+            "detail": "endpoint[0] port must be between 1 and 65535",
+            "instance": "/oagw/v1/upstreams",
+            "context": {
+                "format": "endpoint[0] port must be between 1 and 65535",
+                "resource_type": gts_id!("cf.core.oagw.proxy.v1~")
+            }
+        })
+    );
+
+    // A field violation.
+    let resp = h
+        .api_v1()
+        .post_upstream()
+        .with_body(post(serde_json::json!({
+            "server": server,
+            "auth": {"type": gts_id!("cf.core.oagw.auth_plugin.v1~cf.core.oagw.basic.v1")}
+        })))
+        .expect_status(400)
+        .await;
+    let implemented = [
+        gts_id!("cf.core.oagw.auth_plugin.v1~cf.core.oagw.noop.v1"),
+        gts_id!("cf.core.oagw.auth_plugin.v1~cf.core.oagw.apikey.v1"),
+        gts_id!("cf.core.oagw.auth_plugin.v1~cf.core.oagw.oauth2_client_cred.v1"),
+        gts_id!("cf.core.oagw.auth_plugin.v1~cf.core.oagw.oauth2_client_cred_basic.v1"),
+    ];
+    assert_eq!(
+        resp.json(),
+        serde_json::json!({
+            "type": INVALID_ARGUMENT,
+            "title": "Invalid Argument",
+            "status": 400,
+            "detail": "Request validation failed",
+            "instance": "/oagw/v1/upstreams",
+            "context": {
+                "field_violations": [{
+                    "field": "auth.type",
+                    "reason": "NOT_IMPLEMENTED",
+                    "description": format!(
+                        "auth plugin '{}' is not implemented; use one of {implemented:?}",
+                        gts_id!("cf.core.oagw.auth_plugin.v1~cf.core.oagw.basic.v1")
+                    )
+                }],
+                "resource_type": gts_id!("cf.core.oagw.proxy.v1~")
+            }
+        })
+    );
+
+    // A malformed credential reference: a field violation on its key.
+    let resp = h
+        .api_v1()
+        .post_upstream()
+        .with_body(post(serde_json::json!({
+            "server": server,
+            "auth": {
+                "type": gts_id!("cf.core.oagw.auth_plugin.v1~cf.core.oagw.apikey.v1"),
+                "config": {"header": "authorization", "secret_ref": "cred://not a ref"}
+            }
+        })))
+        .expect_status(400)
+        .await;
+    assert_eq!(
+        resp.json(),
+        serde_json::json!({
+            "type": INVALID_ARGUMENT,
+            "title": "Invalid Argument",
+            "status": 400,
+            "detail": "Request validation failed",
+            "instance": "/oagw/v1/upstreams",
+            "context": {
+                "field_violations": [{
+                    "field": "auth.config.secret_ref",
+                    "reason": "VALIDATION",
+                    "description": "auth.config.secret_ref: invalid credential reference: \
+                                    contains invalid characters; only [a-zA-Z0-9_-] are allowed"
+                }],
+                "resource_type": gts_id!("cf.core.oagw.proxy.v1~")
+            }
+        })
+    );
+
+    // A credential reference the store does not have: a precondition.
+    let resp = h
+        .api_v1()
+        .post_upstream()
+        .with_body(post(serde_json::json!({
+            "server": server,
+            "auth": {
+                "type": gts_id!("cf.core.oagw.auth_plugin.v1~cf.core.oagw.oauth2_client_cred.v1"),
+                "config": {
+                    "token_endpoint": "https://idp.example.com/token",
+                    "client_id_ref": "cred://client-id",
+                    "client_secret_ref": "cred://missing"
+                }
+            }
+        })))
+        .expect_status(400)
+        .await;
+    assert_eq!(
+        resp.json(),
+        serde_json::json!({
+            "type": FAILED_PRECONDITION,
+            "title": "Failed Precondition",
+            "status": 400,
+            "detail": "Operation precondition not met",
+            "instance": "/oagw/v1/upstreams",
+            "context": {
+                "violations": [{
+                    "type": "STATE",
+                    "subject": "auth.config.client_secret_ref",
+                    "description": "credential reference is not accessible to this tenant \
+                                    (not provisioned yet, or not shared)"
+                }],
+                "resource_type": gts_id!("cf.core.oagw.upstream.v1~")
+            }
+        })
+    );
+
+    // An unsupported list parameter names the listed resource.
+    for (resp, instance, resource_type, supported) in [
+        (
+            h.api_v1()
+                .list_upstreams()
+                .with_query("$filter", "x")
+                .expect_status(400)
+                .await,
+            "/oagw/v1/upstreams",
+            gts_id!("cf.core.oagw.upstream.v1~"),
+            "limit, offset",
+        ),
+        (
+            h.api_v1()
+                .list_routes(None)
+                .with_query("$filter", "x")
+                .expect_status(400)
+                .await,
+            "/oagw/v1/routes",
+            gts_id!("cf.core.oagw.route.v1~"),
+            "upstream_id, limit, offset",
+        ),
+    ] {
+        assert_eq!(
+            resp.json(),
+            serde_json::json!({
+                "type": INVALID_ARGUMENT,
+                "title": "Invalid Argument",
+                "status": 400,
+                "detail": "Request validation failed",
+                "instance": instance,
+                "context": {
+                    "field_violations": [{
+                        "field": "$filter",
+                        "reason": "UNSUPPORTED_QUERY_PARAM",
+                        "description": format!(
+                            "query parameter '$filter' is not supported; supported: {supported}"
+                        )
+                    }],
+                    "resource_type": resource_type
+                }
+            })
+        );
+    }
+}

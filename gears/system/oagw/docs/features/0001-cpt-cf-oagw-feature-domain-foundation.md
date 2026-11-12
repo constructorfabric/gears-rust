@@ -248,9 +248,11 @@ Foundation layer that all other OAGW features depend on. Provides the shared dom
    3. [ ] - `p1` - Validate `config_schema` is valid JSON schema - `inst-val-4c`
    4. [ ] - `p1` - Validate `source_code` is non-empty - `inst-val-4d`
 5. [x] - `p1` - **IF** entity is `Endpoint` - `inst-val-5`
-   1. [x] - `p1` - Validate `scheme` is `https` (HTTPS-only constraint for MVP) - `inst-val-5a`
+   1. [x] - `p1` - Validate `scheme` is `https` (HTTPS-only constraint for MVP; `http` only with the gear option `allow_http_upstream`) - `inst-val-5a`
    2. [x] - `p1` - Validate `host` is a valid hostname or IP address - `inst-val-5b`
-   3. [x] - `p1` - Validate `port` is in valid range (1–65535) - `inst-val-5c`
+   3. [x] - `p1` - Validate `port` is in valid range (1-65535; 0 is a 400) - `inst-val-5c`
+   4. [x] - `p1` - Reject IPv6 addresses (not supported yet) - `inst-val-5d`
+   5. [x] - `p1` - Reject a pool that mixes IP and hostname endpoints, or whose endpoints differ in scheme or port - `inst-val-5e`
 6. [x] - `p1` - **RETURN** validation result with collected errors - `inst-val-6`
 
 ### SDK Trait Definition

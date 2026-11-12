@@ -184,6 +184,15 @@ pub const UNSUPPORTED_SCHEME: &str = "UNSUPPORTED_SCHEME";
 /// that requires TLS — refused by SSRF protection.
 pub const HTTP_UPSTREAM_FORBIDDEN: &str = "HTTP_UPSTREAM_FORBIDDEN";
 
+/// The configuration names something OAGW does not implement yet: a
+/// catalog-only, custom or unknown plugin, or an unsupported setting.
+pub const NOT_IMPLEMENTED: &str = "NOT_IMPLEMENTED";
+
+/// A list query parameter OAGW does not support (`$filter`, `$orderby`, or
+/// any key other than the documented ones). Same code as the platform's
+/// `OData` extractor uses.
+pub const UNSUPPORTED_QUERY_PARAM: &str = "UNSUPPORTED_QUERY_PARAM";
+
 /// `Content-Length` header is present but fails numeric parsing or is
 /// inconsistent with the body.
 pub const INVALID_CONTENT_LENGTH: &str = "INVALID_CONTENT_LENGTH";

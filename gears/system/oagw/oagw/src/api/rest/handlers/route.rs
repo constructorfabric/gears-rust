@@ -1,13 +1,14 @@
 use axum::Json;
-use axum::extract::{Extension, Path, Query};
+use axum::extract::{Extension, Path};
 use axum::response::IntoResponse;
 use http::StatusCode;
-use toolkit_canonical_errors::Problem;
+use toolkit_canonical_errors::builder::{NeedsFieldViolation, ResourceOptional};
+use toolkit_canonical_errors::{Problem, ResourceErrorBuilder};
 use toolkit_security::SecurityContext;
 
 use crate::api::rest::dto::{CreateRouteRequest, RouteResponse, UpdateRouteRequest};
-use crate::api::rest::error::domain_error_to_problem;
-use crate::api::rest::extractors::parse_gts_id;
+use crate::api::rest::error::{OagwRouteError, domain_error_to_problem};
+use crate::api::rest::extractors::{ListQueryParams, parse_gts_id, parse_list_query};
 use crate::domain::gts_helpers as gts;
 use crate::domain::model::Route;
 use crate::gear::AppState;
@@ -59,6 +60,7 @@ pub async fn get_route(
 
 /// Query parameters for `GET /oagw/v1/routes`.
 #[derive(Debug, serde::Deserialize)]
+#[cfg_attr(test, derive(serde::Serialize, PartialEq))]
 pub struct ListRoutesQuery {
     /// Optional upstream GTS identifier to filter routes by upstream.
     #[serde(default)]
@@ -69,6 +71,14 @@ pub struct ListRoutesQuery {
     pub offset: u32,
 }
 
+impl ListQueryParams for ListRoutesQuery {
+    const KEYS: &'static [&'static str] = &["upstream_id", "limit", "offset"];
+
+    fn invalid_argument() -> ResourceErrorBuilder<ResourceOptional, NeedsFieldViolation> {
+        OagwRouteError::invalid_argument()
+    }
+}
+
 fn default_limit() -> u32 {
     50
 }
@@ -76,9 +86,10 @@ fn default_limit() -> u32 {
 pub async fn list_routes(
     Extension(state): Extension<AppState>,
     Extension(ctx): Extension<SecurityContext>,
-    Query(params): Query<ListRoutesQuery>,
+    uri: http::Uri,
 ) -> Result<impl IntoResponse, Box<Problem>> {
     let instance = "/oagw/v1/routes";
+    let params: ListRoutesQuery = parse_list_query(&uri, instance)?;
     let upstream_uuid = params
         .upstream_id
         .as_deref()

@@ -38,6 +38,19 @@ pub(in crate::domain::services) fn validate_alias(alias: &str) -> Result<(), Dom
     Ok(())
 }
 
+/// [`validate_alias`], plus the rules a new alias must follow: `_` may start
+/// or end it, `.`, `-` and `:` may not. Only creates apply them, so an
+/// upstream stored before them keeps resolving (an update keeps its alias).
+pub(in crate::domain::services) fn validate_new_alias(alias: &str) -> Result<(), DomainError> {
+    validate_alias(alias)?;
+    if alias.starts_with(['.', '-', ':']) || alias.ends_with(['.', '-', ':']) {
+        return Err(DomainError::validation(
+            "alias must not start or end with '.', '-' or ':'",
+        ));
+    }
+    Ok(())
+}
+
 /// Normalize an alias to lowercase. Hostname trailing dots are already
 /// handled by `Endpoint::normalized_host()` during derivation; this covers
 /// user-provided explicit aliases. All trailing dots are stripped.
@@ -166,12 +179,12 @@ pub(in crate::domain::services) fn enforce_alias_create_with(
                 )));
             }
             // User provided the exact derived value — tolerate silently.
-            validate_alias(&derived)?;
+            validate_new_alias(&derived)?;
             Ok(derived)
         }
         None => {
             let normalized = normalize_alias(user_alias);
-            validate_alias(&normalized)?;
+            validate_new_alias(&normalized)?;
             Ok(normalized)
         }
     }
@@ -186,7 +199,7 @@ pub(in crate::domain::services) fn enforce_alias_create_derived(
 ) -> Result<String, DomainError> {
     match compute_derived_alias(endpoints) {
         Some(derived) => {
-            validate_alias(&derived)?;
+            validate_new_alias(&derived)?;
             Ok(derived)
         }
         None => Err(DomainError::validation(

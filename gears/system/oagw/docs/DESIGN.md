@@ -180,7 +180,7 @@ Body size hard limit: 100MB. Prevent resource exhaustion; reject before bufferin
 
 **ID**: `cpt-cf-oagw-constraint-https-only`
 
-HTTPS-only for upstream connections in MVP. SSRF prevention; plaintext upstreams explicitly blocked.
+HTTPS-only for upstream connections in MVP. SSRF prevention; plaintext upstreams explicitly blocked. An `http` endpoint is rejected on create and update with 400 `invalid_argument` (field `server.endpoints.scheme`, reason `HTTP_UPSTREAM_FORBIDDEN`) unless the gear option `allow_http_upstream` is on. The proxy checks it again, before auth runs, for upstreams stored earlier, with the same field; the proxy's `UNSUPPORTED_SCHEME` violation names `server.endpoints.scheme` too.
 
 ## 3. Technical Architecture
 
@@ -277,7 +277,7 @@ Built-in auth plugins:
 - `gts.cf.core.oagw.auth_plugin.v1~cf.core.oagw.oauth2_client_cred.v1`
 - `gts.cf.core.oagw.auth_plugin.v1~cf.core.oagw.oauth2_client_cred_basic.v1`
 
-`basic.v1` and `bearer.v1` are reserved GTS identifiers cataloged in the types-registry with no backing `AuthPlugin` implementation in `AuthPluginRegistry` — using either as `auth.plugin_type` fails with `unknown auth plugin`.
+`basic.v1` and `bearer.v1` are reserved GTS identifiers cataloged in the types-registry with no backing `AuthPlugin` implementation in `AuthPluginRegistry`: setting either as `auth.type` is rejected on write with 400 `invalid_argument` (reason `NOT_IMPLEMENTED`).
 
 **Guard Plugin** — Base type: `gts.cf.core.oagw.guard_plugin.v1~` — [schemas/guard_plugin.v1.schema.json](./schemas/guard_plugin.v1.schema.json)
 
@@ -287,7 +287,7 @@ Multiple per upstream/route. Can reject requests before they reach upstream.
 |---|---|
 | `gts.cf.core.oagw.guard_plugin.v1~cf.core.oagw.required_headers.v1` | Required header enforcement (request/response) — see [ADR: Required Headers Guard Plugin](./ADR/0017-required-headers-guard-plugin.md) |
 
-`required_headers.v1` is the only guard identifier resolvable via `GuardPluginRegistry` and bindable through `plugins.items[].plugin_ref`. Timeout and CORS are core Data Plane functionality, not `GuardPlugin` trait implementations: request timeout is gear-level configuration, and CORS is configured via the dedicated `cors` field on `Upstream`/`Route` (see [ADR: CORS](./ADR/0006-cors.md)). Their `gts.cf.core.oagw.guard_plugin.v1~cf.core.oagw.timeout.v1` / `...cors.v1` identifiers exist only for types-registry cataloging and cannot be bound via `plugins.items[].plugin_ref`. Circuit breaker is likewise **core functionality** (not a plugin). See [ADR: Circuit Breaker](./ADR/0005-circuit-breaker.md).
+`required_headers.v1` is the only guard identifier resolvable via `GuardPluginRegistry` and bindable through `plugins.items[].plugin_ref`. Timeout and CORS are core Data Plane functionality, not `GuardPlugin` trait implementations: request timeout is gear-level configuration, and CORS is configured via the dedicated `cors` field on `Upstream`/`Route` (see [ADR: CORS](./ADR/0006-cors.md)). Their `gts.cf.core.oagw.guard_plugin.v1~cf.core.oagw.timeout.v1` / `...cors.v1` identifiers exist only for types-registry cataloging and cannot be bound via `plugins.items[].plugin_ref` (400 `NOT_IMPLEMENTED` on write). Circuit breaker is likewise **core functionality** (not a plugin). See [ADR: Circuit Breaker](./ADR/0005-circuit-breaker.md).
 
 **Transform Plugin** — Base type: `gts.cf.core.oagw.transform_plugin.v1~` — [schemas/transform_plugin.v1.schema.json](./schemas/transform_plugin.v1.schema.json)
 
@@ -297,7 +297,7 @@ Multiple per upstream/route, executed in order. Each plugin declares supported p
 |---|---|---|
 | `gts.cf.core.oagw.transform_plugin.v1~cf.core.oagw.request_id.v1` | request, response | X-Request-ID injection/propagation |
 
-`logging.v1` and `metrics.v1` are core Data Plane instrumentation (`infra/metrics.rs`, `tracing`), not `TransformPlugin` trait implementations. Their GTS identifiers exist for types-registry cataloging only and are not resolvable via `TransformPluginRegistry`.
+`logging.v1` and `metrics.v1` are core Data Plane instrumentation (`infra/metrics.rs`, `tracing`), not `TransformPlugin` trait implementations. Their GTS identifiers exist for types-registry cataloging only, are not resolvable via `TransformPluginRegistry`, and are rejected on write (400 `NOT_IMPLEMENTED`).
 
 #### Plugin Identification Model
 
@@ -409,6 +409,8 @@ Plugin chain composition: upstream plugins execute before route plugins (`[U1, U
 - Auth: `basic`, `bearer`
 - Guard: `timeout`, `cors`
 - Transform: `logging`, `metrics`
+
+**Write-time check**: on create and update (Management API, SDK and types-registry provisioning), `auth.type` must be an implemented auth plugin and every `plugins.items[].plugin_ref` an implemented guard or transform plugin. Catalog-only ids, custom (UUID) ids, which are not implemented yet, and unknown ids are rejected with 400 `invalid_argument`, field violation reason `NOT_IMPLEMENTED`. A plugin of the wrong kind (an auth plugin in `plugins.items`, a guard or transform plugin in `auth.type`) is rejected with reason `VALIDATION`. Bindings stored before this check are not rewritten; the proxy still has to handle an unresolvable one.
 
 **Custom Plugins**: Starlark scripts with sandboxed execution (no network/file I/O, timeout/memory limits enforced). Immutable after creation; GC for unlinked plugins after configurable TTL.
 
@@ -690,7 +692,9 @@ At proxy time, `resolve_alias` walks the tenant chain (descendant → root) to f
 
 #### List Query Parameters
 
-All list endpoints support OData query parameters: `$filter`, `$select`, `$orderby`, `$top`, `$skip`.
+Implemented today: upstream lists accept `limit` (default 50, capped at 100) and `offset`, route lists also `upstream_id`. Lists are ordered by resource id (UUID). Any other parameter, OData `$…` parameters included, is rejected with 400 `invalid_argument` instead of being ignored: one field violation per parameter, named by the parameter, with reason `UNSUPPORTED_QUERY_PARAM` (as the platform `OData` extractor reports them). At most 16 parameters are named, each cut to 64 bytes.
+
+Planned: OData query parameters `$filter`, `$select`, `$orderby`, `$top`, `$skip`, as below.
 
 **Upstream**:
 

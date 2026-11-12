@@ -50,7 +50,7 @@ pub(crate) use registry::RegistryProvisionerImpl;
 pub(in crate::domain::services) use validation::validate_route_request;
 #[cfg(test)]
 pub(crate) use validation::{MAX_GRPC_NAME_BYTES, MAX_PATH_BYTES, MAX_REF_BYTES, MAX_TAG_BYTES};
-pub(crate) use validation::{overlapping_method, registry_route_overlaps};
+pub(crate) use validation::{forbid_http_endpoints, overlapping_method, registry_route_overlaps};
 use validation::{
     route_overlap_conflict, validate_route_update_request, validate_upstream_request,
     validate_upstream_update_request,
@@ -79,6 +79,9 @@ pub(crate) struct ControlPlaneServiceImpl {
     policy_enforcer: PolicyEnforcer,
     credstore: Arc<dyn CredStoreClientV1>,
     ssrf_guard: Arc<SsrfGuard>,
+    /// Whether upstream endpoints may use plaintext HTTP
+    /// (`allow_http_upstream`); off unless the gear enables it.
+    allow_http_upstream: bool,
     proxy_reader: Option<Arc<dyn ProxyConfigReader>>,
     /// Counts withheld ancestor credentials on the proxy path; none in tests
     /// that do not set it.
@@ -111,11 +114,19 @@ impl ControlPlaneServiceImpl {
             policy_enforcer,
             credstore,
             ssrf_guard,
+            allow_http_upstream: false,
             proxy_reader,
             metrics: None,
             rate_limiter: None,
             withheld_log: withheld::WithheldLog::default(),
         }
+    }
+
+    /// Accept plaintext HTTP upstream endpoints (`allow_http_upstream`).
+    #[must_use]
+    pub(crate) fn with_allow_http_upstream(mut self, allow: bool) -> Self {
+        self.allow_http_upstream = allow;
+        self
     }
 
     /// Drop the buckets of `rate_limiter` that a write makes stale.
@@ -482,7 +493,7 @@ impl ControlPlaneServiceImpl {
         req: CreateUpstreamRequest,
         managed_by: ManagedBy,
     ) -> Result<Upstream, DomainError> {
-        let alias = validate_upstream_request(&self.ssrf_guard, &req)?;
+        let alias = validate_upstream_request(&self.ssrf_guard, self.allow_http_upstream, &req)?;
 
         let tenant_id = ctx.subject_tenant_id();
         let id = req.id.unwrap_or_else(Uuid::new_v4);
@@ -507,12 +518,12 @@ impl ControlPlaneServiceImpl {
         )
         .await?;
 
-        // Verify the descendant's secret_ref is reachable (fail-closed).
-        if let Some(ref auth) = req.auth
-            && let Some(ref config) = auth.config
-            && let Some(raw_ref) = config.get("secret_ref")
-        {
-            validate_secret_ref_accessible(ctx, self.credstore.as_ref(), raw_ref).await?;
+        // Verify the descendant's credential references are reachable
+        // (fail-closed).
+        if let Some(auth) = req.auth.as_ref() {
+            for credential in auth.credential_refs() {
+                validate_secret_ref_accessible(ctx, self.credstore.as_ref(), credential).await?;
+            }
         }
 
         self.validate_budget_allocation(
@@ -564,7 +575,7 @@ impl ControlPlaneServiceImpl {
         // Snapshot old endpoints before applying server update (needed for alias enforcement).
         let old_endpoints = existing.server.endpoints.clone();
 
-        validate_upstream_update_request(&self.ssrf_guard, &req)?;
+        validate_upstream_update_request(&self.ssrf_guard, self.allow_http_upstream, &req)?;
 
         existing.server = req.server;
         existing.protocol = req.protocol;
@@ -633,12 +644,12 @@ impl ControlPlaneServiceImpl {
         )
         .await?;
 
-        // Verify the descendant's secret_ref is reachable (fail-closed).
-        if let Some(ref auth) = req.auth
-            && let Some(ref config) = auth.config
-            && let Some(raw_ref) = config.get("secret_ref")
-        {
-            validate_secret_ref_accessible(ctx, self.credstore.as_ref(), raw_ref).await?;
+        // Verify the descendant's credential references are reachable
+        // (fail-closed).
+        if let Some(auth) = req.auth.as_ref() {
+            for credential in auth.credential_refs() {
+                validate_secret_ref_accessible(ctx, self.credstore.as_ref(), credential).await?;
+            }
         }
 
         self.validate_budget_allocation(

@@ -17,7 +17,7 @@ use super::registry_row_db_repo::DbRegistryRowRepo;
 use super::route_db_repo::DbRouteRepo;
 use super::testing::recorded_sqlite;
 use super::upstream_db_repo::DbUpstreamRepo;
-use crate::domain::gts_helpers::{HTTP_PROTOCOL_ID, TIMEOUT_GUARD_PLUGIN_ID};
+use crate::domain::gts_helpers::{HTTP_PROTOCOL_ID, REQUIRED_HEADERS_GUARD_PLUGIN_ID};
 use crate::domain::model::{
     CreateUpstreamRequest, Endpoint, HttpMatch, HttpMethod, ListQuery, ManagedBy, MatchRules,
     PathSuffixMode, PluginBinding, PluginsConfig, Route, Scheme, Server, SharingMode,
@@ -116,8 +116,11 @@ fn plugins() -> PluginsConfig {
     PluginsConfig {
         sharing: SharingMode::Private,
         items: vec![PluginBinding {
-            plugin_ref: TIMEOUT_GUARD_PLUGIN_ID.into(),
-            config: HashMap::from([("timeout_ms".to_owned(), "500".to_owned())]),
+            plugin_ref: REQUIRED_HEADERS_GUARD_PLUGIN_ID.into(),
+            config: HashMap::from([(
+                "required_request_headers".to_owned(),
+                "x-request-id".to_owned(),
+            )]),
         }],
     }
 }

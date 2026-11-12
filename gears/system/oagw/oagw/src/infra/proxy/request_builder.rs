@@ -20,7 +20,7 @@ pub fn build_upstream_url(
         Scheme::Wt => "https",
         Scheme::Grpc => {
             return Err(DomainError::Validation {
-                field: "endpoint.scheme",
+                field: "server.endpoints.scheme",
                 reason: field::UNSUPPORTED_SCHEME,
                 detail: "gRPC scheme is not supported for HTTP proxy".into(),
                 instance: String::new(),
@@ -189,6 +189,12 @@ mod tests {
             port: 443,
         };
         let err = build_upstream_url(&ep, "/service", "", &[]).unwrap_err();
-        assert!(matches!(err, DomainError::Validation { .. }));
+        match err {
+            DomainError::Validation { field, reason, .. } => {
+                assert_eq!(field, "server.endpoints.scheme");
+                assert_eq!(reason, oagw_sdk::field::UNSUPPORTED_SCHEME);
+            }
+            other => panic!("expected UNSUPPORTED_SCHEME, got {other:?}"),
+        }
     }
 }

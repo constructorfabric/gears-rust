@@ -67,6 +67,19 @@ pub const METRICS_TRANSFORM_PLUGIN_ID: &str =
 pub const REQUEST_ID_TRANSFORM_PLUGIN_ID: &str =
     gts_id!("cf.core.oagw.transform_plugin.v1~cf.core.oagw.request_id.v1");
 
+/// Auth plugins the gateway runs. The other auth plugin IDs are registered
+/// in the types registry only (catalog-only) and cannot be bound yet.
+pub const IMPLEMENTED_AUTH_PLUGIN_IDS: &[&str] = &[
+    NOOP_AUTH_PLUGIN_ID,
+    APIKEY_AUTH_PLUGIN_ID,
+    OAUTH2_CLIENT_CRED_AUTH_PLUGIN_ID,
+    OAUTH2_CLIENT_CRED_BASIC_AUTH_PLUGIN_ID,
+];
+/// Guard plugins the gateway runs.
+pub const IMPLEMENTED_GUARD_PLUGIN_IDS: &[&str] = &[REQUIRED_HEADERS_GUARD_PLUGIN_ID];
+/// Transform plugins the gateway runs.
+pub const IMPLEMENTED_TRANSFORM_PLUGIN_IDS: &[&str] = &[REQUEST_ID_TRANSFORM_PLUGIN_ID];
+
 /// Format an upstream resource as a GTS identifier.
 #[must_use]
 pub fn format_upstream_gts(id: Uuid) -> String {

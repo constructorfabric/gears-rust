@@ -1,5 +1,6 @@
 use crate::domain::error::{DeniedOn, DomainError};
 use crate::domain::model::Upstream;
+use crate::domain::plugin::credentials::CredentialRef;
 
 use super::authz::BIND_UPSTREAM_RESOURCE;
 use authz_resolver_sdk::PolicyEnforcer;
@@ -193,28 +194,53 @@ pub(in crate::domain::services) async fn validate_bind_constraints(
     Ok(())
 }
 
-/// Detail of a `secret_ref` that does not resolve. The ref itself is never
-/// put in logs or errors (F0008): the caller already knows which one it sent.
-const SECRET_REF_NOT_ACCESSIBLE: &str =
-    "secret_ref is not accessible to this tenant (not provisioned yet, or not shared)";
+/// How long a write waits for the credential store to answer whether a
+/// reference resolves.
+const CREDSTORE_CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// Validate that a `secret_ref` is accessible to the requesting tenant via
-/// `cred_store`. Per `cpt-cf-oagw-principle-cred-isolation`, if the secret
-/// is not accessible, the request is rejected (fail-closed).
+/// Detail of a credential reference that does not resolve. The ref itself is
+/// never put in logs or errors (F0008): the caller already knows which one it
+/// sent, and the violation's field names the key.
+const SECRET_REF_NOT_ACCESSIBLE: &str =
+    "credential reference is not accessible to this tenant (not provisioned yet, or not shared)";
+
+/// Validate that a credential reference is accessible to the requesting
+/// tenant via `cred_store`. Per `cpt-cf-oagw-principle-cred-isolation`, if
+/// the secret is not accessible, the request is rejected (fail-closed).
 pub(in crate::domain::services) async fn validate_secret_ref_accessible(
     ctx: &SecurityContext,
     credstore: &dyn CredStoreClientV1,
-    raw_ref: &str,
+    credential: CredentialRef<'_>,
 ) -> Result<(), DomainError> {
-    let key = parse_secret_ref(raw_ref)?;
+    let secret_key = parse_secret_ref(credential)?;
+    // cancel-safe: `get` only reads; dropping it at the deadline leaves no
+    // state behind in OAGW or the store.
+    // An SDK write has no request deadline of its own: a stalled store
+    // must not hold it (or a gear's startup provisioning) forever.
+    let Ok(found) =
+        tokio::time::timeout(CREDSTORE_CHECK_TIMEOUT, credstore.get(ctx, &secret_key)).await
+    else {
+        tracing::warn!(
+            tenant_id = %ctx.subject_tenant_id(),
+            subject_id = %ctx.subject_id(),
+            field = credential.field,
+            timeout = ?CREDSTORE_CHECK_TIMEOUT,
+            "cred_store did not answer during secret_ref validation"
+        );
+        return Err(DomainError::Internal {
+            message: "credential validation unavailable: the credential store did not answer"
+                .to_owned(),
+        });
+    };
 
-    match credstore.get(ctx, &key).await {
+    match found {
         Ok(Some(_)) => Ok(()),
         // Not a malformed argument: the ref parses, the secret just isn't
         // there (yet) or isn't shared. Distinguished from `Validation` so
         // provisioning callers can defer-and-retry instead of treating it
         // as a deterministic misconfiguration.
         Ok(None) => Err(DomainError::SecretRefNotAccessible {
+            field: credential.field,
             detail: SECRET_REF_NOT_ACCESSIBLE.to_owned(),
             instance: String::new(),
         }),
@@ -225,16 +251,22 @@ pub(in crate::domain::services) async fn validate_secret_ref_accessible(
         // provisioned): not accessible *yet*, so provisioning callers must be
         // able to defer-and-retry rather than fail fast.
         Err(e) if e.is_not_found() => Err(DomainError::SecretRefNotAccessible {
+            field: credential.field,
             detail: SECRET_REF_NOT_ACCESSIBLE.to_owned(),
             instance: String::new(),
         }),
         // The credential store is down or absent: nothing about this request
         // is wrong, and every other secret_ref would fail the same way.
         Err(e) if e.is_unavailable() => Err(credstore_outage(ctx, &e)),
-        Err(e) => Err(DomainError::validation(format!(
-            "secret_ref validation failed: {}",
-            credstore_error_kind(&e)
-        ))),
+        Err(e) => Err(DomainError::validation_for(
+            credential.field,
+            oagw_sdk::field::VALIDATION,
+            format!(
+                "{}: credential store refused the reference: {}",
+                credential.field,
+                credstore_error_kind(&e)
+            ),
+        )),
     }
 }
 
@@ -270,14 +302,30 @@ fn credstore_error_kind(e: &credstore_sdk::CredStoreError) -> &'static str {
     }
 }
 
-/// Parse a `secret_ref` (with or without the `cred://` scheme), without
-/// asking the credential store whether it exists.
+/// Parse a credential reference (with or without the `cred://` scheme),
+/// without asking the credential store whether it exists. The error names
+/// the field and not the reference.
 pub(in crate::domain::services) fn parse_secret_ref(
-    raw_ref: &str,
+    credential: CredentialRef<'_>,
 ) -> Result<credstore_sdk::SecretRef, DomainError> {
-    let bare = raw_ref.strip_prefix("cred://").unwrap_or(raw_ref);
-    credstore_sdk::SecretRef::new(bare)
-        .map_err(|e| DomainError::validation(format!("invalid secret_ref: {e}")))
+    let bare = credential
+        .value
+        .strip_prefix("cred://")
+        .unwrap_or(credential.value);
+    credstore_sdk::SecretRef::new(bare).map_err(|e| {
+        let reason = match &e {
+            credstore_sdk::CredStoreError::InvalidSecretRef { reason } => reason.as_str(),
+            other => credstore_error_kind(other),
+        };
+        DomainError::validation_for(
+            credential.field,
+            oagw_sdk::field::VALIDATION,
+            format!(
+                "{}: invalid credential reference: {reason}",
+                credential.field
+            ),
+        )
+    })
 }
 
 /// Validate bind constraints against the **closest** ancestor with a matching

@@ -8,12 +8,16 @@ use crate::domain::ssrf::SsrfPolicy;
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OagwConfig {
+    /// Upstream request timeout. Between 1 and [`MAX_PROXY_TIMEOUT_SECS`].
     #[serde(default = "default_proxy_timeout_secs")]
     pub proxy_timeout_secs: u64,
+    /// Largest request body the proxy buffers. Between 1 and
+    /// [`MAX_BODY_SIZE_BYTES`].
     #[serde(default = "default_max_body_size_bytes")]
     pub max_body_size_bytes: usize,
-    /// Allow plaintext HTTP upstreams (and HTTP token endpoints) for the
-    /// proxy. Default: `false`.
+    /// Allow plaintext HTTP upstreams (and HTTP token endpoints). Default:
+    /// `false`: an `http` endpoint is then rejected on write, and refused by
+    /// the proxy for upstreams stored earlier.
     ///
     /// **FIPS:** allowed under `--features fips` as an explicit opt-in to
     /// plaintext; `toolkit-http` logs a warning for the token-endpoint client.
@@ -25,23 +29,23 @@ pub struct OagwConfig {
     /// cached until TTL expiry. Increase only if IdP rate limits require it.
     #[serde(default = "default_token_cache_ttl_secs")]
     pub token_cache_ttl_secs: u64,
-    /// Maximum number of entries in the OAuth2 token cache.
-    /// Default: 10 000.
+    /// Maximum number of entries in the OAuth2 token cache. Must be at least
+    /// 1. Default: 10 000.
     #[serde(default = "default_token_cache_capacity")]
     pub token_cache_capacity: usize,
     /// Idle timeout in seconds for WebSocket streaming connections.
     /// A connection with no data in either direction for this duration
-    /// will be torn down. Must be > 0. Default: 300 (5 minutes).
+    /// will be torn down. Between 1 and [`MAX_PROXY_TIMEOUT_SECS`]. Default: 300 (5 minutes).
     #[serde(default = "default_websocket_idle_timeout_secs")]
     pub websocket_idle_timeout_secs: u64,
     /// Timeout in seconds for announcing a gateway-originated WebSocket close.
     /// On idle timeout or shutdown the gateway gives each leg this long to
-    /// accept Close 1001 and half-close. Must be > 0. Default: 5.
+    /// accept Close 1001 and half-close. Between 1 and [`MAX_PROXY_TIMEOUT_SECS`]. Default: 5.
     #[serde(default = "default_websocket_close_timeout_secs")]
     pub websocket_close_timeout_secs: u64,
     /// Idle timeout in seconds for SSE streaming connections.
     /// A connection with no data received from upstream for this duration
-    /// will be closed. Must be > 0. Default: 300 (5 minutes).
+    /// will be closed. Between 1 and [`MAX_PROXY_TIMEOUT_SECS`]. Default: 300 (5 minutes).
     #[serde(default = "default_streaming_idle_timeout_secs")]
     pub streaming_idle_timeout_secs: u64,
     /// TTL in seconds for cached HTTP protocol version (ALPN) negotiation
@@ -238,12 +242,21 @@ fn default_true() -> bool {
     true
 }
 
+/// Longest allowed `proxy_timeout_secs`, and the streaming and WebSocket
+/// timeouts: a day. A deadline is computed as now plus the timeout, which
+/// would overflow for values near `u64::MAX`.
+pub const MAX_PROXY_TIMEOUT_SECS: u64 = 24 * 60 * 60;
+
+/// Largest allowed `max_body_size_bytes`: the 100 MiB hard limit of DESIGN
+/// (resource exhaustion).
+pub const MAX_BODY_SIZE_BYTES: usize = 100 * 1024 * 1024;
+
 fn default_proxy_timeout_secs() -> u64 {
     30
 }
 
 fn default_max_body_size_bytes() -> usize {
-    100 * 1024 * 1024 // 100 MB
+    MAX_BODY_SIZE_BYTES
 }
 
 fn default_token_cache_ttl_secs() -> u64 {
@@ -274,14 +287,34 @@ impl OagwConfig {
     /// Validate configuration values. Returns an error for values that
     /// would cause broken runtime behaviour.
     pub fn validate(&self) -> Result<(), String> {
-        if self.websocket_idle_timeout_secs == 0 {
-            return Err("websocket_idle_timeout_secs must be > 0".to_owned());
+        // With 0 every proxied request times out, or every body is refused.
+        if !(1..=MAX_PROXY_TIMEOUT_SECS).contains(&self.proxy_timeout_secs) {
+            return Err(format!(
+                "proxy_timeout_secs must be between 1 and {MAX_PROXY_TIMEOUT_SECS}"
+            ));
         }
-        if self.websocket_close_timeout_secs == 0 {
-            return Err("websocket_close_timeout_secs must be > 0".to_owned());
+        if !(1..=MAX_BODY_SIZE_BYTES).contains(&self.max_body_size_bytes) {
+            return Err(format!(
+                "max_body_size_bytes must be between 1 and {MAX_BODY_SIZE_BYTES}"
+            ));
         }
-        if self.streaming_idle_timeout_secs == 0 {
-            return Err("streaming_idle_timeout_secs must be > 0".to_owned());
+        if self.token_cache_capacity == 0 {
+            return Err("token_cache_capacity must be > 0".to_owned());
+        }
+        if !(1..=MAX_PROXY_TIMEOUT_SECS).contains(&self.websocket_idle_timeout_secs) {
+            return Err(format!(
+                "websocket_idle_timeout_secs must be between 1 and {MAX_PROXY_TIMEOUT_SECS}"
+            ));
+        }
+        if !(1..=MAX_PROXY_TIMEOUT_SECS).contains(&self.websocket_close_timeout_secs) {
+            return Err(format!(
+                "websocket_close_timeout_secs must be between 1 and {MAX_PROXY_TIMEOUT_SECS}"
+            ));
+        }
+        if !(1..=MAX_PROXY_TIMEOUT_SECS).contains(&self.streaming_idle_timeout_secs) {
+            return Err(format!(
+                "streaming_idle_timeout_secs must be between 1 and {MAX_PROXY_TIMEOUT_SECS}"
+            ));
         }
         let recheck = self.registry_provisioning.recheck_interval;
         if !(RECHECK_INTERVAL_MIN..=RECHECK_INTERVAL_MAX).contains(&recheck) {
@@ -424,6 +457,101 @@ mod tests {
     fn token_cache_capacity_defaults_to_10000() {
         let config = OagwConfig::default();
         assert_eq!(config.token_cache_capacity, 10_000);
+    }
+
+    #[test]
+    fn validate_bounds_proxy_timeout_body_limit_and_token_cache() {
+        let timeout = OagwConfig {
+            proxy_timeout_secs: 0,
+            ..Default::default()
+        };
+        assert!(
+            timeout
+                .validate()
+                .unwrap_err()
+                .contains("proxy_timeout_secs")
+        );
+        let body = OagwConfig {
+            max_body_size_bytes: 0,
+            ..Default::default()
+        };
+        assert!(body.validate().unwrap_err().contains("max_body_size_bytes"));
+        // Each upper bound, at N+1 and at the type's maximum, names its key.
+        let over = |key: &str, config: OagwConfig| {
+            let err = config.validate().unwrap_err();
+            assert!(err.contains(key), "{key}: {err}");
+        };
+        for (key, value) in [
+            ("proxy_timeout_secs", MAX_PROXY_TIMEOUT_SECS + 1),
+            ("proxy_timeout_secs", u64::MAX),
+        ] {
+            over(
+                key,
+                OagwConfig {
+                    proxy_timeout_secs: value,
+                    ..Default::default()
+                },
+            );
+        }
+        over(
+            "max_body_size_bytes",
+            OagwConfig {
+                max_body_size_bytes: MAX_BODY_SIZE_BYTES + 1,
+                ..Default::default()
+            },
+        );
+        for value in [MAX_PROXY_TIMEOUT_SECS + 1, u64::MAX] {
+            over(
+                "streaming_idle_timeout_secs",
+                OagwConfig {
+                    streaming_idle_timeout_secs: value,
+                    ..Default::default()
+                },
+            );
+            over(
+                "websocket_idle_timeout_secs",
+                OagwConfig {
+                    websocket_idle_timeout_secs: value,
+                    ..Default::default()
+                },
+            );
+            over(
+                "websocket_close_timeout_secs",
+                OagwConfig {
+                    websocket_close_timeout_secs: value,
+                    ..Default::default()
+                },
+            );
+        }
+        assert!(
+            OagwConfig {
+                streaming_idle_timeout_secs: MAX_PROXY_TIMEOUT_SECS,
+                websocket_idle_timeout_secs: MAX_PROXY_TIMEOUT_SECS,
+                websocket_close_timeout_secs: MAX_PROXY_TIMEOUT_SECS,
+                ..Default::default()
+            }
+            .validate()
+            .is_ok()
+        );
+        assert!(
+            OagwConfig {
+                proxy_timeout_secs: MAX_PROXY_TIMEOUT_SECS,
+                max_body_size_bytes: MAX_BODY_SIZE_BYTES,
+                ..Default::default()
+            }
+            .validate()
+            .is_ok()
+        );
+        let cache = OagwConfig {
+            token_cache_capacity: 0,
+            ..Default::default()
+        };
+        assert!(
+            cache
+                .validate()
+                .unwrap_err()
+                .contains("token_cache_capacity")
+        );
     }
 
     #[test]

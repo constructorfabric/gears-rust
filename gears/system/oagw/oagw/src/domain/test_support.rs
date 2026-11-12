@@ -302,6 +302,51 @@ impl CredStoreClientV1 for ErroringCredStore {
 }
 
 #[cfg(test)]
+/// A credential store that never answers.
+pub struct StalledCredStore;
+
+#[cfg(test)]
+#[async_trait]
+impl CredStoreClientV1 for StalledCredStore {
+    async fn get(
+        &self,
+        _ctx: &SecurityContext,
+        _key: &credstore_sdk::SecretRef,
+    ) -> Result<Option<credstore_sdk::GetSecretResponse>, credstore_sdk::CredStoreError> {
+        std::future::pending().await
+    }
+    async fn put_opts(
+        &self,
+        _ctx: &SecurityContext,
+        _key: &credstore_sdk::SecretRef,
+        _value: credstore_sdk::SecretValue,
+        _sharing: credstore_sdk::SharingMode,
+        _precondition: credstore_sdk::WritePrecondition,
+        _opts: credstore_sdk::WriteOptions,
+    ) -> Result<(), credstore_sdk::CredStoreError> {
+        std::future::pending().await
+    }
+    async fn create_opts(
+        &self,
+        _ctx: &SecurityContext,
+        _key: &credstore_sdk::SecretRef,
+        _value: credstore_sdk::SecretValue,
+        _sharing: credstore_sdk::SharingMode,
+        _opts: credstore_sdk::WriteOptions,
+    ) -> Result<(), credstore_sdk::CredStoreError> {
+        std::future::pending().await
+    }
+    async fn delete(
+        &self,
+        _ctx: &SecurityContext,
+        _key: &credstore_sdk::SecretRef,
+        _precondition: credstore_sdk::WritePrecondition,
+    ) -> Result<(), credstore_sdk::CredStoreError> {
+        std::future::pending().await
+    }
+}
+
+#[cfg(test)]
 /// A tenant resolver that refuses OAGW itself (`Unauthorized`) on every
 /// call, as a misconfigured resolver client would.
 pub struct UnauthorizedTenantResolver;
@@ -682,7 +727,9 @@ impl TestCpBuilder {
                 Arc::new(SsrfGuard::disabled()),
                 None,
             )
-            .with_rate_limiter(rate_limiter),
+            .with_rate_limiter(rate_limiter)
+            // The harness proxies to plaintext mocks, as its Data Plane allows.
+            .with_allow_http_upstream(true),
         );
 
         cp

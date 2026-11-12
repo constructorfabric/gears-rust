@@ -386,6 +386,35 @@ def assert_problem(
     return body
 
 
+# A fixed W3C traceparent: a request that sends it gets a `trace_id` in its
+# Problem Details body whatever the server's tracing setup.
+TRACEPARENT = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+
+
+def traced(headers: dict) -> dict:
+    """``headers`` plus :data:`TRACEPARENT`."""
+    return {**headers, "traceparent": TRACEPARENT}
+
+
+def assert_problem_body(resp: httpx.Response, expected: dict) -> None:
+    """Assert ``resp`` is a Problem Details response produced by OAGW's
+    Management API whose body is exactly ``expected`` plus a ``trace_id``.
+
+    Send the request with :func:`traced` headers. ``trace_id`` is only checked
+    to be a W3C trace id: with server-side tracing it is the server span's.
+    """
+    assert resp.status_code == expected["status"], (
+        f"expected {expected['status']}, got {resp.status_code}: {resp.text[:500]}"
+    )
+    ct = resp.headers.get("content-type", "")
+    assert ct.startswith("application/problem+json"), f"content-type {ct!r}: {resp.text[:300]}"
+    assert resp.headers.get("x-oagw-error-source") is None, resp.headers
+    body = resp.json()
+    trace_id = body.pop("trace_id", None)
+    assert isinstance(trace_id, str) and re.fullmatch(r"[0-9a-f]{32}", trace_id), resp.text
+    assert body == expected, resp.text
+
+
 # ---------------------------------------------------------------------------
 # Listing and cleanup
 # ---------------------------------------------------------------------------

@@ -11,15 +11,21 @@ import pytest
 from .helpers import (
     GRPC_PROTOCOL_ID,
     HTTP_PROTOCOL_ID,
+    NOOP_AUTH_PLUGIN_ID,
+    REQUEST_ID_TRANSFORM_PLUGIN_ID,
+    REQUIRED_HEADERS_GUARD_PLUGIN_ID,
     ROUTE_SCHEMA,
     UPSTREAM_SCHEMA,
     assert_problem,
+    assert_problem_body,
     create_route,
     create_route_raw,
     create_upstream,
     create_upstream_raw,
     delete_upstream,
+    err_type,
     list_all,
+    traced,
     unique_alias,
     update_upstream_raw,
 )
@@ -394,19 +400,40 @@ async def test_create_upstream_with_tags(
 @pytest.mark.scenario("positive-2.9-tags-support-discovery-filtering")
 @pytest.mark.asyncio
 @pytest.mark.parametrize("param", ["$filter", "$orderby", "tags"])
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason="M-07: list endpoints ignore $filter, $orderby and unknown parameters "
-           "and return the unfiltered list with 200",
+@pytest.mark.parametrize(
+    ("collection", "resource_type", "supported"),
+    [
+        ("upstreams", UPSTREAM_SCHEMA, "limit, offset"),
+        ("routes", ROUTE_SCHEMA, "upstream_id, limit, offset"),
+    ],
 )
-async def test_list_rejects_unsupported_query_parameters(param, oagw_base_url, oagw_headers):
+async def test_list_rejects_unsupported_query_parameters(
+    param, collection, resource_type, supported, oagw_base_url, oagw_headers,
+):
     """Scenario 2.9 (filter half): an unsupported list parameter is a 400, not a silent no-op."""
     async with httpx.AsyncClient(timeout=10.0) as client:
         resp = await client.get(
-            f"{oagw_base_url}/oagw/v1/upstreams", headers=oagw_headers, params={param: "llm"},
+            f"{oagw_base_url}/oagw/v1/{collection}",
+            headers=traced(oagw_headers),
+            params={param: "llm"},
         )
-        assert_problem(resp, 400, esrc=None)
+        assert_problem_body(resp, {
+            "type": err_type("invalid_argument"),
+            "title": "Invalid Argument",
+            "status": 400,
+            "detail": "Request validation failed",
+            "instance": f"/oagw/v1/{collection}",
+            "context": {
+                "field_violations": [{
+                    "field": param,
+                    "reason": "UNSUPPORTED_QUERY_PARAM",
+                    "description": (
+                        f"query parameter '{param}' is not supported; supported: {supported}"
+                    ),
+                }],
+                "resource_type": resource_type,
+            },
+        })
 
 
 # ---------------------------------------------------------------------------
@@ -460,10 +487,9 @@ def _assert_stored(stored, expected, field="body"):
             {"tags": [f"t{i}" for i in range(64)]}, {"tags": [f"t{i}" for i in range(65)]},
             "at most 64 tags are allowed, got 65",
         ),
-        # Bytes, not characters: 65 two-byte characters fit 128 characters.
         _limit_case(
             "129-byte-tag", "A", "upstream",
-            {"tags": ["\u00e9" * 64]}, {"tags": ["\u00e9" * 64 + "a"]},
+            {"tags": ["a" * 128]}, {"tags": ["a" * 129]},
             "tags[0] must not exceed 128 bytes, got 129",
         ),
         _limit_case(
@@ -506,19 +532,21 @@ def _assert_stored(stored, expected, field="body"):
             {"protocol": "p" * 256}, {"protocol": "p" * 257},
             "protocol must not exceed 256 bytes, got 257",
         ),
+        # Plugin ids must name an implemented plugin, and none is 256 bytes
+        # long: the accepted value is a real id.
         _limit_case(
             "257-byte-auth-type", "C", "upstream",
-            {"auth": {"type": "a" * 256}}, {"auth": {"type": "a" * 257}},
+            {"auth": {"type": NOOP_AUTH_PLUGIN_ID}}, {"auth": {"type": "a" * 257}},
             "auth.type must not exceed 256 bytes, got 257",
         ),
         _limit_case(
             "control-character-upstream-plugin-ref", "C", "upstream",
-            {"plugins": _plugins("p-1")}, {"plugins": _plugins("p\u0000")},
+            {"plugins": _plugins(REQUEST_ID_TRANSFORM_PLUGIN_ID)}, {"plugins": _plugins("p\u0000")},
             "plugins.items[0].plugin_ref must not contain control characters",
         ),
         _limit_case(
             "257-byte-route-plugin-ref", "C", "route",
-            {"match": _http_match("/p"), "plugins": _plugins("p" * 256)},
+            {"match": _http_match("/p"), "plugins": _plugins(REQUIRED_HEADERS_GUARD_PLUGIN_ID)},
             {"match": _http_match("/p"), "plugins": _plugins("p" * 257)},
             "plugins.items[0].plugin_ref must not exceed 256 bytes, got 257",
         ),

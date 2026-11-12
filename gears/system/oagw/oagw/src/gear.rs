@@ -345,7 +345,8 @@ impl Gear for OutboundApiGatewayGear {
                 proxy_reader,
             )
             .with_metrics(metrics.clone())
-            .with_rate_limiter(rate_limiter.clone()),
+            .with_rate_limiter(rate_limiter.clone())
+            .with_allow_http_upstream(cfg.allow_http_upstream),
         );
         // The registry reconcile only; handlers and the SDK get `cp`.
         self.registry_provisioner

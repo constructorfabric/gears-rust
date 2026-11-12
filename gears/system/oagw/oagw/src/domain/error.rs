@@ -165,6 +165,9 @@ pub enum DomainError {
     /// config failure (500).
     #[error("{detail}")]
     SecretRefNotAccessible {
+        /// The auth config key that holds the reference, for example
+        /// `auth.config.client_secret_ref`.
+        field: &'static str,
         /// Human-readable explanation of the failure.
         detail: String,
         /// Request instance URI the error relates to (used as the problem `instance`).
