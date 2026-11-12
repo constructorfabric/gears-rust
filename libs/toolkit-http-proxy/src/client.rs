@@ -8,7 +8,7 @@ use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
 use bytes::Bytes;
-use http::{HeaderValue, Method, Request, Response, StatusCode, Uri, Version, header};
+use http::{HeaderName, HeaderValue, Method, Request, Response, StatusCode, Uri, Version, header};
 use http_body::Body as _;
 use hyper::body::Incoming;
 use hyper::client::conn::http1;
@@ -16,7 +16,10 @@ use hyper::upgrade::Upgraded;
 use hyper_util::rt::TokioIo;
 use tokio_util::sync::DropGuard;
 
-use crate::body::{BodySettings, Hold, OnEnd, ProxyBody, ReplayableBody, ResponseBody, full_body};
+use crate::body::{
+    BodySettings, Hold, OnEnd, ProxyBody, ReplayableBody, ResponseBody, full_body,
+    with_sanitized_trailers,
+};
 use crate::config::ProxyClientConfig;
 use crate::connect::{KillableIo, connect};
 use crate::error::{ErrorKind, ProxyError};
@@ -204,18 +207,38 @@ impl ProxyClient {
         target: &Target,
         req: Request<ProxyBody>,
     ) -> Result<Response<ResponseBody>, ProxyError> {
-        let (mut parts, body) = req.into_parts();
-        // Fields the head's `Connection` nominated: HTTP/2 request trailers
-        // lose them too (HTTP/1.1 sends no request trailers: `Trailer` is
-        // never forwarded on requests).
-        let hop = sanitize::connection_nominated(&parts.headers);
-        if !hop.is_empty() {
-            parts.extensions.insert(sanitize::HopFields(hop.into()));
+        let (mut parts, mut body) = req.into_parts();
+        // Fields the head's `Connection` nominated: the request trailers
+        // lose them too.
+        // Read before sanitizing: a declaration whose every name is filtered
+        // out still announces trailers, which a resent copy would lose.
+        let declared_trailers = parts.headers.contains_key(header::TRAILER);
+        // Allocated only when `Connection` nominated something; shared by
+        // the HTTP/2 upload and the trailer wrapper.
+        let nominated = sanitize::connection_nominated(&parts.headers);
+        let hop: Option<Arc<[HeaderName]>> = (!nominated.is_empty()).then(|| nominated.into());
+        if let Some(hop) = &hop {
+            parts
+                .extensions
+                .insert(sanitize::HopFields(Arc::clone(hop)));
         }
         sanitize::sanitize_request_headers(&mut parts.headers, RequestKind::Regular);
+        // HTTP/1.1 sends only the request trailers `Trailer` declares, and
+        // the sanitized declaration names none that trailers must not carry.
+        // The frames are sanitized as well, as on HTTP/2, which also drops
+        // what a `Connection` field inside the trailers nominates, and the
+        // body is chunked even when its length is known, so the trailers go
+        // out.
+        if parts.headers.contains_key(header::TRAILER) {
+            body = with_sanitized_trailers(body, hop.unwrap_or_default());
+        }
         // A body that can be sent again: an empty one, or the caller's copy.
+        // The copy holds the data only, so a request that declares trailers
+        // is not resent from it (see [`ReplayableBody`]).
         let replay = if body.is_end_stream() {
             Some(Bytes::new())
+        } else if declared_trailers {
+            None
         } else {
             parts
                 .extensions
