@@ -28,8 +28,12 @@ jobs:
   # Publishing waits for CodeQL, but only when there is something to publish: a workspace
   # crate whose manifest version is not on crates.io yet. That covers a release PR merge, a
   # manual dispatch, and an interrupted release finished by a later push alike. Every other
-  # push to main skips the ~1h scan and publishes nothing. The check is fail-closed (an
-  # unreadable index counts as pending), and a failed check blocks `release`.
+  # push to main skips the ~1h scan and publishes nothing. The check also covers `git_only`
+  # packages (publish = false, git_only = true in release-plz.toml: Docker image + Helm chart
+  # artifacts), which count as pending until their `<name>-v<version>` tag exists on origin.
+  # The check is fail-closed (an unreadable index or tag list counts as pending), and a failed
+  # check blocks `release`. It needs no extra permissions: the repository is public, so
+  # `git ls-remote --tags origin` works with the plain checkout.
   pending:
     name: Release pending?
     if: >-

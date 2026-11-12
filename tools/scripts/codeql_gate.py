@@ -56,7 +56,8 @@ def main() -> int:
     args = ap.parse_args()
 
     if args.alerts_file:
-        alerts = json.load(open(args.alerts_file))
+        with open(args.alerts_file) as f:
+            alerts = json.load(f)
     else:
         alerts = fetch_alerts(os.environ["GITHUB_REPOSITORY"], os.environ["GITHUB_REF"])
 
