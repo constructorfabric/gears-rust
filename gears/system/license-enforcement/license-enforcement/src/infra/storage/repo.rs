@@ -1476,8 +1476,10 @@ impl GrantRepo for Store {
         if roots.is_empty() {
             return Ok(HashMap::new());
         }
-        // ponytail: reads and locks the whole live trees of the roots, siblings
-        // included; a recursive query when trees grow large or contended.
+        // The live tree of a root is a chain: one live child per grant (I3), and
+        // no live grant under a terminated one. So this is one indexed read of at
+        // most MAX_DELEGATION_DEPTH + 1 rows. The rows above the grant come along;
+        // writers already hold the root lock, so locking them adds no wait.
         let mut q = grant::Entity::find()
             .secure()
             .scope_with(&all)

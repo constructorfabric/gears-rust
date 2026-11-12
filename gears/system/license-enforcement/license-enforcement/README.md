@@ -27,8 +27,8 @@ license-enforcement:
     server: "sqlite_users"
     file: "license_enforcement.db"
     params:
-      # SQLite only: verbs wait for the write lock instead of failing at once
-      # beside another writer; checks stay deferred.
+      # SQLite only: mutating operations wait for the write lock instead of
+      # failing at once beside another writer; checks stay deferred.
       transaction_mode: "immediate"
   config:
     vendor: "constructorfabric"    # license-resolver selects its backend by vendor
@@ -41,17 +41,19 @@ license-enforcement:
     sweep_interval_secs: 3600
 ```
 
-The values above are the defaults. The gear does not start when a value is out of range.
+The values under `config` are the defaults. The gear does not start when a value is out of range.
+On SQLite, set `transaction_mode: immediate`. Otherwise the database layer (`toolkit-db`) begins each transaction as
+`deferred`, and a mutating operation fails at once, instead of waiting, when another connection holds the write lock.
 
 | Key | Meaning | Range |
 |---|---|---|
 | `vendor` | Vendor of the backend that the gear registers in `license-resolver`; `license-resolver` selects its backend by vendor. | any string |
 | `priority` | Priority among the backends of the same vendor; the lower value wins. 50 wins over the default of the static license plugin (100). | `i16` |
-| `idempotency_window_secs` | How long the answer to a mutating request is kept: a repeat with the same idempotency token in this window gets that answer. | 1 s ..= one year |
+| `idempotency_window_secs` | How long the answer to a mutating request is kept: a repeat from the same caller (the same tenant and subject of the security context) with the same idempotency token in this window gets that answer. | 1 s ..= one year |
 | `default_page_size` | Page size of a list without `limit`. | 1 ..= `max_page_size` |
 | `max_page_size` | Largest `limit` of a list. | `default_page_size` ..< `u64::MAX` |
 | `max_candidates` | Most candidate grants that one check reads. | 1 ..= 1000 |
-| `retention_days` | How long a terminated grant is kept before the sweeper deletes it. | 1 ..= 36 500, and at least `idempotency_window_secs` |
+| `retention_days` | How long a terminated grant is kept, counted from its last change, before the sweeper deletes it. A grant never goes before the grants delegated from it. A terminated root (an issued grant) goes with every grant left in its tree, and only when all of them are terminated. A terminated sub-grant (a grant delegated from another grant) goes on its own once no grant delegated from it is left. | 1 ..= 36 500, and `retention_days` × 86 400 ≥ `idempotency_window_secs` |
 | `sweep_interval_secs` | Pause between two runs of the sweeper, which deletes terminated grants after `retention_days` and the expired answers of `idempotency_window_secs`. | 1 s ..= one week |
 
 ## Known limits

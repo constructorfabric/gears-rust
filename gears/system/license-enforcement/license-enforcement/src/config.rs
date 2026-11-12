@@ -78,7 +78,7 @@ impl LicenseEnforcementConfig {
         }
         if self.retention_days * 24 * 60 * 60 < self.idempotency_window_secs {
             return Err(format!(
-                "retention_days ({}) must cover idempotency_window_secs ({})",
+                "retention_days * 86400 must be at least idempotency_window_secs, got {} * 86400 < {}",
                 self.retention_days, self.idempotency_window_secs
             ));
         }

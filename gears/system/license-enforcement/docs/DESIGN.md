@@ -62,9 +62,10 @@ transaction. Only a verb terminates a grant. An expired grant keeps its stored s
 extend it at any time.
 
 A subject grant has one binding: none, a subject, or the sub-grant that delegation created from it. Delegation moves
-the binding down the tenant tree. Recall, return, reject, and revocation move it back. The number of licensed subjects
-under a root is the number of chains that end in a subject binding. A partial unique index in storage enforces at most
-one live child per grant.
+the binding down the tenant tree. Recall, return, and reject move it back. Revocation of a root terminates the root and
+every grant delegated from it; their bindings stay for audit. The number of licensed subjects is the number of grants
+that are not terminated and bind a subject. A partial unique index in storage enforces at most one live (not
+terminated) child per grant.
 
 The check path reads only the store and process memory. It compares type ids by their GTS derivation chain. The write
 path validates the conditions. At delegation, it also validates the tenant hierarchy and that each sub-grant is a subset
@@ -192,9 +193,10 @@ terminates a grant. An expired grant keeps its stored state.
 
 - [ ] `p1` - **ID**: `cpt-cf-license-enforcement-principle-conservation-by-binding`
 
-A subject grant has one binding slot. The slot holds none, a subject, or the one live sub-grant that delegation
-created from it. Delegation moves the slot down a tenant chain. Recall, return, reject, and revocation move it back.
-"N seats" is N grants. The count of licensed subjects is a count of rows with a live binding. A partial unique index
+A subject grant has one binding slot. The slot holds none, a subject, or the sub-grant that delegation created
+from it. Delegation moves the slot down a tenant chain. Recall, return, and reject move it back. Revocation of
+a root terminates the root and every grant delegated from it; their slots stay for audit. "N seats" is N grants. The
+count of licensed subjects is a count of rows that are not terminated and bind a subject. A partial unique index
 enforces this count, not arithmetic that a concurrent writer could get wrong.
 
 #### The Store Finds Candidates, the Plugin Decides
@@ -716,8 +718,9 @@ candidate tenant as `tenant-resolver` returns it.
 
 - **Why**: One SecureORM persistence layer for grants, packs, evidence, idempotency, and plugin material.
 - **Scope**: Repositories over §3.7 with `AccessScope`-scoped queries. The candidate-and-root query. The chain read of
-  the check service. The partial unique index that holds I3. The retention sweeper for terminated grants. It deletes a
-  terminated grant only with its whole subtree, and only when every grant in the subtree is terminated.
+  the check service. The partial unique index that holds I3. The retention sweeper for terminated grants. It never
+  deletes a grant before the grants delegated from it. A terminated root goes with its whole tree, only when every
+  grant in it is terminated. A terminated sub-grant goes on its own once no grant delegated from it is left.
 - **Boundaries**: No business rules beyond constraints. `AccessScope` applies to the rows that a tenant holds. Plugin
   material belongs to no tenant, and evidence is unique across tenants, so the queries on them take no scope. The
   retention sweeper and the idempotency cleanup run over every tenant. Three more kinds of query cross tenants:
@@ -790,7 +793,9 @@ The evaluator is a separate crate that depends only on the SDK. It registers its
 |--------|-------------------------------------------------------------------------------------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|-----------|
 | `POST` | `/packs`, `/grants`                                                                             | Issue through the `issue` intake. `unimplemented` without that intake.                                                                                                                                                                                                              | unstable  |
 | `POST` | `/evidence`                                                                                     | Submit evidence (base64 in JSON) to the linked plugin through the `import` intake. `unimplemented` without that intake.                                                                                                                                                             | unstable  |
-| `GET`  | `/packs`, `/packs/{id}`, `/grants`, `/grants/{id}`, `/delegations/{id}`                         | Read and list in the scope that the PDP gives. Lists take OData `$filter` on id, resource type, state, bound subject, binding kind, delegation recipient, holder, pack, and parent grant, `$orderby` on the id only, and a cursor. A filter only narrows a list. Packs carry unbound, bound, and delegated counts per resource. | unstable  |
+| `GET`  | `/grants`                                                                                       | List grants in the scope that the PDP gives. OData `$filter` on id, resource type, state, bound subject, binding kind (none, subject, or delegated), delegation recipient, holder, pack, and parent grant, `$orderby` on the id only, and a cursor. A filter only narrows a list.                                                                             | unstable  |
+| `GET`  | `/packs`                                                                                        | List packs in the scope that the PDP gives, with unbound, bound, and delegated counts per resource. OData `$filter` on the resource type of a member, `$orderby` on the id only, and a cursor. A filter only narrows a list.                                                                                                    | unstable  |
+| `GET`  | `/grants/{id}`, `/packs/{id}`, `/delegations/{id}`                                              | Read in the scope that the PDP gives. A pack carries its counts.                                                                                                                                                                                                                                                                | unstable  |
 | `POST` | `/packs/{id}/{accept,reject,suspend,reinstate,revoke,renew,replace}`                            | Pack verbs, atomic over members. `accept` and `reject` are of the holder; the others are `unimplemented` without the `issue` intake, and `renew` also under a plugin that verifies evidence.                                                                                                                                                | unstable  |
 | `POST` | `/grants/{id}/{accept,reject,suspend,reinstate,revoke,renew,bind,unbind,return,recall,replace}` | Grant verbs. `replace` takes successors through the `issue` intake. Without the `issue` intake, replacement is evidence supersession, and the API rejects root `suspend`, `reinstate`, `revoke`, `renew`. `renew` is also rejected under a plugin that verifies evidence.                                                                           | unstable  |
 | `POST` | `/delegations`                                                                                  | Delegate the unbound grants named by id to a recipient tenant in one transaction                                                                                                                                                                                                    | unstable  |
@@ -1030,8 +1035,9 @@ the stored models and the fields that the design needs. It is not a complete sch
     subject index orders by id instead: one subject has few grants on one resource, so the check tests the end of the
     window on these rows.
   - Chain reads go through an index on the root over grants that are not terminated, so the history of a tree adds no
-    work to the check, `bind`, or `delegate`. The retention sweeper deletes a returned or recalled branch under a live
-    root on its own.
+    work to the check, `bind`, or `delegate`. The retention sweeper never deletes a grant before the grants delegated
+    from it. A terminated root goes with its whole tree, only when every grant in it is terminated. A terminated
+    sub-grant goes on its own once no grant delegated from it is left.
 - **Packs.** Id, holder tenant, version, and the unbound, bound, and delegated counts of the live members per
   resource. Issue writes the counts. Each write of a member moves it between the counts in the same transaction, after
   the lock of its root, so reads never count the member rows. A transaction locks roots first and then their packs,
