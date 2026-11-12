@@ -76,6 +76,8 @@ jobs:
       actions: read
       packages: read
     uses: ./.github/workflows/codeql.yml
+    with:
+      gate: true
 
   # After a successful CodeQL run: block on open high/critical CodeQL alerts of this ref
   # that are not accepted in .github/codeql-allowlist.toml (fix the code, dismiss the alert

@@ -8,7 +8,8 @@ fails the gate, and so blocks publishing crates.
 
 To accept an alert, add an entry to the allowlist in a pull request (rule, path, reason);
 the review of that PR is the approval. An entry may carry `expires = "YYYY-MM-DD"`;
-after that date it stops suppressing. Dismissing the alert in the Security tab also
+after that date it stops suppressing. An entry may carry `alert = N` to accept only that
+alert number instead of every alert of the rule in the matching path. Dismissing the alert in the Security tab also
 works: dismissed alerts are not open.
 
 Environment: GH_TOKEN, GITHUB_REPOSITORY, GITHUB_REF (set by Actions).
@@ -45,6 +46,13 @@ def load_allowlist(path: str) -> list[dict]:
         missing = [k for k in ("rule", "path", "reason") if not str(e.get(k, "")).strip()]
         if missing:
             sys.exit(f"::error file={path}::allowlist entry {e} lacks: {', '.join(missing)}")
+        if "expires" in e:
+            try:
+                datetime.date.fromisoformat(str(e["expires"]))
+            except ValueError:
+                sys.exit(f"::error file={path}::allowlist entry {e}: expires must be YYYY-MM-DD")
+        if "alert" in e and not isinstance(e["alert"], int):
+            sys.exit(f"::error file={path}::allowlist entry {e}: alert must be an integer alert number")
     return entries
 
 
@@ -72,8 +80,8 @@ def main() -> int:
         path = a["most_recent_instance"]["location"]["path"]
         hit = None
         for i, e in enumerate(entries):
-            if e["rule"] == rule and fnmatch.fnmatch(path, e["path"]):
-                if str(e.get("expires", "9999-12-31")) < args.today:
+            if e["rule"] == rule and fnmatch.fnmatch(path, e["path"]) and e.get("alert", a["number"]) == a["number"]:
+                if "expires" in e and datetime.date.fromisoformat(str(e["expires"])) < datetime.date.fromisoformat(args.today):
                     print(f"::warning file={args.allowlist}::allowlist entry for {rule} {e['path']} expired {e['expires']}")
                     continue
                 hit = i

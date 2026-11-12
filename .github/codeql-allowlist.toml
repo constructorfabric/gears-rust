@@ -7,7 +7,8 @@
 #   rule    = "rust/cleartext-logging"          # rule id shown on the alert
 #   path    = "libs/some-crate/src/lib.rs"      # file of the alert; globs allowed
 #   reason  = "why this is safe, with a link to the discussion"   # required
-#   expires = "2027-03-01"                      # optional; the entry stops working after it
+#   alert   = 123                               # optional; accept only this alert number
+#   expires = "2027-03-01"                      # optional YYYY-MM-DD; the entry stops working after it
 #
 # An entry that matches no open alert produces a warning: remove it.
 
@@ -18,16 +19,19 @@
 rule    = "rust/cleartext-logging"
 path    = "gears/graph-storage/remote-embedding-plugin/src/lib.rs"
 reason  = "alert #169: test the_credential_does_not_render_in_debug asserts a dummy key (sk-this-must-not-leak) is absent from Debug output; the message only prints the redacted rendering"
+alert   = 169
 expires = "2027-05-01"
 
 [[ignore]]
 rule    = "rust/cleartext-logging"
 path    = "libs/toolkit-db/src/secure/db_ops.rs"
 reason  = "alert #140: unit test prints a Uuid in an assert message; test code, no secret"
+alert   = 140
 expires = "2027-05-01"
 
 [[ignore]]
 rule    = "rust/cleartext-logging"
 path    = "gears/system/account-management/account-management/src/infra/storage/repo_impl/reads.rs"
 reason  = "alert #104: unit test prints a derived tenant-type UUIDv5 in assert/panic messages; test code, no secret"
+alert   = 104
 expires = "2027-05-01"

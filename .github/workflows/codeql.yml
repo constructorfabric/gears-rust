@@ -20,12 +20,17 @@ on:
     branches: [ "main" ]
     types: [ opened, synchronize, reopened ]
   workflow_call:
+    inputs:
+      gate:
+        description: "Called as the release gate: always gets its own concurrency group"
+        type: boolean
+        default: false
   workflow_dispatch:
 
 concurrency:
   # Nightly and manual runs queue one by one. Every other run gets its own group: a
   # release gate must never be cancelled by, or replaced in the queue by, another run.
-  group: ${{ github.workflow }}-${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && 'scheduled' || github.run_id }}
+  group: ${{ github.workflow }}-${{ ((github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && !inputs.gate) && 'scheduled' || github.run_id }}
   cancel-in-progress: false
 
 permissions:
