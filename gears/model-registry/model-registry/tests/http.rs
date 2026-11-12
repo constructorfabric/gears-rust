@@ -19,7 +19,6 @@ use model_registry::domain::error::DomainError;
 use model_registry::domain::local_client::LocalClient;
 use model_registry::domain::service::Service;
 use model_registry::infra::chain_cache::ChainCache;
-use model_registry::infra::storage::migrations::Migrator;
 use model_registry::testing::{
     StaticAuthz, StaticSchemaSource, StaticSecretRefSource, StaticTenantResolver, model_update,
     provider_update, security_context,
@@ -29,17 +28,18 @@ use model_registry_sdk::{
     ContextWindow, CreateModelRequestV1, CreateProviderRequestV1, ModelRegistryClientV1, field,
     reason::{aborted, permission},
 };
-use sea_orm_migration::MigratorTrait;
 use serde_json::{Value, json};
 use toolkit::api::operation_builder::OperationSpec;
 use toolkit::api::{OpenApiRegistry, canonical_error_middleware};
 use toolkit_canonical_errors::{CanonicalError, Problem};
-use toolkit_db::migration_runner::run_migrations_for_testing;
-use toolkit_db::{ConnectOpts, DBProvider, connect_db};
+use toolkit_db::DBProvider;
 use toolkit_gts::gts_id;
 use toolkit_odata::ODataQuery;
 use tower::ServiceExt;
 use uuid::Uuid;
+
+mod common;
+use common::{KeepAlive, TestDb, test_db};
 
 const OPENAI: &str = gts_id!("cf.genai.model.provider.v1~cf.genai._.openai.v1~");
 const STRICT: &str = gts_id!("cf.genai.model.provider.v1~cf.genai._.strict.v1~");
@@ -66,12 +66,13 @@ impl OpenApiRegistry for NoopRegistry {
     }
 }
 
-/// Root → Child, both served by one service over one in-memory database.
+/// Root → Child, both served by one service over one database.
 struct Harness {
     service: Arc<Service>,
     sdk: LocalClient,
     root: Uuid,
     child: Uuid,
+    _db: KeepAlive,
 }
 
 struct Reply {
@@ -104,19 +105,10 @@ impl Reply {
 }
 
 async fn harness_with(authz: StaticAuthz) -> Harness {
-    let raw = connect_db(
-        "sqlite::memory:",
-        ConnectOpts {
-            max_conns: Some(1),
-            min_conns: Some(1),
-            ..Default::default()
-        },
-    )
-    .await
-    .expect("in-memory SQLite");
-    run_migrations_for_testing(&raw, Migrator::migrations())
-        .await
-        .expect("migrations");
+    let TestDb {
+        db: raw,
+        keep_alive,
+    } = test_db().await;
     let root = Uuid::new_v4();
     let child = Uuid::new_v4();
     let cfg = ModelRegistryConfig::default();
@@ -159,6 +151,7 @@ async fn harness_with(authz: StaticAuthz) -> Harness {
         sdk: LocalClient::new(service),
         root,
         child,
+        _db: keep_alive,
     }
 }
 

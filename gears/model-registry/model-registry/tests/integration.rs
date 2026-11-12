@@ -1,6 +1,7 @@
-//! Service-level integration tests on in-memory SQLite with the production
-//! migration and the dependency doubles of `model_registry::testing`
-//! (DESIGN §4 Testability, PRD §9 acceptance criteria).
+//! Service-level integration tests with the production migration and the
+//! dependency doubles of `model_registry::testing` (DESIGN §4 Testability,
+//! PRD §9 acceptance criteria). On in-memory SQLite by default, on `PostgreSQL`
+//! with `--features integration` (`tests/common`).
 
 #![allow(
     clippy::expect_used,
@@ -26,7 +27,6 @@ use model_registry::domain::credential_check::OwnRowState;
 use model_registry::domain::error::{Dependency, DomainError, Resource};
 use model_registry::domain::service::Service;
 use model_registry::infra::chain_cache::ChainCache;
-use model_registry::infra::storage::migrations::Migrator;
 use model_registry::testing::{
     StaticAuthz, StaticSchemaSource, StaticSecretRefSource, StaticTenantResolver, deny,
     model_update, own_tenant_constraint, permit_with, provider_update, security_context,
@@ -40,14 +40,15 @@ use model_registry_sdk::{
     ApprovalState, ContextWindow, CreateModelRequestV1, CreateProviderRequestV1, ModelCostV1,
     ModelEntryV1, ModelV1, SharingMode, field,
 };
-use sea_orm_migration::MigratorTrait;
 use tenant_resolver_sdk::BarrierMode;
-use toolkit_db::migration_runner::run_migrations_for_testing;
-use toolkit_db::{ConnectOpts, DBProvider, connect_db};
+use toolkit_db::DBProvider;
 use toolkit_gts::gts_id;
 use toolkit_odata::ODataQuery;
 use toolkit_security::SecurityContext;
 use uuid::Uuid;
+
+mod common;
+use common::{KeepAlive, TestDb, test_db};
 
 const OPENAI: &str = gts_id!("cf.genai.model.provider.v1~cf.genai._.openai.v1~");
 const STRICT: &str = gts_id!("cf.genai.model.provider.v1~cf.genai._.strict.v1~");
@@ -63,6 +64,7 @@ struct Harness {
     schemas: Arc<StaticSchemaSource>,
     secrets: Arc<StaticSecretRefSource>,
     clock: Arc<ManualClock>,
+    _db: KeepAlive,
 }
 
 fn schemas() -> StaticSchemaSource {
@@ -101,19 +103,10 @@ async fn harness_full(
     secrets: StaticSecretRefSource,
     cfg: ModelRegistryConfig,
 ) -> Harness {
-    let raw = connect_db(
-        "sqlite::memory:",
-        ConnectOpts {
-            max_conns: Some(1),
-            min_conns: Some(1),
-            ..Default::default()
-        },
-    )
-    .await
-    .expect("in-memory SQLite");
-    run_migrations_for_testing(&raw, Migrator::migrations())
-        .await
-        .expect("migrations");
+    let TestDb {
+        db: raw,
+        keep_alive,
+    } = test_db().await;
     let db = Arc::new(DBProvider::<DomainError>::new(raw));
     let authz = Arc::new(authz);
     let resolver = Arc::new(resolver);
@@ -147,6 +140,7 @@ async fn harness_full(
         schemas,
         secrets,
         clock,
+        _db: keep_alive,
     }
 }
 

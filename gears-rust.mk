@@ -513,7 +513,7 @@ test-eb-kafka: install-tools
 TOOLKIT_DB_LANES := toolkit-db-sqlite toolkit-db-pg toolkit-db-pgq toolkit-db-mysql
 INTEGRATION_LANES := $(TOOLKIT_DB_LANES) users-info-pg usage-collector-pg usage-collector-ch \
 	types-registry-db oagw-db oagw-cluster cluster-pg cluster-redis rg-pg settings-service-pg credstore-pg construct-pg \
-	pricing-pg coord-pg products-pg ledger-pg orders-pg eb-gear-db quota-enforcement-pg
+	model-registry-pg pricing-pg coord-pg products-pg ledger-pg orders-pg eb-gear-db quota-enforcement-pg
 
 ## toolkit-db on SQLite; the examples must still build after the tests.
 lane_args_toolkit-db-sqlite = -p cf-gears-toolkit-db --features sqlite,integration
@@ -641,6 +641,17 @@ lane_env_credstore-pg = CREDSTORE_PG_REQUIRE_DOCKER=1
 ## CONSTRUCT_PG_REQUIRE_DOCKER=1 turns an unreachable Docker into a failure.
 lane_args_construct-pg = -p cf-gears-construct --features integration --test pg_erasure_test
 lane_env_construct-pg = CONSTRUCT_PG_REQUIRE_DOCKER=1
+
+## The model-registry gear on PostgreSQL (Docker required; every harness spins
+## up its own postgres container via testcontainers -- see
+## gears/model-registry/model-registry/tests/common/mod.rs). With
+## `integration` the service and REST suites that the default run executes on
+## SQLite run on PostgreSQL instead, next to the PostgreSQL-only migration and
+## concurrency suites (tests/pg_*_test.rs).
+## MODEL_REGISTRY_PG_REQUIRE_DOCKER=1 turns an unreachable Docker into a
+## failure; otherwise the suites fall back to SQLite or skip.
+lane_args_model-registry-pg = -p cf-gears-model-registry --features integration
+lane_env_model-registry-pg = MODEL_REGISTRY_PG_REQUIRE_DOCKER=1
 
 ## bss-pricing's Postgres tier (Docker required; each suite spins up its own
 ## postgres container via testcontainers).
