@@ -13,9 +13,8 @@ alert number instead of every alert of the rule in the matching path. Dismissing
 works: dismissed alerts are not open.
 
 Environment: GH_TOKEN, GITHUB_REPOSITORY, GITHUB_REF (set by Actions).
-`--alerts-file FILE` reads the alerts from a JSON file instead of the API (for tests).
+Tests call `evaluate()` directly with alerts and allowlist entries; the CLI takes no file paths.
 """
-import argparse
 import datetime
 import fnmatch
 import json
@@ -56,22 +55,10 @@ def load_allowlist(path: str) -> list[dict]:
     return entries
 
 
-def main() -> int:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--alerts-file")
-    ap.add_argument("--allowlist", default=ALLOWLIST)
-    ap.add_argument("--today", default=datetime.date.today().isoformat())
-    args = ap.parse_args()
-
-    if args.alerts_file:
-        with open(args.alerts_file) as f:
-            alerts = json.load(f)
-    else:
-        alerts = fetch_alerts(os.environ["GITHUB_REPOSITORY"], os.environ["GITHUB_REF"])
-
-    entries = load_allowlist(args.allowlist)
+def evaluate(alerts: list[dict], entries: list[dict], today: str) -> int:
     used = set()
     blocking = []
+    today_date = datetime.date.fromisoformat(today)
     for a in alerts:
         sev = (a["rule"].get("security_severity_level") or "").lower()
         if sev not in BLOCKING:
@@ -81,8 +68,8 @@ def main() -> int:
         hit = None
         for i, e in enumerate(entries):
             if e["rule"] == rule and fnmatch.fnmatch(path, e["path"]) and e.get("alert", a["number"]) == a["number"]:
-                if "expires" in e and datetime.date.fromisoformat(str(e["expires"])) < datetime.date.fromisoformat(args.today):
-                    print(f"::warning file={args.allowlist}::allowlist entry for {rule} {e['path']} expired {e['expires']}")
+                if "expires" in e and datetime.date.fromisoformat(str(e["expires"])) < today_date:
+                    print(f"::warning file={ALLOWLIST}::allowlist entry for {rule} {e['path']} expired {e['expires']}")
                     continue
                 hit = i
                 break
@@ -94,7 +81,7 @@ def main() -> int:
 
     for i, e in enumerate(entries):
         if i not in used:
-            print(f"::warning file={args.allowlist}::allowlist entry for {e['rule']} {e['path']} matches no open alert; remove it")
+            print(f"::warning file={ALLOWLIST}::allowlist entry for {e['rule']} {e['path']} matches no open alert; remove it")
 
     if blocking:
         for n, sev, rule, path, url in blocking:
@@ -104,6 +91,11 @@ def main() -> int:
         return 1
     print("No blocking CodeQL alerts.")
     return 0
+
+
+def main() -> int:
+    alerts = fetch_alerts(os.environ["GITHUB_REPOSITORY"], os.environ["GITHUB_REF"])
+    return evaluate(alerts, load_allowlist(ALLOWLIST), datetime.date.today().isoformat())
 
 
 if __name__ == "__main__":
