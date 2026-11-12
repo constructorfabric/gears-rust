@@ -297,6 +297,89 @@ async fn proxy_sse_streaming() {
     assert!(body_str.contains("data: [DONE]"));
 }
 
+// 13.3: the Data Plane subscribes its SSE bodies to the signal the gear stops
+// streams with. Stopped first, so the mock's whole-body SSE answer cannot
+// end the stream before the stop does.
+#[tokio::test]
+async fn proxy_sse_stream_ends_when_streams_were_stopped() {
+    use futures_util::StreamExt as _;
+
+    let mut guard = MockGuard::new();
+    guard.mock(
+        "POST",
+        "/v1/chat/completions/stream",
+        MockResponse {
+            status: 200,
+            headers: vec![("content-type".into(), "text/event-stream".into())],
+            body: MockBody::Sse(vec!["[DONE]".to_string()]),
+        },
+    );
+
+    let h = AppHarness::builder().build().await;
+    let ctx = h.security_context().clone();
+    let upstream = h
+        .facade()
+        .create_upstream(
+            ctx.clone(),
+            CreateUpstreamRequest::builder(
+                Server {
+                    endpoints: vec![Endpoint {
+                        scheme: Scheme::Http,
+                        host: "127.0.0.1".into(),
+                        port: h.mock_port(),
+                    }],
+                },
+                HTTP_PROTOCOL_ID,
+            )
+            .alias("sse-stopped")
+            .build(),
+        )
+        .await
+        .unwrap();
+    h.facade()
+        .create_route(
+            ctx.clone(),
+            CreateRouteRequest::builder(
+                upstream.id,
+                MatchRules {
+                    http: Some(HttpMatch {
+                        methods: vec![HttpMethod::Post],
+                        path: guard.path("/v1/chat/completions/stream"),
+                        query_allowlist: vec![],
+                        path_suffix_mode: PathSuffixMode::Disabled,
+                    }),
+                    grpc: None,
+                },
+            )
+            .build(),
+        )
+        .await
+        .unwrap();
+
+    h.end_streams();
+    let req = http::Request::builder()
+        .method(Method::POST)
+        .uri(format!(
+            "/sse-stopped{}",
+            guard.path("/v1/chat/completions/stream")
+        ))
+        .header(http::header::CONTENT_TYPE, "application/json")
+        .body(Body::from(r#"{"stream":true}"#))
+        .unwrap();
+    let response = h.facade().proxy_request(ctx, req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut body = response.into_body().into_stream();
+    match body.next().await {
+        Some(Err(e)) => assert!(
+            e.downcast_ref::<oagw_sdk::StreamClosedByGateway>()
+                .is_some(),
+            "not the shutdown error: {e}"
+        ),
+        other => panic!("expected the shutdown error, got {other:?}"),
+    }
+    assert!(body.next().await.is_none(), "the stream goes on");
+}
+
 // 6.15: Upstream 500 error passthrough.
 #[tokio::test]
 async fn proxy_upstream_500_passthrough() {
@@ -2277,6 +2360,40 @@ async fn proxy_websocket_idle_timeout_closes_connection() {
         // Close frame received; EOF (None) is also valid — gateway closed TCP.
         assert_eq!(op, 0x8, "expected close frame after idle timeout");
     }
+
+    server_handle.abort();
+}
+
+// 13.3: the Data Plane subscribes its WebSocket relays to the signal the gear
+// stops streams with. The default idle timeout is kept: it would send the same
+// Close 1001 and hide a broken wiring.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn proxy_websocket_closes_when_streams_were_stopped() {
+    use tokio::io::AsyncReadExt;
+
+    let h = AppHarness::builder().build().await;
+    setup_ws_upstream(&h, "ws-stopped").await;
+    let (addr, server_handle) = start_oagw_server(&h).await;
+
+    h.end_streams();
+    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    ws_send_upgrade_request(
+        &mut stream,
+        &default_ws_upgrade_request("/oagw/v1/proxy/ws-stopped/ws/echo"),
+    )
+    .await;
+
+    let mut close = [0u8; 14];
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        stream.read_exact(&mut close),
+    )
+    .await
+    .expect("the gateway closes the relay at once")
+    .unwrap();
+    let mut expected = vec![0x88, 0x0c, 0x03, 0xe9];
+    expected.extend_from_slice(b"Going Away");
+    assert_eq!(close.as_slice(), expected.as_slice());
 
     server_handle.abort();
 }

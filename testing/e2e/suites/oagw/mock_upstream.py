@@ -155,6 +155,10 @@ _OAUTH2_CLIENT = ("test-client-id", "test-client-secret")
 # that buffering is visible over a busy CI runner's scheduling jitter.
 SSE_EVENT_GAP_SECS = 0.2
 
+# How long /sse/hold keeps a stream open without an event: past every bound a
+# test waits for, short enough that a leaked stream does not outlive the run.
+SSE_HOLD_SECS = 60
+
 
 def _bump_count(key: str) -> int:
     """Increment and return the call count for *key* (1-indexed)."""
@@ -349,6 +353,20 @@ async def _handle(method: str, target: str, headers: dict, body: bytes, writer: 
             await writer.drain()
             await asyncio.sleep(SSE_EVENT_GAP_SECS)
         writer.write(_sse_raw("event: done\nid: 4\ndata: bye\n\n"))
+        writer.write(_sse_end())
+
+    # POST /sse/hold — one event, then the stream stays open with nothing to
+    # send until the caller closes it (or SSE_HOLD_SECS pass).
+    elif method == "POST" and path == "/sse/hold":
+        writer.write(_sse_header())
+        writer.write(_sse_chunk("held"))
+        await writer.drain()
+        if reader is not None:
+            try:
+                # b"" once the caller closes: nothing more is read from it.
+                await asyncio.wait_for(reader.read(), timeout=SSE_HOLD_SECS)
+            except asyncio.TimeoutError:
+                pass
         writer.write(_sse_end())
 
     # POST /v1/chat/completions/stream

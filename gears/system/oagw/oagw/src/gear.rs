@@ -93,6 +93,11 @@ pub struct OutboundApiGatewayGear {
     registry_job: OnceLock<RegistryJob>,
     /// The running registry task, from `start` to `stop`.
     registry_task: parking_lot::Mutex<Option<(CancellationToken, tokio::task::JoinHandle<()>)>>,
+    /// The Data Plane's stream shutdown signal: `stop` ends open SSE streams
+    /// and WebSocket relays with it, `start` gives new streams a fresh token.
+    stream_shutdown: OnceLock<crate::infra::proxy::streaming::StreamShutdown>,
+    /// Whether streams run under a `start` that no `stop` ended yet.
+    streams_started: std::sync::atomic::AtomicBool,
     /// Where provisioning stands, for the healthcheck.
     provisioning: ProvisioningState,
     /// What `start` connects to the cluster on a database with the cache
@@ -143,6 +148,8 @@ impl Default for OutboundApiGatewayGear {
             owner: uuid::Uuid::new_v4(),
             registry_job: OnceLock::new(),
             registry_task: parking_lot::Mutex::new(None),
+            stream_shutdown: OnceLock::new(),
+            streams_started: std::sync::atomic::AtomicBool::new(false),
             provisioning: ProvisioningState::default(),
             #[cfg(feature = "cluster")]
             cache_sync: OnceLock::new(),
@@ -411,8 +418,14 @@ impl Gear for OutboundApiGatewayGear {
         .with_allow_http_upstream(cfg.allow_http_upstream)
         .with_websocket_idle_timeout(Duration::from_secs(cfg.websocket_idle_timeout_secs))
         .with_websocket_close_timeout(Duration::from_secs(cfg.websocket_close_timeout_secs))
-        .with_streaming_idle_timeout(Duration::from_secs(cfg.streaming_idle_timeout_secs));
+        .with_streaming_idle_timeout(Duration::from_secs(cfg.streaming_idle_timeout_secs))
+        // The REST surface serves before the start phase: a stream opened in
+        // that window must end at shutdown too.
+        .with_streams_under(ctx.cancellation_token());
         dp_impl.spawn_rate_limit_sweeper(ctx.cancellation_token().clone());
+        self.stream_shutdown
+            .set(dp_impl.stream_shutdown())
+            .map_err(|_| anyhow::anyhow!("stream shutdown signal already set"))?;
         let dp: Arc<dyn DataPlaneService> = Arc::new(dp_impl);
 
         // -- Facade (for external SDK consumers) --
@@ -615,6 +628,15 @@ impl RunnableCapability for OutboundApiGatewayGear {
             })?;
             *self.change_feed.lock() = Some(feed);
         }
+        // After every step that can fail. Streams opened from now on end at
+        // the next `stop`, or as soon as the runtime starts shutting down:
+        // it drains HTTP before it calls `stop`, and an open stream would
+        // hold the drain until its deadline.
+        if let Some(streams) = self.stream_shutdown.get() {
+            streams.resume_streams(&cancel);
+            self.streams_started
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
         let Some((job, config)) = registry else {
             return Ok(());
         };
@@ -643,6 +665,13 @@ impl RunnableCapability for OutboundApiGatewayGear {
     }
 
     async fn stop(&self, deadline: CancellationToken) -> anyhow::Result<()> {
+        // First: an open SSE stream or WebSocket relay would otherwise run
+        // until its peer or its idle timeout ends it.
+        if let Some(streams) = self.stream_shutdown.get() {
+            streams.end_streams();
+        }
+        self.streams_started
+            .store(false, std::sync::atomic::Ordering::Release);
         let task = self.registry_task.lock().take();
         if let Some((token, handle)) = task {
             stop_registry_task(token, handle, deadline.clone()).await;
@@ -664,7 +693,12 @@ impl RunnableCapability for OutboundApiGatewayGear {
 impl OutboundApiGatewayGear {
     /// Whether a task of an earlier `start` still runs.
     fn running(&self) -> bool {
-        let running = self.registry_task.lock().is_some();
+        // Started streams count too, so a start after a start without a stop
+        // ends the open streams in every storage mode.
+        let running = self.registry_task.lock().is_some()
+            || self
+                .streams_started
+                .load(std::sync::atomic::Ordering::Acquire);
         #[cfg(feature = "cluster")]
         let running = running || self.change_feed.lock().is_some();
         running

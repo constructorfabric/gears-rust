@@ -9,7 +9,6 @@ use futures_util::StreamExt;
 use http::{HeaderMap, HeaderValue};
 use oagw_sdk::body::{Body, BodyStream};
 use oagw_sdk::{field, reason};
-use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 use toolkit_http_proxy::{ReplayableBody, UpgradeOutcome, empty_body, full_body, stream_body};
 use toolkit_security::SecurityContext;
@@ -37,6 +36,7 @@ use crate::infra::plugin::{AuthPluginRegistry, GuardPluginRegistry, TransformPlu
 
 use super::engine::{ProxyEngine, into_body_stream, map_proxy_error};
 use super::headers;
+use super::streaming::StreamShutdown;
 use super::{request_builder, streaming};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
@@ -50,9 +50,9 @@ pub struct DataPlaneServiceImpl {
     cp: Arc<dyn ControlPlaneService>,
     backend_selector: Arc<dyn EndpointSelector>,
     engine: Arc<ProxyEngine>,
-    /// Sender kept alive so receivers see `false` (not shutting down) until drop.
-    _shutdown_tx: watch::Sender<bool>,
-    shutdown_rx: watch::Receiver<bool>,
+    /// Ends open SSE streams and WebSocket relays at gear stop and runtime
+    /// shutdown ([`Self::stream_shutdown`]).
+    stream_shutdown: StreamShutdown,
     auth_registry: AuthPluginRegistry,
     guard_registry: GuardPluginRegistry,
     transform_registry: TransformPluginRegistry,
@@ -92,14 +92,12 @@ impl DataPlaneServiceImpl {
             AuthPluginRegistry::with_builtins(credstore, token_http_config, token_cache_config);
         let guard_registry = GuardPluginRegistry::with_builtins();
         let transform_registry = TransformPluginRegistry::with_builtins();
-        let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
         Self {
             cp,
             backend_selector,
             engine,
-            _shutdown_tx: shutdown_tx,
-            shutdown_rx,
+            stream_shutdown: StreamShutdown::new(),
             auth_registry,
             guard_registry,
             transform_registry,
@@ -117,13 +115,12 @@ impl DataPlaneServiceImpl {
 
     /// Start evicting idle rate-limit buckets every
     /// [`RATE_LIMIT_SWEEP_INTERVAL`]. The task ends when `cancel` fires or
-    /// this service is dropped.
+    /// the limiter, shared with the Control Plane, is dropped.
     pub fn spawn_rate_limit_sweeper(&self, cancel: CancellationToken) {
         tokio::spawn(sweep_rate_limits(
             Arc::downgrade(&self.rate_limiter),
             Arc::clone(&self.metrics),
             RATE_LIMIT_SWEEP_INTERVAL,
-            self.shutdown_rx.clone(),
             cancel,
         ));
     }
@@ -139,6 +136,21 @@ impl DataPlaneServiceImpl {
     #[must_use]
     pub fn with_max_body_size(mut self, size: usize) -> Self {
         self.max_body_size = size;
+        self
+    }
+
+    /// The signal the gear ends open SSE streams and WebSocket relays with.
+    pub(crate) fn stream_shutdown(&self) -> StreamShutdown {
+        self.stream_shutdown.clone()
+    }
+
+    /// End open SSE streams and WebSocket relays also when `parent` (the
+    /// runtime's root token) is cancelled, the ones opened before the gear's
+    /// first start included. Call it before [`Self::stream_shutdown`]: it
+    /// replaces the signal.
+    #[must_use]
+    pub(crate) fn with_streams_under(mut self, parent: &CancellationToken) -> Self {
+        self.stream_shutdown = StreamShutdown::under(parent);
         self
     }
 
@@ -259,7 +271,7 @@ impl DataPlaneServiceImpl {
             streaming::streaming_body_with_lifecycle(
                 resp_body_stream,
                 self.streaming_idle_timeout,
-                self.shutdown_rx.clone(),
+                self.stream_shutdown.subscribe(),
             )
         } else {
             resp_body_stream
@@ -1051,13 +1063,13 @@ impl DataPlaneServiceImpl {
     }
 }
 
-/// Evict idle rate-limit buckets every `interval` until the service is
-/// dropped: its shutdown sender closes, or the limiter is gone.
+/// Evict idle rate-limit buckets every `interval` until `cancel` fires or the
+/// limiter is gone. The stream shutdown signal does not stop it: a gear stop
+/// and a later start keep the same limiter.
 async fn sweep_rate_limits(
     limiter: Weak<RateLimiter>,
     metrics: Arc<dyn OagwMetricsPort>,
     interval: Duration,
-    mut shutdown: watch::Receiver<bool>,
     cancel: CancellationToken,
 ) {
     let mut ticker = tokio::time::interval(interval);
@@ -1066,7 +1078,6 @@ async fn sweep_rate_limits(
     loop {
         tokio::select! {
             () = cancel.cancelled() => return,
-            _ = shutdown.changed() => return,
             _ = ticker.tick() => {
                 let Some(limiter) = limiter.upgrade() else {
                     return;
@@ -1172,7 +1183,7 @@ impl DataPlaneServiceImpl {
                     leftover: Bytes::new(),
                     idle_timeout: self.websocket_idle_timeout,
                     close_timeout: self.websocket_close_timeout,
-                    shutdown_rx: self.shutdown_rx.clone(),
+                    stopped: self.stream_shutdown.subscribe(),
                     metrics: Some(self.metrics.clone()),
                     host: pipeline.host.to_string(),
                 },
@@ -2648,12 +2659,10 @@ mod tests {
         limiter
             .try_consume("key", &fast_refill_config(), "/test")
             .unwrap();
-        let (_tx, rx) = watch::channel(false);
         let sweep = tokio::spawn(sweep_rate_limits(
             Arc::downgrade(&limiter),
             Arc::new(crate::domain::ports::NoopMetrics),
             Duration::from_millis(5),
-            rx,
             CancellationToken::new(),
         ));
 
@@ -2665,25 +2674,6 @@ mod tests {
         .await
         .expect("the sweep evicts the refilled bucket");
         sweep.abort();
-    }
-
-    #[tokio::test]
-    async fn sweep_ends_when_the_service_drops_its_shutdown_sender() {
-        let limiter = Arc::new(RateLimiter::new());
-        let (tx, rx) = watch::channel(false);
-        let sweep = tokio::spawn(sweep_rate_limits(
-            Arc::downgrade(&limiter),
-            Arc::new(crate::domain::ports::NoopMetrics),
-            Duration::from_secs(3600),
-            rx,
-            CancellationToken::new(),
-        ));
-
-        drop(tx);
-        tokio::time::timeout(Duration::from_secs(5), sweep)
-            .await
-            .expect("the sweep ends")
-            .unwrap();
     }
 
     /// Keeps only the request-duration observations.
@@ -3005,6 +2995,22 @@ mod tests {
         }
     }
 
+    /// The handle the gear stops streams with is the one this service
+    /// subscribes its SSE bodies and WebSocket relays to.
+    #[tokio::test]
+    async fn the_stream_shutdown_handle_is_the_one_streams_watch() {
+        let svc = build_svc_resolving(
+            Arc::new(MockSelector::new()),
+            Arc::new(crate::domain::ports::NoopMetrics),
+            None,
+        );
+        let watched = svc.stream_shutdown.subscribe();
+        svc.stream_shutdown().end_streams();
+        tokio::time::timeout(Duration::from_secs(1), watched.stopped())
+            .await
+            .expect("a stop through the handed-out handle reaches the streams");
+    }
+
     /// Rows stored before plugin ids were checked on write (#4974) may still
     /// name a plugin that does not resolve. Pins what the proxy does with
     /// them today: an auth plugin fails the request with
@@ -3239,12 +3245,10 @@ mod tests {
     #[tokio::test]
     async fn sweep_ends_when_the_limiter_is_dropped() {
         let limiter = Arc::new(RateLimiter::new());
-        let (_tx, rx) = watch::channel(false);
         let sweep = tokio::spawn(sweep_rate_limits(
             Arc::downgrade(&limiter),
             Arc::new(crate::domain::ports::NoopMetrics),
             Duration::from_millis(5),
-            rx,
             CancellationToken::new(),
         ));
 

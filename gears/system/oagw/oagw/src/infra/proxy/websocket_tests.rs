@@ -1,26 +1,23 @@
 use super::*;
+use crate::infra::proxy::streaming::wake_flag::WakeFlag;
 use tokio::io::AsyncReadExt;
+use tokio_util::sync::CancellationToken;
 
-/// Create a no-op shutdown receiver for tests that don't exercise shutdown.
-fn test_shutdown_rx() -> watch::Receiver<bool> {
-    let (_tx, rx) = watch::channel(false);
-    rx
+/// A stop signal that never fires, for tests that don't exercise shutdown.
+fn never_stopped() -> CancellationToken {
+    CancellationToken::new()
 }
 
-fn cfg(idle: Duration, shutdown_rx: watch::Receiver<bool>) -> RelayConfig {
-    cfg_with_leftover(idle, shutdown_rx, Bytes::new())
+fn cfg(idle: Duration, stopped: CancellationToken) -> RelayConfig {
+    cfg_with_leftover(idle, stopped, Bytes::new())
 }
 
-fn cfg_with_leftover(
-    idle: Duration,
-    shutdown_rx: watch::Receiver<bool>,
-    leftover: Bytes,
-) -> RelayConfig {
+fn cfg_with_leftover(idle: Duration, stopped: CancellationToken, leftover: Bytes) -> RelayConfig {
     RelayConfig {
         leftover,
         idle_timeout: idle,
         close_timeout: Duration::from_millis(100),
-        shutdown_rx,
+        stopped: stopped.into(),
     }
 }
 
@@ -135,7 +132,7 @@ async fn relay_forwards_bytes_in_both_directions() {
         relay(
             client_b,
             upstream_b,
-            cfg(Duration::from_secs(5), test_shutdown_rx()),
+            cfg(Duration::from_secs(5), never_stopped()),
         )
         .await
     });
@@ -187,7 +184,7 @@ async fn relay_forwards_masked_rsv_and_unknown_opcode_frames_verbatim() {
         relay(
             client_b,
             upstream_b,
-            cfg(Duration::from_secs(5), test_shutdown_rx()),
+            cfg(Duration::from_secs(5), never_stopped()),
         )
         .await
     });
@@ -222,7 +219,7 @@ async fn relay_peer_disconnect_ends_the_session() {
         relay(
             client_b,
             upstream_b,
-            cfg(Duration::from_secs(5), test_shutdown_rx()),
+            cfg(Duration::from_secs(5), never_stopped()),
         )
         .await
     });
@@ -246,7 +243,7 @@ async fn relay_idle_timeout_sends_close_1001_to_both_sides() {
         relay(
             client_b,
             upstream_b,
-            cfg(Duration::from_millis(100), test_shutdown_rx()),
+            cfg(Duration::from_millis(100), never_stopped()),
         )
         .await
     });
@@ -294,7 +291,7 @@ async fn relay_idle_timer_is_pushed_out_by_traffic() {
         relay(
             client_b,
             upstream_b,
-            cfg(Duration::from_millis(300), test_shutdown_rx()),
+            cfg(Duration::from_millis(300), never_stopped()),
         )
         .await
     });
@@ -317,25 +314,31 @@ async fn relay_idle_timer_is_pushed_out_by_traffic() {
 async fn relay_shutdown_sends_close_1001() {
     let (mut client_a, client_b) = tokio::io::duplex(4096);
     let (upstream_a, upstream_b) = tokio::io::duplex(4096);
-    let (tx, rx) = watch::channel(false);
+    let stop = CancellationToken::new();
 
-    let handle =
-        tokio::spawn(
-            async move { relay(client_b, upstream_b, cfg(Duration::from_secs(5), rx)).await },
-        );
+    let mut session = std::pin::pin!(relay(
+        client_b,
+        upstream_b,
+        cfg(Duration::from_secs(5), stop.clone())
+    ));
+    // Parked on the idle peers when the stop comes.
+    let flag = Arc::new(WakeFlag::default());
+    flag.park(session.as_mut());
+    stop.cancel();
+    assert!(flag.woken(), "the stop wakes the waiting relay");
 
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    tx.send(true).unwrap();
+    // The Close frames fit the duplex buffers, so the relay ends unread.
+    let outcome = tokio::time::timeout(Duration::from_secs(1), session)
+        .await
+        .expect("the relay ends at once");
+    assert!(matches!(outcome, RelayOutcome::Shutdown), "{outcome:?}");
 
     let to_client = read_n(&mut client_a, 14).await;
     assert_eq!(to_client[0], 0x88);
     assert_eq!(to_client[1], 12, "server-to-client frames are not masked");
     assert_eq!(&to_client[2..4], &1001u16.to_be_bytes());
     assert_eq!(&to_client[4..14], b"Going Away");
-
     drop(upstream_a);
-    let outcome = handle.await.unwrap();
-    assert!(matches!(outcome, RelayOutcome::Shutdown));
 }
 
 /// A peer that has stopped reading must not be able to wedge teardown.
@@ -352,7 +355,7 @@ async fn relay_teardown_is_bounded_when_a_peer_stops_reading() {
         relay(
             StalledIo,
             upstream_b,
-            cfg(Duration::from_millis(100), test_shutdown_rx()),
+            cfg(Duration::from_millis(100), never_stopped()),
         ),
     )
     .await
@@ -379,7 +382,7 @@ async fn relay_announces_close_to_upstream_even_when_the_caller_has_stalled() {
         relay(
             StalledIo,
             upstream_b,
-            cfg(Duration::from_millis(100), test_shutdown_rx()),
+            cfg(Duration::from_millis(100), never_stopped()),
         )
         .await
     });
@@ -418,7 +421,7 @@ async fn relay_streams_a_payload_far_larger_than_the_copy_buffer() {
         relay(
             client_b,
             upstream_b,
-            cfg(Duration::from_secs(10), test_shutdown_rx()),
+            cfg(Duration::from_secs(10), never_stopped()),
         )
         .await
     });
@@ -457,7 +460,7 @@ async fn relay_reports_an_upstream_drop_distinctly() {
         relay(
             client_b,
             upstream_b,
-            cfg(Duration::from_secs(5), test_shutdown_rx()),
+            cfg(Duration::from_secs(5), never_stopped()),
         )
         .await
     });
@@ -500,7 +503,7 @@ async fn relay_surfaces_io_errors() {
         relay(
             BrokenIo,
             upstream_b,
-            cfg(Duration::from_secs(5), test_shutdown_rx()),
+            cfg(Duration::from_secs(5), never_stopped()),
         ),
     )
     .await
@@ -510,18 +513,18 @@ async fn relay_surfaces_io_errors() {
     drop(upstream_a);
 }
 
-/// A session opened after shutdown was already announced must close at
-/// once, without waiting for a `changed()` edge that will never come.
+/// A session opened after the stop must close at once: the stop is already
+/// active when the relay starts waiting.
 #[tokio::test]
 async fn relay_closes_when_shutdown_was_already_signalled() {
     let (mut client_a, client_b) = tokio::io::duplex(4096);
     let (upstream_a, upstream_b) = tokio::io::duplex(4096);
-    let (_tx, rx) = watch::channel(true);
+    let stop = CancellationToken::new();
+    stop.cancel();
 
-    let handle =
-        tokio::spawn(
-            async move { relay(client_b, upstream_b, cfg(Duration::from_secs(30), rx)).await },
-        );
+    let handle = tokio::spawn(async move {
+        relay(client_b, upstream_b, cfg(Duration::from_secs(30), stop)).await
+    });
 
     let to_client = read_n(&mut client_a, 14).await;
     assert_eq!(to_client[0], 0x88);
@@ -547,7 +550,7 @@ async fn leftover_bytes_reach_the_caller_ahead_of_later_upstream_data() {
             upstream_b,
             cfg_with_leftover(
                 Duration::from_secs(5),
-                test_shutdown_rx(),
+                never_stopped(),
                 Bytes::from_static(b"post-101-bytes"),
             ),
         )
@@ -575,7 +578,7 @@ async fn empty_leftover_forwards_nothing_of_its_own() {
         relay(
             client_b,
             upstream_b,
-            cfg(Duration::from_secs(5), test_shutdown_rx()),
+            cfg(Duration::from_secs(5), never_stopped()),
         )
         .await
     });
@@ -604,7 +607,7 @@ async fn relay_tears_down_when_leftover_bytes_meet_a_stalled_caller() {
             upstream_b,
             cfg_with_leftover(
                 Duration::from_millis(100),
-                test_shutdown_rx(),
+                never_stopped(),
                 Bytes::from_static(b"never-accepted"),
             ),
         )
@@ -630,27 +633,4 @@ async fn relay_tears_down_when_leftover_bytes_meet_a_stalled_caller() {
         "teardown took {:?}; leftover delivery is not bounded",
         started.elapsed()
     );
-}
-
-/// A dropped shutdown sender can never deliver a signal; the branch must go
-/// inert rather than resolving `Err` on every poll and spinning the loop.
-#[tokio::test]
-async fn relay_survives_a_dropped_shutdown_sender() {
-    let (mut client_a, client_b) = tokio::io::duplex(4096);
-    let (mut upstream_a, upstream_b) = tokio::io::duplex(4096);
-    let (tx, rx) = watch::channel(false);
-    drop(tx);
-
-    let handle =
-        tokio::spawn(
-            async move { relay(client_b, upstream_b, cfg(Duration::from_secs(5), rx)).await },
-        );
-
-    client_a.write_all(b"still-works").await.unwrap();
-    assert_eq!(read_n(&mut upstream_a, 11).await, b"still-works");
-
-    drop(client_a);
-    drop(upstream_a);
-    let outcome = handle.await.unwrap();
-    assert!(matches!(outcome, RelayOutcome::Closed { .. }));
 }
