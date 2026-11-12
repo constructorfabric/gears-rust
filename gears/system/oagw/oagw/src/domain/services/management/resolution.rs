@@ -9,7 +9,7 @@ use std::collections::HashSet;
 use crate::domain::error::DomainError;
 use crate::domain::model::{Route, Upstream};
 use crate::domain::repo::{ProxyConfigReader, RepositoryError, RowKey, Tags};
-use crate::domain::route_matching::{parse_method, select_route};
+use crate::domain::route_matching::{SeparatorBypass, parse_method, select_route};
 
 use super::ControlPlaneServiceImpl;
 
@@ -74,6 +74,24 @@ impl ControlPlaneServiceImpl {
         method_path: Option<(&str, &str)>,
         tags: Tags,
     ) -> Result<(Upstream, Option<Route>), DomainError> {
+        let (effective, route, _) = self
+            .resolve_alias_sourced(ctx, tenant_chain, alias, method_path, tags)
+            .await?;
+        Ok((effective, route))
+    }
+
+    /// [`Self::resolve_alias`], with the upstreams the answer is built from:
+    /// the selected one, then the merge chain closest-first. Ancestor
+    /// upstreams outside the merge chain share nothing and change nothing in
+    /// the answer.
+    pub(super) async fn resolve_alias_sourced(
+        &self,
+        ctx: &SecurityContext,
+        tenant_chain: &[Uuid],
+        alias: &str,
+        method_path: Option<(&str, &str)>,
+        tags: Tags,
+    ) -> Result<(Upstream, Option<Route>, Vec<RowKey>), DomainError> {
         // Normalize the incoming alias for case-insensitive matching.
         let alias = normalize_alias(alias);
         if validate_alias(&alias).is_err() {
@@ -104,6 +122,13 @@ impl ControlPlaneServiceImpl {
         };
         let (selected_upstream, merge_chain) =
             select_upstream(candidates, ctx.subject_tenant_id(), tenant_chain)?;
+        let sources: Vec<RowKey> = std::iter::once(&selected_upstream)
+            .chain(&merge_chain)
+            .map(|u| RowKey {
+                tenant_id: u.tenant_id,
+                id: u.id,
+            })
+            .collect();
 
         // The deny-list may have grown since the upstream was stored.
         validate_endpoint_hostnames_ssrf(&self.ssrf_guard, &selected_upstream.server.endpoints)?;
@@ -129,9 +154,9 @@ impl ControlPlaneServiceImpl {
                     std::slice::from_ref(&selected_upstream),
                     Some(route),
                 )?;
-                return Ok((effective, Some(route.clone())));
+                return Ok((effective, Some(route.clone()), sources));
             }
-            return Ok((selected_upstream, None));
+            return Ok((selected_upstream, None, sources));
         }
 
         // Root-first order for merge: reverse ancestors, append selected.
@@ -147,7 +172,7 @@ impl ControlPlaneServiceImpl {
                     self.withheld_log.report(self.metrics.as_deref(), &withheld);
                 }
             })?;
-        Ok((effective, route))
+        Ok((effective, route, sources))
     }
 
     /// The best enabled HTTP route for `method` and `path` over `upstreams`
@@ -174,6 +199,7 @@ impl ControlPlaneServiceImpl {
                 {
                     Ok(route) => Ok(route),
                     Err(RepositoryError::NotFound { .. }) => Err(not_found()),
+                    Err(RepositoryError::SeparatorBypass) => Err(SeparatorBypass.into_error(path)),
                     Err(e) => Err(DomainError::from(e)),
                 };
             }
@@ -195,6 +221,7 @@ impl ControlPlaneServiceImpl {
             method,
             path,
         )
+        .map_err(|bypass| bypass.into_error(path))?
         .cloned()
         .ok_or_else(not_found)
     }

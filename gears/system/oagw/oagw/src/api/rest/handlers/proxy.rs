@@ -33,6 +33,29 @@ pub async fn proxy_handler(
     proxy(state, ctx, req).await.unwrap_or_else(error_response)
 }
 
+/// Map a failure to buffer the request body. Only the size limit
+/// (`http_body_util::LengthLimitError` somewhere in the source chain) is a
+/// 413; any other failure, such as an aborted upload, is a gateway 400.
+fn body_read_error(err: &axum::Error, max_body_size: usize, path: &str) -> DomainError {
+    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(err);
+    while let Some(cause) = source {
+        if cause.is::<http_body_util::LengthLimitError>() {
+            return DomainError::PayloadTooLarge {
+                detail: format!("request body exceeds maximum of {max_body_size} bytes"),
+                instance: path.to_owned(),
+            };
+        }
+        source = cause.source();
+    }
+    tracing::debug!(error = %err, path, "reading the proxied request body failed");
+    DomainError::Validation {
+        field: "body",
+        reason: field::BODY_READ_FAILED,
+        detail: "failed to read the request body".into(),
+        instance: path.to_owned(),
+    }
+}
+
 /// The body of [`proxy_handler`]. A failure stays a [`DomainError`] until the
 /// handler renders it, so this `Result` does not carry a 128-byte `Response`.
 async fn proxy(
@@ -83,6 +106,11 @@ async fn proxy(
 
     let max_body_size = state.config.max_body_size_bytes;
     let (mut parts, body) = req.into_parts();
+
+    // Authorize before anything reads, buffers or validates the request
+    // (WebSocket, path, body): a caller without `proxy:invoke` gets 403, not
+    // a 400 from a request check (#4981).
+    let grant = state.dp.authorize_proxy(ctx).await?;
 
     // Detect WebSocket upgrade and extract the hyper upgrade handle.
     // This must happen before body consumption — the OnUpgrade future is
@@ -172,10 +200,7 @@ async fn proxy(
     } else {
         axum::body::to_bytes(body, max_body_size)
             .await
-            .map_err(|_| DomainError::PayloadTooLarge {
-                detail: format!("request body exceeds maximum of {max_body_size} bytes"),
-                instance: path.to_string(),
-            })?
+            .map_err(|e| body_read_error(&e, max_body_size, path))?
     };
 
     // Strip the proxy prefix from the URI so the DP receives /{alias}/{path}?query.
@@ -196,7 +221,7 @@ async fn proxy(
     let proxy_req = http::Request::from_parts(parts, sdk_body);
 
     // Execute proxy pipeline.
-    let proxy_resp = state.dp.proxy_request(ctx, proxy_req).await?;
+    let proxy_resp = state.dp.proxy_request_granted(grant, proxy_req).await?;
 
     // Convert http::Response<oagw_sdk::Body> to axum Response.
     let (mut resp_parts, sdk_body) = proxy_resp.into_parts();

@@ -164,6 +164,10 @@ pub const INVALID_PROXY_PATH: &str = "INVALID_PROXY_PATH";
 /// The request URI lacks an upstream alias segment (e.g. raw `/`).
 pub const MISSING_ALIAS: &str = "MISSING_ALIAS";
 
+/// Reading the request body failed for a reason other than its size, for
+/// example the client aborted the upload.
+pub const BODY_READ_FAILED: &str = "BODY_READ_FAILED";
+
 /// The route does not allow query parameters but the request supplied
 /// one or more.
 pub const QUERY_NOT_ALLOWED: &str = "QUERY_NOT_ALLOWED";

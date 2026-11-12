@@ -212,7 +212,7 @@ Design constraints enforced: `cpt-cf-oagw-constraint-body-limit`, `cpt-cf-oagw-c
 4. [x] - `p1` - **FOR EACH** route ordered by path prefix length (longest first), then priority (higher number first, per `cpt-cf-oagw-adr-storage-schema`), then lowest route ID - `inst-route-3`
    1. [x] - `p1` - **IF** route.match_type = 'http' - `inst-route-3a`
       1. [x] - `p1` - Check request method is in the route's HTTP method list - `inst-route-3a1`
-      2. [x] - `p1` - Check request path starts with the route's path prefix - `inst-route-3a2`
+      2. [x] - `p1` - Check request path starts with the route's path prefix on a segment boundary: the prefix is not followed by a character that continues a segment name (ASCII letter or digit, `-`, `_`, `~`), so `/v1/chat` covers `/v1/chat`, `/v1/chat/…`, `/v1/chat.json` and `/v1/chat:verb`, not `/v1/chatty`; a suffix that does not start with `/` is forwarded as sent; a prefix ending in `/` covers everything below it, and route `/` also covers the bare alias - `inst-route-3a2`
       3. [x] - `p1` - **IF** method allowed AND path matches prefix - `inst-route-3a3`
          1. [x] - `p1` - **RETURN** RouteConfig (first match wins in the order defined by `inst-route-1b` and `inst-route-3`) - `inst-route-3a3a`
    2. [ ] - `p1` - **IF** route.match_type = 'grpc' (planned; gRPC routes are stored but never matched today) - `inst-route-3b`
@@ -452,6 +452,9 @@ Engine errors **MUST** be converted into `DomainError` and returned through the 
 - [x] Disabled upstreams return 503 LinkUnavailable with `X-OAGW-Error-Source: gateway`
 - [x] Private upstreams are not visible to descendant tenants during alias resolution
 - [x] Route matching selects the longest path prefix match, then the higher priority number
+- [x] A route path prefix ends on a segment boundary (`/v1/chat` does not cover `/v1/chatty` or `/v1/chat-x`, but covers `/v1/chat.json`, `/v1/chat:verb` and `/v1/chat%2Fx`; the rule is for ASCII names, so an escaped non-ASCII character also ends the segment and `/v1/chat%C3%A9` is covered), and route `/` matches the bare `/oagw/v1/proxy/{alias}`; a request that would select another route with `%2F`, `%5C`, `\` and the fullwidth and small solidi `%EF%BC%8F`, `%EF%BC%BC` and `%EF%B9%A8`, which NFKC folds to `/` and `\` read as `/` (routes `/v1` and `/v1/admin`, request `/v1%2Fadmin`), or the reverse (routes `/v3` and `/v3/a%2Fb`, request `/v3/a/b`), is rejected with 400 `INVALID_PROXY_PATH`
+- [x] A path segment that is a dot-segment once percent-decoded (`%2e%2e`, `.%2e`, `..%2f`, `..\`, `..;param`, `%252e%252e`) or whose escapes are not UTF-8, a path with a `%` not followed by two hex digits, and a segment with a `;` path parameter (raw or `%3B`), are rejected with 400 `INVALID_PROXY_PATH`; literal `.` and `..` are resolved before matching, and an encoded `/` inside a segment is forwarded encoded
+- [x] Route matching and the upstream URL use the normalized path: percent-encoded unreserved characters are decoded (`/v1/ch%61t` is `/v1/chat`) and other escapes are uppercased (RFC 3986 §6.2.2)
 - [x] Route matching evaluates candidates by upstream preference (selected upstream first, then ancestor upstreams closest-first) and tenant chain position before path prefix, and breaks remaining ties by the lowest route ID
 - [x] Unmatched routes return 404 RouteNotFound with `X-OAGW-Error-Source: gateway`
 - [x] Plugin chain executes in deterministic order: Auth → Guards → Transform(on_request) → upstream → Transform(on_response/on_error)

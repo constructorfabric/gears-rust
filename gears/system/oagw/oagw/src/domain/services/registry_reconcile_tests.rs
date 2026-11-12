@@ -2012,6 +2012,7 @@ fn every_domain_error_is_fatal_or_has_a_reason() {
             DomainError::Forbidden {
                 reason: oagw_sdk::reason::permission::TENANT_RESOLVER_UNAUTHORIZED.to_owned(),
                 detail: d(),
+                entity: crate::domain::error::DeniedOn::Proxy,
             },
             None,
         ),
@@ -2019,6 +2020,7 @@ fn every_domain_error_is_fatal_or_has_a_reason() {
             DomainError::Forbidden {
                 reason: "policy".to_owned(),
                 detail: d(),
+                entity: crate::domain::error::DeniedOn::Proxy,
             },
             Some(why::FORBIDDEN),
         ),

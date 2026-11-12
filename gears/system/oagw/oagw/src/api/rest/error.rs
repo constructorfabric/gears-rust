@@ -41,7 +41,7 @@ use axum::response::{IntoResponse, Response};
 use http::HeaderValue;
 use toolkit_canonical_errors::{CanonicalError, Http, Problem, resource_error};
 
-use crate::domain::error::DomainError;
+use crate::domain::error::{DeniedOn, DomainError};
 use crate::domain::gts_helpers as gts;
 use oagw_sdk::api::ErrorSource;
 use oagw_sdk::{field, precondition, quota, reason};
@@ -384,11 +384,23 @@ impl From<DomainError> for CanonicalError {
                 plugin_in_use_to_canonical(gts_id, detail)
             }
 
-            DomainError::Forbidden { reason, detail } => {
-                tracing::debug!(reason = %reason, detail = %detail, "OAGW authorization denied");
-                OagwProxyError::permission_denied()
-                    .with_reason(reason)
-                    .create()
+            DomainError::Forbidden {
+                reason,
+                detail,
+                entity,
+            } => {
+                tracing::debug!(reason = %reason, detail = %detail, ?entity, "OAGW authorization denied");
+                match entity {
+                    DeniedOn::Upstream => OagwUpstreamError::permission_denied()
+                        .with_reason(reason)
+                        .create(),
+                    DeniedOn::Route => OagwRouteError::permission_denied()
+                        .with_reason(reason)
+                        .create(),
+                    DeniedOn::Proxy => OagwProxyError::permission_denied()
+                        .with_reason(reason)
+                        .create(),
+                }
             }
         }
     }
@@ -1079,6 +1091,7 @@ mod tests {
             DomainError::Forbidden {
                 reason: reason::permission::AUTHZ_DENIED.into(),
                 detail: "test".into(),
+                entity: DeniedOn::Proxy,
             },
         ];
         for err in errors {

@@ -12,11 +12,17 @@ pub(in crate::domain::services) fn canonical_tags(mut tags: Vec<String>) -> Vec<
     tags
 }
 
-/// De-duplicate HTTP methods and sort them in canonical (declaration) order.
+/// De-duplicate HTTP methods and sort them in canonical (declaration) order,
+/// and store the path prefix in the form requests are matched in (encoded
+/// unreserved characters decoded, other escapes uppercased), so the overlap
+/// check compares equal prefixes.
 pub(in crate::domain::services) fn canonicalize_match_rules(rules: &mut MatchRules) {
     if let Some(http) = rules.http.as_mut() {
         http.methods.sort();
         http.methods.dedup();
+        if http.path.contains('%') {
+            http.path = crate::domain::proxy_path::normalize_percent_encoding(&http.path);
+        }
     }
 }
 

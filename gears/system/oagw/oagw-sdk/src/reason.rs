@@ -148,6 +148,11 @@ pub mod permission {
     /// [`DenialReason::Unknown`], which keeps the enum unchanged.
     pub const ENFORCED_AUTH_OTHER_SERVER: &str = "ENFORCED_AUTH_OTHER_SERVER";
 
+    /// The policy granted a management permission only on part of the
+    /// caller's tenant (a row-level constraint), which OAGW cannot apply, so
+    /// the call is refused. Projects to [`DenialReason::Unknown`].
+    pub const AUTHZ_SCOPE_NOT_SUPPORTED: &str = "AUTHZ_SCOPE_NOT_SUPPORTED";
+
     use core::fmt;
 
     /// Typed view of the wire `reason` strings emitted alongside

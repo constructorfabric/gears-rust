@@ -331,6 +331,9 @@ impl Gear for OutboundApiGatewayGear {
         // the enforcer resolves it from the hub per call.
         let policy_enforcer = PolicyEnforcer::from_hub(ctx.client_hub());
 
+        // Shared by the Control Plane, which drops the buckets a write makes
+        // stale, and the Data Plane, which enforces the limits.
+        let rate_limiter = Arc::new(crate::domain::rate_limit::RateLimiter::new());
         let cp_impl = Arc::new(
             ControlPlaneServiceImpl::new(
                 upstream_repo,
@@ -341,7 +344,8 @@ impl Gear for OutboundApiGatewayGear {
                 ssrf_guard.clone(),
                 proxy_reader,
             )
-            .with_metrics(metrics.clone()),
+            .with_metrics(metrics.clone())
+            .with_rate_limiter(rate_limiter.clone()),
         );
         // The registry reconcile only; handlers and the SDK get `cp`.
         self.registry_provisioner
@@ -398,6 +402,8 @@ impl Gear for OutboundApiGatewayGear {
             backend_selector.clone(),
             engine,
             metrics.clone(),
+            // Shared with the Control Plane (see above).
+            rate_limiter,
         )
         .with_request_timeout(Duration::from_secs(cfg.proxy_timeout_secs))
         .with_max_body_size(cfg.max_body_size_bytes)

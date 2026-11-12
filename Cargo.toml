@@ -786,6 +786,7 @@ humantime = "2.3.0"
 
 # URL parsing
 url = "2.5"
+unicode-normalization = "0.1.26"
 urlencoding = "2.1"
 # RFC 3986 percent-encoding. Already in the tree via `toolkit-contract`,
 # which uses it to build path segments; promoted to a workspace dep so

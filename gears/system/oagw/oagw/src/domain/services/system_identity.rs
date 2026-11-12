@@ -3,8 +3,9 @@
 //!
 //! The registry reconcile runs outside any request, as the platform's
 //! default subject (`DEFAULT_SUBJECT_ID`) in the tenant each instance names,
-//! trusted as the registry gives it. The policy engine is asked only when an
-//! upstream binds to an ancestor's alias. With auth disabled every request
+//! trusted as the registry gives it. It is not checked for the Management API
+//! permissions; the policy engine is asked only when an upstream binds to an
+//! ancestor's alias. With auth disabled every request
 //! has the same identity, so neither the policy engine nor the credential
 //! store can tell them apart (ADR-0018 *Tenant Scope*).
 

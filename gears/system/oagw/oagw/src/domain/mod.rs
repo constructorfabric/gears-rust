@@ -7,6 +7,8 @@ pub(crate) mod model;
 /// Auth, guard and transform plugin traits and their shared types.
 pub(crate) mod plugin;
 pub(crate) mod ports;
+/// Canonical form of a proxied request path.
+pub(crate) mod proxy_path;
 /// Rate limiting (token-bucket) logic and bucket-key construction.
 pub(crate) mod rate_limit;
 /// Repository traits for upstream and route persistence.

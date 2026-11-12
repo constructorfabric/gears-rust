@@ -29,7 +29,8 @@ Content-Length: 999
 {"a":1}
 ```
 
-Expected:
-- `400 Bad Request`
+Expected (the client ends the body early, so reading it fails):
+- `400 Bad Request`, not `413`: only the size limit is `413 PayloadTooLarge`
 - `Content-Type: application/problem+json`
-- `detail` mentions mismatch between declared and actual size.
+- `X-OAGW-Error-Source: gateway`
+- field violation reason `BODY_READ_FAILED`

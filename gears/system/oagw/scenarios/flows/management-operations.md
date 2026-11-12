@@ -55,7 +55,7 @@ Content-Type: application/json
 
 1. **API Handler** receives request
    - Validates Bearer token → 401 if invalid
-   - Checks `oagw:upstream:create` permission → 403 if denied
+   - Checks `gts.cf.core.oagw.upstream.v1~:create` permission → 403 if denied
    - Routes to Control Plane
 
 2. **Control Plane** processes request

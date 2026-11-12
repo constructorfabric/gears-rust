@@ -1,5 +1,6 @@
 mod alias;
 mod ancestor;
+mod authz;
 mod bind;
 mod budget;
 mod canonical;
@@ -11,15 +12,16 @@ mod withheld;
 
 use std::sync::Arc;
 
-use super::{ControlPlaneService, UpstreamCheck};
+use super::{ControlPlaneService, ProxyGrant, UpstreamCheck};
 use crate::domain::ssrf::SsrfGuard;
 
-use crate::domain::error::DomainError;
+use crate::domain::error::{DeniedOn, DomainError};
 use crate::domain::model::{
     CreateRouteRequest, CreateUpstreamRequest, ListQuery, ManagedBy, Route, UpdateRouteRequest,
     UpdateUpstreamRequest, Upstream,
 };
 use crate::domain::ports::OagwMetricsPort;
+use crate::domain::rate_limit::RateLimiter;
 use crate::domain::repo::{
     ProxyConfigReader, RepositoryError, RouteRepository, Tags, UpstreamRepository,
 };
@@ -34,6 +36,7 @@ use alias::{
     enforce_alias_update_with, normalize_alias,
 };
 use ancestor::ancestor_upstreams;
+use authz::{Action, Managed};
 use bind::{
     BindOverrides, enforced_auth_server, validate_ancestor_bind, validate_secret_ref_accessible,
 };
@@ -80,6 +83,10 @@ pub(crate) struct ControlPlaneServiceImpl {
     /// Counts withheld ancestor credentials on the proxy path; none in tests
     /// that do not set it.
     metrics: Option<Arc<dyn OagwMetricsPort>>,
+    /// The proxy's rate-limit buckets; a write that changes or removes a
+    /// limit drops the buckets it made stale. None in tests that do not set
+    /// it.
+    rate_limiter: Option<Arc<RateLimiter>>,
     withheld_log: withheld::WithheldLog,
 }
 
@@ -106,7 +113,22 @@ impl ControlPlaneServiceImpl {
             ssrf_guard,
             proxy_reader,
             metrics: None,
+            rate_limiter: None,
             withheld_log: withheld::WithheldLog::default(),
+        }
+    }
+
+    /// Drop the buckets of `rate_limiter` that a write makes stale.
+    #[must_use]
+    pub(crate) fn with_rate_limiter(mut self, rate_limiter: Arc<RateLimiter>) -> Self {
+        self.rate_limiter = Some(rate_limiter);
+        self
+    }
+
+    /// Drop the rate-limit buckets of a deleted upstream.
+    fn drop_upstream_buckets(&self, id: Uuid) {
+        if let Some(limiter) = &self.rate_limiter {
+            limiter.remove_keys_for_upstream(id);
         }
     }
 
@@ -131,15 +153,17 @@ impl ControlPlaneService for ControlPlaneServiceImpl {
         ctx: &SecurityContext,
         req: CreateUpstreamRequest,
     ) -> Result<Upstream, DomainError> {
-        self.create_upstream_as(ctx, req, ManagedBy::Api).await
+        self.authorize(ctx, Managed::Upstream, Action::Create)
+            .await?;
+        self.create_upstream_as(ctx, req, ManagedBy::Api)
+            .await
+            .map_err(|e| e.on_entity(DeniedOn::Upstream))
     }
 
     async fn get_upstream(&self, ctx: &SecurityContext, id: Uuid) -> Result<Upstream, DomainError> {
-        let tenant_id = ctx.subject_tenant_id();
-        self.upstreams
-            .get_by_id(tenant_id, id)
-            .await
-            .map_err(DomainError::from)
+        self.authorize(ctx, Managed::Upstream, Action::Read(id))
+            .await?;
+        self.get_upstream_unchecked(ctx, id).await
     }
 
     async fn list_upstreams(
@@ -147,6 +171,7 @@ impl ControlPlaneService for ControlPlaneServiceImpl {
         ctx: &SecurityContext,
         query: &ListQuery,
     ) -> Result<Vec<Upstream>, DomainError> {
+        self.authorize(ctx, Managed::Upstream, Action::List).await?;
         let tenant_id = ctx.subject_tenant_id();
         self.upstreams
             .list(tenant_id, query)
@@ -160,11 +185,19 @@ impl ControlPlaneService for ControlPlaneServiceImpl {
         id: Uuid,
         req: UpdateUpstreamRequest,
     ) -> Result<Upstream, DomainError> {
-        self.update_upstream_as(ctx, id, req, ManagedBy::Api).await
+        self.authorize(ctx, Managed::Upstream, Action::Override(id))
+            .await?;
+        self.update_upstream_as(ctx, id, req, ManagedBy::Api)
+            .await
+            .map_err(|e| e.on_entity(DeniedOn::Upstream))
     }
 
     async fn delete_upstream(&self, ctx: &SecurityContext, id: Uuid) -> Result<(), DomainError> {
-        self.delete_upstream_as(ctx, id, ManagedBy::Api).await
+        self.authorize(ctx, Managed::Upstream, Action::Delete(id))
+            .await?;
+        self.delete_upstream_as(ctx, id, ManagedBy::Api)
+            .await
+            .map_err(|e| e.on_entity(DeniedOn::Upstream))
     }
 
     // -- Route CRUD --
@@ -174,16 +207,16 @@ impl ControlPlaneService for ControlPlaneServiceImpl {
         ctx: &SecurityContext,
         req: CreateRouteRequest,
     ) -> Result<Route, DomainError> {
+        self.authorize(ctx, Managed::Route, Action::Create).await?;
         self.create_route_as(ctx, req, ManagedBy::Api, UpstreamCheck::Read)
             .await
+            .map_err(|e| e.on_entity(DeniedOn::Route))
     }
 
     async fn get_route(&self, ctx: &SecurityContext, id: Uuid) -> Result<Route, DomainError> {
-        let tenant_id = ctx.subject_tenant_id();
-        self.routes
-            .get_by_id(tenant_id, id)
-            .await
-            .map_err(DomainError::from)
+        self.authorize(ctx, Managed::Route, Action::Read(id))
+            .await?;
+        self.get_route_unchecked(ctx, id).await
     }
 
     async fn list_routes(
@@ -192,11 +225,8 @@ impl ControlPlaneService for ControlPlaneServiceImpl {
         upstream_id: Option<Uuid>,
         query: &ListQuery,
     ) -> Result<Vec<Route>, DomainError> {
-        let tenant_id = ctx.subject_tenant_id();
-        self.routes
-            .list(tenant_id, upstream_id, query)
-            .await
-            .map_err(DomainError::from)
+        self.authorize(ctx, Managed::Route, Action::List).await?;
+        self.list_routes_unchecked(ctx, upstream_id, query).await
     }
 
     async fn update_route(
@@ -205,17 +235,114 @@ impl ControlPlaneService for ControlPlaneServiceImpl {
         id: Uuid,
         req: UpdateRouteRequest,
     ) -> Result<Route, DomainError> {
+        self.authorize(ctx, Managed::Route, Action::Override(id))
+            .await?;
         self.update_route_as(ctx, id, req, ManagedBy::Api, None)
             .await
+            .map_err(|e| e.on_entity(DeniedOn::Route))
     }
 
     async fn delete_route(&self, ctx: &SecurityContext, id: Uuid) -> Result<(), DomainError> {
-        self.delete_route_as(ctx, id, ManagedBy::Api).await
+        self.authorize(ctx, Managed::Route, Action::Delete(id))
+            .await?;
+        self.delete_route_as(ctx, id, ManagedBy::Api)
+            .await
+            .map_err(|e| e.on_entity(DeniedOn::Route))
     }
 
     // -- Resolution --
 
+    async fn resolve_proxy_target_for_client(
+        &self,
+        ctx: &SecurityContext,
+        alias: &str,
+        method: &str,
+        path: &str,
+    ) -> Result<(Upstream, Route), DomainError> {
+        // Asked first, so a caller without `read` learns nothing about which
+        // aliases and routes exist.
+        self.authorize(ctx, Managed::Upstream, Action::List).await?;
+        // Match on the path the proxy would match on.
+        let path = crate::domain::proxy_path::canonical_path(path, path)?;
+        // One chain for the merge and for the checks below, so the tenants
+        // authorized are the ones whose settings were merged.
+        let tenant_chain = self.build_tenant_chain(ctx).await?;
+        let enforcer = &self.policy_enforcer;
+        let resolved = self
+            .resolve_alias_sourced(ctx, &tenant_chain, alias, Some((method, &path)), Tags::Load)
+            .await;
+        let (upstream, route, sources) = match resolved {
+            Ok((upstream, Some(route), sources)) => (upstream, route, sources),
+            Ok((_, None, _)) => {
+                return Err(DomainError::Internal {
+                    message: "resolve_alias returned None route for method+path request".into(),
+                });
+            }
+            Err(e) => {
+                // Resolution looks at every tenant of the chain, so its
+                // errors (unknown alias, no matching route) tell about the
+                // ancestors' upstreams too: report them only to a caller
+                // with `read` on all of them.
+                for &owner in &tenant_chain {
+                    if owner != ctx.subject_tenant_id() {
+                        authz::authorize_owned(
+                            enforcer,
+                            ctx,
+                            Managed::Upstream,
+                            Action::List,
+                            owner,
+                        )
+                        .await?;
+                    }
+                }
+                return Err(e);
+            }
+        };
+        // The pair carries settings merged from the upstreams it is built
+        // from (the selected one and the ancestors that share with it): the
+        // client needs `read` on each of them, and on the route it gets back
+        // (the proxy hot path holds a grant and calls
+        // `resolve_proxy_target`). An ancestor's upstream that shares nothing
+        // changes nothing in the answer and is not asked about.
+        for source in &sources {
+            authz::authorize_owned(
+                enforcer,
+                ctx,
+                Managed::Upstream,
+                Action::Read(source.id),
+                source.tenant_id,
+            )
+            .await?;
+        }
+        authz::authorize_owned(
+            enforcer,
+            ctx,
+            Managed::Route,
+            Action::Read(route.id),
+            route.tenant_id,
+        )
+        .await?;
+        Ok((upstream, route))
+    }
+
     async fn resolve_proxy_target(
+        &self,
+        grant: &ProxyGrant,
+        alias: &str,
+        method: &str,
+        path: &str,
+        tags: Tags,
+    ) -> Result<(Upstream, Route), DomainError> {
+        self.resolve_target(grant.ctx(), alias, method, path, tags)
+            .await
+    }
+}
+
+impl ControlPlaneServiceImpl {
+    /// Resolve the proxy target for `ctx`, without a permission check: the
+    /// callers ([`ControlPlaneService::resolve_proxy_target`] and
+    /// [`ControlPlaneService::resolve_proxy_target_for_client`]) authorize.
+    async fn resolve_target(
         &self,
         ctx: &SecurityContext,
         alias: &str,
@@ -224,8 +351,22 @@ impl ControlPlaneService for ControlPlaneServiceImpl {
         tags: Tags,
     ) -> Result<(Upstream, Route), DomainError> {
         let tenant_chain = self.build_tenant_chain(ctx).await?;
+        self.resolve_in_chain(ctx, &tenant_chain, alias, method, path, tags)
+            .await
+    }
+
+    /// [`Self::resolve_target`] over a tenant chain the caller built.
+    async fn resolve_in_chain(
+        &self,
+        ctx: &SecurityContext,
+        tenant_chain: &[Uuid],
+        alias: &str,
+        method: &str,
+        path: &str,
+        tags: Tags,
+    ) -> Result<(Upstream, Route), DomainError> {
         let (effective, route) = self
-            .resolve_alias(ctx, &tenant_chain, alias, Some((method, path)), tags)
+            .resolve_alias(ctx, tenant_chain, alias, Some((method, path)), tags)
             .await?;
         Ok((
             effective,
@@ -287,6 +428,54 @@ fn ensure_owner(
 }
 
 impl ControlPlaneServiceImpl {
+    /// Check a management permission for an API/SDK call.
+    async fn authorize(
+        &self,
+        ctx: &SecurityContext,
+        managed: Managed,
+        action: Action,
+    ) -> Result<(), DomainError> {
+        authz::authorize(&self.policy_enforcer, ctx, managed, action).await
+    }
+
+    /// Read an upstream of the caller's tenant without a permission check
+    /// (the registry reconcile and the checked [`ControlPlaneService`] reads).
+    async fn get_upstream_unchecked(
+        &self,
+        ctx: &SecurityContext,
+        id: Uuid,
+    ) -> Result<Upstream, DomainError> {
+        self.upstreams
+            .get_by_id(ctx.subject_tenant_id(), id)
+            .await
+            .map_err(DomainError::from)
+    }
+
+    /// Read a route of the caller's tenant without a permission check.
+    async fn get_route_unchecked(
+        &self,
+        ctx: &SecurityContext,
+        id: Uuid,
+    ) -> Result<Route, DomainError> {
+        self.routes
+            .get_by_id(ctx.subject_tenant_id(), id)
+            .await
+            .map_err(DomainError::from)
+    }
+
+    /// List routes of the caller's tenant without a permission check.
+    async fn list_routes_unchecked(
+        &self,
+        ctx: &SecurityContext,
+        upstream_id: Option<Uuid>,
+        query: &ListQuery,
+    ) -> Result<Vec<Route>, DomainError> {
+        self.routes
+            .list(ctx.subject_tenant_id(), upstream_id, query)
+            .await
+            .map_err(DomainError::from)
+    }
+
     async fn create_upstream_as(
         &self,
         ctx: &SecurityContext,
@@ -481,15 +670,24 @@ impl ControlPlaneServiceImpl {
         existing.auth = req.auth;
         existing.headers = req.headers;
         existing.plugins = req.plugins;
-        existing.rate_limit = req.rate_limit;
+        let previous_rate_limit = std::mem::replace(&mut existing.rate_limit, req.rate_limit);
         existing.cors = req.cors;
         existing.tags = canonical_tags(req.tags);
         existing.enabled = req.enabled;
 
-        self.upstreams
+        let current = self
+            .upstreams
             .update(existing)
             .await
-            .map_err(DomainError::from)
+            .map_err(DomainError::from)?;
+        // A changed limit leaves stale buckets: drop them on every write
+        // path (API, SDK, registry).
+        if previous_rate_limit != current.rate_limit
+            && let Some(limiter) = &self.rate_limiter
+        {
+            limiter.remove_keys_for_upstream(id);
+        }
+        Ok(current)
     }
 
     async fn delete_upstream_as(
@@ -513,6 +711,10 @@ impl ControlPlaneServiceImpl {
             .delete(tenant_id, id)
             .await
             .map_err(DomainError::from)?;
+        // The deleted routes' buckets go with the idle-bucket sweep.
+        if let Some(limiter) = &self.rate_limiter {
+            limiter.remove_keys_for_upstream(id);
+        }
         self.routes
             .delete_by_upstream(tenant_id, id)
             .await
@@ -621,17 +823,24 @@ impl ControlPlaneServiceImpl {
         // Full replacement: directly assign all fields (None = unset).
         existing.match_rules = match_rules;
         existing.plugins = req.plugins;
-        existing.rate_limit = req.rate_limit;
+        let previous_rate_limit = std::mem::replace(&mut existing.rate_limit, req.rate_limit);
         existing.cors = req.cors;
         existing.tags = canonical_tags(req.tags);
         existing.priority = req.priority;
         existing.enabled = req.enabled;
 
         let written = existing.clone();
-        self.routes
+        let current = self
+            .routes
             .update(existing)
             .await
-            .map_err(|e| route_write_error(e, &written))
+            .map_err(|e| route_write_error(e, &written))?;
+        if previous_rate_limit != current.rate_limit
+            && let Some(limiter) = &self.rate_limiter
+        {
+            limiter.remove_keys_for_route(id);
+        }
+        Ok(current)
     }
 
     async fn delete_route_as(
@@ -650,7 +859,11 @@ impl ControlPlaneServiceImpl {
         self.routes
             .delete(tenant_id, id)
             .await
-            .map_err(DomainError::from)
+            .map_err(DomainError::from)?;
+        if let Some(limiter) = &self.rate_limiter {
+            limiter.remove_keys_for_route(id);
+        }
+        Ok(())
     }
 }
 

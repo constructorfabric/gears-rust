@@ -464,9 +464,10 @@ async def _handle(method: str, target: str, headers: dict, body: bytes, writer: 
         await _ws_echo_loop(reader, writer)
         return  # Connection fully handled — don't close in _client.
 
-    # 404 fallback
+    # 404 fallback; names the path as received, so a test can check the
+    # outbound path of a route the mock has no handler for.
     else:
-        writer.write(_json_response({"error": "not found"}, status=404))
+        writer.write(_json_response({"error": "not found", "method": method, "path": path}, status=404))
 
 
 # ---------------------------------------------------------------------------

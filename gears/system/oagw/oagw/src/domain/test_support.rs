@@ -657,7 +657,11 @@ impl TestCpBuilder {
 
     /// Create repos, service, and mock credstore, register them in the
     /// provided `ClientHub`, and return the CP service trait object.
-    pub(crate) fn build_and_register(self, hub: &ClientHub) -> Arc<dyn ControlPlaneService> {
+    pub(crate) fn build_and_register(
+        self,
+        hub: &ClientHub,
+        rate_limiter: Arc<crate::domain::rate_limit::RateLimiter>,
+    ) -> Arc<dyn ControlPlaneService> {
         let upstream_repo = Arc::new(InMemoryUpstreamRepo::new());
         let route_repo = Arc::new(InMemoryRouteRepo::new());
         let tenant_resolver: Arc<dyn TenantResolverClient> = Arc::new(
@@ -668,15 +672,18 @@ impl TestCpBuilder {
             Arc::new(MockCredStoreClient::with_secrets(self.credentials));
         hub.register::<dyn CredStoreClientV1>(credstore.clone());
 
-        let cp: Arc<dyn ControlPlaneService> = Arc::new(ControlPlaneServiceImpl::new(
-            upstream_repo,
-            route_repo,
-            tenant_resolver,
-            allow_all_enforcer(),
-            credstore,
-            Arc::new(SsrfGuard::disabled()),
-            None,
-        ));
+        let cp: Arc<dyn ControlPlaneService> = Arc::new(
+            ControlPlaneServiceImpl::new(
+                upstream_repo,
+                route_repo,
+                tenant_resolver,
+                allow_all_enforcer(),
+                credstore,
+                Arc::new(SsrfGuard::disabled()),
+                None,
+            )
+            .with_rate_limiter(rate_limiter),
+        );
 
         cp
     }
@@ -791,6 +798,7 @@ impl TestDpBuilder {
         self,
         hub: &ClientHub,
         cp: Arc<dyn ControlPlaneService>,
+        rate_limiter: Arc<crate::domain::rate_limit::RateLimiter>,
     ) -> Arc<dyn DataPlaneService> {
         let credstore = hub
             .get::<dyn CredStoreClientV1>()
@@ -834,6 +842,7 @@ impl TestDpBuilder {
             backend_selector,
             engine,
             std::sync::Arc::new(crate::domain::ports::NoopMetrics),
+            rate_limiter,
         )
         .with_allow_http_upstream(true);
         if let Some(timeout) = self.request_timeout {
@@ -884,10 +893,13 @@ pub fn build_test_app_state(
     // The gear hands one `max_body_size_bytes` to both the handler and the
     // Data Plane, so a limit set for the Data Plane applies to the handler too.
     let max_body_size_bytes = dp_builder.max_body_size.unwrap_or(100 * 1024 * 1024);
-    let cp = cp_builder.build_and_register(hub);
+    // One limiter, as the gear wires it: Control Plane writes drop the
+    // buckets the Data Plane enforces.
+    let rate_limiter = Arc::new(crate::domain::rate_limit::RateLimiter::new());
+    let cp = cp_builder.build_and_register(hub, rate_limiter.clone());
     let dp = dp_builder
         .with_backend_selector(backend_selector.clone())
-        .build_and_register(hub, cp.clone());
+        .build_and_register(hub, cp.clone(), rate_limiter);
     let facade: Arc<dyn ServiceGatewayClientV1> = Arc::new(ServiceGatewayClientV1Facade::new(
         cp.clone(),
         dp.clone(),
@@ -926,10 +938,13 @@ pub fn build_test_gateway(
                 )),
             )
         });
-    let cp = cp_builder.build_and_register(hub);
+    // One limiter, as the gear wires it: Control Plane writes drop the
+    // buckets the Data Plane enforces.
+    let rate_limiter = Arc::new(crate::domain::rate_limit::RateLimiter::new());
+    let cp = cp_builder.build_and_register(hub, rate_limiter.clone());
     let dp = dp_builder
         .with_backend_selector(backend_selector.clone())
-        .build_and_register(hub, cp.clone());
+        .build_and_register(hub, cp.clone(), rate_limiter);
     let oagw: Arc<dyn ServiceGatewayClientV1> =
         Arc::new(ServiceGatewayClientV1Facade::new(cp, dp, backend_selector));
     hub.register::<dyn ServiceGatewayClientV1>(oagw.clone());

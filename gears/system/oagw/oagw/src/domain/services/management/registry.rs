@@ -17,7 +17,7 @@ use crate::domain::model::{
     UpdateUpstreamRequest, Upstream,
 };
 use crate::domain::repo::{DeleteOutcome, RegistryRowRepository};
-use crate::domain::services::{ControlPlaneService, RegistryProvisioner, UpstreamCheck};
+use crate::domain::services::{RegistryProvisioner, UpstreamCheck};
 
 /// The registry write path over a Control Plane, with the registry rows
 /// across tenants. Only the gear holds it.
@@ -42,11 +42,11 @@ impl RegistryProvisionerImpl {
 #[async_trait]
 impl RegistryProvisioner for RegistryProvisionerImpl {
     async fn get_upstream(&self, ctx: &SecurityContext, id: Uuid) -> Result<Upstream, DomainError> {
-        self.cp.get_upstream(ctx, id).await
+        self.cp.get_upstream_unchecked(ctx, id).await
     }
 
     async fn get_route(&self, ctx: &SecurityContext, id: Uuid) -> Result<Route, DomainError> {
-        self.cp.get_route(ctx, id).await
+        self.cp.get_route_unchecked(ctx, id).await
     }
 
     async fn list_routes(
@@ -55,7 +55,7 @@ impl RegistryProvisioner for RegistryProvisionerImpl {
         upstream_id: Option<Uuid>,
         query: &ListQuery,
     ) -> Result<Vec<Route>, DomainError> {
-        self.cp.list_routes(ctx, upstream_id, query).await
+        self.cp.list_routes_unchecked(ctx, upstream_id, query).await
     }
 
     async fn create_registry_upstream(
@@ -126,10 +126,15 @@ impl RegistryProvisioner for RegistryProvisionerImpl {
         ctx: &SecurityContext,
         id: Uuid,
     ) -> Result<DeleteOutcome, DomainError> {
-        self.rows
+        let outcome = self
+            .rows
             .delete_upstream_if_unused(ctx.subject_tenant_id(), id)
             .await
-            .map_err(DomainError::from)
+            .map_err(DomainError::from)?;
+        if outcome == DeleteOutcome::Deleted {
+            self.cp.drop_upstream_buckets(id);
+        }
+        Ok(outcome)
     }
 
     async fn registry_upstreams(&self) -> Result<Vec<Upstream>, DomainError> {

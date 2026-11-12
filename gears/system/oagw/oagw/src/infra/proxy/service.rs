@@ -3,7 +3,6 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use authz_resolver_sdk::PolicyEnforcer;
-use authz_resolver_sdk::pep::AccessRequest;
 use bytes::Bytes;
 use credstore_sdk::CredStoreClientV1;
 use futures_util::StreamExt;
@@ -14,8 +13,6 @@ use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 use toolkit_http_proxy::{ReplayableBody, UpgradeOutcome, empty_body, full_body, stream_body};
 use toolkit_security::SecurityContext;
-
-use uuid::Uuid;
 
 use crate::config::TokenCacheConfig;
 use crate::domain::error::DomainError;
@@ -28,15 +25,16 @@ use crate::domain::plugin::{
 };
 use crate::domain::ports::OagwMetricsPort;
 use crate::domain::ports::metric_labels::{self, phase};
+use crate::domain::proxy_path::canonical_path;
 use crate::domain::rate_limit::{
     RateLimitKeyContext, RateLimitOutcome, RateLimitResource, RateLimiter, build_rate_limit_key,
 };
 use crate::domain::repo::Tags;
+use crate::domain::route_matching::path_after_route_prefix;
 use crate::domain::services::{
-    ControlPlaneService, DataPlaneService, EndpointSelector, SelectedEndpoint,
+    ControlPlaneService, DataPlaneService, EndpointSelector, ProxyGrant, SelectedEndpoint,
 };
 use crate::infra::plugin::{AuthPluginRegistry, GuardPluginRegistry, TransformPluginRegistry};
-use crate::infra::proxy::{actions, resources};
 
 use super::engine::{ProxyEngine, into_body_stream, map_proxy_error};
 use super::headers;
@@ -89,12 +87,12 @@ impl DataPlaneServiceImpl {
         backend_selector: Arc<dyn EndpointSelector>,
         engine: Arc<ProxyEngine>,
         metrics: Arc<dyn OagwMetricsPort>,
+        rate_limiter: Arc<RateLimiter>,
     ) -> Self {
         let auth_registry =
             AuthPluginRegistry::with_builtins(credstore, token_http_config, token_cache_config);
         let guard_registry = GuardPluginRegistry::with_builtins();
         let transform_registry = TransformPluginRegistry::with_builtins();
-        let rate_limiter = Arc::new(RateLimiter::new());
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
         Self {
@@ -390,7 +388,10 @@ fn parse_proxy_request(
             Some(pos) => (&trimmed[..pos], &trimmed[pos..]),
             None => (trimmed, ""),
         };
-        (alias.to_string(), normalize_path(raw_suffix))
+        (
+            alias.to_string(),
+            canonical_path(raw_suffix, &instance_uri)?,
+        )
     };
 
     // Parse query parameters with proper URL decoding.
@@ -447,6 +448,81 @@ fn parse_proxy_request(
         body_bytes,
         body_stream,
     })
+}
+
+/// Metric label of a request whose future was dropped before it finished.
+const CANCELLED: &str = "Cancelled";
+
+/// Where a `proxy:invoke` check stands, for [`AuthorizeMetricsGuard`].
+enum AuthorizeOutcome {
+    /// Not answered yet: a drop now is a cancellation.
+    Pending,
+    /// Granted: the proxied request is counted by [`RequestMetricsGuard`].
+    Granted,
+    /// Refused or failed, under this error label.
+    Failed(&'static str),
+}
+
+/// Counts a `proxy:invoke` check that does not lead to a proxied request:
+/// a denial or failure, or a check whose future was dropped. A granted check
+/// records nothing here.
+struct AuthorizeMetricsGuard {
+    metrics: Arc<dyn OagwMetricsPort>,
+    start: Instant,
+    outcome: AuthorizeOutcome,
+}
+
+impl AuthorizeMetricsGuard {
+    fn new(metrics: Arc<dyn OagwMetricsPort>) -> Self {
+        Self {
+            metrics,
+            start: Instant::now(),
+            outcome: AuthorizeOutcome::Pending,
+        }
+    }
+
+    fn granted(&mut self) {
+        self.outcome = AuthorizeOutcome::Granted;
+    }
+
+    fn failed(&mut self, variant: &'static str) {
+        self.outcome = AuthorizeOutcome::Failed(variant);
+    }
+}
+
+impl Drop for AuthorizeMetricsGuard {
+    fn drop(&mut self) {
+        let variant = match self.outcome {
+            AuthorizeOutcome::Granted => return,
+            AuthorizeOutcome::Pending => CANCELLED,
+            AuthorizeOutcome::Failed(variant) => variant,
+        };
+        self.metrics.record_request_duration_seconds(
+            metric_labels::UNKNOWN,
+            metric_labels::UNKNOWN,
+            phase::TOTAL,
+            self.start.elapsed().as_secs_f64(),
+        );
+        self.metrics
+            .record_error(metric_labels::UNKNOWN, metric_labels::UNKNOWN, variant);
+    }
+}
+
+/// The part of `path` after the matched route's prefix. The route was chosen
+/// by the same rule, so a path outside the prefix is an internal error, not
+/// an empty suffix.
+fn route_suffix<'a>(path: &'a str, route_prefix: &str) -> Result<&'a str, DomainError> {
+    path_after_route_prefix(path, route_prefix).ok_or_else(|| DomainError::Internal {
+        message: format!("matched route prefix {route_prefix:?} does not cover the request path"),
+    })
+}
+
+/// How a proxied request is authorized.
+enum Authorization {
+    /// Check `proxy:invoke` for this caller first (the SDK path).
+    Check(SecurityContext),
+    /// Already granted by `authorize_proxy` (the REST path).
+    Granted(ProxyGrant),
 }
 
 /// Terminal outcome captured before [`RequestMetricsGuard`] drops.
@@ -528,8 +604,7 @@ impl Drop for RequestMetricsGuard {
                 self.metrics.record_error(&self.host, &self.path, variant);
             }
             RequestOutcome::Pending => {
-                self.metrics
-                    .record_error(&self.host, &self.path, "Cancelled");
+                self.metrics.record_error(&self.host, &self.path, CANCELLED);
             }
         }
     }
@@ -542,12 +617,62 @@ impl DataPlaneService for DataPlaneServiceImpl {
         ctx: SecurityContext,
         req: http::Request<Body>,
     ) -> Result<http::Response<Body>, DomainError> {
+        self.proxy(Authorization::Check(ctx), req).await
+    }
+
+    async fn authorize_proxy(&self, ctx: SecurityContext) -> Result<ProxyGrant, DomainError> {
+        // cancel-safe: the guard records a denial or a cancellation (the
+        // future dropped mid-check, e.g. by the gateway's request timeout)
+        // when it drops. A granted request is counted from the grant once it
+        // reaches `proxy_request_granted`; the REST handler's own rejections
+        // in between (body limit, body read) are not counted, as before
+        // (#4989 owns counting every request).
+        let mut guard = AuthorizeMetricsGuard::new(Arc::clone(&self.metrics));
+        let result = ProxyGrant::authorize(&self.policy_enforcer, ctx).await;
+        match &result {
+            Ok(_) => guard.granted(),
+            Err(e) => guard.failed(domain_error_type_name(e)),
+        }
+        result
+    }
+
+    async fn proxy_request_granted(
+        &self,
+        grant: ProxyGrant,
+        req: http::Request<Body>,
+    ) -> Result<http::Response<Body>, DomainError> {
+        self.proxy(Authorization::Granted(grant), req).await
+    }
+}
+
+impl DataPlaneServiceImpl {
+    /// The proxy pipeline. Without a grant, `proxy:invoke` is checked first,
+    /// before the request is validated.
+    async fn proxy(
+        &self,
+        auth: Authorization,
+        req: http::Request<Body>,
+    ) -> Result<http::Response<Body>, DomainError> {
         let method = crate::infra::metrics::normalize_method(req.method());
         let mut guard = RequestMetricsGuard::new(Arc::clone(&self.metrics), method);
+        if let Authorization::Granted(grant) = &auth {
+            // The REST path authorized before reading the body: count the
+            // check, as the SDK path does, but not the client's upload.
+            guard.start = guard
+                .start
+                .checked_sub(grant.authorized_in())
+                .unwrap_or(guard.start);
+        }
         let mut host_label: String = metric_labels::UNKNOWN.to_owned();
         let mut path_label: String = metric_labels::UNKNOWN.to_owned();
 
         let result: Result<http::Response<Body>, DomainError> = async {
+            let grant = match auth {
+                Authorization::Granted(grant) => grant,
+                Authorization::Check(ctx) => ProxyGrant::authorize(&self.policy_enforcer, ctx).await?,
+            };
+            let ctx = grant.ctx();
+
             let ParsedRequest {
                 instance_uri,
                 alias,
@@ -560,18 +685,6 @@ impl DataPlaneService for DataPlaneServiceImpl {
                 body_stream,
             } = parse_proxy_request(req, self.max_body_size)?;
 
-            self.policy_enforcer
-                .access_scope_with(
-                    &ctx,
-                    &resources::PROXY,
-                    actions::INVOKE,
-                    None,
-                    &AccessRequest::new()
-                        .require_constraints(false)
-                        .context_tenant_id(ctx.subject_tenant_id()),
-                )
-                .await?;
-
             let max_body = self.max_body_size;
 
             // 1. Resolve upstream + route in one pass (single hierarchy walk),
@@ -582,7 +695,7 @@ impl DataPlaneService for DataPlaneServiceImpl {
             let resolve_start = Instant::now();
             let resolved = self
                 .cp
-                .resolve_proxy_target(&ctx, &alias, method.as_ref(), &path_suffix, Tags::Skip)
+                .resolve_proxy_target(&grant, &alias, method.as_ref(), &path_suffix, Tags::Skip)
                 .await;
             let resolve_seconds = resolve_start.elapsed().as_secs_f64();
             let (upstream, route) = match resolved {
@@ -655,7 +768,7 @@ impl DataPlaneService for DataPlaneServiceImpl {
             && http_match.path_suffix_mode == PathSuffixMode::Disabled
         {
             let route_path = &http_match.path;
-            let extra = path_suffix.strip_prefix(route_path.as_str()).unwrap_or("");
+            let extra = route_suffix(&path_suffix, route_path)?;
             if !extra.is_empty() {
                 return Err(DomainError::Validation {
                     field: "path",
@@ -681,6 +794,7 @@ impl DataPlaneService for DataPlaneServiceImpl {
             .and_then(|h| h.request.as_ref())
             .map_or_else(Vec::new, |r| r.passthrough_allowlist.clone());
         let mut outbound_headers = headers::apply_passthrough(&req_headers, &mode, &allowlist);
+        headers::strip_inbound_nominated(&mut outbound_headers, &req_headers, is_upgrade);
         if is_upgrade {
             headers::strip_hop_by_hop_for_upgrade(&mut outbound_headers);
         } else {
@@ -720,7 +834,7 @@ impl DataPlaneService for DataPlaneServiceImpl {
                 &self.auth_registry,
                 auth,
                 &outbound_headers,
-                &ctx,
+                ctx,
                 &instance_uri,
             )
             .await;
@@ -742,13 +856,15 @@ impl DataPlaneService for DataPlaneServiceImpl {
         let guard_bindings =
             collect_plugin_bindings(&upstream, GuardPluginRegistry::is_guard_plugin);
 
+        // Guards check what the client sent (ADR-0017), not the outbound
+        // map: that starts filtered and already carries the credential.
         execute_guard_requests(
             &self.guard_registry,
             &guard_bindings,
-            &outbound_headers,
+            &req_headers,
             method.as_str(),
             &path_suffix,
-            &ctx,
+            ctx,
             &instance_uri,
         )
         .await?;
@@ -777,9 +893,17 @@ impl DataPlaneService for DataPlaneServiceImpl {
             &mut query_params,
             method.as_str(),
             &path_suffix,
-            &ctx,
+            ctx,
         )
         .await;
+        // Header rules and transforms run after the strip and may set a
+        // hop-by-hop name; the engine reads a request `Trailer` as declared
+        // trailers. Strip again.
+        if is_upgrade {
+            headers::strip_hop_by_hop_for_upgrade(&mut outbound_headers);
+        } else {
+            headers::strip_hop_by_hop(&mut outbound_headers);
+        }
 
         // 6. Endpoint selection (two-tier: target-host header or round-robin).
         // The request timeout covers selection (a first selection resolves
@@ -817,7 +941,7 @@ impl DataPlaneService for DataPlaneServiceImpl {
             &upstream,
             &route,
             &req_headers,
-            &ctx,
+            ctx,
             &instance_uri,
             self.metrics.as_ref(),
             &host_label,
@@ -832,7 +956,7 @@ impl DataPlaneService for DataPlaneServiceImpl {
             .http
             .as_ref()
             .map_or("/", |h| h.path.as_str());
-        let remaining_suffix = path_suffix.strip_prefix(route_path).unwrap_or("");
+        let remaining_suffix = route_suffix(&path_suffix, route_path)?;
         let url = request_builder::build_upstream_url(
             endpoint,
             route_path,
@@ -862,7 +986,7 @@ impl DataPlaneService for DataPlaneServiceImpl {
             transform_bindings,
             method: method.as_str(),
             path_suffix: &path_suffix,
-            ctx: &ctx,
+            ctx,
             cors_config: effective_cors.as_ref(),
             origin: request_origin,
             response_header_rules,
@@ -925,14 +1049,6 @@ impl DataPlaneService for DataPlaneServiceImpl {
         }
 
         result
-    }
-
-    fn remove_rate_limit_keys_for_upstream(&self, upstream_id: Uuid) {
-        self.rate_limiter.remove_keys_for_upstream(upstream_id);
-    }
-
-    fn remove_rate_limit_keys_for_route(&self, route_id: Uuid) {
-        self.rate_limiter.remove_keys_for_route(route_id);
     }
 }
 
@@ -1299,13 +1415,13 @@ async fn execute_auth_plugin(
 async fn execute_guard_requests(
     guard_registry: &GuardPluginRegistry,
     guard_bindings: &[&crate::domain::model::PluginBinding],
-    outbound_headers: &HeaderMap,
+    inbound_headers: &HeaderMap,
     method: &str,
     path_suffix: &str,
     ctx: &SecurityContext,
     instance_uri: &str,
 ) -> Result<(), DomainError> {
-    let guard_headers = headers::header_map_to_vec(outbound_headers);
+    let guard_headers = headers::header_map_to_vec(inbound_headers);
     for binding in guard_bindings {
         let guard =
             guard_registry
@@ -1798,31 +1914,12 @@ fn build_proxy_response(
     Ok(resp)
 }
 
-/// Normalize a URL path: collapse consecutive slashes and resolve `.`/`..` segments.
-/// Segments that would escape above the root are discarded.
-fn normalize_path(path: &str) -> String {
-    let mut segments: Vec<&str> = Vec::new();
-    for seg in path.split('/') {
-        match seg {
-            "" | "." => {}
-            ".." => {
-                segments.pop();
-            }
-            s => segments.push(s),
-        }
-    }
-    let mut result = String::with_capacity(path.len());
-    if path.starts_with('/') {
-        result.push('/');
-    }
-    result.push_str(&segments.join("/"));
-    result
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::domain::model::{Endpoint, ManagedBy, Scheme, Server, Upstream};
+    use crate::domain::proxy_path::normalize_percent_encoding;
+    use crate::domain::proxy_path::resolve_dots_for_tests as normalize_path;
     use crate::domain::services::{EndpointSelector, SelectionError};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use uuid::Uuid;
@@ -1830,6 +1927,220 @@ mod tests {
     #[test]
     fn normalize_collapses_double_slashes() {
         assert_eq!(normalize_path("/alias//v1//chat"), "/alias/v1/chat");
+    }
+
+    fn parse_path(path: &str) -> Result<ParsedRequest, DomainError> {
+        let req = http::Request::builder()
+            .uri(path)
+            .body(Body::Empty)
+            .expect("request");
+        parse_proxy_request(req, 1024)
+    }
+
+    #[test]
+    fn encoded_dot_segments_are_rejected() {
+        for path in [
+            "/alias/v1/%2e%2e/admin",
+            "/alias/v1/%2E%2E/admin",
+            "/alias/v1/.%2e/admin",
+            "/alias/v1/%2e./admin",
+            "/alias/v1/%2e/admin",
+            "/alias/v1/..%2fadmin",
+            "/alias/v1/..%2Fadmin",
+            "/alias/v1/..%5cadmin",
+            "/alias/v1/..\\admin",
+            "/alias/v1/x%2f..%2fadmin",
+            // A `;` path parameter Tomcat and Jetty strip before resolving.
+            "/alias/v1/..;/admin",
+            "/alias/v1/%2e%2e;x/admin",
+            "/alias/v1/..%3b/admin",
+            // Encoded twice and three times; four is too deep to follow.
+            "/alias/v1/%252e%252e/admin",
+            "/alias/v1/%25252e/admin",
+            "/alias/v1/%2525252e/admin",
+            // Overlong UTF-8 for `.`, and percent-encoding that is not UTF-8.
+            "/alias/v1/%c0%ae%c0%ae/admin",
+            "/alias/v1/%ff",
+            // Unicode forms an upstream may fold to `..` or `/`.
+            "/alias/v1/%EF%BC%8E%EF%BC%8E/admin",
+            "/alias/v1/%E2%80%A5/admin",
+            "/alias/v1/..%EF%BC%8Fadmin",
+            "/alias/v1/public/%EF%B8%B0/admin",
+            "/alias/v1/public/..%EF%B9%A8admin",
+            // A query or fragment marker after a decoded `..`.
+            "/alias/v1/public/..%3F",
+            "/alias/v1/public/..%23x",
+            // A path parameter, raw or encoded.
+            "/alias/v1/admin;x/secret",
+            "/alias/v1/admin%3bx/secret",
+            // A dot-segment padded with NUL or a space.
+            "/alias/v1/..%00/admin",
+            "/alias/v1/..%20/admin",
+            "/alias/v1/%2e%2e%09/admin",
+            // A stray `%` that normalization would turn into a new escape.
+            "/alias/v1/ch%%36%31t",
+            "/alias/v1/a%",
+            "/alias/v1/a%2",
+        ] {
+            match parse_path(path) {
+                Err(DomainError::Validation { reason, field, .. }) => {
+                    assert_eq!(reason, field::INVALID_PROXY_PATH, "{path}");
+                    assert_eq!(field, "path", "{path}");
+                }
+                Err(other) => panic!("{path}: unexpected error {other:?}"),
+                Ok(_) => panic!("{path}: accepted"),
+            }
+        }
+    }
+
+    #[test]
+    fn encoded_slash_and_literal_dots_are_kept() {
+        // An encoded `/` inside a segment is forwarded encoded.
+        assert_eq!(
+            parse_path("/alias/v1/a%2Fb").unwrap().path_suffix,
+            "/v1/a%2Fb"
+        );
+        assert_eq!(
+            parse_path("/alias/v1/a%252Fb").unwrap().path_suffix,
+            "/v1/a%252Fb"
+        );
+        // Dots that are not a whole segment stay.
+        assert_eq!(
+            parse_path("/alias/v1/a..b/.x").unwrap().path_suffix,
+            "/v1/a..b/.x"
+        );
+        assert_eq!(
+            parse_path("/alias/v1/%2e%2ex").unwrap().path_suffix,
+            "/v1/..x"
+        );
+        // Literal dot-segments are resolved, not rejected.
+        assert_eq!(parse_path("/alias/v1/../v2").unwrap().path_suffix, "/v2");
+        // A literal `%` stays.
+        assert_eq!(
+            parse_path("/alias/v1/100%25").unwrap().path_suffix,
+            "/v1/100%25"
+        );
+    }
+
+    /// A segment encoded three times is followed to its end; one encoded
+    /// four times is refused as too deep, which tells the limit apart from a
+    /// dot-segment.
+    #[test]
+    fn decode_depth_boundary() {
+        assert_eq!(
+            parse_path("/alias/v1/a%25252Fb").unwrap().path_suffix,
+            "/v1/a%25252Fb"
+        );
+        match parse_path("/alias/v1/a%2525252Fb") {
+            Err(DomainError::Validation { detail, .. }) => {
+                assert!(detail.contains("too many times"), "{detail}");
+            }
+            Err(other) => panic!("expected a depth rejection, got {other:?}"),
+            Ok(parsed) => panic!("accepted as {}", parsed.path_suffix),
+        }
+    }
+
+    /// The suffix after a route stored with escapes is cut where matching
+    /// put the prefix's end.
+    #[test]
+    fn route_suffix_follows_the_normalized_prefix() {
+        assert_eq!(route_suffix("/v1/~user/x", "/v1/%7euser").unwrap(), "/x");
+        assert_eq!(route_suffix("/v1/~user", "/v1/%7euser").unwrap(), "");
+        assert!(matches!(
+            route_suffix("/v2/x", "/v1"),
+            Err(DomainError::Internal { .. })
+        ));
+    }
+
+    /// Route matching sees encoded unreserved characters decoded, so
+    /// `/v1/ch%61t` is `/v1/chat`, not a request for a broader route.
+    #[test]
+    fn encoded_unreserved_characters_are_decoded() {
+        assert_eq!(
+            parse_path("/alias/v1/ch%61t").unwrap().path_suffix,
+            "/v1/chat"
+        );
+        assert_eq!(
+            parse_path("/alias/%7Euser/a%2db").unwrap().path_suffix,
+            "/~user/a-b"
+        );
+        // Other escapes stay encoded, with uppercase hex.
+        assert_eq!(
+            parse_path("/alias/v1/a%2fb%3a").unwrap().path_suffix,
+            "/v1/a%2Fb%3A"
+        );
+        assert_eq!(
+            parse_path("/alias/v1/%e2%82%ac").unwrap().path_suffix,
+            "/v1/%E2%82%AC"
+        );
+    }
+
+    proptest::proptest! {
+        /// Whatever pieces a segment is built from, a path the parser accepts
+        /// never decodes, once or twice, to a `.` or `..` segment.
+        #[test]
+        fn accepted_paths_have_no_hidden_dot_segments(
+            pieces in proptest::collection::vec(
+                proptest::sample::select(vec![
+                    ".", "%2e", "%2E", "%252e", "%2f", "%2F", "%5c", "/", ";", "%3b",
+                    "a", "b", "%25", "%61",
+                ]),
+                0..8,
+            ),
+        ) {
+            let path = format!("/alias/v1/{}", pieces.concat());
+            if let Ok(parsed) = parse_path(&path) {
+                let once = percent_encoding::percent_decode_str(&parsed.path_suffix)
+                    .decode_utf8_lossy()
+                    .into_owned();
+                let twice = percent_encoding::percent_decode_str(&once)
+                    .decode_utf8_lossy()
+                    .into_owned();
+                for decoded in [once, twice] {
+                    // Independent of `is_dot_segment`: a server splits on `/`
+                    // and `\\`, and drops a `;` path parameter.
+                    let hidden = decoded
+                        .split(['/', '\\'])
+                        .map(|piece| match piece.find([';', '?', '#']) {
+                            Some(at) => &piece[..at],
+                            None => piece,
+                        })
+                        .any(|piece| piece == "." || piece == "..");
+                    proptest::prop_assert!(
+                        !hidden,
+                        "{} accepted as {}", path, parsed.path_suffix
+                    );
+                }
+            }
+        }
+
+        /// Normalizing is idempotent and keeps the decoded path: a second
+        /// pass cannot reveal a different route.
+        #[test]
+        fn normalization_is_idempotent(
+            pieces in proptest::collection::vec(
+                proptest::sample::select(vec![
+                    "%", "%3", "%36", "%31", "%61", "%2f", "%2F", "%7e", "a", "t", "/", "%25",
+                ]),
+                0..10,
+            ),
+        ) {
+            let path = format!("/alias/v1/{}", pieces.concat());
+            if let Ok(parsed) = parse_path(&path) {
+                let again = normalize_percent_encoding(&parsed.path_suffix);
+                proptest::prop_assert_eq!(&again, &parsed.path_suffix);
+                let decode = |p: &str| {
+                    percent_encoding::percent_decode_str(p)
+                        .decode_utf8_lossy()
+                        .into_owned()
+                };
+                let raw_suffix = path.trim_start_matches("/alias");
+                proptest::prop_assert_eq!(
+                    normalize_path(&decode(&parsed.path_suffix)),
+                    normalize_path(&decode(raw_suffix))
+                );
+            }
+        }
     }
 
     #[test]
@@ -1935,6 +2246,17 @@ mod tests {
         metrics: Arc<dyn OagwMetricsPort>,
         resolved: Option<(Upstream, crate::domain::model::Route)>,
     ) -> DataPlaneServiceImpl {
+        build_svc_with_decision(selector, metrics, resolved, true)
+    }
+
+    /// Like [`build_svc_resolving`], with every authorization answered by
+    /// `allow`.
+    fn build_svc_with_decision(
+        selector: Arc<dyn EndpointSelector>,
+        metrics: Arc<dyn OagwMetricsPort>,
+        resolved: Option<(Upstream, crate::domain::model::Route)>,
+        allow: bool,
+    ) -> DataPlaneServiceImpl {
         use authz_resolver_sdk::{
             AuthZResolverApi, EvaluationRequest, EvaluationResponse, EvaluationResponseContext,
             PolicyEnforcer,
@@ -1943,16 +2265,16 @@ mod tests {
         use toolkit_canonical_errors::CanonicalError;
         use toolkit_security::{PlatformSecurityContext, SecurityContext};
 
-        struct AllowAllAuthZ;
+        struct FixedAuthZ(bool);
         #[async_trait]
-        impl AuthZResolverApi for AllowAllAuthZ {
+        impl AuthZResolverApi for FixedAuthZ {
             async fn evaluate(
                 &self,
                 _ctx: PlatformSecurityContext,
                 _request: EvaluationRequest,
             ) -> Result<EvaluationResponse, CanonicalError> {
                 Ok(EvaluationResponse {
-                    decision: true,
+                    decision: self.0,
                     context: EvaluationResponseContext {
                         constraints: Vec::new(),
                         deny_reason: None,
@@ -1963,7 +2285,7 @@ mod tests {
 
         let credstore: Arc<dyn CredStoreClientV1> =
             Arc::new(credstore_sdk::test_util::MockCredStoreClient::empty());
-        let policy_enforcer = PolicyEnforcer::new(Arc::new(AllowAllAuthZ));
+        let policy_enforcer = PolicyEnforcer::new(Arc::new(FixedAuthZ(allow)));
 
         // Minimal CP — only the proxy lookup is implemented.
         use crate::domain::error::DomainError;
@@ -2038,9 +2360,18 @@ mod tests {
             async fn delete_route(&self, _: &SecurityContext, _: Uuid) -> Result<(), DomainError> {
                 unimplemented!()
             }
-            async fn resolve_proxy_target(
+            async fn resolve_proxy_target_for_client(
                 &self,
                 _: &SecurityContext,
+                _: &str,
+                _: &str,
+                _: &str,
+            ) -> Result<(Upstream, Route), DomainError> {
+                unimplemented!()
+            }
+            async fn resolve_proxy_target(
+                &self,
+                _: &ProxyGrant,
                 _: &str,
                 _: &str,
                 _: &str,
@@ -2077,6 +2408,7 @@ mod tests {
             selector,
             engine,
             metrics,
+            Arc::new(RateLimiter::new()),
         )
     }
 
@@ -2513,6 +2845,157 @@ mod tests {
             metrics.phases(phase::RESOLVE),
             vec![(unknown.clone(), unknown)]
         );
+    }
+
+    /// Keeps the request counters, durations and in-flight changes.
+    #[derive(Default)]
+    struct RequestRecorder(std::sync::Mutex<Vec<String>>);
+
+    impl RequestRecorder {
+        fn events(&self) -> Vec<String> {
+            self.0.lock().unwrap().clone()
+        }
+        fn push(&self, event: String) {
+            self.0.lock().unwrap().push(event);
+        }
+    }
+
+    impl OagwMetricsPort for RequestRecorder {
+        fn record_request(&self, _: &str, _: &str, _: &str, status: u16) {
+            self.push(format!("request {status}"));
+        }
+        fn record_error(&self, _: &str, _: &str, variant: &str) {
+            self.push(format!("error {variant}"));
+        }
+        fn record_request_duration_seconds(&self, _: &str, _: &str, phase: &str, _: f64) {
+            self.push(format!("duration {phase}"));
+        }
+        fn increment_in_flight(&self, _: &str) {
+            self.push("in_flight +1".to_owned());
+        }
+        fn decrement_in_flight(&self, _: &str) {
+            self.push("in_flight -1".to_owned());
+        }
+        fn record_rate_limit_exceeded(&self, _: &str, _: &str) {}
+        fn record_rate_limit_usage_ratio(&self, _: &str, _: &str, _: f64) {}
+        fn increment_active_websocket_sessions(&self, _: &str) {}
+        fn decrement_active_websocket_sessions(&self, _: &str) {}
+        fn record_websocket_session_duration_seconds(&self, _: &str, _: f64) {}
+        fn record_rate_limit_sweep(&self, _: u64, _: u64) {}
+        fn record_registry_provisioning_failure(&self, _: &str, _: &str) {}
+        fn record_registry_provisioning_run(&self, _: &str) {}
+        fn record_credential_withheld(&self, _: &str, _: &'static str) {}
+        fn record_proxy_cache_lookup(
+            &self,
+            _: crate::domain::ports::metric_labels::CacheMap,
+            _: crate::domain::ports::metric_labels::CacheLookup,
+        ) {
+        }
+        fn record_proxy_cache_entries(
+            &self,
+            _: crate::domain::ports::metric_labels::CacheMap,
+            _: u64,
+        ) {
+        }
+        fn record_proxy_cache_evictions(
+            &self,
+            _: crate::domain::ports::metric_labels::CacheMap,
+            _: crate::domain::ports::metric_labels::CacheEviction,
+            _: u64,
+        ) {
+        }
+        fn record_proxy_cache_change(&self, _: &str) {}
+        fn record_proxy_cache_flush(&self, _: &str) {}
+        fn record_proxy_cache_load_discarded(
+            &self,
+            _: crate::domain::ports::metric_labels::CacheMap,
+        ) {
+        }
+        fn record_proxy_cache_stale_served(
+            &self,
+            _: crate::domain::ports::metric_labels::CacheMap,
+            _: crate::domain::ports::metric_labels::CacheStale,
+        ) {
+        }
+        fn record_proxy_cache_publish_failures(&self, _: &str, _: u64) {}
+    }
+
+    /// `authorize_proxy` counts a denial; a grant counts nothing, since the
+    /// proxied request is counted when it completes (#4981).
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn authorize_proxy_counts_only_a_denial() {
+        let metrics = Arc::new(RequestRecorder::default());
+        let allowed =
+            build_svc_with_decision(Arc::new(MockSelector::new()), metrics.clone(), None, true);
+        allowed.authorize_proxy(test_ctx()).await.unwrap();
+        assert!(metrics.events().is_empty(), "{:?}", metrics.events());
+
+        let denied =
+            build_svc_with_decision(Arc::new(MockSelector::new()), metrics.clone(), None, false);
+        let err = denied.authorize_proxy(test_ctx()).await.unwrap_err();
+        assert!(logs_contain("OAGW proxy call denied"));
+        assert!(matches!(err, DomainError::Forbidden { .. }), "{err:?}");
+        let events = metrics.events();
+        assert_eq!(
+            events,
+            vec![
+                format!("duration {}", phase::TOTAL),
+                "error Forbidden".to_owned()
+            ]
+        );
+    }
+
+    /// A `proxy:invoke` check dropped before the policy engine answers (the
+    /// gateway's request timeout) is counted as a cancelled request.
+    #[tokio::test]
+    async fn cancelled_authorization_is_counted() {
+        use authz_resolver_sdk::{AuthZResolverApi, EvaluationRequest, EvaluationResponse};
+        struct NeverAnswers;
+        #[async_trait]
+        impl AuthZResolverApi for NeverAnswers {
+            async fn evaluate(
+                &self,
+                _: toolkit_security::PlatformSecurityContext,
+                _: EvaluationRequest,
+            ) -> Result<EvaluationResponse, toolkit_canonical_errors::CanonicalError> {
+                std::future::pending().await
+            }
+        }
+        let metrics = Arc::new(RequestRecorder::default());
+        let mut svc =
+            build_svc_with_decision(Arc::new(MockSelector::new()), metrics.clone(), None, true);
+        svc.policy_enforcer = PolicyEnforcer::new(Arc::new(NeverAnswers));
+        let timed_out =
+            tokio::time::timeout(Duration::from_millis(20), svc.authorize_proxy(test_ctx())).await;
+        assert!(timed_out.is_err());
+        assert_eq!(
+            metrics.events(),
+            vec![
+                format!("duration {}", phase::TOTAL),
+                "error Cancelled".to_owned()
+            ]
+        );
+    }
+
+    /// The SDK path checks `proxy:invoke` before validating the request: a
+    /// denied caller with an invalid Content-Type gets 403, not 400.
+    #[tokio::test]
+    async fn sdk_path_authorizes_before_validating() {
+        let svc = build_svc_with_decision(
+            Arc::new(MockSelector::new()),
+            Arc::new(crate::domain::ports::NoopMetrics),
+            None,
+            false,
+        );
+        let req = http::Request::builder()
+            .method(http::Method::POST)
+            .uri("/alias/v1/x")
+            .header(http::header::CONTENT_TYPE, "not a mime")
+            .body(Body::from("body"))
+            .unwrap();
+        let err = svc.proxy_request(test_ctx(), req).await.unwrap_err();
+        assert!(matches!(err, DomainError::Forbidden { .. }), "{err:?}");
     }
 
     /// Keeps only what the sweep reports.

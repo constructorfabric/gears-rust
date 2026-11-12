@@ -300,7 +300,13 @@ async fn service_resolution(tags: Tags) -> (usize, usize, Vec<String>, Vec<Strin
     r.recorder.clear();
 
     let (effective, route) = cp
-        .resolve_proxy_target(&ctx, "api", "POST", "/v1/chat", tags)
+        .resolve_proxy_target(
+            &crate::domain::services::ProxyGrant::for_tests(ctx.clone()),
+            "api",
+            "POST",
+            "/v1/chat",
+            tags,
+        )
         .await
         .unwrap();
     let tag_reads = r
