@@ -126,18 +126,19 @@ impl Default for BatchConfig {
 pub struct PublishConfig {
     /// The ceiling on a `Prefer: wait=N` publish's hold, in seconds. A request
     /// asking for more is capped to this; the broker never holds a publish open
-    /// longer than the operator allows. Default 20, to stay inside api-gateway's
-    /// request deadline. In the ingest-serving modes (`standalone` and
-    /// `cluster_ingest`) a startup check refuses a value above
-    /// [`MAX_PUBLISH_WAIT_SECS`](crate::config::checks::MAX_PUBLISH_WAIT_SECS),
-    /// which explains the bound and when it can rise (#4752).
+    /// longer than the operator allows. Default 50, to stay inside the 60s
+    /// request deadline the publish routes declare to api-gateway. In
+    /// the ingest-serving modes (`standalone` and `cluster_ingest`) a startup
+    /// check refuses a value above
+    /// [`MAX_PUBLISH_WAIT_SECS`](crate::config::checks::MAX_PUBLISH_WAIT_SECS).
     pub max_wait_secs: u32,
 }
 
 impl Default for PublishConfig {
     fn default() -> Self {
-        // Below api-gateway's request deadline; see `MAX_PUBLISH_WAIT_SECS`.
-        Self { max_wait_secs: 20 }
+        // Below the publish routes' declared api-gateway deadline; see
+        // `MAX_PUBLISH_WAIT_SECS`.
+        Self { max_wait_secs: 50 }
     }
 }
 

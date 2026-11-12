@@ -82,6 +82,8 @@ bootstrap = [
 ]
 
 [dependencies]
+# `x-toolkit-request-timeout` vendor-extension values use humantime strings.
+humantime = { workspace = true }
 toolkit-http = { workspace = true, optional = true }
 # Project-local crates
 toolkit-macros = { workspace = true }

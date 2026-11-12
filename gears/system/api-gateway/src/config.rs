@@ -291,6 +291,16 @@ pub struct Defaults {
     /// has been returned.
     #[serde(with = "humantime_serde")]
     pub request_timeout: Duration,
+
+    /// Optional maximum deadline any route may declare. When set, longer
+    /// route deadlines and explicit no-timeout declarations are limited to
+    /// this duration. The cap applies only until response headers are sent.
+    #[serde(
+        default,
+        with = "humantime_serde::option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub max_request_timeout: Option<Duration>,
 }
 
 impl Default for Defaults {
@@ -298,6 +308,7 @@ impl Default for Defaults {
         Self {
             body_limit_bytes: default_body_limit_bytes(),
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
+            max_request_timeout: None,
         }
     }
 }
@@ -307,16 +318,27 @@ impl Defaults {
     ///
     /// A zero `request_timeout` would fail every request with 504 before its
     /// handler could run, so it is refused at startup. There is deliberately no
-    /// upper bound: how long a request may legitimately take is a property of
-    /// the deployment's slowest route, which the gateway cannot know, and a cap
-    /// would only reintroduce a hard-coded limit one level up.
+    /// upper bound unless `max_request_timeout` is configured. When set, the
+    /// cap must be at least as large as the default deadline.
     ///
     /// # Errors
-    /// Returns a human-readable description when `request_timeout` is zero.
+    /// Returns a human-readable description when the default is zero or the
+    /// maximum is below the default.
     pub fn validate(&self) -> Result<(), String> {
         if self.request_timeout.is_zero() {
             return Err(
-                "invalid api_gateway configuration: `defaults.request_timeout` must be greater                  than zero (e.g. \"30s\")"
+                "invalid api_gateway configuration: `defaults.request_timeout` must be greater \
+                 than zero (e.g. \"30s\")"
+                    .to_owned(),
+            );
+        }
+        if self
+            .max_request_timeout
+            .is_some_and(|max| max < self.request_timeout)
+        {
+            return Err(
+                "invalid api_gateway configuration: `defaults.max_request_timeout` must be greater \
+                 than or equal to `defaults.request_timeout`"
                     .to_owned(),
             );
         }
@@ -451,7 +473,8 @@ pub struct RoutePolicyRule {
     /// Required scopes for this route. Request passes if token has ANY of these scopes.
     /// Must not be empty.
     pub required_scopes: Vec<String>,
-    // Future fields: rate_limit, timeout, operation_id, etc.
+    // Future fields: rate_limit, operation_id, etc. (per-route timeouts are
+    // declared on the operation via `OperationSpec::request_timeout`, not here).
 }
 
 // =================================================================================================
@@ -751,6 +774,7 @@ mod defaults_tests {
 ",
         );
         assert_eq!(cfg.defaults.request_timeout, Duration::from_secs(30));
+        assert_eq!(cfg.defaults.max_request_timeout, None);
 
         let cfg = parse(
             "bind_addr: \"0.0.0.0:8086\"
@@ -759,6 +783,7 @@ defaults:
 ",
         );
         assert_eq!(cfg.defaults.request_timeout, Duration::from_secs(30));
+        assert_eq!(cfg.defaults.max_request_timeout, None);
         assert_eq!(cfg.defaults.body_limit_bytes, 1024);
 
         assert_eq!(
@@ -789,6 +814,42 @@ defaults:
     }
 
     #[test]
+    fn max_request_timeout_parses_humantime_and_round_trips() {
+        let cfg = parse(
+            r#"
+bind_addr: "0.0.0.0:8086"
+defaults:
+  max_request_timeout: 2m
+"#,
+        );
+        assert_eq!(
+            cfg.defaults.max_request_timeout,
+            Some(Duration::from_secs(120))
+        );
+        assert!(cfg.defaults.validate().is_ok());
+
+        let json = serde_json::to_value(&cfg.defaults).expect("serialize");
+        assert_eq!(json["max_request_timeout"], "2m");
+    }
+
+    #[test]
+    fn max_request_timeout_must_not_be_below_default() {
+        let cfg = parse(
+            r#"
+bind_addr: "0.0.0.0:8086"
+defaults:
+  request_timeout: 30s
+  max_request_timeout: 20s
+"#,
+        );
+        let err = cfg.defaults.validate().unwrap_err();
+        assert!(
+            err.contains("max_request_timeout"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
     fn request_timeout_rejects_a_bare_number() {
         let res = serde_saphyr::from_str::<ApiGatewayConfig>(
             "bind_addr: \"0.0.0.0:8086\"
@@ -816,6 +877,7 @@ defaults:
         let defaults = Defaults::default();
         let json = serde_json::to_value(&defaults).expect("serialize");
         assert_eq!(json["request_timeout"], "30s");
+        assert!(json.get("max_request_timeout").is_none());
     }
 }
 

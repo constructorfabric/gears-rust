@@ -16,7 +16,9 @@ use crate::error::GatewayError;
 use crate::provider::{GatewayProvider, InstanceSpec};
 use crate::registry::{InstanceRoutes, ProxyRegistry, RouteTemplate};
 use crate::types::{Endpoint, GearInstance, GearName, OpenApiSpec};
-use crate::{API_VISIBILITY_EXPOSED, API_VISIBILITY_EXTENSION};
+use crate::{
+    API_VISIBILITY_EXPOSED, API_VISIBILITY_EXTENSION, REQUEST_TIMEOUT_EXTENSION, RouteTimeout,
+};
 use toolkit_security::constants::INTERNAL_TOKEN_HEADER;
 
 /// HTTP method keys recognized when scanning an `OpenAPI` path item.
@@ -286,13 +288,42 @@ fn extract_public_routes(spec: &OpenApiSpec<'_>) -> Result<PublicRoutes, Gateway
             let authenticated = security_authenticated(operation.get("security"))
                 .or(doc_authenticated)
                 .unwrap_or(false);
-            found
-                .routes
-                .push(RouteTemplate::new(method, path.clone(), authenticated));
+            let request_timeout = parse_request_timeout(operation);
+            found.routes.push(
+                RouteTemplate::new(method, path.clone(), authenticated)
+                    .with_request_timeout(request_timeout),
+            );
         }
     }
 
     Ok(found)
+}
+
+/// Read the operation's `x-toolkit-request-timeout` extension: `"none"` for a
+/// deadline-free (streaming) route, a humantime duration string (e.g. `"60s"`)
+/// for a route-specific deadline. Absent, malformed, or unrecognised values
+/// fall back to [`RouteTimeout::Inherit`].
+fn parse_request_timeout(operation: &serde_json::Map<String, serde_json::Value>) -> RouteTimeout {
+    let Some(raw) = operation
+        .get(REQUEST_TIMEOUT_EXTENSION)
+        .and_then(serde_json::Value::as_str)
+    else {
+        return RouteTimeout::Inherit;
+    };
+    if raw == "none" {
+        return RouteTimeout::Disabled;
+    }
+    match humantime::parse_duration(raw) {
+        Ok(timeout) => RouteTimeout::Custom(timeout),
+        Err(err) => {
+            tracing::warn!(
+                value = %raw,
+                error = %err,
+                "ignoring malformed x-toolkit-request-timeout operation extension",
+            );
+            RouteTimeout::Inherit
+        }
+    }
 }
 
 /// Interpret a `security` field (from a document root or an operation object).
@@ -356,6 +387,7 @@ mod tests {
     use bytes::Bytes;
 
     use super::{InstanceSpec, ToolKitGatewayProvider, extract_public_routes};
+    use crate::RouteTimeout;
     use crate::provider::GatewayProvider;
     use crate::registry::ProxyRegistry;
     use crate::types::{Endpoint, GearName, OpenApiSpec};
@@ -850,5 +882,78 @@ mod tests {
             )
             .await;
         assert_eq!(registry.instance_count(), 0);
+    }
+
+    #[test]
+    fn extract_reads_the_request_timeout_extension() {
+        let doc = serde_json::json!({
+            "openapi": "3.1.0",
+            "info": { "title": "eb", "version": "1.0.0" },
+            "paths": {
+                "/eb/v1/events": {
+                    "post": {
+                        "x-toolkit-visibility": "exposed",
+                        "x-toolkit-request-timeout": "60s",
+                        "responses": {}
+                    }
+                },
+                "/eb/v1/events:sse": {
+                    "get": {
+                        "x-toolkit-visibility": "exposed",
+                        "x-toolkit-request-timeout": "none",
+                        "responses": {}
+                    }
+                },
+                "/eb/v1/topics": {
+                    "get": {
+                        "x-toolkit-visibility": "exposed",
+                        "responses": {}
+                    }
+                },
+                "/eb/v1/compound": {
+                    "get": {
+                        "x-toolkit-visibility": "exposed",
+                        "x-toolkit-request-timeout": "1s 500ms",
+                        "responses": {}
+                    }
+                },
+                "/eb/v1/bad": {
+                    "get": {
+                        "x-toolkit-visibility": "exposed",
+                        "x-toolkit-request-timeout": "soon-ish",
+                        "responses": {}
+                    }
+                }
+            }
+        });
+        let spec = OpenApiSpec::Owned(Box::new(
+            serde_json::from_value::<utoipa::openapi::OpenApi>(doc).expect("openapi doc"),
+        ));
+        let routes = extract_public_routes(&spec).expect("parse spec").routes;
+        let timeout_of = |path: &str| {
+            routes
+                .iter()
+                .find(|r| r.path == path)
+                .map(|r| r.request_timeout)
+        };
+        assert_eq!(
+            timeout_of("/eb/v1/events"),
+            Some(RouteTimeout::Custom(std::time::Duration::from_secs(60)))
+        );
+        assert_eq!(
+            timeout_of("/eb/v1/events:sse"),
+            Some(RouteTimeout::Disabled)
+        );
+        assert_eq!(timeout_of("/eb/v1/topics"), Some(RouteTimeout::Inherit));
+        assert_eq!(
+            timeout_of("/eb/v1/compound"),
+            Some(RouteTimeout::Custom(std::time::Duration::from_millis(1500))),
+            "a compound humantime duration (as `humantime::format_duration` emits) parses back"
+        );
+        assert_eq!(
+            timeout_of("/eb/v1/bad"),
+            Some(RouteTimeout::Inherit),
+            "a malformed extension falls back to inheriting"
+        );
     }
 }

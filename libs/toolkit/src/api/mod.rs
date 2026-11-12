@@ -24,7 +24,7 @@ pub use openapi_registry::{OpenApiInfo, OpenApiRegistry, OpenApiRegistryImpl, en
 pub use operation_builder::{
     INTERNAL_TOKEN_SECURITY_SCHEME, Missing, OperationBuilder, OperationSpec, ParamLocation,
     ParamSpec, Present, ResponseHeaderSpec, ResponseHeaderType, ResponseSpec, RouteAuth,
-    ThrottlingSpec, state,
+    RouteTimeout, ThrottlingSpec, state,
 };
 pub use select::{apply_select, page_to_projected_json, project_json};
 pub use toolkit_trace_context::{

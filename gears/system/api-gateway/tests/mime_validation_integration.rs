@@ -14,7 +14,7 @@ use axum::{
 };
 use http::Method;
 use serde_json::json;
-use toolkit::api::OperationSpec;
+use toolkit::api::{OperationSpec, RouteTimeout};
 use toolkit_canonical_errors::Problem;
 use toolkit_gts::gts_uri;
 use tower::ServiceExt; // for oneshot
@@ -66,6 +66,7 @@ async fn test_middleware_allows_configured_content_type() {
         auth: toolkit::api::RouteAuth::Anonymous,
         exposed: false,
         license_requirement: None,
+        request_timeout: RouteTimeout::Inherit,
         throttling: None,
         allowed_request_content_types: Some(vec!["application/json"]),
         vendor_extensions: VendorExtensions::default(),
@@ -111,6 +112,7 @@ async fn test_middleware_strips_content_type_parameters() {
         auth: toolkit::api::RouteAuth::Anonymous,
         exposed: false,
         license_requirement: None,
+        request_timeout: RouteTimeout::Inherit,
         throttling: None,
         allowed_request_content_types: Some(vec!["application/json"]),
         vendor_extensions: VendorExtensions::default(),
@@ -156,6 +158,7 @@ async fn test_middleware_rejects_disallowed_content_type() {
         auth: toolkit::api::RouteAuth::Anonymous,
         exposed: false,
         license_requirement: None,
+        request_timeout: RouteTimeout::Inherit,
         throttling: None,
         allowed_request_content_types: Some(vec!["application/json"]),
         vendor_extensions: VendorExtensions::default(),
@@ -217,6 +220,7 @@ async fn test_middleware_rejects_missing_content_type() {
         auth: toolkit::api::RouteAuth::Anonymous,
         exposed: false,
         license_requirement: None,
+        request_timeout: RouteTimeout::Inherit,
         throttling: None,
         allowed_request_content_types: Some(vec!["multipart/form-data"]),
         vendor_extensions: VendorExtensions::default(),
@@ -307,6 +311,7 @@ async fn test_middleware_allows_multiple_content_types() {
         auth: toolkit::api::RouteAuth::Anonymous,
         exposed: false,
         license_requirement: None,
+        request_timeout: RouteTimeout::Inherit,
         throttling: None,
         allowed_request_content_types: Some(vec![
             "application/json",

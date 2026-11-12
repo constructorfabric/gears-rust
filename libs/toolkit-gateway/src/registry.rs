@@ -11,6 +11,20 @@ use parking_lot::RwLock;
 
 use crate::types::{Endpoint, GearInstance, GearName};
 
+/// Per-route request deadline declared by the upstream gear, parsed from the
+/// `x-toolkit-request-timeout` `OpenAPI` vendor extension. Mirrors
+/// `toolkit::api::RouteTimeout`; toolkit-gateway does not depend on toolkit.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RouteTimeout {
+    /// Inherit the edge's default request timeout.
+    #[default]
+    Inherit,
+    /// No deadline: long-lived streaming routes (SSE, multipart streams).
+    Disabled,
+    /// A route-specific deadline replacing the edge default.
+    Custom(std::time::Duration),
+}
+
 /// A single registered route: an HTTP method plus an `OpenAPI` path template
 /// (e.g. `GET /calculator/v1/items/{id}`), and whether it requires
 /// authentication at the edge.
@@ -24,6 +38,9 @@ pub struct RouteTemplate {
     /// from the operation's `OpenAPI` `security` requirement). An exposed route
     /// may still be anonymous (`authenticated == false`).
     pub authenticated: bool,
+    /// Request deadline the upstream declared for this route. `Inherit` when
+    /// the spec carries no `x-toolkit-request-timeout` extension.
+    pub request_timeout: RouteTimeout,
 }
 
 impl RouteTemplate {
@@ -34,7 +51,15 @@ impl RouteTemplate {
             method,
             path: path.into(),
             authenticated,
+            request_timeout: RouteTimeout::Inherit,
         }
+    }
+
+    /// Overrides the inherited edge request timeout for this route.
+    #[must_use]
+    pub fn with_request_timeout(mut self, timeout: RouteTimeout) -> Self {
+        self.request_timeout = timeout;
+        self
     }
 }
 
@@ -66,18 +91,29 @@ pub struct InstanceRoutes {
     pub templates: Vec<RouteTemplate>,
 }
 
-/// Accumulated auth map and the selected upstream endpoint for one
+/// The edge policy for one `(path, method)`: whether the edge enforces auth
+/// and the request deadline the upstream declared. Kept as one unit so the two
+/// cannot drift apart — they are always derived from the same [`RouteTemplate`].
+#[derive(Clone, Copy, Debug)]
+struct MethodPolicy {
+    /// Whether the edge must enforce authentication for this method.
+    authenticated: bool,
+    /// Request deadline the upstream declared; `Inherit` when unspecified.
+    request_timeout: RouteTimeout,
+}
+
+/// Accumulated per-method policy and the selected upstream endpoint for one
 /// `(gear, path)` while rebuilding the router.
 struct PathAggregate {
-    /// Per-method auth requirement for this path.
-    authenticated: HashMap<http::Method, bool>,
+    /// Per-method edge policy for this path.
+    methods: HashMap<http::Method, MethodPolicy>,
     /// The endpoint selected for this path: the first instance of the owning
     /// gear seen in deterministic order (see [`State::rebuild`]).
     endpoint: Endpoint,
 }
 
 /// The value stored per path template in the router: the owning gear, its
-/// selected upstream endpoint, and the per-method authentication requirement.
+/// selected upstream endpoint, and the per-method edge policy.
 #[derive(Clone, Debug)]
 struct RegisteredPath {
     /// The gear that owns the matched path.
@@ -93,9 +129,9 @@ struct RegisteredPath {
     /// changing [`State::rebuild`]/[`ProxyRegistry::match_path`], without a
     /// change to how routes are stored.
     endpoint: Endpoint,
-    /// Per-method auth requirement for this path. A method absent from the map
-    /// defaults to authenticated (the safe choice).
-    authenticated: HashMap<http::Method, bool>,
+    /// Per-method edge policy. A method absent from the map defaults to
+    /// authenticated (the safe choice) and an inherited timeout.
+    methods: HashMap<http::Method, MethodPolicy>,
 }
 
 /// Mutable state guarded by the registry's lock.
@@ -138,15 +174,18 @@ impl State {
 
         for (instance, entry) in instances {
             // Collapse this instance's templates by path.
-            let mut by_path: HashMap<&str, HashMap<http::Method, bool>> = HashMap::new();
+            let mut by_path: HashMap<&str, HashMap<http::Method, MethodPolicy>> = HashMap::new();
             for template in &entry.templates {
-                by_path
-                    .entry(template.path.as_str())
-                    .or_default()
-                    .insert(template.method.clone(), template.authenticated);
+                by_path.entry(template.path.as_str()).or_default().insert(
+                    template.method.clone(),
+                    MethodPolicy {
+                        authenticated: template.authenticated,
+                        request_timeout: template.request_timeout,
+                    },
+                );
             }
 
-            for (path, authenticated) in by_path {
+            for (path, per_method) in by_path {
                 let key = (instance.gear().clone(), path.to_owned());
                 // Aggregate a gear's routes across its instances with two
                 // Profile-3 simplifications, both resolved in favour of the
@@ -156,8 +195,10 @@ impl State {
                 //     the gear's stable k8s Service DNS. Every instance is still
                 //     retained, so Profile 2 (proxy as sole load balancer) is a
                 //     future change here and in `match_path`, not a storage one.
-                //   * auth flag — the first-seen `authenticated` value per method
-                //     wins (the `or_insert` below).
+                //   * per-method policy (auth flag + request timeout) — the
+                //     first-seen policy per method wins (the `or_insert` below);
+                //     `Inherit` is recorded too, so a later instance's declared
+                //     timeout cannot override the first's.
                 //
                 // Instances of one gear normally publish an identical spec, so
                 // this only diverges transiently during a rolling upgrade when
@@ -169,11 +210,11 @@ impl State {
                 // Converging mixed versions exactly would require fetching a spec
                 // per instance (the snapshot carries one document per gear).
                 let aggregate = path_map.entry(key).or_insert_with(|| PathAggregate {
-                    authenticated: HashMap::new(),
+                    methods: HashMap::new(),
                     endpoint: entry.endpoint.clone(),
                 });
-                for (method, is_auth) in authenticated {
-                    aggregate.authenticated.entry(method).or_insert(is_auth);
+                for (method, policy) in per_method {
+                    aggregate.methods.entry(method).or_insert(policy);
                 }
             }
         }
@@ -213,7 +254,7 @@ impl State {
             let value = RegisteredPath {
                 gear,
                 endpoint: aggregate.endpoint,
-                authenticated: aggregate.authenticated,
+                methods: aggregate.methods,
             };
             if let Err(err) = router.insert(path.clone(), value) {
                 tracing::warn!(
@@ -344,10 +385,27 @@ impl ProxyRegistry {
         Some(
             matched
                 .value
-                .authenticated
+                .methods
                 .get(method)
-                .copied()
-                .unwrap_or(true),
+                .is_none_or(|policy| policy.authenticated),
+        )
+    }
+
+    /// Returns the request deadline the upstream declared for a proxied
+    /// `(method, path)`, or `None` if `path` is not a proxied route.
+    ///
+    /// A matched path whose specific `method` declared no timeout returns
+    /// [`RouteTimeout::Inherit`].
+    #[must_use]
+    pub fn request_timeout(&self, method: &http::Method, path: &str) -> Option<RouteTimeout> {
+        let state = self.inner.read();
+        let matched = state.router.at(path).ok()?;
+        Some(
+            matched
+                .value
+                .methods
+                .get(method)
+                .map_or(RouteTimeout::Inherit, |policy| policy.request_timeout),
         )
     }
 
@@ -698,5 +756,51 @@ mod tests {
         );
         // Exactly one of the conflicting templates wins; the path is routable.
         assert!(registry.match_path("/calc/v1/anything").is_some());
+    }
+
+    #[test]
+    fn first_instance_request_timeout_wins_across_divergent_instances() {
+        use super::RouteTimeout;
+        use std::time::Duration;
+
+        // When instances of one gear diverge (a rolling upgrade), the first in
+        // deterministic order (`calc-1`) wins — including when its timeout is
+        // `Inherit`, which must not be overridden by a later instance's
+        // explicit deadline (the `registry.rs` fix). Winner selection
+        // independent of registration order is covered by
+        // `multiple_instances_same_gear_deregister_one`.
+        let gear = GearName::from("calc");
+        let path = "/calc/v1/publish";
+
+        for first_timeout in [
+            RouteTimeout::Custom(Duration::from_secs(60)),
+            RouteTimeout::Inherit,
+        ] {
+            let registry = ProxyRegistry::new();
+            registry.register(
+                gear.clone(),
+                "calc-1",
+                endpoint("http://calc-1:8080"),
+                vec![
+                    RouteTemplate::new(http::Method::POST, path, true)
+                        .with_request_timeout(first_timeout),
+                ],
+            );
+            registry.register(
+                gear.clone(),
+                "calc-2",
+                endpoint("http://calc-2:8080"),
+                vec![
+                    RouteTemplate::new(http::Method::POST, path, true)
+                        .with_request_timeout(RouteTimeout::Custom(Duration::from_secs(10))),
+                ],
+            );
+
+            assert_eq!(
+                registry.request_timeout(&http::Method::POST, path),
+                Some(first_timeout),
+                "first instance (calc-1) timeout must win, even when it is Inherit",
+            );
+        }
     }
 }

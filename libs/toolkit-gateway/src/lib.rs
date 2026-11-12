@@ -31,7 +31,7 @@ mod types;
 pub use error::GatewayError;
 pub use forward::{Forwarder, proxy_fallback};
 pub use provider::{GatewayProvider, InstanceSpec};
-pub use registry::{InstanceRoutes, ProxyRegistry, RouteMatch, RouteTemplate};
+pub use registry::{InstanceRoutes, ProxyRegistry, RouteMatch, RouteTemplate, RouteTimeout};
 pub use toolkit_provider::ToolKitGatewayProvider;
 pub use types::{Endpoint, GearInstance, GearName, OpenApiSpec};
 
@@ -44,3 +44,7 @@ pub const API_VISIBILITY_EXTENSION: &str = "x-toolkit-visibility";
 /// The [`API_VISIBILITY_EXTENSION`] value indicating an exposed (externally visible)
 /// route.
 pub const API_VISIBILITY_EXPOSED: &str = "exposed";
+
+/// `OpenAPI` operation extension carrying the route's declared request
+/// deadline: `"none"` for streaming routes, or a humantime duration (`"60s"`).
+pub const REQUEST_TIMEOUT_EXTENSION: &str = "x-toolkit-request-timeout";

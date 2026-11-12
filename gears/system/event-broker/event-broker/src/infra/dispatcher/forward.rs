@@ -22,11 +22,11 @@ use crate::config::MAX_REQUEST_BODY_BYTES;
 /// duration. It also bounds the wait for the *response head*, so it must sit
 /// above the two things a dispatched route can legitimately hold before its
 /// first byte: the consumer SDK's ~50s stream self-heal window (`DESIGN.md`
-/// "Streaming connection - proxy interaction") - the binding constraint - and -
-/// sending nothing until it resolves - a synchronous `Prefer: wait=N` publish,
-/// capped at `config::checks::MAX_PUBLISH_WAIT_SECS` (20s) on an ingest
-/// upstream. 90s clears the self-heal window with margin, and the publish cap
-/// sits well under it.
+/// "Streaming connection - proxy interaction") - the binding constraint - and
+/// a synchronous `Prefer: wait=N` publish, capped at
+/// `config::checks::MAX_PUBLISH_WAIT_SECS` (50s) on an ingest upstream. 90s
+/// clears the self-heal window with margin, and the publish cap sits well under
+/// it.
 const IDLE_READ_TIMEOUT: Duration = Duration::from_secs(90);
 
 /// Bound on the TCP connect to a resolved instance. Unlike the idle-read

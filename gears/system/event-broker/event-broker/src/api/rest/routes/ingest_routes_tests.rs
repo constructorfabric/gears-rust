@@ -2,9 +2,97 @@
 //! a registry that records every registered `OperationSpec`.
 
 use axum::Router;
+use toolkit::api::operation_builder::RouteTimeout;
 
-use super::register_ingest_routes;
+use crate::config::checks::{DISPATCHER_PUBLISH_ROUTE_TIMEOUT_SECS, PUBLISH_ROUTE_TIMEOUT_SECS};
+
 use super::route_spec_recorder::{RecordingOpenApiRegistry, declared_responses};
+use super::{register_delivery_routes, register_dispatcher_routes, register_ingest_routes};
+
+/// The declared request timeout of the single operation registered on `path`.
+fn declared_timeout(registry: &RecordingOpenApiRegistry, path: &str) -> RouteTimeout {
+    let operations = registry.operations.lock().expect("operations lock");
+    let [operation] = operations
+        .iter()
+        .filter(|operation| operation.path == path)
+        .collect::<Vec<_>>()[..]
+    else {
+        panic!("expected one operation on {path}");
+    };
+    operation.request_timeout
+}
+
+#[test]
+fn ingest_publish_routes_declare_the_publish_timeout() {
+    use std::time::Duration;
+
+    let registry = RecordingOpenApiRegistry::default();
+    let _router = register_ingest_routes(Router::new(), &registry);
+
+    // Both publish routes declare the 60s deadline (so a `Prefer: wait=N` hold
+    // stays inside it); other routes inherit the gateway default.
+    let publish = RouteTimeout::Custom(Duration::from_secs(PUBLISH_ROUTE_TIMEOUT_SECS));
+    assert_eq!(
+        declared_timeout(&registry, "/event-broker/v1/events"),
+        publish
+    );
+    assert_eq!(
+        declared_timeout(&registry, "/event-broker/v1/events:batch"),
+        publish
+    );
+    assert_eq!(
+        declared_timeout(&registry, "/event-broker/v1/topics"),
+        RouteTimeout::Inherit
+    );
+}
+
+#[test]
+fn delivery_stream_routes_disable_the_request_timeout() {
+    let registry = RecordingOpenApiRegistry::default();
+    let _router = register_delivery_routes(Router::new(), &registry);
+
+    // Long-lived streaming routes must never be cut by the unary deadline.
+    assert_eq!(
+        declared_timeout(&registry, "/event-broker/v1/events:stream"),
+        RouteTimeout::Disabled
+    );
+    assert_eq!(
+        declared_timeout(&registry, "/event-broker/v1/events:sse"),
+        RouteTimeout::Disabled
+    );
+}
+
+#[test]
+fn dispatcher_forwarding_routes_declare_the_cluster_timeouts() {
+    use std::time::Duration;
+
+    let registry = RecordingOpenApiRegistry::default();
+    let _router = register_dispatcher_routes(Router::new(), &registry);
+
+    // A cluster publish crosses two gateways, so the dispatcher's outer
+    // deadline (75s) must exceed the upstream ingest deadline (60s).
+    let dispatcher_publish =
+        RouteTimeout::Custom(Duration::from_secs(DISPATCHER_PUBLISH_ROUTE_TIMEOUT_SECS));
+    assert_eq!(
+        declared_timeout(&registry, "/event-broker/v1/events"),
+        dispatcher_publish
+    );
+    assert_eq!(
+        declared_timeout(&registry, "/event-broker/v1/events:batch"),
+        dispatcher_publish
+    );
+
+    // Forwarded streaming routes stay deadline-free, as on the ingest/delivery
+    // hosts themselves.
+    assert_eq!(
+        declared_timeout(&registry, "/event-broker/v1/events:stream"),
+        RouteTimeout::Disabled
+    );
+    assert_eq!(
+        declared_timeout(&registry, "/event-broker/v1/events:sse"),
+        RouteTimeout::Disabled
+    );
+}
 
 #[test]
 fn the_single_publish_route_declares_its_full_response_list() {

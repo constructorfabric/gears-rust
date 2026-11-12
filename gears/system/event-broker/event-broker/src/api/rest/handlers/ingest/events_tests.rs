@@ -255,7 +255,7 @@ async fn publish_event_prefer_wait_beyond_u64_saturates_to_the_cap() {
         resp.headers()
             .get("preference-applied")
             .map(|v| v.to_str().unwrap()),
-        Some("wait=20"),
+        Some("wait=50"),
         "a wait beyond u64 saturates and clamps to the cap"
     );
 }
@@ -340,7 +340,7 @@ async fn publish_event_prefer_wait_above_the_cap_clamps_and_reports_the_applied_
         .post_events()
         .with_header(
             axum::http::header::HeaderName::from_static("prefer"),
-            // Far above the default 20s ceiling.
+            // Far above the default 50s ceiling.
             axum::http::HeaderValue::from_static("wait=99999"),
         )
         .with_body(Json(&json!({
@@ -360,7 +360,7 @@ async fn publish_event_prefer_wait_above_the_cap_clamps_and_reports_the_applied_
         resp.headers()
             .get("preference-applied")
             .map(|v| v.to_str().unwrap()),
-        Some("wait=20"),
+        Some("wait=50"),
         "the applied wait is the cap, not the requested 99999"
     );
 }
@@ -399,7 +399,7 @@ async fn publish_event_prefer_bare_wait_uses_the_cap() {
         resp.headers()
             .get("preference-applied")
             .map(|v| v.to_str().unwrap()),
-        Some("wait=20")
+        Some("wait=50")
     );
 }
 

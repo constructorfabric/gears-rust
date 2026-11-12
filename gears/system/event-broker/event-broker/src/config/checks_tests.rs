@@ -229,6 +229,26 @@ fn an_ingest_mode_accepts_the_publish_wait_cap_and_zero() {
     }
 }
 
+/// The ordering that keeps a synchronous publish from being answered `504`
+/// after it already committed: the hold cap stays below the ingest publish
+/// deadline (so the broker never holds past it), which stays below the
+/// dispatcher's outer deadline (so a two-gateway cluster publish is bounded,
+/// not cut). Inverting either relationship reopens that window, so it is pinned
+/// at compile time.
+#[test]
+fn the_publish_deadlines_keep_the_hold_inside_the_declared_route_deadlines() {
+    const {
+        assert!(
+            (super::MAX_PUBLISH_WAIT_SECS as u64) < super::PUBLISH_ROUTE_TIMEOUT_SECS,
+            "the hold cap must stay below the ingest publish route deadline",
+        );
+        assert!(
+            super::PUBLISH_ROUTE_TIMEOUT_SECS < super::DISPATCHER_PUBLISH_ROUTE_TIMEOUT_SECS,
+            "the dispatcher's outer deadline must exceed the ingest publish deadline",
+        );
+    }
+}
+
 /// The cap binds the ingest-serving modes only: `cluster_delivery` never
 /// enqueues, so it carries the `publish` section without being subject to the
 /// rule.

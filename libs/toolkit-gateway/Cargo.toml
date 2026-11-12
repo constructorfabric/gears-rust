@@ -28,6 +28,8 @@ http = { workspace = true }
 # Distinguish a body-size-limit failure (`LengthLimitError`) from a client
 # stream read error when buffering the proxied request body.
 http-body-util = { workspace = true }
+# Parse `x-toolkit-request-timeout` humantime duration strings.
+humantime = { workspace = true }
 thiserror = { workspace = true }
 # `OpenApi` document type accepted by `register_routes`.
 utoipa = { workspace = true }

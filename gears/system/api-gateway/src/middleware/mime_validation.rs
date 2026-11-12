@@ -143,7 +143,7 @@ pub async fn mime_validation_middleware(
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
-    use toolkit::api::operation_builder::VendorExtensions;
+    use toolkit::api::operation_builder::{RouteTimeout, VendorExtensions};
 
     #[test]
     fn test_build_mime_validation_map() {
@@ -170,6 +170,7 @@ mod tests {
             auth: toolkit::api::RouteAuth::Anonymous,
             exposed: false,
             license_requirement: None,
+            request_timeout: RouteTimeout::Inherit,
             throttling: None,
             allowed_request_content_types: Some(vec!["multipart/form-data", "application/pdf"]),
             vendor_extensions: VendorExtensions::default(),

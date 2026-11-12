@@ -12,7 +12,6 @@ use arc_swap::ArcSwap;
 use dashmap::DashMap;
 
 use anyhow::Result;
-use axum::error_handling::HandleErrorLayer;
 use axum::http::Method;
 use axum::middleware::from_fn_with_state;
 use axum::{Extension, Router, extract::DefaultBodyLimit, middleware::from_fn, routing::get};
@@ -22,36 +21,12 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use toolkit::api::{OpenApiRegistry, OpenApiRegistryImpl, RouteAuth};
 use toolkit::lifecycle::ReadySignal;
-use tower::{BoxError, ServiceBuilder};
 use tower_http::{
     catch_panic::CatchPanicLayer,
     limit::RequestBodyLimitLayer,
     request_id::{PropagateRequestIdLayer, SetRequestIdLayer},
 };
 use tracing::debug;
-
-use crate::middleware::errors::ApiGatewayGatewayError;
-
-/// Map a `tower::timeout` `Elapsed` (or any other unexpected `BoxError`)
-/// into a canonical `application/problem+json` response.
-fn timeout_to_canonical(err: &BoxError, timeout: Duration) -> axum::response::Response {
-    use axum::response::IntoResponse;
-
-    if err.is::<tower::timeout::error::Elapsed>() {
-        let canonical = ApiGatewayGatewayError::deadline_exceeded(format!(
-            "Request exceeded {} timeout",
-            humantime_serde::re::humantime::format_duration(timeout)
-        ))
-        .create();
-        return canonical.into_response();
-    }
-
-    let canonical = toolkit_canonical_errors::CanonicalError::internal(format!(
-        "request pipeline error: {err}"
-    ))
-    .create();
-    canonical.into_response()
-}
 
 use authn_resolver_sdk::AuthNResolverClient;
 
@@ -447,7 +422,8 @@ impl ApiGateway {
         // Fail fast on invalid throttling configuration (undefined zone refs, zero limits, etc.).
         config.validate_throttling()?;
 
-        // Collect specs once; used by MIME validation + throttling maps.
+        // Collect specs once; used by MIME validation, throttling, and
+        // per-route timeout maps.
         let specs: Vec<_> = self
             .openapi_registry
             .operation_specs
@@ -597,18 +573,25 @@ impl ApiGateway {
         router = router.layer(RequestBodyLimitLayer::new(config.defaults.body_limit_bytes));
         router = router.layer(DefaultBodyLimit::max(config.defaults.body_limit_bytes));
 
-        // 6) Timeout (`defaults.request_timeout`) — emits canonical
-        //    `deadline_exceeded` Problem with `application/problem+json` body
-        //    when the inner service exceeds the deadline. Layer position is
-        //    unchanged (between BodyLimit and CatchPanic).
-        let request_timeout = config.defaults.request_timeout;
-        router = router.layer(
-            ServiceBuilder::new()
-                .layer(HandleErrorLayer::new(move |err: BoxError| {
-                    std::future::ready(timeout_to_canonical(&err, request_timeout))
-                }))
-                .timeout(request_timeout),
-        );
+        // 6) Timeout — per-route resolution of `defaults.request_timeout`:
+        //    operations declaring `.request_timeout(..)` or
+        //    `.no_request_timeout()` override the default, and proxied routes
+        //    inherit the deadline their upstream gear published. Emits a
+        //    canonical `deadline_exceeded` Problem with an
+        //    `application/problem+json` body when the deadline expires. Layer
+        //    position is unchanged (between BodyLimit and CatchPanic).
+        router = router.layer(from_fn_with_state(
+            middleware::request_timeout::build_request_timeout_state(
+                &specs,
+                config.defaults.request_timeout,
+                config.defaults.max_request_timeout,
+                config
+                    .gateway_proxy
+                    .enabled
+                    .then(|| Arc::clone(&self.proxy_registry)),
+            ),
+            middleware::request_timeout::request_timeout_middleware,
+        ));
 
         // 5) CatchPanic (converts panics to 500 before metrics sees them)
         router = router.layer(CatchPanicLayer::new());

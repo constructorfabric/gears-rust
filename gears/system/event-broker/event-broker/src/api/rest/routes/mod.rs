@@ -21,7 +21,10 @@
 
 use axum::Router;
 use axum::http::StatusCode;
+use std::time::Duration;
 use toolkit::api::{OpenApiRegistry, OperationBuilder, ResponseSpec};
+
+use crate::config::checks::{DISPATCHER_PUBLISH_ROUTE_TIMEOUT_SECS, PUBLISH_ROUTE_TIMEOUT_SECS};
 
 use crate::api::rest::handlers::delivery::consumer_groups as consumer_groups_h;
 use crate::api::rest::handlers::delivery::dto as delivery_dto;
@@ -132,6 +135,7 @@ pub fn register_ingest_routes(mut router: Router, openapi: &dyn OpenApiRegistry)
         .tag(INGEST_API_TAG)
         .authenticated()
         .no_license_required()
+        .request_timeout(Duration::from_secs(PUBLISH_ROUTE_TIMEOUT_SECS))
         .param(prefer_wait_param())
         .json_request::<ingest_dto::PublishEventRequest>(openapi, "Event to publish")
         .handler(ingest_h::publish_event)
@@ -187,6 +191,7 @@ pub fn register_ingest_routes(mut router: Router, openapi: &dyn OpenApiRegistry)
         .tag(INGEST_API_TAG)
         .authenticated()
         .no_license_required()
+        .request_timeout(Duration::from_secs(PUBLISH_ROUTE_TIMEOUT_SECS))
         .param(prefer_wait_param())
         .json_request::<ingest_dto::PublishBatchRequest>(openapi, "Batch of events to publish")
         .handler(ingest_h::publish_batch)
@@ -431,6 +436,7 @@ pub fn register_delivery_routes(mut router: Router, openapi: &dyn OpenApiRegistr
         .query_param("subscription", true, "Subscription id")
         .authenticated()
         .no_license_required()
+        .no_request_timeout()
         .handler(delivery_h::stream_events)
         .text_response(
             StatusCode::OK,
@@ -464,6 +470,7 @@ pub fn register_delivery_routes(mut router: Router, openapi: &dyn OpenApiRegistr
         .query_param("subscription", true, "Subscription id")
         .authenticated()
         .no_license_required()
+        .no_request_timeout()
         .handler(delivery_h::sse_events)
         .sse_json::<delivery_dto::FrameDto>(openapi, "Long-lived text/event-stream of frames")
         .problem_response(
@@ -795,6 +802,7 @@ fn register_ingest_forwarding_routes(mut router: Router, openapi: &dyn OpenApiRe
         .tag(INGEST_TAG)
         .authenticated()
         .no_license_required()
+        .request_timeout(Duration::from_secs(DISPATCHER_PUBLISH_ROUTE_TIMEOUT_SECS))
         .handler(proxy::handle)
         .response(proxied_response(axum::http::StatusCode::OK))
         .problem_response(
@@ -813,6 +821,7 @@ fn register_ingest_forwarding_routes(mut router: Router, openapi: &dyn OpenApiRe
         .tag(INGEST_TAG)
         .authenticated()
         .no_license_required()
+        .request_timeout(Duration::from_secs(DISPATCHER_PUBLISH_ROUTE_TIMEOUT_SECS))
         .handler(proxy::handle)
         .response(proxied_response(axum::http::StatusCode::OK))
         .problem_response(
@@ -900,6 +909,7 @@ fn register_delivery_forwarding_routes(
         .tag(DELIVERY_TAG)
         .authenticated()
         .no_license_required()
+        .no_request_timeout()
         .handler(router::handle)
         .response(proxied_response(axum::http::StatusCode::OK))
         .standard_errors(openapi)
@@ -913,6 +923,7 @@ fn register_delivery_forwarding_routes(
         .tag(DELIVERY_TAG)
         .authenticated()
         .no_license_required()
+        .no_request_timeout()
         .handler(router::handle)
         .response(proxied_response(axum::http::StatusCode::OK))
         .standard_errors(openapi)

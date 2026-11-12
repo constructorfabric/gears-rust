@@ -536,8 +536,8 @@ async fn a_persisted_publish_answered_202_is_reported_as_accepted() {
 
 // The client timeout is the caller's wait budget plus the processing margin, so
 // the final `201`/`202` always outlasts the broker's hold. There is no ceiling:
-// the timeout tracks sync_wait, so it adapts to whatever hold the server (and,
-// later, a per-route gateway deadline, #4752) allows.
+// the timeout tracks sync_wait, so it adapts to whatever hold the server (and
+// the per-route gateway deadline on the publish routes) allows.
 #[test]
 fn request_timeout_is_the_wait_plus_a_margin() {
     assert_eq!(
