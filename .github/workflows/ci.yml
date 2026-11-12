@@ -98,6 +98,9 @@ jobs:
               - 'deploy/components.yaml'
               - 'tools/scripts/resolve_release.py'
               - 'tools/scripts/tests/test_resolve_release.py'
+              # Release tag backfill script run by release-plz.yml, and its tests.
+              - 'tools/scripts/backfill_release_tags.py'
+              - 'tools/scripts/tests/test_backfill_release_tags.py'
               # Input to `e2e_sidecar_pins_the_same_timescaledb_image` in
               # libs/test-containers: a Python-only edit to the E2E sidecar must
               # still get the cross-lane TimescaleDB pin checked, or the guard
@@ -310,6 +313,9 @@ jobs:
 
       - name: Release resolver tests (resolve_release.py + components.yaml)
         run: make check-release-resolver
+
+      - name: Release tag backfill tests (backfill_release_tags.py)
+        run: python3 -m unittest discover -s tools/scripts/tests -p test_backfill_release_tags.py
 
   test:
     # test-report.yml looks for this name followed by ` / nextest`.

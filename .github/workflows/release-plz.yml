@@ -158,14 +158,17 @@ jobs:
 
       # release-plz tags through the REST API after publishing. If that call is rate
       # limited the crate is published but untagged, and later runs skip it as "already
-      # published", so the tag would never appear. Runs even when release-plz failed.
+      # published", so the tag would never appear. Runs even when release-plz failed (but not
+      # when it never ran, e.g. a setup failure). A backfill failure must not skip the
+      # publish planning that follows, hence continue-on-error; the script emits ::error::.
       # Pushes over git transport, which the REST API rate limit does not cover.
       # Uses the same token as the release-plz step above.
       - name: Backfill missing release tags
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.release-plz.outcome != 'skipped' }}
+        continue-on-error: true
         env:
           GITHUB_TOKEN: ${{ steps.app.outputs.token || secrets.GITHUB_TOKEN }}
-        run: python3 -I scripts/ci/backfill_release_tags.py
+        run: python3 -I tools/scripts/backfill_release_tags.py
 
       - name: Disk report (post-mortem)
         if: always()
