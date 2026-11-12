@@ -1423,33 +1423,63 @@ jobs:
           # each pass means a report found after a failure is the failing
           # pass's own, never an earlier pass's.
           fresh_report() { rm -f target/nextest/ci/junit.xml llvm-cov-target/nextest/ci/junit.xml; }
+          # Fold the raw profiles into one file. cargo-llvm-cov points
+          # LLVM_PROFILE_FILE at `...-%p-%10m.profraw` and ignores an override
+          # from the environment, so every test process (nextest runs one per
+          # test) leaves its own file: ~32k files, ~17 GiB after pass 1, which
+          # together with the instrumented build exhausted the runner's disk
+          # ("No space left on device") before the last pass. Merged and
+          # sparse they take tens of MiB, and `report` reads the merged file
+          # like any other profile. Originals are removed only when the merge
+          # succeeded.
+          compact_profraw() {
+            local pd list out=llvm-cov-target/merged.profraw.tmp
+            pd="$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | sed -n 's/^host: //p')/bin/llvm-profdata"
+            list="$RUNNER_TEMP/profraw.list"
+            find llvm-cov-target llvm-cov-build -name '*.profraw' 2>/dev/null > "$list" || true
+            [ -s "$list" ] || return 0
+            if "$pd" merge -sparse -f "$list" -o "$out"; then
+              xargs -d '\n' rm -f < "$list"
+              mv "$out" llvm-cov-target/merged.profraw
+            else
+              echo "::warning::profraw merge failed; keeping the unmerged files"
+              rm -f "$out"
+            fi
+          }
           "$W" cargo llvm-cov clean --workspace
           # Pass 1: whole workspace, default features. Accumulate, don't report.
           fresh_report
           "$W" cargo llvm-cov nextest --workspace --no-report
           # Pass 2: redis-cluster-plugin integration suites (real Redis via
           # testcontainers).
+          compact_profraw
           fresh_report
           "$W" cargo llvm-cov nextest --no-report -p cf-redis-cluster-plugin --features integration --retries 1
           # Pass 3: postgres-cluster-plugin integration suites (real Postgres
           # via testcontainers).
+          compact_profraw
           fresh_report
           "$W" cargo llvm-cov nextest --no-report -p cf-postgres-cluster-plugin --features integration --retries 1
           # Pass 4: k8s-cluster-plugin k3s suites (cargo test: no JUnit).
+          compact_profraw
           fresh_report
           "$W" make coverage-cluster-k8s
           # Pass 5: durable-execution PostgreSQL and subprocess recovery suites
           # (cargo test: no JUnit).
+          compact_profraw
           fresh_report
           "$W" make coverage-durable-execution-pg
           # Pass 6: OAGW with the `cluster` feature.
+          compact_profraw
           fresh_report
           "$W" cargo llvm-cov nextest --no-report -p cf-gears-oagw --features cluster
           # Pass 7: quota-enforcement storage plugin PostgreSQL suites (real
           # Postgres via testcontainers).
+          compact_profraw
           fresh_report
           "$W" cargo llvm-cov nextest --no-report -p cf-gears-quota-enforcement-storage-plugin --features postgres
           # Merge into the single report that gets uploaded.
+          compact_profraw
           cargo llvm-cov report --lcov --output-path lcov.info
 
       # The passes stop at the first failing one and each starts without a
