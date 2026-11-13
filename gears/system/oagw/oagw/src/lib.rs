@@ -4,6 +4,9 @@ pub use oagw_sdk::{
     UpdateRouteRequest, UpdateUpstreamRequest, Upstream, api::ServiceGatewayClientV1,
 };
 
+// === GTS DECLARATIONS ===
+toolkit_gts::declare_gts_inventory!();
+
 // === MODULE DEFINITION ===
 pub mod gear;
 pub use gear::OutboundApiGatewayGear;

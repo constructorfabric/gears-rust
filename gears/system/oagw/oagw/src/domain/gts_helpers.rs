@@ -14,18 +14,26 @@ use uuid::Uuid;
 // impl crate share a single source of truth for the wire `resource_type`
 // strings. `PROTOCOL_SCHEMA` stays local because it identifies a config
 // type, not an error scope, and never appears in the SDK error surface.
+//
+// `domain::type_catalog` declares every built-in entity with literal
+// identifiers (the declaration macros need literals); its tests pin them to
+// these constants. A constant no runtime path names is `cfg(test)`.
+#[cfg(test)]
+pub use oagw_sdk::gts::PROXY_SCHEMA;
 pub use oagw_sdk::gts::{
-    AUTH_PLUGIN_SCHEMA, GUARD_PLUGIN_SCHEMA, PROXY_SCHEMA, ROUTE_SCHEMA, TRANSFORM_PLUGIN_SCHEMA,
-    UPSTREAM_SCHEMA,
+    AUTH_PLUGIN_SCHEMA, GUARD_PLUGIN_SCHEMA, ROUTE_SCHEMA, TRANSFORM_PLUGIN_SCHEMA, UPSTREAM_SCHEMA,
 };
 
 /// GTS schema identifier of the protocol config type (not an error scope, so it is not re-exported from the SDK).
+#[cfg(test)]
 pub const PROTOCOL_SCHEMA: &str = gts_id!("cf.core.oagw.protocol.v1~");
 
 // -- Builtin protocol instances --
 /// GTS instance ID of the built-in HTTP protocol.
+#[cfg(test)]
 pub const HTTP_PROTOCOL_ID: &str = gts_id!("cf.core.oagw.protocol.v1~cf.core.oagw.http.v1");
 /// GTS instance ID of the built-in gRPC protocol.
+#[cfg(test)]
 pub const GRPC_PROTOCOL_ID: &str = gts_id!("cf.core.oagw.protocol.v1~cf.core.oagw.grpc.v1");
 
 // -- Builtin auth plugin instances --
@@ -35,8 +43,10 @@ pub const NOOP_AUTH_PLUGIN_ID: &str = gts_id!("cf.core.oagw.auth_plugin.v1~cf.co
 pub const APIKEY_AUTH_PLUGIN_ID: &str =
     gts_id!("cf.core.oagw.auth_plugin.v1~cf.core.oagw.apikey.v1");
 /// GTS instance ID of the built-in HTTP Basic auth plugin.
+#[cfg(test)]
 pub const BASIC_AUTH_PLUGIN_ID: &str = gts_id!("cf.core.oagw.auth_plugin.v1~cf.core.oagw.basic.v1");
 /// GTS instance ID of the built-in Bearer-token auth plugin.
+#[cfg(test)]
 pub const BEARER_AUTH_PLUGIN_ID: &str =
     gts_id!("cf.core.oagw.auth_plugin.v1~cf.core.oagw.bearer.v1");
 /// GTS instance ID of the built-in OAuth2 client-credentials auth plugin (credentials in the request body).
@@ -54,9 +64,11 @@ pub const OAUTH2_CLIENT_CRED_PRIVATE_KEY_JWT_AUTH_PLUGIN_ID: &str =
 
 // -- Builtin guard plugin instances --
 /// GTS instance ID of the built-in request-timeout guard plugin.
+#[cfg(test)]
 pub const TIMEOUT_GUARD_PLUGIN_ID: &str =
     gts_id!("cf.core.oagw.guard_plugin.v1~cf.core.oagw.timeout.v1");
 /// GTS instance ID of the built-in CORS guard plugin.
+#[cfg(test)]
 pub const CORS_GUARD_PLUGIN_ID: &str = gts_id!("cf.core.oagw.guard_plugin.v1~cf.core.oagw.cors.v1");
 /// GTS instance ID of the built-in required-headers guard plugin.
 pub const REQUIRED_HEADERS_GUARD_PLUGIN_ID: &str =
@@ -64,9 +76,11 @@ pub const REQUIRED_HEADERS_GUARD_PLUGIN_ID: &str =
 
 // -- Builtin transform plugin instances --
 /// GTS instance ID of the built-in logging transform plugin.
+#[cfg(test)]
 pub const LOGGING_TRANSFORM_PLUGIN_ID: &str =
     gts_id!("cf.core.oagw.transform_plugin.v1~cf.core.oagw.logging.v1");
 /// GTS instance ID of the built-in metrics transform plugin.
+#[cfg(test)]
 pub const METRICS_TRANSFORM_PLUGIN_ID: &str =
     gts_id!("cf.core.oagw.transform_plugin.v1~cf.core.oagw.metrics.v1");
 /// GTS instance ID of the built-in request-ID transform plugin.

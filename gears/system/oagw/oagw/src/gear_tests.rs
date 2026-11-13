@@ -52,6 +52,7 @@ use crate::domain::type_provisioning::{ProvisionedRoute, ProvisionedUpstream};
 use crate::infra::proxy_cache::testing::{ClusterFixture, ScriptedCache, facade, read_log, until};
 use crate::infra::storage::testing::SqliteFile;
 use toolkit::contracts::RunnableCapability;
+use toolkit::gts_publication::GtsPublicationCapability;
 
 const NO_HANDLE_MESSAGE: &str = "gears.oagw.database is configured but no database is available";
 const MEMORY_WARNING: &str = "upstreams and routes are kept in memory and lost on restart";
@@ -212,6 +213,25 @@ fn context_under(
     hub: Arc<ClientHub>,
     root: tokio_util::sync::CancellationToken,
 ) -> GearCtx {
+    let manifest = Arc::new(manifest(&section));
+    unpublished_context(section, db, hub, root).with_gts_publication_manifest_for_test(manifest)
+}
+
+/// The publication manifest the runtime builds for `section`.
+fn manifest(section: &Value) -> toolkit::gts_publication::GtsManifest {
+    OutboundApiGatewayGear::default()
+        .descriptor()
+        .build_gts_manifest(&FixedConfig(section.clone()))
+        .expect("the OAGW manifest builds")
+}
+
+/// As [`context_under`], without the admitted manifest the runtime attaches.
+fn unpublished_context(
+    section: Value,
+    db: Option<Db>,
+    hub: Arc<ClientHub>,
+    root: tokio_util::sync::CancellationToken,
+) -> GearCtx {
     crate::domain::test_support::ensure_crypto_provider();
     let ctx = GearCtx::new(
         OutboundApiGatewayGear::MODULE_NAME,
@@ -253,6 +273,52 @@ fn assert_warned_once_about_memory(lines: &[&str]) -> Result<(), String> {
         return Err("a database was reported without one".to_owned());
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// GTS publication
+// ---------------------------------------------------------------------------
+
+/// The runtime publishes the OAGW catalog before `init`: the manifest is the
+/// catalog, under the gear's name and version.
+#[test]
+fn the_manifest_is_the_oagw_catalog() {
+    let manifest = manifest(&json!({ "config": {} }));
+
+    let expected: Vec<(gts::GtsId, Value)> = crate::gts_declarations()
+        .into_iter()
+        .map(|(id, text)| {
+            (
+                gts::GtsId::try_new(&id).unwrap(),
+                serde_json::from_str(&text).unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(manifest.documents(), expected.as_slice());
+    assert_eq!(expected.len(), 23, "7 Type Schemas and 16 Instances");
+    assert_eq!(manifest.publisher_name(), "oagw");
+    assert_eq!(manifest.publisher_version(), env!("CARGO_PKG_VERSION"));
+}
+
+/// Outside the runtime — without an admitted manifest — `init` fails before
+/// serving anything.
+#[tokio::test]
+async fn init_without_an_admitted_manifest_fails() {
+    let hub = wired_hub();
+    let ctx = unpublished_context(
+        json!({ "config": {} }),
+        None,
+        Arc::clone(&hub),
+        Default::default(),
+    );
+
+    let err = init(&ctx).await.err().expect("init refuses");
+
+    assert!(
+        format!("{err:#}").contains("admitted GTS manifest"),
+        "{err:#}"
+    );
+    assert!(hub.get::<dyn ServiceGatewayClientV1>().is_err());
 }
 
 // ---------------------------------------------------------------------------
