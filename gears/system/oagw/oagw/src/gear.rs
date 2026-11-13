@@ -16,7 +16,6 @@ use sea_orm_migration::MigrationTrait;
 use tenant_resolver_sdk::TenantResolverClient;
 use tokio_util::sync::CancellationToken;
 use toolkit::api::OpenApiRegistry;
-#[cfg(feature = "cluster")]
 use toolkit::client_hub::ClientHub;
 use toolkit::contracts::RunnableCapability;
 use toolkit::{
@@ -25,7 +24,7 @@ use toolkit::{
 };
 use toolkit_db::DBProvider;
 use tracing::{Instrument, error, info, info_span, warn};
-use types_registry_sdk::TypesRegistryClient;
+use types_registry_sdk::PlatformTypesRegistryApi;
 
 use crate::api::rest::routes;
 use crate::domain::ports::OagwMetricsPort;
@@ -69,15 +68,18 @@ pub struct AppState {
 
 /// Outbound API Gateway gear: wires repos, services, and routes.
 #[toolkit::consumes(contract = authz_resolver_sdk::AuthZResolverApi, from = "authz-resolver")]
+#[toolkit::consumes(contract = types_registry_sdk::PlatformTypesRegistryApi, from = "types-registry")]
 #[toolkit::gear(
     name = "oagw",
-    deps = [types_registry, credstore, tenant_resolver],
+    deps = [credstore, tenant_resolver],
     capabilities = [db, rest, stateful],
     gts_publication(crates = [crate]),
 )]
 pub struct OutboundApiGatewayGear {
     state: arc_swap::ArcSwapOption<AppState>,
-    registry_client: OnceLock<Arc<dyn TypesRegistryClient>>,
+    /// The hub `init` ran with: the consumed registry client is wired into it
+    /// after `init`, before `post_init`.
+    hub: OnceLock<Arc<ClientHub>>,
     tenant_resolver: OnceLock<Arc<dyn TenantResolverClient>>,
     type_provisioning: OnceLock<Arc<dyn TypeProvisioningService>>,
     registry_provisioner: OnceLock<Arc<dyn RegistryProvisioner>>,
@@ -137,7 +139,7 @@ impl Default for OutboundApiGatewayGear {
     fn default() -> Self {
         Self {
             state: arc_swap::ArcSwapOption::from(None),
-            registry_client: OnceLock::new(),
+            hub: OnceLock::new(),
             tenant_resolver: OnceLock::new(),
             type_provisioning: OnceLock::new(),
             registry_provisioner: OnceLock::new(),
@@ -453,14 +455,9 @@ impl Gear for OutboundApiGatewayGear {
         ctx.client_hub()
             .register::<dyn ServiceGatewayClientV1>(oagw.clone());
 
-        // -- Types Registry --
-        // The provisioning reader still lists the legacy catalogue (T38b);
-        // the global declaration inventory seeds the catalog there too.
-        let registry = ctx.client_hub().get::<dyn TypesRegistryClient>()?;
-
-        self.registry_client
-            .set(registry)
-            .map_err(|_| anyhow::anyhow!("TypesRegistryClient already set"))?;
+        self.hub
+            .set(ctx.client_hub())
+            .map_err(|_| anyhow::anyhow!("client hub already set"))?;
 
         self.tenant_resolver
             .set(tenant_resolver)
@@ -492,11 +489,14 @@ impl OutboundApiGatewayGear {
     /// group initialized, for `start`'s background task; in memory, also
     /// reconcile once now.
     async fn prepare_registry_provisioning(&self) -> anyhow::Result<()> {
+        // The platform registry API is a consumed contract, wired after
+        // `init` (locally or remotely).
         let registry = self
-            .registry_client
+            .hub
             .get()
-            .ok_or_else(|| anyhow::anyhow!("TypesRegistryClient not set — init() must run first"))?
-            .clone();
+            .ok_or_else(|| anyhow::anyhow!("client hub not set — init() must run first"))?
+            .get::<dyn PlatformTypesRegistryApi>()
+            .context("oagw: types-registry platform client unavailable")?;
 
         let tenant_resolver = self
             .tenant_resolver

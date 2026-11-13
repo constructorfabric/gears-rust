@@ -76,8 +76,7 @@ url = { workspace = true }
 gts = { workspace = true }
 schemars = { workspace = true }
 utoipa = { workspace = true }
-types-registry-sdk = { workspace = true }
-types-registry = { workspace = true }
+types-registry-sdk = { workspace = true, features = ["rest-client"] }
 authz-resolver-sdk = { workspace = true, features = ["rest-client"] }
 tenant-resolver-sdk = { workspace = true }
 tenant-resolver = { workspace = true }
@@ -128,6 +127,8 @@ credstore-sdk = { workspace = true, features = ["test-util"] }
 toolkit = { workspace = true, features = ["bootstrap", "test-support"] }
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
 types-registry-sdk = { workspace = true, features = ["test-util"] }
+# The real registry, for managed admission of the OAGW catalog.
+types-registry = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time", "net", "test-util"] }
 tower = { workspace = true, features = ["util"] }
 hyper = { workspace = true }

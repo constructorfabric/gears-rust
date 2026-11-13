@@ -1,11 +1,19 @@
 """Shared helpers for OAGW E2E tests."""
-import json
+import os
 import re
 import uuid
-from pathlib import Path
 from typing import Optional
 
 import httpx
+
+from ..types_registry.helpers import (
+    PLATFORM_API,
+    RECEIPT,
+    get_entity,
+    gts_uuid,
+    submit_and_poll,
+    walk,
+)
 
 # ---------------------------------------------------------------------------
 # OAGW GTS type catalog — mirrors the Rust catalog in domain/type_catalog.rs
@@ -15,10 +23,15 @@ import httpx
 UPSTREAM_SCHEMA = "gts.cf.core.oagw.upstream.v1~"
 ROUTE_SCHEMA = "gts.cf.core.oagw.route.v1~"
 
-# The sqlite profile's post-startup entities (registry-fixtures.json).
-REGISTRY_UPSTREAM_ID = f"{UPSTREAM_SCHEMA}5e0a1900-0000-4000-8000-000000000001"
-REGISTRY_ROUTE_ID = f"{ROUTE_SCHEMA}5e0a1900-0000-4000-8000-000000000002"
-BARE_UUID_ROUTE_ID = f"{ROUTE_SCHEMA}5e0a1900-0000-4000-8000-000000000003"
+# The sqlite profile's post-startup registry instances (`registry_fixtures`),
+# and the OAGW resource IDs of the rows provisioned from them: a row's ID is
+# its instance's registry UUID.
+REGISTRY_UPSTREAM_GTS_ID = f"{UPSTREAM_SCHEMA}cf.e2e.oagw.registry_upstream.v1"
+REGISTRY_ROUTE_GTS_ID = f"{ROUTE_SCHEMA}cf.e2e.oagw.registry_route.v1"
+BARE_UUID_ROUTE_GTS_ID = f"{ROUTE_SCHEMA}cf.e2e.oagw.bare_uuid_route.v1"
+REGISTRY_UPSTREAM_ID = f"{UPSTREAM_SCHEMA}{gts_uuid(REGISTRY_UPSTREAM_GTS_ID)}"
+REGISTRY_ROUTE_ID = f"{ROUTE_SCHEMA}{gts_uuid(REGISTRY_ROUTE_GTS_ID)}"
+BARE_UUID_ROUTE_ID = f"{ROUTE_SCHEMA}{gts_uuid(BARE_UUID_ROUTE_GTS_ID)}"
 PROTOCOL_SCHEMA = "gts.cf.core.oagw.protocol.v1~"
 AUTH_PLUGIN_SCHEMA = "gts.cf.core.oagw.auth_plugin.v1~"
 GUARD_PLUGIN_SCHEMA = "gts.cf.core.oagw.guard_plugin.v1~"
@@ -72,42 +85,79 @@ OAGW_INSTANCES = [
 ALL_OAGW_GTS_IDS = OAGW_SCHEMAS + OAGW_INSTANCES
 
 
-def seed_legacy_registry_fixtures(client: httpx.Client, base_url: str, headers: dict) -> None:
-    """Publish SQLite fixtures after OAGW registers its legacy schemas in init.
+def registry_fixtures() -> list[tuple[str, dict]]:
+    """The sqlite profile's upstream and two routes, as `(GTS ID, body)`.
 
-    Until T38 migrates OAGW, its provisioner requires UUID-tail identities and
-    reads the legacy catalogue. Managed admission forbids those identities, so
-    these fixtures cannot be registry startup seeds. This is explicit legacy
-    setup, never a fallback from a failed managed publication.
+    One route names its upstream by instance identifier, the other by the
+    bare UUID of the row provisioned from it.
     """
-    entities = json.loads(Path(__file__).with_name("registry-fixtures.json").read_text())
-    response = client.post(
-        f"{base_url}/types-registry/v1/entities", headers=headers, json={"entities": entities}
-    )
-    response.raise_for_status()
-    result = response.json()
-    summary = result.get("summary", {})
-    if summary.get("succeeded") != len(entities) or summary.get("failed") != 0:
-        raise RuntimeError(f"OAGW registry fixture registration failed: {result}")
+    return [
+        (
+            REGISTRY_UPSTREAM_GTS_ID,
+            {
+                "id": REGISTRY_UPSTREAM_GTS_ID,
+                "alias": "e2e-registry-upstream",
+                "server": {"endpoints": [{"host": "127.0.0.1", "port": 19876, "scheme": "http"}]},
+                "protocol": HTTP_PROTOCOL_ID,
+                "tags": ["e2e-registry"],
+            },
+        ),
+        (
+            REGISTRY_ROUTE_GTS_ID,
+            {
+                "id": REGISTRY_ROUTE_GTS_ID,
+                "upstream_id": REGISTRY_UPSTREAM_GTS_ID,
+                "match": {"http": {"methods": ["GET"], "path": "/v1/models"}},
+                "tags": ["e2e-registry"],
+            },
+        ),
+        (
+            BARE_UUID_ROUTE_GTS_ID,
+            {
+                "id": BARE_UUID_ROUTE_GTS_ID,
+                "upstream_id": gts_uuid(REGISTRY_UPSTREAM_GTS_ID),
+                "match": {"http": {"methods": ["GET"], "path": "/v1/bare-uuid"}},
+            },
+        ),
+    ]
 
 
-async def list_oagw_types(
-    client: httpx.AsyncClient,
-    base_url: str,
-    headers: dict,
-) -> list[dict]:
-    """List all OAGW entities registered in the types-registry via REST API.
+def platform_headers() -> dict:
+    """The types registry's platform plane: the internal token alone."""
+    return {"X-ToolKit-Internal-Token": os.getenv("E2E_INTERNAL_TOKEN", "e2e-internal-token")}
 
-    Queries with namespace=oagw to scope to OAGW entities.
-    Returns the list of entity dicts from the response.
-    """
-    resp = await client.get(
-        f"{base_url}/types-registry/v1/entities",
-        headers=headers,
-        params={"namespace": "oagw"},
-    )
-    resp.raise_for_status()
-    return resp.json().get("entities", [])
+
+async def publish_registry_fixtures(base_url: str) -> None:
+    """Publish `registry_fixtures` through the platform API and wait for
+    admission. An existing instance is revised at its current version, so
+    runs sharing a registry database republish the same content."""
+    async with httpx.AsyncClient(
+        base_url=base_url.rstrip("/") + "/", headers=platform_headers(), timeout=10.0
+    ) as platform:
+        candidates = []
+        for gts_id, content in registry_fixtures():
+            candidate = {"gts_id": gts_id, "content": content}
+            current = await get_entity(platform, PLATFORM_API, gts_id, select="origin")
+            if current.status_code == 200:
+                candidate["expected_resource_version"] = current.json()["origin"]["resource_version"]
+            else:
+                assert current.status_code == 404, f"read of '{gts_id}': {current.status_code} {current.text}"
+            candidates.append(candidate)
+        operation = await submit_and_poll(platform, PLATFORM_API, candidates, RECEIPT)
+    refused = [i for i in operation["items"] if i["status"] not in ("succeeded", "unchanged")]
+    assert not refused, f"the types registry refused OAGW fixtures: {refused}"
+
+
+async def list_oagw_types(base_url: str) -> list[dict]:
+    """Every active OAGW entity in the types registry, through paged platform
+    discovery (`gts_id`, `kind`, ...)."""
+    async with httpx.AsyncClient(
+        base_url=base_url.rstrip("/") + "/", headers=platform_headers(), timeout=10.0
+    ) as platform:
+        pages = await walk(
+            platform, PLATFORM_API, {"pattern": "gts.cf.core.oagw.*", "limit": 100}
+        )
+    return [item for page in pages for item in page["items"]]
 
 
 def unique_alias(prefix: str = "e2e") -> str:
