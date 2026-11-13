@@ -861,6 +861,9 @@ pub mod repo_sync_status {
         pub last_session_id: Option<Uuid>,
         /// RFC3339 time of the last run that completed.
         pub last_synced_at: Option<String>,
+        /// Credential-store key of the credential that last read the
+        /// repository, in this row's tenant; `NULL` for the gear-wide token.
+        pub credential_key: Option<String>,
     }
 
     #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
@@ -937,6 +940,9 @@ pub mod active_syncs {
         pub owner_id: Uuid,
         pub scope_json: String,
         pub since: Option<String>,
+        /// Credential-store key the run reads with; `NULL` for the gear-wide
+        /// token.
+        pub credential_key: Option<String>,
         pub updated_at: String,
     }
 

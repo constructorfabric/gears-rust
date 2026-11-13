@@ -1651,6 +1651,9 @@ pub struct RepoSyncStatusRecord {
     pub status: RepoRunStatus,
     pub last_session_id: Option<Uuid>,
     pub last_synced_at: Option<String>,
+    /// The credential-store key of the credential that last read the
+    /// repository; `None` for the gear-wide token. Its tenant is the row's.
+    pub credential_key: Option<String>,
 }
 
 #[async_trait]
@@ -1676,6 +1679,16 @@ pub trait RepoSyncStatusRepository: Send + Sync {
         repo_id: Option<i64>,
         synced_at: &str,
     ) -> Result<bool, DomainError>;
+
+    /// Bind the repository to the credential that read it (`None`: the
+    /// gear-wide token). Only that column changes; a repository with no row
+    /// yet is left alone.
+    async fn bind_credential(
+        &self,
+        scope: &AccessScope,
+        repo_full_name: &str,
+        credential_key: Option<&str>,
+    ) -> Result<(), DomainError>;
 
     /// Every repository the scope can see in slug order, optionally narrowed
     /// to one status, starting after the slug `after` when a page continues.
@@ -1796,6 +1809,8 @@ pub struct ActiveSyncRecord {
     pub owner_id: Uuid,
     pub scope: ScopeConfig,
     pub since: Option<DateTime<Utc>>,
+    /// The credential the run reads with, part of its terms.
+    pub credential_key: Option<String>,
     pub updated_at: String,
 }
 

@@ -237,6 +237,7 @@ mod tests {
             telemetry_file: None,
             max_concurrent_tasks: None,
             access_scope: AccessScope::default(),
+            credential: crate::domain::service::SyncCredential::default(),
             claim: None,
         }
     }

@@ -57,76 +57,7 @@ pub fn register_routes(mut router: Router, openapi: &dyn OpenApiRegistry) -> Rou
         .error_500(openapi)
         .register(router, openapi);
 
-    router = OperationBuilder::post("/github-mirror/v1/repos/{owner}/{name}/sync")
-        .operation_id("github_mirror.v1.sync_repository")
-        .summary("Sync a repository from GitHub into the mirror")
-        .description(
-            "Queues a sync of the repository and answers immediately with a session id. \
-             The background worker pages through the repository and every object type in \
-             scope, replays the `ETag` it stored last time so GitHub can answer `304` \
-             instead of resending a page, and waits out a rate limit before carrying \
-             on. What it fetches is upserted into the caller's tenant mirror; poll the \
-             session for the outcome. While a sync of the repository is queued or \
-             running, a request on the same terms joins it and one with a different \
-             scope or `since` is refused with `409`.",
-        )
-        .tag(API_TAG)
-        .authenticated()
-        .require_license_features::<License>([])
-        .path_param("owner", "Repo owner login")
-        .path_param("name", "Repo name")
-        .query_param_typed(
-            "force",
-            false,
-            "Bypass the HTTP cache and re-fetch everything",
-            "boolean",
-        )
-        .query_param_typed(
-            "force_full",
-            false,
-            "Walk every listing and refine every entity, keeping the HTTP cache",
-            "boolean",
-        )
-        .query_param(
-            "include",
-            false,
-            "Comma-separated object types to collect, e.g. `issues,pull_requests`",
-        )
-        .query_param(
-            "actions_scope",
-            false,
-            "`all`, `open` or `none` for CI results",
-        )
-        .query_param(
-            "reactions_scope",
-            false,
-            "`all`, `open` or `none` for reactions",
-        )
-        .query_param(
-            "timeline_scope",
-            false,
-            "`all`, `open` or `none` for timeline events",
-        )
-        .query_param(
-            "since",
-            false,
-            "RFC3339 instant; closed issues and pull requests older than this are not collected",
-        )
-        .handler(handlers::sync_repository)
-        .json_response_with_schema::<dto::SyncAcceptedDto>(
-            openapi,
-            StatusCode::ACCEPTED,
-            "Sync queued; the body carries the session id to poll. A repeat call on the \
-             same terms for a repository whose sync is still queued or running answers \
-             with that existing session instead of starting another",
-        )
-        .error_400(openapi)
-        .error_401(openapi)
-        .error_403(openapi)
-        .error_404(openapi)
-        .error_409(openapi)
-        .error_500(openapi)
-        .register(router, openapi);
+    router = register_sync_route(router, openapi);
 
     router = OperationBuilder::delete("/github-mirror/v1/cache")
         .operation_id("github_mirror.v1.clear_cache")
@@ -325,4 +256,92 @@ fn register_session_routes(mut router: Router, openapi: &dyn OpenApiRegistry) ->
         .register(router, openapi);
 
     router
+}
+
+/// `POST /github-mirror/v1/repos/{owner}/{name}/sync`, the one route that queues work.
+fn register_sync_route(router: Router, openapi: &dyn OpenApiRegistry) -> Router {
+    OperationBuilder::post("/github-mirror/v1/repos/{owner}/{name}/sync")
+        .operation_id("github_mirror.v1.sync_repository")
+        .summary("Sync a repository from GitHub into the mirror")
+        .description(
+            "Queues a sync of the repository and answers immediately with a session id. \
+             The background worker pages through the repository and every object type in \
+             scope, replays the `ETag` it stored last time so GitHub can answer `304` \
+             instead of resending a page, and waits out a rate limit before carrying \
+             on. What it fetches is upserted into the caller's tenant mirror; poll the \
+             session for the outcome. While a sync of the repository is queued or \
+             running, a request on the same terms joins it and one with a different \
+             scope, `since` or credential is refused with `409`. `credential_key` names \
+             the secret in the credential store the sync reads GitHub with, read as \
+             the caller; the sync never falls back to another token, and one that \
+             reads the repository binds it to that credential for later syncs.",
+        )
+        .tag(API_TAG)
+        .authenticated()
+        .require_license_features::<License>([])
+        .path_param("owner", "Repo owner login")
+        .path_param("name", "Repo name")
+        .query_param_typed(
+            "force",
+            false,
+            "Bypass the HTTP cache and re-fetch everything",
+            "boolean",
+        )
+        .query_param_typed(
+            "force_full",
+            false,
+            "Walk every listing and refine every entity, keeping the HTTP cache",
+            "boolean",
+        )
+        .query_param(
+            "include",
+            false,
+            "Comma-separated object types to collect, e.g. `issues,pull_requests`",
+        )
+        .query_param(
+            "actions_scope",
+            false,
+            "`all`, `open` or `none` for CI results",
+        )
+        .query_param(
+            "reactions_scope",
+            false,
+            "`all`, `open` or `none` for reactions",
+        )
+        .query_param(
+            "timeline_scope",
+            false,
+            "`all`, `open` or `none` for timeline events",
+        )
+        .query_param(
+            "since",
+            false,
+            "RFC3339 instant; closed issues and pull requests older than this are not collected",
+        )
+        .query_param(
+            "credential_key",
+            false,
+            "Credential-store key of the GitHub token to sync with; omit to keep the \
+             repository's bound credential, or the gear-wide token",
+        )
+        .query_param(
+            "credential_tenant_id",
+            false,
+            "Tenant of `credential_key`; defaults to the caller's own, and no other is accepted",
+        )
+        .handler(handlers::sync_repository)
+        .json_response_with_schema::<dto::SyncAcceptedDto>(
+            openapi,
+            StatusCode::ACCEPTED,
+            "Sync queued; the body carries the session id to poll. A repeat call on the \
+             same terms for a repository whose sync is still queued or running answers \
+             with that existing session instead of starting another",
+        )
+        .error_400(openapi)
+        .error_401(openapi)
+        .error_403(openapi)
+        .error_404(openapi)
+        .error_409(openapi)
+        .error_500(openapi)
+        .register(router, openapi)
 }

@@ -7,6 +7,7 @@ use std::sync::{Arc, OnceLock};
 use authz_resolver_sdk::pep::{AccessRequest, ResourceType};
 use authz_resolver_sdk::{EnforcerError, PolicyEnforcer};
 use chrono::{DateTime, Utc};
+pub use github_mirror_sdk::CredentialRef;
 use github_mirror_sdk::{
     Artifact, Branch, CheckRun, Comment, Commit, CommitComment, CommitFile, CommitStatus,
     Contributor, Deployment, Issue, IssueEvent, IssueReaction, IssueTimelineEvent, Label,
@@ -22,6 +23,7 @@ use toolkit_security::{AccessScope, SecurityContext, pep_properties};
 use uuid::Uuid;
 
 use super::error::DomainError;
+use super::ports::credentials::GithubCredentials;
 use super::ports::github::{
     FetchOptions, ForceMode, GithubPort, RateLimitQuota, SHARED_CACHE_PARTITION,
 };
@@ -604,6 +606,9 @@ pub struct SyncJob {
     /// `max_concurrent_tasks` for it.
     pub max_concurrent_tasks: Option<NonZeroUsize>,
     pub access_scope: AccessScope,
+    /// The credential this run reads GitHub with, resolved when the sync was
+    /// requested.
+    pub credential: SyncCredential,
     #[expect(
         dead_code,
         reason = "held for its drop: a job that goes away, run or not, gives its claim back"
@@ -695,6 +700,8 @@ pub struct Service {
     change_gate: Arc<ChangeGate>,
     sweep_watermark: Arc<SweepWatermark>,
     github: Arc<dyn GithubPort>,
+    /// Clients for syncs that name a credential; `None` refuses such syncs.
+    credentials: Option<Arc<dyn GithubCredentials>>,
     policy_enforcer: PolicyEnforcer,
     config: ServiceConfig,
     telemetry_sink: Arc<dyn TelemetrySink>,
@@ -727,6 +734,9 @@ pub struct SyncRequest {
     pub force: ForceMode,
     pub since: Option<DateTime<Utc>>,
     pub max_concurrent_tasks: Option<NonZeroUsize>,
+    /// The credential the sync reads GitHub with; `None` keeps the one the
+    /// repository is bound to, or the gear-wide token.
+    pub credential: Option<CredentialRef>,
 }
 
 /// One repository of one tenant: what a queued or running sync occupies.
@@ -854,11 +864,14 @@ mod gate {
 /// sync ran for terms it never asked for. `force` is deliberately not part of
 /// them — a forced request and a plain one collect the same things, and the
 /// run in flight is already fetching the repository.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct Claim {
     session_id: Uuid,
     scope: ScopeConfig,
     since: Option<DateTime<Utc>>,
+    /// The credential the run reads with; a request naming another one is
+    /// refused rather than told a sync ran with a credential it never used.
+    credential_key: Option<String>,
 }
 
 /// Manual `Clone`: every field is an `Arc` (cheap refcount bump) or already
@@ -907,6 +920,7 @@ impl Clone for Service {
             change_gate: Arc::clone(&self.change_gate),
             sweep_watermark: Arc::clone(&self.sweep_watermark),
             github: Arc::clone(&self.github),
+            credentials: self.credentials.clone(),
             policy_enforcer: self.policy_enforcer.clone(),
             config: self.config.clone(),
             telemetry_sink: Arc::clone(&self.telemetry_sink),
@@ -1012,6 +1026,7 @@ impl Service {
             change_gate: Arc::new(ChangeGate::new(fingerprints)),
             sweep_watermark: Arc::new(SweepWatermark::new(watermark_store)),
             github,
+            credentials: None,
             policy_enforcer,
             config,
             telemetry_sink,
@@ -3975,7 +3990,9 @@ impl Service {
             repo_id,
             status,
             last_session_id: Some(session_id),
-            last_synced_at: synced_at.or_else(|| previous.and_then(|p| p.last_synced_at)),
+            last_synced_at: synced_at
+                .or_else(|| previous.as_ref().and_then(|p| p.last_synced_at.clone())),
+            credential_key: previous.and_then(|p| p.credential_key),
         };
         self.repo_sync_status
             .upsert(scope, tenant_id, record)
@@ -4156,7 +4173,7 @@ impl Service {
                 continue;
             };
             match self
-                .enqueue_sync_scoped(ctx, &scopes, owner, name, None, force, None)
+                .enqueue_sync_scoped(ctx, &scopes, owner, name, None, force, None, None)
                 .await
             {
                 Ok(queued) => outcome.session_ids.push(queued.session_id),
@@ -4210,9 +4227,46 @@ impl Service {
         force: ForceMode,
         since: Option<DateTime<Utc>>,
     ) -> Result<QueuedSync, DomainError> {
+        self.enqueue_sync_with(
+            ctx,
+            owner,
+            name,
+            SyncRequest {
+                scope: sync_scope,
+                force,
+                since,
+                ..SyncRequest::default()
+            },
+        )
+        .await
+    }
+
+    /// [`Self::enqueue_sync`] with the request's terms in one value, the
+    /// credential it names among them. `max_concurrent_tasks` is not taken
+    /// from a queued request.
+    ///
+    /// # Errors
+    /// As [`Self::enqueue_sync`], and `Validation`/`Forbidden` when the named
+    /// credential cannot be read.
+    pub async fn enqueue_sync_with(
+        &self,
+        ctx: &SecurityContext,
+        owner: &str,
+        name: &str,
+        request: SyncRequest,
+    ) -> Result<QueuedSync, DomainError> {
         let scopes = self.enqueue_scopes(ctx).await?;
-        self.enqueue_sync_scoped(ctx, &scopes, owner, name, sync_scope, force, since)
-            .await
+        self.enqueue_sync_scoped(
+            ctx,
+            &scopes,
+            owner,
+            name,
+            request.scope,
+            request.force,
+            request.since,
+            request.credential,
+        )
+        .await
     }
 
     /// The scopes one sync request needs, resolved once so a resume of hundreds
@@ -4242,9 +4296,12 @@ impl Service {
         sync_scope: Option<ScopeConfig>,
         force: ForceMode,
         since: Option<DateTime<Utc>>,
+        credential: Option<CredentialRef>,
     ) -> Result<QueuedSync, DomainError> {
         let (job, session) = match self
-            .prepare_sync(ctx, scopes, owner, name, sync_scope, force, since)
+            .prepare_sync(
+                ctx, scopes, owner, name, sync_scope, force, since, credential,
+            )
             .await?
         {
             PreparedSync::Joined(running) => return Ok(running),
@@ -4285,6 +4342,19 @@ impl Service {
         owner: String,
         name: String,
     ) -> tokio::task::JoinHandle<Result<SyncSummary, DomainError>> {
+        self.spawn_sync_with(ctx, owner, name, SyncRequest::default())
+    }
+
+    /// [`Self::spawn_sync_now`] on the request's terms, the credential it
+    /// names among them.
+    #[must_use]
+    pub fn spawn_sync_with(
+        self: &Arc<Self>,
+        ctx: SecurityContext,
+        owner: String,
+        name: String,
+        request: SyncRequest,
+    ) -> tokio::task::JoinHandle<Result<SyncSummary, DomainError>> {
         let service = Arc::clone(self);
         self.in_process_syncs.spawn(async move {
             let shutdown = service.shutdown_token();
@@ -4294,9 +4364,7 @@ impl Service {
                 })?,
                 () = shutdown.cancelled() => return Err(DomainError::Cancelled),
             };
-            service
-                .sync_now(&ctx, &owner, &name, None, SyncRequest::default())
-                .await
+            service.sync_now(&ctx, &owner, &name, None, request).await
         })
     }
 
@@ -4338,6 +4406,7 @@ impl Service {
                 request.scope,
                 request.force,
                 request.since,
+                request.credential,
             )
             .await?
         {
@@ -4368,12 +4437,18 @@ impl Service {
         sync_scope: Option<ScopeConfig>,
         force: ForceMode,
         since: Option<DateTime<Utc>>,
+        credential: Option<CredentialRef>,
     ) -> Result<PreparedSync, DomainError> {
         let sync_scope = sync_scope.unwrap_or(self.config.scope);
         sync_scope.validate()?;
         let tenant_id = ctx.subject_tenant_id();
         let scope = &scopes.session;
         let key = (tenant_id, format!("{owner}/{name}"));
+        // Read before anything is claimed or written: a credential the
+        // caller cannot use is refused here, with no session left behind.
+        let credential = self
+            .sync_credential(ctx, scopes, &key.1, credential)
+            .await?;
         let id = Uuid::new_v4();
         let now = now_rfc3339();
         let session = SyncSessionRecord {
@@ -4408,12 +4483,13 @@ impl Service {
                 owner_id: self.instance_id,
                 scope: sync_scope,
                 since,
+                credential_key: credential.key().map(ToOwned::to_owned),
                 updated_at: now,
             };
             if let Some(running) = self.take_active_sync(scopes, tenant_id, &active).await? {
                 drop(claimed);
                 return self
-                    .join_or_refuse(scope, &key.1, running, sync_scope, since)
+                    .join_or_refuse(scope, &key.1, running, &active)
                     .await
                     .map(PreparedSync::Joined);
             }
@@ -4449,6 +4525,7 @@ impl Service {
             telemetry_file: None,
             max_concurrent_tasks: None,
             access_scope: scopes.sync.clone(),
+            credential,
             claim: Some(claim),
         };
         Ok(PreparedSync::Claimed {
@@ -4629,10 +4706,12 @@ impl Service {
         scope: &AccessScope,
         repo_full_name: &str,
         running: Claim,
-        sync_scope: ScopeConfig,
-        since: Option<DateTime<Utc>>,
+        wanted: &ActiveSyncRecord,
     ) -> Result<QueuedSync, DomainError> {
-        if running.scope != sync_scope || running.since != since {
+        if running.scope != wanted.scope
+            || running.since != wanted.since
+            || running.credential_key != wanted.credential_key
+        {
             tracing::debug!(
                 repository = repo_full_name,
                 session_id = %running.session_id,
@@ -4701,6 +4780,7 @@ impl Service {
                         session_id: held.session_id,
                         scope: held.scope,
                         since: held.since,
+                        credential_key: held.credential_key,
                     }));
                 }
                 Some(held) => {
@@ -4922,7 +5002,15 @@ impl Service {
         ));
 
         let outcome = self
-            .sync_repository_scoped(&job.ctx, &job.owner, &job.name, &options, progress, cancel)
+            .sync_repository_scoped(
+                &job.ctx,
+                &job.owner,
+                &job.name,
+                &options,
+                progress,
+                cancel,
+                Some(&job.credential),
+            )
             .await;
 
         stop_beating.cancel();
@@ -5183,10 +5271,17 @@ impl Service {
             access_scope: self.sync_access_scope(ctx).await?,
             ..options.clone()
         };
-        self.sync_repository_scoped(ctx, owner, name, &options, progress, cancel)
+        self.sync_repository_scoped(ctx, owner, name, &options, progress, cancel, None)
             .await
     }
 
+    /// `credential` is the job's: the client it reads with, and the binding
+    /// written once Discovery has read the repository with it. `None` reads
+    /// with the gear-wide client and leaves the binding alone.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the run's own inputs, as `sync_repository` takes them, plus the credential"
+    )]
     async fn sync_repository_scoped(
         &self,
         ctx: &SecurityContext,
@@ -5195,6 +5290,7 @@ impl Service {
         options: &FetchOptions,
         progress: &SyncProgress,
         cancel: &CancellationToken,
+        credential: Option<&SyncCredential>,
     ) -> Result<SyncSummary, DomainError> {
         // Checked here and not only in the REST handler: the tests call this
         // directly, and `owner`/`name` reach a log line below, where a newline
@@ -5242,7 +5338,16 @@ impl Service {
                 ..options.clone()
             },
         ));
-        let outcome = self.run_phases(&run, progress, cancel).await;
+        let outcome = self
+            .run_phases(&run, self.github_for(credential), progress, cancel)
+            .await;
+        // Discovery stored the repository, so this credential can read it.
+        if let Some(credential) = credential
+            && run.repo_id().is_ok()
+        {
+            self.bind_credential(ctx, &format!("{owner}/{name}"), credential)
+                .await;
+        }
 
         // Deterministic unlock on the way out; a failed release is only
         // logged — the guard's Drop already queued a best-effort release,
@@ -5330,6 +5435,7 @@ impl Service {
     async fn run_phases(
         &self,
         run: &Arc<RunState>,
+        github: Arc<dyn GithubPort>,
         progress: &SyncProgress,
         cancel: &CancellationToken,
     ) -> Result<SyncSummary, DomainError> {
@@ -5339,7 +5445,7 @@ impl Service {
         let watermark = Utc::now();
 
         let worker: Arc<dyn Worker> = Arc::new(MirrorWorker::new(
-            Arc::clone(&self.github),
+            github,
             Arc::clone(&self.sync_writer),
             Arc::clone(&self.change_gate),
             Arc::clone(&self.sweep_watermark),
@@ -5443,6 +5549,10 @@ impl Service {
         Ok(summary)
     }
 }
+
+#[path = "service_credential.rs"]
+mod credential;
+pub use credential::SyncCredential;
 
 #[cfg(test)]
 #[path = "service_tests.rs"]

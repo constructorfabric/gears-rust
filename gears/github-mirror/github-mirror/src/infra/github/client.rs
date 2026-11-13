@@ -380,8 +380,8 @@ impl GithubClient {
     }
 }
 
-fn cache_partition(options: &FetchOptions) -> (AccessScope, uuid::Uuid) {
-    if options.public_repo.get() == Some(&true) {
+fn cache_partition(options: &FetchOptions, share_public: bool) -> (AccessScope, uuid::Uuid) {
+    if share_public && options.public_repo.get() == Some(&true) {
         (
             AccessScope::for_tenant(SHARED_CACHE_PARTITION),
             SHARED_CACHE_PARTITION,
@@ -431,18 +431,25 @@ fn refuse_cleartext(api_base_url: &str, parsed: &url::Url) -> Result<(), DomainE
 /// GitHub REST client for the mirror (gears-rust#4630).
 ///
 /// Conditional requests, `Link`-header pagination and per-token rate-limit
-/// admission (ADR-0003) are in. The token comes from gear config as a
-/// temporary shortcut until credstore integration (#4534).
+/// admission (ADR-0003) are in. One client reads with one token: the gear's
+/// own client with the gear-wide `github_token_secret`, and one client per
+/// credential a sync names (gears-rust#5970, see
+/// [`crate::infra::github::credentials`]).
 pub struct GithubClient {
     http: reqwest::Client,
     api_base_url: String,
     api_origin: url::Origin,
     token: Arc<Token>,
     cache: Arc<dyn HttpCache>,
-    /// Ceiling on requests in flight, shared by every sync using this client.
+    /// Ceiling on requests in flight, shared by every sync using this client
+    /// and by every client [`Self::with_shared_permits`] handed it to.
     /// GitHub's secondary rate limit reacts to concurrency, so the ceiling is
     /// global rather than per sync.
-    permits: Semaphore,
+    permits: Arc<Semaphore>,
+    /// Whether a public repository's responses are cached in the shared
+    /// partition every tenant reads. Off for a client that reads with a
+    /// tenant's own credential: what GitHub answers differs per token.
+    share_public_cache: bool,
     /// The token's admission controller: every request is admitted here
     /// before it takes a shared permit, so a token that is backing off or out
     /// of budget never occupies capacity another token could use.
@@ -518,7 +525,8 @@ impl GithubClient {
             api_origin,
             token,
             cache,
-            permits: Semaphore::new(DEFAULT_MAX_CONCURRENT_REQUESTS),
+            permits: Arc::new(Semaphore::new(DEFAULT_MAX_CONCURRENT_REQUESTS)),
+            share_public_cache: true,
             controller,
             max_cap: u32::try_from(DEFAULT_MAX_CONCURRENT_REQUESTS).unwrap_or(u32::MAX),
             metrics: GithubRequestMetrics::from_global(),
@@ -552,9 +560,29 @@ impl GithubClient {
 
     /// Cap the requests this client keeps in flight at `max`.
     #[must_use]
-    pub fn with_max_concurrent_requests(mut self, max: std::num::NonZeroUsize) -> Self {
-        self.permits = Semaphore::new(max.get());
+    pub fn with_max_concurrent_requests(self, max: std::num::NonZeroUsize) -> Self {
+        self.with_shared_permits(Arc::new(Semaphore::new(max.get())), max)
+    }
+
+    /// Take request permits from `permits`, which holds `max` of them and
+    /// may be shared with other clients, so the ceiling on requests in
+    /// flight stays one across every token the gear reads with.
+    #[must_use]
+    pub fn with_shared_permits(
+        mut self,
+        permits: Arc<Semaphore>,
+        max: std::num::NonZeroUsize,
+    ) -> Self {
+        self.permits = permits;
         self.max_cap = u32::try_from(max.get()).unwrap_or(u32::MAX);
+        self
+    }
+
+    /// Keep a public repository's responses in the caller's own cache
+    /// partition instead of the one every tenant shares.
+    #[must_use]
+    pub fn without_shared_public_cache(mut self) -> Self {
+        self.share_public_cache = false;
         self
     }
 
@@ -718,7 +746,7 @@ impl GithubClient {
         if options.force.skips_cache() {
             return None;
         }
-        let (scope, tenant_id) = cache_partition(options);
+        let (scope, tenant_id) = cache_partition(options, self.share_public_cache);
         match self.cache.get(&scope, tenant_id, key).await {
             Ok(entry) => entry,
             Err(e) => {
@@ -1134,7 +1162,7 @@ impl GithubClient {
         if !entry.is_revalidatable() {
             return;
         }
-        let (scope, tenant_id) = cache_partition(options);
+        let (scope, tenant_id) = cache_partition(options, self.share_public_cache);
         if let Err(e) = self.cache.put(&scope, tenant_id, key, url, entry).await {
             tracing::warn!(url = %redacted_word(url), error = %e, "cache write failed; the next sync will re-fetch");
         }

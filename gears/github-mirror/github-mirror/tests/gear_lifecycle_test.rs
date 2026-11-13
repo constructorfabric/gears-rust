@@ -207,3 +207,53 @@ async fn an_empty_token_secret_means_an_unauthenticated_gear() {
         .expect("an empty token must leave the gear unauthenticated, not fail it");
     rate_limit.assert_async().await;
 }
+
+#[tokio::test]
+async fn with_rest_off_no_route_is_registered_and_the_sdk_still_serves() {
+    let hub = Arc::new(ClientHub::new());
+    let gear = GithubMirrorGear::default();
+    let ctx = common::gear_ctx(
+        Arc::clone(&hub),
+        Some(serde_json::json!({ "config": { "rest": { "enabled": false } } })),
+    )
+    .await;
+    gear.init(&ctx).await.expect("init must succeed");
+
+    let openapi = OpenApiRegistryImpl::new();
+    let router = gear
+        .register_rest(&ctx, Router::new(), &openapi)
+        .expect("register_rest must succeed with REST off");
+
+    for uri in [
+        "/github-mirror/v1/health",
+        "/github-mirror/v1/repos",
+        "/repos/rust-lang/rust",
+        "/user/repos",
+    ] {
+        let request = Request::builder().uri(uri).body(Body::empty()).unwrap();
+        let response = router.clone().oneshot(request).await.unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_FOUND,
+            "{uri} must not be served with REST off"
+        );
+    }
+    assert!(
+        openapi.operation_specs.is_empty(),
+        "no operation may be published with REST off"
+    );
+
+    let client = hub
+        .get::<dyn github_mirror_sdk::GithubMirrorClientV1>()
+        .expect("the SDK client must still be registered");
+    let status = client
+        .status(&common::caller())
+        .await
+        .expect("the SDK must still serve");
+    assert_eq!(status.gear, "github-mirror");
+    let repos = client
+        .list_repos(&common::caller(), toolkit_odata::ODataQuery::default())
+        .await
+        .expect("the SDK must still read the mirror");
+    assert!(repos.items.is_empty());
+}
