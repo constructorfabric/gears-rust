@@ -27,6 +27,11 @@ config_prune:
       id_contains: "gts.cf.core.am."
     keep_when_config_gears:
       - account-management
+  - path: gears.types-registry.config.entities
+    match:
+      id_contains: "gts.cf.genai.model.provider."
+    keep_when_config_gears:
+      - model-registry
 
 # Shared (unscoped) `make e2e-local` behaviour.
 shared:

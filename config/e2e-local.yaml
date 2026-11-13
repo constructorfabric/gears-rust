@@ -180,6 +180,30 @@ gears:
               - "gts.cf.core.am.tenant_type.v1~cf.core.am.platform.v1~"
               - "gts.cf.core.am.tenant_type.v1~cf.core.am.customer.v1~"
             idp_provisioning: false
+        # Provider types for the model-registry suite. The gear publishes the
+        # base type; provider plugins own the derived ones, and none is linked
+        # here. `open` leaves `provider_settings` unconstrained, `strict`
+        # narrows it.
+        - $id: "gts://gts.cf.genai.model.provider.v1~cf.e2e._.open.v1~"
+          $schema: "http://json-schema.org/draft-07/schema#"
+          description: "E2E provider type with open settings."
+          type: "object"
+          allOf:
+            - $ref: "gts://gts.cf.genai.model.provider.v1~"
+        - $id: "gts://gts.cf.genai.model.provider.v1~cf.e2e._.strict.v1~"
+          $schema: "http://json-schema.org/draft-07/schema#"
+          description: "E2E provider type that requires a deployment name."
+          type: "object"
+          allOf:
+            - $ref: "gts://gts.cf.genai.model.provider.v1~"
+            - type: "object"
+              properties:
+                provider_settings:
+                  type: "object"
+                  additionalProperties: false
+                  properties:
+                    deployment: { type: "string" }
+                  required: ["deployment"]
       # Suite settings, kept here rather than in their manifests so the shared
       # `make e2e-local` server has them too. Force lets TR-REG-903 waive a
       # compatibility failure; the types-registry suite's `force-disabled`
@@ -230,6 +254,17 @@ gears:
         - id: "00000000-0000-0000-0000-000000000006"
           name: "hierarchy-l2c"
           parent_id: "00000000-0000-0000-0000-000000000005"
+          status: active
+        # Self-managed tenant (barrier) and its child, used by the
+        # model-registry suite.
+        - id: "00000000-0000-0000-0000-000000000007"
+          name: "hierarchy-sm"
+          parent_id: "00000000-0000-0000-0000-000000000001"
+          status: active
+          self_managed: true
+        - id: "00000000-0000-0000-0000-000000000008"
+          name: "hierarchy-sm-child"
+          parent_id: "00000000-0000-0000-0000-000000000007"
           status: active
 
   tenant-resolver:
@@ -374,6 +409,23 @@ gears:
             subject_id: "22222222-0000-0000-0000-000000000005"
             subject_tenant_id: "00000000-0000-0000-0000-000000000005"
             token_scopes: ["*"]
+        # Grandchild, self-managed, and below-barrier tokens — used by the
+        # model-registry suite.
+        - token: "e2e-token-hierarchy-l2b"
+          identity:
+            subject_id: "22222222-0000-0000-0000-000000000004"
+            subject_tenant_id: "00000000-0000-0000-0000-000000000004"
+            token_scopes: ["*"]
+        - token: "e2e-token-hierarchy-sm"
+          identity:
+            subject_id: "22222222-0000-0000-0000-000000000007"
+            subject_tenant_id: "00000000-0000-0000-0000-000000000007"
+            token_scopes: ["*"]
+        - token: "e2e-token-hierarchy-sm-child"
+          identity:
+            subject_id: "22222222-0000-0000-0000-000000000008"
+            subject_tenant_id: "00000000-0000-0000-0000-000000000008"
+            token_scopes: ["*"]
         - token: "e2e-token-tenant-b"
           identity:
             subject_id: "22222222-6a88-4768-9dfc-6bcd5187d9ed"
@@ -436,6 +488,14 @@ gears:
     database:
       server: "sqlite_users"
       file: "resource_group.db"
+    config: {}
+
+  model-registry:
+    database:
+      server: "sqlite_users"
+      file: "model_registry.db"
+      params:
+        transaction_mode: "immediate"
     config: {}
 
   static-idp-plugin:
