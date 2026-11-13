@@ -28,7 +28,6 @@ use toolkit::lifecycle::ReadySignal;
 use toolkit::{Gear, Healthcheck, RestApiCapability};
 use toolkit_contract::policy::PolicyStack;
 use tracing::info;
-use types_registry_sdk::TypesRegistryClient;
 
 use crate::api::healthcheck::ReadinessCheck;
 use crate::api::in_process::{
@@ -58,9 +57,10 @@ const LOG_TARGET: &str = "qe.lifecycle";
 /// features host their sweepers there under child cancellation tokens.
 // @cpt-dod:cpt-cf-quota-enforcement-dod-workspace-crates:p1
 #[toolkit::consumes(contract = types_registry_sdk::PlatformTypesRegistryApi, from = "types-registry")]
+#[toolkit::consumes(contract = types_registry_sdk::TypesRegistryApi, from = "types-registry")]
 #[toolkit::gear(
     name = "quota-enforcement",
-    deps = [authz_resolver, types_registry],
+    deps = [authz_resolver],
     capabilities = [rest, stateful],
     lifecycle(entry = "serve", stop_timeout = "30s", await_ready),
     gts_publication(crates = [quota_enforcement_sdk]),
@@ -346,19 +346,17 @@ impl Gear for QuotaEnforcementGear {
         // The SDK default is a hang guard, far above the admission latency budget.
         let enforcer = PolicyEnforcer::new(authz).with_deadline(cfg.pdp_deadline());
 
-        // Bootstrap builds the projection catalogue from this registry client.
-        let registry: Arc<dyn TypesRegistryClient> = hub
-            .get::<dyn TypesRegistryClient>()
-            .with_context(|| format!("{} requires a types-registry client", Self::MODULE_NAME))?;
+        // Bootstrap builds the projection catalogue through the registry
+        // clients, consumed contracts the runtime wires after `init`.
         let catalog = CatalogBinding {
-            registry: Arc::new(TypesRegistryContracts::new(registry.clone())),
+            registry: Arc::new(TypesRegistryContracts::new(hub.clone())),
             config: cfg
                 .catalog
                 .to_domain()
                 .context("[quota-enforcement.catalog] is not a valid catalogue")?,
         };
         let metric_registry: Arc<dyn MetricRegistry> = Arc::new(CachedMetricRegistry::new(
-            registry,
+            hub.clone(),
             cfg.quotas.metric_cache_entries,
             cfg.quotas.metric_cache_ttl(),
             cfg.quotas.metric_cache_stale_grace(),

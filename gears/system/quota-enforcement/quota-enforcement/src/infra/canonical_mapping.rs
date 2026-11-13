@@ -8,7 +8,7 @@
 
 use toolkit_canonical_errors::{CanonicalError, resource_error};
 
-use crate::domain::error::{DomainError, ResourceKind};
+use crate::domain::error::{CallerRefusal, DomainError, ResourceKind};
 
 /// A Quota, the resource a canonical error names.
 #[resource_error(gts_id!("cf.core.qe.quota.v1~"))]
@@ -28,8 +28,11 @@ pub(crate) struct OperationResource;
 
 /// Closed reason tokens of the canonical envelope.
 pub mod reason {
-    /// PDP denial or constraint compile failure.
+    /// PDP denial, constraint compile failure, or the types registry refusing
+    /// the caller.
     pub const AUTHZ: &str = "AUTHZ";
+    /// The caller's credential was refused (the platform listener's token).
+    pub const AUTHN_FAILED: &str = "AUTHN_FAILED";
     /// Bootstrap has not completed.
     pub const NOT_READY: &str = "NOT_READY";
     /// A dependency is unreachable.
@@ -165,9 +168,19 @@ impl From<DomainError> for CanonicalError {
             | DomainError::VersionRolledBack { .. } => policy(err),
 
             // --- 403 PermissionDenied (no PDP detail on the wire) ---
-            DomainError::PdpDenied { .. } => QuotaResource::permission_denied()
-                .with_reason(reason::AUTHZ)
-                .create(),
+            DomainError::PdpDenied { .. }
+            | DomainError::RegistryRefusedCaller(CallerRefusal::PermissionDenied) => {
+                QuotaResource::permission_denied()
+                    .with_reason(reason::AUTHZ)
+                    .create()
+            }
+
+            // --- 401 Unauthenticated (no upstream text on the wire) ---
+            DomainError::RegistryRefusedCaller(CallerRefusal::Unauthenticated) => {
+                CanonicalError::unauthenticated()
+                    .with_reason(reason::AUTHN_FAILED)
+                    .create()
+            }
 
             // --- 404 NotFound ---
             DomainError::NotFound { kind, id } => not_found(kind, id),

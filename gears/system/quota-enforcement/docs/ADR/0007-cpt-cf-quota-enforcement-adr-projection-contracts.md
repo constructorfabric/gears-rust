@@ -234,7 +234,7 @@ Contracts are resolved and snapshotted **outside** the evaluation transaction:
   snapshot. `types-registry` remains authoritative; QE's catalogue is only a validated local
   snapshot. A new contract version becomes evaluable only when the configured catalogue includes
   it. P1 has no runtime refresh or breaking-version activation path.
-* **`QuotaManagementService`** owns the `TypesRegistryClient` and a bounded LRU cache for
+* **`QuotaManagementService`** owns the types-registry clients (`TypesRegistryApi` under the caller's context, `PlatformTypesRegistryApi` for the gear's own reads) and a bounded LRU cache for
   metric, projection, and constraint-contract lookups. Quota creation validates the
   registry contract and requires the projection to be in the configured evaluation catalogue.
 * **`PolicyService`** resolves the contracts a Policy references and snapshots their schema
@@ -247,7 +247,7 @@ independently sufficient:
 * The canonical pipeline — public request-shape checks → PDP authorization → catalogue/contract validation and
   mapping → idempotency lookup → locked applicable-Quota read → Policy lookup → Engine evaluation → Debit-Plan validation → mutation →
   idempotency/outbox persistence → commit — has no registry step today.
-* The `ProjectionContractCatalog` is process-local and the `TypesRegistryClient` cache belongs
+* The `ProjectionContractCatalog` is process-local and the types-registry metric cache belongs
   to Quota CRUD, so there is no hot-path cache to reuse.
 * Hot-path metric-mode enforcement already comes from storage errors (`MetricNotRegistered` /
   `MetricNotQuotaGated`).
@@ -298,9 +298,9 @@ validation cannot prove:
 * operator/cardinality mismatch — comparing `quota.regions: string[]` with
   `request.region: string` using `==` rather than membership.
 
-**At bootstrap**, QE registers its own missing definitions — the abstract bases, the
-scope-discriminator type, and its P1 well-known instances — through `TypesRegistryClient`;
-registration is idempotent and touches only QE-owned definitions. Concrete owner projections
+**Before its `init`**, the runtime publishes QE's own definitions — the abstract bases, the
+scope-discriminator type, and its P1 well-known instances — from the SDK's GTS collector
+(`gts_publication(crates = [quota_enforcement_sdk])`); the publication touches only QE-owned definitions. Concrete owner projections
 remain published by their owning Gears, and `types-registry` remains the authoritative source
 throughout — QE's catalogue is only a validated local snapshot. Bootstrap then validates a
 closed consistency set:

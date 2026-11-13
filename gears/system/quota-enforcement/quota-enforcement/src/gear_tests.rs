@@ -34,9 +34,9 @@ use crate::domain::notifications::DeliveryLifecycle;
 use crate::domain::{Dependency, DomainError, ReadinessState};
 use crate::test_support::{
     ClusterFixture, FailingPdp, LLM_MODEL_RESOURCE, LLM_TENANT_PROJECTION, LLM_USER_PROJECTION,
-    OtherProfile, PermitTenantsPdp, ctx as security_ctx, hub_with_registry, in_process_registry,
-    llm_gateway_documents, metric_base_documents, register_pdp, register_sink, register_storage,
-    sink_instance, storage_instance, tenant, wire_cluster, wire_cluster_with,
+    OtherProfile, PermitTenantsPdp, ctx as security_ctx, hub_with_registry, llm_gateway_documents,
+    metric_base_documents, register_pdp, register_sink, register_storage, sink_instance,
+    storage_instance, tenant, wire_cluster, wire_cluster_with,
 };
 
 struct StaticConfigProvider {
@@ -121,10 +121,7 @@ fn environment_with_pdp(
     let storage_fixture = storage_instance("cf.core._.qe_db_storage.v1", "acme", 100);
     let mut documents = llm_gateway_documents();
     documents.extend(metric_base_documents());
-    let hub = hub_with_registry(
-        in_process_registry(documents),
-        &[storage_fixture.published()],
-    );
+    let hub = hub_with_registry(&documents, &[storage_fixture.published()]);
     register_pdp(&hub, pdp);
     let storage = Arc::new(InMemoryStorage::new());
     if with_storage_client {
@@ -198,20 +195,33 @@ async fn init_without_an_admitted_manifest_fails() {
     fixture.stop().await;
 }
 
+/// The registry clients are consumed contracts, wired after `init`: `init`
+/// does not need them, and without them the bootstrap fails closed and the
+/// gear never signals ready.
 #[tokio::test]
-async fn init_fails_closed_without_a_types_registry_client() {
+async fn without_types_registry_clients_init_succeeds_and_serve_never_becomes_ready() {
     let hub = Arc::new(ClientHub::new());
     register_pdp(
         &hub,
         Arc::new(PermitTenantsPdp::new(vec![tenant().as_uuid()])),
     );
-    let gear = QuotaEnforcementGear::default();
-    let err = gear
-        .init(&make_ctx(hub))
+    let gear = Arc::new(QuotaEnforcementGear::default());
+    gear.init(&make_ctx(hub))
         .await
-        .expect_err("no registry, no catalogue, no gear");
-    assert!(format!("{err:#}").contains("types-registry"), "{err:#}");
-    assert!(gear.service().is_none());
+        .expect("init needs no registry client");
+
+    let (tx, rx) = oneshot::channel();
+    let err = gear
+        .clone()
+        .serve(CancellationToken::new(), ReadySignal::from_sender(tx))
+        .await
+        .expect_err("no registry, no catalogue");
+    assert!(format!("{err:#}").contains("bootstrap"), "{err:#}");
+    assert!(rx.await.is_err(), "the ready signal is never sent");
+    assert!(
+        !gear.service().expect("service").readiness().is_ready(),
+        "not ready"
+    );
 }
 
 #[tokio::test]
@@ -442,7 +452,7 @@ async fn serve_delivers_what_the_published_sql_plugin_commits_to_a_registered_si
     documents.extend(metric_base_documents());
     let mut plugins = sql_plugin_published();
     plugins.push(sink_fixture.published());
-    let hub = hub_with_registry(in_process_registry(documents), &plugins);
+    let hub = hub_with_registry(&documents, &plugins);
     register_pdp(
         &hub,
         Arc::new(PermitTenantsPdp::new(vec![tenant().as_uuid()])),
@@ -755,7 +765,7 @@ impl AuthZResolverApi for NarrowingPdp {
 async fn a_bulk_envelope_over_the_sql_plugin_replays_only_while_its_targets_stay_visible() {
     let mut documents = llm_gateway_documents();
     documents.extend(metric_base_documents());
-    let hub = hub_with_registry(in_process_registry(documents), &sql_plugin_published());
+    let hub = hub_with_registry(&documents, &sql_plugin_published());
     let pdp = Arc::new(NarrowingPdp {
         narrowed: std::sync::atomic::AtomicBool::new(false),
     });
@@ -869,7 +879,7 @@ async fn a_bulk_envelope_over_the_sql_plugin_replays_only_while_its_targets_stay
 async fn a_debit_over_the_sql_plugin_traces_admission_and_evaluation_under_the_operation() {
     let mut documents = llm_gateway_documents();
     documents.extend(metric_base_documents());
-    let hub = hub_with_registry(in_process_registry(documents), &sql_plugin_published());
+    let hub = hub_with_registry(&documents, &sql_plugin_published());
     register_pdp(
         &hub,
         Arc::new(PermitTenantsPdp::new(vec![tenant().as_uuid()])),
@@ -1086,7 +1096,7 @@ async fn bulk_step_spans(
 async fn bulk_envelopes_over_the_sql_plugin_open_the_same_spans_for_one_item_and_for_ten() {
     let mut documents = llm_gateway_documents();
     documents.extend(metric_base_documents());
-    let hub = hub_with_registry(in_process_registry(documents), &sql_plugin_published());
+    let hub = hub_with_registry(&documents, &sql_plugin_published());
     register_pdp(
         &hub,
         Arc::new(PermitTenantsPdp::new(vec![tenant().as_uuid()])),
@@ -1192,7 +1202,7 @@ where
 async fn span_overhead_over_the_sql_plugin() {
     let mut documents = llm_gateway_documents();
     documents.extend(metric_base_documents());
-    let hub = hub_with_registry(in_process_registry(documents), &sql_plugin_published());
+    let hub = hub_with_registry(&documents, &sql_plugin_published());
     register_pdp(
         &hub,
         Arc::new(PermitTenantsPdp::new(vec![tenant().as_uuid()])),

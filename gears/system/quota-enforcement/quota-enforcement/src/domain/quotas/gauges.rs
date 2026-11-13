@@ -22,6 +22,7 @@ use tokio_util::sync::CancellationToken;
 use toolkit_macros::domain_model;
 
 use crate::domain::error::DomainError;
+use crate::domain::ports::contracts::RegistryCaller;
 use crate::domain::ports::coordination::{LeaderWork, LeaderWorkFuture};
 use crate::domain::ports::lifecycle_gauges::{LifecycleCounts, LifecycleGaugeSink};
 use crate::domain::ports::metric_registry::{Classified, Freshness, MetricMode, MetricRegistry};
@@ -135,7 +136,11 @@ impl LifecycleGaugeRefresher {
             .map_err(|e| RefreshError::Storage(DomainError::from(e)))?;
         let mut for_direct_metric = 0u64;
         for (metric, active) in &counts.by_metric {
-            match self.metric_registry.describe(metric).await {
+            match self
+                .metric_registry
+                .describe(RegistryCaller::Platform, metric)
+                .await
+            {
                 Ok(Some(Classified {
                     descriptor,
                     freshness: Freshness::Fresh,

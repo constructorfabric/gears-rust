@@ -5,6 +5,7 @@ use quota_enforcement_sdk::{MetricId, MetricKind};
 
 use super::MetricClassifications;
 use crate::domain::error::DomainError;
+use crate::domain::ports::contracts::RegistryCaller;
 use crate::domain::ports::metric_registry::{
     Classified, Freshness, MetricDescriptor, MetricMode, MetricRegistry,
 };
@@ -29,7 +30,11 @@ struct Registry {
 
 #[async_trait]
 impl MetricRegistry for Registry {
-    async fn describe(&self, _metric: &MetricId) -> Result<Option<Classified>, DomainError> {
+    async fn describe(
+        &self,
+        _caller: RegistryCaller<'_>,
+        _metric: &MetricId,
+    ) -> Result<Option<Classified>, DomainError> {
         self.calls
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(self.answer.map(|descriptor| Classified {
@@ -91,7 +96,7 @@ async fn a_metric_the_registry_removed_is_left_out_rather_than_defaulted() {
     // as gated either: it is absent, and an operation on it is refused.
     assert!(
         registry
-            .describe(&metric())
+            .describe(RegistryCaller::Platform, &metric())
             .await
             .expect("the registry answers")
             .is_none()
@@ -107,7 +112,11 @@ struct MalformedRegistry;
 
 #[async_trait]
 impl MetricRegistry for MalformedRegistry {
-    async fn describe(&self, metric: &MetricId) -> Result<Option<Classified>, DomainError> {
+    async fn describe(
+        &self,
+        _caller: RegistryCaller<'_>,
+        metric: &MetricId,
+    ) -> Result<Option<Classified>, DomainError> {
         Err(DomainError::MetricClassificationInvalid {
             metric: metric.as_str().to_owned(),
         })

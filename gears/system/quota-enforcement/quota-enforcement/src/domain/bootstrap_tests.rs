@@ -28,9 +28,10 @@ use crate::infra::types_registry::TypesRegistryContracts;
 use crate::test_support::{
     DenyAllPdp, FailingPdp, FakeContractRegistry, FakeMetricRegistry, LLM_MODEL_RESOURCE,
     LLM_TENANT_PROJECTION, LLM_TOKEN_CONSTRAINT, LLM_TOKEN_REQUEST, LLM_USER_PROJECTION,
-    METRIC_OTHER, METRIC_TOKENS, PermitTenantsPdp, RecordingMetrics, StaticCoordinatorBinding, ctx,
-    hub_with, idle_work, in_process_registry, llm_gateway_documents, metric_base_documents,
-    register_sink, register_storage, sink_instance, storage_instance, tenant,
+    METRIC_OTHER, METRIC_TOKENS, ManagedRegistry, PermitTenantsPdp, RecordingMetrics,
+    StaticCoordinatorBinding, ctx, hub_with, idle_work, llm_gateway_documents,
+    metric_base_documents, register_sink, register_storage, sink_instance, storage_instance,
+    tenant,
 };
 
 fn type_id(raw: &str) -> GtsTypeId {
@@ -467,12 +468,16 @@ async fn a_registry_that_does_not_answer_the_metric_scan_fails_on_the_registry_d
 /// The mandatory real-registry test: registration, discovery, resolution,
 /// compilation, and an idempotent restart, with nothing mocked between the
 /// gear and `types-registry`.
+/// The real managed registry: the owner contracts admit through real
+/// admission, and bootstrap reads their materialized artifacts.
 #[tokio::test]
-async fn the_real_registry_bootstraps_registers_discovers_compiles_and_restarts_idempotently() {
-    let mut extra = llm_gateway_documents();
-    extra.extend(metric_base_documents());
-    let client = in_process_registry(extra);
-    let registry: Arc<dyn ContractRegistry> = Arc::new(TypesRegistryContracts::new(client.clone()));
+async fn the_real_registry_bootstraps_discovers_compiles_and_restarts_idempotently() {
+    let mut extra = metric_base_documents();
+    extra.extend(llm_gateway_documents());
+    let managed = ManagedRegistry::start(extra).await;
+    let hub = Arc::new(ClientHub::new());
+    managed.install(&hub);
+    let registry: Arc<dyn ContractRegistry> = Arc::new(TypesRegistryContracts::new(hub));
 
     let first = harness_with_registry(
         Arc::new(InMemoryStorage::new()),

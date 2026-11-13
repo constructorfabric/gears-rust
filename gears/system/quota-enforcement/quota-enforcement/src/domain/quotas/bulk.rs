@@ -537,7 +537,7 @@ impl QuotaManagement<'_> {
             let draft = validate_create_shape(quota)
                 .map_err(|error| self.shape_rejected(error).at_item(index))?;
             let PreparedCreate { draft, events, .. } = self
-                .prepare_create(draft)
+                .prepare_create(ctx, draft)
                 .await
                 .map_err(|error| error.at_item(index))?;
             entries.push(BulkCreateEntry {

@@ -205,7 +205,7 @@ not here.
 
 - **Scope**:
   - `QuotaManagementService` with transactional CRUD via the storage plugin
-  - Metric existence/kind/mode validation through `TypesRegistryClient` with LRU cache, fail-closed
+  - Metric existence/kind/mode validation through `types-registry-sdk` with LRU cache, fail-closed
   - Cap semantics (`CAP_MUST_BE_NON_NEGATIVE`, `cap = 0`, `cap = null`, `CAP_BELOW_CONSUMED` at commit time)
   - Quota Metadata validation against the owner's constraint contract at write time only
   - Validity-window storage and `currently_within_window` computation

@@ -20,6 +20,7 @@ use quota_enforcement_sdk::MetricId;
 use toolkit_macros::domain_model;
 
 use crate::domain::error::DomainError;
+use crate::domain::ports::contracts::RegistryCaller;
 use crate::domain::ports::metric_registry::{MetricDescriptor, MetricMode, MetricRegistry};
 use crate::domain::ports::metrics::MetricLabel;
 
@@ -51,7 +52,7 @@ impl MetricClassifications {
             if by_metric.contains_key(&metric) || absent.contains(&metric) {
                 continue;
             }
-            match registry.describe(&metric).await {
+            match registry.describe(RegistryCaller::Platform, &metric).await {
                 Ok(Some(classified)) => {
                     by_metric.insert(metric, classified.descriptor);
                 }

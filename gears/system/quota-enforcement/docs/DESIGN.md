@@ -97,7 +97,7 @@ Requirements that significantly influence architecture decisions.
 | `cpt-cf-quota-enforcement-fr-enforcement-mode`                   | `enforcement_mode` reserves the `hard` GTS instance (`gts.cf.core.qe.enforcement_type.v1~cf.core.qe.hard.v1`) — the only value accepted in P1. Future modes (`hard_with_clamp`) are added as new GTS instances per `cpt-cf-quota-enforcement-fr-enforcement-mode` + PRD §13 «Cap-clamp for batch-style admission (P3)» OQ.                                                                                                                                            |
 | `cpt-cf-quota-enforcement-fr-hard-quota-reject`                  | `most-restrictive-wins` Engine returns `Decision::Denied { violated_quota_ids, reason }` when no applicable Quota is satisfiable (every bounded Quota in every tier has `remaining < amount` and no applicable unbounded Quota exists); `EvaluationOrchestrator` aborts mutation, no counter touched. See PRD §5.9 for binding-Quota selection and the cascade/Denial rules.                                                                                                   |
 | `cpt-cf-quota-enforcement-fr-quota-type-rate-rejection`          | `quota_type` reserves the `rate` GTS instance (`gts.cf.core.qe.quota_type.v1~cf.core.qe.rate.v1`) but rejects Quota create/update referencing it with the canonical `Unimplemented` error; `rate_spec` JSON field migration deferred to P3 (zero-cost reservation in P1 per PRD §5.3).                                                                                                                                                                                             |
-| `cpt-cf-quota-enforcement-fr-metric-identity-validation`         | `QuotaManagementService` validates `metric_name` against `types-registry` at Quota create/update via `TypesRegistryClient` (ClientHub-mediated SDK trait); in-process LRU cache; fail-closed on registry unavailability; unknown metric → actionable creation-time error.                                                                                                                                                                                                      |
+| `cpt-cf-quota-enforcement-fr-metric-identity-validation`         | `QuotaManagementService` validates `metric_name` against `types-registry` at Quota create/update via `types-registry-sdk` (ClientHub-mediated SDK trait); in-process LRU cache; fail-closed on registry unavailability; unknown metric → actionable creation-time error.                                                                                                                                                                                                      |
 | `cpt-cf-quota-enforcement-fr-quota-metadata`                     | Separate owner-published constraint contract; ≤ 4 KB and schema conformance enforced at create/update, then stored and snapshotted at the locked read without hot-path revalidation (ADR-0003/0007).                                                                                                                                                                                                                                                                       |
 | `cpt-cf-quota-enforcement-fr-attribute-based-quota-selection`    | Engine consumes validated request and arbitration constraints; `PolicyService` statically validates property references and pair compatibility while the Engine retains semantic interpretation.                                                                                                                                                                                                                                                                                  |
 | `cpt-cf-quota-enforcement-fr-quota-cascade`                      | Two P1 cascade capabilities: (a) **default subject-scope cascade** in the built-in `most-restrictive-wins` Engine — single-entry Debit Plan via subject-scope tier walk (user-scope > tenant-scope in P1); (b) **customizable multi-entry cascade** via `cel` Policies that produce arbitrary sparse or split Debit Plans (cross-tier split, intra-tier cascade, proportional distributions). Worked example: PRD use case `cpt-cf-quota-enforcement-usecase-cascade-via-cel`. |
@@ -543,7 +543,7 @@ platform operators.
 
 Validation (cap non-negative and within `0..=i64::MAX`, thresholds-require-bounded-cap, the period rule: consumption
 Quotas require an explicit valid period, `one_time` included, `PERIOD_REQUIRED` otherwise; allocation Quotas reject
-any period field, `null` included, `PERIOD_NOT_ALLOWED`); metric existence check via `TypesRegistryClient` (platform
+any period field, `null` included, `PERIOD_NOT_ALLOWED`); metric existence check via `types-registry-sdk` (platform
 `types-registry-sdk`, obtained from ClientHub) — runs **outside** the storage transaction; bounded, TTL-refreshed
 in-process cache of metric classifications parsed into closed enums (kind `Counter`/`Gauge`, enforcement mode
 `QuotaGated`/`Direct`); a registered metric without a usable classification is `METRIC_CLASSIFICATION_INVALID`, never
@@ -564,7 +564,7 @@ contract: schema publication, validation against the real registry, and the clas
 Done stay open until the platform contract exists, and a deployment whose metric instances lack the fields fails closed
 on Quota creation with `METRIC_CLASSIFICATION_INVALID`.
 
-The same `TypesRegistryClient` and bounded LRU resolve the metric owner's subject projection and separate Quota-
+The same `types-registry-sdk` and bounded LRU resolve the metric owner's subject projection and separate Quota-
 attribute contract. `quota.metadata` is validated at create/update before persistence, outside the storage transaction.
 Validation wraps the object into the contract envelope `{type, metadata}` and checks the whole document. At evaluation
 ingress, the Gateway applies the same complete-contract rule by wrapping operation metadata and validating the
@@ -583,7 +583,7 @@ through `EvaluationOrchestrator` into the storage plugin (phase-2). Does not own
 ##### Related components (by ID)
 
 - `cpt-cf-quota-enforcement-component-storage-plugin` — calls CRUD primitives.
-- `cpt-cf-quota-enforcement-actor-types-registry` (external) — consulted via `TypesRegistryClient` for metric-name
+- `cpt-cf-quota-enforcement-actor-types-registry` (external) — consulted via `types-registry-sdk` for metric-name
   validation.
 
 #### QuotaEnforcementService
@@ -637,7 +637,7 @@ not interpret scope semantics — compilation is `SecureConn`'s responsibility.
 Does not own arbitration logic (delegated to Engines). Does not own counter mutation mechanics (delegated to Storage
 plugin). Does not pre-eval on idempotency replay — replay returns the stored `decision_blob` verbatim (satisfies the
 idempotency-replay rule of `cpt-cf-quota-enforcement-fr-idempotency` by never re-invoking the Engine on replay).
-It has no `TypesRegistryClient`, performs no schema resolution, and does not revalidate stored Quota metadata. Registry
+It has no `types-registry-sdk`, performs no schema resolution, and does not revalidate stored Quota metadata. Registry
 latency or availability therefore cannot enter the evaluation transaction.
 
 Synchronization between concurrent EO instances (every gateway replica runs an EO) is delegated entirely to the storage
@@ -667,7 +667,7 @@ Policy at evaluation time (`global` ← per-metric).
 CRUD on `policies` and `policy_versions` tables via Storage plugin; the latest-version
 pointer is read authoritatively from storage on every evaluation (`read_policy` inside the evaluation transaction,
 §3.6), so every replica always evaluates the active version; only immutable version-keyed `ValidatedConfig`
-artifacts are cached; contract resolution/snapshotting via `TypesRegistryClient`; `engine_config` validation
+artifacts are cached; contract resolution/snapshotting via `types-registry-sdk`; `engine_config` validation
 delegated to the named Engine's `validate_config` with request/constraint schemas. The `cel` validator statically checks
 property references plus pair compatibility for `{request, resource, arbitration}`, returning line/column diagnostics.
 In P1 it also rejects a
@@ -1995,7 +1995,7 @@ sequenceDiagram
     participant PEP as PolicyEnforcer
     participant PDP as authz-resolver
     participant QMS as QuotaManagementService
-    participant TR as types-registry<br/>(via TypesRegistryClient)
+    participant TR as types-registry<br/>(via types-registry-sdk)
     participant SP as StoragePlugin
 
     Op ->> GW: POST /quotas (QuotaDraft)
@@ -2025,7 +2025,7 @@ sequenceDiagram
 **Description.** Quota creation (`cpt-cf-quota-enforcement-fr-quota-lifecycle`). `QuotaManagementService` validates the
 draft against PRD §5.2 rules (cap non-negative, thresholds-require-bounded-cap, the period rule — consumption Quotas
 require an explicit valid period, `one_time` included, allocation Quotas reject any period field — and source enum
-membership), then calls `TypesRegistryClient` (platform `types-registry-sdk`, ClientHub-mediated) to confirm the metric
+membership), then calls `TypesRegistryApi` (`types-registry-sdk`, under the caller's context, ClientHub-mediated) to confirm the metric
 is **registered** (`cpt-cf-quota-enforcement-fr-metric-identity-validation`); the in-process LRU cache and fail-closed
 mapping for the registry-unavailable case live inside `QuotaManagementService`. Unknown metric → `MetricNotRegistered`
 (400). Metric mode (`QuotaGated` / `Direct`) is **not** a create-time rejection criterion — per PRD §3.2 a Quota MAY be
@@ -2292,11 +2292,11 @@ snapshot on write, and the interval becomes a fallback.
 1. Verifying schema is at the trait's major version (returns `SchemaVersionMismatch` otherwise).
 1. Seeding the `global` Quota Resolution Policy with the `most-restrictive-wins` Engine if it does not exist (cannot be
    deleted thereafter per `cpt-cf-quota-enforcement-fr-quota-resolution-policy`).
-1. Registering the abstract QE bases `gts.cf.core.qe.subj.v1~`, `gts.cf.core.qe.res.v1~`,
+1. Requiring the admitted abstract QE bases `gts.cf.core.qe.subj.v1~`, `gts.cf.core.qe.res.v1~`,
    `gts.cf.core.qe.request.v1~`, and `gts.cf.core.qe.constraint.v1~`, plus
    `gts.cf.core.qe.scope.v1~` and its P1 well-known instances
    `gts.cf.core.qe.scope.v1~cf.core.qe.user.v1` and
-   `gts.cf.core.qe.scope.v1~cf.core.qe.tenant.v1`, through `TypesRegistryClient` if missing. Concrete owner
+   `gts.cf.core.qe.scope.v1~cf.core.qe.tenant.v1`, published by the runtime before `init` (`gts_publication`). Concrete owner
    projections are published by their owners; QE seeds no platform-wide subject instances.
 1. Resolving every configured subject/resource projection and per-metric request contract into a candidate
    `ProjectionContractCatalog`.

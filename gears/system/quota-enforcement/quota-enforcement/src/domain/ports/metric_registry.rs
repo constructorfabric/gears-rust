@@ -18,6 +18,7 @@ use quota_enforcement_sdk::{MetricId, MetricKind};
 use toolkit_macros::domain_model;
 
 use crate::domain::error::DomainError;
+use crate::domain::ports::contracts::RegistryCaller;
 
 /// Registry-reported enforcement mode of a metric (PRD section 3.2, "Gated vs
 /// Non-Gated Metrics"). Closed.
@@ -74,5 +75,11 @@ pub trait MetricRegistry: Send + Sync {
     ///   answer and no cached answer within the grace exists (fail closed).
     /// - [`DomainError::MetricClassificationInvalid`] when the instance is
     ///   registered but carries no usable `kind` and `enforcement`.
-    async fn describe(&self, metric: &MetricId) -> Result<Option<Classified>, DomainError>;
+    /// - [`DomainError::RegistryRefusedCaller`] when the registry refuses a
+    ///   request's caller (401/403); never masked by a cached answer.
+    async fn describe(
+        &self,
+        caller: RegistryCaller<'_>,
+        metric: &MetricId,
+    ) -> Result<Option<Classified>, DomainError>;
 }

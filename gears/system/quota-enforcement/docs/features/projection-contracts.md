@@ -162,7 +162,7 @@ only; the Quota write itself is owned by the quota-lifecycle feature)
 
 - [x] `p1` - **ID**: `cpt-cf-quota-enforcement-algo-catalog-bootstrap`
 
-**Input**: deployment configuration naming the projections configured for evaluation, `TypesRegistryClient`
+**Input**: deployment configuration naming the projections configured for evaluation, `PlatformTypesRegistryApi`
 
 **Output**: the published immutable `ProjectionContractCatalog`, or failed gear bootstrap
 
@@ -259,7 +259,7 @@ QE-owned definitions, seeding no platform-wide subject instances, and exposing n
 **Constraints**: `cpt-cf-quota-enforcement-constraint-types-registry-delegation`
 
 **Touches**:
-- API: `TypesRegistryClient` (platform `types-registry-sdk`, obtained from ClientHub)
+- API: `PlatformTypesRegistryApi` (`types-registry-sdk`, a consumed contract obtained from ClientHub)
 - Entities: `SubjectScope`
 
 ### Projection Contract Catalogue
@@ -281,7 +281,7 @@ no QE-side table exists.
 **Constraints**: `cpt-cf-quota-enforcement-constraint-types-registry-delegation`
 
 **Touches**:
-- API: `TypesRegistryClient` (bootstrap only; never on the request path)
+- API: `PlatformTypesRegistryApi` (bootstrap only; never on the request path)
 - Entities: `ProjectionContractCatalog`, `SubjectProjectionContract`, `ResourceProjectionContract`,
   `MetricRequestContract`, `ConstraintContract`
 
