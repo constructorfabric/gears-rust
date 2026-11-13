@@ -14,33 +14,32 @@ use uuid::Uuid;
 
 use quota_enforcement_sdk::{QuotaEnforcementStoragePluginSpecV1, QuotaEnforcementStoragePluginV1};
 use toolkit::client_hub::ClientScope;
-use types_registry_sdk::{InstanceQuery, RegisterResult, TypesRegistryClient};
+use toolkit::gts::PluginV1;
+use toolkit::gts_publication::GtsPublicationCapability;
 
 use super::{INSTANCE_SEGMENT, StoragePluginGear};
 use crate::infra::storage::Migrator;
 use crate::test_support::{draft, tenant};
 
-/// A real in-process types-registry seeded with the process inventory (the
-/// storage plugin spec among it) and switched to ready, as at run time.
-fn in_process_registry() -> Arc<dyn TypesRegistryClient> {
-    let config = types_registry::config::TypesRegistryConfig::default();
-    let repository = Arc::new(types_registry::infra::InMemoryGtsRepository::new(
-        config.to_gts_config(),
-    ));
-    let service = Arc::new(types_registry::domain::TypesRegistryService::new(
-        repository, config,
-    ));
-    let mut entries = toolkit::gts::all_inventory_type_schemas().expect("inventory type schemas");
-    entries.extend(toolkit::gts::all_inventory_instances().expect("inventory instances"));
-    RegisterResult::ensure_all_ok(&service.register(entries)).expect("inventory registers");
-    service.switch_to_ready().expect("registry ready");
-    Arc::new(types_registry::domain::legacy_local_client::TypesRegistryLocalClient::new(service))
+fn hub() -> Arc<ClientHub> {
+    Arc::new(ClientHub::new())
 }
 
-fn hub() -> Arc<ClientHub> {
-    let hub = Arc::new(ClientHub::new());
-    hub.register::<dyn TypesRegistryClient>(in_process_registry());
-    hub
+/// The plugin instance the runtime publishes for `vendor` (priority 0, the
+/// configuration default).
+fn instance_id(vendor: &str) -> String {
+    let (id, _) = PluginV1::<QuotaEnforcementStoragePluginSpecV1>::build_registration(
+        INSTANCE_SEGMENT,
+        vendor,
+        0,
+    )
+    .expect("plugin instance serializes");
+    id.as_ref().to_owned()
+}
+
+fn bound(hub: &ClientHub, id: &str) -> bool {
+    hub.try_get_scoped::<dyn QuotaEnforcementStoragePluginV1>(&ClientScope::gts_id(id))
+        .is_some()
 }
 
 struct StaticConfigProvider {
@@ -57,12 +56,31 @@ async fn make_ctx(vendor: &str, with_db: bool) -> GearCtx {
     make_ctx_over(vendor, with_db, hub()).await
 }
 
+fn config(vendor: &str) -> StaticConfigProvider {
+    StaticConfigProvider {
+        root: json!({ "quota-enforcement-storage-plugin": { "config": { "vendor": vendor } } }),
+    }
+}
+
+/// A context with the manifest the runtime admits before `init`.
 async fn make_ctx_over(vendor: &str, with_db: bool, hub: Arc<ClientHub>) -> GearCtx {
-    let cfg = json!({ "quota-enforcement-storage-plugin": { "config": { "vendor": vendor } } });
+    let ctx = unpublished_ctx_over(vendor, with_db, hub).await;
+    match StoragePluginGear::default()
+        .descriptor()
+        .build_gts_manifest(&config(vendor))
+    {
+        Ok(manifest) => ctx.with_gts_publication_manifest_for_test(Arc::new(manifest)),
+        // An invalid configuration builds no manifest; `init` reports it.
+        Err(_) => ctx,
+    }
+}
+
+/// As [`make_ctx_over`], without the admitted manifest.
+async fn unpublished_ctx_over(vendor: &str, with_db: bool, hub: Arc<ClientHub>) -> GearCtx {
     let ctx = GearCtx::new(
         StoragePluginGear::MODULE_NAME,
         Uuid::from_u128(1),
-        Arc::new(StaticConfigProvider { root: cfg }),
+        Arc::new(config(vendor)),
         hub,
         CancellationToken::new(),
     );
@@ -160,36 +178,79 @@ async fn init_fails_on_a_blank_vendor_and_on_a_second_call() {
     assert!(err.to_string().contains("already initialized"), "{err}");
 }
 
+/// The manifest is the configured instance, without `init`.
+#[test]
+fn the_manifest_is_the_configured_plugin_instance() {
+    let manifest = StoragePluginGear::default()
+        .descriptor()
+        .build_gts_manifest(&config("acme"))
+        .expect("manifest");
+
+    let ids: Vec<&str> = manifest
+        .documents()
+        .iter()
+        .map(|(id, _)| id.as_ref())
+        .collect();
+    assert_eq!(ids, [instance_id("acme").as_str()]);
+    assert!(ids[0].ends_with(INSTANCE_SEGMENT), "{}", ids[0]);
+    assert_eq!(
+        manifest.publisher_name(),
+        "quota-enforcement-storage-plugin"
+    );
+}
+
+/// Outside the runtime — without an admitted manifest — `init` fails, binds
+/// nothing and builds nothing, so the runtime's `init` then succeeds.
 #[tokio::test]
-async fn init_publishes_one_plugin_instance_whose_scoped_client_answers_the_contract() {
+async fn init_without_an_admitted_manifest_binds_nothing() {
+    let hub = hub();
+    let gear = StoragePluginGear::default();
+
+    let err = gear
+        .init(&unpublished_ctx_over("acme", true, Arc::clone(&hub)).await)
+        .await
+        .expect_err("no admitted manifest");
+
+    assert!(
+        format!("{err:#}").contains("admitted GTS manifest"),
+        "{err:#}"
+    );
+    assert!(!bound(&hub, &instance_id("acme")));
+    assert!(gear.plugin().is_none(), "nothing is built");
+
+    gear.init(&make_ctx_over("acme", true, Arc::clone(&hub)).await)
+        .await
+        .expect("init with the manifest");
+    assert!(bound(&hub, &instance_id("acme")));
+}
+
+/// An invalid configuration is never advertised: it builds no manifest.
+#[test]
+fn an_invalid_configuration_publishes_nothing() {
+    let err = StoragePluginGear::default()
+        .descriptor()
+        .build_gts_manifest(&config("  "))
+        .expect_err("a blank vendor is invalid");
+    assert!(format!("{err:#}").contains("vendor"), "{err:#}");
+}
+
+/// `init` binds the scoped client to the admitted instance, and the client
+/// answers the contract.
+#[tokio::test]
+async fn init_binds_the_admitted_instance_whose_scoped_client_answers_the_contract() {
     let hub = hub();
     let gear = StoragePluginGear::default();
     gear.init(&make_ctx_over("acme", true, Arc::clone(&hub)).await)
         .await
         .expect("init");
 
-    let registry = hub.get::<dyn TypesRegistryClient>().expect("registry");
-    let instances = registry
-        .list_instances(InstanceQuery::new().with_pattern(format!(
-            "{}*",
-            <QuotaEnforcementStoragePluginSpecV1 as gts::GtsSchema>::TYPE_ID
-        )))
-        .await
-        .expect("list");
-    assert_eq!(instances.len(), 1, "one instance: {instances:?}");
-    let instance = &instances[0];
-    assert!(
-        instance.id.to_string().ends_with(INSTANCE_SEGMENT),
-        "{}",
-        instance.id
-    );
     let client = hub
-        .try_get_scoped::<dyn QuotaEnforcementStoragePluginV1>(&ClientScope::gts_id(
-            instance.id.as_ref(),
-        ))
-        .expect("the scoped client is registered under the instance");
+        .try_get_scoped::<dyn QuotaEnforcementStoragePluginV1>(&ClientScope::gts_id(&instance_id(
+            "acme",
+        )))
+        .expect("the scoped client is bound under the admitted instance");
     client
         .bootstrap(&BootstrapBundle::foundation())
         .await
-        .expect("the published client answers the contract");
+        .expect("the bound client answers the contract");
 }

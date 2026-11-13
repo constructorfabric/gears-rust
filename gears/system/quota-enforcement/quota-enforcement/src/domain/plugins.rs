@@ -1,10 +1,14 @@
 //! Plugin binding: select the storage plugin by vendor, discover every
 //! notification sink, and resolve their scoped `ClientHub` clients.
 //!
-//! Storage selection goes through the types registry (`GtsPluginSelector`
-//! semantics: same vendor, lowest priority wins). Sinks are not selected:
-//! every registered sink of every vendor receives every event. Nothing is
-//! cached here; bootstrap resolves once and keeps the handles.
+//! Both read every page of the Active plugin instances through the platform
+//! registry API (`PlatformTypesRegistryApi`). Storage selection considers only
+//! instances whose scoped client this process bound (`choose_registered_plugin_instance`:
+//! same vendor, lowest priority wins), so a stale instance of an earlier
+//! deployment never wins. Sinks are not selected: every Active sink instance
+//! of every vendor receives every event, and one without a bound client fails
+//! bootstrap. Nothing is cached here; bootstrap resolves once and keeps the
+//! handles.
 //!
 //! Singleton coordination is not a plugin of this gear. The platform `cluster`
 //! gear provides it, and `infra::cluster_coordination` resolves it (ADR-0006).
@@ -19,10 +23,14 @@ use quota_enforcement_sdk::{
 };
 use toolkit::client_hub::{ClientHub, ClientScope};
 use toolkit::gts::PluginV1;
-use toolkit::plugins::choose_plugin_instance;
+use toolkit::plugins::choose_registered_plugin_instance;
 use toolkit_canonical_errors::CanonicalError;
 use toolkit_macros::domain_model;
-use types_registry_sdk::{GtsInstance, InstanceQuery, TypesRegistryClient};
+use toolkit_security::PlatformSecurityContext;
+use types_registry_sdk::{
+    GtsIdPattern, Instance, ListEntitiesRequest, PlatformTypesRegistryApi,
+    PlatformTypesRegistryApiExt,
+};
 
 use super::error::{DomainError, PluginKind};
 
@@ -60,16 +68,20 @@ impl PluginBinding {
     /// # Errors
     ///
     /// - [`DomainError::TypesRegistryUnavailable`] when the registry cannot answer.
-    /// - [`DomainError::PluginNotFound`] when no instance matches the vendor.
+    /// - [`DomainError::PluginNotFound`] when no instance with a bound client
+    ///   matches the vendor, including one only advertised by another process.
     /// - [`DomainError::InvalidPluginInstance`] when an instance is malformed.
-    /// - [`DomainError::PluginClientNotRegistered`] when the instance exists
-    ///   but its scoped client does not.
+    /// - [`DomainError::PluginClientNotRegistered`] when the selected
+    ///   instance's scoped client is gone by the time it is resolved.
     pub async fn resolve_storage(
         &self,
     ) -> Result<Arc<dyn QuotaEnforcementStoragePluginV1>, DomainError> {
         let kind = PluginKind::Storage;
         let gts_id = self
-            .select::<QuotaEnforcementStoragePluginSpecV1>(kind, &self.storage_vendor)
+            .select::<QuotaEnforcementStoragePluginSpecV1, dyn QuotaEnforcementStoragePluginV1>(
+                kind,
+                &self.storage_vendor,
+            )
             .await?;
         self.hub
             .try_get_scoped::<dyn QuotaEnforcementStoragePluginV1>(&ClientScope::gts_id(&gts_id))
@@ -102,9 +114,12 @@ impl PluginBinding {
                 gts_id: gts_id.to_owned(),
                 reason,
             };
+            let content = instance
+                .content
+                .clone()
+                .ok_or_else(|| invalid("the registry returned no content".to_owned()))?;
             let content: PluginV1<QuotaNotificationSinkSpecV1> =
-                serde_json::from_value(instance.object.clone())
-                    .map_err(|e| invalid(e.to_string()))?;
+                serde_json::from_value(content).map_err(|e| invalid(e.to_string()))?;
             if content.id != gts_id {
                 return Err(invalid(format!("content.id is {:?}", content.id)));
             }
@@ -137,13 +152,17 @@ impl PluginBinding {
         // @cpt-end:cpt-cf-quota-enforcement-flow-sink-delivery:p1:inst-del-register
     }
 
-    async fn select<P>(&self, kind: PluginKind, vendor: &str) -> Result<String, DomainError>
+    /// The instance of `P` for `vendor` among those with a bound `C` client.
+    async fn select<P, C>(&self, kind: PluginKind, vendor: &str) -> Result<String, DomainError>
     where
         P: for<'de> gts::GtsDeserialize<'de> + gts::GtsSchema,
+        C: ?Sized + Send + Sync + 'static,
     {
         let instances = self.list::<P>().await?;
-        let candidates = instances.iter().map(|e| (e.id.as_ref(), &e.object));
-        let gts_id = choose_plugin_instance::<P>(vendor, candidates)
+        let candidates = instances
+            .iter()
+            .map(|e| (e.id.as_ref(), e.content.as_ref()));
+        let gts_id = choose_registered_plugin_instance::<P, C>(&self.hub, vendor, candidates)
             .map_err(|e| DomainError::plugin_selection(kind, e))?;
         tracing::info!(
             target: "qe.bootstrap",
@@ -155,24 +174,25 @@ impl PluginBinding {
         Ok(gts_id)
     }
 
-    /// Every registered instance of the plugin spec `P`.
-    async fn list<P: gts::GtsSchema>(&self) -> Result<Vec<GtsInstance>, DomainError> {
+    /// Every Active instance of the plugin spec `P`, with its content, from
+    /// every page. One deadline bounds the whole listing.
+    async fn list<P: gts::GtsSchema>(&self) -> Result<Vec<Instance>, DomainError> {
         let registry = self
             .hub
-            .get::<dyn TypesRegistryClient>()
+            .get::<dyn PlatformTypesRegistryApi>()
             .map_err(|e| DomainError::TypesRegistryUnavailable(e.to_string()))?;
         let type_id = <P as gts::GtsSchema>::TYPE_ID;
+        let pattern = GtsIdPattern::try_new(&format!("{type_id}*"))
+            .map_err(|e| DomainError::Internal(format!("plugin listing pattern: {e}")))?;
         // A registry that never answers must fail bootstrap, not hang it.
-        let mut instances = bounded(
+        bounded(
             self.deadline,
-            registry.list_instances(InstanceQuery::new().with_pattern(format!("{type_id}*"))),
+            registry.list_instances(
+                &PlatformSecurityContext::outbound_marker(),
+                ListEntitiesRequest::matching(pattern),
+            ),
         )
-        .await?;
-        // A registry answers the pattern query with instances of this spec. The
-        // prefix filter keeps the result correct against a registry that
-        // ignores the pattern, so a foreign instance never fails deserialization.
-        instances.retain(|e| e.id.as_ref().starts_with(type_id));
-        Ok(instances)
+        .await
     }
 }
 

@@ -4252,7 +4252,6 @@ dependencies = [
  "cf-gears-toolkit-db-macros",
  "cf-gears-toolkit-macros",
  "cf-gears-toolkit-security",
- "cf-gears-types-registry",
  "cf-gears-types-registry-sdk",
  "gts",
  "inventory",

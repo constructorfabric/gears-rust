@@ -36,10 +36,8 @@ toolkit-db = { workspace = true, features = ["sqlite"] }
 toolkit-db-macros = { workspace = true }
 toolkit-macros = { workspace = true }
 toolkit-security = { workspace = true }
-# Registers the plugin instance the gear selects storage by.
-types-registry-sdk = { workspace = true }
-# The `deps = [types_registry]` edge of the gear macro names this crate.
-types-registry = { workspace = true }
+# `GtsId` of the published plugin instance; `gts_publication` needs the REST client.
+types-registry-sdk = { workspace = true, features = ["rest-client"] }
 
 sea-orm = { workspace = true }
 sea-orm-migration = { workspace = true }
@@ -69,6 +67,7 @@ toolkit-db = { workspace = true, features = ["sqlite", "test-support"] }
 # build, so the integration suites reach the test-only outbox starter.
 cf-gears-quota-enforcement-storage-plugin = { path = ".", features = ["test-util"] }
 quota-enforcement-sdk = { workspace = true, features = ["test-util"] }
+toolkit = { workspace = true, features = ["test-support"] }
 tokio = { workspace = true, features = ["rt", "macros"] }
 tokio-util = { workspace = true }
 # Unconditional: dev-dependencies cannot be optional; the suite that needs a

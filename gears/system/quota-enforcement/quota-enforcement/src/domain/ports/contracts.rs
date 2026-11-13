@@ -2,8 +2,8 @@
 //! (`features/projection-contracts.md`, ADR-0007).
 //!
 //! The domain reads owner-published contracts from the platform
-//! `types-registry` through this port and re-asserts the QE-owned definitions
-//! through it at bootstrap. Its only production implementation is
+//! `types-registry` through this port. The QE-owned definitions are published
+//! before the gear's `init` (`gts_publication`), not through this port. Its only production implementation is
 //! `infra::types_registry::TypesRegistryContracts`.
 //!
 //! Discovery and resolution are separate methods on purpose. `derived_types`
@@ -14,7 +14,6 @@
 
 use async_trait::async_trait;
 use gts::{CompilePayloadValidatorError, GtsInstanceId, GtsTypeId, PayloadValidator};
-use quota_enforcement_sdk::OwnedDefinition;
 use serde_json::Value;
 use toolkit_macros::domain_model;
 
@@ -65,17 +64,6 @@ pub struct DiscoveredType {
 /// The registry as the catalogue needs it.
 #[async_trait]
 pub trait ContractRegistry: Send + Sync {
-    /// Register the QE-owned definitions that are missing. A byte-identical
-    /// definition already present is a success.
-    ///
-    /// # Errors
-    ///
-    /// - [`DomainError::CatalogInvalid`] with `DefinitionConflict` when a
-    ///   definition exists with different content or is rejected.
-    /// - [`DomainError::TypesRegistryUnavailable`] when the registry cannot
-    ///   answer.
-    async fn ensure_registered(&self, definitions: &[OwnedDefinition]) -> Result<(), DomainError>;
-
     /// Resolve one type with its complete reference graph. `Ok(None)` when it
     /// is not registered.
     ///

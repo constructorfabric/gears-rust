@@ -23,14 +23,12 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use gts::{GtsInstanceId, GtsRefValidation, GtsStore, GtsTypeId, extract_gts_refs};
-use quota_enforcement_sdk::OwnedDefinition;
 use serde_json::Value;
 use toolkit_canonical_errors::CanonicalError;
-use types_registry_sdk::{GtsTypeSchema, RegisterResult, TypeSchemaQuery, TypesRegistryClient};
+use types_registry_sdk::{GtsTypeSchema, TypeSchemaQuery, TypesRegistryClient};
 
 use crate::domain::error::DomainError;
 use crate::domain::ports::contracts::{ContractRegistry, DiscoveredType, RegisteredType};
-use crate::domain::ports::metrics::ValidationReason;
 
 const LOG_TARGET: &str = "qe.bootstrap";
 
@@ -176,32 +174,6 @@ fn is_abstract(raw: &Value) -> bool {
 
 #[async_trait]
 impl ContractRegistry for TypesRegistryContracts {
-    async fn ensure_registered(&self, definitions: &[OwnedDefinition]) -> Result<(), DomainError> {
-        let documents: Vec<Value> = definitions.iter().map(|d| d.document.clone()).collect();
-        let results = self
-            .bounded("register", self.registry.register(documents))
-            .await?;
-        // The registry compares content itself: a byte-identical definition is
-        // a silent success, so any per-item failure is a definition that
-        // exists with other content or was rejected outright.
-        for result in &results {
-            if let RegisterResult::Err { gts_id, error } = result {
-                let subject = gts_id.clone().unwrap_or_else(|| "<unknown>".to_owned());
-                tracing::error!(
-                    target: LOG_TARGET,
-                    gts_id = %subject,
-                    error = %error,
-                    "a QE-owned GTS definition could not be asserted"
-                );
-                return Err(DomainError::CatalogInvalid {
-                    reason: ValidationReason::DefinitionConflict,
-                    subject,
-                });
-            }
-        }
-        Ok(())
-    }
-
     async fn type_schema(&self, id: &GtsTypeId) -> Result<Option<RegisteredType>, DomainError> {
         let Some(root) = self.fetch_type(id.as_ref()).await? else {
             return Ok(None);

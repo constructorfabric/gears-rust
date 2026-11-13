@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 use quota_enforcement_sdk::{
     BootstrapBundle, EnvironmentInputs, PolicyDraft, PolicySchemaSnapshot, PolicyScope,
-    QuotaEnforcementStoragePluginV1, StorageError, owned_definitions,
+    QuotaEnforcementStoragePluginV1, StorageError,
 };
 use toolkit_macros::domain_model;
 
@@ -212,21 +212,6 @@ impl Bootstrap {
         // @cpt-end:cpt-cf-quota-enforcement-algo-engine-bootstrap-seed:p1:inst-ebs-seed
 
         // @cpt-begin:cpt-cf-quota-enforcement-flow-owner-projection-publication:p1:inst-pub-boot
-        // @cpt-begin:cpt-cf-quota-enforcement-algo-catalog-bootstrap:p1:inst-cat-bases
-        // Reasserting identical definitions is idempotent; conflicts fail.
-        let definitions = owned_definitions().map_err(|e| {
-            (
-                Dependency::Catalog,
-                DomainError::Internal(format!("embedded GTS definition does not parse: {e}")),
-            )
-        })?;
-        self.catalog
-            .registry
-            .ensure_registered(&definitions)
-            .await
-            .map_err(|e| (catalog_dependency(&e), e))?;
-        // @cpt-end:cpt-cf-quota-enforcement-algo-catalog-bootstrap:p1:inst-cat-bases
-
         // Publish only after the catalogue and stored bindings agree.
         let builder = CatalogBuilder::new(self.catalog.registry.as_ref(), self.metrics.as_ref());
         let catalog = builder

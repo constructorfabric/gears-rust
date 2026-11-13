@@ -4,16 +4,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use gts::{CompilePayloadValidatorError, GtsInstanceId, GtsTypeId};
-use quota_enforcement_sdk::{
-    METRIC_BASE_TYPE, REQUEST_BASE, SCOPE_TYPE, SCOPE_USER, SUBJECT_BASE, owned_definitions,
-};
-use serde_json::{Value, json};
+use quota_enforcement_sdk::{METRIC_BASE_TYPE, REQUEST_BASE, SCOPE_TYPE, SCOPE_USER, SUBJECT_BASE};
+use serde_json::json;
 use toolkit_canonical_errors::CanonicalError;
 
 use super::TypesRegistryContracts;
 use crate::domain::error::DomainError;
 use crate::domain::ports::contracts::ContractRegistry;
-use crate::domain::ports::metrics::ValidationReason;
 use crate::test_support::{
     LLM_TOKEN_REQUEST, LLM_USER_PROJECTION, METRIC_OTHER, METRIC_TOKENS, MIXIN_REQUEST, MIXIN_TYPE,
     in_process_registry, llm_gateway_documents, metric_base_documents, mixin_request_document,
@@ -194,40 +191,9 @@ async fn missing_types_and_instances_are_none_and_transport_failures_lift() {
 }
 
 #[tokio::test]
-async fn ensure_registered_is_idempotent_and_a_divergent_definition_is_a_conflict() {
+async fn the_real_registry_resolves_the_qe_bases_it_was_seeded_with() {
     let client = in_process_registry(Vec::new());
     let registry = TypesRegistryContracts::new(client.clone());
-    let definitions = owned_definitions().expect("definitions");
-
-    // The inventory already seeded these; asserting them again is a no-op.
-    registry
-        .ensure_registered(&definitions)
-        .await
-        .expect("byte-identical definitions register idempotently");
-    registry
-        .ensure_registered(&definitions)
-        .await
-        .expect("and again");
-
-    let mut divergent = definitions
-        .iter()
-        .find(|d| d.id == SCOPE_TYPE)
-        .cloned()
-        .expect("scope type");
-    divergent.document["description"] = Value::String("changed".to_owned());
-    let err = registry
-        .ensure_registered(&[divergent])
-        .await
-        .expect_err("the same id with other content is a conflict");
-    assert_eq!(
-        err,
-        DomainError::CatalogInvalid {
-            reason: ValidationReason::DefinitionConflict,
-            subject: SCOPE_TYPE.to_owned(),
-        }
-    );
-
-    // The real registry resolves the QE bases it was seeded with.
     let scope = registry
         .type_schema(&type_id(SCOPE_TYPE))
         .await

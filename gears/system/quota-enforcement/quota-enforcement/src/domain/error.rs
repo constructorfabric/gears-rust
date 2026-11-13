@@ -192,8 +192,10 @@ pub enum DomainError {
         /// The GTS id, metric, or pair the check failed on.
         subject: String,
     },
-    /// No plugin instance matched the configured vendor.
-    #[error("no {kind} plugin instance registered for vendor {vendor}")]
+    /// No plugin instance whose client this process bound matched the
+    /// configured vendor. An advertised instance without a bound client
+    /// never matches.
+    #[error("no bound {kind} plugin instance for vendor {vendor}")]
     PluginNotFound {
         /// Plugin family.
         kind: PluginKind,

@@ -57,11 +57,13 @@ const LOG_TARGET: &str = "qe.lifecycle";
 /// It is stateful because the bootstrap runs in the lifecycle entry and later
 /// features host their sweepers there under child cancellation tokens.
 // @cpt-dod:cpt-cf-quota-enforcement-dod-workspace-crates:p1
+#[toolkit::consumes(contract = types_registry_sdk::PlatformTypesRegistryApi, from = "types-registry")]
 #[toolkit::gear(
     name = "quota-enforcement",
     deps = [authz_resolver, types_registry],
     capabilities = [rest, stateful],
-    lifecycle(entry = "serve", stop_timeout = "30s", await_ready)
+    lifecycle(entry = "serve", stop_timeout = "30s", await_ready),
+    gts_publication(crates = [quota_enforcement_sdk]),
 )]
 #[toolkit::provides(
     contract = quota_enforcement_sdk::QuotaManagerApi,
@@ -322,6 +324,15 @@ impl Gear for QuotaEnforcementGear {
         if self.service.get().is_some() {
             anyhow::bail!("{} gear already initialized", Self::MODULE_NAME);
         }
+        // @cpt-begin:cpt-cf-quota-enforcement-algo-catalog-bootstrap:p1:inst-cat-bases
+        // The runtime admits the QE-owned definitions before `init`.
+        ctx.gts_publication_manifest().with_context(|| {
+            format!(
+                "{}: GTS declarations must be admitted before init",
+                Self::MODULE_NAME
+            )
+        })?;
+        // @cpt-end:cpt-cf-quota-enforcement-algo-catalog-bootstrap:p1:inst-cat-bases
         let cfg: QuotaEnforcementConfig = ctx.config_or_default()?;
         cfg.validate()?;
         tracing::Span::current().record("storage_vendor", cfg.storage_vendor.as_str());

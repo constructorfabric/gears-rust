@@ -10,17 +10,18 @@
 //!    `Problem.context.resource_type` (DESIGN section 3.3, "Error Model").
 //! 3. The **projection contract bases** of ADR-0007: four abstract bases, the
 //!    concrete scope-discriminator type, and its two P1 well-known instances.
-//!    The documents are the crate's `schemas/` copies of the reviewed JSON
-//!    Schema files under `docs/schemas`: the copies ship inside the published
-//!    crate, and a test holds them byte-identical to the reviewed files, so
-//!    the registry receives exactly what was reviewed.
-//!    They reach `types-registry` two ways: through the link-time inventory
-//!    the registry seeds itself from in the embedded profile, and through the
-//!    gear's bootstrap, which re-asserts them idempotently for the deployed
-//!    profile ([`owned_definitions`]).
+//!    They are declared as `gts_type_schema` structs in this crate's
+//!    collector ([`crate::gts_declarations`]); quota-enforcement publishes
+//!    them with `gts_publication(crates = [quota_enforcement_sdk])` before its
+//!    `init`. The reviewed contract stays in `docs/schemas/`, and the crate's
+//!    tests hold the generated documents to it.
 
-use serde_json::{Value, json};
-use toolkit_gts::{InventoryInstance, InventoryTypeSchema, PluginV1, gts_id, gts_type_schema};
+use gts::{GtsInstanceId, GtsTypeId};
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
+use toolkit_gts::local::{gts_instance_raw, gts_type_schema};
+use toolkit_gts::{GtsTraitsSchema, PluginV1, gts_id};
 
 /// GTS resource type for Quota records (declarative caps).
 pub const QUOTA_RESOURCE: &str = gts_id!("cf.core.qe.quota.v1~");
@@ -81,95 +82,168 @@ pub const SCOPE_TENANT: &str = gts_id!("cf.core.qe.scope.v1~cf.core.qe.tenant.v1
 /// admitted metrics against it at bootstrap.
 pub const METRIC_BASE_TYPE: &str = gts_id!("cf.core.qe.metric_type.v1~");
 
-const SUBJECT_BASE_JSON: &str = include_str!("../schemas/gts.cf.core.qe.subj.v1~.schema.json");
-const RESOURCE_BASE_JSON: &str = include_str!("../schemas/gts.cf.core.qe.res.v1~.schema.json");
-const REQUEST_BASE_JSON: &str = include_str!("../schemas/gts.cf.core.qe.request.v1~.schema.json");
-const CONSTRAINT_BASE_JSON: &str =
-    include_str!("../schemas/gts.cf.core.qe.constraint.v1~.schema.json");
-const SCOPE_TYPE_JSON: &str = include_str!("../schemas/gts.cf.core.qe.scope.v1~.schema.json");
-
-/// One QE-owned GTS definition as the registry receives it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct OwnedDefinition {
-    /// The GTS id: a type id (trailing `~`) or an instance id.
-    pub id: &'static str,
-    /// The document registered under `id`.
-    pub document: Value,
-}
-
-/// The QE-owned GTS definitions in registration order: the four abstract
-/// bases, the scope-discriminator type, then its two well-known instances.
-///
-/// Registration touches only these definitions. Concrete owner projections
-/// are published by their owning gears, and the gear seeds no platform-wide
-/// subject instances (ADR-0007).
-///
-/// # Errors
-///
-/// Returns the parse error when an embedded schema file is not valid JSON.
-/// The files are reviewed documents checked by the crate's tests, so this is
-/// a build defect rather than a runtime condition.
 // @cpt-dod:cpt-cf-quota-enforcement-dod-base-registration:p1
-pub fn owned_definitions() -> Result<Vec<OwnedDefinition>, serde_json::Error> {
-    let mut out = Vec::with_capacity(7);
-    for (id, raw) in OWNED_TYPE_SCHEMAS {
-        out.push(OwnedDefinition {
-            id,
-            document: serde_json::from_str(raw)?,
-        });
-    }
-    for id in [SCOPE_USER, SCOPE_TENANT] {
-        out.push(OwnedDefinition {
-            id,
-            document: scope_instance(id),
-        });
-    }
-    Ok(out)
+// The QE-owned declarations, in this crate's collector (`gts_declarations`)
+// and published by quota-enforcement with `gts_publication(crates = [...])`.
+// `docs/schemas/` keeps the reviewed contract; `gts_tests.rs` holds these
+// declarations to it.
+
+/// A registered metric id under [`METRIC_BASE_TYPE`] (a trait value).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(transparent)]
+#[schemars(
+    transparent,
+    extend("x-gts-instance-ref" = "gts.cf.core.qe.metric_type.v1~")
+)]
+pub struct MetricInstanceRef(#[schemars(with = "String")] pub GtsInstanceId);
+
+/// Traits of a subject projection ([`SubjectProjectionV1`]). Field docs are
+/// the published schema descriptions, verbatim from `docs/schemas/`.
+#[allow(
+    clippy::doc_markdown,
+    reason = "doc text is the published schema description"
+)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, GtsTraitsSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SubjectTraitsV1 {
+    /// Required scope discriminator: a well-known instance of gts.cf.core.qe.scope.v1~. QE reads the registry-validated effective trait and maps caller-supplied SubjectRef kinds through the catalogue; scope is never encoded in the type-id name segment.
+    #[schemars(
+        with = "String",
+        extend("x-gts-instance-ref" = "gts.cf.core.qe.scope.v1~")
+    )]
+    pub scope: GtsInstanceId,
+    /// Metrics this projection admits. x-gts-instance-ref narrowing is pattern-level only: metric registration, the instance-of relationship to the metric base, and debit admission are checked by QE at bootstrap and Gateway ingress (ADR-0007). At most one projection admits a given metric per (metric, scope) pair per deployment; narrowing this set is a breaking contract change.
+    #[schemars(length(min = 1))]
+    pub admitted_metrics: Vec<MetricInstanceRef>,
 }
 
-/// The five QE-owned type schemas, bases before the concrete scope type.
-const OWNED_TYPE_SCHEMAS: [(&str, &str); 5] = [
-    (SUBJECT_BASE, SUBJECT_BASE_JSON),
-    (RESOURCE_BASE, RESOURCE_BASE_JSON),
-    (REQUEST_BASE, REQUEST_BASE_JSON),
-    (CONSTRAINT_BASE, CONSTRAINT_BASE_JSON),
-    (SCOPE_TYPE, SCOPE_TYPE_JSON),
-];
-
-/// The identity-only document of a well-known scope instance.
-fn scope_instance(id: &str) -> Value {
-    json!({ "id": id, "type": SCOPE_TYPE })
+/// Traits of a metric request contract ([`RequestContractV1`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, GtsTraitsSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RequestTraitsV1 {
+    /// The single registered metric governed by this request contract.
+    #[schemars(
+        with = "String",
+        extend("x-gts-instance-ref" = "gts.cf.core.qe.metric_type.v1~")
+    )]
+    pub metric: GtsInstanceId,
+    /// The concrete arbitration-constraint contract attached to this metric request contract.
+    #[schemars(
+        with = "String",
+        extend("x-gts-type-ref" = "gts.cf.core.qe.constraint.v1~")
+    )]
+    pub constraint_contract: GtsTypeId,
 }
 
-inventory::submit! {
-    InventoryTypeSchema { type_id: SUBJECT_BASE, schema_fn: || SUBJECT_BASE_JSON.to_owned() }
+/// `gts.cf.core.qe.subj.v1~`: the abstract base of subject projections.
+#[gts_type_schema(
+    dir_path = "schemas",
+    type_id = gts_id!("cf.core.qe.subj.v1~"),
+    description = "Abstract base for subject projections (ADR-0007). The metric owner derives one concrete projection per scope; QE maps a caller-supplied SubjectRef kind to the unique projection for (metric, scope). Operation metadata is defined once by the metric request contract, not by each projection.",
+    properties = "gts_type",
+    base = true,
+    traits_schema = inline(SubjectTraitsV1),
+    gts_abstract = true
+)]
+#[derive(Debug)]
+pub struct SubjectProjectionV1 {
+    /// The concrete owner-declared subject projection. QE selects this type from the catalogue; consumers do not supply it.
+    #[schemars(with = "String", extend("x-gts-type-ref" = "/$id"))]
+    #[serde(rename = "type")]
+    pub gts_type: GtsTypeId,
 }
-inventory::submit! {
-    InventoryTypeSchema { type_id: RESOURCE_BASE, schema_fn: || RESOURCE_BASE_JSON.to_owned() }
+
+/// `gts.cf.core.qe.res.v1~`: the abstract base of resource projections.
+#[gts_type_schema(
+    dir_path = "schemas",
+    type_id = gts_id!("cf.core.qe.res.v1~"),
+    description = "Abstract base for resource projections (ADR-0007). Completes the request contract for resource-aware selection; descriptive input only, and not part of the P1 counter key.",
+    properties = "gts_type,id,metadata",
+    base = true,
+    gts_abstract = true
+)]
+#[derive(Debug)]
+pub struct ResourceProjectionV1 {
+    /// The concrete owner-declared resource projection.
+    #[schemars(with = "String", extend("x-gts-type-ref" = "/$id"))]
+    #[serde(rename = "type")]
+    pub gts_type: GtsTypeId,
+    /// Optional resource identity: the contract may describe a resource class or a concrete resource.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "String")]
+    pub id: Option<String>,
+    /// Schematized resource properties, refined by the derived type. Required on the wire per the base contract rule.
+    pub metadata: Map<String, Value>,
 }
-inventory::submit! {
-    InventoryTypeSchema { type_id: REQUEST_BASE, schema_fn: || REQUEST_BASE_JSON.to_owned() }
+
+/// `gts.cf.core.qe.request.v1~`: the abstract base of metric request contracts.
+#[gts_type_schema(
+    dir_path = "schemas",
+    type_id = gts_id!("cf.core.qe.request.v1~"),
+    description = "Abstract base for a metric owner's operation request contract (ADR-0007). One concrete contract is published per metric and validates the operation-level metadata object shared by every subject scope and caller.",
+    properties = "gts_type,metadata",
+    base = true,
+    traits_schema = inline(RequestTraitsV1),
+    gts_abstract = true
+)]
+#[derive(Debug)]
+pub struct RequestContractV1 {
+    /// The concrete owner-published metric request contract selected by QE; consumers do not supply this type.
+    #[schemars(with = "String", extend("x-gts-type-ref" = "/$id"))]
+    #[serde(rename = "type")]
+    pub gts_type: GtsTypeId,
+    /// The operation-level metadata object refined by the concrete contract and supplied once per evaluation request.
+    pub metadata: Map<String, Value>,
 }
-inventory::submit! {
-    InventoryTypeSchema { type_id: CONSTRAINT_BASE, schema_fn: || CONSTRAINT_BASE_JSON.to_owned() }
+
+/// `gts.cf.core.qe.constraint.v1~`: the abstract base of arbitration constraint contracts.
+#[gts_type_schema(
+    dir_path = "schemas",
+    type_id = gts_id!("cf.core.qe.constraint.v1~"),
+    description = "Abstract base for operator-authored arbitration constraints (ADR-0007). The metric owner attaches one derived constraint contract to the metric request contract; operators populate Quota.metadata at create/update, and QE validates it once before persistence (snapshot timing per ADR-0003). The request schema MUST NOT be reused here.",
+    properties = "gts_type,metadata",
+    base = true,
+    gts_abstract = true
+)]
+#[derive(Debug)]
+pub struct ConstraintContractV1 {
+    /// The concrete owner-declared constraint contract.
+    #[schemars(with = "String", extend("x-gts-type-ref" = "/$id"))]
+    #[serde(rename = "type")]
+    pub gts_type: GtsTypeId,
+    /// Operator-populated arbitration object (quota.metadata), refined by the derived type; may carry fields such as regions or weight with no request-side counterpart.
+    pub metadata: Map<String, Value>,
 }
-inventory::submit! {
-    InventoryTypeSchema { type_id: SCOPE_TYPE, schema_fn: || SCOPE_TYPE_JSON.to_owned() }
+
+/// `gts.cf.core.qe.scope.v1~`: the concrete scope-discriminator type.
+#[gts_type_schema(
+    dir_path = "schemas",
+    type_id = gts_id!("cf.core.qe.scope.v1~"),
+    description = "Concrete QE scope-discriminator type (ADR-0007). Its well-known instances classify caller-supplied subject references; each subject projection carries one as its required scope trait.",
+    properties = "id,gts_type",
+    base = true
+)]
+#[derive(Debug)]
+pub struct ScopeV1 {
+    /// The well-known scope instance id.
+    #[schemars(with = "String", extend("x-gts-instance-ref" = "/$id"))]
+    pub id: GtsInstanceId,
+    // A `String`: the schema macro takes a typed id or a typed type field on
+    // a base, not both.
+    /// Always the scope-discriminator type itself.
+    #[schemars(with = "String", extend("x-gts-type-ref" = "/$id"))]
+    #[serde(rename = "type")]
+    pub gts_type: String,
 }
-inventory::submit! {
-    InventoryInstance {
-        type_id: SCOPE_TYPE,
-        instance_id: SCOPE_USER,
-        payload_fn: || scope_instance(SCOPE_USER),
-    }
-}
-inventory::submit! {
-    InventoryInstance {
-        type_id: SCOPE_TYPE,
-        instance_id: SCOPE_TENANT,
-        payload_fn: || scope_instance(SCOPE_TENANT),
-    }
-}
+
+gts_instance_raw!({
+    "id": gts_id!("cf.core.qe.scope.v1~cf.core.qe.user.v1"),
+    "type": gts_id!("cf.core.qe.scope.v1~")
+});
+gts_instance_raw!({
+    "id": gts_id!("cf.core.qe.scope.v1~cf.core.qe.tenant.v1"),
+    "type": gts_id!("cf.core.qe.scope.v1~")
+});
 
 // ---------------------------------------------------------------------------
 // Plugin specs

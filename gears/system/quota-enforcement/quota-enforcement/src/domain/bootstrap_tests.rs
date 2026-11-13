@@ -7,8 +7,7 @@ use gts::GtsTypeId;
 use quota_enforcement_sdk::testing::{InMemoryStorage, RecordingSink, quota_draft};
 use quota_enforcement_sdk::{
     CONTRACT_MAJOR, MetricId, PageRequest, PolicyDraft, PolicyId, PolicySchemaSnapshot,
-    PolicyScope, QuotaEnforcementStoragePluginV1, SCOPE_TENANT, SCOPE_USER, StorageError,
-    SubjectRef, SubjectScope,
+    PolicyScope, QuotaEnforcementStoragePluginV1, StorageError, SubjectRef, SubjectScope,
 };
 use tokio_util::sync::CancellationToken;
 use toolkit::ClientHub;
@@ -156,11 +155,7 @@ async fn a_complete_environment_bootstraps_resolves_the_coordinator_and_becomes_
         "the cluster binding resolved once"
     );
 
-    // The QE-owned definitions were asserted, and the catalogue is published.
-    assert_eq!(fake.ensure_registered_calls(), 1);
-    let registered = fake.last_registered();
-    assert_eq!(registered.len(), 7);
-    assert!(registered.contains(&SCOPE_USER) && registered.contains(&SCOPE_TENANT));
+    // The catalogue is published.
     let tokens = MetricId::parse(METRIC_TOKENS).expect("metric");
     assert_eq!(
         bound
@@ -217,10 +212,8 @@ async fn a_missing_storage_client_fails_bootstrap_before_the_cluster_resolve() {
         .await
         .err()
         .expect("client not registered");
-    assert!(
-        matches!(err, DomainError::PluginClientNotRegistered { .. }),
-        "{err:?}"
-    );
+    // The only acme instance has no bound client, so none is selectable.
+    assert!(matches!(err, DomainError::PluginNotFound { .. }), "{err:?}");
     failed_on(&h, Dependency::Storage);
     assert_eq!(h.storage.bootstrap_calls(), 0);
     assert_eq!(h.coordinator.calls(), 0);
@@ -299,34 +292,6 @@ async fn an_unreachable_registry_fails_bootstrap_on_the_registry_dependency() {
         0,
         "the catalogue precedes the cluster resolve"
     );
-}
-
-#[tokio::test]
-async fn a_conflicting_owned_definition_fails_bootstrap_on_the_catalogue_dependency() {
-    let fake = Arc::new(FakeContractRegistry::llm_gateway());
-    fake.fail_registration_with(DomainError::CatalogInvalid {
-        reason: ValidationReason::DefinitionConflict,
-        subject: "gts.cf.core.qe.scope.v1~".to_owned(),
-    });
-    let h = harness_with_registry(
-        Arc::new(InMemoryStorage::new()),
-        true,
-        permitting_pdp(),
-        fake,
-    );
-    let err = bootstrap(&h).run().await.err().expect("conflict");
-    assert!(
-        matches!(
-            err,
-            DomainError::CatalogInvalid {
-                reason: ValidationReason::DefinitionConflict,
-                ..
-            }
-        ),
-        "{err:?}"
-    );
-    failed_on(&h, Dependency::Catalog);
-    assert!(!h.readiness.is_ready());
 }
 
 #[tokio::test]
@@ -536,8 +501,7 @@ async fn the_real_registry_bootstraps_registers_discovers_compiles_and_restarts_
         .validate(&serde_json::json!({ "type": LLM_TOKEN_REQUEST, "metadata": { "region": "eu" } }))
         .expect("compiled from the resolved registry content");
 
-    // A restart against the same registry re-asserts the QE definitions
-    // (byte-identical: a silent success) and publishes an equivalent catalogue.
+    // A restart against the same registry publishes an equivalent catalogue.
     let second = harness_with_registry(
         Arc::new(InMemoryStorage::new()),
         true,

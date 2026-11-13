@@ -37,9 +37,8 @@ use gts::{
 };
 use quota_enforcement_sdk::testing::InMemoryStorage;
 use quota_enforcement_sdk::{
-    METRIC_BASE_TYPE, MetricId, MetricKind, OwnedDefinition, QuotaEnforcementStoragePluginSpecV1,
+    METRIC_BASE_TYPE, MetricId, MetricKind, QuotaEnforcementStoragePluginSpecV1,
     QuotaEnforcementStoragePluginV1, SCOPE_TENANT, SCOPE_TYPE, SCOPE_USER, TenantId,
-    owned_definitions,
 };
 use serde_json::{Value, json};
 use standalone_cluster_plugin::{StandaloneClusterHandle, StandaloneClusterPlugin};
@@ -53,6 +52,7 @@ use types_registry::domain::TypesRegistryService;
 use types_registry::domain::legacy_local_client::TypesRegistryLocalClient;
 use types_registry::infra::InMemoryGtsRepository;
 use types_registry_sdk::testing::{MockTypesRegistryClient, make_test_instance};
+use types_registry_sdk::testing_platform::{Call, Fault, MockTypesRegistry};
 use types_registry_sdk::{
     GtsInstance, GtsTypeSchema, InstanceQuery, RegisterResult, TypeSchemaQuery, TypesRegistryClient,
 };
@@ -598,12 +598,20 @@ impl QeMetrics for RecordingMetrics {
 // Plugin fixtures
 // ---------------------------------------------------------------------------
 
-/// A registered plugin instance as the types registry would list it.
+/// A published plugin instance as the types registry would list it.
 pub struct PluginFixture {
     /// Full GTS instance id.
     pub instance_id: String,
-    /// Registry entity.
-    pub entity: GtsInstance,
+    /// The published document.
+    pub payload: Value,
+}
+
+impl PluginFixture {
+    /// `(id, document)`, as a publication manifest lists it.
+    #[must_use]
+    pub fn published(&self) -> (String, Value) {
+        (self.instance_id.clone(), self.payload.clone())
+    }
 }
 
 /// A storage plugin instance.
@@ -614,7 +622,7 @@ pub fn storage_instance(segment: &str, vendor: &str, priority: i16) -> PluginFix
     .expect("registration payload");
     PluginFixture {
         instance_id: id.to_string(),
-        entity: make_test_instance(id.as_ref(), payload),
+        payload,
     }
 }
 
@@ -627,7 +635,7 @@ pub fn sink_instance(segment: &str, vendor: &str) -> PluginFixture {
         .expect("registration payload");
     PluginFixture {
         instance_id: id.to_string(),
-        entity: make_test_instance(id.as_ref(), payload),
+        payload,
     }
 }
 
@@ -642,7 +650,7 @@ impl PluginFixture {
         let broken = json!({ "id": id.to_string(), "vendor": 7 });
         Self {
             instance_id: id.to_string(),
-            entity: make_test_instance(id.as_ref(), broken),
+            payload: broken,
         }
     }
 
@@ -654,27 +662,34 @@ impl PluginFixture {
         let broken = json!({ "id": id.to_string(), "priority": "not-a-number" });
         Self {
             instance_id: id.to_string(),
-            entity: make_test_instance(id.as_ref(), broken),
+            payload: broken,
         }
     }
 }
 
-/// A hub whose types registry lists `fixtures`.
+/// A platform registry listing the published `plugins`.
+pub fn platform_registry(plugins: &[(String, Value)]) -> Arc<MockTypesRegistry> {
+    let registry = Arc::new(MockTypesRegistry::new());
+    for (id, payload) in plugins {
+        registry.seed(id, payload.clone());
+    }
+    registry
+}
+
+/// A hub whose platform registry lists `fixtures`.
 pub fn hub_with(fixtures: &[&PluginFixture]) -> Arc<ClientHub> {
-    let registry =
-        MockTypesRegistryClient::new().with_instances(fixtures.iter().map(|f| f.entity.clone()));
+    let published: Vec<_> = fixtures.iter().map(|f| f.published()).collect();
     let hub = Arc::new(ClientHub::new());
-    let client: Arc<dyn TypesRegistryClient> = Arc::new(registry);
-    hub.register::<dyn TypesRegistryClient>(client);
+    platform_registry(&published).install(&hub);
     hub
 }
 
-/// A hub whose types registry fails every listing with `err`.
+/// A hub whose platform registry fails every listing with `err`.
 pub fn hub_with_failing_registry(err: CanonicalError) -> Arc<ClientHub> {
-    let registry = MockTypesRegistryClient::new().with_list_error(err);
+    let registry = platform_registry(&[]);
+    registry.inject(Fault::on(Call::List).fail(err));
     let hub = Arc::new(ClientHub::new());
-    let client: Arc<dyn TypesRegistryClient> = Arc::new(registry);
-    hub.register::<dyn TypesRegistryClient>(client);
+    registry.install(&hub);
     hub
 }
 
@@ -1076,12 +1091,12 @@ pub fn document_id(document: &Value) -> String {
         .expect("a GTS document carries $id or id")
 }
 
+/// The QE-owned Type Schemas of the SDK collector (the plugin specs excluded).
 fn owned_type_documents() -> Vec<Value> {
-    owned_definitions()
-        .expect("owned definitions parse")
+    quota_enforcement_sdk::gts_declarations()
         .into_iter()
-        .filter(|d| d.id.ends_with('~'))
-        .map(|d| d.document)
+        .filter(|(id, _)| id.starts_with("gts.cf.core.qe.") && id.ends_with('~'))
+        .map(|(_, text)| serde_json::from_str(&text).expect("declared JSON"))
         .collect()
 }
 
@@ -1139,18 +1154,16 @@ pub fn in_process_registry(extra: Vec<Value>) -> Arc<dyn TypesRegistryClient> {
     Arc::new(TypesRegistryLocalClient::new(service))
 }
 
-/// A hub whose types registry is `registry`, listing `fixtures` on top of
-/// whatever `registry` holds is not needed: plugin instances are registered
-/// through the same registry.
-pub fn hub_with_registry(registry: Arc<dyn TypesRegistryClient>) -> Arc<ClientHub> {
+/// A hub whose legacy types registry is `registry` (projection contracts and
+/// metrics) and whose platform registry lists the published `plugins`.
+pub fn hub_with_registry(
+    registry: Arc<dyn TypesRegistryClient>,
+    plugins: &[(String, Value)],
+) -> Arc<ClientHub> {
     let hub = Arc::new(ClientHub::new());
     hub.register::<dyn TypesRegistryClient>(registry);
+    platform_registry(plugins).install(&hub);
     hub
-}
-
-/// The plugin instance document of `fixture` as the registry accepts it.
-pub fn plugin_instance_document(fixture: &PluginFixture) -> Value {
-    fixture.entity.object.clone()
 }
 
 /// Resolves `documents` the way the production adapter does: a local
@@ -1203,10 +1216,8 @@ pub struct FakeContractRegistry {
     /// reference graph is broken.
     broken: Mutex<HashMap<String, DiscoveredType>>,
     instances: Mutex<HashMap<String, GtsTypeId>>,
-    registered: Mutex<Vec<Vec<&'static str>>>,
     reads: AtomicUsize,
     fail_all: AtomicBool,
-    registration_failure: Mutex<Option<DomainError>>,
 }
 
 impl FakeContractRegistry {
@@ -1274,21 +1285,6 @@ impl FakeContractRegistry {
         self.instances.lock().expect("lock").remove(id);
     }
 
-    /// Number of `ensure_registered` calls.
-    pub fn ensure_registered_calls(&self) -> usize {
-        self.registered.lock().expect("lock").len()
-    }
-
-    /// The ids of the last `ensure_registered` call.
-    pub fn last_registered(&self) -> Vec<&'static str> {
-        self.registered
-            .lock()
-            .expect("lock")
-            .last()
-            .cloned()
-            .unwrap_or_default()
-    }
-
     /// Number of read calls (`type_schema`, `derived_types`, `instance_type`).
     pub fn read_calls(&self) -> usize {
         self.reads.load(Ordering::SeqCst)
@@ -1297,11 +1293,6 @@ impl FakeContractRegistry {
     /// Every later call fails as unavailable.
     pub fn fail_all(&self) {
         self.fail_all.store(true, Ordering::SeqCst);
-    }
-
-    /// `ensure_registered` fails with `err`.
-    pub fn fail_registration_with(&self, err: DomainError) {
-        *self.registration_failure.lock().expect("lock") = Some(err);
     }
 
     fn read(&self) -> Result<(), DomainError> {
@@ -1317,22 +1308,6 @@ impl FakeContractRegistry {
 
 #[async_trait]
 impl ContractRegistry for FakeContractRegistry {
-    async fn ensure_registered(&self, definitions: &[OwnedDefinition]) -> Result<(), DomainError> {
-        if self.fail_all.load(Ordering::SeqCst) {
-            return Err(DomainError::TypesRegistryUnavailable(
-                "fake registry unavailable".to_owned(),
-            ));
-        }
-        if let Some(err) = self.registration_failure.lock().expect("lock").clone() {
-            return Err(err);
-        }
-        self.registered
-            .lock()
-            .expect("lock")
-            .push(definitions.iter().map(|d| d.id).collect());
-        Ok(())
-    }
-
     async fn type_schema(&self, id: &GtsTypeId) -> Result<Option<RegisteredType>, DomainError> {
         self.read()?;
         if self.broken.lock().expect("lock").contains_key(id.as_ref()) {
